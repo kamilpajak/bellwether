@@ -1,0 +1,5 @@
+# Workspace root. One member today; vault, derive, modelgate, propose and ledger are
+# the services the design memo names, and each arrives as its own crate here.
+[workspace]
+members = ["services/newsvault"]
+resolver = "2"
