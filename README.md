@@ -36,9 +36,10 @@ happened and was measured.
 
 Each item carries two instants that are **separate types and cannot be compared with each other**:
 when the world published it, and when we could first have known it. A single query decides
-visibility and it requires both. The half-question — "was it published before T?" — is not
-expressible from outside its module, because that is the question whose answer leaked in 60.2% of a
-69-probe retrieval test while the full question leaked in none.
+visibility and it requires both, because the half-question — "was it published before T?" — is the
+one whose answer leaked in 60.2% of a 69-probe retrieval test while the full question leaked in none.
+The two instants cannot be compared with each other, so that leak cannot happen by confusing them;
+the accessors are public, so a caller who sets out to ask the half-question still can.
 
 From the same source: the archive is complete and append-only, and any cap is a derived view;
 a missing input aborts rather than becoming an empty result; a failed network call must be handled
@@ -73,9 +74,9 @@ keeping. It is here so this project is not free to repeat them.
 ## Running the archive reader
 
 ```
-cargo test                                  # 14 unit tests plus a compile_fail doc test
-cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --no-fail-fast          # 14 unit tests plus a compile_fail doc test
 cargo run -p newsvault -- day 2026-07-01 --lake <path-to-lake> --format json
 cargo run -p newsvault -- schema           # machine-readable description of the command tree
 ```

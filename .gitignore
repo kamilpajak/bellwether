@@ -1,3 +1,4 @@
 target/
 *.parquet
 .DS_Store
+probes/**/vendor_probe_results.json

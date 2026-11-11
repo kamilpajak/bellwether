@@ -34,6 +34,16 @@ PAGE_CAP = 12          # stop paging; a day needing more than 1200 articles is a
 TIMEOUT = 60.0
 
 
+def _scrub(text: str) -> str:
+    """Replace any configured key found in `text`. Used before anything is printed."""
+    out = text
+    for name in ("NEWSAPI_AI_KEY", "NEWSCATCHER_API_KEY"):
+        v = os.environ.get(name)
+        if v and len(v) >= 8:
+            out = out.replace(v, f"<{name}>")
+    return out
+
+
 def _need(name: str) -> str:
     """Missing input aborts. An empty fallback is forbidden - requirement R6."""
     v = os.environ.get(name)
@@ -51,13 +61,18 @@ def _need(name: str) -> str:
 def probe_newsapi_ai(day: str) -> dict:
     """Event Registry / newsapi.ai. Broad query: English business news for one UTC day."""
     key = _need("NEWSAPI_AI_KEY")
-    # Documented setup passes the key as a URL parameter; requests stay sequential
-    # because the documented rate limit caps simultaneous requests at 5.
-    url = f"https://eventregistry.org/api/v1/article/getArticles?apiKey={key}"
+    # The documented setup passes the key as a URL parameter. It is sent in the POST
+    # body instead, because httpx puts the full request URL into the message of any
+    # HTTPStatusError it raises - verified 2026-11-12 - and this script writes error
+    # messages into a results file inside a PUBLIC repository. A key in the query
+    # string would therefore be published by one 401 or one rate-limit response.
+    # Requests stay sequential because the documented limit is 5 simultaneous.
+    url = "https://eventregistry.org/api/v1/article/getArticles"
     items, pages, cost_note = [], 0, None
     with httpx.Client(timeout=TIMEOUT) as c:
         for page in range(1, PAGE_CAP + 1):
             body = {
+                "apiKey": key,
                 "resultType": "articles",
                 "lang": "eng",
                 "dateStart": day,
@@ -178,7 +193,11 @@ def summarise(res: dict) -> dict:
         "note": res.get("note"),
         "articles": len(items),
         "distinct_ids": len(ids),
-        "id_digest": hashlib.sha256("\n".join(ids).encode()).hexdigest(),
+        "id_digest": (hashlib.sha256("\n".join(ids).encode()).hexdigest()
+                      if ids else None),   # None, not the digest of "" - an empty
+                                           # day would otherwise hash identically for
+                                           # every vendor and every date, and two such
+                                           # days would compare as "the same set".
         "paging_exhausted": res["pages"] < PAGE_CAP,
         "body_len_median": int(statistics.median(bodies)) if bodies else 0,
         "body_len_p90": q(bodies, 0.9),
@@ -205,14 +224,37 @@ def main() -> int:
             except SystemExit:
                 raise
             except Exception as e:
-                print(f"  {v} {day}: PORAZKA {type(e).__name__}: {e}", flush=True)
-                rows.append({"vendor": v, "day": day, "error": f"{type(e).__name__}: {e}"})
+                # The type only. A vendor exception message can carry the request URL,
+                # the request body or a response echo, any of which may hold the key, and
+                # this file is written inside a public repository. The type is enough to
+                # tell a transport failure from a refusal; the detail belongs in a local
+                # log, not in a committed artefact.
+                detail = _scrub(f"{type(e).__name__}: {e}")
+                print(f"  {v} {day}: PORAZKA {detail}", flush=True)
+                rows.append({"vendor": v, "day": day, "error": type(e).__name__})
                 continue
             s = summarise(res)
             rows.append(s)
             print(f"  {v} {day}: {s['articles']} art., {s['pages']} stron, "
                   f"cialo mediana {s['body_len_median']} zn., "
                   f"opoznienie mediana {s['lag_seconds_median']} s", flush=True)
+
+    # Q2 is answered BEFORE the results are written. Writing first would overwrite the
+    # baseline that --compare reads, and the pre-registration points --compare at this
+    # very path, so a second run would have compared its own fresh output against itself
+    # and reported "the same set" for every day, always. A stability check that cannot
+    # return no is not a check.
+    baseline = None
+    if args.compare:
+        cmp_path = pathlib.Path(args.compare).resolve()
+        if cmp_path == OUT.resolve():
+            raise SystemExit(
+                f"--compare points at this run's own output ({OUT.name}).\n"
+                "  Copy the earlier run's file to another name and compare against that."
+            )
+        if not cmp_path.exists():
+            raise SystemExit(f"brak pliku odniesienia: {cmp_path}")
+        baseline = json.loads(cmp_path.read_text())
 
     stamp = dt.datetime.now(dt.timezone.utc).isoformat()
     OUT.write_text(json.dumps({"fetched_at": stamp, "rows": rows}, indent=1))
@@ -238,20 +280,24 @@ def main() -> int:
         print(f"   {r['vendor']:14} {r['day']}: {searches} wyszukiwan/dzien -> "
               f"{tok_year:,} tokenow/rok -> ${tok_year * 0.015:,.0f}")
 
-    if args.compare:
-        prev = json.loads(pathlib.Path(args.compare).read_text())
+    if baseline is not None:
         old = {(r.get("vendor"), r.get("day")): r.get("id_digest")
-               for r in prev.get("rows", [])}
+               for r in baseline.get("rows", [])}
         print("\nQ2 stabilnosc archiwum (ten sam zbior po czasie?):")
         for r in rows:
             k = (r.get("vendor"), r.get("day"))
             if k not in old or "error" in r:
                 continue
+            if old[k] is None or r["id_digest"] is None:
+                print(f"   {k[0]:14} {k[1]}: NIEROZSTRZYGNIETE (pusty dzien po jednej ze stron)")
+                continue
             same = old[k] == r["id_digest"]
             print(f"   {k[0]:14} {k[1]}: {'TEN SAM zbior' if same else 'ZBIOR SIE ZMIENIL'}")
     else:
-        print("\nQ2 stabilnosc: zapisano odciski. Powtorz ten sam przebieg po kilku dniach")
-        print(f"   z --compare {OUT.name}, bo jeden przebieg tego nie rozstrzyga.")
+        print("\nQ2 stabilnosc: zapisano odciski. Jeden przebieg tego nie rozstrzyga.")
+        print(f"   Skopiuj {OUT.name} pod inna nazwe, odczekaj co najmniej 7 dni i uruchom")
+        print("   ponownie z --compare wskazujacym TE KOPIE. Porownanie z wlasnym wyjsciem")
+        print("   jest odrzucane, bo porownywaloby przebieg sam ze soba.")
     print(f"\nzapisano {OUT}")
     return 0
 

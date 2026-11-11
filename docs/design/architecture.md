@@ -311,16 +311,16 @@ today — named rather than hidden.
 | # | invariant | enforced by | status |
 |---|---|---|---|
 | R1 | archive complete, caps are views | `vault` has no truncating write path; the cap lives in a view builder | design |
-| R2 | valid and observation time are distinct types | the type system; a `compile_fail` doc test pins it | **enforced** |
+| R2 | valid and observation time are distinct types | the type system; a `compile_fail` doc test pins it, and CI runs it | **enforced, but narrower than §3.1 claims** — see the correction below |
 | R3 | first sighting wins | unit tests in `newsvault` | **enforced** |
 | R4 | coverage ledger beside every store | a write to the archive without an `Attempt` row fails the store's own test | design |
-| R5 | failed calls must be handled | the type system: a `Result` that is not handled does not compile | **enforced** |
-| R6 | missing input aborts | unit tests; the loader has no empty-fallback branch | **enforced** |
-| R7 | units are types, identity is a content hash | newtypes for units; `item_id` derivation under test | **partly** — identity is tested, unit types are not yet introduced because no numeric unit crosses a boundary yet |
+| R5 | failed calls must be handled | **not the type system.** An ignored `Result` is the rustc *warning* `unused_must_use`, and `let _ = f()` emits nothing at all. Only `cargo clippy --all-targets -- -D warnings` in CI makes it red, and `unused_must_use` is not yet denied in `Cargo.toml`. | **overstated** |
+| R6 | missing input aborts | unit tests cover the missing root and the missing day. But `lake.rs` `string_list_at` has five `Vec::new()` exits, four of which swallow a real decoding error while `unusable_rows` stays 0 — so the loader does have empty-fallback branches. | **partly** |
+| R7 | units are types, identity is a content hash | nothing. `grep -rn item_id services/newsvault/src` returns no match: there is no derivation and no test. Unit newtypes are also absent. | **no enforcement point yet**, both halves |
 | R8 | presence counted, never multiplied | the panel manifest requires `rows` and `exchangeable_units`; a CI check rejects a manifest whose row count equals a product of two cardinalities | **no enforcement point yet** |
 | R9 | power from the registered procedure | the statistics tier refuses a panel without `exchangeable_units`; `params_version` names the power method | **no enforcement point yet** |
 | R10 | provenance labelled | enum field, non-nullable | design |
-| R11 | backfill lag is measured | `Visibility::from_backfill` requires a `MeasuredLag`; no constructor skips it | **enforced** |
+| R11 | backfill lag is measured | `from_backfill` requires a `MeasuredLag`, so the **type** cannot be skipped. But all four of its fields are `pub` with no validating constructor, so `{probe_id: "", probes: 0, leaks: 0, seconds: 0}` is accepted — demonstrated 2026-11-12 from outside the crate. And `Visibility` derives `Deserialize` over private fields, which bypasses `from_live`. | **the type is required; the measurement is not** |
 | R12 | no path to the order queue | an AST check over every crate forbids order-placing calls; no credential is present | **no enforcement point yet** |
 | R13 | five time columns, sequence is the authority | store schema; ordering helpers take `seq` only | design |
 | R14 | an attempt is recorded even when empty | the four-outcome enum is non-nullable; a test asserts a row on an empty fetch | design |
@@ -328,6 +328,21 @@ today — named rather than hidden.
 | R16 | ledger records poll events | `items_new = 0` still writes a row; a test asserts it | design |
 | R17 | matching survives a broad corpus, over article body | the rules file is hashed and versioned; the gazetteer regression case is a test | design |
 | R18 | two rule versions, one snapshot, a diff | a `derive diff` subcommand; its absence is the gap | design |
+
+**Correction, 2026-11-12, after an adversarial review.** Four rows above said **enforced** and did
+not earn it, and one structural problem outranked all of them: before this date there was no CI, so
+"enforced" meant *a test exists*, not *a test ran*. The project's own principle — a gate nobody
+replaced is a rule that quietly stopped applying — covers a gate nobody runs. A twenty-line workflow
+now runs `fmt`, `clippy -D warnings` and `test --no-fail-fast`, and the flag matters: measured on
+this tree, one failing unit test made plain `cargo test` exit without ever running the doc test,
+which is R2's only enforcement point.
+
+The R2 wording in §3.1 and in the README was also wrong, and the sentence is deleted rather than
+defended. "There is no public way to ask only half of it" is false: `Visibility::valid()`,
+`observed()` and `Cutoff::inner()` are public, so the publication-only predicate is one line from
+any crate — demonstrated by compiling it. What is true is narrower and still worth having: the two
+instants cannot be compared **with each other**, so the 60.2% leak cannot happen by type confusion.
+A claim nobody can enforce is worse than an accessor.
 
 Three gaps, and they are not equivalent. **R12** is the most serious: it protects the only boundary
 with money behind it, and today it rests on the fact that no code exists to violate yet. It needs

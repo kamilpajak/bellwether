@@ -1,0 +1,64 @@
+# The gate. Section 8 of docs/design/architecture.md marks an invariant "enforced" when a test for
+# it exists; a test nobody runs enforces nothing. This workflow is what turns "a test exists" into
+# "a test ran", and it is the only thing in the repository that does.
+#
+# The commands are the three README.md names under "Running the archive reader" (lines 76-78), plus
+# one flag explained at the test step. Change a command here and change it there, or the document
+# starts lying again.
+#
+# No toolchain setup step: the GitHub ubuntu runner image installs cargo, rustfmt and clippy
+# (images/ubuntu/scripts/build/install-rust.sh in actions/runner-images runs
+# `rustup component add rustfmt clippy`; the image readme lists rustfmt but not clippy, so the
+# build script is the authority). That also means the compiler version floats with the runner
+# image, so a new clippy lint can turn this red with no commit here. Pinning the compiler needs a
+# rust-toolchain.toml, which is a different file.
+#
+# No dependency cache: measured cold on a developer machine, the whole job is roughly 5 s of
+# dependency fetch, 10 s of clippy and 15 s of tests. Restoring and saving a cargo home to save
+# that is not a trade.
+#
+# What this gate does NOT cover, so that section 8 is not read more generously than it earns:
+#   * unwrap_used, expect_used and panic are denied in services/newsvault/Cargo.toml, which is a
+#     per-package table. A second workspace crate inherits none of them until the root Cargo.toml
+#     carries [workspace.lints] and each package opts in with `[lints] workspace = true`.
+#   * A crate on disk that is missing from workspace.members is invisible to all three commands
+#     and the run still goes green. A glob ("services/*") in the root members list closes that.
+#   * probes/ is Python and nothing here checks it.
+
+name: ci
+
+on: [push, pull_request]
+
+# The job only reads the tree. Nothing here publishes, comments or tags, so no token with write
+# access should be handed to third-party code.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # The work is under a minute. A bound well above that turns a hung step into a failed run
+    # rather than a six-hour one holding a required status check. A timed-out run can surface as
+    # a cancellation rather than a failure, so do not read one as a broken build.
+    timeout-minutes: 15
+    steps:
+      # Pinned to the commit behind release v7.0.1 (committed 2026-07-17, released 2026-07-20).
+      # A moving tag such as @v7 is a standing grant of write access to this gate: whoever can
+      # move the tag can change what runs here. It is also a reproducibility hole, because two
+      # runs of the same repository commit can then execute different action code.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: cargo fmt --check
+      # The three checks are independent, so one run should report all three verdicts. Without a
+      # condition here, a formatting diff ends the job and the tests never run at all, which costs
+      # a whole push to learn the second thing. "!cancelled()" keeps the step running after an
+      # earlier step failed, while still skipping it when the run is cancelled. The price is that
+      # a failed checkout yields three "could not find Cargo.toml" errors instead of one.
+      - if: ${{ !cancelled() }}
+        run: cargo clippy --locked --all-targets -- -D warnings
+      # --no-fail-fast, which README.md line 76 should carry as well: cargo stops at the first
+      # failing test target, and the compile_fail doc test is a separate target that runs last.
+      # Measured on this tree: with one unit test failing, plain `cargo test` exited 101 without
+      # ever printing "Doc-tests newsvault", so R2's only enforcement point was skipped by an
+      # unrelated failure. With the flag the doc test runs and the exit code is still 101.
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked --no-fail-fast
