@@ -58,6 +58,10 @@ keep passing.
 | `docs/inherited/` | two documents carried from the predecessor: the mandatory research gates, and the postmortem of eleven closed strategy paradigms |
 | `services/newsvault/` | the point-in-time core and the archive reader, in Rust |
 
+`docs/design/architecture.md` is the contract layer: what crosses each service boundary, in what
+shape, and — in its §8 — the single place each invariant is enforced, including the three that are
+not enforced anywhere yet.
+
 `docs/design/successor_system_design_2026_11_11.md` is the document to read before changing anything
 here. It carries eighteen numbered requirements, each paired with the measurement that forced it,
 and it names the decisions that are still open rather than writing around them.
