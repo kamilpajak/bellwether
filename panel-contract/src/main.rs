@@ -1,13 +1,9 @@
-//! `panel-contract` - the panel manifest contract on the command line.
+//! `panel-contract` - the panel manifest contract on the command line, so the Python side of the
+//! panel file boundary runs this validator instead of a second implementation of the same rules
+//! (`docs/design/architecture.md` sections 3.4 and 4).
 //!
-//! It exists so the non-Rust side of the boundary can use the same validator the Rust side will.
-//! Section 3.4 of `docs/design/architecture.md` keeps statistics in Python on the far side of a
-//! file boundary; a contract that only Rust can check would be re-implemented there, and two
-//! implementations of one rule set is how the rule set stops being one.
-//!
-//! Follows the repo's CLI contract: the result goes to stdout and nothing else does, errors go to
-//! stderr with a non-zero exit, JSON mode emits exactly one value, and `schema` prints the
-//! command tree and the field table for a caller that is not a human.
+//! Follows the repo's CLI contract: the result on stdout and nothing else, errors on stderr with a
+//! non-zero exit, exactly one JSON value in JSON mode, and `schema` for a caller that is not human.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -59,8 +55,6 @@ fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(code) => code,
         Err(message) => {
-            // The exit code carries the verdict, so a closed stderr must not turn an error path
-            // into a panic or change it.
             #[allow(
                 clippy::let_underscore_must_use,
                 reason = "reporting an error must not fail on a closed stderr; the exit code is the verdict"

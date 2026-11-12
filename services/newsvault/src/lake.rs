@@ -1,20 +1,11 @@
-//! Reader for the append-only news lake.
+//! Reader for the append-only news lake. Layout written by the Python ingest:
+//! `thematic_news_lake/session_date=<YYYY-MM-DD>/run=<YYYYMMDDTHHMMSSsssZ>.parquet`, one file per
+//! ingest run, holding that run's RAW per-source union before dedup and before the 200-item cap.
 //!
-//! Layout written by the Python ingest:
-//! `thematic_news_lake/session_date=<YYYY-MM-DD>/run=<YYYYMMDDTHHMMSSsssZ>.parquet`,
-//! one file per ingest run, holding that run's RAW per-source union before dedup
-//! and before the 200-item cap.
-//!
-//! Two differences from the Python current view, both deliberate:
-//!
-//! * **No cap.** The view keeps 200 items because that is the brief budget. Days
-//!   measured 2026-11-11 held 287 / 560 / 678 distinct items in the lake against the
-//!   same 200 in the view, so the view truncates by 30-70% at a rate that moves day
-//!   to day. A count taken from it is biased by the brief budget.
-//! * **First sighting wins.** When several runs carry the same item, the view keeps
-//!   the LAST run's `ingested_at`; this reader keeps the FIRST. Observation time is
-//!   the earliest instant we could have known the item, and taking the last run
-//!   would postdate our own knowledge.
+//! Two differences from the Python current view. **No cap** - what the cap costs is measured in
+//! `README.md`, point 1. **First sighting wins**: when several runs carry the same item the view
+//! keeps the LAST run's `ingested_at` and this reader keeps the FIRST, because observation time is
+//! the earliest instant we could have known the item.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -79,7 +70,6 @@ pub enum LakeError {
     Pit(#[from] crate::pit::PitError),
 }
 
-/// Reads one day out of the lake.
 pub struct LakeReader {
     root: PathBuf,
 }
@@ -221,8 +211,6 @@ fn read_run(
             let observed = ObservationTime::new(seen_at);
             let visibility = match Visibility::from_live(valid, observed) {
                 Ok(v) => v,
-                // A run that recorded an item before its own publication stamp is a
-                // source bug, not an archive fact. Count it; never silently date it.
                 Err(_) => {
                     day.unusable_rows += 1;
                     continue;
@@ -332,8 +320,7 @@ mod tests {
         let tickers = ListArray::from_iter_primitive::<arrow::datatypes::Int32Type, _, _>(
             rows.iter().map(|_| Some(Vec::<Option<i32>>::new())),
         );
-        // Cast the empty int list to a string list so the fixture matches the real
-        // schema while staying easy to build.
+        // Cast the empty int list to a string list so the fixture matches the real schema.
         let tickers = cast(&tickers, &DataType::new_list(DataType::Utf8, true)).unwrap();
         let batch = RecordBatch::try_new(
             schema(),

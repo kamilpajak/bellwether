@@ -1,79 +1,24 @@
-//! Repo-wide invariant checks.
+//! Repo-wide invariant checks: row G1 of `docs/design/architecture.md` section 8, the lint floor
+//! every workspace member must opt in to. Why such a gate is its own crate: `CONTRIBUTING.md`,
+//! "Everything else". What it cannot see: section 8's third correction. Nothing depends on this
+//! crate; its product is a failing test whose message says what to add and where.
 //!
-//! Section 8 of `docs/design/architecture.md` lists every invariant and the single place it is
-//! enforced. Most belong to one crate and are tested inside it. One is a property of the
-//! *repository* rather than of any crate: row G1 (every workspace member inherits the lint
-//! floor). It has no owning crate, and a check placed inside one of the things it polices
-//! disappears the day that thing is split or deleted. It lives here.
-//!
-//! Two rows were listed here earlier on 2026-11-12 and are not this crate's, which is recorded
-//! rather than quietly deleted. Row R12 left the repository: an AST check forbidding
-//! order-placing calls passes unconditionally where no broker code exists, and the invariant
-//! belongs to a mediating service that does not exist yet. Row R8 is about an artefact rather
-//! than about the repository, so it lives in `panel-contract`, which both sides of the panel
-//! file boundary can depend on.
-//!
-//! This crate ships no runtime behaviour and nothing depends on it. Its product is a failing
-//! test whose message tells a reader who has never seen it what to add and where.
-//!
-//! # How the manifests are read, and why
-//!
-//! Two readers, because the question has two halves and they have different right answers.
-//!
-//! **Which crates are members** comes from `cargo metadata --no-deps`, not from parsing
-//! `workspace.members` in the root manifest. The list in the root manifest is not the member set.
-//! Measured 2026-11-12 on cargo 1.99.1: a crate reached by a `path` dependency from inside the
-//! workspace directory becomes a workspace member **without appearing in `members` at all**, is
-//! compiled by `cargo clippy --locked --all-targets`, and inherits nothing. A check that reads
-//! `members` reports "2 workspace member(s) checked" while cargo builds three, and all three CI
-//! commands exit 0 over an `unwrap()` - which is row G1 happening behind the row G1 gate. The
-//! same call also settles `exclude`, glob entries of every shape (`*`, `**`, `?`, `[...]`) and
-//! `default-members`, none of which then needs a second implementation here that can disagree
-//! with cargo. A hand-rolled resolver was written first and this is what it got wrong.
-//!
-//! The costs are real and were paid deliberately: one subprocess per test run, and a dependency
-//! on the host's cargo being able to load the workspace. Measured, the subprocess does not
-//! deadlock on the package-cache lock - by the time a test runs, the build that holds that lock
-//! has finished - and `--no-deps` resolves no dependency graph, so it needs neither the network
-//! nor an up-to-date `Cargo.lock`.
-//!
-//! **Whether one member inherits the floor** comes from a real TOML parse of that member's
-//! manifest, because `cargo metadata` cannot answer it: a package object carries 24 keys
-//! (`authors` … `version`), none of them `lints`, and the string `lints` does not occur anywhere
-//! in the output - measured 2026-11-12 on this tree. A line scan instead of a parse has to get
-//! four things right that a parser gets right for free, and every one of them fails *green*:
-//! `[lints]` plus `workspace = true` and the inline `lints = { workspace = true }` are the same
-//! manifest; `[lints.rust]` is not the inherit stanza although it starts with the same eight
-//! characters; a `workspace = true` under `[dependencies.something]` is a different key; and a
-//! commented-out or in-a-string occurrence is not a declaration. There is also a measured trap:
-//! `lints = { workspace = true }` written *inside* `[package]` becomes `package.lints`, which
-//! cargo ignores without even an unused-key warning, so that crate passes
-//! `cargo clippy -- -D warnings` with an `unwrap()` in it. A scan for "workspace = true" anywhere
-//! in the file would call it covered.
-//!
-//! # What this cannot see
-//!
-//! A crate on disk that no `members` entry and no path dependency reaches is not a workspace
-//! member, is compiled by nothing, and is invisible here as it is to all three CI commands.
-//! Closing that is a `members = ["services/*"]` glob, which is a separate change.
-//!
-//! A gate crate dropped from `members` is not self-enforceable: nothing compiles it, so no test
-//! in it runs. `cargo test` naming no `repo_invariants` binary is the only signal, and
-//! `absent_from_the_workspace` below states the verdict for a tree where that is still readable.
+//! The member set comes from `cargo metadata`, never from `workspace.members`: measured
+//! 2026-11-12 on cargo 1.99.1, a crate reached only by a `path` dependency from inside the
+//! workspace directory is a member that `members` never lists, is compiled by
+//! `cargo clippy --locked --all-targets`, inherits nothing, and leaves all three CI commands at
+//! exit 0 over an `unwrap()` in it. That call also settles `exclude`, `default-members` and globs.
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// File name of a cargo manifest.
 const MANIFEST: &str = "Cargo.toml";
-/// The two lines a crate needs in its own manifest to inherit the floor.
+/// The two lines a crate needs in its own manifest to inherit the floor, indented for a message.
 const STANZA: &str = "        [lints]\n        workspace = true";
-/// Where the invariant and its measurement are written down.
 const ROW: &str = "docs/design/architecture.md section 8 row G1";
-/// The lints a crate loses by omitting the stanza, pre-wrapped for a terminal. Spelled out
-/// rather than referenced, because the point of the message is that a reader should not have to
-/// open the root manifest to learn what has been switched off.
+/// The lints a crate loses by omitting the stanza, pre-wrapped for a terminal. Spelled out rather
+/// than referenced so a reader need not open the root manifest to see what is switched off.
 const FLOOR: &str = concat!(
     "        rust:   unsafe_code, unused_must_use\n",
     "        clippy: unwrap_used, expect_used, panic, todo, unimplemented, unreachable,\n",
@@ -94,7 +39,6 @@ pub enum Verdict {
     LintsWithoutInheritance,
     /// Cargo named the member; there is no manifest at the path it gave.
     ManifestMissing,
-    /// The manifest exists and could not be read.
     ManifestUnreadable(String),
     /// The manifest exists and is not valid TOML, so the question cannot be decided.
     ManifestUnparseable(String),
@@ -108,15 +52,11 @@ pub struct Member {
     /// False when `workspace.default-members` excludes it, which means no bare `cargo test`,
     /// `cargo clippy` or `cargo build` at the root touches it.
     pub built_by_default: bool,
-    /// What the member's own manifest says about the floor.
     pub verdict: Verdict,
 }
 
 /// The whole check: `None` when the floor is in force everywhere, otherwise the failure message.
-///
-/// `root_manifest` is the workspace root's `Cargo.toml`; `gate_crate_dir` is this crate's own
-/// directory relative to that root, passed in rather than hard-coded so the check can also be
-/// run against a tree it does not live in.
+/// `gate_crate_dir` is passed in rather than hard-coded so the check can run against another tree.
 pub fn lint_floor_failure(root_manifest: &Path, gate_crate_dir: &str) -> Option<String> {
     let members = match resolve_members(root_manifest) {
         Ok(members) => members,
@@ -253,12 +193,9 @@ fn describe(member: &Member) -> Option<String> {
     Some(detail)
 }
 
-/// Ask cargo which crates are members of the workspace headed by `root_manifest`, and read each
-/// one's manifest for its lint verdict.
-///
-/// `Err` means the member set itself could not be determined. The check then fails rather than
-/// reporting success over a set it does not trust: a member silently dropped here is a crate with
-/// no lint floor and a green CI, which is the failure this file exists to prevent.
+/// Ask cargo for the member set and read each member's manifest for its lint verdict. `Err` means
+/// the member set is unknown; the check then fails rather than passing over a set it does not
+/// trust, because a silently dropped member is a crate with no lint floor and a green CI.
 pub fn resolve_members(root_manifest: &Path) -> Result<Vec<Member>, String> {
     let json = cargo_metadata(root_manifest)?;
     let meta: serde_json::Value = serde_json::from_slice(&json)
@@ -284,18 +221,14 @@ pub fn resolve_members(root_manifest: &Path) -> Result<Vec<Member>, String> {
             verdict: read_verdict(dir),
         });
     }
-    // The order cargo prints is the order of `members`, which is stable but not sorted; a message
-    // that reorders between runs is harder to read than one that does not.
+    // cargo prints the order of `members`, which is stable but not sorted.
     members.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(members)
 }
 
-/// `cargo metadata --no-deps` over one workspace, as raw stdout.
-///
-/// `--no-deps` is what keeps this cheap and offline: cargo resolves no dependency graph, so the
-/// call needs neither the network nor an up-to-date lock file. `CARGO` is the cargo that is
-/// running this test; falling back to the name on `PATH` keeps the check usable when it is run
-/// some other way.
+/// `cargo metadata --no-deps` over one workspace, as raw stdout. One subprocess per test run, and
+/// `--no-deps` resolves no dependency graph, so it needs neither the network nor an up-to-date
+/// lock file and does not deadlock on the package-cache lock the build already released.
 fn cargo_metadata(root_manifest: &Path) -> Result<Vec<u8>, String> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     let output = Command::new(&cargo)
@@ -339,9 +272,8 @@ fn array_at<'a>(
         .ok_or_else(|| format!("`cargo metadata` has no array `{key}`"))
 }
 
-/// A member directory as a reader of the root manifest would spell it. An absolute path is kept
-/// whole rather than guessed at: a member outside the workspace root cannot be written relative
-/// to it, and a wrong path in the message is worse than a long one.
+/// A member directory as a reader of the root manifest would spell it. A member outside the
+/// workspace root cannot be written relative to it, so its absolute path is kept whole.
 fn relative(root: &Path, dir: &Path) -> String {
     match dir.strip_prefix(root) {
         Ok(rest) => rest
@@ -353,7 +285,9 @@ fn relative(root: &Path, dir: &Path) -> String {
     }
 }
 
-/// Read one member manifest and decide its verdict.
+/// Read one member manifest and decide its verdict. A parse, not a line scan: a scan passes green
+/// on `[lints.rust]`, on `workspace = true` under another table, and on a commented-out line. Not
+/// `cargo metadata` either: measured 2026-11-12, a package object's 24 keys include no `lints`.
 fn read_verdict(member_dir: &Path) -> Verdict {
     let text = match std::fs::read_to_string(member_dir.join(MANIFEST)) {
         Ok(text) => text,
@@ -364,16 +298,14 @@ fn read_verdict(member_dir: &Path) -> Verdict {
         Ok(doc) => doc,
         Err(why) => return Verdict::ManifestUnparseable(why.to_string()),
     };
-    // Both spellings are the same manifest to cargo and to a parser: a `[lints]` table with
-    // `workspace = true`, or the inline `lints = { workspace = true }`. Written inside
-    // `[package]` it is neither, and `doc.get("lints")` is correctly empty.
+    // A `[lints]` table with `workspace = true` and the inline `lints = { workspace = true }` are
+    // the same manifest. Inside `[package]` it becomes `package.lints`, so `doc.get` is empty.
     match doc.get("lints").and_then(toml::Value::as_table) {
         None => Verdict::NoLintsTable,
         Some(lints) => match lints.get("workspace").and_then(toml::Value::as_bool) {
             Some(true) => Verdict::Inherits,
             // `workspace = false` is rejected by cargo itself ("`workspace` cannot be false",
-            // measured), so it needs no verdict of its own; it lands here, which is still a
-            // failure and still the right direction.
+            // measured 2026-11-12), so it needs no verdict of its own and lands here.
             _ => Verdict::LintsWithoutInheritance,
         },
     }
@@ -385,10 +317,9 @@ mod tests {
 
     use super::*;
 
-    /// This crate's directory name, and the root manifest one level above it. Both come from
-    /// cargo rather than from a search, which assumes the crate sits directly below the root.
-    /// Move it deeper and the failure is loud rather than quiet: `cargo metadata` is then asked
-    /// for a manifest that is not there, or for one with no `[workspace]` table, and says so.
+    /// This crate's directory name, from `CARGO_MANIFEST_DIR` rather than from a search, which
+    /// assumes the crate sits directly below the root. Move it deeper and `cargo metadata` is
+    /// asked for a manifest that is not there, or for one with no `[workspace]` table, and says so.
     fn gate_crate_dir() -> String {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .file_name()
@@ -403,8 +334,8 @@ mod tests {
             .join(MANIFEST)
     }
 
-    /// Row G1. Every crate cargo counts as a member of this workspace carries
-    /// `[lints] workspace = true`, this one included, and every one of them is built by default.
+    /// Row G1. Every crate cargo counts as a member here carries `[lints] workspace = true`, this
+    /// one included, and every one of them is built by default.
     #[test]
     fn every_workspace_member_inherits_the_lint_floor() {
         // `clippy::panic` is denied here too, so the report arrives as an assertion message.
@@ -478,10 +409,7 @@ mod tests {
         assert_eq!(tree.failure("gate"), None);
     }
 
-    /// The hole that the first version of this check had, and the reason the member set comes
-    /// from cargo. `services/derive` is in no `members` entry; cargo makes it a member anyway
-    /// because a member depends on it by a path inside the workspace directory, and
-    /// `cargo clippy --all-targets` compiles it with no lint floor.
+    /// The hole the first version of this check had; the measurement is in the module header.
     #[test]
     fn a_path_dependency_is_a_member_even_though_members_does_not_name_it() {
         let tree = Tree::new(ROOT)
@@ -564,11 +492,9 @@ mod tests {
         assert_eq!(tree.failure("gate"), None);
     }
 
-    /// `lints` is a top-level key. Written inside `[package]` it becomes `package.lints`, which
-    /// cargo ignores in silence - measured 2026-11-12: a crate with that manifest and an
-    /// `unwrap()` in it passes `cargo clippy -- -D warnings` with no output at all, not even an
-    /// unused-key warning. A scan looking for `workspace = true` anywhere in the file would call
-    /// this crate covered.
+    /// Measured 2026-11-12: a crate whose `lints = { workspace = true }` sits inside `[package]`,
+    /// with an `unwrap()` in it, passes `cargo clippy -- -D warnings` with no output at all. The
+    /// mechanism is at `read_verdict`.
     #[test]
     fn an_inline_lints_key_inside_the_package_table_is_not_inheritance() {
         let tree = Tree::new(ROOT)
@@ -647,15 +573,15 @@ mod tests {
         );
     }
 
-    /// The verdicts for a manifest that goes missing or stops parsing after cargo has read it.
-    /// Unreachable through `resolve_members` by construction, which is why they are checked here.
+    /// The verdicts for a manifest that goes missing or stops parsing after cargo has read it:
+    /// unreachable through `resolve_members` by construction, so they are checked directly.
     #[test]
     fn a_manifest_that_disappears_or_stops_parsing_has_its_own_verdict() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(read_verdict(dir.path()), Verdict::ManifestMissing);
         std::fs::write(dir.path().join(MANIFEST), "[package\n").unwrap();
-        // `clippy::panic` is denied in this crate too, so the shape is asserted rather than
-        // destructured with a panicking `else` arm.
+        // `clippy::panic` is denied here too, so the shape is asserted rather than destructured
+        // with a panicking `else` arm.
         let verdict = read_verdict(dir.path());
         assert!(
             matches!(&verdict, Verdict::ManifestUnparseable(why) if why.contains("unclosed table")),

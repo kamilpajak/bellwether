@@ -1,91 +1,45 @@
 //! The panel manifest contract: the required shape of the JSON file beside a panel's Arrow data,
 //! and the validator that decides whether one instance of it is admissible.
 //!
-//! # The failure this encodes
-//!
-//! Memo section 1.8. The predecessor's analysis panel was computed as
-//! `len(universe) * len(sessions)` - `count_cases.py:104` - 1,672 companies times 47 sessions,
-//! and it reported **78,584 rows**. Recounted 2026-11-11 against the actual presence of a closing
-//! price on the session and on the next one: **78,460**. 124 rows of that rectangle do not exist.
-//! The error is small and the method is wrong regardless of its size, because nothing about a
-//! product says whether its factors were ever present together.
-//!
-//! The second half cost more. The same panel's power came from the two-sample formula for
-//! independent observations: **88.2%**. Measured through the randomization procedure the study
-//! would actually run, **27.4%**, and on a corrected archive **10.9%** (section 1.9, 24,000
-//! draws, seed 20261111). The exchangeable unit was the trading session - 47 of them - not the
-//! row, of which there were thousands. So a panel that states a row count and no unit count
-//! invites that formula, and one claiming its unit count equals its row count is claiming
-//! independence. Both are now sentences someone has to write on purpose.
-//!
-//! # Why this is its own crate
-//!
-//! Section 4 of `docs/design/architecture.md` makes `derive` to the statistics tier a **file**
-//! boundary so the panel outlives the process. A contract both sides depend on then belongs to
-//! neither: inside the producer, the consumer trusts the producer's own reading of the rules;
-//! inside the consumer, the producer cannot check its output before writing it. Neither side
-//! exists yet - the contract does, and it is what makes the required field required before
-//! anyone is there to refuse a manifest without it. It is not part of `repo-invariants`, which
-//! holds invariants about the repository rather than about an artefact.
-//!
-//! # What it does not check
-//!
-//! `design_effect` and `within_unit_correlation`, which section 3.4 also lists as required. They
-//! are properties of a *statistic* measured by the procedure that computes the result, not of the
-//! row set `derive` writes, so they can first be required at row R9's refusing consumer - which
-//! does not exist. They are in [`FIELDS`] as [`Need::DeferredToR9`], so the narrowness is
-//! machine-readable rather than rediscovered. This crate closes row R8 and leaves R9 open.
-//!
-//! Nor does it open the Arrow file: a manifest whose `rows` disagrees with the data file passes
-//! every rule here. Counting Arrow rows is the producer's own test, and the missing Arrow
-//! dependency is what lets the Python tier validate a manifest on its own.
+//! Row R8 of `docs/design/architecture.md` section 8 holds the six rules and the measurement that
+//! forced them, and its fifth correction holds the ceiling: this crate never opens the Arrow file
+//! beside the manifest, and the two fields section 3.4 requires that are properties of a
+//! *statistic* rather than of the row set are carried as [`Need::DeferredToR9`] instead of being
+//! required here. The failure being encoded is memo sections 1.8 and 1.9. Why the contract is its
+//! own crate, owned by neither side of the boundary: `CONTRIBUTING.md`, "Everything else".
 
 use serde_json::{Map, Value};
 
-/// The one schema version this validator knows. A manifest carrying any other value is rejected
-/// rather than read optimistically: field meanings are what change between versions, and reading
-/// version 2 with version 1's rules is how a rule silently stops applying.
+/// The one schema version this validator knows. Any other value is rejected rather than read
+/// optimistically, because field meanings are what change between versions.
 pub const SCHEMA: &str = "panel.manifest/1";
 
-/// Where the invariant and the measurement behind it are written down.
 const ROW: &str = "docs/design/architecture.md section 8 row R8";
-/// The memo section carrying the numbers quoted in the messages below.
 const MEMO: &str = "docs/design/successor_system_design_2026_11_11.md section 1.8";
 
 /// The attestation that zero attrition was counted rather than assumed.
 pub const ZERO_ATTRITION: &str = "zero_attrition_counted";
-/// The attestation that the rows really are the exchangeable units.
 pub const ROWS_EXCHANGEABLE: &str = "rows_are_exchangeable";
 
-/// Shortest string accepted as an attestation sentence.
-///
-/// HEURISTIC, and the messages say so. The rule being enforced is "a human wrote a sentence
-/// saying how this was counted", and no validator can check that. A length floor only rules out
-/// `"yes"`, `"ok"` and `""`; it cannot tell a counted check from a confident paragraph. It is
-/// here because the alternative - accepting any non-empty string - makes the attestation a
-/// checkbox, and a checkbox is what the original failure already was.
+/// Shortest string accepted as an attestation sentence. A length floor, HEURISTIC, and what it
+/// can and cannot tell apart is architecture.md section 8, fifth correction.
 const ATTESTATION_CHARS: usize = 40;
 
 /// The JSON shape a manifest field must carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shape {
-    /// A non-empty string.
     Text,
     /// A non-negative integer. A count arriving as `78460.0` is rejected: a row count that went
     /// through a float has been through arithmetic that can lose it.
     Count,
-    /// A non-negative number that need not be an integer: a measured ratio. Carried by the
-    /// two deferred fields only, so that the schema this crate prints does not call a design
-    /// effect of 2.61 an integer.
+    /// A non-negative number that need not be an integer: a measured ratio, carried by the two
+    /// deferred fields only.
     Ratio,
-    /// A JSON array.
     List,
-    /// A JSON object.
     Table,
 }
 
 impl Shape {
-    /// Whether `value` is of this shape.
     fn fits(self, value: &Value) -> bool {
         match self {
             Self::Text => value.as_str().is_some_and(|text| !text.trim().is_empty()),
@@ -96,7 +50,7 @@ impl Shape {
         }
     }
 
-    /// How to name this shape in a message to whoever has to fix the manifest.
+    /// How to name this shape to whoever has to fix the manifest.
     fn name(self) -> &'static str {
         match self {
             Self::Text => "a non-empty string",
@@ -119,19 +73,14 @@ pub enum Need {
     DeferredToR9,
 }
 
-/// One manifest field: its name, its shape, when it is needed, and why it exists at all.
-///
-/// One table, read by the validator and printed by `panel-contract schema`, so the documented
-/// shape cannot drift from the enforced one.
+/// One manifest field. One table, read by the validator and printed by `panel-contract schema`,
+/// so the documented shape cannot drift from the enforced one.
 #[derive(Debug)]
 pub struct Field {
-    /// The JSON key.
     pub name: &'static str,
-    /// What it must contain.
     pub shape: Shape,
-    /// When it must be present.
     pub need: Need,
-    /// Why a manifest without it is not admissible.
+    /// Quoted back in the failure message, so a manifest is never refused without its reason.
     pub why: &'static str,
 }
 
@@ -227,9 +176,8 @@ pub struct Finding {
     pub code: &'static str,
     /// Which lettered rule of row R8 this is, for a reader holding the document.
     pub rule: &'static str,
-    /// True when the rule is a proxy for the thing that actually matters rather than a proof of
-    /// it. Stated in the message too: a validator that overstates its own certainty is the thing
-    /// this repository spent a day correcting.
+    /// True when the rule is a proxy for what matters rather than a proof of it. The message says
+    /// so too, and a test asserts the two never disagree: they are read by different callers.
     pub heuristic: bool,
     /// What is wrong, with the numbers it was decided on.
     pub message: String,
@@ -262,12 +210,9 @@ struct Cardinality {
     count: u64,
 }
 
-/// Validate one parsed manifest. An empty result is a pass.
-///
-/// Every rule that can still be decided is decided, so one run reports every problem rather than
-/// costing a round trip per fix. Where a malformed field makes a later rule undecidable, that
-/// rule is skipped rather than guessed: reporting arithmetic over a half-read cardinality list
-/// would be a verdict about a set the validator does not trust.
+/// Validate one parsed manifest. An empty result is a pass. Every rule that can still be decided
+/// is decided, so one run reports every problem; a rule that a malformed field makes undecidable
+/// is skipped rather than guessed, because arithmetic over a half-read list is not a verdict.
 pub fn validate(manifest: &Value) -> Vec<Finding> {
     let mut findings = Vec::new();
 
@@ -336,13 +281,9 @@ fn check_schema(table: &Map<String, Value>, findings: &mut Vec<Finding>) {
     }
 }
 
-/// Rule b. `exchangeable_units` carries a count and a named, defined unit.
-///
-/// Three keys rather than two, and the third is from section 1.9 rather than from taste: the
-/// predecessor's panel nominally had 47 sessions while six contiguous earnings-season sessions
-/// shared one market environment, so the name "session" did not say what made two of them
-/// exchangeable. A count without a named unit is not an answer; a name without a definition is
-/// not checkable by the next reader.
+/// Rule b. `exchangeable_units` carries a count, a named unit and a definition of the unit. The
+/// definition is the third key because of memo section 1.9, where 47 nominal sessions were
+/// effectively fewer and the name alone did not say what made two of them exchangeable.
 fn check_units_shape(table: &Map<String, Value>, findings: &mut Vec<Finding>) {
     let Some(units) = table.get("exchangeable_units").and_then(Value::as_object) else {
         return;
@@ -423,11 +364,8 @@ fn check_arithmetic(table: &Map<String, Value>, findings: &mut Vec<Finding>) {
 }
 
 /// Rule c. The chain closes: product of the stated cardinalities, minus every row the manifest
-/// says was dropped, equals the row count.
-///
-/// This is the rule that makes the original failure impossible to *state*. 1,672 x 47 with zero
-/// attrition reconciles to 78,584 only by claiming that no row was ever absent, and rule d then
-/// asks for that claim in writing.
+/// says was dropped, equals the row count. The original failure reconciles only by claiming no
+/// row was ever absent, and rule d then asks for that claim in writing.
 fn check_chain(
     rows: u64,
     cardinalities: &[Cardinality],
@@ -471,11 +409,9 @@ fn check_chain(
     ));
 }
 
-/// Rule d. `rows` equal to a product of the stated cardinalities is allowed - a panel where every
-/// company is present on every session legitimately equals it - but it has to be attested.
-///
-/// Full rectangles are real, so this cannot be a prohibition. What it can be is a sentence
-/// someone has to write, which is the difference between a counted zero and an assumed one.
+/// Rule d. `rows` equal to a product of the stated cardinalities is allowed, because a full
+/// rectangle is real, but it has to be attested: a written sentence is the difference between a
+/// counted zero attrition and an assumed one.
 fn check_product(
     rows: u64,
     cardinalities: &[Cardinality],
@@ -538,9 +474,8 @@ fn check_units_against_rows(
     }
 }
 
-/// Whether the manifest carries a non-trivial attestation under `name`. The sentence itself is
-/// checked separately, so a too-short one yields its own finding rather than silently failing
-/// the rule that asked for it.
+/// Whether the manifest carries a non-trivial attestation under `name`. The sentence is checked
+/// separately, so a too-short one yields its own finding as well as failing the rule that asked.
 fn attested(table: &Map<String, Value>, name: &str) -> bool {
     table
         .get("attestations")
@@ -550,21 +485,9 @@ fn attested(table: &Map<String, Value>, name: &str) -> bool {
         .is_some_and(|text| text.trim().chars().count() >= ATTESTATION_CHARS)
 }
 
-/// The product `rows` was recognised as, if any: the whole rectangle, or any two of the stated
-/// cardinalities multiplied together.
-///
-/// HEURISTIC and deliberately shallow. Pairs because the measured failure was a pair - companies
-/// times sessions - and the whole product because that is the whole rectangle. A product of three
-/// of five stated cardinalities is not recognised, and no rule here claims it is: rule c catches
-/// that case whenever the attrition does not also happen to close.
-///
-/// The whole-product arm covers a list of **one** as well, and that is not a formality. Measured
-/// 2026-11-12: with the arm limited to lists longer than two, a manifest stating a single
-/// cardinality `company_sessions = 78584`, zero attrition and 47 sessions as the unit was
-/// admissible - the predecessor's own `len(universe) * len(sessions)` with the multiplication
-/// already done, which is the one manifest this row exists to refuse. A list of one states no
-/// factors, so nothing in the manifest distinguishes a count from a product; the attestation is
-/// what has to say which it was.
+/// The product `rows` was recognised as, if any: any pair of the stated cardinalities, the whole
+/// product, or a list of one. HEURISTIC and shallow - what it misses, and the measured manifest
+/// that forced the list-of-one arm, are architecture.md section 8, fifth correction.
 fn recognised_product(rows: u64, cardinalities: &[Cardinality]) -> Option<(u128, String)> {
     let rows = u128::from(rows);
     for (index, left) in cardinalities.iter().enumerate() {
@@ -683,7 +606,6 @@ fn read_attrition(table: &Map<String, Value>, findings: &mut Vec<Finding>) -> Op
     Some(total)
 }
 
-/// How to name a JSON value's type in a message.
 fn kind_of(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
@@ -704,8 +626,8 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
-    /// `clippy::panic` is denied in this crate as well, so the failure path here is `expect` on a
-    /// `Result` whose error already carries the file name.
+    /// `clippy::panic` is denied here too, so the failure path is `expect` on a `Result` whose
+    /// error already carries the file name.
     fn fixture(name: &str) -> Value {
         let path = fixtures().join(name);
         let text = std::fs::read_to_string(&path)
@@ -732,8 +654,8 @@ mod tests {
             .join("\n")
     }
 
-    /// Fixture 1. The historical failure: 1,672 x 47 = 78,584 rows, no attrition, no unit count.
-    /// Rejected twice over, and the message has to name the product it recognised.
+    /// Fixture 1, the historical failure of memo section 1.8: rejected twice over, and the message
+    /// has to name the product it recognised.
     #[test]
     fn the_predecessors_panel_is_rejected_and_the_product_is_named() {
         let findings = validate(&fixture("historical_failure_78584.json"));
@@ -751,9 +673,7 @@ mod tests {
     }
 
     /// Every finding whose message calls itself a heuristic carries the flag, and every flagged
-    /// finding says so in its message. The message and the field are read by different callers -
-    /// a person and a program - and a validator that is honest to one of them only is the thing
-    /// this repository spent a day correcting.
+    /// finding says so in its message: the two are read by a person and by a program.
     #[test]
     fn the_heuristic_flag_and_the_word_heuristic_never_disagree() {
         let all: Vec<Finding> = [
@@ -778,15 +698,13 @@ mod tests {
         }
     }
 
-    /// Fixture 2. The same panel recounted: 78,460 rows, 124 dropped in two stages, the unit is
-    /// the session and there are 47 of them.
+    /// Fixture 2. The same panel recounted, as memo section 1.8 recounted it.
     #[test]
     fn the_recounted_panel_passes() {
         assert_eq!(validate(&fixture("corrected_panel_78460.json")), vec![]);
     }
 
-    /// Fixture 3, both halves. One unit per row is the independence claim; it is permitted and it
-    /// has to be written down.
+    /// Fixture 3, both halves. One unit per row is the independence claim: permitted, and written.
     #[test]
     fn units_equal_to_rows_need_their_own_attestation() {
         let findings = validate(&fixture("units_equal_rows_unattested.json"));
@@ -822,12 +740,9 @@ mod tests {
         );
     }
 
-    /// Every fixture on disk is reached by a test above. A fixture nobody validates is a file
-    /// that looks like evidence.
-    ///
-    /// Only `.json` entries count. Measured 2026-11-12: an untracked `.DS_Store`, which Finder
-    /// writes and `.gitignore` hides, turned this test red on macOS while CI stayed green - a
-    /// failure that says nothing about the contract.
+    /// Every fixture on disk is reached by a test above; a fixture nobody validates is a file that
+    /// looks like evidence. Only `.json` counts: measured 2026-11-12, an untracked `.DS_Store`,
+    /// which Finder writes and `.gitignore` hides, turned this red on macOS while CI stayed green.
     #[test]
     fn the_fixture_directory_holds_exactly_the_seven_committed_cases() {
         let mut names: Vec<String> = std::fs::read_dir(fixtures())
@@ -858,9 +773,8 @@ mod tests {
 
     // ---- the rules against hand-built values, where a fixture would be an eighth file ----
 
-    /// A pass with one field removed must fail, for every always-required field. Written as a
-    /// loop rather than as one test per field: the point is that the set in `FIELDS` is the set
-    /// enforced, and a hand-written list here could fall behind that table.
+    /// A pass with one field removed must fail, for every always-required field. A loop over
+    /// `FIELDS` rather than one test per field, because a hand-written list could fall behind it.
     #[test]
     fn every_required_field_is_actually_required() {
         let base = fixture("corrected_panel_78460.json");
@@ -882,8 +796,8 @@ mod tests {
         }
     }
 
-    /// The two fields section 3.4 lists and this crate does not enforce. The test states the
-    /// narrowness so that a reader of row R8 cannot take it for more than it is.
+    /// The two fields section 3.4 lists and this crate does not enforce, so a reader of row R8
+    /// cannot take it for more than it is.
     #[test]
     fn the_two_r9_fields_are_not_required_here() {
         let base = fixture("corrected_panel_78460.json");
@@ -914,7 +828,6 @@ mod tests {
         assert_eq!(codes(&findings), vec!["unknown_schema"]);
     }
 
-    /// A row count that arrived as a float has been through arithmetic that can lose it.
     #[test]
     fn a_row_count_that_is_not_an_integer_is_the_wrong_type() {
         let mut manifest = fixture("corrected_panel_78460.json");
@@ -952,7 +865,6 @@ mod tests {
         );
     }
 
-    /// The attestation length rule, and the fact that it says it is a heuristic.
     #[test]
     fn a_one_word_attestation_is_not_a_sentence_and_the_message_says_it_is_a_heuristic() {
         let mut manifest = fixture("full_rectangle_attested.json");
@@ -975,8 +887,7 @@ mod tests {
         );
     }
 
-    /// Rule d recognises a pair inside a longer list, and names that pair rather than the whole
-    /// product. The limit is stated in `recognised_product`: three of five is not recognised.
+    /// Rule d recognises a pair inside a longer list and names that pair, not the whole product.
     #[test]
     fn a_product_of_two_cardinalities_among_three_is_recognised_and_named() {
         let findings = validate(&serde_json::json!({
@@ -1001,9 +912,8 @@ mod tests {
     }
 
     /// The pre-multiplied manifest: the product done before the manifest was written, stated as a
-    /// single cardinality. Measured 2026-11-12, this was admissible while describing exactly the
-    /// panel of section 1.8 - 78,584 rows, zero attrition, an honest 47-session unit count - so
-    /// the whole-product arm of `recognised_product` has to cover a list of one.
+    /// single cardinality. It was admissible until the whole-product arm covered a list of one -
+    /// architecture.md section 8, fifth correction.
     #[test]
     fn a_product_stated_as_one_pre_multiplied_cardinality_is_still_a_product() {
         let findings = validate(&serde_json::json!({
@@ -1025,8 +935,7 @@ mod tests {
         );
     }
 
-    /// Rule c when the manifest drops more rows than the rectangle holds: still one finding, and
-    /// the subtraction does not wrap.
+    /// Rule c when more rows are dropped than the rectangle holds: the subtraction does not wrap.
     #[test]
     fn attrition_larger_than_the_product_does_not_underflow() {
         let findings = validate(&serde_json::json!({
@@ -1055,11 +964,10 @@ mod tests {
             serde_json::json!([{"count": 1672}, {"name": "sessions", "count": 47}]),
         );
         let findings = validate(&manifest);
-        // The whole code list, not a `contains`: the mutation this pins is the one that reports
-        // arithmetic over the half of the list it could read, and that shows up as an EXTRA
-        // finding rather than a missing one. Measured 2026-11-12: with `return None` changed to
-        // `continue`, this manifest gains an `attrition_does_not_reconcile` computed from a
-        // single cardinality, and a `contains`-only assertion passed it.
+        // The whole code list, not a `contains`: the mutation this pins reports arithmetic over
+        // the half of the list it could read, which shows up as an EXTRA finding. Measured
+        // 2026-11-12, with `return None` changed to `continue` this manifest gains an
+        // `attrition_does_not_reconcile` and a `contains`-only assertion passed it.
         assert_eq!(
             codes(&findings),
             vec!["missing_field", "cardinality_malformed"],

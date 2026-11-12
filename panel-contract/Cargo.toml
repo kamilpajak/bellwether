@@ -5,19 +5,15 @@ edition = "2021"
 description = "The panel manifest contract: schema, validator and `validate` subcommand for the derive-to-statistics file boundary."
 publish = false
 
-# `serde_json` reads the manifest; `clap` is the subcommand surface. Both are already in
-# Cargo.lock (services/newsvault uses them), so this crate adds no package to the dependency
-# graph - measured 2026-11-12 by diffing Cargo.lock before and after.
-#
-# Deliberately NOT here: arrow. This crate validates the manifest and never opens the data file
-# beside it, so the Python statistics tier can run `panel-contract validate` on a manifest alone.
-# Also deliberately not here: a time crate. `cutoff` is required to be present and is not parsed,
-# because a shape check on an instant without a time type is a heuristic the gap does not ask for.
+# Both are already in Cargo.lock (services/newsvault uses them), so this crate adds no package to
+# the dependency graph - measured 2026-11-12 by diffing Cargo.lock before and after.
+
+# Not here, and neither absence is an oversight: arrow, because this crate never opens the data
+# file (the ceiling that follows is architecture.md section 8, fifth correction), and a time crate,
+# because `cutoff` is required to be present and is not parsed.
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 serde_json = "1.0.154"
 
-# Inherited from [workspace.lints] in the root Cargo.toml; row G1 of architecture.md section 8
-# fails if this stanza is missing, and the gate reads it from this manifest.
 [lints]
 workspace = true

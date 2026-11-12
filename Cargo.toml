@@ -1,50 +1,31 @@
-# Workspace root. One service today; vault, derive, modelgate, propose and ledger are
-# the services the design memo names, and each arrives as its own crate here.
-#
-# `repo-invariants` is not a service. It holds the checks that belong to the repository rather
-# than to any crate - today section 8 row G1, the lint floor every member must opt in to. It sits
-# here and not inside services/newsvault because a gate living inside one of the things it
-# polices disappears the day that thing is split or deleted.
-#
-# `panel-contract` is not a service either, and it is not a repo invariant. It holds the contract
-# for one artefact that crosses a file boundary: the panel manifest that `derive` writes and the
-# Python statistics tier reads (section 3.4 and section 4 of docs/design/architecture.md). Both
-# sides of that boundary depend on it and neither owns it - put the validator in the producer and
-# the consumer trusts the producer's reading of the rules; put it in the consumer and the producer
-# cannot check its own output. Neither side exists yet; the contract does.
+# Workspace root. The memo names five services and each arrives as its own crate here; `derive`'s
+# panel manifest is the first artefact that crosses a boundary, so its contract is a crate too.
+# Why `repo-invariants` and `panel-contract` are crates of their own rather than code inside a
+# service: CONTRIBUTING.md, "Everything else".
 [workspace]
 members = ["panel-contract", "repo-invariants", "services/newsvault"]
 resolver = "2"
 
-# The lint floor for every crate in the workspace. It lives here rather than in a package
-# table because the comment above says four more crates arrive, and a package table covers
-# exactly one of them: a new crate would inherit nothing while CI stayed green.
-#
-# Inheritance is opt-in, not automatic. A member gets these only by carrying
-# `[lints] workspace = true`, and a member that forgets the stanza is silently unlint-ed -
-# measured 2026-11-12, see docs/design/architecture.md section 8 row G1.
+# The lint floor for every crate in the workspace. Why it is here and not in a package table, and
+# that inheritance is opt-in with nothing but row G1 checking for the stanza:
+# docs/design/architecture.md section 8, second correction and row G1.
 [workspace.lints.rust]
 unsafe_code = "forbid"
-# R5, "failed calls must be handled". Warn-by-default in rustc, so CI's own `-D warnings`
-# already made the bare `f();` form red before this entry existed - measured 2026-11-12 on the
-# previous tree, clippy exit 101. What this entry adds is outside CI: `cargo check` and
-# `cargo build` now exit 101 on that form instead of printing a warning. It does NOT catch
-# `let _ = f()`; the clippy lint below is the only form this change newly denies in CI.
+# R5. Warn-by-default in rustc, so CI's own `-D warnings` already made the bare `f();` form red
+# before this entry existed - measured 2026-11-12 on the previous tree, clippy exit 101. What it
+# adds is outside CI: `cargo check` and `cargo build` now exit 101 on that form instead of printing
+# a warning. It does NOT catch `let _ = f()`.
 unused_must_use = "deny"
 
 [workspace.lints.clippy]
-# The archive's job is to be correct about time and provenance. These lints turn
-# the three ways Rust still lets you lose a value into compile errors.
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
-# The other three macros that panic. clippy::panic covers only `panic!` itself, so
-# `todo!()`, `unimplemented!()` and `unreachable!()` passed every check until these
-# lines existed - measured 2026-11-12. A genuinely unreachable branch is still allowed,
-# but it has to say so with a reason, which is the outcome worth having.
+# clippy::panic covers only `panic!` itself, so `todo!()`, `unimplemented!()` and `unreachable!()`
+# passed every check until these three lines existed - measured 2026-11-12.
 todo = "deny"
 unimplemented = "deny"
 unreachable = "deny"
-# The second half of R5. `let _ = f()` emits nothing under `unused_must_use`, which is how
-# a discarded Result currently leaves no trace at all. Allow-by-default in clippy.
+# The second half of R5. `let _ = f()` emits nothing under `unused_must_use` and is
+# allow-by-default in clippy, so a discarded Result otherwise leaves no trace at all.
 let_underscore_must_use = "deny"

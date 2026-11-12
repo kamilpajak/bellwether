@@ -1,20 +1,10 @@
-//! The point-in-time contract, as types.
+//! The point-in-time contract, as types: **valid time** is when the world published an item and
+//! **observation time** is when we could first have known it. The retrieval leak that forced the
+//! split is memo section 1.2; how far the split reaches, and the claim about it withdrawn on
+//! 2026-11-12, are `docs/design/architecture.md` section 8 row R2 and its first correction.
+//! [`Visibility::visible_at`] is the single query and requires both instants.
 //!
-//! Two distinct instants belong to every news item:
-//!
-//! * **valid time** - when the world published it;
-//! * **observation time** - when we could first have known it.
-//!
-//! They are separate types on purpose. A measured leak is what motivates it: a
-//! Perplexity retrieval filtered on publication date alone returned documents we
-//! could not have seen at the time in 60.2% of probes, while adding the filter on
-//! last-update time closed it on all 69 (2026-11-11). The failure was not a wrong
-//! comparison - it was asking only ONE of the two questions. So this module offers
-//! no way to ask only one: [`Visibility::visible_at`] is the single query, and the
-//! half-predicates it is built from are private.
-//!
-//! The two instants also cannot be compared with each other, because they are
-//! different types:
+//! The two instants cannot be compared with each other, because they are different types:
 //!
 //! ```compile_fail
 //! use newsvault::pit::{ObservationTime, ValidTime};
@@ -80,12 +70,9 @@ impl Cutoff {
     }
 }
 
-/// How long after publication an item became visible to us, and the probe that
-/// established it.
-///
-/// A backfill cannot invent this number. [`Visibility::from_backfill`] is the only
-/// way to date a backfilled item, and it takes a `MeasuredLag`, so "I fetched this
-/// a year later and will pretend I saw it on the day" has no spelling here.
+/// How long after publication an item became visible to us, and the probe that established it.
+/// [`Visibility::from_backfill`] is the only way to date a backfilled item and it takes one of
+/// these, so the type cannot be skipped; that the measurement still can is section 8 row R11.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeasuredLag {
     /// Identifier of the probe run that measured this lag.
@@ -99,8 +86,8 @@ pub struct MeasuredLag {
 }
 
 impl MeasuredLag {
-    /// Fraction of probes that leaked. A lag with a non-zero rate is still usable,
-    /// but the rate travels with it so a panel can disclose it.
+    /// Fraction of probes that leaked, `None` with no probes. A non-zero rate is still usable;
+    /// the rate travels with the lag so a panel can disclose it.
     #[must_use]
     pub fn leak_rate(&self) -> Option<f64> {
         if self.probes == 0 {
@@ -145,8 +132,8 @@ impl Visibility {
         })
     }
 
-    /// An item recovered from a vendor index after the fact. Its observation time is
-    /// its publication time plus a lag somebody measured.
+    /// An item recovered from a vendor index after the fact: observation time is its publication
+    /// time plus a lag somebody measured.
     pub fn from_backfill(valid: ValidTime, lag: &MeasuredLag) -> Result<Self, PitError> {
         if lag.seconds < 0 {
             return Err(PitError::NegativeLag(lag.seconds));
@@ -214,8 +201,8 @@ mod tests {
 
     #[test]
     fn publication_alone_does_not_make_an_item_visible() {
-        // This is the 60.2% leak, as a test: filtering on publication date only
-        // admits an item we could not have read yet.
+        // The 60.2% leak as a test: the publication filter alone admits an item we could not have
+        // read yet.
         let v =
             Visibility::from_live(ValidTime::new(at(0)), ObservationTime::new(at(86_400))).unwrap();
         let cutoff = Cutoff::new(at(3_600));

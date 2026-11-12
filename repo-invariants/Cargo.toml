@@ -5,15 +5,10 @@ edition = "2021"
 description = "Repo-wide invariant checks: the section 8 gates that belong to no single service crate."
 publish = false
 
-# These are normal dependencies and not dev-dependencies on purpose. The checks ARE this crate's
-# lib target, and a lib target cannot use dev-dependencies; keeping them out of this table would
-# mean pushing the whole implementation into a `#[cfg(test)]` module to stay compilable, which is
-# a worse shape than two dependency edges. The crate is `publish = false`, exports no runtime
-# behaviour and nothing depends on it, so the edges reach no artefact.
-#
-# `serde_json` reads what `cargo metadata` prints; `toml` reads each member manifest. Why both,
-# and why not one or the other alone - see the module comment in src/lib.rs.
-#
+# Normal dependencies rather than dev-dependencies: the checks ARE this crate's lib target, and a
+# lib target cannot use dev-dependencies. Why a TOML parser is needed beside the `cargo metadata`
+# reader: `read_verdict` in src/lib.rs.
+
 # Measured 2026-11-12: `serde_json` 1.0.154 is already in Cargo.lock (services/newsvault uses it),
 # so it adds no package. `toml` adds five - toml, toml_parser, toml_datetime, serde_spanned,
 # winnow - and `default-features = false` drops a sixth, toml_writer, which writes TOML and is
@@ -22,8 +17,6 @@ publish = false
 serde_json = "1.0.154"
 toml = { version = "1.2.1", default-features = false, features = ["parse", "serde"] }
 
-# Inherited from [workspace.lints] in the root Cargo.toml. The test in src/lib.rs fails if this
-# stanza is missing from any member, including this crate: the gate is inside its own scope.
 [lints]
 workspace = true
 

@@ -1,85 +1,59 @@
-# The gate. Section 8 of docs/design/architecture.md marks an invariant "enforced" when a test for
-# it exists; a test nobody runs enforces nothing. This workflow is what turns "a test exists" into
-# "a test ran", and it is the only thing in the repository that does.
-#
-# The commands are the three README.md names under "Running the archive reader" (lines 76-78), plus
-# one flag explained at the test step. Change a command here and change it there, or the document
-# starts lying again.
+# The gate: it is what turns "a test exists" into "a test ran" (docs/design/architecture.md
+# section 8, first correction), and what it does NOT cover is that section's own table. The
+# commands must stay the ones README.md names - CONTRIBUTING.md, "Everything else".
 #
 # No toolchain setup step: the GitHub ubuntu runner image installs cargo, rustfmt and clippy
 # (images/ubuntu/scripts/build/install-rust.sh in actions/runner-images runs
 # `rustup component add rustfmt clippy`; the image readme lists rustfmt but not clippy, so the
-# build script is the authority). That also means the compiler version floats with the runner
-# image, so a new clippy lint can turn this red with no commit here. Pinning the compiler needs a
-# rust-toolchain.toml, which is a different file.
-#
-# No dependency cache: measured cold on a developer machine, the whole job is roughly 5 s of
-# dependency fetch, 10 s of clippy and 15 s of tests. Restoring and saving a cargo home to save
-# that is not a trade.
-#
-# What this gate does NOT cover, so that section 8 is not read more generously than it earns:
-#   * unwrap_used, expect_used and panic are denied in services/newsvault/Cargo.toml, which is a
-#     per-package table. A second workspace crate inherits none of them until the root Cargo.toml
-#     carries [workspace.lints] and each package opts in with `[lints] workspace = true`.
-#   * A crate on disk that is missing from workspace.members is invisible to all three commands
-#     and the run still goes green. A glob ("services/*") in the root members list closes that.
-#   * probes/ is Python and nothing here checks it.
+# build script is the authority), so the compiler floats with the image and a new clippy lint can
+# turn this red with no commit here. No dependency cache: measured 2026-11-12 over the five runs
+# on this runner, the whole job wall clock was 71-93 s, so a cache would save less than it costs.
 
 name: ci
 
 on: [push, pull_request]
 
-# The job only reads the tree. Nothing here publishes, comments or tags, so no token with write
-# access should be handed to third-party code.
+# Nothing here publishes, comments or tags, so third-party action code gets no write token.
 permissions:
   contents: read
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    # The work is under a minute. A bound well above that turns a hung step into a failed run
-    # rather than a six-hour one holding a required status check. A timed-out run can surface as
-    # a cancellation rather than a failure, so do not read one as a broken build.
+    # The work is under a minute, and the default bound is six hours of a required status check
+    # held by a hung step. A timed-out run surfaces as a cancellation, not a failure.
     timeout-minutes: 15
     steps:
       # Pinned to the commit behind release v7.0.1 (committed 2026-07-17, released 2026-07-20).
-      # A moving tag such as @v7 is a standing grant of write access to this gate: whoever can
-      # move the tag can change what runs here. It is also a reproducibility hole, because two
-      # runs of the same repository commit can then execute different action code.
+      # A moving tag such as @v7 is a standing grant of write access to this gate, and a
+      # reproducibility hole: two runs of one repository commit can execute different action code.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: cargo fmt --check
-      # The three checks are independent, so one run should report all three verdicts. Without a
-      # condition here, a formatting diff ends the job and the tests never run at all, which costs
-      # a whole push to learn the second thing. "!cancelled()" keeps the step running after an
-      # earlier step failed, while still skipping it when the run is cancelled. The price is that
-      # a failed checkout yields three "could not find Cargo.toml" errors instead of one.
+      # "!cancelled()" keeps the step running after an earlier step failed while still skipping it
+      # when the run is cancelled, so one run reports all three verdicts instead of stopping at a
+      # formatting diff. The price: a failed checkout yields three "could not find Cargo.toml".
       - if: ${{ !cancelled() }}
         run: cargo clippy --locked --all-targets -- -D warnings
-      # --no-fail-fast, which README.md line 76 should carry as well: cargo stops at the first
-      # failing test target, and the compile_fail doc test is a separate target that runs last.
-      # Measured on this tree: with one unit test failing, plain `cargo test` exited 101 without
-      # ever printing "Doc-tests newsvault", so R2's only enforcement point was skipped by an
-      # unrelated failure. With the flag the doc test runs and the exit code is still 101.
+      # --no-fail-fast: cargo stops at the first failing test target and the compile_fail doc test
+      # is a separate target that runs last. Measured on this tree, with one unit test failing
+      # plain `cargo test` exited 101 without printing "Doc-tests newsvault" - R2's only gate.
       - if: ${{ !cancelled() }}
         run: cargo test --locked --no-fail-fast
-      # Rule 1 of CONTRIBUTING.md, printed and never enforced. The predecessor's test lines passed
-      # its source lines in June 2026 and reached 1.45x by November without anyone noticing, because
-      # nobody was counting. This step does the counting. It cannot fail the run: a gate here would
-      # be a gate on a number nobody has justified, and the point is visibility, not a threshold.
+      # Rule 1 of CONTRIBUTING.md, which prints the ratio and gates nothing. It also counts
+      # `probes/`, which nothing checks: this is the only workflow and no step runs a Python tool.
       - if: ${{ !cancelled() }}
         name: size (test lines vs source lines, rule 1)
         run: |
           # Per file, not "-exec ... {} +": awk's exit ends the whole invocation, so one batched
-          # call stops counting at the first file holding a test module and silently undercounts
-          # every file after it. The first version of this step did exactly that and reported
-          # 2.56x on a 1,026-line crate.
+          # call stops counting at the first file holding a test module. The first version of this
+          # step did exactly that and reported 2.56x on a 1,026-line crate.
           src=0; tst=0
           while IFS= read -r f; do
             all=$(wc -l < "$f")
             head=$(awk '/^ *#\[cfg\(test\)\]/{exit} {n++} END{print n+0}' "$f")
             src=$((src + head)); tst=$((tst + all - head))
-          # Every crate, not just `services`: the two gate crates hold 1,955 of the tree's Rust
-          # lines of 2,995 as of 2026-11-12, and a ratio that leaves them out is not the repository's.
+          # Every crate, not just `services`: measured 2026-11-12, the two gate crates hold 1,784
+          # of the tree's 2,791 Rust lines, and a ratio that leaves them out is not the repository's.
           done < <(find . -name '*.rs' -not -path './target/*')
           py=$(find probes -name '*.py' -exec cat {} + | wc -l)
           doc=$(find docs -name '*.md' -exec cat {} + | wc -l)

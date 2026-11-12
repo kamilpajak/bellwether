@@ -1,8 +1,7 @@
 //! `newsvault` - command line over the point-in-time news archive.
 //!
-//! Follows the repo's CLI contract: the result goes to stdout and nothing else does,
-//! logs and errors go to stderr, JSON mode emits exactly one value, and
-//! `newsvault schema` describes the command tree for a caller that is not a human.
+//! Follows the repo's CLI contract: the result on stdout and nothing else, logs and errors on
+//! stderr, exactly one JSON value in JSON mode, and `schema` for a caller that is not human.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -69,10 +68,6 @@ fn main() -> ExitCode {
                 Some(LakeError::MissingRoot(_) | LakeError::MissingDay { .. }) => EXIT_NOT_FOUND,
                 _ => EXIT_FAILED,
             };
-            // The process is already failing and the exit code below carries the verdict.
-            // A closed stderr (`newsvault day ... 2>/dev/null`, or a dead pager) must not
-            // turn an error path into a panic or change the exit code, so the write result
-            // is deliberately dropped.
             #[allow(
                 clippy::let_underscore_must_use,
                 reason = "reporting an error must not fail on a closed stderr; the exit code is the verdict"
@@ -118,8 +113,6 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 }
 
 fn usage(message: String) -> anyhow::Error {
-    // Same reason as in `main`: this is the last write before `exit`, and a closed stderr
-    // must not replace exit code 2 with a panic.
     #[allow(
         clippy::let_underscore_must_use,
         reason = "reporting a usage error must not fail on a closed stderr; EXIT_USAGE is the verdict"
