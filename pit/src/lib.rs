@@ -7,7 +7,7 @@
 //! The two instants cannot be compared with each other, because they are different types:
 //!
 //! ```compile_fail
-//! use newsvault::pit::{ObservationTime, ValidTime};
+//! use pit::{ObservationTime, ValidTime};
 //! # use chrono::{TimeZone, Utc};
 //! let v = ValidTime::new(Utc.timestamp_opt(0, 0).single().unwrap());
 //! let o = ObservationTime::new(Utc.timestamp_opt(1, 0).single().unwrap());
@@ -17,24 +17,21 @@
 //! **The positive control for the block above.** A `compile_fail` test passes whenever its snippet
 //! fails to compile for *any* reason, so on its own it is a test of "this does not compile" rather
 //! than of "these cannot be compared". This second doc test carries the same `use` line and the
-//! legal form of the comparison, so a rename, a moved path or a broken import turns it RED while
-//! the `compile_fail` one above would stay green. Measured 2026-11-12 on a copy of this tree:
-//! replacing the compared line with a call to a function that does not exist left the
-//! `compile_fail` test reporting `ok`, and renaming the module left it reporting `ok` too while
-//! this block failed with `error[E0432]: unresolved import`. A `compile_fail,E0308` annotation does
-//! not close that hole — measured the same day, rustdoc reports `ok` for a snippet that fails with
-//! a different error code than the one declared.
+//! legal form of the comparison, so a moved path or a broken import turns it RED while the
+//! `compile_fail` one above would stay green. The measurements are section 8 row R2.
 //!
 //! ```
-//! use newsvault::pit::{ObservationTime, ValidTime};
+//! use pit::{ObservationTime, ValidTime};
 //! # use chrono::{TimeZone, Utc};
 //! let v = ValidTime::new(Utc.timestamp_opt(0, 0).single().unwrap());
 //! let o = ObservationTime::new(Utc.timestamp_opt(1, 0).single().unwrap());
 //! assert!(v.inner() < o.inner()); // the two instants compare only through `inner()`
 //! ```
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
 use serde::{Deserialize, Serialize};
+
+pub mod datedness;
 
 /// When the world published an item.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -44,14 +41,34 @@ pub struct ValidTime(DateTime<Utc>);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ObservationTime(DateTime<Utc>);
 
+/// A vendor's own claim about when IT saw an item. Never an [`ObservationTime`] on its own:
+/// [`ObservationTime::floor_from_vendor`] is the only route from one to the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SeenTime(DateTime<Utc>);
+
 /// The instant an analysis claims to stand at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Cutoff(DateTime<Utc>);
 
 impl ValidTime {
+    /// Truncated to a whole microsecond, because section 2's canonical form renders `%.6f` and two
+    /// instants 1 ns apart would then digest the same while the stored column kept them apart.
     #[must_use]
-    pub const fn new(at: DateTime<Utc>) -> Self {
-        Self(at)
+    pub fn new(at: DateTime<Utc>) -> Self {
+        Self(truncate_to_microsecond(at))
+    }
+    #[must_use]
+    pub const fn inner(self) -> DateTime<Utc> {
+        self.0
+    }
+}
+
+impl SeenTime {
+    /// Truncated like [`ValidTime::new`], so that the ordering check in
+    /// [`Visibility::from_live`] compares two values at the precision the store keeps.
+    #[must_use]
+    pub fn new(at: DateTime<Utc>) -> Self {
+        Self(truncate_to_microsecond(at))
     }
     #[must_use]
     pub const fn inner(self) -> DateTime<Utc> {
@@ -60,9 +77,21 @@ impl ValidTime {
 }
 
 impl ObservationTime {
+    /// Truncated like [`ValidTime::new`]. Truncating only one of the two instants made
+    /// [`Visibility::from_live`] accept an observation 300 ns BEFORE its publication and report a
+    /// positive lag for it - found by review 2026-11-13, before this crate had a second caller.
+    /// An inversion smaller than one microsecond is now accepted as simultaneous, because the
+    /// stored columns cannot tell the two instants apart; a whole microsecond is still refused.
     #[must_use]
-    pub const fn new(at: DateTime<Utc>) -> Self {
-        Self(at)
+    pub fn new(at: DateTime<Utc>) -> Self {
+        Self(truncate_to_microsecond(at))
+    }
+
+    /// A vendor's claim about when IT saw an item can never move our observation earlier than the
+    /// process that read it. `run_at` has no default, so the call does not compile without it.
+    #[must_use]
+    pub fn floor_from_vendor(seen: SeenTime, run_at: ObservationTime) -> Self {
+        Self(seen.0.max(run_at.0))
     }
     #[must_use]
     pub const fn inner(self) -> DateTime<Utc> {
@@ -80,13 +109,26 @@ impl Cutoff {
         self.0
     }
 
+    /// Redundant given both [`Visibility`] constructors, which refuse an observation before its
+    /// publication, so `observed <= cutoff` already implies this. Kept because the claim the
+    /// project makes is that the query asks both halves, and a reader of `visible_at` should see
+    /// both halves asked rather than have to re-derive the implication.
     fn admits_valid(self, t: ValidTime) -> bool {
         t.0 <= self.0
     }
 
-    fn admits_observation(self, t: ObservationTime) -> bool {
+    pub(crate) fn admits_observation(self, t: ObservationTime) -> bool {
         t.0 <= self.0
     }
+}
+
+const NANOS_PER_MICRO: u32 = 1_000;
+
+/// chrono carries a leap second's extra second in the nanosecond field, so the whole subsecond
+/// field is truncated rather than its nanosecond part; `with_nanosecond` refuses only >= 2e9.
+fn truncate_to_microsecond(at: DateTime<Utc>) -> DateTime<Utc> {
+    at.with_nanosecond(at.timestamp_subsec_micros() * NANOS_PER_MICRO)
+        .unwrap_or(at)
 }
 
 /// How long after publication an item became visible to us, and the probe that established it.
@@ -220,8 +262,84 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    /// The two doc blocks in this file's header are section 8 row R2's whole enforcement point.
+    const DOC_IMPORT: &str = "use pit::{ObservationTime, ValidTime};";
+
+    /// One microsecond, in nanoseconds.
+    const MICRO_NANOS: u32 = 1_000;
+
+    fn utc(seconds: i64, nanos: u32) -> DateTime<Utc> {
+        Utc.timestamp_opt(seconds, nanos)
+            .single()
+            .expect("a valid instant")
+    }
+
+    /// The guarded direction is a vendor claiming it saw an item BEFORE our run; the other
+    /// direction is a vendor that saw it later, and that instant is the one that stands.
+    /// Mutation 2026-11-13 replaced the maximum with `run_at` alone and nothing was red.
+    #[test]
+    fn a_vendor_that_saw_an_item_after_our_run_moves_our_observation_later() {
+        let run_at = ObservationTime::new(utc(1_000, 0));
+        let seen = SeenTime::new(utc(2_000, 0));
+        assert_eq!(
+            ObservationTime::floor_from_vendor(seen, run_at).inner(),
+            seen.inner()
+        );
+    }
+
+    #[test]
+    fn an_observation_a_whole_microsecond_before_its_publication_is_still_refused() {
+        let valid = ValidTime::new(utc(1_000, MICRO_NANOS));
+        let observed = ObservationTime::new(utc(1_000, 0));
+        assert_eq!(
+            Visibility::from_live(valid, observed),
+            Err(PitError::ObservedBeforeValid {
+                valid: valid.inner(),
+                observed: observed.inner(),
+            })
+        );
+    }
+
+    /// Both instants truncate, so a lag the stored columns cannot represent is reported as zero
+    /// rather than as 300 ns. Truncating only the publication instant reported the 300 ns.
+    #[test]
+    fn a_lag_smaller_than_one_microsecond_is_reported_as_zero_and_not_as_nanoseconds() {
+        let valid = ValidTime::new(utc(1_000, 0));
+        let observed = ObservationTime::new(utc(1_000, 300));
+        match Visibility::from_live(valid, observed) {
+            Ok(v) => assert_eq!(v.lag(), Duration::zero()),
+            Err(error) => assert_eq!(format!("{error:?}"), "an accepted visibility"),
+        }
+    }
+    const COMPILE_FAIL: &str = "compile_fail";
+    const COMPILE_FAIL_BLOCK: usize = 0;
+    const POSITIVE_CONTROL_BLOCK: usize = 1;
+    const VENDOR_SEEN_AT: &str = "2026-07-01T10:00:00Z";
+    const THE_RUN_THAT_READ_IT: &str = "2026-07-02T00:34:00Z";
+    const WHOLE_MICROSECOND: &str = "2026-07-01T12:00:00.000001Z";
+    const ONE_NANOSECOND_LATER: &str = "2026-07-01T12:00:00.000001001Z";
+
     fn at(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(secs, 0).single().unwrap()
+    }
+
+    fn instant(text: &str) -> DateTime<Utc> {
+        match text.parse::<DateTime<Utc>>() {
+            Ok(parsed) => parsed,
+            Err(_) => DateTime::<Utc>::UNIX_EPOCH,
+        }
+    }
+
+    /// The header's fenced blocks, in order. The fence is assembled rather than written out, so
+    /// this function's own text does not split the file it reads.
+    fn doc_blocks() -> Vec<String> {
+        let fence = format!("//! {}", "```");
+        include_str!("lib.rs")
+            .split(&fence)
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect()
     }
 
     fn lag(seconds: i64) -> MeasuredLag {
@@ -325,5 +443,41 @@ mod tests {
         assert!((l.leak_rate().unwrap() - 42.0 / 69.0).abs() < 1e-12);
         l.probes = 0;
         assert_eq!(l.leak_rate(), None);
+    }
+
+    #[test]
+    fn a_vendor_seen_instant_cannot_move_our_observation_earlier_than_the_run_that_read_it() {
+        let run_at = ObservationTime::new(instant(THE_RUN_THAT_READ_IT));
+        let floored =
+            ObservationTime::floor_from_vendor(SeenTime::new(instant(VENDOR_SEEN_AT)), run_at);
+        assert_eq!(floored, run_at);
+    }
+
+    #[test]
+    fn two_instants_one_nanosecond_apart_store_as_the_same_microsecond_they_digest_as() {
+        let truncated = ValidTime::new(instant(ONE_NANOSECOND_LATER));
+        assert_eq!(truncated, ValidTime::new(instant(WHOLE_MICROSECOND)));
+        assert_eq!(truncated.inner(), instant(WHOLE_MICROSECOND));
+    }
+
+    /// A `compile_fail` block passes whenever its snippet stops compiling for ANY reason, so what
+    /// these two pin is the import path: wrong in the control and the pair goes silently green.
+    #[test]
+    fn the_two_instants_still_cannot_be_compared_with_each_other_after_the_move() {
+        let block = doc_blocks()
+            .get(COMPILE_FAIL_BLOCK)
+            .cloned()
+            .unwrap_or_default();
+        assert!(block.starts_with(COMPILE_FAIL), "{block}");
+        assert!(block.contains(DOC_IMPORT), "{block}");
+    }
+
+    #[test]
+    fn the_positive_control_for_the_compile_fail_block_imports_from_the_new_path() {
+        let block = doc_blocks()
+            .get(POSITIVE_CONTROL_BLOCK)
+            .cloned()
+            .unwrap_or_default();
+        assert!(block.contains(DOC_IMPORT), "{block}");
     }
 }

@@ -1,0 +1,26 @@
+[package]
+name = "pit"
+version = "0.1.0"
+edition = "2021"
+description = "The point-in-time contract as types: valid time, observation time, and the precision that decides visibility."
+publish = false
+
+# A member of its own rather than a module of `newsvault`, because `news-provider` needs these
+# types and `newsvault` needs `news-provider`: measured 2026-11-12, `cargo build` over that pair
+# prints `error: cyclic package dependency`, while `cargo metadata --no-deps` exits 0, so §8 row
+# G1 does not see it.
+[dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
+# Cost, measured 2026-11-13 by `cargo tree -e normal,build --workspace --prefix none`, package
+# names uniqued: 125 before this member, 130 after - `pit` itself plus chrono-tz, phf, phf_shared
+# and siphasher. No zoneinfo build script compiles: `chrono-tz-build` is optional and only
+# `case-insensitive` or `filter-by-regex` enables it, and neither is on.
+chrono-tz = "0.10.4"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde_json = "1.0.154"

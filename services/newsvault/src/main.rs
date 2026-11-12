@@ -11,7 +11,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use newsvault::lake::{Day, LakeError, LakeReader};
-use newsvault::pit::Cutoff;
+use pit::Cutoff;
 
 /// Exit codes, kept small and documented. Domain detail belongs in the error body.
 const EXIT_USAGE: u8 = 2;
@@ -158,8 +158,8 @@ fn emit(day: &Day, before_cutoff: usize, format: Format) -> anyhow::Result<()> {
                 writeln!(
                     out,
                     "published        {} .. {}",
-                    first.visibility.valid().inner(),
-                    last.visibility.valid().inner()
+                    first.visibility.published(),
+                    last.visibility.published()
                 )?;
                 let earliest = day
                     .items

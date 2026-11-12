@@ -14,17 +14,25 @@ use std::path::{Path, PathBuf};
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, TimeUnit};
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use crate::pit::{ObservationTime, ValidTime, Visibility};
+use pit::datedness::Datedness;
+use pit::{ObservationTime, ValidTime, Visibility};
+
+/// The lake has no precision column, so a publication value stamped exactly at midnight is a
+/// DATE the predecessor rendered as an instant. Measured 2026-11-13 over all 779 run files and
+/// 243,226 rows of `~/thematic_news_lake`: 7,767 rows (3.19%) are stamped `00:00:00.000000`, and
+/// for source `perplexity` it is 7,141 of 7,141 - every row. Reading those as instants admitted
+/// them up to a day before they existed.
+const LAKE_CALENDAR: &str = "UTC";
 
 /// One item as the archive holds it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct NewsItem {
     pub id: String,
     pub source: String,
-    pub visibility: Visibility,
+    pub visibility: Datedness,
     pub tickers: Vec<String>,
     pub title: String,
     pub body: String,
@@ -82,7 +90,7 @@ pub enum LakeError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
-    Pit(#[from] crate::pit::PitError),
+    Pit(#[from] pit::PitError),
 }
 
 pub struct LakeReader {
@@ -150,13 +158,28 @@ impl LakeReader {
         let mut items: Vec<NewsItem> = first.into_values().map(|seen| seen.item).collect();
         items.sort_by(|a, b| {
             a.visibility
-                .valid()
-                .cmp(&b.visibility.valid())
+                .published()
+                .lower_bound()
+                .cmp(&b.visibility.published().lower_bound())
                 .then_with(|| a.id.cmp(&b.id))
         });
         day.items = items;
         Ok(day)
     }
+}
+
+/// A publication value stamped exactly at midnight is read as a DATE, per [`LAKE_CALENDAR`].
+fn datedness(valid_at: DateTime<Utc>, observed: ObservationTime) -> Option<Datedness> {
+    if valid_at == valid_at.date_naive().and_time(NaiveTime::MIN).and_utc() {
+        return Some(Datedness::DayDated {
+            day: valid_at.date_naive(),
+            tz: LAKE_CALENDAR,
+            observed,
+        });
+    }
+    Visibility::from_live(ValidTime::new(valid_at), observed)
+        .ok()
+        .map(Datedness::Dated)
 }
 
 fn utf8_column<'a>(
@@ -286,15 +309,15 @@ fn read_run(
                 day.unusable_rows += 1;
                 continue;
             };
-            let valid = ValidTime::new(valid_at);
             let observed = ObservationTime::new(seen_at);
-            let visibility = match Visibility::from_live(valid, observed) {
-                Ok(v) => v,
-                Err(_) => {
+            let visibility = match datedness(valid_at, observed) {
+                Some(v) => v,
+                None => {
                     day.unusable_rows += 1;
                     continue;
                 }
             };
+            let published = visibility.published();
             let id = ids.value(row).to_owned();
             // The publication-time comparison runs BEFORE the first-sighting test, so it runs on
             // both paths: the repeat that is discarded and the earlier-observed row that replaces
@@ -303,7 +326,7 @@ fn read_run(
             // with a second ingest schedule or a backfill (section 3.1 `provenance`).
             let mut disputed = false;
             if let Some(seen) = first.get_mut(&id) {
-                if seen.item.visibility.valid() != valid {
+                if seen.item.visibility.published() != published {
                     day.valid_time_conflict_events += 1;
                     seen.valid_time_disputed = true;
                 }
@@ -370,7 +393,7 @@ mod tests {
     use parquet::arrow::ArrowWriter;
 
     use super::*;
-    use crate::pit::Cutoff;
+    use pit::Cutoff;
 
     /// One row of the lake schema, as the Python ingest writes it.
     struct Row {
@@ -489,6 +512,67 @@ mod tests {
         LakeReader::new(root)
             .day(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap())
             .unwrap()
+    }
+
+    /// Epoch microseconds of 2026-07-01T00:00:00Z, the partition's own midnight.
+    const PARTITION_MIDNIGHT: i64 = 1_782_864_000 * SEC;
+    /// 23:59:59.999999Z on the same day: the last instant [`LAKE_CALENDAR`] admits.
+    const PARTITION_END_OF_DAY: i64 = PARTITION_MIDNIGHT + 86_400 * SEC - 1;
+
+    fn lake_with_a_midnight_stamped_row() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let part = root.path().join("session_date=2026-07-01");
+        std::fs::create_dir_all(&part).unwrap();
+        write_run(
+            &part,
+            "run=20260701T000500000Z.parquet",
+            &[row(
+                "m",
+                PARTITION_MIDNIGHT,
+                PARTITION_MIDNIGHT + 5 * 60 * SEC,
+            )],
+        );
+        root
+    }
+
+    fn cutoff_at(micros: i64) -> Cutoff {
+        Cutoff::new(DateTime::UNIX_EPOCH + chrono::TimeDelta::microseconds(micros))
+    }
+
+    /// The lookahead this crate was moved to its own member to close: read as an instant, a
+    /// midnight-stamped row was visible from 00:00 for a document published some time that day.
+    #[test]
+    fn a_midnight_stamped_row_is_not_visible_until_the_end_of_its_own_day() {
+        let root = lake_with_a_midnight_stamped_row();
+        let day = day_of(root.path());
+        let item = day.items.iter().find(|i| i.id == "m").unwrap();
+        assert!(
+            !item
+                .visibility
+                .visible_at(cutoff_at(PARTITION_END_OF_DAY - 1)),
+            "a date has no hour, so no cutoff inside its day admits it"
+        );
+    }
+
+    #[test]
+    fn a_midnight_stamped_row_is_visible_once_its_day_has_ended() {
+        let root = lake_with_a_midnight_stamped_row();
+        let day = day_of(root.path());
+        let item = day.items.iter().find(|i| i.id == "m").unwrap();
+        assert!(item.visibility.visible_at(cutoff_at(PARTITION_END_OF_DAY)));
+    }
+
+    /// The publication value a midnight-stamped row reports is a DATE, not an instant, so nothing
+    /// downstream can print or compare a fabricated 00:00.
+    #[test]
+    fn a_midnight_stamped_rows_publication_value_prints_as_a_date_and_not_as_an_instant() {
+        let root = lake_with_a_midnight_stamped_row();
+        let day = day_of(root.path());
+        let item = day.items.iter().find(|i| i.id == "m").unwrap();
+        assert_eq!(
+            item.visibility.published().to_string(),
+            "2026-07-01 (UTC day)"
+        );
     }
 
     #[test]
@@ -640,8 +724,12 @@ mod tests {
             "one item, however many times it was re-reported"
         );
         assert_eq!(
-            day.items[0].visibility.valid().inner().timestamp(),
-            100,
+            day.items[0]
+                .visibility
+                .published()
+                .lower_bound()
+                .map(|b| b.timestamp()),
+            Some(100),
             "the first sighting's publication time is the one kept"
         );
     }
