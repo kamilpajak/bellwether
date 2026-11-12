@@ -3,3 +3,36 @@
 [workspace]
 members = ["services/newsvault"]
 resolver = "2"
+
+# The lint floor for every crate in the workspace. It lives here rather than in a package
+# table because the comment above says four more crates arrive, and a package table covers
+# exactly one of them: a new crate would inherit nothing while CI stayed green.
+#
+# Inheritance is opt-in, not automatic. A member gets these only by carrying
+# `[lints] workspace = true`, and a member that forgets the stanza is silently unlint-ed -
+# measured 2026-11-12, see docs/design/architecture.md section 8 row G1.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+# R5, "failed calls must be handled". Warn-by-default in rustc, so CI's own `-D warnings`
+# already made the bare `f();` form red before this entry existed - measured 2026-11-12 on the
+# previous tree, clippy exit 101. What this entry adds is outside CI: `cargo check` and
+# `cargo build` now exit 101 on that form instead of printing a warning. It does NOT catch
+# `let _ = f()`; the clippy lint below is the only form this change newly denies in CI.
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+# The archive's job is to be correct about time and provenance. These lints turn
+# the three ways Rust still lets you lose a value into compile errors.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+# The other three macros that panic. clippy::panic covers only `panic!` itself, so
+# `todo!()`, `unimplemented!()` and `unreachable!()` passed every check until these
+# lines existed - measured 2026-11-12. A genuinely unreachable branch is still allowed,
+# but it has to say so with a reason, which is the outcome worth having.
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+# The second half of R5. `let _ = f()` emits nothing under `unused_must_use`, which is how
+# a discarded Result currently leaves no trace at all. Allow-by-default in clippy.
+let_underscore_must_use = "deny"

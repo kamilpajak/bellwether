@@ -79,9 +79,13 @@ was believed when.
 - `--no-fail-fast` is load-bearing: measured on this tree, one failing unit test made plain
   `cargo test` exit without ever running the doc test, which is the only enforcement point for the
   claim that the two time types cannot be compared.
-- `unwrap`, `expect` and `panic!` are denied in `services/newsvault/Cargo.toml` and `unsafe` is
-  forbidden. These are per-package tables: a second crate inherits none of them until the workspace
-  root carries `[workspace.lints]`.
+- `unwrap`, `expect` and `panic!` are denied, `unsafe` is forbidden, and a discarded `Result` is an
+  error under `unused_must_use` and `clippy::let_underscore_must_use`. The table is
+  `[workspace.lints]` in the root `Cargo.toml`, so a new crate is covered by one stanza in its own
+  manifest: `[lints] workspace = true`. Two measured limits, both named in §8: that stanza is
+  opt-in and nothing checks for it (row G1), and the five `deny` lints are switched off from inside
+  a crate by one `#![allow]`, by wrapping the call in a local `macro_rules!`, or by writing it in a
+  doc test (row G2). Only `unsafe_code` is `forbid`, and only `forbid` refuses a local `allow`.
 - Every number in a document carries the construction and the date that produced it. A number
   without its construction is an anecdote, and the predecessor has a measured case of four studies
   sharing one upstream count and being wrong together.

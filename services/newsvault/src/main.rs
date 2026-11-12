@@ -69,6 +69,14 @@ fn main() -> ExitCode {
                 Some(LakeError::MissingRoot(_) | LakeError::MissingDay { .. }) => EXIT_NOT_FOUND,
                 _ => EXIT_FAILED,
             };
+            // The process is already failing and the exit code below carries the verdict.
+            // A closed stderr (`newsvault day ... 2>/dev/null`, or a dead pager) must not
+            // turn an error path into a panic or change the exit code, so the write result
+            // is deliberately dropped.
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "reporting an error must not fail on a closed stderr; the exit code is the verdict"
+            )]
             let _ = writeln!(std::io::stderr(), "error: {e:#}");
             ExitCode::from(code)
         }
@@ -110,6 +118,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 }
 
 fn usage(message: String) -> anyhow::Error {
+    // Same reason as in `main`: this is the last write before `exit`, and a closed stderr
+    // must not replace exit code 2 with a panic.
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "reporting a usage error must not fail on a closed stderr; EXIT_USAGE is the verdict"
+    )]
     let _ = writeln!(std::io::stderr(), "usage error: {message}");
     std::process::exit(i32::from(EXIT_USAGE));
 }

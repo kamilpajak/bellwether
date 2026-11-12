@@ -314,7 +314,7 @@ today — named rather than hidden.
 | R2 | valid and observation time are distinct types | the type system; a `compile_fail` doc test pins it, and CI runs it | **enforced, but narrower than §3.1 claims** — see the correction below |
 | R3 | first sighting wins | unit tests in `newsvault` | **enforced** |
 | R4 | coverage ledger beside every store | a write to the archive without an `Attempt` row fails the store's own test | design |
-| R5 | failed calls must be handled | **not the type system.** An ignored `Result` is the rustc *warning* `unused_must_use`, and `let _ = f()` emits nothing at all. Only `cargo clippy --all-targets -- -D warnings` in CI makes it red, and `unused_must_use` is not yet denied in `Cargo.toml`. | **overstated** |
+| R5 | failed calls must be handled | `cargo clippy --locked --all-targets -- -D warnings` in CI, over the workspace lint set: `unused_must_use` denied under rust (which also makes a local `cargo check` fail, not merely warn) and `let_underscore_must_use` denied under clippy, which is the only form the move newly catches in CI. Never the type system. | **enforced against the accidental case only** — three escapes measured 2026-11-12: a violation inside a local `macro_rules!` passes; a crate- or module-level `#![allow]` switches any of these off and no command notices; and doc tests are reached by nothing, because `--all-targets` does not cover them. |
 | R6 | missing input aborts | unit tests cover the missing root and the missing day. But `lake.rs` `string_list_at` has five `Vec::new()` exits, four of which swallow a real decoding error while `unusable_rows` stays 0 — so the loader does have empty-fallback branches. | **partly** |
 | R7 | units are types, identity is a content hash | nothing. `grep -rn item_id services/newsvault/src` returns no match: there is no derivation and no test. Unit newtypes are also absent. | **no enforcement point yet**, both halves |
 | R8 | presence counted, never multiplied | the panel manifest requires `rows` and `exchangeable_units`; a CI check rejects a manifest whose row count equals a product of two cardinalities | **no enforcement point yet** |
@@ -328,6 +328,7 @@ today — named rather than hidden.
 | R16 | ledger records poll events | `items_new = 0` still writes a row; a test asserts it | design |
 | R17 | matching survives a broad corpus, over article body | the rules file is hashed and versioned; the gazetteer regression case is a test | design |
 | R18 | two rule versions, one snapshot, a diff | a `derive diff` subcommand; its absence is the gap | design |
+| G1 | **a workspace member inherits the lint floor** | nothing. Workspace lints are opt-in: a crate without `[lints] workspace = true` in its own manifest inherits none of them, and `cargo clippy --all-targets` reports success — demonstrated 2026-11-12 with a throwaway second crate holding an `unwrap`, which failed with the stanza and passed without it. | **no enforcement point yet** |
 
 **Correction, 2026-11-12, after an adversarial review.** Four rows above said **enforced** and did
 not earn it, and one structural problem outranked all of them: before this date there was no CI, so
@@ -344,7 +345,20 @@ any crate — demonstrated by compiling it. What is true is narrower and still w
 instants cannot be compared **with each other**, so the 60.2% leak cannot happen by type confusion.
 A claim nobody can enforce is worse than an accessor.
 
-Three gaps, and they are not equivalent. **R12** is the most serious: it protects the only boundary
+**Second correction, 2026-11-12.** The lint floor moved from the one package's manifest to
+`[workspace.lints]` at the root, because the root's own comment says four more service crates arrive
+and a package table covers exactly one of them. That closes the "a new crate inherits nothing" half
+of the problem and exposes the other half, now row G1: inheritance is opt-in, so a crate that omits
+the stanza is silently unlinted and CI still goes green. Two further escapes were measured and are
+named in the R5 row rather than left to be rediscovered, and a third was closed in the same change
+by denying `todo`, `unimplemented` and `unreachable` — `clippy::panic` covers only `panic!`, so until
+then all three passed.
+
+**What a lint can and cannot be.** These are a floor against the accidental case. None of them
+survives an author who writes `#![allow(...)]` at the top of a file, and no command in this gate
+notices that they did. Section 8 should not be read as saying otherwise.
+
+Four gaps now, and they are not equivalent. **R12** is the most serious: it protects the only boundary
 with money behind it, and today it rests on the fact that no code exists to violate yet. It needs
 its check written before the first service that could have a credential. **R8** and **R9** protect
 the number that was wrong by a factor of three, and their checks are cheap: a manifest validator and

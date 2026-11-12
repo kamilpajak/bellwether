@@ -42,9 +42,10 @@ The two instants cannot be compared with each other, so that leak cannot happen 
 the accessors are public, so a caller who sets out to ask the half-question still can.
 
 From the same source: the archive is complete and append-only, and any cap is a derived view;
-a missing input aborts rather than becoming an empty result; a failed network call must be handled
-for the program to compile; counting is counting and never multiplication; and units are types, so
-basis points and standard deviations cannot be added together.
+a missing input aborts rather than becoming an empty result; a discarded failure is a lint error
+rather than a warning, which is as far as the compiler can be made to care — §8 row R5 says how far
+that reaches; counting is counting and never multiplication; and units are types, so basis points
+and standard deviations cannot be added together.
 
 Two implementations of the archive-reading rules, one here and one written independently in pandas,
 were run over 156 days of the predecessor's news lake and agreed on every field on **156 of 156
@@ -81,8 +82,10 @@ cargo run -p newsvault -- day 2026-07-01 --lake <path-to-lake> --format json
 cargo run -p newsvault -- schema           # machine-readable description of the command tree
 ```
 
-`unwrap`, `expect` and `panic!` are denied by lint in the `newsvault` crate, and `unsafe` is
-forbidden.
+`unwrap`, `expect` and `panic!` are denied by lint and `unsafe` is forbidden. The table is
+`[workspace.lints]` in the root `Cargo.toml`, and each crate opts in with
+`[lints] workspace = true`. What that floor does not cover is §8 rows G1 and G2 of
+`docs/design/architecture.md`.
 
 ## Status
 
