@@ -1,0 +1,14 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "item_id",
+  "note": "A day-precision publication date carries the date string beside the day tag. Its digest differs from item_id_midnight_instant.json, which is the same microsecond as an instant.",
+  "input": {
+    "source": "edgar_press",
+    "source_item_id": "0000320193-26-000071",
+    "url": "https://www.sec.gov/Archives/edgar/data/320193/000032019326000071/ex991.htm",
+    "valid": { "day": "2026-07-01" },
+    "title": "Schäfer Holdings reports",
+    "body_ref": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "sha256": "2cfceba6bc694d2dd7229b06a94cc5f9b8cb5f135e0f5254e789fb2231c40e52"
+}

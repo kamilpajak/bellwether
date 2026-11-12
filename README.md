@@ -59,6 +59,7 @@ keep passing.
 | `docs/design/` | the founding design memo: requirements, architecture, and what is still open |
 | `docs/inherited/` | two documents carried from the predecessor: the mandatory research gates, and the postmortem of eleven closed strategy paradigms |
 | `services/newsvault/` | the point-in-time core and the archive reader, in Rust |
+| `canon/` | the canonical form every identity is hashed over, with the vectors a second reader in another language must reproduce |
 | `panel-contract/` | the panel manifest contract: the shape the statistics tier may read, and the validator that refuses a row count that is really a product |
 | `repo-invariants/` | the one invariant that is a property of the repository rather than of a crate |
 
@@ -80,7 +81,7 @@ keeping. It is here so this project is not free to repeat them.
 ```
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked --no-fail-fast          # 68 tests plus a compile_fail doc test and its control
+cargo test --locked --no-fail-fast          # 83 tests plus a compile_fail doc test and its control
 cargo run -p newsvault -- day 2026-07-01 --lake <path-to-lake> --format json
 cargo run -p newsvault -- schema           # machine-readable description of the command tree
 ```

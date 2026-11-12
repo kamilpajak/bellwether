@@ -1,0 +1,10 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "selection_id",
+  "note": "Adversarial sibling: the same two ids in German phonebook collation order, where ä sorts with ae and therefore before z. Raw UTF-8 bytes put z first, so this digest must differ from selection_id.json's.",
+  "input": {
+    "cutoff": "2026-07-01T21:00:00.000000Z",
+    "item_ids": ["ärger-item", "zebra-item"]
+  },
+  "sha256": "a3520fa88ede2a0afff83192cb2fa5713070a34eb01b530b7c1bb22fd781bed5"
+}

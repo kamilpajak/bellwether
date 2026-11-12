@@ -1,0 +1,14 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "item_id",
+  "note": "Adversarial sibling: the title is NFD. Its digest must equal item_id.json's, whose title is the composed form.",
+  "input": {
+    "source": "edgar_press",
+    "source_item_id": "0000320193-26-000071",
+    "url": "https://www.sec.gov/Archives/edgar/data/320193/000032019326000071/ex991.htm",
+    "valid": { "instant": "2026-07-01T12:00:00.000000Z" },
+    "title": "Schäfer Holdings reports",
+    "body_ref": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "sha256": "b6b9e3d5bc1da75c789c27b084816b2721520bdccd8a61d5d12ed2178d0bfdea"
+}

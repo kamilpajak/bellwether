@@ -1,0 +1,14 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "item_id",
+  "note": "Adversarial sibling: an absent optional field contributes an empty string and keeps its place, so this digest is also the digest of body_ref = \"\".",
+  "input": {
+    "source": "edgar_press",
+    "source_item_id": "0000320193-26-000071",
+    "url": "https://www.sec.gov/Archives/edgar/data/320193/000032019326000071/ex991.htm",
+    "valid": { "instant": "2026-07-01T12:00:00.000000Z" },
+    "title": "Schäfer Holdings reports",
+    "body_ref": null
+  },
+  "sha256": "c4762e45e9a265dca16f5f1a48b46e39187cec8613f15f53365af5a7bfa51f24"
+}

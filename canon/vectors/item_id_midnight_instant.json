@@ -1,0 +1,14 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "item_id",
+  "note": "The fabricated midnight the day arm refuses to produce, as an instant. Pair with item_id_day_precision.json: equal values, different precisions, different digests.",
+  "input": {
+    "source": "edgar_press",
+    "source_item_id": "0000320193-26-000071",
+    "url": "https://www.sec.gov/Archives/edgar/data/320193/000032019326000071/ex991.htm",
+    "valid": { "instant": "2026-07-01T00:00:00.000000Z" },
+    "title": "Schäfer Holdings reports",
+    "body_ref": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "sha256": "05ccf2d1a8ca80683b674186489c62cc20a1b5e94c68cbadaac59ac0b10d848f"
+}

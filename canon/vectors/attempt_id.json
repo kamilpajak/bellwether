@@ -1,0 +1,12 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "attempt_id",
+  "note": "ordinal is the attempt's position within its run, so a retry of one request is a second attempt_id.",
+  "input": {
+    "run_id": "2026-07-01T00:34:21Z-edgar_press",
+    "source": "edgar_press",
+    "target_window": "2026-07-01",
+    "ordinal": 2
+  },
+  "sha256": "84628c30dee39430df8868f96983f66f4295fe14185e7a2c107a7ec96977b1ff"
+}

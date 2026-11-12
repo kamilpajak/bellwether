@@ -1,0 +1,10 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "selection_id",
+  "note": "The ids keep their ascending seq order, which here is also code-point order. Pair with selection_id_locale_ordered.json.",
+  "input": {
+    "cutoff": "2026-07-01T21:00:00.000000Z",
+    "item_ids": ["zebra-item", "ärger-item"]
+  },
+  "sha256": "b0703c22c3087c89be998c0d2786565dc27d578921b92ecf43462ca5244fd174"
+}

@@ -1,0 +1,7 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "doc_id",
+  "note": "Cross-source identity. The url arrives already canonicalised by a hashed rule under url_canon_version.",
+  "input": { "canonical_url": "https://www.sec.gov/Archives/edgar/data/320193/000032019326000071/ex991.htm" },
+  "sha256": "c2efef46e4467d8d7d555a29d43759ae35b0ceea96af742e3e757faab289e329"
+}

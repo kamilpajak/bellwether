@@ -1,0 +1,7 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "story_id",
+  "note": "The within-source dedup key. Unchanged by a re-stamp of the title or the publication time.",
+  "input": { "source": "edgar_press", "source_item_id": "0000320193-26-000071" },
+  "sha256": "42b1cd13780fa6ed1f4fb607b7b69b66eca05a0ca61b795356ecb9f8e67b8a6e"
+}

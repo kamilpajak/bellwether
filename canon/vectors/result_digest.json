@@ -1,0 +1,14 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "result_digest",
+  "note": "A SET: the ids arrive unordered and with one repeat, and the digest is over the byte-ordered deduplicated list.",
+  "input": {
+    "ids": [
+      "0000320193-26-000071",
+      "0001018724-26-000014",
+      "0000320193-26-000071",
+      "0000789019-26-000003"
+    ]
+  },
+  "sha256": "9e1519563676a2c285a61e2ad0bff7bcf06fa4fbf07f0b8d9457d2c1ff342b07"
+}

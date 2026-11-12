@@ -1,0 +1,14 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "item_id",
+  "note": "Adversarial sibling: 1,500 ns past a whole microsecond. Truncated, never rounded, so this digest is the digest of ...000001Z.",
+  "input": {
+    "source": "edgar_press",
+    "source_item_id": "0000320193-26-000071",
+    "url": "https://www.sec.gov/Archives/edgar/data/320193/000032019326000071/ex991.htm",
+    "valid": { "instant": "2026-07-01T12:00:00.000001500Z" },
+    "title": "Schäfer Holdings reports",
+    "body_ref": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "sha256": "be236e670693b4905b85ca6466c107999c618efc070cd4bf565961eab1a06498"
+}

@@ -1,0 +1,14 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "filter_params",
+  "note": "Parameters ordered by name over raw UTF-8 bytes, headers included. The User-Agent carries the credential's NAME: the SEC-required contact address must never reach an archive nothing may delete.",
+  "input": {
+    "params": [
+      { "name": "User-Agent", "credential": "sec_contact" },
+      { "name": "action", "literal": "getcompany" },
+      { "name": "Accept", "literal": "application/json" },
+      { "name": "ärger", "literal": "umlaut-keyed, to pin byte order against a collation" }
+    ]
+  },
+  "sha256": "cab1f66f8ed012e1194492bb1314a3e57d699bd870d222f74f8f9abb8069fa0e"
+}

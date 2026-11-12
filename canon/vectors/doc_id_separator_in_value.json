@@ -1,0 +1,7 @@
+{
+  "schema": "canon.vector/1",
+  "note": "Adversarial sibling: a value holding a separator would forge a field boundary, so one field `a\u001fb` and the two fields `a` and `b` would have one form. Both readers refuse it.",
+  "digest": "doc_id",
+  "input": { "canonical_url": "https://example.test/a\u001fb" },
+  "refused": "a value holding a canonical-form separator"
+}
