@@ -1,8 +1,30 @@
 # probes
 
-A probe is a measurement script kept so its number can be re-derived, not a service and not
-production code. It answers one question about the outside world, writes a result file, and is
-expected to be run rarely.
+A probe is a measurement script kept so its number can be re-derived. It is not a service and not
+production code: it answers one question whose answer we do not know in advance, writes a result
+file, and is expected to run rarely.
+
+**The boundary that matters is not internal versus external, it is whether the answer is known in
+advance.** A test checks our code against our expectations and has its answer up front. A probe
+measures something we do not control — a vendor's volume, our own archive's composition, the
+standard error of a statistic — and could return anything.
+
+**A probe is kept only if it will be run again** (rule 3 of `../CONTRIBUTING.md`). Four live here
+because each has a second run ahead of it. Roughly as many measurements from the same work were
+deliberately not kept: their numbers are in `../docs/design/` with the construction that produced
+them, which is what a reader needs. A script that answered its question once is a receipt.
+
+| file | the question it answers | when it runs again |
+|---|---|---|
+| `parity_baseline.py` | does an independent reading of the archive rules agree with the Rust one, day by day? | at every migration stage; it **is** the parity gate |
+| `panel_recount.py` | how many company-sessions does the panel treat, under which rule version? | on every rule change, which is requirement R18 |
+| `panel_power.py` | what is the measured power of the registered procedure on this panel? | on every panel rebuild |
+| `matcher_audit.py` | what is the entity precision of the counterparty matcher, and what does the text cap cost? | on every change to the matching rules |
+| `vendor_probe/` | four questions about a news vendor; **not yet run** | once, then once more at least 7 days later for the stability half |
+
+Each takes its inputs from the environment and aborts with a named error when one is absent, which
+is requirement R6 applied to the measurement scripts themselves. Run one with no environment set to
+see what it needs.
 
 Two rules, both of which exist because of the predecessor's history:
 

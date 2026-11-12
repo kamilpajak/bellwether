@@ -62,3 +62,25 @@ jobs:
       # unrelated failure. With the flag the doc test runs and the exit code is still 101.
       - if: ${{ !cancelled() }}
         run: cargo test --locked --no-fail-fast
+      # Rule 1 of CONTRIBUTING.md, printed and never enforced. The predecessor's test lines passed
+      # its source lines in June 2026 and reached 1.45x by November without anyone noticing, because
+      # nobody was counting. This step does the counting. It cannot fail the run: a gate here would
+      # be a gate on a number nobody has justified, and the point is visibility, not a threshold.
+      - if: ${{ !cancelled() }}
+        name: size (test lines vs source lines, rule 1)
+        run: |
+          # Per file, not "-exec ... {} +": awk's exit ends the whole invocation, so one batched
+          # call stops counting at the first file holding a test module and silently undercounts
+          # every file after it. The first version of this step did exactly that and reported
+          # 2.56x on a 1,026-line crate.
+          src=0; tst=0
+          while IFS= read -r f; do
+            all=$(wc -l < "$f")
+            head=$(awk '/^ *#\[cfg\(test\)\]/{exit} {n++} END{print n+0}' "$f")
+            src=$((src + head)); tst=$((tst + all - head))
+          done < <(find services -name '*.rs' -not -path '*/target/*')
+          py=$(find probes -name '*.py' -exec cat {} + | wc -l)
+          doc=$(find docs -name '*.md' -exec cat {} + | wc -l)
+          printf 'rust source %6d\nrust tests  %6d  ratio %s\nprobes (py) %6d\ndocs (md)   %6d\n' \
+            "$src" "$tst" "$(awk -v a=$tst -v b=$src 'BEGIN{printf "%.2fx", (b?a/b:0)}')" "$py" "$doc"
+        shell: bash
