@@ -1,7 +1,12 @@
-# Workspace root. One member today; vault, derive, modelgate, propose and ledger are
+# Workspace root. One service today; vault, derive, modelgate, propose and ledger are
 # the services the design memo names, and each arrives as its own crate here.
+#
+# `repo-invariants` is not a service. It holds the checks that belong to the repository rather
+# than to any crate - today section 8 row G1, the lint floor every member must opt in to. It sits
+# here and not inside services/newsvault because a gate living inside one of the things it
+# polices disappears the day that thing is split or deleted.
 [workspace]
-members = ["services/newsvault"]
+members = ["repo-invariants", "services/newsvault"]
 resolver = "2"
 
 # The lint floor for every crate in the workspace. It lives here rather than in a package

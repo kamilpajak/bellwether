@@ -73,6 +73,9 @@ was believed when.
 
 ## Everything else
 
+- Repo-wide invariants live in `repo-invariants/`, not inside the crate they police: a gate that
+  lives in one of the things it checks disappears the day that thing is split. Its first test is
+  §8 row G1.
 - The gate is `.github/workflows/ci.yml`: `cargo fmt --check`, `cargo clippy --locked --all-targets
   -- -D warnings`, `cargo test --locked --no-fail-fast`. The commands are the ones `README.md`
   names; change one and change the other, or the document starts lying.

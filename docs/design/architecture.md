@@ -328,7 +328,7 @@ today — named rather than hidden.
 | R16 | ledger records poll events | `items_new = 0` still writes a row; a test asserts it | design |
 | R17 | matching survives a broad corpus, over article body | the rules file is hashed and versioned; the gazetteer regression case is a test | design |
 | R18 | two rule versions, one snapshot, a diff | a `derive diff` subcommand; its absence is the gap | design |
-| G1 | **a workspace member inherits the lint floor** | nothing. Workspace lints are opt-in: a crate without `[lints] workspace = true` in its own manifest inherits none of them, and `cargo clippy --all-targets` reports success — demonstrated 2026-11-12 with a throwaway second crate holding an `unwrap`, which failed with the stanza and passed without it. | **no enforcement point yet** |
+| G1 | **a workspace member inherits the lint floor** | a test in the `repo-invariants` crate. It asks `cargo metadata` for the member set rather than reading `workspace.members`, because that list is **not** the member set: measured 2026-11-12, a crate reached only by a `path` dependency is a member, is compiled by `cargo clippy --locked --all-targets`, inherits nothing, and all three CI commands exit 0 over an `unwrap()` in it. The test also rejects `lints = { workspace = true }` written inside `[package]`, which cargo ignores without a warning while the crate passes clippy. It polices its own crate too. | **enforced** |
 
 **Correction, 2026-11-12, after an adversarial review.** Four rows above said **enforced** and did
 not earn it, and one structural problem outranked all of them: before this date there was no CI, so
@@ -358,7 +358,20 @@ then all three passed.
 survives an author who writes `#![allow(...)]` at the top of a file, and no command in this gate
 notices that they did. Section 8 should not be read as saying otherwise.
 
-Four gaps now, and they are not equivalent. **R12** is the most serious: it protects the only boundary
+**Third correction, 2026-11-12.** G1 is closed, and closing it overturned the design it was given.
+The obvious gate — read `workspace.members` and check each entry — would have reported every member
+compliant while cargo built an unlinted third crate, because a `path` dependency from inside the
+workspace makes a member without appearing in that list. The gate asks cargo instead. Two traps are
+pinned by tests rather than described: that case, and `lints = { workspace = true }` inside
+`[package]`, which cargo silently ignores.
+
+One hole stays open and is deliberately not this gate's job: a crate on disk that no `members` entry
+and no `path` dependency reaches is not a member, is compiled by nothing, and is invisible here as it
+is to all of CI. Reproduced on this tree — `services/derive` with an `unwrap()` and no registration,
+all three commands green. A glob in `members` removes the mistake instead of testing for it, and
+that is a separate change with its own behaviour to argue about.
+
+Three gaps now, and they are not equivalent. **R12** is the most serious: it protects the only boundary
 with money behind it, and today it rests on the fact that no code exists to violate yet. It needs
 its check written before the first service that could have a credential. **R8** and **R9** protect
 the number that was wrong by a factor of three, and their checks are cheap: a manifest validator and
