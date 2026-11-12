@@ -67,9 +67,14 @@ construction is the artefact; the code is only worth the space when it has a sec
 memos, of which 125 carry a status line and the rest are one-off reports.
 
 The natural path is a new file per decision, which is why this needs to be a rule rather than a
-preference. A decision goes into the document it changes, with its date, and the superseded text
-stays visible as superseded rather than being deleted — a design document is also a record of what
-was believed when.
+preference. A decision goes into the document it changes, and it goes into the **row or section it
+changes** rather than into a note below it.
+
+**The document states what is, not what was believed.** Superseded text is deleted and the
+measurement inside it moves into the row that now carries the claim. The record of what was believed
+when is the commit that changed it, where it costs nothing to keep and nobody has to read it to
+learn the current shape. Measured 2026-11-12: five "correction" blocks had grown to 81 lines, 14% of
+`architecture.md`, in one day.
 
 ## Everything else
 
