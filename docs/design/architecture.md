@@ -254,7 +254,7 @@ What each service does when its input is wrong, rather than what it does when ev
 | an item's observation precedes its publication | counted as unusable, never dated | that is a source bug, not an archive fact |
 | the same item arrives in several runs | first sighting wins | **R3.** Keeping the last postdates our own knowledge, by up to 19h59m on the predecessor's store. |
 | a panel lacks `exchangeable_units` | the statistics tier refuses to run | **R9** |
-| a brief carries an order-shaped field | rejected by schema | **R12** |
+| a brief carries an order-shaped field | rejected by schema | **R12b** |
 | an event is lost | latency, not data: the archive is the source of truth and the hourly sweep closes the gap | memo §4 rule 2 |
 | a consumer is silently dead | detected by lag and backlog depth, not by staleness | memo §4 rule 3 |
 
@@ -291,11 +291,15 @@ this system does not have: at a few hundred items a day, one event arrives every
 ## 7. What is not reachable from here
 
 The order-placing path is in a different repository, holds the only credentials that matter, and
-accepts hand-written documents only. This repository's services hold no credentials for it, know no
-path to it, and are checked for the absence of order-placing calls (§8).
+accepts hand-written documents only. Nothing here holds a credential for it.
 
-Circumventing that requires changes in two repositories and the removal of a check — a deliberate
-act, not an accident. The same rule in the other direction: no backward edge from `ledger`.
+**Where the wall is enforced, and where it is not.** Not here. A check in this repository for
+order-placing calls would pass unconditionally, because there is no such call to forbid; the
+predecessor's equivalent gate guards code that exists. If a mediating service is ever built between
+this repository and the executor, that service is where the enforcement belongs, and the condition
+is stated in §8 row R12a: its input may not be a brief alone. A mediator that formats a decision a
+person made is a convenience. A mediator that derives the decision from a proposal is the producer
+the predecessor deleted, returning under a new name. The same rule in the other direction: no backward edge from `ledger`.
 
 Lower latency makes this boundary *more* important, not less. "We must act now" is exactly the
 argument that talks a person into automating a pick, and the boundary has to hold at the moment it
@@ -321,7 +325,8 @@ today — named rather than hidden.
 | R9 | power from the registered procedure | the statistics tier refuses a panel without `exchangeable_units`; `params_version` names the power method | **no enforcement point yet** |
 | R10 | provenance labelled | enum field, non-nullable | design |
 | R11 | backfill lag is measured | `from_backfill` requires a `MeasuredLag`, so the **type** cannot be skipped. But all four of its fields are `pub` with no validating constructor, so `{probe_id: "", probes: 0, leaks: 0, seconds: 0}` is accepted — demonstrated 2026-11-12 from outside the crate. And `Visibility` derives `Deserialize` over private fields, which bypasses `from_live`. | **the type is required; the measurement is not** |
-| R12 | no path to the order queue | an AST check over every crate forbids order-placing calls; no credential is present | **no enforcement point yet** |
+| R12a | **no automatic derivation from a proposal to an order** | nothing here, and nothing here is the right answer. Reframed 2026-11-12: the invariant is not "no path". A path is harmless. What the predecessor removed on 2026-09-24 was an automatic brief-to-intent producer, and that is the thing that must not return. A mediating service that **formats a human's decision** into a valid order document is a convenience; one that **derives** which companies and what size from a brief is the deleted thing coming back. The check belongs at that mediator, whose input may not be a `brief_id` alone, and it cannot be written before the mediator exists. | **not this repository's gate** |
+| R12b | the brief carries no order-shaped field | the brief schema: no side, quantity, size, entry price, stop or ladder, enumerated as absent in §3.6 so the absence is checkable rather than assumed | design |
 | R13 | five time columns, sequence is the authority | store schema; ordering helpers take `seq` only | design |
 | R14 | an attempt is recorded even when empty | the four-outcome enum is non-nullable; a test asserts a row on an empty fetch | design |
 | R15 | disputed timestamps marked, never corrected | `valid_disputed` + `earliest_valid_at`; a test asserts neither value moves | design |
@@ -371,11 +376,24 @@ is to all of CI. Reproduced on this tree — `services/derive` with an `unwrap()
 all three commands green. A glob in `members` removes the mistake instead of testing for it, and
 that is a separate change with its own behaviour to argue about.
 
-Three gaps now, and they are not equivalent. **R12** is the most serious: it protects the only boundary
-with money behind it, and today it rests on the fact that no code exists to violate yet. It needs
-its check written before the first service that could have a credential. **R8** and **R9** protect
-the number that was wrong by a factor of three, and their checks are cheap: a manifest validator and
-a refusing consumer.
+**Fourth correction, 2026-11-12.** R12 was called the most serious gap in this document for most of a
+day, and it was not a gap in this repository at all. An AST check forbidding order-placing calls, in
+a repository with no broker code, passes unconditionally — the same shape as the four enforcement
+claims corrected above, except this one was written here rather than inherited.
+
+Worse, the invariant was wrong as well as unenforceable. "No path to the order queue" protects
+nothing: a path is harmless. The thing the predecessor deleted on 2026-09-24 was an **automatic
+brief-to-intent producer**, and a mediating service between this repository and the existing executor
+is a perfectly good idea as long as its input is a decision a person made rather than a brief. That
+is why every pick in the predecessor carries `"source": "manual"` — the label is not provenance
+metadata, it **is** the invariant, written into the data.
+
+So R12 is split. R12a moves to the mediator that does not exist yet, and leaves this document rather
+than sitting in it as a permanent unmet gap. R12b, the half that is real here, stays: the brief
+schema has no field an executor would accept.
+
+Two gaps now, and they are not equivalent. **R8** and **R9** protect the number that was wrong by a
+factor of three, and their checks are cheap: a manifest validator and a refusing consumer.
 
 ---
 
@@ -408,4 +426,5 @@ Beyond the memo's own open decisions:
   absence costs most if it is still absent in a year.
 - **No freshness target**, so §5's lag-and-backlog detection has nothing to alert on yet. Memo
   question N2.
-- **The three enforcement gaps of §8**, of which R12 is the one to close first.
+- **The two enforcement gaps of §8**, R8 and R9. R12a left the list on 2026-11-12 because it belongs to
+  a service that does not exist; it is not closed, it is relocated, and §7 says where.
