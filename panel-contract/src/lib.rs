@@ -1,11 +1,10 @@
 //! The panel manifest contract: the required shape of the JSON file beside a panel's Arrow data,
 //! and the validator that decides whether one instance of it is admissible.
 //!
-//! Row R8 of `docs/design/architecture.md` section 8 holds the six rules and the measurement that
-//! forced them, and its fifth correction holds the ceiling: this crate never opens the Arrow file
-//! beside the manifest, and the two fields section 3.4 requires that are properties of a
-//! *statistic* rather than of the row set are carried as [`Need::DeferredToR9`] instead of being
-//! required here. The failure being encoded is memo sections 1.8 and 1.9. Why the contract is its
+//! Row R8 of `docs/design/architecture.md` section 8 holds the six rules, the measurement that
+//! forced them, and the ceiling: this crate never opens the Arrow file beside the manifest, and the
+//! two fields that are properties of a *statistic* rather than of the row set are carried as
+//! [`Need::DeferredToR9`] instead of being required here. The failure being encoded is memo sections 1.8 and 1.9. Why the contract is its
 //! own crate, owned by neither side of the boundary: `CONTRIBUTING.md`, "Everything else".
 
 use serde_json::{Map, Value};
@@ -21,8 +20,8 @@ const MEMO: &str = "docs/design/successor_system_design_2026_11_11.md section 1.
 pub const ZERO_ATTRITION: &str = "zero_attrition_counted";
 pub const ROWS_EXCHANGEABLE: &str = "rows_are_exchangeable";
 
-/// Shortest string accepted as an attestation sentence. A length floor, HEURISTIC, and what it
-/// can and cannot tell apart is architecture.md section 8, fifth correction.
+/// Shortest string accepted as an attestation sentence, and as a unit definition. A length floor,
+/// HEURISTIC, and what it can and cannot tell apart is architecture.md section 8 row R8's ceiling.
 const ATTESTATION_CHARS: usize = 40;
 
 /// The JSON shape a manifest field must carry.
@@ -69,7 +68,8 @@ pub enum Need {
     Always,
     /// Only when one of the arithmetic rules asks for an attestation.
     WhenAttested,
-    /// Listed by architecture.md section 3.4 and not enforced here - see the module docs.
+    /// A property of a statistic, so architecture.md row R9's consumer is where it can be
+    /// required - not here. See the module docs.
     DeferredToR9,
 }
 
@@ -309,6 +309,26 @@ fn check_units_shape(table: &Map<String, Value>, findings: &mut Vec<Finding>) {
             )),
         }
     }
+    // The definition is the field carrying memo section 1.9's prose, so it is held to the same
+    // floor as an attestation. Without this it was checked only by `Shape::Text`, which accepts
+    // one non-whitespace character: measured 2026-11-12, `{"count": 47, "unit": "s",
+    // "definition": "?"}` was admissible with zero findings.
+    let written = units
+        .get("definition")
+        .and_then(Value::as_str)
+        .map_or(0, |text| text.trim().chars().count());
+    if (1..ATTESTATION_CHARS).contains(&written) {
+        findings.push(Finding::heuristic(
+            "unit_definition_not_a_sentence",
+            "R8.b",
+            format!(
+                "`exchangeable_units.definition` carries {written} characters; at least \
+                 {ATTESTATION_CHARS} are required. HEURISTIC: the rule is that someone wrote down \
+                 what makes two units exchangeable, and length cannot check that. It rules out a \
+                 placeholder, which is what the name alone already was ({MEMO})."
+            ),
+        ));
+    }
 }
 
 /// Rules d and e, sentence half. HEURISTIC - see [`ATTESTATION_CHARS`].
@@ -487,7 +507,7 @@ fn attested(table: &Map<String, Value>, name: &str) -> bool {
 
 /// The product `rows` was recognised as, if any: any pair of the stated cardinalities, the whole
 /// product, or a list of one. HEURISTIC and shallow - what it misses, and the measured manifest
-/// that forced the list-of-one arm, are architecture.md section 8, fifth correction.
+/// that forced the list-of-one arm, are architecture.md section 8 row R8 and its ceiling.
 fn recognised_product(rows: u64, cardinalities: &[Cardinality]) -> Option<(u128, String)> {
     let rows = u128::from(rows);
     for (index, left) in cardinalities.iter().enumerate() {
@@ -796,7 +816,7 @@ mod tests {
         }
     }
 
-    /// The two fields section 3.4 lists and this crate does not enforce, so a reader of row R8
+    /// The two fields this crate publishes as deferred and does not enforce, so a reader of row R8
     /// cannot take it for more than it is.
     #[test]
     fn the_two_r9_fields_are_not_required_here() {
@@ -865,6 +885,62 @@ mod tests {
         );
     }
 
+    /// The three codes nothing else asserts. One case each, so renaming any of them turns a test
+    /// red rather than changing a published vocabulary in silence (section 8 row E1).
+    #[test]
+    fn the_three_remaining_codes_are_each_pinned_by_a_case() {
+        let mut manifest = fixture("corrected_panel_78460.json");
+        let table = manifest.as_object_mut().unwrap();
+
+        table.insert("cardinalities".to_owned(), serde_json::json!([]));
+        assert!(
+            codes(&validate(&manifest)).contains(&"cardinalities_empty"),
+            "{:#?}",
+            validate(&manifest)
+        );
+
+        let table = manifest.as_object_mut().unwrap();
+        table.insert(
+            "cardinalities".to_owned(),
+            serde_json::json!([{"name": "a", "count": u64::MAX}, {"name": "b", "count": u64::MAX},
+                               {"name": "c", "count": u64::MAX}]),
+        );
+        assert!(
+            codes(&validate(&manifest)).contains(&"cardinalities_overflow"),
+            "{:#?}",
+            validate(&manifest)
+        );
+
+        let table = manifest.as_object_mut().unwrap();
+        table.insert(
+            "attrition".to_owned(),
+            serde_json::json!([{"stage": "   ", "rows_dropped": 1}]),
+        );
+        assert!(
+            codes(&validate(&manifest)).contains(&"attrition_malformed"),
+            "{:#?}",
+            validate(&manifest)
+        );
+    }
+
+    /// Rule b, the sentence half. The definition carries the load-bearing prose of memo section
+    /// 1.9, so it is held to the same floor as an attestation rather than to one character.
+    #[test]
+    fn a_one_character_unit_definition_is_not_a_definition() {
+        let mut manifest = fixture("corrected_panel_78460.json");
+        manifest.as_object_mut().unwrap().insert(
+            "exchangeable_units".to_owned(),
+            serde_json::json!({"count": 47, "unit": "s", "definition": "?"}),
+        );
+        let findings = validate(&manifest);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.code == "unit_definition_not_a_sentence" && f.heuristic),
+            "{findings:#?}"
+        );
+    }
+
     #[test]
     fn a_one_word_attestation_is_not_a_sentence_and_the_message_says_it_is_a_heuristic() {
         let mut manifest = fixture("full_rectangle_attested.json");
@@ -913,7 +989,7 @@ mod tests {
 
     /// The pre-multiplied manifest: the product done before the manifest was written, stated as a
     /// single cardinality. It was admissible until the whole-product arm covered a list of one -
-    /// architecture.md section 8, fifth correction.
+    /// architecture.md section 8 row R8.
     #[test]
     fn a_product_stated_as_one_pre_multiplied_cardinality_is_still_a_product() {
         let findings = validate(&serde_json::json!({
@@ -925,7 +1001,8 @@ mod tests {
             "cardinalities": [{"name": "company_sessions", "count": 78584}],
             "attrition": [],
             "exchangeable_units": {
-                "count": 47, "unit": "trading_session", "definition": "One trading session."
+                "count": 47, "unit": "trading_session",
+                "definition": "One US equity trading session. Rows inside one are exchangeable."
             }
         }));
         assert_eq!(codes(&findings), vec!["rows_equal_a_product_unattested"]);
@@ -946,7 +1023,10 @@ mod tests {
             "rows": 5,
             "cardinalities": [{"name": "companies", "count": 3}, {"name": "sessions", "count": 4}],
             "attrition": [{"stage": "everything", "rows_dropped": 999}],
-            "exchangeable_units": {"count": 4, "unit": "session", "definition": "one session"}
+            "exchangeable_units": {
+                "count": 4, "unit": "session",
+                "definition": "One US equity trading session. Rows inside one are exchangeable."
+            }
         }));
         assert_eq!(codes(&findings), vec!["attrition_does_not_reconcile"]);
         assert!(

@@ -13,7 +13,8 @@ What changed in the INPUT, not the method:
   - the 4,000-character truncation is gone (it discarded 50.5% of occurrences);
   - 18 cores are sieved out as generic name components, non-companies or places, with
     "Premier" restored after it was found to be a real company.
-Treated company-sessions went from 4,715 to 6,527, +38.4%.
+Treated company-sessions rose +38.4%; the count itself is memo section 1.9's and is not
+copied here, because two copies of one number is how they come to disagree.
 
 The prediction being tested: power barely moves, because the binding constraint was the
 47 exchangeable sessions and not the row count. Written down before the run.

@@ -5,12 +5,15 @@ gate exist. The point is NOT that pandas is authoritative - it is that two
 implementations written from the same stated rules must agree, and where they do not,
 the rules were ambiguous rather than one side being wrong.
 
-The rules, mirroring apps/newsvault/src/lake.rs exactly:
+The rules, mirroring services/newsvault/src/lake.rs exactly:
   1. read every run=*.parquet under session_date=<d>/, in filename order
-  2. drop a row with a null id, publication time or ingest time, and COUNT it
+  2. drop a row whose id is null, empty or blank, or whose publication or ingest
+     time is null, and COUNT it
   3. drop a row whose ingest time precedes its publication time, and COUNT it
   4. collapse repeats across runs keeping the FIRST sighting (earliest ingest time)
-  5. count a disagreement on publication time when a later run re-reports an id
+  5. count a disagreement on publication time whenever a row re-reports an id,
+     whether that row is discarded as a repeat or replaces the kept sighting -
+     and count it twice over, as ROW events and as the ITEMS they fall on
   6. order the survivors by (publication time, id)
 
 Digest: sha256 over the newline-joined sorted distinct ids, so the two sides can be
@@ -27,7 +30,8 @@ COLS = ["id", "source", "timestamp", "title", "body", "url", "ingested_at"]
 def read_day(part: pathlib.Path) -> dict:
     runs = sorted(p for p in part.glob("run=*.parquet"))
     first: dict[str, tuple] = {}
-    raw = unusable = conflicts = 0
+    disputed: set[str] = set()
+    raw = unusable = events = 0
     for path in runs:
         df = pd.read_parquet(path, columns=COLS)
         raw += len(df)
@@ -35,7 +39,7 @@ def read_day(part: pathlib.Path) -> dict:
         ing = pd.to_datetime(df["ingested_at"], utc=True)
         for i, rid in enumerate(df["id"]):
             v, o = ts.iloc[i], ing.iloc[i]
-            if not isinstance(rid, str) or not rid or pd.isna(v) or pd.isna(o):
+            if not isinstance(rid, str) or not rid.strip() or pd.isna(v) or pd.isna(o):
                 unusable += 1
                 continue
             if o < v:                      # observed before published: source bug
@@ -43,9 +47,10 @@ def read_day(part: pathlib.Path) -> dict:
                 continue
             prev = first.get(rid)
             if prev is not None:
+                if prev[1] != v:           # before the first-sighting test, so both paths count
+                    events += 1
+                    disputed.add(rid)
                 if prev[0] <= o:
-                    if prev[1] != v:
-                        conflicts += 1
                     continue
             first[rid] = (o, v)
     ids = sorted(first)
@@ -57,7 +62,8 @@ def read_day(part: pathlib.Path) -> dict:
         "raw_rows": raw,
         "distinct_items": len(first),
         "unusable_rows": unusable,
-        "valid_time_conflicts": conflicts,
+        "valid_time_conflict_events": events,
+        "items_with_conflicting_valid_time": len(disputed),
         "first_sighting": str(min(obs)) if obs else None,
         "last_sighting": str(max(obs)) if obs else None,
         "id_digest": digest,
@@ -100,11 +106,13 @@ def main() -> int:
     tot_raw = sum(r["raw_rows"] for r in out)
     tot_d = sum(r["distinct_items"] for r in out)
     tot_u = sum(r["unusable_rows"] for r in out)
-    tot_c = sum(r["valid_time_conflicts"] for r in out)
+    tot_c = sum(r["valid_time_conflict_events"] for r in out)
+    tot_ci = sum(r["items_with_conflicting_valid_time"] for r in out)
     print(f"\nsurowych wierszy      : {tot_raw:,}")
     print(f"unikatow (po 1. spojrzeniu): {tot_d:,}")
     print(f"nieuzytecznych wierszy: {tot_u:,}")
-    print(f"kolizji czasu zdarzenia: {tot_c:,}")
+    print(f"kolizji czasu zdarzenia (wiersze): {tot_c:,}")
+    print(f"kolizji czasu zdarzenia (pozycje w partycji): {tot_ci:,}")
     print(f"dni z zerem unikatow  : {sum(1 for r in out if r['distinct_items'] == 0)}")
     print(f"\nzapisano {dest}")
     return 0

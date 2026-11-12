@@ -9,7 +9,7 @@ publish = false
 # the dependency graph - measured 2026-11-12 by diffing Cargo.lock before and after.
 
 # Not here, and neither absence is an oversight: arrow, because this crate never opens the data
-# file (the ceiling that follows is architecture.md section 8, fifth correction), and a time crate,
+# file (the ceiling that follows is architecture.md section 8 row R8's), and a time crate,
 # because `cutoff` is required to be present and is not parsed.
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }

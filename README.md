@@ -63,8 +63,9 @@ keep passing.
 | `repo-invariants/` | the one invariant that is a property of the repository rather than of a crate |
 
 `docs/design/architecture.md` is the contract layer: what crosses each service boundary, in what
-shape, and — in its §8 — the single place each invariant is enforced, including the two that are
-not enforced anywhere yet, and the ceiling on the two gates that are.
+shape, and — in its §8 — the single place each invariant is enforced. That table's status column is
+the only count of which invariants are enforced and which are not yet, and every enforced one states
+its ceiling.
 
 `docs/design/successor_system_design_2026_11_11.md` is the document to read before changing anything
 here. It carries eighteen numbered requirements, each paired with the measurement that forced it,
@@ -79,15 +80,15 @@ keeping. It is here so this project is not free to repeat them.
 ```
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked --no-fail-fast          # 49 unit tests plus a compile_fail doc test
+cargo test --locked --no-fail-fast          # 68 tests plus a compile_fail doc test and its control
 cargo run -p newsvault -- day 2026-07-01 --lake <path-to-lake> --format json
 cargo run -p newsvault -- schema           # machine-readable description of the command tree
 ```
 
 `unwrap`, `expect` and `panic!` are denied by lint and `unsafe` is forbidden. The table is
 `[workspace.lints]` in the root `Cargo.toml`, and each crate opts in with
-`[lints] workspace = true`. What that floor does not cover is §8 rows G1 and G2 of
-`docs/design/architecture.md`.
+`[lints] workspace = true`. What that floor does not cover is §8 row G1 of
+`docs/design/architecture.md` (the stanza is opt-in) and row R5 (the forms and opt-outs it misses).
 
 ## Status
 

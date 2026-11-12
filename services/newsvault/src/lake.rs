@@ -40,11 +40,26 @@ pub struct Day {
     pub runs: Vec<String>,
     /// Rows read before collapsing repeats across runs.
     pub raw_rows: usize,
-    /// Items a later run re-reported with a different publication time. The first
-    /// sighting is kept; this counts how often the sources disagreed.
-    pub valid_time_conflicts: usize,
-    /// Rows dropped because a required field was null.
+    /// ROW events: one per row whose publication time differs from the one kept for that id, so an
+    /// item re-reported in five later runs of this day contributes five. The first sighting's time
+    /// is the one kept. Measured lake-wide beside the item count in memo section 5.1.
+    pub valid_time_conflict_events: usize,
+    /// ITEMS: distinct ids of this partition carrying more than one publication time, counted once
+    /// each. This is the unit R15's handling has to size itself in, and it is the smaller of the
+    /// two numbers - memo section 5.1 states both with their construction.
+    pub items_with_conflicting_valid_time: usize,
+    /// Rows dropped because a required field was null or, for the id, empty.
     pub unusable_rows: usize,
+}
+
+/// What the reader keeps for one id inside one partition.
+struct Sighting {
+    /// The earliest observation seen for this id, which is the sighting that wins.
+    observed: ObservationTime,
+    item: NewsItem,
+    /// Set the first time any other row of this partition carries a different publication time for
+    /// this id, on either path through the dedup.
+    valid_time_disputed: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -105,13 +120,14 @@ impl LakeReader {
             .collect();
         files.sort();
 
-        let mut first: HashMap<String, (ObservationTime, NewsItem)> = HashMap::new();
+        let mut first: HashMap<String, Sighting> = HashMap::new();
         let mut day = Day {
             date,
             items: Vec::new(),
             runs: Vec::new(),
             raw_rows: 0,
-            valid_time_conflicts: 0,
+            valid_time_conflict_events: 0,
+            items_with_conflicting_valid_time: 0,
             unusable_rows: 0,
         };
         for path in &files {
@@ -127,7 +143,11 @@ impl LakeReader {
                 date,
             });
         }
-        let mut items: Vec<NewsItem> = first.into_values().map(|(_, it)| it).collect();
+        day.items_with_conflicting_valid_time = first
+            .values()
+            .filter(|seen| seen.valid_time_disputed)
+            .count();
+        let mut items: Vec<NewsItem> = first.into_values().map(|seen| seen.item).collect();
         items.sort_by(|a, b| {
             a.visibility
                 .valid()
@@ -176,9 +196,60 @@ fn to_utc(micros: i64) -> Option<DateTime<Utc>> {
     Utc.timestamp_micros(micros).single()
 }
 
+/// The one list column, read like every other column: absent is [`LakeError::MissingColumn`] and a
+/// type that cannot be read as a list of strings is [`LakeError::BadColumnType`], both once per
+/// batch rather than silently per row. Before this existed `tickers` was fetched as an `Option` and
+/// every failure returned an empty list with `unusable_rows` at 0 - measured 2026-11-12, a run file
+/// with no `tickers` column and one whose `tickers` was a struct both exited 0 with every tag gone,
+/// which is the empty fallback section 8 row R6 forbids.
+fn string_list_column<'a>(
+    batch: &RecordBatch,
+    name: &'static str,
+    held: &'a mut Vec<arrow::array::ArrayRef>,
+) -> Result<&'a arrow::array::ListArray, LakeError> {
+    let col = batch
+        .column_by_name(name)
+        .ok_or(LakeError::MissingColumn(name))?;
+    // Refuse before casting, not after. `cast` succeeds from a numeric list, so a
+    // `list<int64>` of [7] arrives as the ticker "7": plausible data rather than an error, which
+    // is worse than the empty list R6 forbids. Measured 2026-11-12 on a one-row lake, exit 0 with
+    // `unusable_rows` 0. Only the three string layouts pandas emits may be cast.
+    let item_type = match col.data_type() {
+        DataType::List(f) | DataType::LargeList(f) | DataType::ListView(f) => f.data_type(),
+        other => {
+            return Err(LakeError::BadColumnType {
+                column: name,
+                actual: other.to_string(),
+            })
+        }
+    };
+    if !matches!(
+        item_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    ) {
+        return Err(LakeError::BadColumnType {
+            column: name,
+            actual: col.data_type().to_string(),
+        });
+    }
+    let casted = cast(col, &DataType::new_list(DataType::Utf8, true)).map_err(|_| {
+        LakeError::BadColumnType {
+            column: name,
+            actual: col.data_type().to_string(),
+        }
+    })?;
+    held.push(casted);
+    held.last()
+        .and_then(|a| a.as_any().downcast_ref::<arrow::array::ListArray>())
+        .ok_or_else(|| LakeError::BadColumnType {
+            column: name,
+            actual: col.data_type().to_string(),
+        })
+}
+
 fn read_run(
     path: &Path,
-    first: &mut HashMap<String, (ObservationTime, NewsItem)>,
+    first: &mut HashMap<String, Sighting>,
     day: &mut Day,
 ) -> Result<(), LakeError> {
     let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?.build()?;
@@ -195,10 +266,18 @@ fn read_run(
         let ing = micros_column(&batch, "ingested_at")?;
         let ts = ts.as_primitive::<arrow::datatypes::TimestampMicrosecondType>();
         let ing = ing.as_primitive::<arrow::datatypes::TimestampMicrosecondType>();
-        let tickers = batch.column_by_name("tickers").cloned();
+        let mut held_list = Vec::new();
+        let tickers = string_list_column(&batch, "tickers", &mut held_list)?;
 
         for row in 0..batch.num_rows() {
-            if ids.is_null(row) || ts.is_null(row) || ing.is_null(row) {
+            // An id that is present and blank is not an id: it would become the dedup key and
+            // collapse every blank-id row of the day into one item. `probes/parity_baseline.py`
+            // rejects the same row, so the two readers of the archive stay one rule.
+            if ids.is_null(row) || ids.value(row).trim().is_empty() {
+                day.unusable_rows += 1;
+                continue;
+            }
+            if ts.is_null(row) || ing.is_null(row) {
                 day.unusable_rows += 1;
                 continue;
             }
@@ -217,55 +296,67 @@ fn read_run(
                 }
             };
             let id = ids.value(row).to_owned();
-            match first.get(&id) {
-                Some((seen, kept)) if *seen <= observed => {
-                    if kept.visibility.valid() != valid {
-                        day.valid_time_conflicts += 1;
-                    }
+            // The publication-time comparison runs BEFORE the first-sighting test, so it runs on
+            // both paths: the repeat that is discarded and the earlier-observed row that replaces
+            // the kept one are each a disagreement. The replacement path counted nothing until
+            // 2026-11-12; it is taken 0 times in the 243,226 archived rows and becomes reachable
+            // with a second ingest schedule or a backfill (section 3.1 `provenance`).
+            let mut disputed = false;
+            if let Some(seen) = first.get_mut(&id) {
+                if seen.item.visibility.valid() != valid {
+                    day.valid_time_conflict_events += 1;
+                    seen.valid_time_disputed = true;
+                }
+                disputed = seen.valid_time_disputed;
+                if seen.observed <= observed {
                     continue;
                 }
-                _ => {}
             }
             let item = NewsItem {
                 id: id.clone(),
                 source: sources.value(row).to_owned(),
                 visibility,
-                tickers: string_list_at(tickers.as_ref(), row),
+                tickers: string_list_at(tickers, row)?,
                 title: titles.value(row).to_owned(),
                 body: bodies.value(row).to_owned(),
                 url: urls.value(row).to_owned(),
             };
-            first.insert(id, (observed, item));
+            first.insert(
+                id,
+                Sighting {
+                    observed,
+                    item,
+                    valid_time_disputed: disputed,
+                },
+            );
         }
     }
     Ok(())
 }
 
-fn string_list_at(col: Option<&arrow::array::ArrayRef>, row: usize) -> Vec<String> {
-    let Some(col) = col else { return Vec::new() };
-    if col.is_null(row) {
-        return Vec::new();
+/// One row's tag list. **One** empty return is left and it is the only legitimate one: a null cell,
+/// meaning the vendor tagged nothing. Every other way of failing to read the list is an error, so an
+/// empty list in the output means the row carried none rather than that the column could not be
+/// decoded.
+fn string_list_at(list: &arrow::array::ListArray, row: usize) -> Result<Vec<String>, LakeError> {
+    if list.is_null(row) {
+        return Ok(Vec::new());
     }
-    let Ok(listed) = cast(col, &DataType::new_list(DataType::Utf8, true)) else {
-        return Vec::new();
-    };
-    let Some(list) = listed.as_any().downcast_ref::<arrow::array::ListArray>() else {
-        return Vec::new();
-    };
     let values = list.value(row);
-    let Ok(strings) = cast(&values, &DataType::Utf8) else {
-        return Vec::new();
-    };
-    strings
+    // One arm, not three: `string_list_column` has already cast the whole column to
+    // `list<utf8>`, so the values of any row it accepted are a `StringArray`. The arm stays
+    // because the alternative is an `expect`, which the lint floor denies.
+    let strings = values
         .as_any()
         .downcast_ref::<arrow::array::StringArray>()
-        .map(|a| {
-            (0..a.len())
-                .filter(|i| !a.is_null(*i))
-                .map(|i| a.value(i).to_owned())
-                .collect()
-        })
-        .unwrap_or_default()
+        .ok_or_else(|| LakeError::BadColumnType {
+            column: "tickers",
+            actual: values.data_type().to_string(),
+        })?;
+    Ok((0..strings.len())
+        .filter(|i| !strings.is_null(*i))
+        .map(|i| strings.value(i).to_owned())
+        .collect())
 }
 
 #[cfg(test)]
@@ -283,10 +374,24 @@ mod tests {
 
     /// One row of the lake schema, as the Python ingest writes it.
     struct Row {
-        id: &'static str,
+        /// `None` writes an Arrow null. `Some("")` writes a real empty string, which is a
+        /// different row: it is present, it is not an id, and it used to become the dedup key.
+        id: Option<&'static str>,
         source: &'static str,
+        title: &'static str,
         published_micros: i64,
         ingested_micros: i64,
+    }
+
+    /// The common case: an id that is a real id.
+    fn row(id: &'static str, published_micros: i64, ingested_micros: i64) -> Row {
+        Row {
+            id: Some(id),
+            source: "rss",
+            title: id,
+            published_micros,
+            ingested_micros,
+        }
     }
 
     fn schema() -> Arc<Schema> {
@@ -313,10 +418,7 @@ mod tests {
 
     fn write_run(dir: &Path, name: &str, rows: &[Row]) {
         let tz: Arc<str> = Arc::from("UTC");
-        let ids: Vec<Option<&str>> = rows
-            .iter()
-            .map(|r| if r.id.is_empty() { None } else { Some(r.id) })
-            .collect();
+        let ids: Vec<Option<&str>> = rows.iter().map(|r| r.id).collect();
         let tickers = ListArray::from_iter_primitive::<arrow::datatypes::Int32Type, _, _>(
             rows.iter().map(|_| Some(Vec::<Option<i32>>::new())),
         );
@@ -337,7 +439,7 @@ mod tests {
                 ),
                 tickers,
                 Arc::new(StringArray::from(
-                    rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+                    rows.iter().map(|r| r.title).collect::<Vec<_>>(),
                 )),
                 Arc::new(StringArray::from(vec!["body"; rows.len()])),
                 Arc::new(StringArray::from(vec!["https://example.test"; rows.len()])),
@@ -366,18 +468,8 @@ mod tests {
             &part,
             "run=20260702T003000000Z.parquet",
             &[
-                Row {
-                    id: "a",
-                    source: "gdelt",
-                    published_micros: 100 * SEC,
-                    ingested_micros: 1_000 * SEC,
-                },
-                Row {
-                    id: "b",
-                    source: "rss",
-                    published_micros: 200 * SEC,
-                    ingested_micros: 1_000 * SEC,
-                },
+                row("a", 100 * SEC, 1_000 * SEC),
+                row("b", 200 * SEC, 1_000 * SEC),
             ],
         );
         write_run(
@@ -385,19 +477,9 @@ mod tests {
             "run=20260702T043000000Z.parquet",
             &[
                 // same item, later run: the first sighting must win
-                Row {
-                    id: "a",
-                    source: "gdelt",
-                    published_micros: 100 * SEC,
-                    ingested_micros: 9_000 * SEC,
-                },
+                row("a", 100 * SEC, 9_000 * SEC),
                 // only the later run has it
-                Row {
-                    id: "c",
-                    source: "polygon",
-                    published_micros: 300 * SEC,
-                    ingested_micros: 9_000 * SEC,
-                },
+                row("c", 300 * SEC, 9_000 * SEC),
             ],
         );
         root
@@ -455,23 +537,59 @@ mod tests {
             "run=20260702T003000000Z.parquet",
             &[
                 Row {
-                    id: "",
+                    id: None,
                     source: "rss",
+                    title: "null id",
                     published_micros: 100 * SEC,
                     ingested_micros: 1_000 * SEC,
                 },
-                Row {
-                    id: "ok",
-                    source: "rss",
-                    published_micros: 100 * SEC,
-                    ingested_micros: 1_000 * SEC,
-                },
+                row("ok", 100 * SEC, 1_000 * SEC),
             ],
         );
         let day = day_of(root.path());
         assert_eq!(day.raw_rows, 2);
         assert_eq!(day.items.len(), 1);
         assert_eq!(day.unusable_rows, 1, "the null id is reported, not hidden");
+    }
+
+    /// A blank id is present, so nothing above counted it: it became the dedup key and every row
+    /// carrying it collapsed into the first one. The fixture writes a real empty string rather
+    /// than an Arrow null, which is why `Row::id` is an `Option`.
+    #[test]
+    fn a_blank_id_is_unusable_and_does_not_collapse_distinct_stories() {
+        let root = tempfile::tempdir().unwrap();
+        let part = root.path().join("session_date=2026-07-01");
+        std::fs::create_dir_all(&part).unwrap();
+        write_run(
+            &part,
+            "run=20260702T003000000Z.parquet",
+            &[
+                Row {
+                    id: Some(""),
+                    source: "rss",
+                    title: "story 0",
+                    published_micros: 100 * SEC,
+                    ingested_micros: 1_000 * SEC,
+                },
+                Row {
+                    id: Some("   "),
+                    source: "rss",
+                    title: "story 1",
+                    published_micros: 200 * SEC,
+                    ingested_micros: 1_000 * SEC,
+                },
+                row("real", 300 * SEC, 1_000 * SEC),
+            ],
+        );
+        let day = day_of(root.path());
+        assert_eq!(day.raw_rows, 3);
+        assert_eq!(day.unusable_rows, 2, "both blanks are reported");
+        assert_eq!(day.items.len(), 1);
+        assert_eq!(day.items[0].id, "real");
+        assert_eq!(
+            day.valid_time_conflict_events, 0,
+            "a lost story must not surface as a publication-time disagreement"
+        );
     }
 
     #[test]
@@ -482,16 +600,195 @@ mod tests {
         write_run(
             &part,
             "run=20260702T003000000Z.parquet",
-            &[Row {
-                id: "backwards",
-                source: "rss",
-                published_micros: 5_000 * SEC,
-                ingested_micros: 1_000 * SEC,
-            }],
+            &[row("backwards", 5_000 * SEC, 1_000 * SEC)],
         );
         let day = day_of(root.path());
         assert!(day.items.is_empty());
         assert_eq!(day.unusable_rows, 1);
+    }
+
+    /// Two counters, two units (R15). One id re-reported twice with a different publication time is
+    /// two row events and one item; the memo's lake-wide pair is 301 against 79.
+    #[test]
+    fn a_publication_time_disagreement_is_counted_as_rows_and_as_items() {
+        let root = tempfile::tempdir().unwrap();
+        let part = root.path().join("session_date=2026-07-01");
+        std::fs::create_dir_all(&part).unwrap();
+        write_run(
+            &part,
+            "run=20260702T003000000Z.parquet",
+            &[row("a", 100 * SEC, 1_000 * SEC)],
+        );
+        write_run(
+            &part,
+            "run=20260702T013000000Z.parquet",
+            &[row("a", 500 * SEC, 2_000 * SEC)],
+        );
+        write_run(
+            &part,
+            "run=20260702T023000000Z.parquet",
+            &[row("a", 700 * SEC, 3_000 * SEC)],
+        );
+        let day = day_of(root.path());
+        assert_eq!(day.items.len(), 1);
+        assert_eq!(
+            day.valid_time_conflict_events, 2,
+            "one event per re-reporting row"
+        );
+        assert_eq!(
+            day.items_with_conflicting_valid_time, 1,
+            "one item, however many times it was re-reported"
+        );
+        assert_eq!(
+            day.items[0].visibility.valid().inner().timestamp(),
+            100,
+            "the first sighting's publication time is the one kept"
+        );
+    }
+
+    /// The replacement path: a run file sorted later carries an EARLIER observation, so its row
+    /// replaces the kept one. The publication-time disagreement used to be dropped from the count
+    /// on this path. Unreachable on the archive as it stands and reachable with a second ingest
+    /// schedule or a backfill.
+    #[test]
+    fn a_replacing_row_counts_its_disagreement_too() {
+        let root = tempfile::tempdir().unwrap();
+        let part = root.path().join("session_date=2026-07-01");
+        std::fs::create_dir_all(&part).unwrap();
+        write_run(
+            &part,
+            "run=20260702T003000000Z.parquet",
+            &[row("a", 100 * SEC, 9_000 * SEC)],
+        );
+        write_run(
+            &part,
+            "run=20260702T043000000Z.parquet",
+            &[row("a", 500 * SEC, 1_000 * SEC)],
+        );
+        let day = day_of(root.path());
+        assert_eq!(day.items.len(), 1);
+        assert_eq!(
+            day.items[0].visibility.observed().inner().timestamp(),
+            1_000,
+            "the earlier observation replaces the kept sighting"
+        );
+        assert_eq!(
+            day.valid_time_conflict_events, 1,
+            "the disagreement is counted on the replacement path"
+        );
+        assert_eq!(day.items_with_conflicting_valid_time, 1);
+    }
+
+    /// R6 over the one column that used to be optional. A run file with no `tickers` column, and
+    /// one whose `tickers` cannot be read as a list of strings, are each a named error - not an
+    /// empty tag list on every row with `unusable_rows` at 0.
+    #[test]
+    fn a_missing_or_undecodable_tickers_column_is_an_error_not_an_empty_list() {
+        for (name, columns) in [("absent", false), ("wrong type", true)] {
+            let root = tempfile::tempdir().unwrap();
+            let part = root.path().join("session_date=2026-07-01");
+            std::fs::create_dir_all(&part).unwrap();
+            let tz: Arc<str> = Arc::from("UTC");
+            let mut fields: Vec<Field> = schema()
+                .fields()
+                .iter()
+                .filter(|f| columns || f.name() != "tickers")
+                .map(|f| (**f).clone())
+                .collect();
+            let mut arrays: Vec<arrow::array::ArrayRef> = Vec::new();
+            for field in &mut fields {
+                arrays.push(match field.name().as_str() {
+                    "timestamp" | "ingested_at" => Arc::new(
+                        TimestampMicrosecondArray::from(vec![100 * SEC]).with_timezone(tz.clone()),
+                    ),
+                    // A struct where a list of strings belongs: the shape the reader used to
+                    // swallow.
+                    "tickers" => {
+                        *field = Field::new(
+                            "tickers",
+                            DataType::Struct(vec![Field::new("sym", DataType::Utf8, true)].into()),
+                            true,
+                        );
+                        Arc::new(arrow::array::StructArray::from(vec![(
+                            Arc::new(Field::new("sym", DataType::Utf8, true)),
+                            Arc::new(StringArray::from(vec!["V"])) as arrow::array::ArrayRef,
+                        )]))
+                    }
+                    _ => Arc::new(StringArray::from(vec!["x"])),
+                });
+            }
+            let batch =
+                RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).expect("fixture batch");
+            let file = File::create(part.join("run=20260702T003000000Z.parquet")).unwrap();
+            let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+
+            let err = LakeReader::new(root.path())
+                .day(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap())
+                .unwrap_err();
+            match name {
+                "absent" => assert!(
+                    matches!(err, LakeError::MissingColumn("tickers")),
+                    "{name}: got {err:?}"
+                ),
+                _ => assert!(
+                    matches!(
+                        err,
+                        LakeError::BadColumnType {
+                            column: "tickers",
+                            ..
+                        }
+                    ),
+                    "{name}: got {err:?}"
+                ),
+            }
+        }
+    }
+
+    /// A `tickers` column that IS a list but of the wrong item type is refused, not cast.
+    /// `cast` succeeds from a numeric list, so before this check a `list<int64>` of `[7]` arrived
+    /// as the ticker `"7"` with `unusable_rows` at 0 - plausible data rather than an error, which
+    /// is worse than the empty list R6 forbids. Measured 2026-11-12.
+    #[test]
+    fn a_numeric_tickers_list_is_refused_rather_than_cast_to_strings() {
+        let root = tempfile::tempdir().unwrap();
+        let part = root.path().join("session_date=2026-07-01");
+        std::fs::create_dir_all(&part).unwrap();
+        let tz: Arc<str> = Arc::from("UTC");
+        let mut fields: Vec<Field> = schema().fields().iter().map(|f| (**f).clone()).collect();
+        let mut arrays: Vec<arrow::array::ArrayRef> = Vec::new();
+        for field in &mut fields {
+            arrays.push(match field.name().as_str() {
+                "timestamp" | "ingested_at" => Arc::new(
+                    TimestampMicrosecondArray::from(vec![100 * SEC]).with_timezone(tz.clone()),
+                ),
+                "tickers" => {
+                    *field = Field::new("tickers", DataType::new_list(DataType::Int64, true), true);
+                    Arc::new(ListArray::from_iter_primitive::<
+                        arrow::datatypes::Int64Type,
+                        _,
+                        _,
+                    >(vec![Some(vec![Some(7)])]))
+                }
+                _ => Arc::new(StringArray::from(vec!["x"])),
+            });
+        }
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).expect("fixture batch");
+        let file = File::create(part.join("run=20260702T003000000Z.parquet")).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let err = LakeReader::new(root.path())
+            .day(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap())
+            .unwrap_err();
+        assert!(
+            matches!(&err, LakeError::BadColumnType { column, actual }
+                if *column == "tickers" && actual.contains("Int64")),
+            "{err:?}"
+        );
     }
 
     #[test]

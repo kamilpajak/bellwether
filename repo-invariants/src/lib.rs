@@ -1,7 +1,10 @@
 //! Repo-wide invariant checks: row G1 of `docs/design/architecture.md` section 8, the lint floor
-//! every workspace member must opt in to. Why such a gate is its own crate: `CONTRIBUTING.md`,
-//! "Everything else". What it cannot see: section 8's third correction. Nothing depends on this
-//! crate; its product is a failing test whose message says what to add and where.
+//! every workspace member must opt in to. Two halves, because inheriting a table says nothing about
+//! what the table holds: [`lint_floor_failure`] checks that every member inherits it, and
+//! [`lint_floor_contents_failure`] checks the floor itself against the root manifest and
+//! `lint-floor.snapshot`. Why such a gate is its own crate: `CONTRIBUTING.md`, "Everything else".
+//! What neither can see is the hole row G1 states. Nothing depends on this crate; its product is a
+//! failing test whose message says what to add and where.
 //!
 //! The member set comes from `cargo metadata`, never from `workspace.members`: measured
 //! 2026-11-12 on cargo 1.99.1, a crate reached only by a `path` dependency from inside the
@@ -17,15 +20,89 @@ const MANIFEST: &str = "Cargo.toml";
 /// The two lines a crate needs in its own manifest to inherit the floor, indented for a message.
 const STANZA: &str = "        [lints]\n        workspace = true";
 const ROW: &str = "docs/design/architecture.md section 8 row G1";
-/// The lints a crate loses by omitting the stanza, pre-wrapped for a terminal. Spelled out rather
-/// than referenced so a reader need not open the root manifest to see what is switched off.
-const FLOOR: &str = concat!(
-    "        rust:   unsafe_code, unused_must_use\n",
-    "        clippy: unwrap_used, expect_used, panic, todo, unimplemented, unreachable,\n",
-    "                let_underscore_must_use",
-);
 /// The command that will not notice any of this.
 const BLIND: &str = "cargo clippy --locked --all-targets -- -D warnings";
+/// The committed floor, beside the crate that reads it. One line per lint, `table.name = level`;
+/// it is what [`lint_floor_contents_failure`] is given for this workspace, and public because the
+/// file is the record a reader goes looking for.
+pub const SNAPSHOT: &str = include_str!("../lint-floor.snapshot");
+/// The only two levels a floor may state. `warn` and `allow` make the entry decoration.
+const BINDING_LEVELS: [&str; 2] = ["deny", "forbid"];
+
+/// One entry of the root manifest's `[workspace.lints]`, as read from it. The names are never
+/// written down in this crate: a second copy of the list would drift from the manifest, and the
+/// manifest is where the list lives.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LintEntry {
+    /// The lint tool: `rust`, `clippy`, `rustdoc`.
+    pub table: String,
+    pub name: String,
+    /// `deny`, `forbid`, `warn` or `allow`, however the entry spells it.
+    pub level: String,
+}
+
+impl LintEntry {
+    fn line(&self) -> String {
+        format!("{}.{} = {}", self.table, self.name, self.level)
+    }
+}
+
+/// The root manifest's `[workspace.lints]`, sorted. `Err` when the manifest cannot be read or
+/// parsed, which is a different answer from an empty floor.
+pub fn read_lint_floor(root_manifest: &Path) -> Result<Vec<LintEntry>, String> {
+    let text = std::fs::read_to_string(root_manifest)
+        .map_err(|why| format!("{} could not be read: {why}", root_manifest.display()))?;
+    let doc: toml::Table = text
+        .parse()
+        .map_err(|why| format!("{} is not valid TOML: {why}", root_manifest.display()))?;
+    let mut entries: Vec<LintEntry> = Vec::new();
+    let Some(lints) = doc
+        .get("workspace")
+        .and_then(toml::Value::as_table)
+        .and_then(|workspace| workspace.get("lints"))
+        .and_then(toml::Value::as_table)
+    else {
+        return Ok(entries);
+    };
+    for (table, body) in lints {
+        let Some(body) = body.as_table() else {
+            continue;
+        };
+        for (name, value) in body {
+            // Cargo accepts `lint = "deny"` and `lint = { level = "deny", priority = -1 }`.
+            let level = value.as_str().map(str::to_owned).or_else(|| {
+                value
+                    .as_table()
+                    .and_then(|detail| detail.get("level"))
+                    .and_then(toml::Value::as_str)
+                    .map(str::to_owned)
+            });
+            entries.push(LintEntry {
+                table: table.clone(),
+                name: name.clone(),
+                level: level.unwrap_or_else(|| "(no level)".to_owned()),
+            });
+        }
+    }
+    entries.sort();
+    Ok(entries)
+}
+
+/// The floor as a message block: what a crate without the stanza loses, read from the root manifest
+/// rather than spelled out here, so the message cannot name a lint the root no longer holds.
+fn floor_block(root_manifest: &Path) -> String {
+    match read_lint_floor(root_manifest) {
+        Err(why) => format!("        (the root manifest could not be read: {why})"),
+        Ok(entries) if entries.is_empty() => {
+            "        (nothing - the root manifest states no `[workspace.lints]`)".to_owned()
+        }
+        Ok(entries) => entries
+            .iter()
+            .map(|entry| format!("        {}", entry.line()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
 
 /// How one workspace member stands with respect to the lint floor.
 #[derive(Debug, PartialEq, Eq)]
@@ -97,8 +174,84 @@ pub fn lint_floor_failure(root_manifest: &Path, gate_crate_dir: &str) -> Option<
         problems.len(),
         problems.join("\n"),
         STANZA,
-        FLOOR,
+        floor_block(root_manifest),
         BLIND,
+        ROW,
+    ))
+}
+
+/// The other half of row G1: the floor's **contents**. Inheritance can be in force everywhere while
+/// the table every member inherits says nothing, and nothing noticed - measured 2026-11-12 on a
+/// copy of this tree, deleting `unwrap_used = "deny"` from the root and adding an `unwrap()` left
+/// all three CI commands and the inheritance test at exit 0.
+///
+/// Two things are checked against the manifest alone, needing no second copy of the list: the floor
+/// is not empty, and every entry is at a level that refuses rather than decorates. The third is a
+/// comparison with `lint-floor.snapshot`, which is the one deliberate second copy: without it a
+/// deleted entry is invisible, because every expectation derived from the table disappears with the
+/// entry it describes. `snapshot` is passed in so the check can run against another floor.
+pub fn lint_floor_contents_failure(root_manifest: &Path, snapshot: &str) -> Option<String> {
+    let entries = match read_lint_floor(root_manifest) {
+        Ok(entries) => entries,
+        Err(why) => return Some(format!("{why}\n\nThe invariant is {ROW}.\n")),
+    };
+    let mut problems: Vec<String> = Vec::new();
+    if entries.is_empty() {
+        problems.push(format!(
+            "    * the root manifest states no `[workspace.lints]` at all, so every member's\n      \
+             `[lints] workspace = true` inherits nothing and `{BLIND}`\n      has nothing to say \
+             about an `unwrap()` anywhere in the workspace."
+        ));
+    }
+    for entry in entries
+        .iter()
+        .filter(|entry| !BINDING_LEVELS.contains(&entry.level.as_str()))
+    {
+        problems.push(format!(
+            "    * `{}` is at `{}`, which decorates rather than refuses. A floor entry is \
+             `deny`\n      or `forbid`; `forbid` is the only one a local `#![allow]` cannot \
+             switch off.",
+            entry.line(),
+            entry.level
+        ));
+    }
+
+    let held: Vec<String> = entries.iter().map(LintEntry::line).collect();
+    let committed: Vec<String> = snapshot
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect();
+    for gone in committed.iter().filter(|line| !held.contains(line)) {
+        problems.push(format!(
+            "    * `{gone}` is in lint-floor.snapshot and not in the root manifest. Deleting a \
+             floor\n      entry is the change nothing else in this repository can see: the lint \
+             stops\n      applying to every member at once and all three CI commands stay green."
+        ));
+    }
+    for added in held.iter().filter(|line| !committed.contains(line)) {
+        problems.push(format!(
+            "    * `{added}` is in the root manifest and not in lint-floor.snapshot."
+        ));
+    }
+    if problems.is_empty() {
+        return None;
+    }
+    Some(format!(
+        concat!(
+            "The workspace lint floor's contents are not the committed floor. {} problem(s):\n\n",
+            "{}\n\n",
+            "The floor as the root manifest states it now:\n\n{}\n\n",
+            "If the change is intended, edit `repo-invariants/lint-floor.snapshot` in the same\n",
+            "commit and say in the commit message which lint stopped applying and why. The ",
+            "snapshot\nis the second copy of this list on purpose: an expectation derived from the ",
+            "manifest\ndisappears together with the entry it was meant to protect. The invariant ",
+            "is {}.\n",
+        ),
+        problems.len(),
+        problems.join("\n"),
+        floor_block(root_manifest),
         ROW,
     ))
 }
@@ -341,6 +494,99 @@ mod tests {
         // `clippy::panic` is denied here too, so the report arrives as an assertion message.
         let failure = lint_floor_failure(&root_manifest(), &gate_crate_dir()).unwrap_or_default();
         assert!(failure.is_empty(), "\n\n{failure}\n");
+    }
+
+    /// Row G1's other half. The floor every member inherits is the floor that was committed, every
+    /// entry of it refuses rather than warns, and the list itself is read from the root manifest.
+    #[test]
+    fn the_lint_floor_holds_what_the_committed_snapshot_holds() {
+        let failure = lint_floor_contents_failure(&root_manifest(), SNAPSHOT).unwrap_or_default();
+        assert!(failure.is_empty(), "\n\n{failure}\n");
+    }
+
+    /// The message a member without the stanza gets names the real floor, so it cannot print a
+    /// lint the root has stopped holding.
+    #[test]
+    fn the_message_about_a_missing_stanza_names_the_floor_the_root_actually_states() {
+        let block = floor_block(&root_manifest());
+        assert!(block.contains("clippy.unwrap_used = deny"), "{block}");
+        assert!(block.contains("rust.unsafe_code = forbid"), "{block}");
+    }
+
+    // ---- the floor's contents, against synthetic root manifests ----
+
+    /// A root manifest holding exactly the three lines given, as `[workspace.lints]` entries.
+    fn root_with(lints: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MANIFEST);
+        std::fs::write(
+            &path,
+            format!("[workspace]\nmembers = [\"m\"]\nresolver = \"2\"\n{lints}"),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    const TWO_LINE_SNAPSHOT: &str = "clippy.unwrap_used = deny\nrust.unsafe_code = forbid\n";
+    const TWO_LINE_FLOOR: &str = "[workspace.lints.rust]\nunsafe_code = \"forbid\"\n\
+         [workspace.lints.clippy]\nunwrap_used = \"deny\"\n";
+
+    #[test]
+    fn a_floor_that_matches_its_snapshot_is_silence() {
+        let (_dir, root) = root_with(TWO_LINE_FLOOR);
+        assert_eq!(lint_floor_contents_failure(&root, TWO_LINE_SNAPSHOT), None);
+    }
+
+    /// The measured mutation: one entry deleted from the root, every member still inheriting, all
+    /// three CI commands green.
+    #[test]
+    fn a_lint_deleted_from_the_root_is_named() {
+        let (_dir, root) = root_with("[workspace.lints.rust]\nunsafe_code = \"forbid\"\n");
+        let failure =
+            lint_floor_contents_failure(&root, TWO_LINE_SNAPSHOT).expect("expected a failure");
+        assert!(failure.contains("`clippy.unwrap_used = deny` is in lint-floor.snapshot and not in the root manifest"), "{failure}");
+        assert!(failure.contains("stay green"), "{failure}");
+    }
+
+    /// The quieter mutation: the entry stays and stops binding.
+    #[test]
+    fn a_lint_downgraded_to_a_warning_is_named_as_decoration() {
+        let (_dir, root) = root_with(
+            "[workspace.lints.rust]\nunsafe_code = \"forbid\"\n\
+             [workspace.lints.clippy]\nunwrap_used = \"warn\"\n",
+        );
+        let failure =
+            lint_floor_contents_failure(&root, TWO_LINE_SNAPSHOT).expect("expected a failure");
+        assert!(
+            failure.contains("decorates rather than refuses"),
+            "{failure}"
+        );
+    }
+
+    /// A lint added to the root is also a change to the floor, and the snapshot is where it is
+    /// recorded. The `priority` form is cargo's second spelling of an entry.
+    #[test]
+    fn a_lint_added_to_the_root_asks_for_the_snapshot_to_say_so() {
+        let (_dir, root) = root_with(&format!(
+            "{TWO_LINE_FLOOR}[workspace.lints.rustdoc]\nbroken_intra_doc_links = {{ level = \"deny\", priority = -1 }}\n"
+        ));
+        let failure =
+            lint_floor_contents_failure(&root, TWO_LINE_SNAPSHOT).expect("expected a failure");
+        assert!(
+            failure.contains("`rustdoc.broken_intra_doc_links = deny` is in the root manifest"),
+            "{failure}"
+        );
+    }
+
+    #[test]
+    fn a_root_with_no_lint_table_at_all_is_the_loudest_case() {
+        let (_dir, root) = root_with("");
+        let failure =
+            lint_floor_contents_failure(&root, TWO_LINE_SNAPSHOT).expect("expected a failure");
+        assert!(
+            failure.contains("no `[workspace.lints]` at all"),
+            "{failure}"
+        );
     }
 
     // ---- synthetic workspaces, resolved by the real cargo ----

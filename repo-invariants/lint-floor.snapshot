@@ -1,0 +1,14 @@
+# The lint floor every workspace member inherits, one line per entry, `table.name = level`.
+# Read and compared by `lint_floor_contents_failure` in src/lib.rs; the floor itself lives in
+# `[workspace.lints]` in the root Cargo.toml and this file is only the record of what it held, so
+# that deleting an entry is a visible change rather than a silent one.
+# Blank lines and lines starting with `#` are ignored.
+clippy.expect_used = deny
+clippy.let_underscore_must_use = deny
+clippy.panic = deny
+clippy.todo = deny
+clippy.unimplemented = deny
+clippy.unreachable = deny
+clippy.unwrap_used = deny
+rust.unsafe_code = forbid
+rust.unused_must_use = deny

@@ -134,7 +134,8 @@ fn emit(day: &Day, before_cutoff: usize, format: Format) -> anyhow::Result<()> {
                     "raw_rows": day.raw_rows,
                     "distinct_items": before_cutoff,
                     "items_returned": day.items.len(),
-                    "valid_time_conflicts": day.valid_time_conflicts,
+                    "valid_time_conflict_events": day.valid_time_conflict_events,
+                    "items_with_conflicting_valid_time": day.items_with_conflicting_valid_time,
                     "unusable_rows": day.unusable_rows,
                     "items": day.items,
                 }),
@@ -147,7 +148,11 @@ fn emit(day: &Day, before_cutoff: usize, format: Format) -> anyhow::Result<()> {
             writeln!(out, "raw rows         {}", day.raw_rows)?;
             writeln!(out, "distinct items   {before_cutoff}")?;
             writeln!(out, "returned         {}", day.items.len())?;
-            writeln!(out, "valid-time clash {}", day.valid_time_conflicts)?;
+            writeln!(
+                out,
+                "valid-time clash {} row event(s), {} item(s)",
+                day.valid_time_conflict_events, day.items_with_conflicting_valid_time
+            )?;
             writeln!(out, "unusable rows    {}", day.unusable_rows)?;
             if let (Some(first), Some(last)) = (day.items.first(), day.items.last()) {
                 writeln!(

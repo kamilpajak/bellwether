@@ -8,7 +8,7 @@ resolver = "2"
 
 # The lint floor for every crate in the workspace. Why it is here and not in a package table, and
 # that inheritance is opt-in with nothing but row G1 checking for the stanza:
-# docs/design/architecture.md section 8, second correction and row G1.
+# docs/design/architecture.md section 8 rows G1 and R5.
 [workspace.lints.rust]
 unsafe_code = "forbid"
 # R5. Warn-by-default in rustc, so CI's own `-D warnings` already made the bare `f();` form red

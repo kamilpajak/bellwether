@@ -53,10 +53,10 @@ did this and it is the reason its dead-code share is 0.6%.
 
 ### 3. A measurement script is kept only if it will be run again
 
-Four live under `probes/`. They are there because each will run again — on a rule change, on a panel
-rebuild, at every stage of the migration. Roughly as many were deliberately not kept, and their
-numbers live in `docs/design/` with the construction that produced them, which is what a reader
-needs.
+The ones kept live under `probes/` and `probes/README.md` is the only count of them; each is there
+because it will run again — on a rule change, on a panel rebuild, at every stage of the migration.
+Roughly as many were deliberately not kept, and their numbers live in `docs/design/` with the
+construction that produced them, which is what a reader needs.
 
 A script that answered its question once is a receipt, not an asset. The number plus its
 construction is the artefact; the code is only worth the space when it has a second run ahead of it.
@@ -73,8 +73,8 @@ changes** rather than into a note below it.
 **The document states what is, not what was believed.** Superseded text is deleted and the
 measurement inside it moves into the row that now carries the claim. The record of what was believed
 when is the commit that changed it, where it costs nothing to keep and nobody has to read it to
-learn the current shape. Measured 2026-11-12: five "correction" blocks had grown to 81 lines, 14% of
-`architecture.md`, in one day.
+learn the current shape. Measured 2026-11-12: five "correction" blocks had grown to 81 lines of the
+file's 530, 15.3%, in one day.
 
 ## Everything else
 
@@ -89,15 +89,19 @@ learn the current shape. Measured 2026-11-12: five "correction" blocks had grown
   -- -D warnings`, `cargo test --locked --no-fail-fast`. The commands are the ones `README.md`
   names; change one and change the other, or the document starts lying.
 - `--no-fail-fast` is load-bearing: measured on this tree, one failing unit test made plain
-  `cargo test` exit without ever running the doc test, which is the only enforcement point for the
-  claim that the two time types cannot be compared.
+  `cargo test` exit without ever running the doc tests, which are the only enforcement point for
+  the claim that the two time types cannot be compared — the `compile_fail` block and, since
+  2026-11-12, the positive control that keeps it from passing vacuously (§8 row R2).
 - `unwrap`, `expect` and `panic!` are denied, `unsafe` is forbidden, and a discarded `Result` is an
   error under `unused_must_use` and `clippy::let_underscore_must_use`. The table is
   `[workspace.lints]` in the root `Cargo.toml`, so a new crate is covered by one stanza in its own
-  manifest: `[lints] workspace = true`. Two measured limits, both named in §8: that stanza is
-  opt-in and nothing checks for it (row G1), and the five `deny` lints are switched off from inside
-  a crate by one `#![allow]`, by wrapping the call in a local `macro_rules!`, or by writing it in a
-  doc test (row G2). Only `unsafe_code` is `forbid`, and only `forbid` refuses a local `allow`.
+  manifest: `[lints] workspace = true`. Row G1 checks that stanza, and since 2026-11-12 the table's
+  contents too, against `repo-invariants/lint-floor.snapshot`. Two measured limits, both named in
+  §8: a crate cargo counts as no member at all is covered by neither check (row G1), and the `deny`
+  lints are switched off from inside a crate by one `#![allow]` or by writing the call in a doc test,
+  with a local `macro_rules!` hiding the `unwrap`/`expect`/`panic!` half but not a discarded
+  `Result`; `let _named = f()` and `drop(f())` are missed with no opt-out at all (row R5). Only
+  `unsafe_code` is `forbid`, and only `forbid` refuses a local `allow`.
 - Every number in a document carries the construction and the date that produced it. A number
   without its construction is an anecdote, and the predecessor has a measured case of four studies
   sharing one upstream count and being wrong together.

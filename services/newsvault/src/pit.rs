@@ -1,7 +1,7 @@
 //! The point-in-time contract, as types: **valid time** is when the world published an item and
 //! **observation time** is when we could first have known it. The retrieval leak that forced the
-//! split is memo section 1.2; how far the split reaches, and the claim about it withdrawn on
-//! 2026-11-12, are `docs/design/architecture.md` section 8 row R2 and its first correction.
+//! split is memo section 1.2; how far the split reaches, and where it stops, are
+//! `docs/design/architecture.md` section 8 row R2.
 //! [`Visibility::visible_at`] is the single query and requires both instants.
 //!
 //! The two instants cannot be compared with each other, because they are different types:
@@ -12,6 +12,25 @@
 //! let v = ValidTime::new(Utc.timestamp_opt(0, 0).single().unwrap());
 //! let o = ObservationTime::new(Utc.timestamp_opt(1, 0).single().unwrap());
 //! let _ = v < o; // mismatched types
+//! ```
+//!
+//! **The positive control for the block above.** A `compile_fail` test passes whenever its snippet
+//! fails to compile for *any* reason, so on its own it is a test of "this does not compile" rather
+//! than of "these cannot be compared". This second doc test carries the same `use` line and the
+//! legal form of the comparison, so a rename, a moved path or a broken import turns it RED while
+//! the `compile_fail` one above would stay green. Measured 2026-11-12 on a copy of this tree:
+//! replacing the compared line with a call to a function that does not exist left the
+//! `compile_fail` test reporting `ok`, and renaming the module left it reporting `ok` too while
+//! this block failed with `error[E0432]: unresolved import`. A `compile_fail,E0308` annotation does
+//! not close that hole — measured the same day, rustdoc reports `ok` for a snippet that fails with
+//! a different error code than the one declared.
+//!
+//! ```
+//! use newsvault::pit::{ObservationTime, ValidTime};
+//! # use chrono::{TimeZone, Utc};
+//! let v = ValidTime::new(Utc.timestamp_opt(0, 0).single().unwrap());
+//! let o = ObservationTime::new(Utc.timestamp_opt(1, 0).single().unwrap());
+//! assert!(v.inner() < o.inner()); // the two instants compare only through `inner()`
 //! ```
 
 use chrono::{DateTime, Duration, Utc};
@@ -111,10 +130,38 @@ pub enum PitError {
 }
 
 /// The pair of instants that decides whether an item may enter an analysis.
+///
+/// Deserialisation goes through [`WireWindow`] rather than straight onto the fields, so the file
+/// path runs the same ordering check as [`Visibility::from_live`]: section 4 makes vault-to-derive a
+/// FILE boundary and section 3.10.2 specifies a JSON stream carrying both instants, so serde is
+/// that consumer's normal constructor and not an exception.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "WireWindow")]
 pub struct Visibility {
     valid: ValidTime,
     observed: ObservationTime,
+}
+
+/// The two instants as they travel on the wire, with no claim about their order. It exists so that
+/// [`Visibility`] has no deserialisation path that skips the check: a derived `Deserialize` over
+/// the private fields accepted an item observed before it was published, with a negative
+/// [`Visibility::lag`] - measured 2026-11-12 from outside the crate, and what section 5's fourth
+/// row forbids.
+#[derive(Deserialize)]
+struct WireWindow {
+    valid: ValidTime,
+    observed: ObservationTime,
+}
+
+impl TryFrom<WireWindow> for Visibility {
+    type Error = PitError;
+
+    /// The same check as `from_live`, because the invariant is about the pair and not about how the
+    /// pair was produced: a backfilled item's observation is its publication plus a non-negative
+    /// lag, so it satisfies this too.
+    fn try_from(wire: WireWindow) -> Result<Self, Self::Error> {
+        Self::from_live(wire.valid, wire.observed)
+    }
 }
 
 impl Visibility {
@@ -233,6 +280,34 @@ mod tests {
         );
         assert!(v.visible_at(Cutoff::new(at(two_days))));
         assert_eq!(v.lag(), Duration::seconds(two_days));
+    }
+
+    /// The file path is a constructor too. Before the `try_from` attribute the derived
+    /// `Deserialize` wrote straight onto the private fields, so this pair arrived with a negative
+    /// lag while `from_live` refused it.
+    #[test]
+    fn deserialising_an_item_observed_before_it_was_published_is_refused() {
+        let backwards = r#"{"valid":"2026-07-01T12:00:00Z","observed":"2026-06-01T00:00:00Z"}"#;
+        let why = serde_json::from_str::<Visibility>(backwards).unwrap_err();
+        assert!(
+            why.to_string().contains("nothing is seen before it exists"),
+            "{why}"
+        );
+    }
+
+    /// The other half of the same check: a well-ordered pair still deserialises, and to the same
+    /// value the constructor gives.
+    #[test]
+    fn deserialising_a_well_ordered_pair_gives_what_the_constructor_gives() {
+        let forwards = r#"{"valid":"2026-06-01T00:00:00Z","observed":"2026-07-01T12:00:00Z"}"#;
+        let read: Visibility = serde_json::from_str(forwards).unwrap();
+        let built = Visibility::from_live(
+            ValidTime::new("2026-06-01T00:00:00Z".parse().unwrap()),
+            ObservationTime::new("2026-07-01T12:00:00Z".parse().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(read, built);
+        assert!(read.lag() > Duration::zero());
     }
 
     #[test]

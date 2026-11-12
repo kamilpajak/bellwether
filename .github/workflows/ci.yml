@@ -1,5 +1,6 @@
 # The gate: it is what turns "a test exists" into "a test ran" (docs/design/architecture.md
-# section 8, first correction), and what it does NOT cover is that section's own table. The
+# section 8 row R2, which this workflow is the enforcement point of), and what it does NOT cover is
+# that section's own table. The
 # commands must stay the ones README.md names - CONTRIBUTING.md, "Everything else".
 #
 # No toolchain setup step: the GitHub ubuntu runner image installs cargo, rustfmt and clippy
@@ -50,10 +51,16 @@ jobs:
           src=0; tst=0
           while IFS= read -r f; do
             all=$(wc -l < "$f")
-            head=$(awk '/^ *#\[cfg\(test\)\]/{exit} {n++} END{print n+0}' "$f")
+            case "$f" in
+              # An integration-test target carries no `#[cfg(test)]` marker, so the scan below
+              # would count every line of it as source and report a ratio that falls when a test
+              # file is added. Such a file is test from its first line.
+              */tests/*.rs) head=0 ;;
+              *) head=$(awk '/^ *#\[cfg\(test\)\]/{exit} {n++} END{print n+0}' "$f") ;;
+            esac
             src=$((src + head)); tst=$((tst + all - head))
-          # Every crate, not just `services`: measured 2026-11-12, the two gate crates hold 1,784
-          # of the tree's 2,791 Rust lines, and a ratio that leaves them out is not the repository's.
+          # Every crate, not just `services`: measured 2026-11-12, the two gate crates hold 2,233
+          # of the tree's 3,531 Rust lines, and a ratio that leaves them out is not the repository's.
           done < <(find . -name '*.rs' -not -path './target/*')
           py=$(find probes -name '*.py' -exec cat {} + | wc -l)
           doc=$(find docs -name '*.md' -exec cat {} + | wc -l)

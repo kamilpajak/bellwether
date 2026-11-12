@@ -344,7 +344,7 @@ side is switched off.
 
 Demonstrated on 2026-11-11 over the **whole archive**, not a sample. Two implementations written
 independently from the same stated rules — one in Rust, one in pandas — were run over all 156 lake
-partitions and compared on five fields per day, including a sha256 digest of the sorted item-id set:
+partitions and compared on six fields per day, including a sha256 digest of the sorted item-id set:
 
 | | |
 |---|---|
@@ -352,12 +352,24 @@ partitions and compared on five fields per day, including a sha256 digest of the
 | raw rows | 243,226 |
 | distinct items after the first-sighting rule | 62,507 |
 | unusable rows | 0 |
-| valid-time conflicts | 301 |
+| valid-time disagreements, as **row events**: one per row re-reporting an id with a different publication time | 301 |
+| the same disagreements as **items**: distinct ids carrying more than one publication time inside their partition | 79 |
 | **days agreeing on every field, digest included** | **156 / 156** |
 
 Zero disagreements, so the rules of §2.1 are unambiguous rather than merely written down. That is
 the shape every stage needs — characterisation tests at the command-line boundary, not ported unit
 tests.
+
+**The two conflict rows are one disagreement counted in two units, and the row count is the larger
+by 3.8×.** Both re-derived on 2026-11-12, after the sixth field was added: the row events by summing
+`newsvault day --format json` over the 156 partitions and again through `probes/parity_baseline.py`,
+which agreed on all five counts. Lake-wide the item figure is **580** rather than 79, because an id
+re-stamped between two partitions is invisible to a reader of one — counted with pyarrow over the
+779 run files, the same cross-partition pass that gives the architecture's §10 its 61,282 distinct
+ids against the 62,507 the per-day counts sum to. It decomposes exactly: the 79 ids carrying two
+times inside one partition and the 501 ids §10 counts as repeating across partitions are disjoint
+sets, and 79 + 501 = 580. The number that sizes R15's population is therefore 79 within a partition
+and 580 across the archive; 301 sizes the counting, not the population.
 
 One caution from doing it: the first comparison reported a mismatch on all 156 days because the
 digest was computed once through the shell (`sort` collates by locale, `shasum` counts a trailing
