@@ -87,7 +87,7 @@ The archive record. Every consumer sees this shape and none sees the storage beh
 | `valid_precision` | `instant` \| `day` \| `unknown` | A publication time scraped from page metadata is often a date with no hour. An item with `day` precision cannot be assigned to a pre-close window, so the precision must travel with the value rather than being assumed. |
 | `valid_disputed` | bool | **R15.** Set when another source carries the same story at a materially earlier time. |
 | `earliest_valid_at` | `ValidTime?` | **R15.** The earlier twin's time, carried alongside. Neither value is moved: a disputed date is an **unknown** age, never an old one. |
-| `title`, `body`, `url`, `lang` | strings | `body` is article text, not page HTML. **R17.** |
+| `title`, `body`, `url`, `lang` | strings | `body` is article text, not page HTML. **R17.** Superseded 2026-11-12: `body` becomes `body_ref`, §3.9. |
 | `raw_blob_ref` | digest | the payload as received, so extraction can be redone when its rules change |
 | `vendor_tickers` | list | the vendor's own tagging, **kept and never used for matching** |
 | `vendor_duplicate_flag` | bool | the vendor's own dedup verdict, **kept and never filtered on** |
@@ -207,9 +207,9 @@ A derived surface on `vault`, never a window onto the outbox.
 | field | notes |
 |---|---|
 | `seq` | the store's ordering authority, so a consumer can order by ours instead of trusting clocks |
-| `item_id`, `valid_at`, `observed_at`, `valid_precision`, `source`, `provenance` | the consumer makes its own point-in-time cut |
+| `item_id`, `valid_at`, `observed_at`, `valid_precision`, `source`, `provenance`, and from 2026-11-12 `valid_disputed` with `earliest_valid_at` (§3.10.2) | the consumer makes its own point-in-time cut |
 | `title`, `url`, `body_ref` | |
-| `schema_version` | the item contract, versioned apart from the storage row |
+| `schema_version` | the item contract, versioned apart from the storage row. Renamed to `schema` 2026-11-12, §3.10.2 |
 
 Plus a **heartbeat** carrying `seq`, an instant and items-since. Silence must be distinguishable
 from a dead stream, because a consumer reading our outage as "no news" turns our failure into theirs.
@@ -222,6 +222,89 @@ is an HTTP read of it; a latency promise would need a freshness number the desig
 `ledger` consumes briefs, prices and realised outcomes and produces readings. It holds no edge back
 upstream: a service that sees outcomes must not influence the service that produces proposals, or
 selection happens under the result. The absence of that edge is enforced in §8, not trusted.
+
+### 3.9 `RawBlob` and `Expiry` — the layer a retention number may name (decided 2026-11-12)
+
+| layer | addressed by | may a number expire it |
+|---|---|---|
+| L0 item row (§3.1 minus the text) | `item_id` | **never** — it carries R1's completeness claim |
+| L1 extracted body | `body_ref` | **not as a setting.** Matching runs over body text (R17), so an expired body cannot be re-matched under a new `rule_version`; a number here reopens memo D-2 instead of configuring it. |
+| L2 payload as received | `raw_blob_ref` | **yes.** The cost is re-extraction, and memo §6b says an index timestamp is not an immutable archive, so a re-fetch may not recover it. |
+
+**This changes §3.1**, which holds `body` as a string while §3.7 already carries `body_ref`. `body`
+becomes `body_ref`, beside each blob's length and a `present`/`expired` state; a digest is what
+proves a restored copy is the same bytes.
+
+**An expiry is its own row type, under the same `seq`, and not an `Attempt`.** An `Attempt` is keyed by
+what a vendor was asked (§3.2), so a deletion filed as `outcome=empty` would count as a quiet vendor
+inside the reconstruction R16 exists for. `Expiry` carries `blob_digest`, `layer`, `bytes`,
+`items_affected`, `policy_version`, `decided_at`, `deleted_at` and `seq`, and `policy_version` hashes a
+retention file as §3.3 hashes a rule file — the mechanism by which a later number is a setting. A
+consumer meets the absence at the item row's state, not at a failed blob fetch, which is why §5.1 gives
+it no code. Only `vault` may delete, and only at L2.
+
+**Measured 2026-11-12 at 42322eb, and no gate proposed.** Two temporary fixtures in `lake.rs`, run and
+reverted: a null `body` returns `body == ""` with `unusable_rows == 0`, while dropping the column fails
+the whole day as `LakeError::MissingColumn("body")`. The inherited layout has no third state, which is
+why L1 and L2 are blobs beside the row. Nor can anything delete yet — `ls services` returns `newsvault`
+alone and no `fs::remove_*` call exists in any `*.rs` outside `target/`.
+
+**The ceiling: this settles the layer, not the number.** N4 still needs a count of days for L2 and a
+medium for what is kept past it, one number per provenance class (§3.1) being the next smallest
+form. Until N1 names the second copy every number is a delete, not a demotion. The memo's §3 charter
+bars deleting "to another consumer's budget", which an L2 expiry under its own `policy_version` is not.
+
+### 3.10 Wire formats — two of the eight contracts, decided 2026-11-12
+
+§10's first bullet made serialisation conditional on a second consumer. Counted over §3.1–3.8: `Panel`
+has two — `propose`, and the statistics tier whose live half is `probes/panel_power.py`, reading an
+ad-hoc `assign.json` + `meta.json` where the panel belongs; its manifest half is `panel-contract`'s
+and R8's, not this section's. `Item` has three, from §4's boundary table, none with code and none
+specified here. `StreamMessage` has none at all, so §3.10.2 is here on D-7's instruction that the
+shape go in from the start, not on §10's trigger. The other five wait on a consumer that has code.
+
+#### 3.10.1 `panel.data/1` — the Arrow data file beside the manifest
+
+Arrow IPC **file** format, one schema, rows sorted by (`session`, `ticker`) so a `panel_id` has one
+byte sequence.
+
+| column | Arrow type | null | unit, and who reads it |
+|---|---|---|---|
+| `ticker` | `utf8` | no | both consumers |
+| `session`, `next_session` | `date32` | no | labels in the calendar named by `calendar_version`, never instants. `next_session` is stored rather than re-derived, because a half-day is §2's named way to get this silently wrong |
+| `has_relation` | `bool` | no | the statistics tier's control arm. Per row, not per ticker: constant across a ticker's rows today, and a point-in-time relation map makes it vary without a grain change |
+| `salient_counterparties` | `list<struct<name: utf8 not null, salience: int64 not null>>` | no; an untreated row carries an empty list | `salience` counts in the unit named by the `salience_unit` metadata key. `propose` takes the counterparty, the tier takes treatment |
+
+`salience` is an integer, never a float that could lose a count (`Shape::Count` in
+`panel-contract`). No `present` or `treated` column: presence is the grain, since a row exists only
+when both closes are there (R8 in the shape), and treatment is a non-empty list. Three `utf8`
+metadata keys: `schema` = `panel.data/1`, so the manifest holds no second copy of the version;
+`panel_id`, so a stray pairing is detectable; and `salience_unit` = `occurrences` or `documents`, so
+a D-8 flip shows in the data. **What never changes:** one row per (ticker, session) present, so the
+manifest's `rows` is this file's row count — the identity §8's fifth correction asks a second reader
+for.
+
+#### 3.10.2 `newsvault.stream/1` — the private item stream
+
+One JSON object per WebSocket text frame, never an array, each carrying `type` (`item` or
+`heartbeat`) and `schema` = `newsvault.stream/1` — on every frame and not only at connect, so a
+reconnecting consumer sees it. An item frame carries §3.7's field list as amended below and nothing
+of its own, instants being RFC 3339 UTC `Z`; a heartbeat carries `at`, `items_since` on this
+connection, `heartbeat_seconds`, and `seq`, the last the store committed. **What never changes:**
+`seq` is the commit order, strictly increasing, never re-used or re-ordered, and gaps are allowed
+because D-7 promises no delivery — a gap is closed by the HTTP read, never read as an ordering. **A
+ceiling:** the frame carries `heartbeat_seconds` rather than naming one here, no measurement and no
+owner decision having produced a number; it is a liveness interval, never N2's freshness target.
+
+**Two amendments to §3.7, made now because they are breaking changes after the first connection:**
+`schema_version` becomes the key `schema`, the spelling `newsvault.day/1` and `panel.manifest/1`
+already use, and `valid_disputed` with `earliest_valid_at` join the field list, because a consumer
+cutting on an undisputed-looking `valid_at` makes exactly the R15 error; `body` against `body_ref`
+there is settled by §3.9. The key is `seq`, not the `sequence` of the owner's NDJSON convention, §2
+being where the ordering authority is named; either way that convention is unmet in code, measured
+2026-11-12, because `newsvault --format=ndjson` emits item lines carrying neither key and no `type`.
+**Nothing here is enforced:** no validator exists and nothing produces either artefact, and an unknown
+version is refused as `panel-contract` refuses one (`unknown_schema`).
 
 ---
 
@@ -257,6 +340,41 @@ What each service does when its input is wrong, rather than what it does when ev
 | a brief carries an order-shaped field | rejected by schema | **R12b** |
 | an event is lost | latency, not data: the archive is the source of truth and the hourly sweep closes the gap | memo §4 rule 2 |
 | a consumer is silently dead | detected by lag and backlog depth, not by staleness | memo §4 rule 3 |
+
+### 5.1 The error-code registry (decided 2026-11-12)
+
+**What a code is.** The `code` field of the error object a command writes to stderr before exiting
+non-zero, and nothing else. The nine rows above are four mechanisms and only one is that object, so
+this registry points at the other three rather than naming a condition twice: §3.2's outcome values,
+the counted rows of rows 4 and 5, and `panel-contract`'s `Finding.code`.
+
+Eight of the nine rows therefore take no code; row 1 is the one that does. Four belong to services that
+do not exist — measured 2026-11-12 at 42322eb, `grep -rl` over `*.rs` outside `target/` matches nothing
+for `Attempt`, `collapsed` or `brief`, and no crate depends on an HTTP client — so a code for them would
+be §8's fourth correction written again. Two are reachable and not errors, an observation before its
+publication counted and a repeat resolved (§3.9 owns a third), and the last two are monitoring rows.
+
+| code | exit | the condition, and who can emit it |
+|---|---|---|
+| `invalid_argument` | 2 | the caller's own mistake, which §5 has no row for. Every CLI |
+| `input_absent` | 4 | a required input file is missing (row 1). `vault`, `panel-contract` |
+| `day_absent` | 4 | narrower: the store is there, the day is not in it (row 1). `vault` |
+| `input_unparseable` | 2 | the file is present and is not what the contract says. `vault`, `panel-contract` |
+| `input_schema_mismatch` | 2 | a required column is absent or has an unusable type. `vault` |
+| `io_failed` | 2 | a read or write the filesystem refused for another reason. Every CLI |
+
+`day_absent` is separate for the reason the coverage ledger exists; measured 2026-11-12, two states
+reach it through one `LakeError::MissingDay`, an absent partition directory and one holding no run
+file. Every `retryable` is `no`: nothing here makes a network call, so exit 7 has no member yet.
+
+**One invariant over the exit codes, readable by a test: stdout is non-empty if and only if the exit
+status is 0 or 1.** It does not hold today. Measured 2026-11-12 at 42322eb, `panel-contract
+validate` on `{}` exits 1 with ten findings on stdout and nothing on stderr, while `newsvault day`
+over a 7-byte `.parquet` exits 1 with an empty stdout and `error: EOF: Parquet file too small` on
+stderr; each tool also publishes its own `schema` map, `{"1": "failed"}` against `{"1": "not
+admissible"}`. **The ceiling:** `1` is undocumented, and the fork is the owner's: either it means
+"the answer is no" and the three error classes above move to `2`, changing `newsvault` only, or it
+means an error and `panel-contract validate` stops carrying its verdict in the exit status.
 
 ---
 
@@ -314,14 +432,14 @@ today — named rather than hidden.
 
 | # | invariant | enforced by | status |
 |---|---|---|---|
-| R1 | archive complete, caps are views | `vault` has no truncating write path; the cap lives in a view builder | design |
+| R1 | archive complete, caps are views | `vault` has no truncating write path; the cap lives in a view builder; §3.9 confines deletion to the L2 blob layer and to `vault` | design |
 | R2 | valid and observation time are distinct types | the type system; a `compile_fail` doc test pins it, and CI runs it | **enforced, but narrower than §3.1 claims** — see the correction below |
 | R3 | first sighting wins | unit tests in `newsvault` | **enforced** |
 | R4 | coverage ledger beside every store | a write to the archive without an `Attempt` row fails the store's own test | design |
 | R5 | failed calls must be handled | `cargo clippy --locked --all-targets -- -D warnings` in CI, over the workspace lint set: `unused_must_use` denied under rust (which also makes a local `cargo check` fail, not merely warn) and `let_underscore_must_use` denied under clippy, which is the only form the move newly catches in CI. Never the type system. | **enforced against the accidental case only** — three escapes measured 2026-11-12: a violation inside a local `macro_rules!` passes; a crate- or module-level `#![allow]` switches any of these off and no command notices; and doc tests are reached by nothing, because `--all-targets` does not cover them. |
 | R6 | missing input aborts | unit tests cover the missing root and the missing day. But `lake.rs` `string_list_at` has five `Vec::new()` exits, four of which swallow a real decoding error while `unusable_rows` stays 0 — so the loader does have empty-fallback branches. | **partly** |
 | R7 | units are types, identity is a content hash | nothing. `grep -rn item_id services/newsvault/src` returns no match: there is no derivation and no test. Unit newtypes are also absent. | **no enforcement point yet**, both halves |
-| R8 | presence counted, never multiplied | `panel-contract`, a workspace member both sides of the panel file boundary can depend on. Six rules over the manifest: the identity and input fields must be present; `exchangeable_units` must carry a count **and** a definition of the unit; the attrition chain must reconcile, cardinality product minus attrition equal to `rows`; `rows` equal to a product of the stated cardinalities — a pair, the whole product, or a single pre-multiplied one — needs an explicit `zero_attrition_counted` sentence; `exchangeable_units.count` equal to `rows` needs a `rows_are_exchangeable` sentence; a count above `rows` is an error with no attestation, because no state of the world matches it. Seven committed fixtures, two of which are the historical case: `1 672 × 47 = 78 584` with no attrition and no unit count is rejected and the product is named, and the recounted `78 460` with 124 dropped rows and 47 sessions as the unit is admitted. | **enforced, within a stated ceiling** — see the fifth correction |
+| R8 | presence counted, never multiplied | `panel-contract`, a workspace member both sides of the panel file boundary can depend on. Six rules over the manifest: the identity and input fields must be present; `exchangeable_units` must carry a count **and** a definition of the unit; the attrition chain must reconcile, cardinality product minus attrition equal to `rows`; `rows` equal to a product of the stated cardinalities — a pair, the whole product, or a single pre-multiplied one — needs an explicit `zero_attrition_counted` sentence; `exchangeable_units.count` equal to `rows` needs a `rows_are_exchangeable` sentence; a count above `rows` is an error with no attestation, because no state of the world matches it. Seven committed fixtures, two of which are the historical case: `1 672 × 47 = 78 584` with no attrition and no unit count is rejected and the product is named, and the recounted `78 460` with 124 dropped rows and 47 sessions as the unit is admitted. Its ceiling is the fifth correction's, and §3.10.1 is what would close it. | **enforced, within a stated ceiling** — see the fifth correction |
 | R9 | power from the registered procedure | the statistics tier refuses a panel without `exchangeable_units`; `params_version` names the power method | **no enforcement point yet** |
 | R10 | provenance labelled | enum field, non-nullable | design |
 | R11 | backfill lag is measured | `from_backfill` requires a `MeasuredLag`, so the **type** cannot be skipped. But all four of its fields are `pub` with no validating constructor, so `{probe_id: "", probes: 0, leaks: 0, seconds: 0}` is accepted — demonstrated 2026-11-12 from outside the crate. And `Visibility` derives `Deserialize` over private fields, which bypasses `from_live`. | **the type is required; the measurement is not** |
@@ -334,6 +452,7 @@ today — named rather than hidden.
 | R17 | matching survives a broad corpus, over article body | the rules file is hashed and versioned; the gazetteer regression case is a test | design |
 | R18 | two rule versions, one snapshot, a diff | a `derive diff` subcommand; its absence is the gap | design |
 | G1 | **a workspace member inherits the lint floor** | a test in the `repo-invariants` crate. It asks `cargo metadata` for the member set rather than reading `workspace.members`, because that list is **not** the member set: measured 2026-11-12, a crate reached only by a `path` dependency is a member, is compiled by `cargo clippy --locked --all-targets`, inherits nothing, and all three CI commands exit 0 over an `unwrap()` in it. The test also rejects `lints = { workspace = true }` written inside `[package]`, which cargo ignores without a warning while the crate passes clippy. It polices its own crate too. | **enforced** |
+| E1 | an error code is never renamed, and no code reaches stderr from outside the table | nothing yet. §5.1 specifies the registry; the check is a workspace member `error-codes/` holding `const CODES` beside a committed `codes.snapshot`, a test that every snapshot line survives with the same exit status and retryable flag, and an error constructor taking `&'static Code` so a bare literal does not compile — measured 2026-11-12, the nearest vocabulary that exists is `panel-contract`'s 14 `Finding` codes, which go to stdout and which §5.1 keeps out of this registry; all 14 are bare `&'static str` literals, so a fifteenth needs no table entry and no review. Repurposing is not checkable at all, because no test reads meaning. | **no enforcement point yet** |
 
 **Correction, 2026-11-12, after an adversarial review.** Four rows above said **enforced** and did
 not earn it, and one structural problem outranked all of them: before this date there was no CI, so
@@ -435,16 +554,19 @@ narrowness is machine-readable rather than left to be rediscovered.
 
 Beyond the memo's own open decisions:
 
-- **No wire formats.** Field names and types are given; the serialisation is not. Arrow schema and
-  JSON shapes come with the first service that has a second consumer.
-- **No error-code registry.** §5 gives behaviours, not stable codes, and the CLI contract wants a
-  registry whose codes are never renamed or repurposed.
-- **No retention policy.** How long raw blobs live, and on what medium, is memo question N4 and the
-  answer changes the storage design rather than a setting.
+- ~~**No wire formats.** Field names and types are given; the serialisation is not.~~ **Two of the
+  eight fired on 2026-11-12: §3.10**, which also counts the consumers of the ones it leaves alone.
+- ~~**No error-code registry.** §5 gives behaviours, not stable codes, and the CLI contract wants
+  a registry whose codes are never renamed or repurposed.~~ **Decided 2026-11-12: §5.1**, including
+  which of §5's rows get no code. Its enforcement point is §8 row E1.
+- ~~**No retention policy.** How long raw blobs live, and on what medium, is memo question N4 and
+  the answer changes the storage design rather than a setting.~~ **The layer a number may name is
+  settled: §3.9.** The count of days and the medium are still N4.
 - **No backup design.** Memo question N1. The archive is called irreplaceable in both documents and
   neither says where its second copy lives. Of everything unresolved here this is the one whose
   absence costs most if it is still absent in a year.
 - **No freshness target**, so §5's lag-and-backlog detection has nothing to alert on yet. Memo
   question N2.
-- **The two enforcement gaps of §8**, R8 and R9. R12a left the list on 2026-11-12 because it belongs to
-  a service that does not exist; it is not closed, it is relocated, and §7 says where.
+- **The enforcement gaps of §8** are that table's own status column, not a second list here. This
+  bullet read "R8 and R9" until 2026-11-12, by which date R8 was closed within a ceiling while R6,
+  R7, R9, R11 and the new E1 were open. R12a is relocated rather than closed, and §7 says where.
