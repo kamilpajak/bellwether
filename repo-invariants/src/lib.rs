@@ -1,12 +1,17 @@
 //! Repo-wide invariant checks.
 //!
 //! Section 8 of `docs/design/architecture.md` lists every invariant and the single place it is
-//! enforced. Most belong to one crate and are tested inside it. A few are properties of the
+//! enforced. Most belong to one crate and are tested inside it. One is a property of the
 //! *repository* rather than of any crate: row G1 (every workspace member inherits the lint
-//! floor), row R12 (no crate holds a path to the order queue) and row R8 (no panel manifest
-//! whose row count is a product of two cardinalities). Those have no owning crate, and a check
-//! placed inside one of the things it polices disappears the day that thing is split or deleted.
-//! They live here.
+//! floor). It has no owning crate, and a check placed inside one of the things it polices
+//! disappears the day that thing is split or deleted. It lives here.
+//!
+//! Two rows were listed here earlier on 2026-11-12 and are not this crate's, which is recorded
+//! rather than quietly deleted. Row R12 left the repository: an AST check forbidding
+//! order-placing calls passes unconditionally where no broker code exists, and the invariant
+//! belongs to a mediating service that does not exist yet. Row R8 is about an artefact rather
+//! than about the repository, so it lives in `panel-contract`, which both sides of the panel
+//! file boundary can depend on.
 //!
 //! This crate ships no runtime behaviour and nothing depends on it. Its product is a failing
 //! test whose message tells a reader who has never seen it what to add and where.

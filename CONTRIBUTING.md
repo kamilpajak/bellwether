@@ -74,8 +74,12 @@ was believed when.
 ## Everything else
 
 - Repo-wide invariants live in `repo-invariants/`, not inside the crate they police: a gate that
-  lives in one of the things it checks disappears the day that thing is split. Its first test is
+  lives in one of the things it checks disappears the day that thing is split. Its only test is
   §8 row G1.
+- A gate over an **artefact** that crosses a boundary goes in its own contract crate instead —
+  `panel-contract/` is the first — because both sides of the boundary depend on it and neither
+  owns it. Put the validator in the producer and the consumer trusts the producer's reading of
+  the rules; put it in the consumer and the producer cannot check its own output before writing.
 - The gate is `.github/workflows/ci.yml`: `cargo fmt --check`, `cargo clippy --locked --all-targets
   -- -D warnings`, `cargo test --locked --no-fail-fast`. The commands are the ones `README.md`
   names; change one and change the other, or the document starts lying.

@@ -1,0 +1,24 @@
+{
+  "schema": "panel.manifest/1",
+  "panel_id": "sha256:fdcb004951792ab5508d981ee16ddd6be5bff51f4afd12cc5e9f65f043ffab5e",
+  "snapshot_id": "sha256:cb519346bd0f7b617b5e9c7bde68dd42427b976b99aa1e762ddcf208a6b08c74",
+  "rule_version": "sha256:65598ce2157aa8f506b26e09f0e544f00af5ca8de2ee95f251350b07a3705b70",
+  "calendar_version": "sha256:e3482711a21299ccb68539c10b5a32bde34bd373615c3ec6a0b96c315c7ca2fd",
+  "cutoff": "2026-08-14T20:00:00Z",
+  "rows": 1600,
+  "cardinalities": [
+    {"name": "companies", "count": 1672},
+    {"name": "sessions", "count": 1}
+  ],
+  "attrition": [
+    {"stage": "no_close_on_session", "rows_dropped": 72}
+  ],
+  "exchangeable_units": {
+    "count": 1600,
+    "unit": "company",
+    "definition": "One company on the single session this cross-section covers."
+  },
+  "attestations": {
+    "rows_are_exchangeable": "One session only, so no row shares a session with another: each row is its own unit. Checked by probes/panel_power.py on 2026-11-12 over the 1,600 rows; the within-unit correlation is undefined rather than zero, because no unit holds a second row."
+  }
+}

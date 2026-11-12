@@ -1,0 +1,22 @@
+{
+  "schema": "panel.manifest/1",
+  "panel_id": "sha256:6df8fd1a726d85e13ba7cee99a5e6ac33b8be509b72d1a59a4b98f0821142dea",
+  "snapshot_id": "sha256:cb519346bd0f7b617b5e9c7bde68dd42427b976b99aa1e762ddcf208a6b08c74",
+  "rule_version": "sha256:65598ce2157aa8f506b26e09f0e544f00af5ca8de2ee95f251350b07a3705b70",
+  "calendar_version": "sha256:e3482711a21299ccb68539c10b5a32bde34bd373615c3ec6a0b96c315c7ca2fd",
+  "cutoff": "2026-08-14T20:00:00Z",
+  "rows": 78460,
+  "cardinalities": [
+    {"name": "companies", "count": 1672},
+    {"name": "sessions", "count": 47}
+  ],
+  "attrition": [
+    {"stage": "no_close_on_session", "rows_dropped": 71},
+    {"stage": "no_close_on_next_session", "rows_dropped": 53}
+  ],
+  "exchangeable_units": {
+    "count": 47,
+    "unit": "trading_session",
+    "definition": "One US equity trading session. Rows inside one session share that session's market environment, so they are exchangeable with each other and not with rows of another session."
+  }
+}

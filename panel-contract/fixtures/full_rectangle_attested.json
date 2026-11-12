@@ -1,0 +1,25 @@
+{
+  "schema": "panel.manifest/1",
+  "panel_id": "sha256:20ea6a35d76470fa7152f2d35c499981d2aa8d9251554716ddf6ff27d92e4b1f",
+  "snapshot_id": "sha256:cb519346bd0f7b617b5e9c7bde68dd42427b976b99aa1e762ddcf208a6b08c74",
+  "rule_version": "sha256:65598ce2157aa8f506b26e09f0e544f00af5ca8de2ee95f251350b07a3705b70",
+  "calendar_version": "sha256:e3482711a21299ccb68539c10b5a32bde34bd373615c3ec6a0b96c315c7ca2fd",
+  "cutoff": "2026-08-14T20:00:00Z",
+  "rows": 60,
+  "cardinalities": [
+    {"name": "companies", "count": 12},
+    {"name": "sessions", "count": 5}
+  ],
+  "attrition": [
+    {"stage": "no_close_on_session", "rows_dropped": 0},
+    {"stage": "no_close_on_next_session", "rows_dropped": 0}
+  ],
+  "exchangeable_units": {
+    "count": 5,
+    "unit": "trading_session",
+    "definition": "One US equity trading session. Rows inside one session share that session's market environment."
+  },
+  "attestations": {
+    "zero_attrition_counted": "All 12 companies have a close on all 5 sessions and on the session after each. Counted row by row by probes/panel_recount.py on 2026-11-12: 60 of 60 present, 0 absent; the zero is a count, not an assumption."
+  }
+}

@@ -59,10 +59,12 @@ keep passing.
 | `docs/design/` | the founding design memo: requirements, architecture, and what is still open |
 | `docs/inherited/` | two documents carried from the predecessor: the mandatory research gates, and the postmortem of eleven closed strategy paradigms |
 | `services/newsvault/` | the point-in-time core and the archive reader, in Rust |
+| `panel-contract/` | the panel manifest contract: the shape the statistics tier may read, and the validator that refuses a row count that is really a product |
+| `repo-invariants/` | the one invariant that is a property of the repository rather than of a crate |
 
 `docs/design/architecture.md` is the contract layer: what crosses each service boundary, in what
-shape, and — in its §8 — the single place each invariant is enforced, including the three that are
-not enforced anywhere yet.
+shape, and — in its §8 — the single place each invariant is enforced, including the two that are
+not enforced anywhere yet, and the ceiling on the two gates that are.
 
 `docs/design/successor_system_design_2026_11_11.md` is the document to read before changing anything
 here. It carries eighteen numbered requirements, each paired with the measurement that forced it,
@@ -77,7 +79,7 @@ keeping. It is here so this project is not free to repeat them.
 ```
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked --no-fail-fast          # 14 unit tests plus a compile_fail doc test
+cargo test --locked --no-fail-fast          # 49 unit tests plus a compile_fail doc test
 cargo run -p newsvault -- day 2026-07-01 --lake <path-to-lake> --format json
 cargo run -p newsvault -- schema           # machine-readable description of the command tree
 ```

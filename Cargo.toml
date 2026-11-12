@@ -5,8 +5,15 @@
 # than to any crate - today section 8 row G1, the lint floor every member must opt in to. It sits
 # here and not inside services/newsvault because a gate living inside one of the things it
 # polices disappears the day that thing is split or deleted.
+#
+# `panel-contract` is not a service either, and it is not a repo invariant. It holds the contract
+# for one artefact that crosses a file boundary: the panel manifest that `derive` writes and the
+# Python statistics tier reads (section 3.4 and section 4 of docs/design/architecture.md). Both
+# sides of that boundary depend on it and neither owns it - put the validator in the producer and
+# the consumer trusts the producer's reading of the rules; put it in the consumer and the producer
+# cannot check its own output. Neither side exists yet; the contract does.
 [workspace]
-members = ["repo-invariants", "services/newsvault"]
+members = ["panel-contract", "repo-invariants", "services/newsvault"]
 resolver = "2"
 
 # The lint floor for every crate in the workspace. It lives here rather than in a package

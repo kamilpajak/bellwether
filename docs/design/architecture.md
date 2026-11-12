@@ -321,7 +321,7 @@ today — named rather than hidden.
 | R5 | failed calls must be handled | `cargo clippy --locked --all-targets -- -D warnings` in CI, over the workspace lint set: `unused_must_use` denied under rust (which also makes a local `cargo check` fail, not merely warn) and `let_underscore_must_use` denied under clippy, which is the only form the move newly catches in CI. Never the type system. | **enforced against the accidental case only** — three escapes measured 2026-11-12: a violation inside a local `macro_rules!` passes; a crate- or module-level `#![allow]` switches any of these off and no command notices; and doc tests are reached by nothing, because `--all-targets` does not cover them. |
 | R6 | missing input aborts | unit tests cover the missing root and the missing day. But `lake.rs` `string_list_at` has five `Vec::new()` exits, four of which swallow a real decoding error while `unusable_rows` stays 0 — so the loader does have empty-fallback branches. | **partly** |
 | R7 | units are types, identity is a content hash | nothing. `grep -rn item_id services/newsvault/src` returns no match: there is no derivation and no test. Unit newtypes are also absent. | **no enforcement point yet**, both halves |
-| R8 | presence counted, never multiplied | the panel manifest requires `rows` and `exchangeable_units`; a CI check rejects a manifest whose row count equals a product of two cardinalities | **no enforcement point yet** |
+| R8 | presence counted, never multiplied | `panel-contract`, a workspace member both sides of the panel file boundary can depend on. Six rules over the manifest: the identity and input fields must be present; `exchangeable_units` must carry a count **and** a definition of the unit; the attrition chain must reconcile, cardinality product minus attrition equal to `rows`; `rows` equal to a product of the stated cardinalities — a pair, the whole product, or a single pre-multiplied one — needs an explicit `zero_attrition_counted` sentence; `exchangeable_units.count` equal to `rows` needs a `rows_are_exchangeable` sentence; a count above `rows` is an error with no attestation, because no state of the world matches it. Seven committed fixtures, two of which are the historical case: `1 672 × 47 = 78 584` with no attrition and no unit count is rejected and the product is named, and the recounted `78 460` with 124 dropped rows and 47 sessions as the unit is admitted. | **enforced, within a stated ceiling** — see the fifth correction |
 | R9 | power from the registered procedure | the statistics tier refuses a panel without `exchangeable_units`; `params_version` names the power method | **no enforcement point yet** |
 | R10 | provenance labelled | enum field, non-nullable | design |
 | R11 | backfill lag is measured | `from_backfill` requires a `MeasuredLag`, so the **type** cannot be skipped. But all four of its fields are `pub` with no validating constructor, so `{probe_id: "", probes: 0, leaks: 0, seconds: 0}` is accepted — demonstrated 2026-11-12 from outside the crate. And `Visibility` derives `Deserialize` over private fields, which bypasses `from_live`. | **the type is required; the measurement is not** |
@@ -392,8 +392,28 @@ So R12 is split. R12a moves to the mediator that does not exist yet, and leaves 
 than sitting in it as a permanent unmet gap. R12b, the half that is real here, stays: the brief
 schema has no field an executor would accept.
 
-Two gaps now, and they are not equivalent. **R8** and **R9** protect the number that was wrong by a
-factor of three, and their checks are cheap: a manifest validator and a refusing consumer.
+**Fifth correction, 2026-11-12.** R8 is closed, and the thing that closed it was a measured hole in
+the first version of the gate rather than the gate itself. The validator recognised a *pair* of stated
+cardinalities whose product equals `rows`, and the whole product when more than two were stated. A list
+of **one** fell between those two arms, so a manifest stating `company_sessions = 78 584` — the
+predecessor's own number with the multiplication done before the manifest was written — passed all six
+rules while describing exactly the panel the row exists to refuse. One condition closed it and a named
+test pins it.
+
+**The ceiling, stated rather than discovered later.** The validator reconciles the numbers the manifest
+states. It never opens the Arrow file beside it, so a fabricated number still closes the chain:
+measured on this tree, a cardinality of 78 708 with an invented attrition stage of 124 rows is
+admissible, as is `rows` equal to the product of three of four stated cardinalities with the remainder
+absorbed by one stage. Closing that needs a second reader of the same fact — the row count of the data
+file — which is the producer's own test and not this contract's job. The attestation check is a length
+floor, deliberately: it rules out `"yes"` and `""` and cannot tell a counted check from a confident
+paragraph, and every message that rests on a heuristic says so.
+
+One gap left, and it is the smaller half of the pair. **R9** — power from the registered procedure —
+protects the same number that was wrong by a factor of three, and its check is a refusing consumer that
+does not exist. `design_effect` and `within_unit_correlation` are properties of a statistic rather than
+of the row set, so `panel-contract` carries them as `Need::DeferredToR9` instead of requiring them: the
+narrowness is machine-readable rather than left to be rediscovered.
 
 ---
 

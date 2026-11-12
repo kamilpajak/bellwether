@@ -1,0 +1,14 @@
+{
+  "schema": "panel.manifest/1",
+  "panel_id": "sha256:78a22de52a55c9ea873fefba8d4d078d3e289d8785b59fafba1556aae900b1be",
+  "snapshot_id": "sha256:c3ff832377ee3e0bcdd66aa561bdfa33138cafb5c754060967bad46078d7c25b",
+  "rule_version": "sha256:ea95cf64e92d80770fa226f5b9c95afabb304d715d7ee7ff10023bdd19a03d4a",
+  "calendar_version": "sha256:9c738956aad29c37be54c4346790d4f9ea44e8654c697b687dad4977aacb7f43",
+  "cutoff": "2026-08-14T20:00:00Z",
+  "rows": 78584,
+  "cardinalities": [
+    {"name": "companies", "count": 1672},
+    {"name": "sessions", "count": 47}
+  ],
+  "attrition": []
+}
