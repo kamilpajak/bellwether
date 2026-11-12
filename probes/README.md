@@ -9,7 +9,7 @@ advance.** A test checks our code against our expectations and has its answer up
 measures something we do not control — a vendor's volume, our own archive's composition, the
 standard error of a statistic — and could return anything.
 
-**A probe is kept only if it will be run again** (rule 3 of `../CONTRIBUTING.md`). Four live here
+**A probe is kept only if it will be run again** (rule 3 of `../CONTRIBUTING.md`). Five live here
 because each has a second run ahead of it. Roughly as many measurements from the same work were
 deliberately not kept: their numbers are in `../docs/design/` with the construction that produced
 them, which is what a reader needs. A script that answered its question once is a receipt.
@@ -20,6 +20,7 @@ them, which is what a reader needs. A script that answered its question once is 
 | `panel_recount.py` | how many company-sessions does the panel treat, under which rule version? | on every rule change, which is requirement R18 |
 | `panel_power.py` | what is the measured power of the registered procedure on this panel? | on every panel rebuild |
 | `matcher_audit.py` | what is the entity precision of the counterparty matcher, and what does the text cap cost? | on every change to the matching rules |
+| `news_gap.py` | how stale may the newest item be before that is an incident? | against the first real vendor, because the thresholds it produced are provisional on D-1 |
 | `vendor_probe/` | four questions about a news vendor; **not yet run** | once, then once more at least 7 days later for the stability half |
 
 Each takes its inputs from the environment and aborts with a named error when one is absent, which

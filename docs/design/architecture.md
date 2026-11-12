@@ -339,7 +339,7 @@ What each service does when its input is wrong, rather than what it does when ev
 | a panel lacks `exchangeable_units` | the statistics tier refuses to run | **R9** |
 | a brief carries an order-shaped field | rejected by schema | **R12b** |
 | an event is lost | latency, not data: the archive is the source of truth and the hourly sweep closes the gap | memo §4 rule 2 |
-| a consumer is silently dead | detected by lag and backlog depth, not by staleness | memo §4 rule 3 |
+| a consumer is silently dead | detected by lag and backlog depth, not by staleness; the threshold on the age of the newest item is §10's N2 | memo §4 rule 3 |
 
 ### 5.1 The error-code registry (decided 2026-11-12)
 
@@ -488,16 +488,43 @@ instead of requiring them: the narrowness is machine-readable rather than left t
 
 ## 10. What this document leaves open
 
-Two things, both waiting on a number nobody has supplied. Everything else this section once listed
-is decided and lives in the section that decides it: wire formats in §3.10 (which also counts the
-consumers of the contracts it leaves alone), the error-code registry in §5.1 with its enforcement
-point at §8 row E1, and the layer a retention number may name in §3.9.
+Nothing of the shape. Both numbers section 10 last asked for were answered on 2026-11-12 and are
+recorded below; what remains open is the memo's own list, where decision D-1 (which news vendor)
+blocks the rest.
 
-- **No backup design.** Memo question N1. The archive is called irreplaceable in both documents and
-  neither says where its second copy lives. Of everything unresolved here this is the one whose
-  absence costs most if it is still absent in a year.
-- **No freshness target**, so §5's lag-and-backlog detection has nothing to alert on yet. Memo
-  question N2.
+**The archive's second copy: the VPS, with the provider's own backup behind it (N1, decided
+2026-11-12 by the owner).** `vault` holds the archive on the VPS and the hosting provider backs that
+machine up. Two parts of the question stay unanswered and are not the shape of the system, so they
+do not block it: nobody has restored that backup, and no one has timed a restore. A backup nobody
+has restored is not yet a backup, and one timed restore drill, recorded once, closes both. The
+verification function already exists and needs no design — a sha256 over the sorted `item_id` set,
+which agreed on 156 of 156 days when two independent readers were compared.
 
-Memo question N4 keeps the count of days and the medium for retention; §3.9 settles only the layer.
-Which invariants are unenforced is §8's own status column and is not listed again here.
+**The risk the owner accepted, stated rather than implied.** With the archive on the VPS and the
+second copy held by the same provider for the same machine, both copies sit in one provider and one
+account. A disk, a kernel or a bad deployment is covered; a billing, suspension or credential loss
+is not. The alternative — a copy at a second provider — was not taken.
+
+**Freshness: 2 hours inside the US session, 6 hours outside it (N2, measured 2026-11-12).** The
+alert is the age of the newest item, per §5's "a consumer is silently dead" row. Measured over the
+predecessor's lake, 61,282 distinct items with a publication time between 2026-05-19 and 2026-11-10,
+156 partitions and 779 run files, gaps taken between consecutive publication instants:
+
+| window | p50 | p90 | p99 | p99.9 | worst |
+|---|---|---|---|---|---|
+| 13:00–20:00 UTC, the US session | 1.0 min | 10.1 min | 26.7 min | 50.3 min | **1.2 h** |
+| outside it | 0.3 min | 13.0 min | 45.0 min | 105.1 min | 332.6 h |
+
+Over the whole 175-day span, 7 gaps exceeded 3 hours and 3 exceeded 6 hours. So 2 hours in session
+would have fired **zero** times, because the worst in-session gap was 1.2 hours, and 6 hours outside
+it would have fired 3 times — and all three are collection outages, which is what the alert is for.
+The thresholds are a quantile choice over that record, not a guess, and `probes/news_gap.py`
+re-derives it.
+
+**What makes those two numbers wrong.** They measure the predecessor's **retrieval** coverage, not
+the world's news, so a different vendor moves them and D-1 is still open: the numbers are provisional
+on the vendor and must be re-measured against the first real one. The publication gap transfers where
+an observation gap would not, because the predecessor ran on a clock and its `ingested_at` spacing is
+its scheduler rather than the news. The record also already contains outages — 161 distinct UTC days
+hold an item inside a 175-day span, so 14 days hold none, and the 332.6-hour gap is one of those
+holes.
