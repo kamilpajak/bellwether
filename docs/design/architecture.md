@@ -281,7 +281,7 @@ when both closes are there (R8 in the shape), and treatment is a non-empty list.
 metadata keys: `schema` = `panel.data/1`, so the manifest holds no second copy of the version;
 `panel_id`, so a stray pairing is detectable; and `salience_unit` = `occurrences` or `documents`, so
 a D-8 flip shows in the data. **What never changes:** one row per (ticker, session) present, so the
-manifest's `rows` is this file's row count — the identity §8's fifth correction asks a second reader
+manifest's `rows` is this file's row count — the identity §8 row R8's ceiling asks a second reader
 for.
 
 #### 3.10.2 `newsvault.stream/1` — the private item stream
@@ -300,9 +300,9 @@ owner decision having produced a number; it is a liveness interval, never N2's f
 `schema_version` becomes the key `schema`, the spelling `newsvault.day/1` and `panel.manifest/1`
 already use, and `valid_disputed` with `earliest_valid_at` join the field list, because a consumer
 cutting on an undisputed-looking `valid_at` makes exactly the R15 error; `body` against `body_ref`
-there is settled by §3.9. The key is `seq`, not the `sequence` of the owner's NDJSON convention, §2
-being where the ordering authority is named; either way that convention is unmet in code, measured
-2026-11-12, because `newsvault --format=ndjson` emits item lines carrying neither key and no `type`.
+there is settled by §3.9. The key is `seq`: §2 is where the ordering authority is named, and it is a
+different number from the per-invocation `sequence` of the owner's NDJSON convention, which no
+format here offers.
 **Nothing here is enforced:** no validator exists and nothing produces either artefact, and an unknown
 version is refused as `panel-contract` refuses one (`unknown_schema`).
 
@@ -351,7 +351,7 @@ the counted rows of rows 4 and 5, and `panel-contract`'s `Finding.code`.
 Eight of the nine rows therefore take no code; row 1 is the one that does. Four belong to services that
 do not exist — measured 2026-11-12 at 42322eb, `grep -rl` over `*.rs` outside `target/` matches nothing
 for `Attempt`, `collapsed` or `brief`, and no crate depends on an HTTP client — so a code for them would
-be §8's fourth correction written again. Two are reachable and not errors, an observation before its
+be §8 row R12a written again. Two are reachable and not errors, an observation before its
 publication counted and a repeat resolved (§3.9 owns a third), and the last two are monitoring rows.
 
 | code | exit | the condition, and who can emit it |
@@ -433,13 +433,13 @@ today — named rather than hidden.
 | # | invariant | enforced by | status |
 |---|---|---|---|
 | R1 | archive complete, caps are views | `vault` has no truncating write path; the cap lives in a view builder; §3.9 confines deletion to the L2 blob layer and to `vault` | design |
-| R2 | valid and observation time are distinct types | the type system; a `compile_fail` doc test pins it, and CI runs it | **enforced, but narrower than §3.1 claims** — see the correction below |
+| R2 | valid and observation time are distinct types | the type system; a `compile_fail` doc test pins it, and CI runs it — `--no-fail-fast` is why, because one failing unit test makes plain `cargo test` exit before the doc test | **enforced, narrowly.** The two instants cannot be compared **with each other**, so the 60.2% leak cannot happen by type confusion. They are not otherwise hidden: `Visibility::valid()`, `observed()` and `Cutoff::inner()` are public, so the publication-only predicate is one line from any crate — demonstrated 2026-11-12 by compiling it. |
 | R3 | first sighting wins | unit tests in `newsvault` | **enforced** |
 | R4 | coverage ledger beside every store | a write to the archive without an `Attempt` row fails the store's own test | design |
 | R5 | failed calls must be handled | `cargo clippy --locked --all-targets -- -D warnings` in CI, over the workspace lint set: `unused_must_use` denied under rust (which also makes a local `cargo check` fail, not merely warn) and `let_underscore_must_use` denied under clippy, which is the only form the move newly catches in CI. Never the type system. | **enforced against the accidental case only** — three escapes measured 2026-11-12: a violation inside a local `macro_rules!` passes; a crate- or module-level `#![allow]` switches any of these off and no command notices; and doc tests are reached by nothing, because `--all-targets` does not cover them. |
 | R6 | missing input aborts | unit tests cover the missing root and the missing day. But `lake.rs` `string_list_at` has five `Vec::new()` exits, four of which swallow a real decoding error while `unusable_rows` stays 0 — so the loader does have empty-fallback branches. | **partly** |
 | R7 | units are types, identity is a content hash | nothing. `grep -rn item_id services/newsvault/src` returns no match: there is no derivation and no test. Unit newtypes are also absent. | **no enforcement point yet**, both halves |
-| R8 | presence counted, never multiplied | `panel-contract`, a workspace member both sides of the panel file boundary can depend on. Six rules over the manifest: the identity and input fields must be present; `exchangeable_units` must carry a count **and** a definition of the unit; the attrition chain must reconcile, cardinality product minus attrition equal to `rows`; `rows` equal to a product of the stated cardinalities — a pair, the whole product, or a single pre-multiplied one — needs an explicit `zero_attrition_counted` sentence; `exchangeable_units.count` equal to `rows` needs a `rows_are_exchangeable` sentence; a count above `rows` is an error with no attestation, because no state of the world matches it. Seven committed fixtures, two of which are the historical case: `1 672 × 47 = 78 584` with no attrition and no unit count is rejected and the product is named, and the recounted `78 460` with 124 dropped rows and 47 sessions as the unit is admitted. Its ceiling is the fifth correction's, and §3.10.1 is what would close it. | **enforced, within a stated ceiling** — see the fifth correction |
+| R8 | presence counted, never multiplied | `panel-contract`, a workspace member both sides of the panel file boundary can depend on. Six rules over the manifest: the identity and input fields must be present; `exchangeable_units` must carry a count **and** a definition of the unit; the attrition chain must reconcile, cardinality product minus attrition equal to `rows`; `rows` equal to a product of the stated cardinalities — a pair, the whole product, or a single pre-multiplied one — needs an explicit `zero_attrition_counted` sentence; `exchangeable_units.count` equal to `rows` needs a `rows_are_exchangeable` sentence; a count above `rows` is an error with no attestation, because no state of the world matches it. Seven committed fixtures, two of which are the historical case: `1 672 × 47 = 78 584` with no attrition and no unit count is rejected and the product is named, and the recounted `78 460` with 124 dropped rows and 47 sessions as the unit is admitted. **The ceiling:** it reconciles the numbers the manifest states and never opens the Arrow file, so a cardinality of 78 708 with an invented attrition stage of 124 rows is admissible, as is `rows` equal to the product of three of four stated cardinalities with the remainder absorbed by one stage — both measured 2026-11-12. §3.10.1 is what would close it. The attestation check is a length floor: it rules out `"yes"` and `""` and cannot tell a counted check from a confident paragraph, and every message resting on a heuristic says so. | **enforced, within the ceiling stated here** |
 | R9 | power from the registered procedure | the statistics tier refuses a panel without `exchangeable_units`; `params_version` names the power method | **no enforcement point yet** |
 | R10 | provenance labelled | enum field, non-nullable | design |
 | R11 | backfill lag is measured | `from_backfill` requires a `MeasuredLag`, so the **type** cannot be skipped. But all four of its fields are `pub` with no validating constructor, so `{probe_id: "", probes: 0, leaks: 0, seconds: 0}` is accepted — demonstrated 2026-11-12 from outside the crate. And `Visibility` derives `Deserialize` over private fields, which bypasses `from_live`. | **the type is required; the measurement is not** |
@@ -454,85 +454,21 @@ today — named rather than hidden.
 | G1 | **a workspace member inherits the lint floor** | a test in the `repo-invariants` crate. It asks `cargo metadata` for the member set rather than reading `workspace.members`, because that list is **not** the member set: measured 2026-11-12, a crate reached only by a `path` dependency is a member, is compiled by `cargo clippy --locked --all-targets`, inherits nothing, and all three CI commands exit 0 over an `unwrap()` in it. The test also rejects `lints = { workspace = true }` written inside `[package]`, which cargo ignores without a warning while the crate passes clippy. It polices its own crate too. | **enforced** |
 | E1 | an error code is never renamed, and no code reaches stderr from outside the table | nothing yet. §5.1 specifies the registry; the check is a workspace member `error-codes/` holding `const CODES` beside a committed `codes.snapshot`, a test that every snapshot line survives with the same exit status and retryable flag, and an error constructor taking `&'static Code` so a bare literal does not compile — measured 2026-11-12, the nearest vocabulary that exists is `panel-contract`'s 14 `Finding` codes, which go to stdout and which §5.1 keeps out of this registry; all 14 are bare `&'static str` literals, so a fifteenth needs no table entry and no review. Repurposing is not checkable at all, because no test reads meaning. | **no enforcement point yet** |
 
-**Correction, 2026-11-12, after an adversarial review.** Four rows above said **enforced** and did
-not earn it, and one structural problem outranked all of them: before this date there was no CI, so
-"enforced" meant *a test exists*, not *a test ran*. The project's own principle — a gate nobody
-replaced is a rule that quietly stopped applying — covers a gate nobody runs. A twenty-line workflow
-now runs `fmt`, `clippy -D warnings` and `test --no-fail-fast`, and the flag matters: measured on
-this tree, one failing unit test made plain `cargo test` exit without ever running the doc test,
-which is R2's only enforcement point.
+Two things this table does not say, and both are measured rather than argued.
 
-The R2 wording in §3.1 and in the README was also wrong, and the sentence is deleted rather than
-defended. "There is no public way to ask only half of it" is false: `Visibility::valid()`,
-`observed()` and `Cutoff::inner()` are public, so the publication-only predicate is one line from
-any crate — demonstrated by compiling it. What is true is narrower and still worth having: the two
-instants cannot be compared **with each other**, so the 60.2% leak cannot happen by type confusion.
-A claim nobody can enforce is worse than an accessor.
+**A lint is a floor against the accidental case.** None of R5's survives an author who writes
+`#![allow(...)]` at the top of a file, and no command in this gate notices that they did.
 
-**Second correction, 2026-11-12.** The lint floor moved from the one package's manifest to
-`[workspace.lints]` at the root, because the root's own comment says four more service crates arrive
-and a package table covers exactly one of them. That closes the "a new crate inherits nothing" half
-of the problem and exposes the other half, now row G1: inheritance is opt-in, so a crate that omits
-the stanza is silently unlinted and CI still goes green. Two further escapes were measured and are
-named in the R5 row rather than left to be rediscovered, and a third was closed in the same change
-by denying `todo`, `unimplemented` and `unreachable` — `clippy::panic` covers only `panic!`, so until
-then all three passed.
+**One hole is deliberately nobody's job here.** A crate on disk that no `members` entry and no
+`path` dependency reaches is not a member, is compiled by nothing, and is invisible to all of CI —
+reproduced 2026-11-12 with `services/derive` holding an `unwrap()` and no registration, all three
+commands green. A glob in `members` removes the mistake instead of testing for it, which is a
+separate change with its own behaviour to argue about.
 
-**What a lint can and cannot be.** These are a floor against the accidental case. None of them
-survives an author who writes `#![allow(...)]` at the top of a file, and no command in this gate
-notices that they did. Section 8 should not be read as saying otherwise.
-
-**Third correction, 2026-11-12.** G1 is closed, and closing it overturned the design it was given.
-The obvious gate — read `workspace.members` and check each entry — would have reported every member
-compliant while cargo built an unlinted third crate, because a `path` dependency from inside the
-workspace makes a member without appearing in that list. The gate asks cargo instead. Two traps are
-pinned by tests rather than described: that case, and `lints = { workspace = true }` inside
-`[package]`, which cargo silently ignores.
-
-One hole stays open and is deliberately not this gate's job: a crate on disk that no `members` entry
-and no `path` dependency reaches is not a member, is compiled by nothing, and is invisible here as it
-is to all of CI. Reproduced on this tree — `services/derive` with an `unwrap()` and no registration,
-all three commands green. A glob in `members` removes the mistake instead of testing for it, and
-that is a separate change with its own behaviour to argue about.
-
-**Fourth correction, 2026-11-12.** R12 was called the most serious gap in this document for most of a
-day, and it was not a gap in this repository at all. An AST check forbidding order-placing calls, in
-a repository with no broker code, passes unconditionally — the same shape as the four enforcement
-claims corrected above, except this one was written here rather than inherited.
-
-Worse, the invariant was wrong as well as unenforceable. "No path to the order queue" protects
-nothing: a path is harmless. The thing the predecessor deleted on 2026-09-24 was an **automatic
-brief-to-intent producer**, and a mediating service between this repository and the existing executor
-is a perfectly good idea as long as its input is a decision a person made rather than a brief. That
-is why every pick in the predecessor carries `"source": "manual"` — the label is not provenance
-metadata, it **is** the invariant, written into the data.
-
-So R12 is split. R12a moves to the mediator that does not exist yet, and leaves this document rather
-than sitting in it as a permanent unmet gap. R12b, the half that is real here, stays: the brief
-schema has no field an executor would accept.
-
-**Fifth correction, 2026-11-12.** R8 is closed, and the thing that closed it was a measured hole in
-the first version of the gate rather than the gate itself. The validator recognised a *pair* of stated
-cardinalities whose product equals `rows`, and the whole product when more than two were stated. A list
-of **one** fell between those two arms, so a manifest stating `company_sessions = 78 584` — the
-predecessor's own number with the multiplication done before the manifest was written — passed all six
-rules while describing exactly the panel the row exists to refuse. One condition closed it and a named
-test pins it.
-
-**The ceiling, stated rather than discovered later.** The validator reconciles the numbers the manifest
-states. It never opens the Arrow file beside it, so a fabricated number still closes the chain:
-measured on this tree, a cardinality of 78 708 with an invented attrition stage of 124 rows is
-admissible, as is `rows` equal to the product of three of four stated cardinalities with the remainder
-absorbed by one stage. Closing that needs a second reader of the same fact — the row count of the data
-file — which is the producer's own test and not this contract's job. The attestation check is a length
-floor, deliberately: it rules out `"yes"` and `""` and cannot tell a counted check from a confident
-paragraph, and every message that rests on a heuristic says so.
-
-One gap left, and it is the smaller half of the pair. **R9** — power from the registered procedure —
-protects the same number that was wrong by a factor of three, and its check is a refusing consumer that
-does not exist. `design_effect` and `within_unit_correlation` are properties of a statistic rather than
-of the row set, so `panel-contract` carries them as `Need::DeferredToR9` instead of requiring them: the
-narrowness is machine-readable rather than left to be rediscovered.
+**R9 is the one gap left**, and it is the smaller half of the pair R8 belonged to. Its check is a
+refusing consumer that does not exist. `design_effect` and `within_unit_correlation` are properties
+of a statistic rather than of the row set, so `panel-contract` carries them as `Need::DeferredToR9`
+instead of requiring them: the narrowness is machine-readable rather than left to be rediscovered.
 
 ---
 
@@ -552,21 +488,16 @@ narrowness is machine-readable rather than left to be rediscovered.
 
 ## 10. What this document leaves open
 
-Beyond the memo's own open decisions:
+Two things, both waiting on a number nobody has supplied. Everything else this section once listed
+is decided and lives in the section that decides it: wire formats in §3.10 (which also counts the
+consumers of the contracts it leaves alone), the error-code registry in §5.1 with its enforcement
+point at §8 row E1, and the layer a retention number may name in §3.9.
 
-- ~~**No wire formats.** Field names and types are given; the serialisation is not.~~ **Two of the
-  eight fired on 2026-11-12: §3.10**, which also counts the consumers of the ones it leaves alone.
-- ~~**No error-code registry.** §5 gives behaviours, not stable codes, and the CLI contract wants
-  a registry whose codes are never renamed or repurposed.~~ **Decided 2026-11-12: §5.1**, including
-  which of §5's rows get no code. Its enforcement point is §8 row E1.
-- ~~**No retention policy.** How long raw blobs live, and on what medium, is memo question N4 and
-  the answer changes the storage design rather than a setting.~~ **The layer a number may name is
-  settled: §3.9.** The count of days and the medium are still N4.
 - **No backup design.** Memo question N1. The archive is called irreplaceable in both documents and
   neither says where its second copy lives. Of everything unresolved here this is the one whose
   absence costs most if it is still absent in a year.
 - **No freshness target**, so §5's lag-and-backlog detection has nothing to alert on yet. Memo
   question N2.
-- **The enforcement gaps of §8** are that table's own status column, not a second list here. This
-  bullet read "R8 and R9" until 2026-11-12, by which date R8 was closed within a ceiling while R6,
-  R7, R9, R11 and the new E1 were open. R12a is relocated rather than closed, and §7 says where.
+
+Memo question N4 keeps the count of days and the medium for retention; §3.9 settles only the layer.
+Which invariants are unenforced is §8's own status column and is not listed again here.

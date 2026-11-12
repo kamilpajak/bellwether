@@ -56,7 +56,6 @@ enum Command {
 enum Format {
     Human,
     Json,
-    Ndjson,
 }
 
 fn main() -> ExitCode {
@@ -142,24 +141,6 @@ fn emit(day: &Day, before_cutoff: usize, format: Format) -> anyhow::Result<()> {
             )?;
             writeln!(out)?;
         }
-        Format::Ndjson => {
-            for item in &day.items {
-                serde_json::to_writer(&mut out, item)?;
-                writeln!(out)?;
-            }
-            serde_json::to_writer(
-                &mut out,
-                &serde_json::json!({
-                    "type": "summary",
-                    "schema": "newsvault.day/1",
-                    "date": day.date,
-                    "raw_rows": day.raw_rows,
-                    "distinct_items": before_cutoff,
-                    "items_returned": day.items.len(),
-                }),
-            )?;
-            writeln!(out)?;
-        }
         Format::Human => {
             writeln!(out, "day              {}", day.date)?;
             writeln!(out, "run files        {}", day.runs.len())?;
@@ -203,7 +184,7 @@ fn print_schema(format: Format) {
                     {"name": "lake", "type": "path"},
                     {"name": "at", "type": "rfc3339",
                      "doc": "keep only items visible at this instant (publication AND observation)"},
-                    {"name": "format", "type": "enum", "values": ["human", "json", "ndjson"]}
+                    {"name": "format", "type": "enum", "values": ["human", "json"]}
                 ],
                 "output": "newsvault.day/1",
                 "mutates": false
@@ -214,6 +195,6 @@ fn print_schema(format: Format) {
     });
     match format {
         Format::Human => println!("{doc:#}"),
-        Format::Json | Format::Ndjson => println!("{doc}"),
+        Format::Json => println!("{doc}"),
     }
 }
