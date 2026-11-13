@@ -1136,3 +1136,36 @@ fn a_vendor_archive_day_with_an_uncovered_accession_reports_coverage_incomplete(
     );
     Ok(())
 }
+
+/// §8 row R20's scope: coverage is the vendor_archive arm's alone. A live_ingest window with an
+/// uncovered follow-up records no `matched` and raises no `coverage_incomplete`, because a live
+/// re-run re-polls every row (R16) and a live shortfall is "not yet", not an unconverged backfill.
+/// Mutation 2026-11-13: recording `matched` for a live index attempt (dropping the `provenance ==
+/// VendorArchive` guard in the driver) turns this red — the live window then reports a gap.
+#[test]
+fn a_live_window_with_an_uncovered_follow_up_reports_no_coverage_gap() -> TestResult {
+    let root = TempDir::new()?;
+    let mut live = ask(root.path(), A_LISTED_SESSION);
+    live.schedule = Some("first".to_owned());
+    let opened = cmd_collect::open_provider(&live)?;
+    cmd_collect::run(&live, &opened, &partial_archive_day()?, &Fixed)?;
+    let report = cmd_ledger::read(root.path(), &ledger_ask()?)?;
+    assert!(
+        !report
+            .coverage
+            .iter()
+            .any(|row| row.target_window == A_LISTED_SESSION),
+        "a live window must record no coverage row: {:?}",
+        report.coverage
+    );
+    assert!(
+        !report
+            .check
+            .findings
+            .iter()
+            .any(|finding| finding.code == "coverage_incomplete"),
+        "{:?}",
+        report.check.findings
+    );
+    Ok(())
+}

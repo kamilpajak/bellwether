@@ -15,7 +15,7 @@ use crate::ledger::{
     abandon, AttemptId, AttemptReceipt, AttemptSlot, Baseline, LedgerError, Outcome, OutcomeKind,
     SendPermit, Sink, Verdict,
 };
-use crate::provider::{CollectedItem, Plan, Provider, RawBlob};
+use crate::provider::{CollectedItem, Plan, Provenance, Provider, RawBlob};
 use crate::request::{Request, RequestPhase, RunId, SourceId, TargetWindow};
 use crate::wire::{RawResponse, SendFailure, Wire};
 use crate::{Calendar, Listing, PlanRefusal};
@@ -474,19 +474,20 @@ fn attempt_once<A: Archive>(
         Ok(committed) => (committed, None),
         Err(refused) => (Committed::default(), Some(refused.detail)),
     };
-    // Follow-ups are an index attempt's business. The matched set is the full in-universe subset
-    // the index named; its count is recorded as the coverage denominator whatever it is, and the
-    // already-covered subset is excluded before queueing so a `vendor_archive` re-run converges on
-    // full coverage. The covered set is read here, once per index attempt, and never on a document
-    // attempt, which has no follow-ups. A live ingest excludes nothing (the provider enforces R16).
+    // Follow-ups are an index attempt's business, and coverage is the vendor_archive arm's alone:
+    // a live index records no `matched` and excludes nothing, re-polling every row (R20, R16).
     let follow_ups = match extracted {
         Some(extracted) if request.phase == RequestPhase::Index => {
             let matched = count(extracted.follow_ups.len());
-            archive.record_planned_coverage(&attempt_id, matched)?;
+            let covered = if request.provenance == Provenance::VendorArchive {
+                archive.record_planned_coverage(&attempt_id, matched)?;
+                archive.covered_story_ids(&request.source, &request.target_window)?
+            } else {
+                std::collections::BTreeSet::new()
+            };
             if matched == 0 {
                 Vec::new()
             } else {
-                let covered = archive.covered_story_ids(&request.source, &request.target_window)?;
                 provider.follow_ups_to_issue(extracted.follow_ups, &covered)
             }
         }
