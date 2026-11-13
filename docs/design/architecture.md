@@ -622,7 +622,12 @@ settled fact. Both are one edit to reverse.
   refused before its first request unless a `MeasuredLag` with a probe id, a non-zero probe count
   and a non-zero lag stands behind it (§8 row R11). Its cost, stated: the normal nightly cadence
   reads the previous session's index, which is a `vendor_archive` window under the boundary below,
-  so a run on that cadence refuses until the probe exists. **The other fork is two places:**
+  so a run on that cadence refuses until the probe exists. **The other half of that cost, measured
+  2026-11-13 against live EDGAR:** the vendor's own quarter listing named `form.20261110.idx` and
+  `form.20261112.idx` and nothing for 2026-11-11 or 2026-11-13, so a same-day run plans zero
+  requests with `reason: window_not_published` while every earlier window takes the archive arm and
+  refuses. Until the probe exists the only window that collects is one reached by passing an `--at`
+  inside it, which is a hand operation and not a cadence. **The other fork is two places:**
   `news_provider::provider::probed_lag` holds the four conditions, and `edgar-press`'s `plan` is the
   one caller that asks.
 - **The provenance boundary, which D5 needs and no measurement places.** A window whose last day is

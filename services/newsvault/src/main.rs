@@ -125,8 +125,9 @@ enum Command {
         /// The hashed extraction rules.
         #[arg(long)]
         rules: PathBuf,
-        /// The run's own observation instant (RFC 3339). Defaults to now, which is the only
-        /// clock read in this binary.
+        /// The instant this run PLANS and classifies provenance against (RFC 3339), not the
+        /// instant anything is observed at: an item's observation time is read from the clock
+        /// when its fetch returns, so this option cannot backdate what we knew. Defaults to now.
         #[arg(long)]
         at: Option<String>,
         /// Plans, validates and resolves every target, and mutates nothing.
