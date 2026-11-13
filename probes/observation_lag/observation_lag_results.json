@@ -1,0 +1,302 @@
+{
+ "fetched_at": "2026-11-13T17:33:51.822684+00:00",
+ "construction": {
+  "registration": "probes/observation_lag/PREREGISTRATION.md",
+  "publication": "<ACCEPTANCE-DATETIME> parsed %Y%m%d%H%M%S in America/New_York",
+  "observation": "the vendor's stated last write of form.<day>.idx, the Last-Modified response header cross-read against the quarter listing",
+  "form_types": [
+   "8-K"
+  ],
+  "sample_rule": "row floor(i x n / 12) in index file order",
+  "scalar_definition": "the MAX of the per-filing lags (amendment 2026-11-13)",
+  "p90_definition": "index min(floor(0.9 x n), n - 1) ascending",
+  "tolerance_seconds": 60,
+  "rewrite_allowance_seconds": 86400,
+  "pace_seconds": 0.5,
+  "requests_spent": 27,
+  "budget": 30
+ },
+ "days": [
+  {
+   "day": "2026-11-10",
+   "rows_in_index": 5429,
+   "rows_of_form": 384,
+   "rows_of_form_off_day": 0,
+   "bytes_downloaded": 1057192,
+   "bytes_vendor_stated": "1033 KB",
+   "write_instant_header": "2026-11-11T03:01:42+00:00",
+   "write_instant_listing": "2026-11-11T03:01:42+00:00",
+   "last_data_received": "Nov 10, 2026",
+   "filings": [
+    {
+     "accession": "0001104659-26-124772",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "unusable": "the document answered 503"
+    },
+    {
+     "accession": "0001999480-26-000030",
+     "cik": "1999480",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T21:12:59+00:00",
+     "lag_seconds": 20923
+    },
+    {
+     "accession": "0001701541-26-000030",
+     "cik": "1701541",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T11:28:50+00:00",
+     "lag_seconds": 55972
+    },
+    {
+     "accession": "0001877939-26-000100",
+     "cik": "1877939",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T21:04:30+00:00",
+     "lag_seconds": 21432
+    },
+    {
+     "accession": "0001654954-26-009663",
+     "cik": "31107",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T22:00:24+00:00",
+     "lag_seconds": 18078
+    },
+    {
+     "accession": "0001104659-26-125253",
+     "cik": "1828377",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T21:34:07+00:00",
+     "lag_seconds": 19655
+    },
+    {
+     "accession": "0001104659-26-125214",
+     "cik": "2160077",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T21:22:44+00:00",
+     "lag_seconds": 20338
+    },
+    {
+     "accession": "0001654954-26-009633",
+     "cik": "1126115",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T00:39:40+00:00",
+     "lag_seconds": 94922
+    },
+    {
+     "accession": "0001104659-26-125328",
+     "cik": "1173420",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T22:08:34+00:00",
+     "lag_seconds": 17588
+    },
+    {
+     "accession": "0001193125-26-454122",
+     "cik": "1137091",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T02:00:06+00:00",
+     "lag_seconds": 90096
+    },
+    {
+     "accession": "0001213900-26-117738",
+     "cik": "22701",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T12:01:13+00:00",
+     "lag_seconds": 54029
+    },
+    {
+     "accession": "0002019804-26-000033",
+     "cik": "2019804",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T13:43:52+00:00",
+     "lag_seconds": 47870
+    }
+   ],
+   "write_instant_used": "both, 0 s apart",
+   "lags": [
+    20923,
+    55972,
+    21432,
+    18078,
+    19655,
+    20338,
+    94922,
+    17588,
+    90096,
+    54029,
+    47870
+   ]
+  },
+  {
+   "day": "2026-11-12",
+   "rows_in_index": 7805,
+   "rows_of_form": 549,
+   "rows_of_form_off_day": 0,
+   "bytes_downloaded": 1520327,
+   "bytes_vendor_stated": "1485 KB",
+   "write_instant_header": "2026-11-13T03:02:22+00:00",
+   "write_instant_listing": "2026-11-13T03:02:22+00:00",
+   "last_data_received": "Nov 12, 2026",
+   "filings": [
+    {
+     "accession": "0001193125-26-458394",
+     "cik": "1650648",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T21:11:13+00:00",
+     "lag_seconds": 21069
+    },
+    {
+     "accession": "0002065708-26-000008",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "unusable": "the document answered 503"
+    },
+    {
+     "accession": "0001193125-26-458403",
+     "cik": "1641281",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T21:11:47+00:00",
+     "lag_seconds": 21035
+    },
+    {
+     "accession": "0000029332-26-000051",
+     "cik": "29332",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T13:12:37+00:00",
+     "lag_seconds": 49785
+    },
+    {
+     "accession": "0001193125-26-458445",
+     "cik": "1128928",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T21:15:29+00:00",
+     "lag_seconds": 20813
+    },
+    {
+     "accession": "0001104659-26-125794",
+     "cik": "1682639",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T12:00:29+00:00",
+     "lag_seconds": 54113
+    },
+    {
+     "accession": "0001357615-26-000205",
+     "cik": "1357615",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T11:03:01+00:00",
+     "lag_seconds": 57561
+    },
+    {
+     "accession": "0001493152-26-051502",
+     "cik": "65770",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T22:30:24+00:00",
+     "lag_seconds": 16318
+    },
+    {
+     "accession": "0001628280-26-073206",
+     "cik": "707179",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T15:20:57+00:00",
+     "lag_seconds": 42085
+    },
+    {
+     "accession": "0001213900-26-118349",
+     "cik": "1874252",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T12:00:18+00:00",
+     "lag_seconds": 54124
+    },
+    {
+     "accession": "0001493152-26-051393",
+     "cik": "1886894",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T21:10:18+00:00",
+     "lag_seconds": 21124
+    },
+    {
+     "accession": "0001104659-26-125797",
+     "cik": "1130598",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T12:00:31+00:00",
+     "lag_seconds": 54111
+    }
+   ],
+   "write_instant_used": "both, 0 s apart",
+   "lags": [
+    21069,
+    21035,
+    49785,
+    20813,
+    54113,
+    57561,
+    16318,
+    42085,
+    54124,
+    21124,
+    54111
+   ]
+  }
+ ],
+ "verdict": {
+  "registered": {
+   "probe_id": "edgar_index_write-20261113",
+   "probes": 22,
+   "leaks": 0,
+   "seconds": 94922
+  },
+  "band": "24 h - 7 d",
+  "meaning": "backfill permitted only with the session shift written into the panel; no day column may mix backfilled and live items",
+  "median_seconds": 42085,
+  "p90_seconds": 57561,
+  "p90_band": "<= 24 h",
+  "p90_would_have_left_above_it": 2,
+  "max_seconds": 94922,
+  "probes": 22,
+  "requested": 24,
+  "per_day": [
+   {
+    "day": "2026-11-10",
+    "probes": 11,
+    "write_instant": "both, 0 s apart",
+    "median_seconds": 21432,
+    "p90_seconds": 90096,
+    "max_seconds": 94922,
+    "rows_of_form": 384,
+    "rows_of_form_off_day": 0
+   },
+   {
+    "day": "2026-11-12",
+    "probes": 11,
+    "write_instant": "both, 0 s apart",
+    "median_seconds": 42085,
+    "p90_seconds": 54124,
+    "max_seconds": 57561,
+    "rows_of_form": 549,
+    "rows_of_form_off_day": 0
+   }
+  ]
+ }
+}

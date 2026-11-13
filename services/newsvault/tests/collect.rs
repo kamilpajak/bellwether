@@ -96,6 +96,7 @@ fn ask(store: &Path, window: &str) -> Ask {
         listing: fixture("quarter_index.json"),
         roster: fixture("roster.json"),
         rules: rules(),
+        lag_policy: None,
         contact: CONTACT.to_owned(),
         at: at(),
         dry_run: false,
@@ -475,7 +476,7 @@ fn a_commit_the_store_refused_exits_eight_and_names_the_attempt() -> TestResult 
     let run = RunId::new("refusing");
     let driven = cmd_collect::drive(
         &ask,
-        &provider,
+        &provider.provider,
         &mut archive,
         &Payloads::a_good_day()?,
         &Fixed,
@@ -683,7 +684,7 @@ fn an_attempt_a_dead_run_left_open_is_closed_interrupted_by_the_next_run() -> Te
             HeaderValue::Literal("text/plain".to_owned()),
         )],
         params: Vec::new(),
-        universe_version: provider.universe_version(),
+        universe_version: provider.provider.universe_version(),
     };
     let orphan = AttemptSlot::open(&mut store, &abandoned, &dead, 0, ObservationTime::new(at()))?;
     let orphaned = orphan.attempt_id().hex().to_owned();
@@ -769,4 +770,219 @@ fn items_ask() -> cmd_items::Ask {
         fields: None,
         per_story: PerStory::All,
     }
+}
+
+/// The production policy file, not a copy of it: one fact, one home, the same rule `rules()`
+/// follows. Its numbers are a measurement and this file asserts the plumbing, never the value.
+fn lag_policy() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../news-provider/policy/observation-lag.json")
+}
+
+/// A window earlier than the run's own date with the policy behind it, which is the arm decision
+/// D5 refuses without one.
+fn an_archive_ask(store: &Path) -> Ask {
+    Ask {
+        at: AFTER_THE_NEW_YORK_DAY_CLOSED
+            .parse()
+            .unwrap_or(DateTime::UNIX_EPOCH),
+        lag_policy: Some(lag_policy()),
+        ..ask(store, A_LISTED_SESSION)
+    }
+}
+
+#[test]
+fn a_vendor_archive_window_collects_once_the_measured_lag_is_handed_to_the_provider() -> TestResult
+{
+    let root = TempDir::new()?;
+    let without = Ask {
+        lag_policy: None,
+        ..an_archive_ask(root.path())
+    };
+    let opened = cmd_collect::open_provider(&without)?;
+    let refused = cmd_collect::run(&without, &opened, &Payloads::a_good_day()?, &Fixed);
+    assert!(refused.is_err(), "the window was not refused without a lag");
+    let with = an_archive_ask(root.path());
+    let opened = cmd_collect::open_provider(&with)?;
+    let answer = cmd_collect::run(&with, &opened, &Payloads::a_good_day()?, &Fixed)?;
+    assert_eq!(answer.exit, Exit::Ok, "{:#}", answer.envelope);
+    assert_eq!(
+        answer.envelope["attempts"][0]["provenance"].as_str(),
+        Some("vendor_archive"),
+        "{:#}",
+        answer.envelope
+    );
+    Ok(())
+}
+
+#[test]
+fn the_run_envelope_names_the_policy_and_the_probe_that_dated_its_archive_windows() -> TestResult {
+    let root = TempDir::new()?;
+    let with = an_archive_ask(root.path());
+    let opened = cmd_collect::open_provider(&with)?;
+    let answer = cmd_collect::run(&with, &opened, &Payloads::a_good_day()?, &Fixed)?;
+    let stated = news_provider::LagPolicy::read(&std::fs::read(lag_policy())?)?;
+    let Some(lag) = stated.lag(&SourceId::new(SOURCE), Provenance::VendorArchive) else {
+        return Err("the production policy states no edgar_press vendor_archive lag".into());
+    };
+    assert_eq!(
+        (
+            answer.envelope["observation_lag_policy_version"].as_str(),
+            answer.envelope["observation_lag_probe_id"].as_str(),
+            answer.envelope["observation_lag_seconds"].as_i64(),
+        ),
+        (
+            Some(stated.version().hex()),
+            Some(lag.probe_id.as_str()),
+            Some(lag.seconds)
+        ),
+        "{:#}",
+        answer.envelope
+    );
+    // A live-ingest run states no lag at all rather than a zero, because none dated it.
+    let live = ask(root.path(), A_LISTED_SESSION);
+    let opened = cmd_collect::open_provider(&live)?;
+    let plain = cmd_collect::run(&live, &opened, &Payloads::a_good_day()?, &Fixed)?;
+    assert!(
+        plain.envelope["observation_lag_probe_id"].is_null(),
+        "{:#}",
+        plain.envelope
+    );
+    Ok(())
+}
+
+#[test]
+fn the_policy_that_dated_a_run_is_in_the_vault_under_its_own_digest() -> TestResult {
+    let root = TempDir::new()?;
+    let with = an_archive_ask(root.path());
+    let opened = cmd_collect::open_provider(&with)?;
+    let answer = cmd_collect::run(&with, &opened, &Payloads::a_good_day()?, &Fixed)?;
+    let bytes = std::fs::read(lag_policy())?;
+    let digest = canon::FileDigest::of(&bytes);
+    let stored = root
+        .path()
+        .join("policy")
+        .join(format!("{}.json", digest.hex()));
+    assert_eq!(
+        std::fs::read(&stored).ok().as_ref(),
+        Some(&bytes),
+        "{stored:?}"
+    );
+    assert_eq!(
+        answer.envelope["observation_lag_policy_version"].as_str(),
+        Some(digest.hex())
+    );
+    // Second use of the same bytes is the same path and no staging file is left behind.
+    let again = Ask {
+        schedule: Some("second".to_owned()),
+        ..an_archive_ask(root.path())
+    };
+    let opened = cmd_collect::open_provider(&again)?;
+    cmd_collect::run(&again, &opened, &Payloads::a_good_day()?, &Fixed)?;
+    let kept = tree(&root.path().join("policy"));
+    assert_eq!(kept.len(), 1, "{:?}", kept.keys().collect::<Vec<_>>());
+    Ok(())
+}
+
+#[test]
+fn a_dry_run_dates_nothing_and_copies_no_policy_into_the_vault() -> TestResult {
+    let root = TempDir::new()?;
+    let dry = Ask {
+        dry_run: true,
+        ..an_archive_ask(root.path())
+    };
+    let opened = cmd_collect::open_provider(&dry)?;
+    let exchange = Payloads::a_good_day()?;
+    let answer = cmd_collect::run(&dry, &opened, &exchange, &Fixed)?;
+    assert_eq!((exchange.sends(), answer.exit), (0, Exit::Ok));
+    assert!(!root.path().join("policy").exists());
+    Ok(())
+}
+
+#[test]
+fn an_unreadable_lag_policy_is_named_and_is_not_a_window_with_no_lag() -> TestResult {
+    let root = TempDir::new()?;
+    let broken = root.path().join("broken.json");
+    std::fs::write(&broken, br#"{"schema": "calendar/1", "lags": []}"#)?;
+    let ask = Ask {
+        lag_policy: Some(broken),
+        ..an_archive_ask(root.path())
+    };
+    let Err(why) = cmd_collect::open_provider(&ask) else {
+        return Err("an unreadable policy opened a provider".into());
+    };
+    let said = why.to_string();
+    assert!(said.contains("observation-lag policy"), "{said}");
+    assert!(!said.contains("no probed observation lag"), "{said}");
+    Ok(())
+}
+
+#[test]
+fn a_policy_stating_only_the_other_provenance_leaves_the_archive_window_refused() -> TestResult {
+    let root = TempDir::new()?;
+    let live_only = root.path().join("live_only.json");
+    std::fs::write(
+        &live_only,
+        std::fs::read_to_string(lag_policy())?.replace("vendor_archive", "live_ingest"),
+    )?;
+    let ask = Ask {
+        lag_policy: Some(live_only),
+        ..an_archive_ask(root.path())
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let Err(why) = cmd_collect::run(&ask, &opened, &Payloads::a_good_day()?, &Fixed) else {
+        return Err("a lag measured for the live arm dated the archive arm".into());
+    };
+    assert!(
+        why.to_string().contains("no probed observation lag"),
+        "{why}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_staged_policy_copy_a_crash_left_behind_is_refused_rather_than_overwritten() -> TestResult {
+    let root = TempDir::new()?;
+    let with = an_archive_ask(root.path());
+    let bytes = std::fs::read(lag_policy())?;
+    let digest = canon::FileDigest::of(&bytes);
+    let dir = root.path().join("policy");
+    std::fs::create_dir_all(&dir)?;
+    let staging = dir.join(format!(".tmp-{}.json", digest.hex()));
+    std::fs::write(&staging, b"bytes a dead run staged")?;
+    let opened = cmd_collect::open_provider(&with)?;
+    let Err(why) = cmd_collect::run(&with, &opened, &Payloads::a_good_day()?, &Fixed) else {
+        return Err("the copy reopened a staged file instead of refusing".into());
+    };
+    assert!(why.to_string().contains("exists"), "{why}");
+    assert_eq!(std::fs::read(&staging)?, b"bytes a dead run staged");
+    Ok(())
+}
+
+#[test]
+fn every_option_the_collect_parser_takes_is_in_the_machine_readable_schema() -> TestResult {
+    // The manifest is hand-written and the parser is derived, so the two drift silently: measured
+    // 2026-11-13, `--lag-policy` worked on the command line and the schema did not name it.
+    let help = String::from_utf8_lossy(&binary(&["collect", "--help"])?.stdout).to_string();
+    let schema: Value = serde_json::from_slice(&binary(&["schema", "--format", "json"])?.stdout)?;
+    let named: Vec<String> = schema["commands"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|command| command["path"][0].as_str() == Some("collect"))
+        .and_then(|command| command["options"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|option| option["name"].as_str().map(|name| name.replace('_', "-")))
+        .collect();
+    let mut missing = Vec::new();
+    for word in help.split_whitespace() {
+        let flag = word.trim_end_matches(|c: char| !c.is_alphanumeric());
+        if let Some(long) = flag.strip_prefix("--") {
+            if !long.is_empty() && long != "help" && !named.contains(&long.to_owned()) {
+                missing.push(long.to_owned());
+            }
+        }
+    }
+    assert!(missing.is_empty(), "the schema names none of {missing:?}");
+    Ok(())
 }

@@ -10,7 +10,7 @@ measures something we do not control — a vendor's volume, our own archive's co
 standard error of a statistic — and could return anything.
 
 **A probe is kept only if it will be run again** (rule 3 of `../CONTRIBUTING.md`). The table below
-is the list, and the count: six scripts and two packages, each with a second run ahead of it.
+is the list, and the count: six scripts and three packages, each with a second run ahead of it.
 Roughly as many measurements from the same work were
 deliberately not kept: their numbers are in `../docs/design/` with the construction that produced
 them, which is what a reader needs. A script that answered its question once is a receipt.
@@ -24,6 +24,7 @@ them, which is what a reader needs. A script that answered its question once is 
 | `matcher_audit.py` | what is the entity precision of the counterparty matcher, and what does the text cap cost? | on every change to the matching rules |
 | `news_gap.py` | how stale may the newest item be before that is an incident? | against the first real vendor, because the thresholds it produced are provisional on D-1 |
 | `vendor_probe/` | four questions about a news vendor; **not yet run** | once, then once more at least 7 days later for the stability half |
+| `observation_lag/` | how many seconds after a filing's acceptance does EDGAR's daily index carry it, which is the `MeasuredLag` a `vendor_archive` window is refused without (R11); **run 2026-11-13, 27 requests of a registered 30: 94,922 s, band 24 h - 7 d** | the same two days again at least 7 days later, which is what tells a final index file from one that is still being rewritten, and on any change to the daily-index construction |
 | `newsvault_parity/` | the corpus `newsvault_parity.py` runs over, one partition per shape the archive lacks, plus that probe's pre-registration and its committed output | rebuilt with `--write-corpus` when a shape is added |
 
 Three of them take their inputs from the environment and abort with a named error when one is

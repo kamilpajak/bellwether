@@ -37,19 +37,23 @@
 //! # }
 //! ```
 
+pub mod budget;
 pub mod clock;
 pub mod collect;
 pub mod conformance;
+pub mod lag_policy;
 pub mod ledger;
 pub mod provider;
 pub mod request;
 pub mod wire;
 
-pub use clock::{Clock, SystemClock};
+pub use budget::{BudgetError, BudgetScope, Pace, RequestBudget};
+pub use clock::{Clock, Sleeper, SystemClock, ThreadSleeper};
 pub use collect::{
     collect, Archive, ArchiveError, AttemptRow, CollectError, Collected, Committed, Exchange, Exit,
     NotPlannedRow, Run, SourceTally, Tally, EXITS,
 };
+pub use lag_policy::{LagPolicy, LagPolicyError, LAG_POLICY_SCHEMA};
 pub use ledger::{
     abandon, AttemptEvent, AttemptId, AttemptReceipt, AttemptSlot, Baseline, Cost, Counts,
     LedgerError, Outcome, OutcomeKind, SendPermit, Sink, Verdict,

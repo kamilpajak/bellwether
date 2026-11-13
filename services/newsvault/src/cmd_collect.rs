@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use canon::digest::{doc_id, item_id, story_id, ItemFields};
 use chrono::{DateTime, NaiveDate, Utc};
 use edgar_press::EdgarPress;
-use news_provider::provider::{Calendar, CalendarError, Listing, PlanRefusal};
+use news_provider::lag_policy::{LagPolicy, LagPolicyError};
+use news_provider::provider::{Calendar, CalendarError, Listing, PlanRefusal, Provenance};
 use news_provider::{
     stamp_of, Archive, ArchiveError, AttemptReceipt, Clock, CollectError, Collected, CollectedItem,
     Committed, Exchange, Exit, Provider, Run, RunId, SourceId, TargetWindow,
@@ -19,7 +20,7 @@ use pit::ObservationTime;
 use serde_json::{json, Value};
 
 use crate::cmd_ledger::{Envelope, RUN_ENVELOPE_SCHEMA};
-use crate::store::{Committer, ItemRow, StoreError, RUNS_DIR};
+use crate::store::{Committer, ItemRow, StoreError, POLICY_DIR, RUNS_DIR};
 
 pub const SCHEMA: &str = "newsvault.collect/1";
 /// What a run with no schedule slot is keyed by, so an ad-hoc run still has a run id and a
@@ -43,6 +44,10 @@ pub struct Ask {
     /// file would be a shape nothing reads.
     pub roster: PathBuf,
     pub rules: PathBuf,
+    /// The measured observation lag per (source, provenance), hashed like the three files above.
+    /// Absent is not "no lag of zero": a `vendor_archive` window then has nothing behind it and
+    /// `probed_lag` refuses it before the first request (decision D5).
+    pub lag_policy: Option<PathBuf>,
     pub contact: String,
     pub at: DateTime<Utc>,
     pub dry_run: bool,
@@ -64,6 +69,10 @@ pub enum CollectRunError {
     PlanRefused(#[from] PlanRefusal),
     #[error(transparent)]
     Refused(#[from] edgar_press::Refusal),
+    /// Registry code `input_unparseable`, exit 2. A policy nothing can read is not a run with no
+    /// lag: that would refuse the window with R11's message and hide the unreadable file.
+    #[error("the observation-lag policy is unusable: {0}")]
+    UnusableLagPolicy(#[from] LagPolicyError),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -89,14 +98,84 @@ pub struct Driven {
     pub calendar_version: String,
 }
 
+/// The provider and the policy that dated it. One struct, because the digest the envelope reports
+/// and the lag `plan` was handed have to come from ONE read of one file: two reads of a path a
+/// caller names are two different files when the second read lands after an edit.
+#[derive(Debug)]
+pub struct Opened {
+    pub provider: EdgarPress,
+    pub lag: Option<AppliedLag>,
+}
+
+/// The lag a `vendor_archive` window of this run is dated through, as read.
+#[derive(Debug, Clone)]
+pub struct AppliedLag {
+    /// sha256 of the policy file, which is also the name it is copied into the vault under.
+    pub version: String,
+    pub probe_id: String,
+    pub seconds: i64,
+    bytes: Vec<u8>,
+}
+
 /// The one provider registered here. A second one makes this a table.
-pub fn open_provider(ask: &Ask) -> Result<EdgarPress, CollectRunError> {
+pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
     for source in &ask.sources {
         if source != edgar_press::SOURCE {
             return Err(CollectRunError::UnknownSource(source.clone()));
         }
     }
-    Ok(EdgarPress::open(&ask.roster, &ask.rules, &ask.contact)?)
+    let provider = EdgarPress::open(&ask.roster, &ask.rules, &ask.contact)?;
+    let Some(path) = ask.lag_policy.as_deref() else {
+        return Ok(Opened {
+            provider,
+            lag: None,
+        });
+    };
+    let bytes = read_input("observation-lag policy", path)?;
+    let policy = LagPolicy::read(&bytes)?;
+    // Per (source, provenance), because the same adapter reading today's index and an earlier one
+    // are two populations (R10) and one measured lag does not describe both.
+    let Some(lag) = policy.lag(&provider.source(), Provenance::VendorArchive) else {
+        return Ok(Opened {
+            provider,
+            lag: None,
+        });
+    };
+    let applied = AppliedLag {
+        version: policy.version().hex().to_owned(),
+        probe_id: lag.probe_id.clone(),
+        seconds: lag.seconds,
+        bytes,
+    };
+    Ok(Opened {
+        provider: provider.with_observation_lag(lag.clone()),
+        lag: Some(applied),
+    })
+}
+
+/// The policy as a file in the archive, named by its own digest, on first use. A run that dated
+/// items by a lag keeps the bytes that stated it, so the number survives an edit to the caller's
+/// copy; a digest already there is the same bytes and nothing is written.
+pub fn copy_policy_into_vault(
+    root: &Path,
+    applied: &AppliedLag,
+) -> Result<PathBuf, CollectRunError> {
+    let dir = root.join(POLICY_DIR);
+    let stored = dir.join(format!("{}.json", applied.version));
+    if stored.exists() {
+        return Ok(stored);
+    }
+    std::fs::create_dir_all(&dir)?;
+    let staging = dir.join(format!("{STAGING_PREFIX}{}.json", applied.version));
+    // `create_new` and not `create`: the content files of this archive are never truncated, and
+    // a staged file a crash left behind is a refusal rather than a silent overwrite (row R1).
+    let mut staged = std::fs::File::create_new(&staging)?;
+    std::io::Write::write_all(&mut staged, &applied.bytes)?;
+    staged.sync_all()?;
+    drop(staged);
+    std::fs::rename(&staging, &stored)?;
+    std::fs::File::open(&dir)?.sync_all()?;
+    Ok(stored)
 }
 
 fn read_input(what: &'static str, path: &Path) -> Result<Vec<u8>, CollectRunError> {
@@ -153,16 +232,22 @@ pub fn drive<A: Archive>(
 /// envelope and sends nothing.
 pub fn run(
     ask: &Ask,
-    provider: &dyn Provider,
+    opened: &Opened,
     exchange: &dyn Exchange,
     clock: &dyn Clock,
 ) -> Result<Answer, CollectRunError> {
+    let provider = &opened.provider;
     let run_id = run_id(ask);
     let run_date = ask.at.date_naive();
     if ask.dry_run {
-        return planned(ask, provider, &run_id, run_date);
+        return planned(ask, opened, &run_id, run_date);
     }
     let run = RunId::new(run_id.clone());
+    // Before the plan, because the plan is where a lag dates a window: a run that refuses after
+    // dating nothing still leaves the policy it would have dated by.
+    if let Some(applied) = opened.lag.as_ref() {
+        copy_policy_into_vault(&ask.store, applied)?;
+    }
     let envelope = Envelope {
         schema: RUN_ENVELOPE_SCHEMA.to_owned(),
         run_id: run_id.clone(),
@@ -182,17 +267,18 @@ pub fn run(
     write_envelope(&ask.store, &finished)?;
     Ok(Answer {
         exit: driven.collected.exit(),
-        envelope: envelope_of(ask, provider, &run_id, run_date, &driven, true),
+        envelope: envelope_of(ask, opened, &run_id, run_date, &driven, true),
     })
 }
 
 /// The plan alone, which is what `--dry-run` returns: everything except the mutation.
 fn planned(
     ask: &Ask,
-    provider: &dyn Provider,
+    opened: &Opened,
     run_id: &str,
     run_date: NaiveDate,
 ) -> Result<Answer, CollectRunError> {
+    let provider = &opened.provider;
     let (calendar, listing) = inputs(ask)?;
     let target = TargetWindow::new(&ask.window);
     let plan = provider
@@ -205,7 +291,7 @@ fn planned(
     Ok(Answer {
         // A dry run answers the plan question and nothing else, so its exit is the plan's.
         exit: driven.collected.exit(),
-        envelope: envelope_of(ask, provider, run_id, run_date, &driven, false),
+        envelope: envelope_of(ask, opened, run_id, run_date, &driven, false),
     })
 }
 
@@ -239,12 +325,13 @@ fn write_envelope(root: &Path, envelope: &Envelope) -> Result<(), CollectRunErro
 
 fn envelope_of(
     ask: &Ask,
-    provider: &dyn Provider,
+    opened: &Opened,
     run_id: &str,
     run_date: NaiveDate,
     driven: &Driven,
     changed: bool,
 ) -> Value {
+    let provider = &opened.provider;
     let collected = &driven.collected;
     let exit = collected.exit();
     json!({
@@ -256,6 +343,12 @@ fn envelope_of(
         "calendar_version": driven.calendar_version,
         "universe_version": provider.universe_version().hex(),
         "extract_rules_version": provider.extract_rules_version().hex(),
+        // What dated this run's archive windows, or null. Three fields and not one: the digest
+        // names the file, the probe id names the measurement inside it, and the seconds are the
+        // quantity every backfilled observation in this run is publication plus.
+        "observation_lag_policy_version": opened.lag.as_ref().map(|lag| lag.version.clone()),
+        "observation_lag_probe_id": opened.lag.as_ref().map(|lag| lag.probe_id.clone()),
+        "observation_lag_seconds": opened.lag.as_ref().map(|lag| lag.seconds),
         "at": ask.at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
         "dry_run": ask.dry_run,
         "plan": {

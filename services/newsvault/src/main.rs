@@ -125,6 +125,11 @@ enum Command {
         /// The hashed extraction rules.
         #[arg(long)]
         rules: PathBuf,
+        /// The measured observation lag per source and provenance, hashed. Without it a window
+        /// earlier than this run's own date is refused before its first request, which is what
+        /// `probes/observation_lag/` measures (requirement R11, decision D5).
+        #[arg(long)]
+        lag_policy: Option<PathBuf>,
         /// The instant this run PLANS and classifies provenance against (RFC 3339), not the
         /// instant anything is observed at: an item's observation time is read from the clock
         /// when its fetch returns, so this option cannot backdate what we knew. Defaults to now.
@@ -338,6 +343,7 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
             listing,
             roster,
             rules,
+            lag_policy,
             at,
             dry_run,
             non_interactive: _,
@@ -354,6 +360,7 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 listing,
                 roster,
                 rules,
+                lag_policy,
                 contact: contact(),
                 at: match at {
                     Some(raw) => instant(&raw, "--at"),
@@ -361,14 +368,18 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 },
                 dry_run,
             };
-            let provider = cmd_collect::open_provider(&ask)?;
+            let opened = cmd_collect::open_provider(&ask)?;
             // The provider's profile, this crate's socket, and the credential by name: the
             // address is substituted inside `Wire::send` and reaches no plan and no ledger row.
             let wire = Wire::new(
-                provider.transport(),
+                opened.provider.transport(),
                 Credentials::default().with(edgar_press::CONTACT_CREDENTIAL, ask.contact.clone()),
+                // The pace file goes beside this run's own store, and the production sleeper is
+                // the only thing in the tree that really waits.
+                &ask.store,
+                &opened.provider.source(),
             );
-            let answer = cmd_collect::run(&ask, &provider, &wire, &clock)?;
+            let answer = cmd_collect::run(&ask, &opened, &wire, &clock)?;
             if answer.exit.carries_the_result_on_stdout() {
                 emit_collect(&answer.envelope, format)?;
             } else {
@@ -692,6 +703,9 @@ fn print_schema(format: Format) {
                     {"name": "listing", "type": "path", "required": true},
                     {"name": "roster", "type": "path", "required": true},
                     {"name": "rules", "type": "path", "required": true},
+                    {"name": "lag_policy", "type": "path",
+                     "doc": "the measured observation lag per source and provenance; without it a \
+                             window earlier than the run's own date is refused unplanned (R11)"},
                     {"name": "at", "type": "rfc3339",
                      "doc": "the run's observation instant; defaults to now"},
                     {"name": "dry_run", "type": "flag",

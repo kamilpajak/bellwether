@@ -185,6 +185,7 @@ mod tests {
         breaches, Subject, EXTRACT_IS_PURE, NO_ITEM_IS_FINER_THAN_THE_CEILING,
         PLAN_ACCOUNTS_FOR_EVERY_DAY, PLAN_ASKS_ONLY_FOR_A_LISTED_SESSION, THE_COUNTS_ADD_UP,
     };
+    use crate::budget::{BudgetScope, RequestBudget};
     use crate::provider::{
         Calendar, CollectedItem, Extracted, Listing, Plan, PlanRefusal, Provenance, Provider,
         RawBlob, ValidPrecision, ValidSource,
@@ -282,6 +283,10 @@ mod tests {
                     recv_body: PATIENCE,
                 },
                 body_limit: 1,
+                budget: RequestBudget {
+                    min_interval: PATIENCE,
+                    scope: BudgetScope::PerIp,
+                },
             }
         }
 

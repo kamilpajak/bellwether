@@ -100,6 +100,9 @@ pub enum CollectError {
     /// A startup refusal and never a vendor event in the coverage ledger (design.md section 3).
     #[error("no credential named {0} is held")]
     Credential(String),
+    /// The same kind of refusal, raised before the socket: the vendor's pace could not be read.
+    #[error(transparent)]
+    Budget(#[from] crate::budget::BudgetError),
 }
 
 /// What a run was asked to collect.
@@ -410,6 +413,7 @@ fn attempt_once<A: Archive>(
         Ok(response) => Ok(response),
         Err(SendFailure::Transport(failed)) => Err(failed),
         Err(SendFailure::CredentialMissing(name)) => return Err(CollectError::Credential(name)),
+        Err(SendFailure::Budget(why)) => return Err(CollectError::Budget(why)),
     };
     let verdict = provider.classify(request, &answer);
     let stored = match &answer {

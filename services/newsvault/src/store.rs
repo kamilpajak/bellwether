@@ -87,6 +87,9 @@ const LOCK_FILE: &str = "LOCK";
 pub const COMMIT_LOG: &str = "commit.sqlite3";
 pub const RUNS_DIR: &str = "runs";
 pub const ITEMS_DIR: &str = "items";
+/// Where a hashed collect input is kept under its own digest, so a run that dated items by a
+/// measured lag keeps the bytes that stated it.
+pub const POLICY_DIR: &str = "policy";
 const BLOB_DIR: &str = "blobs";
 const BLOB_SPACE: &str = "sha256";
 /// One constant for the label `record` writes and `ok_vendor_rows` reads, so the two cannot drift.

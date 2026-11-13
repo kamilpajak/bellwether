@@ -23,5 +23,12 @@ thiserror = "2.0.21"
 # `Wire::new`, because a 403 carrying the vendor's own body is an answer the classifier reads.
 ureq = "3.5.2"
 
+# The pace file is shared state, so every test that touches it needs a store root of its own.
+# Cost measured 2026-11-13 with `cargo tree -e normal,build,dev --workspace --prefix none |
+# sed 's/ (\*)$//' | sort -u | wc -l`: 165 before and after, because `repo-invariants` and
+# `newsvault` already pull it; without `dev` the figure is 160 either way.
+[dev-dependencies]
+tempfile = "3.27.0"
+
 [lints]
 workspace = true

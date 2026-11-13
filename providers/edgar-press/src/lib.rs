@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use canon::FileDigest;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
+use news_provider::budget::{BudgetScope, RequestBudget};
 use news_provider::provider::{
     precision_of, probed_lag, Calendar, CollectedItem, Extracted, ExtractedBody, Listing,
     NotPlanned, Plan, PlanRefusal, Provenance, Provider, RawBlob, UnusableReason, UnusableRow,
@@ -69,6 +70,11 @@ const VENDOR_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 /// 2026-11-12) at the 110-byte fixed width the committed fixture's header carries, so a full index
 /// is about 600 KB. The order of magnitude of room is an assumption, like the timeout above.
 const BODY_LIMIT: u64 = 8 * 1_024 * 1_024;
+/// 1 s / 10 requests. SEC's fair-access ceiling is 10 requests a second per IP as the
+/// predecessor's vendor-quota table states it (read 2026-11-13 from
+/// `apps/alphalens-pipeline/CLAUDE.md`); nothing here has measured it, and this paces TO the
+/// ceiling with no margin under it, which row R19 names as the open question it is.
+const SEC_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Why no request may be made at all. Every one of these is raised BEFORE the first request, so a
 /// broken input is never a vendor event in the coverage ledger.
@@ -398,6 +404,12 @@ impl Provider for EdgarPress {
                 recv_body: VENDOR_PATIENCE,
             },
             body_limit: BODY_LIMIT,
+            // Per IP: the contact above identifies this caller and does not scope the quota, so
+            // every process on this host shares one bucket however many of them there are.
+            budget: RequestBudget {
+                min_interval: SEC_MIN_INTERVAL,
+                scope: BudgetScope::PerIp,
+            },
         }
     }
 

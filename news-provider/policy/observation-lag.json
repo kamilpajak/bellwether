@@ -1,0 +1,13 @@
+{
+  "schema": "observation_lag_policy/1",
+  "lags": [
+    {
+      "source": "edgar_press",
+      "provenance": "vendor_archive",
+      "probe_id": "edgar_index_write-20261113",
+      "probes": 22,
+      "leaks": 0,
+      "seconds": 94922
+    }
+  ]
+}
