@@ -320,21 +320,28 @@ naming a file that is not there is refused.
 20261110 — so a late submission appears in a later day's index and the index's own day is not the
 row's filing date. The column is `YYYYMMDD`, not ISO.
 
-**The file count this layout produces, which is the shape of the failure it has to avoid.** One blob
-per attempt that returned a body. A session day is about 450 attempts — re-derived 2026-11-13
-from the real `form.20261110.idx` (1,057,192 bytes, captured through the predecessor's own SEC
-client) against the 7,992 distinct CIKs of its `company_tickers.json` of 2026-05-29: **5,429**
-filing rows, **391** of them 8-K or 8-K/A, and **347** of those with a CIK in the roster. The roster
-is five months old, so the 347 is a floor and not a count. Plus roughly 100 exhibit follow-ups — so about 450 blob files a run and about 113,000 a
-year over 252 session days, which is 1.7 files per directory across the two-level 65,536-directory
-fan-out. The predecessor of this shape reached 558,235 loose files holding 5,197 current values
-because content addressing dedups identical BYTES and its payload's last bar was still forming, so
-98.7% of what it stored were exact copies. Here the immutable half is the filing document at a fixed
-accession URL, which dedups to zero new files on a re-fetch; the moving tail is the daily index,
-which grows through the day and mints one blob per fetch, bounded by the number of runs in a day and
-not by the number of items. **The re-fetch rate is unmeasured** — no collector has run — and the
-observation that would falsify the paragraph is a run whose blob count is far above its attempt count,
-or one document whose repeated fetches carry more than one digest.
+**The file count this layout produces, which is the shape of the failure it has to avoid.** Two
+blobs per committed item, not one per attempt: the raw submission `.txt` as received (§3.9's L2,
+`raw_blob_ref`) and the extracted article body (L1, `body_ref`) are disjoint and land under separate
+digests. Measured 2026-11-13 on window 2026-11-12: **916** distinct blobs — **458** distinct raw
+payloads and **458** distinct bodies — against **503** attempts (1 index, ~502 document, 458 of them
+committed and ~44 lost to the transient failures R19's no-margin pace leaves), with 918 files on disk
+because two more are the daily index payload. The blob count running far above the attempt count is
+exactly the observation the earlier one-blob-per-attempt projection named as its own falsifier, so
+the two-blob count above is the model. The per-day order of magnitude is the in-universe filing
+count: re-derived 2026-11-13 from the real `form.20261110.idx` (1,057,192 bytes, captured through
+the predecessor's own SEC client) against the 7,992 distinct CIKs of its `company_tickers.json` of
+2026-05-29, **5,429** filing rows, **391** of them 8-K or 8-K/A, and **347** of those with a CIK in
+the roster — a floor, the roster being five months old. So about 916 blob files a run and, at 252
+session days, about **231,000** a year, which is **3.5** files per directory across the two-level
+65,536-directory fan-out (230,832 / 65,536). The predecessor of this shape reached 558,235 loose
+files holding 5,197 current values because content addressing dedups identical BYTES and its
+payload's last bar was still forming, so 98.7% of what it stored were exact copies. Here the
+immutable half is the filing document at a fixed accession URL, which dedups to zero new files on a
+re-fetch; the moving tail is the daily index, which grows through the day and mints one blob per
+fetch, bounded by the number of runs in a day and not by the number of items. **What is still
+unmeasured** is the index re-fetch rate across a whole day; the observation that would now surprise
+this paragraph is one filing document whose repeated fetches carry more than one digest.
 
 **The ceiling: this settles the layer, not the number.** N4 still needs a count of days for L2 and a
 medium for what is kept past it, one number per provenance class (§3.1) being the next smallest
@@ -676,6 +683,18 @@ settled fact. Both are one edit to reverse.
   there is no quantile to put here. **The one place to change it** is
   `edgar-press`'s `Provider::provenance`, which is also where its fail-closed arm lives - a window
   nothing can read takes the archive arm, the one that refuses.
+- **The backfill coverage convergence, a vertical slice 2026-11-13 (§8 row R20).** Three choices,
+  each changeable in one place. **Which arm converges:** a `vendor_archive` follow-up whose story
+  the store already holds a committed item for is dropped, while a `live_ingest` one is always
+  issued (R16), so a re-run fetches only the uncovered accessions. **The one place to change it** is
+  `edgar-press`'s `EdgarPress::follow_ups_to_issue`, the provider's own method - a second provider
+  with a different vendor-row identity maps a follow-up to its story there and nowhere else. **The
+  denominator:** `MAX(matched)` over a window's index attempts, because each run's index records the
+  same in-universe count and `SUM` would multiply it by the number of runs. **The one place to
+  change it** is `newsvault::store`'s `coverage_up_to`. **The gate:** `newsvault ledger --check`
+  raises `coverage_incomplete` whenever `covered < planned`, on a gap of ANY size - no percentage and
+  no tolerance, because a threshold chosen after seeing a result is the thing this project forbids.
+  **The one place to change it** is the `coverage_incomplete` push in `cmd_ledger`'s `read`.
 - **The run's own key, taken by default 2026-11-13.** A run id is `<schedule slot>-<at as
 %Y%m%dT%H%M%SZ>`, or `adhoc-<at>` with no slot, and `run_date` is the UTC date of the run's own
 instant for BOTH, because no schedule registry exists to take a slot's date from (accepted attack
