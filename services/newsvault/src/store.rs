@@ -67,6 +67,7 @@
 //! # }
 //! ```
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::PathBuf;
 
@@ -74,6 +75,7 @@ use canon::Digest;
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use news_provider::{
     AttemptEvent, AttemptReceipt, Cost, LedgerError, OutcomeKind, RunId, Sink, SourceId,
+    TargetWindow,
 };
 use pit::datedness::{Datedness, Published};
 use pit::{ObservationTime, Visibility};
@@ -120,6 +122,11 @@ CREATE TABLE IF NOT EXISTS attempts (
     outcome               TEXT,
     vendor_rows           INTEGER,
     items_new             INTEGER,
+    -- How many in-universe follow-ups an INDEX attempt named: the coverage denominator §8 row R20
+    -- compares committed rows against. NULL on a document attempt and on a sweep, which is how the
+    -- reader tells an index attempt apart without a phase column. Not the matched accessions
+    -- themselves: those are a read over `items`, computed from the index row, never a second copy.
+    matched               INTEGER,
     baseline_count        INTEGER,
     baseline_window       INTEGER,
     baseline_construction TEXT,
@@ -326,6 +333,47 @@ pub struct PublishedSegment {
     pub rows: u32,
 }
 
+/// Coverage per (source, target window): how many accessions an index attempt planned to cover,
+/// against how many distinct stories the store holds a committed item for. Only a window an index
+/// attempt recorded a `matched` count for appears, so `covered < planned` is a real gap and not a
+/// window nobody read. Point-in-time, like every ledger read: a row committed after the cutoff is
+/// not yet covered, and an index attempt opened after it does not count toward the denominator.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WindowCoverage {
+    pub source: String,
+    pub target_window: String,
+    pub planned: i64,
+    pub covered: i64,
+}
+
+/// The coverage rows up to `at`. `planned` is the MAX `matched` over the window's index attempts,
+/// because each run's index records the same count and summing them would multiply by the run
+/// number; `covered` is the distinct committed stories. §8 row R20.
+pub fn coverage_up_to(db: &Connection, at: &str) -> Result<Vec<WindowCoverage>, StoreError> {
+    let mut statement = db.prepare(
+        "SELECT a.source, a.target_window, MAX(a.matched),
+                (SELECT COUNT(DISTINCT i.story_id)
+                   FROM items i JOIN attempts c ON c.attempt_id = i.attempt_id
+                  WHERE c.source = a.source AND c.target_window = a.target_window
+                    AND i.committed_at <= ?1 AND c.opened_at <= ?1)
+         FROM attempts a
+         WHERE a.matched IS NOT NULL AND a.opened_at <= ?1
+         GROUP BY a.source, a.target_window
+         ORDER BY a.source, a.target_window",
+    )?;
+    let rows = statement
+        .query_map([at], |row| {
+            Ok(WindowCoverage {
+                source: row.get(0)?,
+                target_window: row.get(1)?,
+                planned: row.get(2)?,
+                covered: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<WindowCoverage>, _>>()?;
+    Ok(rows)
+}
+
 /// The `seq` of every committed item no segment carries, as contiguous spans. A hole in the
 /// sequence is a range a transaction reserved and rolled back (see [`SCHEMA`]), so the spans
 /// break across it rather than claiming a row the store does not hold.
@@ -500,6 +548,46 @@ impl Committer {
             .query_map(params![source.as_str(), OUTCOME_OK], |row| row.get(0))?
             .collect::<Result<Vec<u32>, _>>()?;
         Ok(counts)
+    }
+
+    /// The story ids this store already holds a COMMITTED item for, under one (source, target
+    /// window). "Covered" is a committed item and never an attempt that merely returned ok: an ok
+    /// attempt that committed nothing is a gap the next run must still close, and keying this on
+    /// the attempt outcome would hide it. The driver hands this set to the provider so a
+    /// `vendor_archive` re-run fetches only the uncovered accessions (§8 row R20). No cutoff: the
+    /// driver holds the write lease and plans against everything the store already holds.
+    pub fn covered_story_ids(
+        &self,
+        source: &SourceId,
+        target: &TargetWindow,
+    ) -> Result<BTreeSet<String>, StoreError> {
+        let mut statement = self.db.prepare(
+            "SELECT DISTINCT i.story_id FROM items i
+             JOIN attempts a ON a.attempt_id = i.attempt_id
+             WHERE a.source = ?1 AND a.target_window = ?2",
+        )?;
+        let covered = statement
+            .query_map(params![source.as_str(), target.as_str()], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<BTreeSet<String>, _>>()?;
+        Ok(covered)
+    }
+
+    /// Records how many in-universe follow-ups an index attempt named. One count per index
+    /// attempt, stable across runs, so the coverage reader takes the MAX. A plain annotation
+    /// column and not an item-row invariant, so it is its own `UPDATE` rather than part of the
+    /// one commit transaction.
+    pub fn record_planned_coverage(
+        &mut self,
+        attempt_id: &str,
+        matched: u32,
+    ) -> Result<(), StoreError> {
+        self.db.execute(
+            "UPDATE attempts SET matched = ?2 WHERE attempt_id = ?1",
+            params![attempt_id, matched],
+        )?;
+        Ok(())
     }
 
     /// Every attempt this store opened and never finalised, oldest first. The startup sweep's
@@ -1641,6 +1729,29 @@ mod tests {
                 (i64::try_from(wanted)?, wanted)
             );
         }
+        Ok(())
+    }
+
+    /// §8 row R20. "Covered" is a committed item under a story, never an attempt that returned ok
+    /// and committed nothing: the second is a gap the next run must still close, so keying the
+    /// covered set on the outcome would hide it. Mutation 2026-11-13: turning the inner
+    /// `JOIN items` into a `LEFT JOIN` (so coverage counts an attempt that returned but committed
+    /// nothing) turns this red - the empty ok attempt then yields a NULL story.
+    #[test]
+    fn covered_story_ids_names_a_committed_story_and_not_an_ok_attempt_that_committed_nothing(
+    ) -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let committed = closed_attempt(&mut store, 0, Verdict::Usable)?;
+        store.record(committed, &[row(&store, &spec(STORY))?], at(5))?;
+        let empty = closed_attempt(&mut store, 1, Verdict::Usable)?;
+        store.record(empty, &[], at(6))?;
+        let covered =
+            store.covered_story_ids(&SourceId::new(SOURCE), &TargetWindow::new(WINDOW))?;
+        assert_eq!(
+            covered,
+            std::collections::BTreeSet::from([story_hex(SOURCE, STORY)])
+        );
         Ok(())
     }
 

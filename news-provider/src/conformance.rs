@@ -366,6 +366,15 @@ mod tests {
         fn extract_rules_version(&self) -> FileDigest {
             FileDigest::of(b"{}")
         }
+
+        /// This mock produces no follow-ups, so coverage has nothing to exclude.
+        fn follow_ups_to_issue(
+            &self,
+            follow_ups: Vec<Request>,
+            _covered: &std::collections::BTreeSet<String>,
+        ) -> Vec<Request> {
+            follow_ups
+        }
     }
 
     fn found(how: Break) -> Vec<&'static str> {

@@ -8,7 +8,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use news_provider::provider::Provider;
 use news_provider::{
     Archive, ArchiveError, AttemptEvent, AttemptReceipt, AttemptSlot, Clock, CollectedItem,
@@ -17,6 +17,7 @@ use news_provider::{
 };
 use newsvault::cmd_collect::{self, Ask};
 use newsvault::cmd_items::{self, PerStory};
+use newsvault::cmd_ledger;
 use newsvault::store::{Committer, COMMIT_LOG};
 use pit::ObservationTime;
 use rusqlite::{Connection, OpenFlags};
@@ -216,6 +217,22 @@ impl Archive for Refusing {
 
     fn attempts_in_flight(&self) -> Result<Vec<String>, ArchiveError> {
         Archive::attempts_in_flight(&self.store)
+    }
+
+    fn covered_story_ids(
+        &self,
+        source: &SourceId,
+        target_window: &TargetWindow,
+    ) -> Result<std::collections::BTreeSet<String>, ArchiveError> {
+        Archive::covered_story_ids(&self.store, source, target_window)
+    }
+
+    fn record_planned_coverage(
+        &mut self,
+        attempt_id: &str,
+        matched: u32,
+    ) -> Result<(), ArchiveError> {
+        Archive::record_planned_coverage(&mut self.store, attempt_id, matched)
     }
 }
 
@@ -984,5 +1001,138 @@ fn every_option_the_collect_parser_takes_is_in_the_machine_readable_schema() -> 
         }
     }
     assert!(missing.is_empty(), "the schema names none of {missing:?}");
+    Ok(())
+}
+
+/// Run 1 of a `vendor_archive` day where Microsoft fails transiently, so only Apple is covered.
+fn partial_archive_day() -> Result<Payloads, Box<dyn Error>> {
+    Payloads::of(&[
+        (INDEX_URL, OK, "form.20261110.idx"),
+        (APPLE_URL, OK, "filing_8k_apple.txt"),
+        (MICROSOFT_URL, FORBIDDEN, "error_403_traffic.html"),
+    ])
+}
+
+fn ledger_ask() -> Result<cmd_ledger::Ask, Box<dyn Error>> {
+    Ok(cmd_ledger::Ask {
+        at: AFTER_THE_NEW_YORK_DAY_CLOSED.parse()?,
+        from: A_LISTED_SESSION.parse::<NaiveDate>()?,
+        to: A_LISTED_SESSION.parse::<NaiveDate>()?,
+        source: None,
+        expected_runs: None,
+        limit: None,
+        check: true,
+    })
+}
+
+fn asked(exchange: &Payloads) -> Vec<String> {
+    exchange.asked.borrow().clone()
+}
+
+/// §8 row R20, the whole point of this change. A backfill re-run of one window re-fetches only the
+/// accessions the store does not already hold a committed item for: run 1 leaves Microsoft
+/// uncovered, and run 2 asks for the index and Microsoft alone, never Apple again. Mutation
+/// 2026-11-13: making `EdgarPress::follow_ups_to_issue` return its input unfiltered turns this red
+/// (run 2 asks for Apple too).
+#[test]
+fn a_vendor_archive_rerun_fetches_only_the_uncovered_accession() -> TestResult {
+    let root = TempDir::new()?;
+    let first = an_archive_ask(root.path());
+    let opened = cmd_collect::open_provider(&first)?;
+    let answer = cmd_collect::run(&first, &opened, &partial_archive_day()?, &Fixed)?;
+    assert_eq!(answer.exit, Exit::PartialCollect, "{:#}", answer.envelope);
+    let second = Ask {
+        schedule: Some("second".to_owned()),
+        ..an_archive_ask(root.path())
+    };
+    let opened = cmd_collect::open_provider(&second)?;
+    let good = Payloads::a_good_day()?;
+    let answer = cmd_collect::run(&second, &opened, &good, &Fixed)?;
+    assert_eq!(answer.exit, Exit::Ok, "{:#}", answer.envelope);
+    assert_eq!(
+        asked(&good),
+        vec![INDEX_URL.to_owned(), MICROSOFT_URL.to_owned()]
+    );
+    Ok(())
+}
+
+/// §8 row R16. A live ingest polls every matched row, so a live re-run fetches BOTH documents even
+/// though run 1 committed them: coverage skips the archive arm alone. Mutation 2026-11-13:
+/// dropping the `provenance != VendorArchive` guard in `follow_ups_to_issue` turns this red (run 2
+/// asks for the index alone).
+#[test]
+fn a_live_rerun_still_polls_every_matched_row_even_when_the_story_is_covered() -> TestResult {
+    let root = TempDir::new()?;
+    let mut first = ask(root.path(), A_LISTED_SESSION);
+    first.schedule = Some("first".to_owned());
+    let opened = cmd_collect::open_provider(&first)?;
+    cmd_collect::run(&first, &opened, &Payloads::a_good_day()?, &Fixed)?;
+    let mut second = ask(root.path(), A_LISTED_SESSION);
+    second.schedule = Some("second".to_owned());
+    let opened = cmd_collect::open_provider(&second)?;
+    let good = Payloads::a_good_day()?;
+    cmd_collect::run(&second, &opened, &good, &Fixed)?;
+    assert_eq!(
+        asked(&good),
+        vec![
+            INDEX_URL.to_owned(),
+            APPLE_URL.to_owned(),
+            MICROSOFT_URL.to_owned()
+        ]
+    );
+    Ok(())
+}
+
+/// §8 row R20's reader half. After a backfill leaves one accession uncovered the ledger reports
+/// the gap per (source, target window) and `--check` raises `coverage_incomplete`; once a re-run
+/// closes the gap the finding is gone. Mutations 2026-11-13: dropping the `coverage_incomplete`
+/// push in `cmd_ledger::read` turns the finding assertions red; summing `matched` instead of
+/// taking its MAX in `coverage_up_to` turns the `(2, 2)` assertion red, because the two runs'
+/// index attempts would add to a planned of 4; making `record_planned_coverage` a no-op turns the
+/// `find` red, because no coverage row exists at all.
+#[test]
+fn a_vendor_archive_day_with_an_uncovered_accession_reports_coverage_incomplete() -> TestResult {
+    let root = TempDir::new()?;
+    let first = an_archive_ask(root.path());
+    let opened = cmd_collect::open_provider(&first)?;
+    cmd_collect::run(&first, &opened, &partial_archive_day()?, &Fixed)?;
+    let report = cmd_ledger::read(root.path(), &ledger_ask()?)?;
+    let gap = report
+        .coverage
+        .iter()
+        .find(|row| row.source == SOURCE && row.target_window == A_LISTED_SESSION)
+        .ok_or("no coverage row for the window")?;
+    assert_eq!((gap.planned, gap.covered), (2, 1));
+    assert!(
+        report
+            .check
+            .findings
+            .iter()
+            .any(|finding| finding.code == "coverage_incomplete"),
+        "{:?}",
+        report.check.findings
+    );
+    let second = Ask {
+        schedule: Some("second".to_owned()),
+        ..an_archive_ask(root.path())
+    };
+    let opened = cmd_collect::open_provider(&second)?;
+    cmd_collect::run(&second, &opened, &Payloads::a_good_day()?, &Fixed)?;
+    let report = cmd_ledger::read(root.path(), &ledger_ask()?)?;
+    let closed = report
+        .coverage
+        .iter()
+        .find(|row| row.target_window == A_LISTED_SESSION)
+        .ok_or("no coverage row for the window")?;
+    assert_eq!((closed.planned, closed.covered), (2, 2));
+    assert!(
+        !report
+            .check
+            .findings
+            .iter()
+            .any(|finding| finding.code == "coverage_incomplete"),
+        "{:?}",
+        report.check.findings
+    );
     Ok(())
 }

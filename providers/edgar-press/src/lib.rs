@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use canon::FileDigest;
+use canon::{Digest, FileDigest};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use news_provider::budget::{BudgetScope, RequestBudget};
@@ -543,6 +543,49 @@ impl Provider for EdgarPress {
     fn extract_rules_version(&self) -> FileDigest {
         self.rules_version.clone()
     }
+
+    /// A `vendor_archive` follow-up whose story the store already holds a committed item for is
+    /// dropped, so a re-run fetches only the uncovered accessions and converges on full coverage.
+    /// A `live_ingest` follow-up is always issued, because a live sweep must poll every matched
+    /// row (§8 row R16): the covered set is consulted for the archive arm alone. A follow-up whose
+    /// accession the url does not carry is never dropped - a skip we cannot justify is a hole.
+    fn follow_ups_to_issue(
+        &self,
+        follow_ups: Vec<Request>,
+        covered: &BTreeSet<String>,
+    ) -> Vec<Request> {
+        follow_ups
+            .into_iter()
+            .filter(|follow_up| {
+                if follow_up.provenance != Provenance::VendorArchive {
+                    return true;
+                }
+                match story_of(follow_up) {
+                    Some(story) => !covered.contains(story.hex()),
+                    None => true,
+                }
+            })
+            .collect()
+    }
+}
+
+/// The story a follow-up document request belongs to, taken over the accession its url carries.
+/// `story_id` is `canon` over the vendor row identity, which for EDGAR is the accession, so the
+/// covered set is matched by computing the digest from the index-derived url rather than by
+/// storing it. `None` when the url carries no accession.
+fn story_of(follow_up: &Request) -> Option<Digest> {
+    let accession = accession_of(&follow_up.url)?;
+    canon::digest::story_id(SOURCE, &accession).ok()
+}
+
+/// The accession an EDGAR document url ends in:
+/// `.../edgar/data/320193/0000320193-26-000071.txt` -> `0000320193-26-000071`. The same string
+/// the filing header's `ACCESSION NUMBER` carries, so a follow-up's story matches the committed
+/// item's.
+fn accession_of(url: &str) -> Option<String> {
+    let last = url.rsplit('/').next()?;
+    let stem = last.strip_suffix(".txt").unwrap_or(last);
+    (!stem.is_empty()).then(|| stem.to_owned())
 }
 
 /// The quarter's listing, read into the seam's [`Listing`]. Only `form.<date>.idx` names count: a

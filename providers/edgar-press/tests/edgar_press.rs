@@ -1,9 +1,10 @@
 //! Against committed fixtures and never the network. Each 403 body below is the shape measured by
 //! curl on six consecutive dates 2026-11-12, which is why the planning tests exist at all.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use canon::digest::{item_id, ItemFields};
+use canon::digest::{item_id, story_id, ItemFields};
 use canon::FileDigest;
 use chrono::{DateTime, Utc};
 use edgar_press::{read_listing, EdgarPress, Refusal, CONTACT_CREDENTIAL, SOURCE};
@@ -35,6 +36,9 @@ const APPLE_ACCEPTED_AT: &str = "2026-11-10T21:32:15Z";
 /// `APPLE_ACCEPTED_AT` plus the 7,200 s `probed()` stands behind.
 const APPLE_OBSERVED_AT: &str = "2026-11-10T23:32:15Z";
 const APPLE_ACCESSION: &str = "0000320193-26-000071";
+/// The second in-universe filing of the fixture index, which is the uncovered one in the
+/// convergence tests below.
+const MICROSOFT_ACCESSION: &str = "0000789019-26-000045";
 /// The acceptance field as the filing header spells it, kept as `valid_raw` so a replay re-parses
 /// the value rather than trusting the stored instant.
 const APPLE_ACCEPTANCE_RAW: &str = "20261110163215";
@@ -684,6 +688,72 @@ fn a_fixture_index_yields_follow_ups_equal_to_the_in_universe_subset() -> Outcom
         .all(|follow_up| follow_up.phase == RequestPhase::Document
             && follow_up.provenance == request.provenance
             && follow_up.universe_version == request.universe_version));
+    Ok(())
+}
+
+/// Both in-universe follow-ups the fixture index yields, under the provenance `day` gives them.
+fn index_follow_ups(
+    provider: &EdgarPress,
+    day: &str,
+) -> Result<Vec<Request>, Box<dyn std::error::Error>> {
+    let index = index_request(provider, day)?;
+    Ok(provider
+        .extract(&index, &blob("form.20261110.idx"))
+        .follow_ups)
+}
+
+/// The covered set the archive would hand in, over the accessions named here.
+fn covered(accessions: &[&str]) -> BTreeSet<String> {
+    accessions
+        .iter()
+        .filter_map(|accession| story_id(SOURCE, accession).ok())
+        .map(|digest| digest.hex().to_owned())
+        .collect()
+}
+
+/// The accession each follow-up url ends in, in order, so the exclusion is checked by the vendor
+/// row identity and not by url string.
+fn accessions_of(follow_ups: &[Request]) -> Vec<String> {
+    follow_ups
+        .iter()
+        .filter_map(|follow_up| follow_up.url.rsplit('/').next())
+        .map(|last| last.trim_end_matches(".txt").to_owned())
+        .collect()
+}
+
+/// §8 row R20. A backfill re-run is handed the stories it already committed; a `vendor_archive`
+/// follow-up whose story is covered is dropped and the uncovered one is kept. That is what makes a
+/// re-run converge on full coverage instead of re-fetching the whole day.
+#[test]
+fn a_vendor_archive_follow_up_whose_story_is_covered_is_dropped_and_an_uncovered_one_is_kept(
+) -> Outcome {
+    let provider = probed()?;
+    let follow_ups = index_follow_ups(&provider, AN_ARCHIVED_SESSION)?;
+    assert!(follow_ups
+        .iter()
+        .all(|follow_up| follow_up.provenance == Provenance::VendorArchive));
+    let issued = provider.follow_ups_to_issue(follow_ups, &covered(&[APPLE_ACCESSION]));
+    assert_eq!(accessions_of(&issued), vec![MICROSOFT_ACCESSION.to_owned()]);
+    Ok(())
+}
+
+/// §8 row R16. A live ingest polls every matched row, so coverage never drops a follow-up even
+/// when the story is already committed: the covered set is consulted for the archive arm alone.
+#[test]
+fn a_live_follow_up_is_issued_even_when_its_story_is_already_covered() -> Outcome {
+    let provider = provider()?;
+    let follow_ups = index_follow_ups(&provider, A_LISTED_SESSION)?;
+    assert!(follow_ups
+        .iter()
+        .all(|follow_up| follow_up.provenance == Provenance::LiveIngest));
+    let issued = provider.follow_ups_to_issue(
+        follow_ups,
+        &covered(&[APPLE_ACCESSION, MICROSOFT_ACCESSION]),
+    );
+    assert_eq!(
+        accessions_of(&issued),
+        vec![APPLE_ACCESSION.to_owned(), MICROSOFT_ACCESSION.to_owned()]
+    );
     Ok(())
 }
 
