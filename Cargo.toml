@@ -3,7 +3,7 @@
 # Why `repo-invariants` and `panel-contract` are crates of their own rather than code inside a
 # service: CONTRIBUTING.md, "Everything else".
 [workspace]
-members = ["canon", "panel-contract", "pit", "repo-invariants", "services/newsvault"]
+members = ["canon", "news-provider", "panel-contract", "pit", "repo-invariants", "services/newsvault"]
 resolver = "2"
 
 # The lint floor for every crate in the workspace. Why it is here and not in a package table, and
