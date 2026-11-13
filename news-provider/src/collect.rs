@@ -44,14 +44,8 @@ impl Exchange for Wire {
     }
 }
 
-/// How many times a request whose fetch failed TRANSIENTLY (HTTP 503 or a transport/connection
-/// error) is re-queued before the run gives up and lets the residual gap stand. A MECHANISM cap,
-/// not a rate read off the measured ~8% transient-loss figure: its only job is to keep one
-/// persistently failing accession from stalling the run, and whatever still fails after it is a
-/// coverage gap the `vendor_archive` convergence (§8 row R20) or the next day closes. The value is
-/// a bound on the work spent per request, never a threshold tuned to an observed failure rate, so
-/// it is not derived from any run's loss count. A permanent failure (4xx, `vendor_refused`) is
-/// never re-queued whatever this is.
+/// Bound on retry work per request — a MECHANISM cap, never derived from an observed loss rate
+/// (§8 row R21, §10). A permanent failure (4xx, `vendor_refused`) is never re-queued.
 pub const MAX_TRANSIENT_RETRIES: u32 = 2;
 
 /// What the archive refused, and which act asked. The act is what the exit table reads: a refused
@@ -392,11 +386,8 @@ pub fn collect<A: Archive>(
     while let Some(Queued { request, retries }) = queue.pop_front() {
         let attempted = attempt_once(&driving, archive, &request, ordinal)?;
         ordinal += 1;
-        // A transient failure under the cap is re-queued to the BACK, so the vendor's own pace
-        // limiter (`Wire::send` → `Pace::reserve`, §8 row R19) spaces the retry behind the other
-        // queued calls with no second clock and no new injected dependency: a retry's socket call
-        // is just another `attempt_once`, which cannot bypass the one send seam. A permanent
-        // failure (4xx, `vendor_refused`) is never re-queued.
+        // Re-queue a transient failure under the cap to the BACK, so the pace limiter (R19) spaces
+        // the retry; it is just another `attempt_once`, so it cannot bypass the send seam. §8 R21.
         let retrying = attempted.is_transient() && retries < MAX_TRANSIENT_RETRIES;
         collected.absorb(&attempted, retrying);
         queue.extend(attempted.follow_ups.into_iter().map(Queued::first_attempt));
@@ -597,13 +588,9 @@ fn sweep<A: Archive>(
 }
 
 impl Collected {
-    /// `retrying` is true when the driver is about to re-queue this attempt after a transient
-    /// failure. Its outcome is then NOT counted toward the exit tally's buckets, because the
-    /// request's final disposition is still pending: a transient failure that a later retry turns
-    /// into a commit must leave the day complete (exit 0), and only a RESIDUAL transient — the
-    /// last attempt, not re-queued — counts as incomplete (exit 7/8), unchanged from before. The
-    /// attempt ROW and its stored evidence are recorded either way: "we looked and failed" is true
-    /// of the attempt whatever the retry does (R4).
+    /// `retrying` true = the driver will re-queue this transient failure, so its outcome is held
+    /// out of the exit tally (the request's final disposition is still pending); the attempt ROW
+    /// is recorded either way — "we looked and failed" holds whatever the retry does (R4). §8 R21.
     fn absorb(&mut self, attempted: &Attempted, retrying: bool) {
         if !retrying {
             match attempted.kind {

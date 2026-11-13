@@ -223,11 +223,10 @@ impl Exchange for Flaky {
             *seen += 1;
             nth
         };
-        let answer = self.answers.get(&request.url).and_then(|sequence| {
-            sequence
-                .get(nth.min(sequence.len().saturating_sub(1)))
-                .filter(|_| !sequence.is_empty())
-        });
+        let answer = self
+            .answers
+            .get(&request.url)
+            .and_then(|sequence| sequence.get(nth.min(sequence.len().saturating_sub(1))));
         match answer {
             Some((status, body)) => Ok(RawResponse::new(
                 attempt,
@@ -244,18 +243,6 @@ impl Exchange for Flaky {
             ))),
         }
     }
-}
-
-/// One run through the library with a flaky exchange, so a transient-then-success document can be
-/// stated. The sibling of `collected`, which takes a static `Payloads`.
-fn collected_flaky(
-    store: &Path,
-    window: &str,
-    exchange: &Flaky,
-) -> Result<cmd_collect::Answer, Box<dyn Error>> {
-    let ask = ask(store, window);
-    let provider = cmd_collect::open_provider(&ask)?;
-    Ok(cmd_collect::run(&ask, &provider, exchange, &Fixed)?)
 }
 
 /// A real archive whose `commit` refuses one attempt, which is the only way to reach the
@@ -320,11 +307,12 @@ impl Archive for Refusing {
     }
 }
 
-/// One run through the library, with the exchange the caller chose.
+/// One run through the library, with the exchange the caller chose (static `Payloads` or a
+/// sequenced `Flaky`).
 fn collected(
     store: &Path,
     window: &str,
-    exchange: &Payloads,
+    exchange: &dyn Exchange,
 ) -> Result<cmd_collect::Answer, Box<dyn Error>> {
     let ask = ask(store, window);
     let provider = cmd_collect::open_provider(&ask)?;
@@ -1287,7 +1275,7 @@ fn a_transient_fetch_failure_is_retried_and_commits_the_item_within_one_run() ->
             ],
         ),
     ])?;
-    let answer = collected_flaky(root.path(), A_LISTED_SESSION, &flaky)?;
+    let answer = collected(root.path(), A_LISTED_SESSION, &flaky)?;
     assert_eq!(
         (
             answer.exit,
@@ -1306,6 +1294,18 @@ fn a_transient_fetch_failure_is_retried_and_commits_the_item_within_one_run() ->
     assert_eq!(
         outcomes_for(&answer, MICROSOFT_URL),
         vec!["failed".to_owned(), "ok".to_owned()],
+        "{:#}",
+        answer.envelope
+    );
+    // per_source.failed counts the failed attempt ROW even though the retry succeeded and the run
+    // exits Ok: per_source summarises attempts, the exit is final disposition, and the two diverge
+    // once a transient is retried (§8 row R21). This pins that divergence.
+    assert_eq!(
+        (
+            answer.exit,
+            answer.envelope["per_source"][0]["failed"].as_u64()
+        ),
+        (Exit::Ok, Some(1)),
         "{:#}",
         answer.envelope
     );
