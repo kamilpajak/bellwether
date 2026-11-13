@@ -83,7 +83,7 @@ keeping. It is here so this project is not free to repeat them.
 ```
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked --no-fail-fast          # 120 tests, plus two compile_fail doc tests and their controls
+cargo test --locked --no-fail-fast          # 155 tests, plus three compile_fail doc tests and their controls
 cargo run -p newsvault -- day 2026-07-01 --lake <path-to-lake> --format json
 cargo run -p newsvault -- schema           # machine-readable description of the command tree
 ```

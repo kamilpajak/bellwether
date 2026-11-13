@@ -8,12 +8,19 @@ publish = false
 [dependencies]
 anyhow = "1.0.104"
 arrow = "60.1.0"
+canon = { path = "../../canon" }
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive"] }
+const-hex = "1.19.3"
+news-provider = { path = "../../news-provider" }
 parquet = "60.1.0"
 pit = { path = "../../pit" }
+# No `bundled` feature: `libsqlite3-sys` links the system library, so CI gains no C compile. The
+# Mac's SQLite is 3.54.0, measured 2026-11-13; the VPS's is unmeasured.
+rusqlite = "0.42.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = "0.11.1"
 thiserror = "2.0.21"
 
 [lints]
