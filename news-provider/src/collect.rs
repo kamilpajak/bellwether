@@ -15,8 +15,8 @@ use crate::ledger::{
     abandon, AttemptId, AttemptReceipt, AttemptSlot, Baseline, LedgerError, Outcome, OutcomeKind,
     SendPermit, Sink, Verdict,
 };
-use crate::provider::{CollectedItem, Plan, Provider, RawBlob};
-use crate::request::{Request, RunId, SourceId, TargetWindow};
+use crate::provider::{CollectedItem, Plan, Provenance, Provider, RawBlob};
+use crate::request::{Request, RequestPhase, RunId, SourceId, TargetWindow};
 use crate::wire::{RawResponse, SendFailure, Wire};
 use crate::{Calendar, Listing, PlanRefusal};
 
@@ -85,6 +85,25 @@ pub trait Archive: Sink {
 
     /// Attempts opened and never finalised, which the startup sweep closes.
     fn attempts_in_flight(&self) -> Result<Vec<String>, ArchiveError>;
+
+    /// The story ids this archive already holds a COMMITTED item for under (source, target window).
+    /// The driver hands this to the provider's follow-up planning so a `vendor_archive` re-run
+    /// fetches only the uncovered accessions (§8 row R20). "Covered" is a committed item, never an
+    /// attempt that returned ok and committed nothing: that is a gap, not coverage.
+    fn covered_story_ids(
+        &self,
+        source: &SourceId,
+        target_window: &TargetWindow,
+    ) -> Result<std::collections::BTreeSet<String>, ArchiveError>;
+
+    /// Records how many in-universe follow-ups an index attempt named: the denominator the coverage
+    /// reader compares the committed rows against. Written whatever the count, so a window that
+    /// matched nothing is distinguishable from one no index ever read.
+    fn record_planned_coverage(
+        &mut self,
+        attempt_id: &str,
+        matched: u32,
+    ) -> Result<(), ArchiveError>;
 }
 
 /// Why a run could not be driven at all. A vendor's own answer is never one of these: it is a
@@ -455,6 +474,25 @@ fn attempt_once<A: Archive>(
         Ok(committed) => (committed, None),
         Err(refused) => (Committed::default(), Some(refused.detail)),
     };
+    // Follow-ups are an index attempt's business, and coverage is the vendor_archive arm's alone:
+    // a live index records no `matched` and excludes nothing, re-polling every row (R20, R16).
+    let follow_ups = match extracted {
+        Some(extracted) if request.phase == RequestPhase::Index => {
+            let matched = count(extracted.follow_ups.len());
+            let covered = if request.provenance == Provenance::VendorArchive {
+                archive.record_planned_coverage(&attempt_id, matched)?;
+                archive.covered_story_ids(&request.source, &request.target_window)?
+            } else {
+                std::collections::BTreeSet::new()
+            };
+            if matched == 0 {
+                Vec::new()
+            } else {
+                provider.follow_ups_to_issue(extracted.follow_ups, &covered)
+            }
+        }
+        _ => Vec::new(),
+    };
     Ok(Attempted {
         row: AttemptRow {
             attempt_id,
@@ -471,7 +509,7 @@ fn attempt_once<A: Archive>(
             items_committed: committed.items_committed,
             commit_refused: refusal,
         },
-        follow_ups: extracted.map(|one| one.follow_ups).unwrap_or_default(),
+        follow_ups,
         kind,
         permanent: matches!(verdict, Verdict::PermanentFailure),
         bytes_written: match &answer {

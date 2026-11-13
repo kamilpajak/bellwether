@@ -13,7 +13,9 @@ use chrono::{DateTime, Days, NaiveDate, Utc};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
-use crate::store::{unpublished_seq_ranges, SeqRange, COMMIT_LOG, RUNS_DIR};
+use crate::store::{
+    coverage_up_to, unpublished_seq_ranges, SeqRange, WindowCoverage, COMMIT_LOG, RUNS_DIR,
+};
 
 pub const SCHEMA: &str = "newsvault.ledger/1";
 pub const RUN_ENVELOPE_SCHEMA: &str = "newsvault.run/1";
@@ -23,11 +25,13 @@ const OUTCOME_EMPTY: &str = "empty";
 const OUTCOME_FAILED: &str = "failed";
 const OUTCOME_INTERRUPTED: &str = "interrupted";
 
-/// The three `--check` answers, each the code of a finding. There is no fourth: the asking-clock
-/// age needs a number from the collect policy, whose first producer is a later commit.
+/// The four `--check` answers, each the code of a finding. `coverage_incomplete` joined them on
+/// 2026-11-13 for the backfill arm (§8 row R20). There is no fifth: the asking-clock age needs a
+/// number from the collect policy, whose first producer is a later commit.
 const RUNS_BELOW_EXPECTED: &str = "runs_below_expected";
 const HOLDS_A_FAILURE: &str = "holds_a_failure";
 const ROWS_ZERO_AGAINST_VENDOR_ROWS: &str = "rows_committed_zero_against_vendor_rows";
+const COVERAGE_INCOMPLETE: &str = "coverage_incomplete";
 
 /// Codes from architecture.md section 5.1, used for a run envelope the reader could not take.
 const INPUT_UNPARSEABLE: &str = "input_unparseable";
@@ -74,6 +78,10 @@ pub struct Report {
     /// Per (source, target window), only where the attempts disagree: one group-by over rows the
     /// store already writes, which is what makes an unrecorded change of inputs visible.
     pub result_digest_drift: Vec<Drift>,
+    /// Per (source, target window) an index attempt read: how many accessions it planned to cover
+    /// against how many distinct stories the store now holds. `covered < planned` is a gap a
+    /// `vendor_archive` re-run closes (§8 row R20), and under `--check` it is a finding.
+    pub coverage: Vec<WindowCoverage>,
     pub unreadable_runs: Vec<Unreadable>,
     pub attempts_without_a_run_envelope: Vec<Orphan>,
     pub unpublished_seq_ranges: Vec<SeqRange>,
@@ -254,6 +262,22 @@ pub fn read(root: &Path, ask: &Ask) -> Result<Report, LedgerReadError> {
             None => break,
         };
     }
+    // Coverage is per (source, target window) and not per run day, like the drift section: it is a
+    // whole-store question up to the cutoff, independent of the --from/--to range. The finding is
+    // added before the Check is built so --check surfaces it; a cap over the day rows never hides
+    // it, because it is not a day row.
+    let mut coverage = coverage_up_to(&db, &at)?;
+    coverage.retain(|row| ask.wants(&row.source));
+    for row in &coverage {
+        if row.covered < row.planned {
+            findings.push(Finding {
+                code: COVERAGE_INCOMPLETE,
+                run_date: row.target_window.clone(),
+                source: Some(row.source.clone()),
+                detail: format!("{} of {} accessions covered", row.covered, row.planned),
+            });
+        }
+    }
     let returned = days.iter().map(|day| day.per_source.len()).sum();
     Ok(Report {
         schema: SCHEMA,
@@ -265,6 +289,7 @@ pub fn read(root: &Path, ask: &Ask) -> Result<Report, LedgerReadError> {
         limit: ask.limit,
         days,
         result_digest_drift: drift(&answers, ask.source.as_deref()),
+        coverage,
         unreadable_runs,
         attempts_without_a_run_envelope,
         unpublished_seq_ranges: unpublished_seq_ranges(&db)?,
@@ -747,6 +772,16 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
         out,
         "digest drift     {} (source, window) pair(s)",
         report.result_digest_drift.len()
+    )?;
+    writeln!(
+        out,
+        "coverage         {} window(s) read, {} with a gap",
+        report.coverage.len(),
+        report
+            .coverage
+            .iter()
+            .filter(|row| row.covered < row.planned)
+            .count()
     )?;
     writeln!(
         out,

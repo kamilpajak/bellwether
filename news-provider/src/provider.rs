@@ -409,6 +409,20 @@ pub trait Provider: Send + Sync {
     fn extract(&self, request: &Request, raw: &RawBlob) -> Extracted;
 
     fn extract_rules_version(&self) -> FileDigest;
+
+    /// Which of an index attempt's follow-ups to actually issue, given the story ids the archive
+    /// already holds a committed item for under that window. A `vendor_archive` follow-up whose
+    /// story is covered is dropped, so a re-run converges on full coverage without re-fetching what
+    /// the store already holds; a `live_ingest` follow-up is always issued, because a live sweep
+    /// must poll every matched row (§8 row R16). The driver reads the covered set from the archive
+    /// and hands it in; mapping a follow-up to its story is the provider's, because only it knows
+    /// its vendor's row identity. Not a parameter of `extract`, which stays pure over bytes and
+    /// rules: the covered set is run state, not payload.
+    fn follow_ups_to_issue(
+        &self,
+        follow_ups: Vec<Request>,
+        covered: &BTreeSet<String>,
+    ) -> Vec<Request>;
 }
 
 #[cfg(test)]

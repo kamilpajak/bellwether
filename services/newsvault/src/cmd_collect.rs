@@ -497,6 +497,24 @@ impl Archive for Committer {
         Committer::attempts_in_flight(self)
             .map_err(|why| refused("read the attempts in flight", &why))
     }
+
+    fn covered_story_ids(
+        &self,
+        source: &SourceId,
+        target_window: &TargetWindow,
+    ) -> Result<std::collections::BTreeSet<String>, ArchiveError> {
+        Committer::covered_story_ids(self, source, target_window)
+            .map_err(|why| refused("read the covered set", &why))
+    }
+
+    fn record_planned_coverage(
+        &mut self,
+        attempt_id: &str,
+        matched: u32,
+    ) -> Result<(), ArchiveError> {
+        Committer::record_planned_coverage(self, attempt_id, matched)
+            .map_err(|why| refused("record planned coverage", &why))
+    }
 }
 
 fn refused(act: &'static str, why: &StoreError) -> ArchiveError {
