@@ -1,0 +1,28 @@
+<SEC-DOCUMENT>0000320193-26-000071.txt : 20261110
+<SEC-HEADER>0000320193-26-000071.hdr.sgml : 20261110
+<ACCEPTANCE-DATETIME>20261110163215
+ACCESSION NUMBER:		0000320193-26-000071
+CONFORMED SUBMISSION TYPE:	8-K
+PUBLIC DOCUMENT COUNT:		2
+FILER:
+	COMPANY DATA:
+		COMPANY CONFORMED NAME:			Apple Inc.
+		CENTRAL INDEX KEY:			0000320193
+</SEC-HEADER>
+<DOCUMENT>
+<TYPE>EX-99.1
+<TEXT>
+<html>
+<head><style>.pr { font-family: serif; }</style>
+<script>window.dataLayer = [{"page":"press release"}];</script></head>
+<body>
+<p>Apple Inc. today announced a multi-year supply agreement with Bellwether Semiconductor
+Holdings covering advanced packaging capacity through 2029. The agreement follows the
+qualification of Bellwether's CoWoS-class line in Hsinchu.</p>
+<p>&quot;Securing packaging capacity early is how we keep the roadmap on schedule,&quot; said the
+company's chief operating officer. Apple expects first shipments under the agreement in the
+second half of 2027.</p>
+</body>
+</html>
+</TEXT>
+</DOCUMENT>

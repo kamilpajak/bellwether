@@ -14,10 +14,11 @@ use std::path::{Path, PathBuf};
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, TimeUnit};
-use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, SecondsFormat, TimeZone, Utc};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use sha2::{Digest as _, Sha256};
 
-use pit::datedness::Datedness;
+use pit::datedness::{Datedness, Published};
 use pit::{ObservationTime, ValidTime, Visibility};
 
 /// The lake has no precision column, so a publication value stamped exactly at midnight is a
@@ -58,6 +59,78 @@ pub struct Day {
     pub items_with_conflicting_valid_time: usize,
     /// Rows dropped because a required field was null or, for the id, empty.
     pub unusable_rows: usize,
+}
+
+impl Day {
+    /// The number `probes/parity_baseline.py` has computed since before this crate existed:
+    /// sha256 over the newline-joined sorted distinct ids of the items returned. It says the id
+    /// SET came back and nothing else - it matches with every title, body and url different,
+    /// which is why [`Day::content_digest`] exists beside it.
+    #[must_use]
+    pub fn id_digest(&self) -> String {
+        let mut ids: Vec<&str> = self.items.iter().map(|item| item.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        hex(Sha256::digest(ids.join("\n").as_bytes()).as_slice())
+    }
+
+    /// The whole item set as one number: every field of every item, in id order, each
+    /// length-prefixed so no value can forge a field boundary. The second reader's own
+    /// construction and what each possible disagreement means:
+    /// `probes/newsvault_parity/PREREGISTRATION.md`.
+    #[must_use]
+    pub fn content_digest(&self) -> String {
+        let mut items: Vec<&NewsItem> = self.items.iter().collect();
+        items.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut hasher = Sha256::new();
+        for item in items {
+            for field in [
+                item.id.as_str(),
+                item.source.as_str(),
+                &published_text(item.visibility.published()),
+                &item
+                    .visibility
+                    .observed()
+                    .inner()
+                    .to_rfc3339_opts(SecondsFormat::Micros, true),
+                item.title.as_str(),
+                item.body.as_str(),
+                item.url.as_str(),
+            ] {
+                field_into(&mut hasher, field.as_bytes());
+            }
+            hasher.update(format!("{}#", item.tickers.len()).as_bytes());
+            for ticker in &item.tickers {
+                field_into(&mut hasher, ticker.as_bytes());
+            }
+        }
+        hex(hasher.finalize().as_slice())
+    }
+}
+
+/// One field as `<byte length>:<bytes>`. A value holding the separator would otherwise forge a
+/// field boundary, which is the defect `canon` was reviewed for on 2026-11-13; it closed that by
+/// refusing three bytes, and a digest over archived values cannot refuse one.
+fn field_into(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(format!("{}:", bytes.len()).as_bytes());
+    hasher.update(bytes);
+}
+
+/// A publication value as the two readers both render it: an instant at whole microseconds, or a
+/// day with the calendar it is a day in.
+fn published_text(published: Published) -> String {
+    match published {
+        Published::At(valid) => valid
+            .inner()
+            .to_rfc3339_opts(SecondsFormat::Micros, true)
+            .to_string(),
+        Published::On { day, tz } => format!("day {day} {tz}"),
+        Published::Unknown => "unknown".to_owned(),
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const_hex::encode(bytes)
 }
 
 /// What the reader keeps for one id inside one partition.
@@ -169,7 +242,15 @@ impl LakeReader {
 }
 
 /// A publication value stamped exactly at midnight is read as a DATE, per [`LAKE_CALENDAR`].
+///
+/// The ordering test is here and not only inside `Visibility::from_live`, because the day branch
+/// below never reaches that constructor: found 2026-11-13 by the first run of
+/// `probes/newsvault_parity.py`, which drops a row whose ingest precedes its publication value
+/// whatever the value's precision, over a shape the archive holds zero of.
 fn datedness(valid_at: DateTime<Utc>, observed: ObservationTime) -> Option<Datedness> {
+    if observed.inner() < valid_at {
+        return None;
+    }
     if valid_at == valid_at.date_naive().and_time(NaiveTime::MIN).and_utc() {
         return Some(Datedness::DayDated {
             day: valid_at.date_naive(),
@@ -685,6 +766,28 @@ mod tests {
             &part,
             "run=20260702T003000000Z.parquet",
             &[row("backwards", 5_000 * SEC, 1_000 * SEC)],
+        );
+        let day = day_of(root.path());
+        assert!(day.items.is_empty());
+        assert_eq!(day.unusable_rows, 1);
+    }
+
+    /// The disagreement the parity comparator found on 2026-11-13, on a shape the archive does
+    /// not hold: the inversion test used to sit inside `Visibility::from_live`, which the
+    /// midnight branch never reached, so this row was an item here and unusable in the probe.
+    #[test]
+    fn a_row_fetched_before_its_own_day_stamp_is_unusable_and_not_day_dated() {
+        let root = tempfile::tempdir().unwrap();
+        let part = root.path().join("session_date=2026-07-01");
+        std::fs::create_dir_all(&part).unwrap();
+        write_run(
+            &part,
+            "run=20260702T003000000Z.parquet",
+            &[row(
+                "backwards",
+                PARTITION_MIDNIGHT,
+                PARTITION_MIDNIGHT - SEC,
+            )],
         );
         let day = day_of(root.path());
         assert!(day.items.is_empty());

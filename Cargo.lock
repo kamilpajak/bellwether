@@ -644,6 +644,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgar-press"
+version = "0.1.0"
+dependencies = [
+ "canon",
+ "chrono",
+ "chrono-tz",
+ "news-provider",
+ "pit",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1020,6 +1033,7 @@ dependencies = [
  "canon",
  "chrono",
  "pit",
+ "serde_json",
  "thiserror",
  "ureq",
 ]
@@ -1034,6 +1048,7 @@ dependencies = [
  "chrono",
  "clap",
  "const-hex",
+ "edgar-press",
  "news-provider",
  "parquet",
  "pit",

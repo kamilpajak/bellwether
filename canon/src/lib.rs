@@ -1,5 +1,6 @@
-//! The canonical form of `docs/design/architecture.md` section 2 and nothing else: the six rules
-//! of the form live in that section's "Canonical form" paragraph and are not restated here. Why
+//! The digest rules of `docs/design/architecture.md` section 2: the canonical form, whose six
+//! rules live in that section's "Canonical form" paragraph and are not restated here, and
+//! [`FileDigest`] for the three rows of that section whose input is a file's bytes. Why
 //! the form is a crate of its own rather than code inside the first producer: `CONTRIBUTING.md`,
 //! "Everything else" - every digest in section 2 is taken over it, and section 8 row R7 is the
 //! row it moves. `canon/vectors/` is what this crate owes a reader in another language.
@@ -107,6 +108,24 @@ pub enum Field<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Digest(String);
 
+/// A sha256 over a hashed FILE's bytes as committed: architecture.md section 2's `rule_version`,
+/// `calendar_version` and `universe_version` rows, which take no canonical form. Its own type so
+/// that "a [`Digest`] was taken over the form" keeps holding.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FileDigest(String);
+
+impl FileDigest {
+    #[must_use]
+    pub fn of(bytes: &[u8]) -> Self {
+        Self(const_hex::encode(Sha256::digest(bytes)))
+    }
+
+    #[must_use]
+    pub fn hex(&self) -> &str {
+        &self.0
+    }
+}
+
 impl Digest {
     #[must_use]
     pub fn hex(&self) -> &str {
@@ -182,7 +201,7 @@ pub fn sha256_canon(domain: Domain, fields: &[Field]) -> Result<Digest, CanonErr
 
 #[cfg(test)]
 mod tests {
-    use super::{canon, sha256_canon, CanonError, Domain, Field, Stamp};
+    use super::{canon, sha256_canon, CanonError, Domain, Field, FileDigest, Stamp};
 
     /// Any one domain: these tests are about the form, and the form is the same under each.
     const ANY: Domain = Domain::ItemId;
@@ -214,6 +233,17 @@ mod tests {
             Ok(digest) => digest.hex().to_string(),
             Err(error) => format!("refused: {error}"),
         }
+    }
+
+    /// `printf 'a' | shasum -a 256` on 2026-11-13. A file digest is the plain sha256 of the bytes
+    /// and takes no canonical form, so the one value an outside tool can reproduce pins it.
+    const SHA256_OF_ONE_LETTER_A: &str =
+        "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb";
+
+    #[test]
+    fn a_file_digest_is_the_plain_sha256_of_the_bytes_and_moves_with_one_of_them() {
+        assert_eq!(FileDigest::of(b"a").hex(), SHA256_OF_ONE_LETTER_A);
+        assert_ne!(FileDigest::of(b"a"), FileDigest::of(b"b"));
     }
 
     #[test]

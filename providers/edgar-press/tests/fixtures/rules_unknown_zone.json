@@ -1,0 +1,7 @@
+{"acceptance": {"field": "ACCEPTANCE-DATETIME", "format": "%Y%m%d%H%M%S", "tz": "Mars/Phobos"},
+ "body": {"collapse_whitespace": true, "drop_elements": ["script", "style"],
+          "entities": {"&amp;": "&", "&quot;": "\"", "&#39;": "'"}, "strip_tags": true},
+ "fields": {"accession_number": "ACCESSION NUMBER", "company_name": "COMPANY CONFORMED NAME", "form_type": "CONFORMED SUBMISSION TYPE"},
+ "form_types": ["8-K"],
+ "schema": "edgar-press.rules/1",
+ "url_canon": {"host_independent": true}}

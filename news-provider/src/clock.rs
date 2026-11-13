@@ -19,50 +19,50 @@ impl Clock for SystemClock {
     }
 }
 
-/// A clock handing out a stated sequence, so a test can say which read got which instant. Shared
-/// between this crate's test modules rather than written twice.
+/// The test clock and this module's own test, in ONE `#[cfg(test)]` item: the CI size step counts
+/// the lines before a file's first `#[cfg(test)]` as source and the rest as test, so a file
+/// holding several markers measures wrong. The guard is the size step's own.
 #[cfg(test)]
-#[derive(Debug)]
-pub(crate) struct StepClock {
-    instants: Vec<DateTime<Utc>>,
-    read: std::cell::Cell<usize>,
-}
+pub(crate) mod testing {
+    use super::{Clock, SystemClock};
+    use chrono::{DateTime, Utc};
 
-#[cfg(test)]
-impl StepClock {
-    pub(crate) fn over(instants: &[&str]) -> Self {
-        Self {
-            instants: instants
-                .iter()
-                .map(|text| text.parse().unwrap_or(DateTime::UNIX_EPOCH))
-                .collect(),
-            read: std::cell::Cell::new(0),
+    /// A clock handing out a stated sequence, so a test can say which read got which instant.
+    /// Shared between this crate's test modules rather than written twice.
+    #[derive(Debug)]
+    pub(crate) struct StepClock {
+        instants: Vec<DateTime<Utc>>,
+        read: std::cell::Cell<usize>,
+    }
+
+    impl StepClock {
+        pub(crate) fn over(instants: &[&str]) -> Self {
+            Self {
+                instants: instants
+                    .iter()
+                    .map(|text| text.parse().unwrap_or(DateTime::UNIX_EPOCH))
+                    .collect(),
+                read: std::cell::Cell::new(0),
+            }
+        }
+
+        pub(crate) fn reads(&self) -> usize {
+            self.read.get()
         }
     }
 
-    pub(crate) fn reads(&self) -> usize {
-        self.read.get()
+    impl Clock for StepClock {
+        /// Past the end of the sequence it keeps answering, with the epoch: a test that reads more
+        /// instants than it stated fails on the value rather than on a panic.
+        fn now(&self) -> DateTime<Utc> {
+            let index = self.read.get();
+            self.read.set(index + 1);
+            self.instants
+                .get(index)
+                .copied()
+                .unwrap_or(DateTime::UNIX_EPOCH)
+        }
     }
-}
-
-#[cfg(test)]
-impl Clock for StepClock {
-    /// Past the end of the sequence it keeps answering, with the epoch: a test that reads more
-    /// instants than it stated fails on the value rather than on a panic.
-    fn now(&self) -> DateTime<Utc> {
-        let index = self.read.get();
-        self.read.set(index + 1);
-        self.instants
-            .get(index)
-            .copied()
-            .unwrap_or(DateTime::UNIX_EPOCH)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Clock, SystemClock};
-    use chrono::{DateTime, Utc};
 
     /// Any instant safely in the past of every run of this suite.
     const BEFORE_THIS_PROJECT_EXISTED: &str = "2026-01-01T00:00:00Z";

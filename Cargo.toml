@@ -1,15 +1,24 @@
 # Workspace root. The memo names five services and each arrives as its own crate here; `derive`'s
 # panel manifest is the first artefact that crosses a boundary, so its contract is a crate too.
+# `providers/` holds one crate per vendor adapter. Each declares no HTTP dependency, which is what
+# makes section 8 row R4's allowlist a one-crate question `cargo metadata` can answer.
 # Why `repo-invariants` and `panel-contract` are crates of their own rather than code inside a
 # service: CONTRIBUTING.md, "Everything else".
+# `providers/*` and `services/*` are globs: a crate added there is a member by existing, which
+# removes the mistake section 8 row G1 leaves instead of checking for it. Its cost, measured
+# 2026-11-13 on cargo 1.99.1: a glob also matches a directory with no manifest, including a
+# dotfile one, and such a directory fails EVERY cargo command with "failed to load manifest for
+# workspace member ... referenced via `services/*`". The top-level crates stay explicit because
+# `*` at the root would match `docs`, `probes` and `target` the same way.
 [workspace]
 members = [
     "canon",
     "news-provider",
     "panel-contract",
     "pit",
+    "providers/*",
     "repo-invariants",
-    "services/newsvault",
+    "services/*",
 ]
 resolver = "2"
 

@@ -1,0 +1,26 @@
+[package]
+name = "edgar-press"
+version = "0.1.0"
+edition = "2021"
+description = "Our EDGAR press-release collector: the first Provider, and the only crate a buy deletes."
+publish = false
+
+# No HTTP dependency, which is what makes the one-crate allowlist of architecture.md section 8 row
+# R4 a question `cargo metadata` can answer completely: this crate plans, classifies and extracts
+# and never touches a socket. Cost, measured 2026-11-13 by
+# `cargo tree -e normal,build --prefix none | sed 's/ (\*)$//' | sort -u | wc -l` over the six
+# older members (159) and over the whole workspace (160): this member adds ITSELF and no new
+# package, because every dependency below is already in the graph.
+[dependencies]
+canon = { path = "../../canon" }
+chrono = "0.4.45"
+# The acceptance instant is Eastern time and `Published::On` carries a zone name, so the adapter
+# resolves one zone. Already a workspace dependency through `pit`: no new package.
+chrono-tz = "0.10.4"
+news-provider = { path = "../../news-provider" }
+pit = { path = "../../pit" }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+
+[lints]
+workspace = true

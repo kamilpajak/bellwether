@@ -1,4 +1,8 @@
 target/
 *.parquet
+# Except the sealed parity corpus. It is the input of
+# `services/newsvault/tests/parity.rs`, so a clone without it has a gate that cannot run; 44 KB
+# over 11 files, rebuilt by `probes/newsvault_parity.py --write-corpus`.
+!probes/newsvault_parity/lake/**/*.parquet
 .DS_Store
 probes/**/vendor_probe_results.json

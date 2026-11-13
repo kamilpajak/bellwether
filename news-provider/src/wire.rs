@@ -298,12 +298,15 @@ mod tests {
     use super::{
         Credentials, RawResponse, SendFailure, Timeouts, TransportProfile, Wire, USER_AGENT,
     };
-    use crate::clock::StepClock;
+    use crate::clock::testing::StepClock;
     use crate::ledger::tests::{at, Recorder};
     use crate::ledger::{AttemptSlot, SendPermit};
+    use crate::provider::Provenance;
     use crate::request::{
-        CredentialRef, HeaderName, HeaderValue, Request, RunId, SourceId, TargetWindow,
+        CredentialRef, HeaderName, HeaderValue, Request, RequestPhase, RunId, SourceId,
+        TargetWindow,
     };
+    use canon::FileDigest;
     use std::time::Duration;
 
     const CONTACT: &str = "sec_contact";
@@ -327,6 +330,8 @@ mod tests {
     const OPENED_ROW: usize = 1;
     const TEST_TIMEOUT: Duration = Duration::from_secs(2);
     const TEST_BODY_LIMIT: u64 = 1_024;
+    /// Any roster bytes: these tests are about the socket.
+    const ROSTER: &[u8] = b"{\"320193\":\"AAPL\"}";
 
     fn contact() -> HeaderValue {
         HeaderValue::FromCredential(CredentialRef::new(CONTACT))
@@ -354,7 +359,10 @@ mod tests {
         Request {
             source: SourceId::new(SOURCE),
             target_window: TargetWindow::new(WINDOW),
+            phase: RequestPhase::Index,
+            provenance: Provenance::LiveIngest,
             url: REFUSED.to_owned(),
+            universe_version: FileDigest::of(ROSTER),
             headers: vec![(
                 HeaderName::new(ACCEPT),
                 HeaderValue::Literal(PLAIN_TEXT.to_owned()),

@@ -35,8 +35,21 @@ because nobody can say what is in them.
 
 ### 1. Tests do not grow faster than code
 
-CI prints the ratio of test lines to source lines on every run. It is not a gate and it fails
-nothing. It exists so that the number is in front of whoever is adding a file.
+CI prints the ratio of test lines to source lines on every run. It gates nothing about the ratio
+itself and fails nothing for being over a number. It exists so that the number is in front of
+whoever is adding a file.
+
+It fails for one thing, since 2026-11-13: a file holding more than one `#[cfg(test)]` line. The
+step counts the lines before the FIRST marker as source and the rest as test, so a second marker
+moves every source line below it into the test column and the printed pair stops meaning what it
+says. Measured that day by adding one empty `#[cfg(test)] mod` to `pit/src/datedness.rs`: 3 lines
+left the source column for the test column with nothing else about the tree changed. The rule also
+lives as a gate `cargo test` can show, `repo_invariants::layout`, because a rule enforced only in a
+workflow file is invisible until a push. The step also prints how many of the SOURCE lines are
+**doc-test** lines: they sit before `#[cfg(test)]`, so the scan counts them as source, and they
+were one of the two things the ratio's own instrument could not see. 100 of them on 2026-11-13, and
+they are the enforcement point of three invariants (§8 rows R2 and R4), so they are test code that
+is deliberately in the source column.
 
 When it passes 1.0×, that is a question in the pull request — does this test cover a case nothing
 covers, or the same case again? The predecessor crossed 1.0× in June and nobody noticed, because

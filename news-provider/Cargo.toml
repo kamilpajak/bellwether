@@ -16,6 +16,8 @@ publish = false
 canon = { path = "../canon" }
 chrono = "0.4.45"
 pit = { path = "../pit" }
+# JSON only: the session calendar is a hashed JSON file this crate reads (`Calendar::read`).
+serde_json = "1.0.154"
 thiserror = "2.0.21"
 # Default features only: `rustls` (over ring) and `gzip`. `http_status_as_error` is turned OFF in
 # `Wire::new`, because a 403 carrying the vendor's own body is an answer the classifier reads.

@@ -48,9 +48,13 @@ jobs:
           # Per file, not "-exec ... {} +": awk's exit ends the whole invocation, so one batched
           # call stops counting at the first file holding a test module. The first version of this
           # step did exactly that and reported 2.56x on a 1,026-line crate.
-          src=0; tst=0
+          src=0; tst=0; multi=''
           while IFS= read -r f; do
             all=$(wc -l < "$f")
+            # The scan below stops at the FIRST marker, so a second one moves every source line
+            # below it into the test column. The rule is repo-invariants::layout, which is what
+            # `cargo test` shows; this is the reader that fails a push.
+            if [ "$(grep -c '^ *#\[cfg(test)\]' "$f")" -gt 1 ]; then multi="$multi $f"; fi
             case "$f" in
               # An integration-test target carries no `#[cfg(test)]` marker, so the scan below
               # would count every line of it as source and report a ratio that falls when a test
@@ -64,6 +68,17 @@ jobs:
           done < <(find . -name '*.rs' -not -path './target/*')
           py=$(find probes -name '*.py' -exec cat {} + | wc -l)
           doc=$(find docs -name '*.md' -exec cat {} + | wc -l)
-          printf 'rust source %6d\nrust tests  %6d  ratio %s\nprobes (py) %6d\ndocs (md)   %6d\n' \
-            "$src" "$tst" "$(awk -v a=$tst -v b=$src 'BEGIN{printf "%.2fx", (b?a/b:0)}')" "$py" "$doc"
+          # Doc-test lines sit BEFORE `#[cfg(test)]` and are counted as source above, which is one
+          # of the two things the ratio's own instrument could not see (the other is `probes`,
+          # printed outside the ratio since the step existed). Fenced blocks in `//!`/`///`
+          # comments, fence lines included.
+          dt=$(find . -name '*.rs' -not -path './target/*' -exec cat {} + \
+            | awk '/^ *\/\/[\/!] ```/{n++; inb=!inb} inb{n++} END{print n+0}')
+          printf 'rust source %6d\nrust tests  %6d  ratio %s\nin source, doc tests %6d\nprobes (py) %6d\ndocs (md)   %6d\n' \
+            "$src" "$tst" "$(awk -v a=$tst -v b=$src 'BEGIN{printf "%.2fx", (b?a/b:0)}')" \
+            "$dt" "$py" "$doc"
+          if [ -n "$multi" ]; then
+            echo "more than one #[cfg(test)] line, so the two columns above are wrong for:$multi" >&2
+            exit 1
+          fi
         shell: bash

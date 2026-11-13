@@ -38,17 +38,30 @@
 //! ```
 
 pub mod clock;
+pub mod collect;
+pub mod conformance;
 pub mod ledger;
+pub mod provider;
 pub mod request;
 pub mod wire;
 
 pub use clock::{Clock, SystemClock};
+pub use collect::{
+    collect, Archive, ArchiveError, AttemptRow, CollectError, Collected, Committed, Exchange, Exit,
+    NotPlannedRow, Run, SourceTally, Tally, EXITS,
+};
 pub use ledger::{
     abandon, AttemptEvent, AttemptId, AttemptReceipt, AttemptSlot, Baseline, Cost, Counts,
     LedgerError, Outcome, OutcomeKind, SendPermit, Sink, Verdict,
 };
+pub use provider::{
+    precision_of, probed_lag, stamp_of, BodyState, Calendar, CalendarError, CollectedItem,
+    Extracted, ExtractedBody, Listing, NotPlanned, Plan, PlanRefusal, Provenance, Provider,
+    RawBlob, UnusableReason, UnusableRow, ValidPrecision, ValidSource,
+};
 pub use request::{
-    CredentialRef, HeaderName, HeaderValue, Param, Request, RunId, SourceId, TargetWindow,
+    days_of, CredentialRef, HeaderName, HeaderValue, Param, Request, RequestPhase, RunId, SourceId,
+    TargetWindow,
 };
 pub use wire::{
     Credentials, RawResponse, SendFailure, Timeouts, TransportError, TransportProfile, Wire,

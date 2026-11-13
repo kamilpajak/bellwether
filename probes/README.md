@@ -10,19 +10,21 @@ measures something we do not control — a vendor's volume, our own archive's co
 standard error of a statistic — and could return anything.
 
 **A probe is kept only if it will be run again** (rule 3 of `../CONTRIBUTING.md`). The table below
-is the list, and the count: five scripts and one package, each with a second run ahead of it.
+is the list, and the count: six scripts and two packages, each with a second run ahead of it.
 Roughly as many measurements from the same work were
 deliberately not kept: their numbers are in `../docs/design/` with the construction that produced
 them, which is what a reader needs. A script that answered its question once is a receipt.
 
 | file | the question it answers | when it runs again |
 |---|---|---|
-| `parity_baseline.py` | does an independent reading of the archive rules agree with the Rust one, day by day? | at every migration stage. **Not yet the parity gate:** it writes a baseline and nothing reads it, so the 156-of-156 agreement in the design's §10 was compared by hand |
+| `parity_baseline.py` | does an independent reading of the archive rules agree with the Rust one, day by day? | at every migration stage. It writes a baseline over the real lake and nothing reads it; the comparison is `newsvault_parity.py` |
+| `newsvault_parity.py` | do the two readings agree field by field, on the shapes the lake holds none of? | whenever either reader's rules change. **This is the parity gate**: its committed `expected.json` is read by `services/newsvault/tests/parity.rs`, so `cargo test` compares the Rust reader against a second implementation without running Python |
 | `panel_recount.py` | how many company-sessions does the panel treat, under which rule version? | on every rule change, which is requirement R18 |
 | `panel_power.py` | what is the measured power of the registered procedure on this panel? | on every panel rebuild |
 | `matcher_audit.py` | what is the entity precision of the counterparty matcher, and what does the text cap cost? | on every change to the matching rules |
 | `news_gap.py` | how stale may the newest item be before that is an incident? | against the first real vendor, because the thresholds it produced are provisional on D-1 |
 | `vendor_probe/` | four questions about a news vendor; **not yet run** | once, then once more at least 7 days later for the stability half |
+| `newsvault_parity/` | the corpus `newsvault_parity.py` runs over, one partition per shape the archive lacks, plus that probe's pre-registration and its committed output | rebuilt with `--write-corpus` when a shape is added |
 
 Three of them take their inputs from the environment and abort with a named error when one is
 absent, which is requirement R6 applied to the measurement scripts themselves: run one with no

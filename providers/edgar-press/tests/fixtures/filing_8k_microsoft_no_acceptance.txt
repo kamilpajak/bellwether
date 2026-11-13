@@ -1,0 +1,20 @@
+<SEC-DOCUMENT>0000789019-26-000045.txt : 20261110
+<SEC-HEADER>0000789019-26-000045.hdr.sgml : 20261110
+ACCESSION NUMBER:		0000789019-26-000045
+CONFORMED SUBMISSION TYPE:	8-K
+PUBLIC DOCUMENT COUNT:		1
+FILER:
+	COMPANY DATA:
+		COMPANY CONFORMED NAME:			Microsoft Corporation
+		CENTRAL INDEX KEY:			0000789019
+</SEC-HEADER>
+<DOCUMENT>
+<TYPE>EX-99.1
+<TEXT>
+<html><body>
+<p>Microsoft Corporation entered into an amended datacentre lease with Bellwether Power
+Partners for 180 megawatts of contracted capacity in central Ohio, with service beginning in
+the first quarter of 2028.</p>
+</body></html>
+</TEXT>
+</DOCUMENT>

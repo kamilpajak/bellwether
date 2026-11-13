@@ -1,0 +1,12 @@
+Description:           Daily Index of EDGAR Dissemination Feed by Form Type
+Last Data Received:    November 10, 2026
+Comments:              webmaster@sec.gov
+Anonymous FTP:         ftp://ftp.sec.gov/edgar/
+ 
+ 
+Form Type   Company Name                                                  CIK         Date Filed  File Name
+--------------------------------------------------------------------------------------------------------------
+8-K         Apple Inc.                                                    320193      2026-11-10  edgar/data/320193/0000320193-26-000071.txt
+8-K         Microsoft Corporation                                         789019      2026-11-10  edgar/data/789019/0000789019-26-000045.txt
+8-K         Nobody Industries Inc                                         999999      2026-11-10  edgar/data/999999/0000999999-26-000001.txt
+10-Q        Amazon.com Inc                                                1018724     2026-11-10  edgar/data/1018724/0001018724-26-000012.txt

@@ -60,8 +60,9 @@ keep passing.
 | `docs/inherited/` | two documents carried from the predecessor: the mandatory research gates, and the postmortem of eleven closed strategy paradigms |
 | `pit/` | the point-in-time contract: two instants that are separate types, and the arm that keeps a publication **date** from being assumed into an instant |
 | `canon/` | the canonical form every identity is hashed over, with the vectors a second reader in another language must reproduce |
-| `news-provider/` | the provider seam: the coverage ledger's write half, and the one HTTP client — a send consumes a permit that only a written attempt row hands out |
-| `services/newsvault/` | the archive reader, in Rust |
+| `news-provider/` | the provider seam: the coverage ledger's write half, the one HTTP client — a send consumes a permit that only a written attempt row hands out — and the driver that opens and closes every slot |
+| `providers/` | one crate per vendor adapter. Each declares no HTTP dependency at all |
+| `services/newsvault/` | the archive: the commit log, the coverage reader and the segment export, in Rust |
 | `panel-contract/` | the panel manifest contract: the shape the statistics tier may read, and the validator that refuses a row count that is really a product |
 | `repo-invariants/` | the one invariant that is a property of the repository rather than of a crate |
 
@@ -83,9 +84,32 @@ keeping. It is here so this project is not free to repeat them.
 ```
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked --no-fail-fast          # 155 tests, plus three compile_fail doc tests and their controls
+cargo test --locked --no-fail-fast          # 273 tests, plus three compile_fail doc tests and their controls
 cargo run -p newsvault -- day 2026-07-01 --lake <path-to-lake> --format json
+cargo run -p newsvault -- ledger --at 2026-07-31T00:00:00Z --from 2026-07-01 --to 2026-07-30 --check
+cargo run -p newsvault -- publish --at 2026-07-31T00:00:00Z
+cargo run -p newsvault -- items --at 2026-07-31T00:00:00Z --per-story latest
 cargo run -p newsvault -- schema           # machine-readable description of the command tree
+python3 probes/newsvault_parity.py         # a second reading of the same rules, compared field by field
+```
+
+The last one needs `pandas` and `pyarrow` and a built binary, and it is the only thing here that is
+not run by CI. Why a second implementation of the reading rules is kept, and what its digests do and
+do not prove: `probes/newsvault_parity/PREREGISTRATION.md`.
+
+## Running a collection
+
+`collect` is the only command that writes to the archive. Every input it reads is a file whose
+digest the run envelope names, so a second reader can reproduce what the run filtered by.
+`BELLWETHER_SEC_CONTACT` carries the contact address SEC requires in the User-Agent; it is
+substituted inside the one HTTP client and reaches no plan and no ledger row.
+
+```
+export BELLWETHER_SEC_CONTACT='bellwether <your address>'
+cargo run -p newsvault -- collect --source edgar_press --window 2026-11-10 \
+  --calendar <calendar.json> --listing <quarter index.json> \
+  --roster <cik roster.json> --rules providers/edgar-press/rules/edgar-press.rules.json \
+  --dry-run --format json
 ```
 
 `unwrap`, `expect` and `panic!` are denied by lint and `unsafe` is forbidden. The table is

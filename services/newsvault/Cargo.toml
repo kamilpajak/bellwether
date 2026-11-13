@@ -12,6 +12,8 @@ canon = { path = "../../canon" }
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive"] }
 const-hex = "1.19.3"
+# The driver registers the providers, so the one adapter that exists is a dependency of it.
+edgar-press = { path = "../../providers/edgar-press" }
 news-provider = { path = "../../news-provider" }
 parquet = "60.1.0"
 pit = { path = "../../pit" }

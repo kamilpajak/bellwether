@@ -1,0 +1,99 @@
+{
+ "schema": "newsvault.parity/1",
+ "reader": "probes/newsvault_parity.py",
+ "days": [
+  {
+   "date": "2026-01-01",
+   "runs": 1,
+   "raw_rows": 2,
+   "distinct_items": 1,
+   "unusable_rows": 1,
+   "valid_time_conflict_events": 0,
+   "items_with_conflicting_valid_time": 0,
+   "id_digest": "c7890f0d7b1a6e4ea5f48efe569780fba896794651843043697dcae06adccc8b",
+   "content_digest": "872338d890cf3a9dd2d2ae1d885de131b5502c4af7acd7f6aa62fe08880e2aa6"
+  },
+  {
+   "date": "2026-01-02",
+   "runs": 1,
+   "raw_rows": 3,
+   "distinct_items": 1,
+   "unusable_rows": 2,
+   "valid_time_conflict_events": 0,
+   "items_with_conflicting_valid_time": 0,
+   "id_digest": "210dbc0978c6423a8405091caaf55f153d26018c721c64c366c0550869da6595",
+   "content_digest": "65f6fe12b8783dc22b9991051eaa30f6d6da29cd46c07be293fb7a8a9ff57581"
+  },
+  {
+   "date": "2026-01-03",
+   "runs": 1,
+   "raw_rows": 2,
+   "distinct_items": 1,
+   "unusable_rows": 1,
+   "valid_time_conflict_events": 0,
+   "items_with_conflicting_valid_time": 0,
+   "id_digest": "cc2c0d0d8cfa1c80702258435e8c530278599797d8f9a4f79cf795b4811f9f3f",
+   "content_digest": "bf637eaa70778c9f4e4bdbb09681e9c3e4eb0c3ef54cd084bfb632e79ee536f1"
+  },
+  {
+   "date": "2026-01-04",
+   "runs": 1,
+   "raw_rows": 2,
+   "distinct_items": 1,
+   "unusable_rows": 1,
+   "valid_time_conflict_events": 0,
+   "items_with_conflicting_valid_time": 0,
+   "id_digest": "68eb9539ba981cda62c583d141bdd295f8e27609f457eb8daae02eb3eee523cc",
+   "content_digest": "c83a367d240e5d09d1016dbbadac85a043da18e2b0b13d83f76250a2177103c4"
+  },
+  {
+   "date": "2026-01-05",
+   "runs": 1,
+   "raw_rows": 3,
+   "distinct_items": 1,
+   "unusable_rows": 2,
+   "valid_time_conflict_events": 0,
+   "items_with_conflicting_valid_time": 0,
+   "id_digest": "76a18d06c6fd1f5b0630280122eed9063008b088bb9ff03ad3e9b019fdc96452",
+   "content_digest": "2dd83d414c3defd33730b3cfe1b1c1754a886887b3ade481bc2e37b72f8181cd"
+  },
+  {
+   "date": "2026-01-06",
+   "runs": 2,
+   "raw_rows": 4,
+   "distinct_items": 3,
+   "unusable_rows": 0,
+   "valid_time_conflict_events": 1,
+   "items_with_conflicting_valid_time": 1,
+   "id_digest": "2828e43fb3f5c61e20ec634d2cf6d93518b3be0e5079224a6deb4e51b6ed533d",
+   "content_digest": "5b35ce6408e884651037e2a2859efa5a70eaa10d43af629088598a8b0b0bd849"
+  },
+  {
+   "date": "2026-01-07",
+   "runs": 2,
+   "raw_rows": 4,
+   "distinct_items": 2,
+   "unusable_rows": 0,
+   "valid_time_conflict_events": 1,
+   "items_with_conflicting_valid_time": 1,
+   "id_digest": "1244ed01b53d3568281e0db5e26aadb446a1be4a209e9dbd021250733f503913",
+   "content_digest": "43634bebcba9d9fb81dcbaf34caa12f9bfba35545c58cee8a5964ca1bf825024"
+  },
+  {
+   "date": "2026-01-08",
+   "runs": 1,
+   "raw_rows": 3,
+   "distinct_items": 3,
+   "unusable_rows": 0,
+   "valid_time_conflict_events": 0,
+   "items_with_conflicting_valid_time": 0,
+   "id_digest": "19f4861c970fed9d79f5a2a81c2d24ee6930c4eeae10b908853c86bcaa66bb2a",
+   "content_digest": "dd8393824aa660c31e6e7c08f42e85f0ca645454402aa9abc63fda0adc8b0ea8"
+  },
+  {
+   "date": "2026-01-09",
+   "refused": "missing_column",
+   "column": "tickers"
+  }
+ ]
+}

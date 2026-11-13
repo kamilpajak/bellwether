@@ -1,10 +1,10 @@
-//! Repo-wide invariant checks: row G1 of `docs/design/architecture.md` section 8, the lint floor
-//! every workspace member must opt in to. Two halves, because inheriting a table says nothing about
-//! what the table holds: [`lint_floor_failure`] checks that every member inherits it, and
-//! [`lint_floor_contents_failure`] checks the floor itself against the root manifest and
-//! `lint-floor.snapshot`. Why such a gate is its own crate: `CONTRIBUTING.md`, "Everything else".
-//! What neither can see is the hole row G1 states. Nothing depends on this crate; its product is a
-//! failing test whose message says what to add and where.
+//! Repo-wide invariant checks: the `docs/design/architecture.md` section 8 rows that belong to no
+//! single service crate. Why such a gate is its own crate: `CONTRIBUTING.md`, "Everything else".
+//! Nothing depends on this crate; its product is a failing test whose message says what to add.
+//!
+//! Row G1 is this file, in two halves because inheriting a table says nothing about what it
+//! holds. Row R4's manifest half is [`clients`] and its clock half is [`clocks`]; the size step's
+//! own precondition is [`layout`].
 //!
 //! The member set comes from `cargo metadata`, never from `workspace.members`: measured
 //! 2026-11-12 on cargo 1.99.1, a crate reached only by a `path` dependency from inside the
@@ -16,10 +16,16 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub mod clients;
+pub mod clocks;
+pub mod layout;
+
 const MANIFEST: &str = "Cargo.toml";
 /// The two lines a crate needs in its own manifest to inherit the floor, indented for a message.
 const STANZA: &str = "        [lints]\n        workspace = true";
 const ROW: &str = "docs/design/architecture.md section 8 row G1";
+/// The row the two manifest-and-text checks beside this one belong to.
+pub const ROW_R4: &str = "docs/design/architecture.md section 8 row R4";
 /// The command that will not notice any of this.
 const BLIND: &str = "cargo clippy --locked --all-targets -- -D warnings";
 /// The committed floor, beside the crate that reads it. One line per lint, `table.name = level`;
@@ -382,7 +388,7 @@ pub fn resolve_members(root_manifest: &Path) -> Result<Vec<Member>, String> {
 /// `cargo metadata --no-deps` over one workspace, as raw stdout. One subprocess per test run, and
 /// `--no-deps` resolves no dependency graph, so it needs neither the network nor an up-to-date
 /// lock file and does not deadlock on the package-cache lock the build already released.
-fn cargo_metadata(root_manifest: &Path) -> Result<Vec<u8>, String> {
+pub(crate) fn cargo_metadata(root_manifest: &Path) -> Result<Vec<u8>, String> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     let output = Command::new(&cargo)
         .args(["metadata", "--no-deps", "--format-version", "1"])
@@ -407,7 +413,7 @@ fn cargo_metadata(root_manifest: &Path) -> Result<Vec<u8>, String> {
     Ok(output.stdout)
 }
 
-fn string_at(value: &serde_json::Value, key: &str) -> Result<String, String> {
+pub(crate) fn string_at(value: &serde_json::Value, key: &str) -> Result<String, String> {
     value
         .get(key)
         .and_then(serde_json::Value::as_str)
@@ -415,7 +421,7 @@ fn string_at(value: &serde_json::Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("`cargo metadata` has no string `{key}`"))
 }
 
-fn array_at<'a>(
+pub(crate) fn array_at<'a>(
     value: &'a serde_json::Value,
     key: &str,
 ) -> Result<&'a Vec<serde_json::Value>, String> {
@@ -465,7 +471,7 @@ fn read_verdict(member_dir: &Path) -> Verdict {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
@@ -480,7 +486,7 @@ mod tests {
             .unwrap_or_default()
     }
 
-    fn root_manifest() -> PathBuf {
+    pub(crate) fn root_manifest() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap_or(Path::new("."))
@@ -591,25 +597,39 @@ mod tests {
 
     // ---- synthetic workspaces, resolved by the real cargo ----
 
-    struct Tree(tempfile::TempDir);
+    pub(crate) struct Tree(tempfile::TempDir);
 
     impl Tree {
         /// `workspace` is the `[workspace]` body; a `[workspace.lints]` table is appended
         /// because a member carrying the inherit stanza does not load without one - cargo
         /// refuses the whole workspace with "`workspace.lints` was not defined".
-        fn new(workspace: &str) -> Self {
+        pub(crate) fn new(workspace: &str) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let root = format!("{workspace}\n[workspace.lints.clippy]\nunwrap_used = \"deny\"\n");
             std::fs::write(dir.path().join(MANIFEST), root).unwrap();
             Self(dir)
         }
 
-        fn crate_at(self, path: &str, manifest: &str) -> Self {
+        pub(crate) fn crate_at(self, path: &str, manifest: &str) -> Self {
             let dir = self.0.path().join(path);
             std::fs::create_dir_all(dir.join("src")).unwrap();
             std::fs::write(dir.join(MANIFEST), manifest).unwrap();
             std::fs::write(dir.join("src/lib.rs"), "pub fn noop() {}\n").unwrap();
             self
+        }
+
+        pub(crate) fn root_manifest(&self) -> PathBuf {
+            self.0.path().join(MANIFEST)
+        }
+
+        /// Writes one file under the tree, creating its parents: how a sibling module's test
+        /// plants the line its gate is supposed to find.
+        pub(crate) fn write(&self, path: &str, body: &str) {
+            let file = self.0.path().join(path);
+            if let Some(parent) = file.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(file, body).unwrap();
         }
 
         fn failure(&self, gate_crate_dir: &str) -> Option<String> {
@@ -626,11 +646,11 @@ mod tests {
     }
 
     /// A member manifest. `name` must be unique inside one synthetic workspace.
-    fn manifest(name: &str, tail: &str) -> String {
+    pub(crate) fn manifest(name: &str, tail: &str) -> String {
         format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{tail}")
     }
 
-    const INHERITS: &str = "\n[lints]\nworkspace = true\n";
+    pub(crate) const INHERITS: &str = "\n[lints]\nworkspace = true\n";
     const BARE: &str = "";
     const ROOT: &str =
         "[workspace]\nmembers = [\"gate\", \"services/newsvault\"]\nresolver = \"2\"\n";

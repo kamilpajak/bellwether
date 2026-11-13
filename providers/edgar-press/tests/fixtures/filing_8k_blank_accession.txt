@@ -1,0 +1,16 @@
+<SEC-DOCUMENT> : 20261110
+<SEC-HEADER> : 20261110
+<ACCEPTANCE-DATETIME>20261110171004
+ACCESSION NUMBER:		
+CONFORMED SUBMISSION TYPE:	8-K
+FILER:
+	COMPANY DATA:
+		COMPANY CONFORMED NAME:			Nobody Industries Inc
+</SEC-HEADER>
+<DOCUMENT>
+<TYPE>EX-99.1
+<TEXT>
+<html><body><p>Nobody Industries Inc announced the appointment of a new chief financial
+officer effective immediately.</p></body></html>
+</TEXT>
+</DOCUMENT>

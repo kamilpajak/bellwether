@@ -7,20 +7,29 @@
 //! than letting `fetch` do it is `docs/design/design.md` section 2.2.
 
 use canon::digest::attempt_id;
-use canon::{CanonError, Digest};
+use canon::{CanonError, Digest, FileDigest};
 use pit::ObservationTime;
 
 use crate::request::{Request, RunId, SourceId, TargetWindow};
 use crate::wire::{RawResponse, TransportError};
 
-/// An attempt's identity, over (run, source, target window, ordinal).
+/// An attempt's identity, over (run, source, target window, ordinal). Holds the hex rather than
+/// a [`Digest`] so that [`AttemptId::recorded`] exists without a second way to make a `Digest`,
+/// whose only producer stays `canon::sha256_canon`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AttemptId(Digest);
+pub struct AttemptId(String);
 
 impl AttemptId {
     #[must_use]
     pub fn hex(&self) -> &str {
-        self.0.hex()
+        &self.0
+    }
+
+    /// Names an attempt the ledger ALREADY holds a row for. The startup sweep's only way to speak
+    /// about an attempt it did not open, because the process that opened it is gone.
+    #[must_use]
+    pub fn recorded(hex: impl Into<String>) -> Self {
+        Self(hex.into())
     }
 }
 
@@ -58,6 +67,9 @@ pub enum AttemptEvent {
         source: SourceId,
         target_window: TargetWindow,
         filter_params: Digest,
+        /// Read off the request rather than passed in beside it, so the roster a run filtered by
+        /// is on every `Opened` row and no caller can leave it off.
+        universe_version: FileDigest,
         opened_at: ObservationTime,
     },
     Answered {
@@ -115,12 +127,27 @@ pub enum OutcomeKind {
     Interrupted,
 }
 
-/// What the payload held and what entered the store.
+impl OutcomeKind {
+    /// The `attempts.outcome` label, in one place: the store writes it and the run envelope
+    /// reports it, and two spellings of one label is a column two readers disagree about.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Empty => "empty",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+/// What the payload held. There is no `items_new` beside it: only the store holds the index that
+/// can count first sightings, and it writes that column itself, so an outcome's own copy could
+/// only ever be a second number for one fact (architecture.md section 8 row R16).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Counts {
     /// Rows the payload held, before any filtering of ours.
     pub vendor_rows: u32,
-    pub items_new: u32,
 }
 
 /// What one attempt cost. There is no metered arm until a metered vendor arrives.
@@ -179,14 +206,10 @@ pub struct Outcome {
 
 impl Outcome {
     /// A total match over `Verdict`. `vendor_rows` is the quantity the collapse question is about
-    /// and `items_new` is not: a replay of a stored window has `items_new` zero and is `ok`.
+    /// and the store's own `items_new` is not: a replay of a stored window has `items_new` zero
+    /// and is `ok`.
     #[must_use]
-    pub fn decide(
-        verdict: &Verdict,
-        vendor_rows: u32,
-        items_new: u32,
-        baseline: &Baseline,
-    ) -> Self {
+    pub fn decide(verdict: &Verdict, vendor_rows: u32, baseline: &Baseline) -> Self {
         let kind = match verdict {
             Verdict::Usable => OutcomeKind::Ok,
             Verdict::Empty => OutcomeKind::Empty,
@@ -194,10 +217,7 @@ impl Outcome {
         };
         Self {
             kind,
-            counts: Some(Counts {
-                vendor_rows,
-                items_new,
-            }),
+            counts: Some(Counts { vendor_rows }),
             baseline: Some(baseline.against(vendor_rows)),
         }
     }
@@ -247,6 +267,13 @@ pub struct SendPermit {
 }
 
 impl SendPermit {
+    /// Which attempt this permit licenses. Reading it opens no socket, and an [`crate::Exchange`]
+    /// outside this crate needs it to put the attempt on the answer it returns.
+    #[must_use]
+    pub const fn attempt_id(&self) -> &AttemptId {
+        &self.attempt_id
+    }
+
     /// Consumes the permit, so the attempt it belongs to travels with the answer.
     pub(crate) fn into_attempt_id(self) -> AttemptId {
         self.attempt_id
@@ -290,18 +317,23 @@ impl AttemptSlot {
         ordinal: u32,
         at: ObservationTime,
     ) -> Result<Self, LedgerError> {
-        let attempt_id = AttemptId(attempt_id(
-            run.as_str(),
-            request.source.as_str(),
-            request.target_window.as_str(),
-            ordinal,
-        )?);
+        let attempt_id = AttemptId(
+            attempt_id(
+                run.as_str(),
+                request.source.as_str(),
+                request.target_window.as_str(),
+                ordinal,
+            )?
+            .hex()
+            .to_owned(),
+        );
         sink.write(&AttemptEvent::Opened {
             attempt_id: attempt_id.clone(),
             run: run.clone(),
             source: request.source.clone(),
             target_window: request.target_window.clone(),
             filter_params: request.filter_params()?,
+            universe_version: request.universe_version.clone(),
             opened_at: at,
         })?;
         Ok(Self {
@@ -409,8 +441,12 @@ pub(crate) mod tests {
         abandon, AttemptEvent, AttemptSlot, Baseline, Cost, LedgerError, Outcome, OutcomeKind,
         Sink, Verdict,
     };
-    use crate::request::{HeaderName, HeaderValue, Param, Request, RunId, SourceId, TargetWindow};
+    use crate::provider::Provenance;
+    use crate::request::{
+        HeaderName, HeaderValue, Param, Request, RequestPhase, RunId, SourceId, TargetWindow,
+    };
     use crate::wire::RawResponse;
+    use canon::FileDigest;
     use chrono::{DateTime, Utc};
     use pit::ObservationTime;
 
@@ -426,9 +462,10 @@ pub(crate) mod tests {
     const CLOSED_AT: &str = "2026-11-10T13:00:03Z";
     const NOTICED_AT: &str = "2026-11-11T13:00:00Z";
     const OK_STATUS: u16 = 200;
+    /// Any roster bytes: these tests are about the ledger, and the digest only has to be one value.
+    const ROSTER: &[u8] = b"{\"320193\":\"AAPL\"}";
     /// architecture.md section 3.9's attempt-count paragraph, which carries the caveat.
     const VENDOR_ROWS: u32 = 348;
-    const ITEMS_NEW: u32 = 103;
     /// The incident the collapse outcome exists for: 59 items against a median of 181.
     const COLLAPSE_SHAPED_ROWS: u32 = 59;
     const PREVIOUS_OK_COUNTS: [u32; 4] = [181, 45, 11, 3];
@@ -490,7 +527,10 @@ pub(crate) mod tests {
         Request {
             source: SourceId::new(SOURCE),
             target_window: TargetWindow::new(WINDOW),
+            phase: RequestPhase::Index,
+            provenance: Provenance::LiveIngest,
             url: URL.to_owned(),
+            universe_version: FileDigest::of(ROSTER),
             headers: vec![(
                 HeaderName::new("Accept"),
                 HeaderValue::Literal("text/plain".to_owned()),
@@ -507,7 +547,7 @@ pub(crate) mod tests {
     }
 
     fn usable() -> Outcome {
-        Outcome::decide(&Verdict::Usable, VENDOR_ROWS, ITEMS_NEW, &baseline())
+        Outcome::decide(&Verdict::Usable, VENDOR_ROWS, &baseline())
     }
 
     fn slot(sink: &mut dyn Sink, ordinal: u32) -> Result<AttemptSlot, LedgerError> {
@@ -665,7 +705,7 @@ pub(crate) mod tests {
                 Verdict::Empty => OutcomeKind::Empty,
                 Verdict::PermanentFailure | Verdict::TransientFailure => OutcomeKind::Failed,
             };
-            let decided = Outcome::decide(&verdict, VENDOR_ROWS, ITEMS_NEW, &baseline());
+            let decided = Outcome::decide(&verdict, VENDOR_ROWS, &baseline());
             assert_eq!((named, decided.kind()), (expected, expected));
         }
     }
@@ -674,12 +714,7 @@ pub(crate) mod tests {
     /// attempt so it can be picked from a quantile of real runs, with its date.
     #[test]
     fn decide_cannot_return_collapsed_until_a_floor_with_our_own_construction_exists() {
-        let decided = Outcome::decide(
-            &Verdict::Usable,
-            COLLAPSE_SHAPED_ROWS,
-            ITEMS_NEW,
-            &baseline(),
-        );
+        let decided = Outcome::decide(&Verdict::Usable, COLLAPSE_SHAPED_ROWS, &baseline());
         assert_eq!(decided.kind(), OutcomeKind::Ok);
         assert_eq!(
             decided.baseline().and_then(|b| b.ratio),
@@ -699,7 +734,6 @@ pub(crate) mod tests {
         let first_ever = Outcome::decide(
             &Verdict::Usable,
             VENDOR_ROWS,
-            ITEMS_NEW,
             &Baseline::from_trailing_ok(&[]),
         );
         assert_eq!(first_ever.baseline().and_then(|b| b.ratio), None);

@@ -22,12 +22,6 @@ impl BlobDigest {
     }
 }
 
-impl std::fmt::Display for BlobDigest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 /// Hex characters per directory level, two levels deep, which is the layout design.md section 5
 /// states.
 const FAN_OUT: usize = 2;
@@ -78,6 +72,13 @@ impl BlobStore {
         fs::rename(&staging, &stored)?;
         sync_directory(stored.parent())?;
         Ok(digest)
+    }
+
+    /// A digest this store ALREADY holds, by its hex. The file has to be there, so a value of
+    /// this type still names bytes this process wrote rather than a string a caller assembled.
+    pub fn named(&self, hex: &str) -> Option<BlobDigest> {
+        let digest = BlobDigest(hex.to_owned());
+        self.path_of(&digest).exists().then_some(digest)
     }
 
     /// The stored length, and the check that no index row is written about a missing file.

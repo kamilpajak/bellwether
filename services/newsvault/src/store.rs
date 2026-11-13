@@ -21,8 +21,9 @@
 //! # use canon::digest::{item_id, story_id, ItemFields};
 //! # use canon::Stamp;
 //! # use chrono::DateTime;
-//! # use news_provider::{AttemptSlot, Baseline, Outcome, RawResponse, Request, RunId, SourceId,
-//! #                     TargetWindow, Verdict};
+//! # use news_provider::{AttemptSlot, Baseline, Outcome, Provenance, RawResponse, Request,
+//! #                     RequestPhase, RunId, SourceId, TargetWindow, Verdict};
+//! # use pit::datedness::Published;
 //! # use pit::{ObservationTime, ValidTime};
 //! # fn legal(root: std::path::PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 //! let run = RunId::new("2026-11-13T00:00:00Z");
@@ -30,15 +31,18 @@
 //! let request = Request {
 //!     source: SourceId::new("edgar_press"),
 //!     target_window: TargetWindow::new("2026-11-10"),
+//!     phase: RequestPhase::Index,
+//!     provenance: Provenance::LiveIngest,
 //!     url: "https://example.test/filing".to_owned(),
 //!     headers: Vec::new(),
 //!     params: Vec::new(),
+//!     universe_version: canon::FileDigest::of(b"{}"),
 //! };
 //! let at = ObservationTime::new(DateTime::UNIX_EPOCH);
 //! let raw = committer.put_blob(b"{}")?;
 //! let mut slot = AttemptSlot::open(&mut committer, &request, &run, 0, at)?;
 //! let answer = RawResponse::new(slot.attempt_id().clone(), 200, b"{}".to_vec(), at, at);
-//! let outcome = Outcome::decide(&Verdict::Usable, 1, 1, &Baseline::from_trailing_ok(&[1]));
+//! let outcome = Outcome::decide(&Verdict::Usable, 1, &Baseline::from_trailing_ok(&[1]));
 //! let closed = slot.close(&mut committer, outcome, &Ok(answer), at)?;
 //! let rows = [ItemRow {
 //!     item_id: item_id(&ItemFields {
@@ -53,7 +57,7 @@
 //!     story_id: story_id("edgar_press", "0000320193-26-000071")
 //!         .map_err(|failure| failure.to_string())?,
 //!     doc_id: None,
-//!     valid: ValidTime::new(DateTime::UNIX_EPOCH),
+//!     valid: Published::At(ValidTime::new(DateTime::UNIX_EPOCH)),
 //!     observed: at,
 //!     raw_blob: raw,
 //!     body_blob: None,
@@ -67,18 +71,22 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::PathBuf;
 
 use canon::Digest;
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use news_provider::{
     AttemptEvent, AttemptReceipt, Cost, LedgerError, OutcomeKind, RunId, Sink, SourceId,
 };
 use pit::datedness::{Datedness, Published};
-use pit::{ObservationTime, ValidTime, Visibility};
+use pit::{ObservationTime, Visibility};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::blobs::{BlobDigest, BlobStore};
 
 const LOCK_FILE: &str = "LOCK";
-const COMMIT_LOG: &str = "commit.sqlite3";
+/// The layout, in one place because a reader and the writer may not disagree about it
+/// (design.md section 6, the archive row).
+pub const COMMIT_LOG: &str = "commit.sqlite3";
+pub const RUNS_DIR: &str = "runs";
+pub const ITEMS_DIR: &str = "items";
 const BLOB_DIR: &str = "blobs";
 const BLOB_SPACE: &str = "sha256";
 /// One constant for the label `record` writes and `ok_vendor_rows` reads, so the two cannot drift.
@@ -97,6 +105,10 @@ CREATE TABLE IF NOT EXISTS attempts (
     source                TEXT NOT NULL,
     target_window         TEXT NOT NULL,
     filter_params         TEXT NOT NULL,
+    -- The roster the run filtered by, which decides at COLLECTION time how many of a payload's
+    -- rows enter the archive: architecture.md section 2's `universe_version` row. NOT NULL,
+    -- because an attempt that cannot name its roster cannot say what it looked at.
+    universe_version      TEXT NOT NULL,
     opened_at             TEXT NOT NULL,
     requested_at          TEXT,
     received_at           TEXT,
@@ -129,6 +141,11 @@ CREATE TABLE IF NOT EXISTS items (
     doc_id            TEXT,
     attempt_id        TEXT NOT NULL REFERENCES attempts(attempt_id),
     valid_at          TEXT,
+    -- A publication DATE with no hour, and the calendar it is a day in. Its own pair of columns
+    -- because folding a date into a midnight instant admits the whole day before the close:
+    -- architecture.md section 3.1's `valid_precision` row.
+    valid_day         TEXT,
+    valid_tz          TEXT,
     valid_refused     TEXT,
     observed_at       TEXT NOT NULL,
     valid_disputed    INTEGER NOT NULL,
@@ -138,9 +155,10 @@ CREATE TABLE IF NOT EXISTS items (
     committed_at      TEXT NOT NULL,
     UNIQUE(item_id, attempt_id),
     -- `valid_refused` is the publication value an observation preceded: section 5 row 4.
-    -- No reachable failure today: `publication()` returns exactly one `Some` on every path, so
-    -- nothing in this crate can trip this clause. It binds a later writer and is not enforcement.
-    CHECK ((valid_at IS NULL) <> (valid_refused IS NULL))
+    -- No reachable failure today: `publication()` returns exactly one of the three on every path,
+    -- so nothing in this crate can trip either clause. They bind a later writer.
+    CHECK ((valid_at IS NOT NULL) + (valid_day IS NOT NULL) + (valid_refused IS NOT NULL) = 1),
+    CHECK ((valid_day IS NULL) = (valid_tz IS NULL))
 );
 CREATE INDEX IF NOT EXISTS items_by_story ON items(story_id);
 CREATE INDEX IF NOT EXISTS items_by_doc ON items(doc_id);
@@ -151,7 +169,36 @@ CREATE TABLE IF NOT EXISTS seq_reservations (
     seq_hi       INTEGER NOT NULL,
     reserved_at  TEXT NOT NULL
 );
+-- One row per exported segment, committed only once the file is at its final name. The grain is
+-- (run, publication day) and not the attempt: design.md section 5.
+CREATE TABLE IF NOT EXISTS published (
+    segment_digest TEXT PRIMARY KEY,
+    run_id         TEXT NOT NULL,
+    valid_date     TEXT NOT NULL,
+    path           TEXT NOT NULL,
+    seq_lo         INTEGER NOT NULL,
+    seq_hi         INTEGER NOT NULL,
+    rows           INTEGER NOT NULL,
+    published_at   TEXT NOT NULL
+);
 ";
+
+/// Which publication day a row is partitioned under: decision D3, taken by default
+/// (architecture.md section 10). [`SCHEMA`]'s CHECK makes exactly one of the two columns
+/// non-null, so every row has one.
+const VALID_DATE: &str = "substr(COALESCE(i.valid_at, i.valid_day, i.valid_refused), 1, 10)";
+
+/// Whether a segment already carries a row: the same publication day AND inside that segment's
+/// seq range. Never the range alone - one run exports several days and their ranges interleave.
+/// Built from [`VALID_DATE`] rather than repeating it: review 2026-11-13 found the expression in
+/// three places and changed one of them to a different key with the whole suite green.
+fn covered_by_a_segment() -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM published p
+     WHERE p.valid_date = {VALID_DATE}
+       AND i.seq BETWEEN p.seq_lo AND p.seq_hi)"
+    )
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -169,6 +216,11 @@ pub enum StoreError {
     /// would carry archive content under an attempt nobody measured.
     #[error("attempt {attempt} was abandoned, so it may not carry items")]
     ItemsUnderAbandonedAttempt { attempt: String },
+    /// An item with no publication value has no identity to take over it, which is why its
+    /// producer files such a row as a `news_provider::UnusableRow`. The door refuses one rather
+    /// than inventing a value for the column the schema requires.
+    #[error("item {item} offers no publication value, so it cannot be stored as an item")]
+    ItemHasNoPublicationValue { item: String },
     /// A replay must be a no-op, which it can only be when it is the SAME claim: a second
     /// `record` of one attempt carrying a different item set is a different claim and was
     /// accepted silently, returning `changed: false` and filing nothing - found by review
@@ -177,6 +229,10 @@ pub enum StoreError {
     ReplayWithDifferentItems { attempt: String },
     #[error("no blob is stored under {digest}")]
     BlobAbsent { digest: String },
+    /// `canon` refuses a value holding a canonical-form separator and an instant whose seconds
+    /// field is 60, and an item whose fields cannot be put in canonical form has no identity.
+    #[error("item {item} has no canonical identity: {why}")]
+    ItemIdentityRefused { item: String, why: String },
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -193,7 +249,10 @@ pub struct ItemRow {
     /// Cross-source identity. Absent until a canonicalised url exists for the row, because the
     /// canonicalisation is a hashed rule the provider owns.
     pub doc_id: Option<Digest>,
-    pub valid: ValidTime,
+    /// The publication value with its precision, never an instant a date was folded into:
+    /// `Published::On` reaches `items.valid_day` and `items.valid_tz` and no cutoff reads it as
+    /// an instant. [`Published::Unknown`] is refused by [`Committer::record`].
+    pub valid: Published,
     pub observed: ObservationTime,
     pub raw_blob: BlobDigest,
     pub body_blob: Option<BlobDigest>,
@@ -213,10 +272,84 @@ pub struct CommitReceipt {
     pub changed: bool,
 }
 
+/// One item row as a segment carries it. Every instant is the stored string and is never
+/// re-rendered: `item_id` digests that exact text, so a second rendering could disagree with the
+/// value it names (architecture.md section 2, canonical form).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportRow {
+    pub seq: i64,
+    pub item_id: String,
+    pub story_id: String,
+    pub doc_id: Option<String>,
+    pub attempt_id: String,
+    pub source: String,
+    pub valid_at: Option<String>,
+    pub valid_day: Option<String>,
+    pub valid_tz: Option<String>,
+    pub valid_refused: Option<String>,
+    pub observed_at: String,
+    pub valid_disputed: bool,
+    pub earliest_valid_at: Option<String>,
+    pub raw_blob: String,
+    pub body_blob: Option<String>,
+    pub committed_at: String,
+    /// The partition the row belongs under, by [`VALID_DATE`].
+    pub valid_date: String,
+}
+
+/// An inclusive span of `seq`. Both ends, because a span with one end is a claim about rows the
+/// store may not hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct SeqRange {
+    pub seq_lo: i64,
+    pub seq_hi: i64,
+}
+
+/// A segment at its final name. The row this describes commits after the rename and never before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedSegment {
+    pub segment_digest: String,
+    pub run_id: String,
+    pub valid_date: String,
+    pub path: String,
+    pub seq_lo: i64,
+    pub seq_hi: i64,
+    pub rows: u32,
+}
+
+/// The `seq` of every committed item no segment carries, as contiguous spans. A hole in the
+/// sequence is a range a transaction reserved and rolled back (see [`SCHEMA`]), so the spans
+/// break across it rather than claiming a row the store does not hold.
+pub fn unpublished_seq_ranges(db: &Connection) -> Result<Vec<SeqRange>, StoreError> {
+    let mut statement = db.prepare(&format!(
+        "SELECT i.seq FROM items i WHERE NOT {} ORDER BY i.seq",
+        covered_by_a_segment()
+    ))?;
+    let seqs = statement
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<Result<Vec<i64>, _>>()?;
+    Ok(contiguous(&seqs))
+}
+
+fn contiguous(seqs: &[i64]) -> Vec<SeqRange> {
+    let mut spans: Vec<SeqRange> = Vec::new();
+    for &seq in seqs {
+        match spans.last_mut() {
+            Some(span) if span.seq_hi + 1 == seq => span.seq_hi = seq,
+            _ => spans.push(SeqRange {
+                seq_lo: seq,
+                seq_hi: seq,
+            }),
+        }
+    }
+    spans
+}
+
 /// The single writer. Holds the lease for its whole life, because dropping the lock file releases
 /// the flock.
 #[derive(Debug)]
 pub struct Committer {
+    root: PathBuf,
     run: RunId,
     db: Connection,
     blobs: BlobStore,
@@ -246,17 +379,103 @@ impl Committer {
         let db = Connection::open(root.join(COMMIT_LOG))?;
         db.execute_batch(SCHEMA)?;
         Ok(Self {
+            blobs: BlobStore::new(root.join(BLOB_DIR).join(BLOB_SPACE)),
+            root,
             run: run.clone(),
             db,
-            blobs: BlobStore::new(root.join(BLOB_DIR).join(BLOB_SPACE)),
             pending: Vec::new(),
             _lease: lease,
         })
     }
 
+    #[must_use]
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
+    #[must_use]
+    pub fn run(&self) -> &RunId {
+        &self.run
+    }
+
+    /// Every committed item no segment carries, oldest `seq` first, with the publication day each
+    /// one belongs under.
+    pub fn unpublished_rows(&self) -> Result<Vec<ExportRow>, StoreError> {
+        let mut statement = self.db.prepare(&format!(
+            "SELECT i.seq, i.item_id, i.story_id, i.doc_id, i.attempt_id, a.source,
+                    i.valid_at, i.valid_day, i.valid_tz, i.valid_refused, i.observed_at,
+                    i.valid_disputed, i.earliest_valid_at, i.raw_blob, i.body_blob,
+                    i.committed_at, {VALID_DATE}
+             FROM items i JOIN attempts a ON a.attempt_id = i.attempt_id
+             WHERE NOT {}
+             ORDER BY i.seq",
+            covered_by_a_segment()
+        ))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(ExportRow {
+                    seq: row.get(0)?,
+                    item_id: row.get(1)?,
+                    story_id: row.get(2)?,
+                    doc_id: row.get(3)?,
+                    attempt_id: row.get(4)?,
+                    source: row.get(5)?,
+                    valid_at: row.get(6)?,
+                    valid_day: row.get(7)?,
+                    valid_tz: row.get(8)?,
+                    valid_refused: row.get(9)?,
+                    observed_at: row.get(10)?,
+                    valid_disputed: row.get(11)?,
+                    earliest_valid_at: row.get(12)?,
+                    raw_blob: row.get(13)?,
+                    body_blob: row.get(14)?,
+                    committed_at: row.get(15)?,
+                    valid_date: row.get(16)?,
+                })
+            })?
+            .collect::<Result<Vec<ExportRow>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn unpublished_seq_ranges(&self) -> Result<Vec<SeqRange>, StoreError> {
+        unpublished_seq_ranges(&self.db)
+    }
+
+    /// Files a segment that is already at its final name. Called after the rename and never
+    /// before: a row about a file that is not there is accepted attack A2.6's own failure.
+    pub fn record_published(
+        &mut self,
+        segment: &PublishedSegment,
+        at: ObservationTime,
+    ) -> Result<(), StoreError> {
+        self.db.execute(
+            "INSERT INTO published
+                 (segment_digest, run_id, valid_date, path, seq_lo, seq_hi, rows, published_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                segment.segment_digest,
+                segment.run_id,
+                segment.valid_date,
+                segment.path,
+                segment.seq_lo,
+                segment.seq_hi,
+                segment.rows,
+                stamp(at.inner())
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Stores a payload under its own digest, before any transaction opens.
     pub fn put_blob(&self, payload: &[u8]) -> Result<BlobDigest, StoreError> {
         self.blobs.put(self.run.as_str(), payload)
+    }
+
+    /// A payload this store already holds, named by its hex.
+    pub fn blob_named(&self, hex: &str) -> Result<BlobDigest, StoreError> {
+        self.blobs.named(hex).ok_or_else(|| StoreError::BlobAbsent {
+            digest: hex.to_owned(),
+        })
     }
 
     /// The counts `news_provider::Outcome::decide` is asked against, oldest first. How many of
@@ -272,6 +491,20 @@ impl Committer {
             .query_map(params![source.as_str(), OUTCOME_OK], |row| row.get(0))?
             .collect::<Result<Vec<u32>, _>>()?;
         Ok(counts)
+    }
+
+    /// Every attempt this store opened and never finalised, oldest first. The startup sweep's
+    /// input: without it an attempt killed between `open` and `close` is in flight forever with a
+    /// growing age (architecture.md section 3.2's `Abandoned` row).
+    pub fn attempts_in_flight(&self) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.db.prepare(
+            "SELECT attempt_id FROM attempts WHERE closed_at IS NULL ORDER BY opened_at,
+                 attempt_id",
+        )?;
+        let open = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(open)
     }
 
     /// The ONLY way an item enters the archive. It takes the closed attempt, so there is no
@@ -338,25 +571,28 @@ impl Committer {
             for (offset, row) in rows.iter().enumerate() {
                 let story = row.story_id.hex();
                 let observed_at = stamp(row.observed.inner());
-                let (valid_at, refused) = publication(row);
-                let (disputed, earliest) = dispute(&transaction, story, valid_at.as_ref())?;
+                let published = publication(row)?;
+                let (disputed, earliest) =
+                    dispute(&transaction, story, published.instant.as_ref())?;
                 if wins(first_observed(&transaction, story)?.as_ref(), &observed_at) {
                     items_new += 1;
                 }
                 transaction.execute(
                     "INSERT INTO items
-                         (seq, item_id, story_id, doc_id, attempt_id, valid_at, valid_refused,
-                          observed_at, valid_disputed, earliest_valid_at, raw_blob, body_blob,
-                          committed_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                         (seq, item_id, story_id, doc_id, attempt_id, valid_at, valid_day,
+                          valid_tz, valid_refused, observed_at, valid_disputed, earliest_valid_at,
+                          raw_blob, body_blob, committed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                     params![
                         seq_lo + i64::try_from(offset).unwrap_or(0),
                         row.item_id.hex(),
                         story,
                         row.doc_id.as_ref().map(Digest::hex),
                         attempt,
-                        valid_at,
-                        refused,
+                        published.instant,
+                        published.day,
+                        published.zone,
+                        published.refused,
                         observed_at,
                         disputed,
                         earliest,
@@ -482,19 +718,22 @@ impl Committer {
             source,
             target_window,
             filter_params,
+            universe_version,
             opened_at,
         } = event
         {
             self.db.execute(
                 "INSERT INTO attempts
-                     (attempt_id, run_id, source, target_window, filter_params, opened_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(attempt_id) DO NOTHING",
+                     (attempt_id, run_id, source, target_window, filter_params, universe_version,
+                      opened_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(attempt_id) DO NOTHING",
                 params![
                     attempt_id.hex(),
                     run.as_str(),
                     source.as_str(),
                     target_window.as_str(),
                     filter_params.hex(),
+                    universe_version.hex(),
                     stamp(opened_at.inner())
                 ],
             )?;
@@ -557,23 +796,81 @@ fn closes(event: &AttemptEvent, attempt: &str) -> bool {
     attempt_of(event) == attempt && matches!(event, AttemptEvent::Finalised { .. })
 }
 
-/// [`Datedness::Undated`]'s only producer. An item whose observation precedes its publication is
-/// stored with its evidence rather than counted as unusable: architecture.md section 5 row 4.
+/// Which visibility rule a row's publication value puts it under. [`Datedness::Undated`] is
+/// reached by an observation that precedes its publication, which is stored with its evidence
+/// rather than counted as unusable: architecture.md section 5 row 4.
 fn datedness(row: &ItemRow) -> Datedness {
-    match Visibility::from_live(row.valid, row.observed) {
-        Ok(window) => Datedness::Dated(window),
-        Err(_) => Datedness::Undated {
+    match row.valid {
+        Published::At(valid) => match Visibility::from_live(valid, row.observed) {
+            Ok(window) => Datedness::Dated(window),
+            Err(_) => Datedness::Undated {
+                observed: row.observed,
+            },
+        },
+        Published::On { day, tz } => Datedness::DayDated {
+            day,
+            tz,
+            observed: row.observed,
+        },
+        Published::Unknown => Datedness::Undated {
             observed: row.observed,
         },
     }
 }
 
-/// The publication value as its two columns: the one a cutoff may read, and the refused one kept
-/// as evidence. A date has no instant to offer either, so it goes to the same column.
-fn publication(row: &ItemRow) -> (Option<String>, Option<String>) {
-    match datedness(row).published() {
-        Published::At(valid) => (Some(stamp(valid.inner())), None),
-        Published::On { .. } | Published::Unknown => (None, Some(stamp(row.valid.inner()))),
+/// The publication value as its columns. Exactly one of the three carries it, which is what the
+/// schema's own CHECK says.
+struct Publication {
+    instant: Option<String>,
+    day: Option<String>,
+    zone: Option<&'static str>,
+    refused: Option<String>,
+}
+
+impl Publication {
+    fn instant(at: String) -> Self {
+        Self {
+            instant: Some(at),
+            day: None,
+            zone: None,
+            refused: None,
+        }
+    }
+
+    fn day(day: NaiveDate, zone: &'static str) -> Self {
+        Self {
+            instant: None,
+            day: Some(day.to_string()),
+            zone: Some(zone),
+            refused: None,
+        }
+    }
+
+    fn refused(at: String) -> Self {
+        Self {
+            instant: None,
+            day: None,
+            zone: None,
+            refused: Some(at),
+        }
+    }
+}
+
+/// A date reaches `valid_day` and `valid_tz`, an instant reaches `valid_at`, and an instant its
+/// own observation preceded reaches `valid_refused`. An item carrying no publication value at all
+/// is refused rather than given an invented one.
+fn publication(row: &ItemRow) -> Result<Publication, StoreError> {
+    match datedness(row) {
+        Datedness::Dated(window) => Ok(Publication::instant(stamp(window.valid().inner()))),
+        Datedness::DayDated { day, tz, .. } => Ok(Publication::day(day, tz)),
+        // `lower_bound` is `None` for exactly one publication value, the unknown one, so this is
+        // where a row with nothing to store in any of the three columns is turned away.
+        Datedness::Undated { .. } => match row.valid.lower_bound() {
+            Some(refused) => Ok(Publication::refused(stamp(refused))),
+            None => Err(StoreError::ItemHasNoPublicationValue {
+                item: row.item_id.hex().to_owned(),
+            }),
+        },
     }
 }
 
@@ -702,12 +999,13 @@ mod tests {
     use std::os::unix::fs::MetadataExt as _;
 
     use canon::digest::{doc_id, item_id, story_id, ItemFields};
-    use canon::Stamp;
+    use canon::{FileDigest, Stamp};
     use chrono::{DateTime, TimeDelta, Utc};
     use news_provider::{
-        abandon, AttemptEvent, AttemptSlot, Baseline, Outcome, RawResponse, Request, SourceId,
-        TargetWindow, Verdict,
+        abandon, AttemptEvent, AttemptSlot, Baseline, Outcome, Provenance, RawResponse, Request,
+        RequestPhase, SourceId, TargetWindow, Verdict,
     };
+    use pit::datedness::Published;
     use pit::ValidTime;
     use tempfile::TempDir;
 
@@ -728,6 +1026,9 @@ mod tests {
     const CORRECTED_TITLE: &str = "A filing, corrected";
     const STORY: &str = "0000320193-26-000071";
     const PAYLOAD: &[u8] = b"{\"filings\": 1}";
+    /// The roster bytes every test attempt names. One value, because these tests are about the
+    /// store and `universe_version` only has to be present and stable.
+    const ROSTER: &[u8] = b"{\"320193\": \"AAPL\"}";
     const CORRECTED_PAYLOAD: &[u8] = b"{\"filings\": 2}";
     const SENTINEL: &[u8] = b"a staged file a crash left behind";
     const STATUS_OK: u16 = 200;
@@ -737,7 +1038,6 @@ mod tests {
     /// A permanent failure brought nothing back, so the two verdicts carry different counts and a
     /// swap of their outcome labels is visible in what the baseline reader returns.
     const FAILED_VENDOR_ROWS: u32 = 0;
-    const ITEMS_NEW: u32 = 7;
     const TRAILING_OK: [u32; 3] = [181, 45, 11];
     const ITEM_COUNTS: [usize; 4] = [0, 1, 2, 17];
 
@@ -755,6 +1055,9 @@ mod tests {
     const OBSERVED_BEFORE_PUBLICATION: i64 = 50 * SECOND;
     /// Not a whole second, so coarsening the stored stamp is visible.
     const VALID_AT_PAST_THE_SECOND: i64 = VALID_AT + 123_456;
+    /// A date with no hour, which is what a filing carrying no acceptance instant publishes at.
+    const A_PUBLICATION_DAY: &str = "2026-11-10";
+    const NEW_YORK: &str = "America/New_York";
 
     const DOC_IMPORT: &str = "use newsvault::store::{Committer, ItemRow};";
     const COMPILE_FAIL: &str = "compile_fail";
@@ -800,9 +1103,12 @@ mod tests {
         Request {
             source: SourceId::new(source),
             target_window: TargetWindow::new(WINDOW),
+            phase: RequestPhase::Index,
+            provenance: Provenance::LiveIngest,
             url: URL.to_owned(),
             headers: Vec::new(),
             params: Vec::new(),
+            universe_version: FileDigest::of(ROSTER),
         }
     }
 
@@ -847,7 +1153,7 @@ mod tests {
             story_id: story_id(spec.source, spec.source_item_id)
                 .map_err(|failure| failure.to_string())?,
             doc_id: Some(doc_id(URL).map_err(|failure| failure.to_string())?),
-            valid: ValidTime::new(instant(spec.valid)),
+            valid: Published::At(ValidTime::new(instant(spec.valid))),
             observed: ObservationTime::new(instant(spec.observed)),
             raw_blob: store.put_blob(spec.payload)?,
             body_blob: None,
@@ -959,7 +1265,6 @@ mod tests {
         let outcome = Outcome::decide(
             &verdict,
             vendor_rows,
-            ITEMS_NEW,
             &Baseline::from_trailing_ok(&TRAILING_OK),
         );
         Ok(slot.close(store, outcome, &Ok(answer), at(4))?)
@@ -989,7 +1294,6 @@ mod tests {
         let outcome = Outcome::decide(
             &Verdict::Usable,
             vendor_rows,
-            ITEMS_NEW,
             &Baseline::from_trailing_ok(&TRAILING_OK),
         );
         Ok(slot.close(store, outcome, &Ok(answer), at(4 + i64::from(ordinal)))?)
@@ -1057,6 +1361,7 @@ mod tests {
         Ok(store.db.query_row(
             "SELECT seq || '|' || item_id || '|' || story_id || '|' || IFNULL(doc_id, '')
                  || '|' || attempt_id || '|' || IFNULL(valid_at, '')
+                 || '|' || IFNULL(valid_day, '') || '|' || IFNULL(valid_tz, '')
                  || '|' || IFNULL(valid_refused, '') || '|' || observed_at
                  || '|' || valid_disputed || '|' || IFNULL(earliest_valid_at, '')
                  || '|' || raw_blob || '|' || IFNULL(body_blob, '') || '|' || committed_at
@@ -1080,6 +1385,25 @@ mod tests {
         assert_eq!(annotation(&control), NO_RUN, "{control}");
         assert!(control.contains(DOC_IMPORT), "{control}");
         assert!(control.contains(RECORD_WITH_AN_ATTEMPT), "{control}");
+    }
+
+    /// The roster the run filtered by, on the row. Without it an unrecorded roster change is
+    /// drift nothing can see, and the predecessor's own roster read returns an empty map on a read
+    /// failure - a silent zero-item day (architecture.md section 2's `universe_version` row).
+    #[test]
+    fn the_opened_row_carries_the_roster_digest_the_request_was_built_from() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let request = request();
+        let slot = AttemptSlot::open(&mut store, &request, &RunId::new(RUN), 0, at(1))?;
+        let stored: String = store.db.query_row(
+            "SELECT universe_version FROM attempts WHERE attempt_id = ?1",
+            params![slot.attempt_id().hex()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(stored, request.universe_version.hex());
+        assert_eq!(stored, FileDigest::of(ROSTER).hex());
+        Ok(())
     }
 
     #[test]
@@ -1624,6 +1948,86 @@ mod tests {
         Ok(())
     }
 
+    /// The fatal defect this pair of columns exists to remove: a day-precision publication value
+    /// folded into a midnight instant was `visible_at` TRUE at 02:00, 06:00 and 14:59:59 on its
+    /// own publication day, 13 h of admitted lookahead, measured 2026-11-12 against the
+    /// predecessor's unmodified reader over 273 of 13,074 rows stamped exactly 00:00:00Z.
+    #[test]
+    fn a_day_precision_publication_value_is_stored_as_a_day_and_never_as_a_fabricated_midnight(
+    ) -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let closed = closed_attempt(&mut store, 0, Verdict::Usable)?;
+        let mut dated = row(&store, &spec(STORY))?;
+        dated.valid = Published::On {
+            day: A_PUBLICATION_DAY.parse()?,
+            tz: NEW_YORK,
+        };
+        store.record(closed, &[dated], at(5))?;
+        let stored: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = store.db.query_row(
+            "SELECT valid_at, valid_day, valid_tz, valid_refused FROM items",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            stored,
+            (
+                None,
+                Some(A_PUBLICATION_DAY.to_owned()),
+                Some(NEW_YORK.to_owned()),
+                None
+            )
+        );
+        Ok(())
+    }
+
+    /// The partition label has to be a true statement about the rows under it (decision D3), and
+    /// a day-dated row has no instant for the label to be read out of.
+    #[test]
+    fn a_day_dated_row_is_partitioned_under_the_day_it_names() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let closed = closed_attempt(&mut store, 0, Verdict::Usable)?;
+        let mut dated = row(&store, &spec(STORY))?;
+        dated.valid = Published::On {
+            day: A_PUBLICATION_DAY.parse()?,
+            tz: NEW_YORK,
+        };
+        store.record(closed, &[dated], at(5))?;
+        let partitions: Vec<String> = store
+            .unpublished_rows()?
+            .into_iter()
+            .map(|row| row.valid_date)
+            .collect();
+        assert_eq!(partitions, vec![A_PUBLICATION_DAY.to_owned()]);
+        Ok(())
+    }
+
+    /// An item with no publication value has no identity to take over it, which is why its
+    /// producer files it as an unusable row. The door refuses one rather than inventing a value
+    /// for the column the schema requires.
+    #[test]
+    fn an_item_offering_no_publication_value_is_refused_rather_than_stored_with_an_invented_one(
+    ) -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let closed = closed_attempt(&mut store, 0, Verdict::Usable)?;
+        let mut undated = row(&store, &spec(STORY))?;
+        undated.valid = Published::Unknown;
+        let refused = store.record(closed, &[undated], at(5));
+        assert!(
+            matches!(refused, Err(StoreError::ItemHasNoPublicationValue { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(count(&store, "items")?, 0);
+        Ok(())
+    }
+
     /// A1.12: the stored column and the digested value must be the same number, or two
     /// implementations of the canonical form disagree over a row neither can be wrong about.
     #[test]
@@ -1662,7 +2066,6 @@ mod tests {
         let outcome = Outcome::decide(
             &Verdict::Usable,
             VENDOR_ROWS,
-            ITEMS_NEW,
             &Baseline::from_trailing_ok(&TRAILING_OK),
         );
         let closed = slot.close(&mut Elsewhere, outcome, &Ok(answer), at(4))?;

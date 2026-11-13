@@ -1,0 +1,225 @@
+{
+  "schema": "newsvault.ledger/1",
+  "at": "2026-07-31T00:00:00.000000Z",
+  "from": "2026-07-01",
+  "to": "2026-07-05",
+  "source": null,
+  "expected_runs": null,
+  "limit": null,
+  "days": [
+    {
+      "run_date": "2026-07-01",
+      "runs_expected": 6,
+      "runs_observed": 3,
+      "runs_shortfall": 3,
+      "runs_over_expected": 0,
+      "runs_unfinished": [
+        "run-0701-1230"
+      ],
+      "per_source": [
+        {
+          "source": "edgar_press",
+          "attempts": 4,
+          "ok": 2,
+          "empty": 0,
+          "failed": 0,
+          "interrupted": 0,
+          "in_flight": 2,
+          "opened_without_answered": [
+            "a-0701-edgar-2"
+          ],
+          "answered_without_finalised": [
+            "a-0701-edgar-3"
+          ],
+          "vendor_rows": 120,
+          "items_new": 3,
+          "rows_committed": 3
+        },
+        {
+          "source": "polygon",
+          "attempts": 1,
+          "ok": 1,
+          "empty": 0,
+          "failed": 0,
+          "interrupted": 0,
+          "in_flight": 0,
+          "opened_without_answered": [],
+          "answered_without_finalised": [],
+          "vendor_rows": 12,
+          "items_new": 1,
+          "rows_committed": 1
+        }
+      ]
+    },
+    {
+      "run_date": "2026-07-02",
+      "runs_expected": 1,
+      "runs_observed": 2,
+      "runs_shortfall": 0,
+      "runs_over_expected": 1,
+      "runs_unfinished": [],
+      "per_source": [
+        {
+          "source": "edgar_press",
+          "attempts": 1,
+          "ok": 0,
+          "empty": 1,
+          "failed": 0,
+          "interrupted": 0,
+          "in_flight": 0,
+          "opened_without_answered": [],
+          "answered_without_finalised": [],
+          "vendor_rows": 0,
+          "items_new": 0,
+          "rows_committed": 0
+        },
+        {
+          "source": "polygon",
+          "attempts": 1,
+          "ok": 0,
+          "empty": 1,
+          "failed": 0,
+          "interrupted": 0,
+          "in_flight": 0,
+          "opened_without_answered": [],
+          "answered_without_finalised": [],
+          "vendor_rows": 0,
+          "items_new": 0,
+          "rows_committed": 0
+        }
+      ]
+    },
+    {
+      "run_date": "2026-07-03",
+      "runs_expected": 1,
+      "runs_observed": 1,
+      "runs_shortfall": 0,
+      "runs_over_expected": 0,
+      "runs_unfinished": [],
+      "per_source": [
+        {
+          "source": "edgar_press",
+          "attempts": 2,
+          "ok": 0,
+          "empty": 0,
+          "failed": 1,
+          "interrupted": 1,
+          "in_flight": 0,
+          "opened_without_answered": [],
+          "answered_without_finalised": [],
+          "vendor_rows": 0,
+          "items_new": 0,
+          "rows_committed": 0
+        },
+        {
+          "source": "polygon",
+          "attempts": 1,
+          "ok": 0,
+          "empty": 0,
+          "failed": 1,
+          "interrupted": 0,
+          "in_flight": 0,
+          "opened_without_answered": [],
+          "answered_without_finalised": [],
+          "vendor_rows": 0,
+          "items_new": 0,
+          "rows_committed": 0
+        }
+      ]
+    },
+    {
+      "run_date": "2026-07-04",
+      "runs_expected": 1,
+      "runs_observed": 1,
+      "runs_shortfall": 0,
+      "runs_over_expected": 0,
+      "runs_unfinished": [],
+      "per_source": [
+        {
+          "source": "edgar_press",
+          "attempts": 1,
+          "ok": 1,
+          "empty": 0,
+          "failed": 0,
+          "interrupted": 0,
+          "in_flight": 0,
+          "opened_without_answered": [],
+          "answered_without_finalised": [],
+          "vendor_rows": 59,
+          "items_new": 0,
+          "rows_committed": 0
+        }
+      ]
+    },
+    {
+      "run_date": "2026-07-05",
+      "runs_expected": 1,
+      "runs_observed": 1,
+      "runs_shortfall": 0,
+      "runs_over_expected": 0,
+      "runs_unfinished": [],
+      "per_source": [
+        {
+          "source": "edgar_press",
+          "attempts": 1,
+          "ok": 1,
+          "empty": 0,
+          "failed": 0,
+          "interrupted": 0,
+          "in_flight": 0,
+          "opened_without_answered": [],
+          "answered_without_finalised": [],
+          "vendor_rows": 5,
+          "items_new": 1,
+          "rows_committed": 1
+        }
+      ]
+    }
+  ],
+  "result_digest_drift": [
+    {
+      "source": "edgar_press",
+      "target_window": "2026-07-01",
+      "distinct": 2,
+      "attempts": [
+        {
+          "attempt_id": "a-0701-edgar-0",
+          "result_digest": "e634e6f6d420f7f9b13d6de957989d2acbc7bf041637c366eb066064cb3ccc6c"
+        },
+        {
+          "attempt_id": "a-0701-edgar-1",
+          "result_digest": "edab74c15466efba273e3663b16653b1bc3ebf329d22e4eedb2700c26748e51e"
+        }
+      ]
+    }
+  ],
+  "unreadable_runs": [],
+  "attempts_without_a_run_envelope": [],
+  "unpublished_seq_ranges": [
+    {
+      "seq_lo": 1,
+      "seq_hi": 5
+    },
+    {
+      "seq_lo": 7,
+      "seq_hi": 10
+    }
+  ],
+  "freshness": {
+    "asking_clock": {
+      "newest": "2026-07-30T13:00:00.000000Z",
+      "age_seconds": 39600
+    },
+    "publication_clock": {
+      "newest": "2026-07-30T12:30:00.000000Z",
+      "age_seconds": 41400
+    }
+  },
+  "matched": 8,
+  "returned": 8,
+  "truncated": false,
+  "check": {
+    "asked": false,
+    "findings": []
+  }
+}
