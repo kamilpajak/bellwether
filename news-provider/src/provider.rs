@@ -132,6 +132,12 @@ pub struct CollectedItem {
     pub valid_field: String,
     pub valid_source: ValidSource,
     pub provenance: Provenance,
+    /// Where this item's own publication and the probed lag put its observation:
+    /// [`pit::Visibility::from_backfill`]'s answer and nothing else. `None` for a live ingest,
+    /// whose observation is the instant the fetch returned. A `vendor_archive` row carrying `None`
+    /// is REFUSED by the store rather than falling back to that instant, which would date an
+    /// archived item as though we had read it the moment it was published - §8 row R11's point.
+    pub observed: Option<ObservationTime>,
     pub body: Option<ExtractedBody>,
 }
 

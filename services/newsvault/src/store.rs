@@ -224,6 +224,12 @@ pub enum StoreError {
     /// than inventing a value for the column the schema requires.
     #[error("item {item} offers no publication value, so it cannot be stored as an item")]
     ItemHasNoPublicationValue { item: String },
+    /// A `vendor_archive` item whose observation the provider could not place. The fetch instant
+    /// is the wrong answer and the only other one available, so the row is refused: dating an
+    /// archived item by when WE read it claims we knew it the moment it was published, which is
+    /// the leak §8 row R11 exists to refuse.
+    #[error("item {item} is a vendor archive row with no observation the probed lag could place")]
+    ArchiveItemHasNoObservation { item: String },
     /// A replay must be a no-op, which it can only be when it is the SAME claim: a second
     /// `record` of one attempt carrying a different item set is a different claim and was
     /// accepted silently, returning `changed: false` and filing nothing - found by review

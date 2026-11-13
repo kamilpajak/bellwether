@@ -258,6 +258,9 @@ mod tests {
                 valid_field: "none".to_owned(),
                 valid_source: ValidSource::OurExtraction,
                 provenance: Provenance::LiveIngest,
+                // A live ingest observes at the fetch instant the driver holds, so the item
+                // carries none of its own.
+                observed: None,
                 body: None,
             }
         }

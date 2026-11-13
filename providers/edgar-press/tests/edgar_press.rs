@@ -32,6 +32,8 @@ const NOT_A_WINDOW: &str = "2026-QTR4";
 const AN_INVERTED_WINDOW: &str = "2026-11-12..2026-11-09";
 /// 16:32:15 New York on 2026-11-10, which is 21:32:15Z: an instant, not a fabricated midnight.
 const APPLE_ACCEPTED_AT: &str = "2026-11-10T21:32:15Z";
+/// `APPLE_ACCEPTED_AT` plus the 7,200 s `probed()` stands behind.
+const APPLE_OBSERVED_AT: &str = "2026-11-10T23:32:15Z";
 const APPLE_ACCESSION: &str = "0000320193-26-000071";
 /// The acceptance field as the filing header spells it, kept as `valid_raw` so a replay re-parses
 /// the value rather than trusting the stored instant.
@@ -170,6 +172,18 @@ fn verdict(
     Ok(provider.classify(request, &answer))
 }
 
+/// A document request inside a window the run reads AFTER the fact, which is the arm that needs a
+/// lag. The day is `AN_ARCHIVED_SESSION` and the run instant is `RUN_AT`.
+fn archived_document_request(provider: &EdgarPress) -> Result<Request, Box<dyn std::error::Error>> {
+    let index = index_request(provider, AN_ARCHIVED_SESSION)?;
+    let extracted = provider.extract(&index, &blob("form.20261110.idx"));
+    extracted
+        .follow_ups
+        .first()
+        .cloned()
+        .ok_or_else(|| "the fixture index yielded no follow-up".to_string().into())
+}
+
 fn document_request(
     provider: &EdgarPress,
     day: &str,
@@ -292,6 +306,35 @@ fn a_window_that_is_not_a_day_or_a_range_is_refused_rather_than_planned_as_nothi
     assert_eq!(
         refused.err(),
         Some(PlanRefusal::TargetWindowUnreadable(NOT_A_WINDOW.to_owned()))
+    );
+    Ok(())
+}
+
+/// §8 row R11's other half. The lag opened the gate on 2026-11-13 and nothing used it: every stored
+/// row still took its observation from the fetch clock, which dates an archived filing as though we
+/// had read it the moment it was published. `from_backfill` had no caller anywhere in the tree.
+#[test]
+fn a_backfilled_item_observes_at_its_publication_plus_the_probed_lag_and_not_at_the_fetch(
+) -> Outcome {
+    let provider = probed()?;
+    let request = archived_document_request(&provider)?;
+    let item = only_item(&provider.extract(&request, &blob("filing_8k_apple.txt")))?;
+    assert_eq!(item.provenance, Provenance::VendorArchive);
+    // The Apple fixture is accepted at 21:32:15Z and the probed lag is 7,200 s.
+    assert_eq!(item.observed, Some(at(APPLE_OBSERVED_AT)));
+    Ok(())
+}
+
+/// A live ingest carries none of its own: the driver's fetch instant is the observation, and an
+/// item that placed one would be overriding the only clock that knows when we read it.
+#[test]
+fn a_live_ingest_item_places_no_observation_of_its_own() -> Outcome {
+    let provider = probed()?;
+    let request = document_request(&provider, A_LISTED_SESSION)?;
+    let item = only_item(&provider.extract(&request, &blob("filing_8k_apple.txt")))?;
+    assert_eq!(
+        (item.provenance, item.observed),
+        (Provenance::LiveIngest, None)
     );
     Ok(())
 }

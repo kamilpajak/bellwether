@@ -531,6 +531,18 @@ impl Committer {
                     item: item.source_item_id.clone(),
                 });
             };
+            // A live ingest observes when the fetch returned; a vendor archive observes where its
+            // own publication plus the probed lag put it, which only the provider can compute
+            // because only the provider holds the lag. Never a fallback between the two.
+            let observed = match (item.provenance, item.observed) {
+                (_, Some(placed)) => placed,
+                (Provenance::VendorArchive, None) => {
+                    return Err(StoreError::ArchiveItemHasNoObservation {
+                        item: item.source_item_id.clone(),
+                    })
+                }
+                (_, None) => observed,
+            };
             rows.push(ItemRow {
                 item_id: named(
                     item,
@@ -565,4 +577,96 @@ fn named(
         item: item.source_item_id.clone(),
         why: why.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Committer, Provenance, StoreError};
+    use news_provider::provider::CollectedItem;
+    use news_provider::{RunId, SourceId, ValidSource};
+    use pit::datedness::Published;
+    use pit::{ObservationTime, ValidTime};
+    use tempfile::TempDir;
+
+    const RUN: &str = "a-run";
+    const SOURCE: &str = "edgar_press";
+    const ITEM: &str = "0000320193-26-000071";
+    const PUBLISHED_AT: i64 = 1_762_810_335;
+    const FETCHED_AT: i64 = 1_763_000_000;
+
+    fn instant(seconds: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(seconds, 0).unwrap_or(chrono::DateTime::UNIX_EPOCH)
+    }
+
+    fn archived(observed: Option<ObservationTime>) -> CollectedItem {
+        CollectedItem {
+            source: SourceId::new(SOURCE),
+            source_item_id: ITEM.to_owned(),
+            url: "https://example.test/a".to_owned(),
+            canonical_url: "/a".to_owned(),
+            title: "A filing".to_owned(),
+            valid: Published::At(ValidTime::new(instant(PUBLISHED_AT))),
+            valid_raw: String::new(),
+            valid_field: "none".to_owned(),
+            valid_source: ValidSource::VendorPublished,
+            provenance: Provenance::VendorArchive,
+            observed,
+            body: None,
+        }
+    }
+
+    /// The store never fills a missing archive observation in from the fetch clock. Unreachable
+    /// through `edgar-press`, whose `plan` refuses an archive window with no probed lag before any
+    /// request exists - so this is the gate for the NEXT provider, exercised here through the one
+    /// path that can reach it.
+    #[test]
+    fn an_archive_row_with_no_placed_observation_is_refused_rather_than_dated_by_the_fetch() {
+        let temp = match TempDir::new() {
+            Ok(temp) => temp,
+            Err(why) => {
+                assert_eq!(why.to_string(), "a temporary directory");
+                return;
+            }
+        };
+        let Ok(store) = Committer::open(temp.path(), &RunId::new(RUN)) else {
+            assert_eq!(temp.path().display().to_string(), "an opened store");
+            return;
+        };
+        let Ok(raw) = Committer::put_blob(&store, b"payload") else {
+            assert_eq!(temp.path().display().to_string(), "a stored blob");
+            return;
+        };
+        let refused = store.rows_of(
+            &[archived(None)],
+            Some(raw.hex()),
+            ObservationTime::new(instant(FETCHED_AT)),
+        );
+        assert!(
+            matches!(refused, Err(StoreError::ArchiveItemHasNoObservation { .. })),
+            "{refused:?}"
+        );
+    }
+
+    /// The other direction: a placed observation is the one stored, and the fetch instant handed
+    /// alongside it is ignored.
+    #[test]
+    fn a_placed_archive_observation_is_the_one_stored_and_not_the_fetch_instant() {
+        let Ok(temp) = TempDir::new() else { return };
+        let Ok(store) = Committer::open(temp.path(), &RunId::new(RUN)) else {
+            return;
+        };
+        let Ok(raw) = Committer::put_blob(&store, b"payload") else {
+            return;
+        };
+        let placed = ObservationTime::new(instant(PUBLISHED_AT + 7_200));
+        let rows = store.rows_of(
+            &[archived(Some(placed))],
+            Some(raw.hex()),
+            ObservationTime::new(instant(FETCHED_AT)),
+        );
+        match rows {
+            Ok(rows) => assert_eq!(rows.first().map(|row| row.observed), Some(placed)),
+            Err(why) => assert_eq!(why.to_string(), "rows"),
+        }
+    }
 }
