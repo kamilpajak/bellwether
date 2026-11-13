@@ -44,6 +44,16 @@ impl Exchange for Wire {
     }
 }
 
+/// How many times a request whose fetch failed TRANSIENTLY (HTTP 503 or a transport/connection
+/// error) is re-queued before the run gives up and lets the residual gap stand. A MECHANISM cap,
+/// not a rate read off the measured ~8% transient-loss figure: its only job is to keep one
+/// persistently failing accession from stalling the run, and whatever still fails after it is a
+/// coverage gap the `vendor_archive` convergence (§8 row R20) or the next day closes. The value is
+/// a bound on the work spent per request, never a threshold tuned to an observed failure rate, so
+/// it is not derived from any run's loss count. A permanent failure (4xx, `vendor_refused`) is
+/// never re-queued whatever this is.
+pub const MAX_TRANSIENT_RETRIES: u32 = 2;
+
 /// What the archive refused, and which act asked. The act is what the exit table reads: a refused
 /// commit is `commit_failed` and a refused read is not.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
@@ -373,16 +383,53 @@ pub fn collect<A: Archive>(
         run: run.run,
         baseline: &baseline,
     };
-    let mut queue: VecDeque<Request> = plan.requests.into_iter().collect();
+    let mut queue: VecDeque<Queued> = plan
+        .requests
+        .into_iter()
+        .map(Queued::first_attempt)
+        .collect();
     let mut ordinal = 0;
-    while let Some(request) = queue.pop_front() {
+    while let Some(Queued { request, retries }) = queue.pop_front() {
         let attempted = attempt_once(&driving, archive, &request, ordinal)?;
         ordinal += 1;
-        collected.absorb(&attempted);
-        queue.extend(attempted.follow_ups);
+        // A transient failure under the cap is re-queued to the BACK, so the vendor's own pace
+        // limiter (`Wire::send` → `Pace::reserve`, §8 row R19) spaces the retry behind the other
+        // queued calls with no second clock and no new injected dependency: a retry's socket call
+        // is just another `attempt_once`, which cannot bypass the one send seam. A permanent
+        // failure (4xx, `vendor_refused`) is never re-queued.
+        let retrying = attempted.is_transient() && retries < MAX_TRANSIENT_RETRIES;
+        collected.absorb(&attempted, retrying);
+        queue.extend(attempted.follow_ups.into_iter().map(Queued::first_attempt));
+        if retrying {
+            queue.push_back(Queued {
+                request,
+                retries: retries + 1,
+            });
+        }
     }
     collected.per_source = vec![tally_of(&source, &collected)];
     Ok(collected)
+}
+
+/// A request waiting in the driver's queue and how many times it has already been re-attempted
+/// after a transient failure. The count rides the queue slot rather than [`Request`], because a
+/// `Request` is hashed into the ledger (`filter_params`) and a retry asks the identical question —
+/// the row must keep saying what was asked, and the fresh ordinal alone makes the retry's
+/// `attempt_id` distinct.
+struct Queued {
+    request: Request,
+    retries: u32,
+}
+
+impl Queued {
+    /// A request that has not yet been attempted. Both the plan's own requests and every follow-up
+    /// enter the queue this way; only a re-queue after a transient failure carries a non-zero count.
+    const fn first_attempt(request: Request) -> Self {
+        Self {
+            request,
+            retries: 0,
+        }
+    }
 }
 
 /// What every attempt of one run is driven with. Grouped because all five are fixed for the whole
@@ -404,6 +451,17 @@ struct Attempted {
     bytes_written: u64,
     blob_written: bool,
     committed: Committed,
+}
+
+impl Attempted {
+    /// A failed outcome the classifier did NOT call permanent: an HTTP 503 or a transport error,
+    /// which §5.1 marks retryable (`vendor_unreachable`). The only input the driver's retry
+    /// decision reads, derived from the fields already here rather than a new classifier: a
+    /// permanent 4xx or `vendor_refused` is `Failed` with `permanent`, and `Ok`/`Empty` are not
+    /// failures at all.
+    const fn is_transient(&self) -> bool {
+        matches!(self.kind, OutcomeKind::Failed) && !self.permanent
+    }
 }
 
 fn attempt_once<A: Archive>(
@@ -539,14 +597,23 @@ fn sweep<A: Archive>(
 }
 
 impl Collected {
-    fn absorb(&mut self, attempted: &Attempted) {
-        match attempted.kind {
-            OutcomeKind::Ok => self.tally.ok += 1,
-            OutcomeKind::Empty => self.tally.empty += 1,
-            OutcomeKind::Failed if attempted.permanent => self.tally.permanent += 1,
-            OutcomeKind::Failed => self.tally.transient += 1,
-            // The sweep's attempts are counted where they are closed, not here.
-            OutcomeKind::Interrupted => {}
+    /// `retrying` is true when the driver is about to re-queue this attempt after a transient
+    /// failure. Its outcome is then NOT counted toward the exit tally's buckets, because the
+    /// request's final disposition is still pending: a transient failure that a later retry turns
+    /// into a commit must leave the day complete (exit 0), and only a RESIDUAL transient — the
+    /// last attempt, not re-queued — counts as incomplete (exit 7/8), unchanged from before. The
+    /// attempt ROW and its stored evidence are recorded either way: "we looked and failed" is true
+    /// of the attempt whatever the retry does (R4).
+    fn absorb(&mut self, attempted: &Attempted, retrying: bool) {
+        if !retrying {
+            match attempted.kind {
+                OutcomeKind::Ok => self.tally.ok += 1,
+                OutcomeKind::Empty => self.tally.empty += 1,
+                OutcomeKind::Failed if attempted.permanent => self.tally.permanent += 1,
+                OutcomeKind::Failed => self.tally.transient += 1,
+                // The sweep's attempts are counted where they are closed, not here.
+                OutcomeKind::Interrupted => {}
+            }
         }
         self.tally.committed += attempted.committed.items_committed;
         self.tally.commit_refused += u32::from(attempted.row.commit_refused.is_some());
