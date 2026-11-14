@@ -321,9 +321,8 @@ Event-driven must not become incremental state. The four rules:
    salient at 10:00 and not at 16:00. Without an explicit `T` the treatment value does not exist,
    and a result could be moved after the fact by choosing an hour.
 
-**Transport: a Postgres outbox with `LISTEN`/`NOTIFY`.** Postgres already runs in production. The
-outbox in the same transaction as the write gives rule 2 atomically, and the outbox table *is* the
-replay log. Kafka solves a throughput problem we do not have: 300–700 items/day is one event every
+**Transport: an outbox table in the archive's own SQLite file, polled by cursor** (architecture §6,
+decided 2026-11-14). Kafka solves a throughput problem we do not have: 300–700 items/day is one event every
 two to five minutes.
 
 **Two consequences to price, not assume away.** Per-item model calls would be 300–700/day instead
@@ -590,7 +589,7 @@ to pick.
 
 ## 11. What this memo does not establish
 
-- **No service contracts.** API surfaces, error codes and the outbox event payload are unspecified.
+- **No service contracts.** API surfaces and error codes are unspecified; the outbox payload is architecture §6.
   "High-level architecture" one level down is missing.
 - **No numbers for N1–N5**, including the backup for an archive the design calls irreplaceable. N5 has one rough datum: a full panel rebuild over 87 lake partitions completed in minutes rather than hours, timed by wall clock only, so the order is measured and the number is not. N4 (retention) is now partly answered by D-2: the archive holds full text, so the question is how long and on what medium, not whether.
 - **No architecture gates.** 22 tests currently enforce repo-wide rules (layer imports, per-vendor

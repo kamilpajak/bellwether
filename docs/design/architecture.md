@@ -501,7 +501,7 @@ not exist.
 ```
 vendor  --poll/stream-->  vault: write  --same transaction-->  outbox
                                                                   |
-                                                            NOTIFY / stream
+                                                       cursor poll / stream
                                                                   v
                                                         derive: compute over a CLOSED window
 ```
@@ -518,9 +518,23 @@ Four rules, from the memo, restated here because the contracts depend on them:
    computed from a partial day differs from the same threshold at the close, so every downstream
    claim names its `T`.
 
-Transport is a Postgres outbox with `LISTEN`/`NOTIFY`. The outbox table in the same transaction as
-the write gives rule 2 atomically and *is* the replay log. A broker would solve a throughput problem
-this system does not have: at a few hundred items a day, one event arrives every few minutes.
+Transport, decided by the owner 2026-11-14 (no code yet; §11 build step 9):
+- An `outbox` table inside `commit.sqlite3`, written inside `Committer::record`'s transaction. Rule 2
+  is then one SQLite transaction. An outbox in any other database would be a dual write.
+- One row per closed attempt, including zero-item attempts: `event_seq`, `attempt_id`, `seq_lo`/`seq_hi`
+  (a pointer into `items.seq`, never a copy), `items_new`. The table is the replay log.
+- Consumers keep their own cursor, outside `commit.sqlite3`, and poll `event_seq > cursor` every 5 s.
+  No push: a late wake costs latency, not data (rule 2).
+- The store switches to WAL, so a long-lived reader never blocks a commit. SQLite is linked
+  `bundled`: the Mac had 3.54.0 and the VPS 3.45.1 (`sqlite3 --version`, 2026-11-14).
+- The writer lease stays whole-life. Narrowing it lets one run's startup sweep close another live
+  run's open attempts (`news-provider/src/collect.rs:573-588`).
+- Polling cost, measured 2026-11-14 with Python `sqlite3` on SQLite 3.53.4, laptop: 10,000
+  `PRAGMA data_version` in 33.2 ms. Order of magnitude only, not through `rusqlite`.
+- Reversed if: a second host must write the same archive; or more than 10 commits per second; or
+  p95 first-sighting-to-frame latency exceeds about one minute with the poll interval as its larger
+  part.
+- A broker would solve a throughput problem this system does not have.
 
 ---
 
@@ -588,9 +602,10 @@ does. Where a row's clauses differ, its status splits with them.
 | alternative | why not |
 |---|---|
 | eleven services, one per bounded context | each deployable is another deploy, log, contract version and place something goes quiet. The predecessor has a recorded case where a boundary between components *removed* a standing alert instead of raising one. The eleven contexts are drawn so the seams exist later. |
-| Kafka for the event bus | solves throughput we do not have — a few hundred items a day is one event every few minutes — and adds infrastructure a one-person system must then operate. A Postgres outbox is already durable and is itself the replay log. |
+| Kafka for the event bus | solves throughput we do not have — a few hundred items a day is one event every few minutes — and adds infrastructure a one-person system must then operate. An outbox table inside `commit.sqlite3` is already durable and is itself the replay log. |
+| a Postgres outbox with `LISTEN`/`NOTIFY` | rule 2 holds only inside one engine, so an outbox next to `commit.sqlite3` is a dual write, and keeping it atomic means moving the whole archive. The Postgres that "already runs in production" is the predecessor's container: no host port, holds `auth_user`, no automated backup, allowed to stop at memo step 7. `NOTIFY` is not queued for a disconnected listener, so a consumer polls by cursor anyway. Rejected 2026-11-14. |
 | Common Crawl's CC-NEWS as the archive | probed and rejected: 7 of our own 287 items for one test day, 2 of our 17 publishers crawled at all, zero tier-1 US financial outlets in 72,000 records, 4.19 TB for ten months, and no index at all, so no URL lookup and no aimed range request. |
-| **collecting the news ourselves** — publisher RSS, EDGAR, or crawling the open web — instead of buying it | **Not rejected, and not decided either; the row is here so the default is a choice rather than a silence.** The pre-registered usability bar is a median article body of 2,000 characters, because R17 matches over body text (`probes/vendor_probe/PREREGISTRATION.md`, Q3). Against it, the predecessor's own RSS path has a median body of **117** characters — short of the bar by more than an order of magnitude, so RSS alone is a snippet feed whatever it costs. Its EDGAR path clears the bar on either of the two figures the probes carry, and they disagree: `panel_recount.py` and memo §1.9 say 50,622 characters, `matcher_audit.py` says 14,039. The 14,039 one IS re-derivable today in one command through the compiled reader and no Python: `newsvault day 2026-07-01 --lake ~/thematic_news_lake --format json`, grouping body lengths by source, gives `edgar_press_release` n=103 median 14,039 characters (and `rss` n=103 median 120, `polygon` n=76 median 426, `perplexity` n=5 median 235), re-derived 2026-11-12. It is one day's median and therefore provisional. The 50,622 one is not re-derivable: `panel_recount.py` dies on an uninstallable import (`probes/README.md`). So "in-house" has to name its sources before it can be costed: EDGAR-only, RSS and crawling the open web have different bodies, different volumes and different costs, and CC-NEWS in the row above is the cheap version of the third. This row does **not** pick — build-or-buy is the owner's, open alongside D-1. |
+| **collecting the news ourselves** — publisher RSS, EDGAR, or crawling the open web — instead of buying it | **Chosen by the owner 2026-11-14 for the forward feed** (§11); history stays a one-time vendor purchase (`probes/vendor_probe/PREREGISTRATION.md`). The pre-registered usability bar is a median article body of 2,000 characters, because R17 matches over body text (`probes/vendor_probe/PREREGISTRATION.md`, Q3). Against it, the predecessor's own RSS path has a median body of **117** characters — short of the bar by more than an order of magnitude, so RSS alone is a snippet feed whatever it costs. Its EDGAR path clears the bar on either of the two figures the probes carry, and they disagree: `panel_recount.py` and memo §1.9 say 50,622 characters, `matcher_audit.py` says 14,039. The 14,039 one IS re-derivable today in one command through the compiled reader and no Python: `newsvault day 2026-07-01 --lake ~/thematic_news_lake --format json`, grouping body lengths by source, gives `edgar_press_release` n=103 median 14,039 characters (and `rss` n=103 median 120, `polygon` n=76 median 426, `perplexity` n=5 median 235), re-derived 2026-11-12. It is one day's median and therefore provisional. The 50,622 one is not re-derivable: `panel_recount.py` dies on an uninstallable import (`probes/README.md`). So "in-house" has to name its sources before it can be costed: EDGAR-only, RSS and crawling the open web have different bodies, different volumes and different costs, and CC-NEWS in the row above is the cheap version of the third. The forward feed therefore fetches article pages, not RSS snippets: on 2026-11-14, 11 article pages over 6 hosts gave 2,281 to 28,038 characters each (§11). |
 | a single news vendor for both the live stream and the archive | no vendor reviewed does both: the one with a 2014 archive filters on publication date only, and the one documenting an index-time filter has it behind a quoted Enterprise plan. So provenance labelling is necessary rather than avoidable. |
 | incremental salience, updated per event | makes the result depend on arrival order, which destroys the determinism the panel contract is built on |
 | the statistics tier as a separate repository | the panel handover is where the worst measured error happened, and a test can only span it from inside one tree |
@@ -802,3 +817,105 @@ the world's news, so a different vendor moves them: provisional on D-1, to be re
 first real vendor. The publication gap transfers where an observation gap would not, the
 predecessor's `ingested_at` spacing being its scheduler rather than the news. The record also holds
 outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.6-hour gap is one.
+
+---
+
+## 11. `open-web-feed` — the own forward news feed (decided 2026-11-14, no code yet)
+
+Two layers. **POC** is what gets built first; each line is an owner decision of 2026-11-14.
+**Target** is the shape the crate grows into; nothing in it is built or gated yet. Probe numbers
+(Saturday 2026-11-14, one request per verdict) are in the session's probe reports, not here; the
+weekday re-probe replaces them.
+
+### 11.1 Fixed in both layers
+
+- Crate `providers/open-web-feed/`, top-level `[lints] workspace = true`. No clock, no HTTP client.
+- Two SourceIds: `open-web-wires`, `open-web-outlets`. Live only: `plan` refuses any target that is
+  not the run's UTC day, before any request. No `VendorArchive` request can exist.
+- Index = dated news sitemap or RSS. Document = one article page. Investor-relations pages: never.
+- Observation time = `Wire`'s `received_at`. A provider-set observation is refused by the store.
+- Valid time, per host: PRN and GNW RSS `pubDate`; CNBC page `article:published_time`, never its
+  sitemap (wrong offset 2 of 2, modification time 1 of 2); Yahoo = syndication time; Fool and BI
+  sitemap value. Never `lastmod`, `dateModified`, fetch time, or a date folded into midnight.
+- Bot protection (403, challenge, WAF, DataDome) = `PermanentFailure`, never retried in another
+  shape. robots.txt is respected; sites' terms of use are not a criterion (owner, 2026-11-14).
+- `item_key(url)` is the one function behind `source_item_id`; `story_of` and `document_of` both
+  call it. A page's canonical link feeds `doc_id` only.
+- Pace: `interval = max(Crawl-delay, 10 s)`; poll every 30 min in the US session, 90 min outside;
+  a host may be slowed, never sped up; worst-case busy time ≤ 50% of a day.
+- Pace tables: one hashed file per SourceId under `providers/open-web-feed/hosts/`; its digest is the
+  run's `universe_version`. The loader refuses, before any request: an interval under the rule, a
+  duplicate or invalid host, an admitted row with no ledgered robots fetch. Only admitted rows are
+  planned.
+- "Already fetched": a story is held if it has a committed item or a Document attempt closed
+  `Usable`, `Empty`, `PermanentFailure`, or with only unusable rows. Not held: `TransientFailure`,
+  `Interrupted`, in flight. New `attempts.story_id` and `attempts.held`; `ledger --check` subtracts
+  `held`. First sighting is unchanged: a skip writes no item.
+
+### 11.2 POC
+
+- Sources: GNW (`rss.globenewswire.com`, www→rss host rewrite) first; then PRN, Yahoo (wire
+  provider keys only), Fool, CNBC, BI, CNW, one PR each, as each robots fetch lands. Fed in
+  `open-web-wires`. Zero Hedge and Newswire.com deferred.
+- Robots: a separate refresh command fetches robots.txt through `Wire` under an attempt row; the
+  hosts file pins its digest. No third `RequestPhase`.
+- Redirects refused: `TransportProfile.redirects = Refuse`, a 3xx is `PermanentFailure`.
+- One interval for all hosts (all admitted hosts are 10 s); R19 hole 7 stays open.
+- `ValidPrecision::Minute` for GNW's minute-resolution `pubDate`.
+- `items` keeps the raw valid-time value, its field and its source, so the CNBC rule is checkable
+  from the archive.
+- Follow-up cap 150 per run; overflow counted as `deferred`, retried next poll. A run must finish
+  inside its poll period.
+- Permanent failures count as held (changes R16 and R20).
+- Fixtures: trimmed real pages from the 2026-11-14 probes, a few paragraphs each.
+- Outbox: the SQLite table of §6, a separate PR after the held filter.
+- Scheduler: a VPS timer outside the crate. One invocation runs both SourceIds under one lease.
+
+### 11.3 Target shape
+
+- Sources: every candidate that passes robots and a weekday probe, including Business Wire if it
+  becomes stable, Zero Hedge, Newswire.com (with a measured zone, date-only valid time), and Yahoo
+  outlet syndication under `open-web-outlets`.
+- Per-host intervals: R19 hole 7 closed (`HostPaces::Listed`), so one slow host does not slow the
+  rest.
+- Redirects followed as their own paced, ledgered requests: `RawResponse` carries headers and the
+  driver accepts Document-phase follow-ups (closes R19 hole 9).
+- Robots re-fetched on a schedule; a changed robots digest blocks the host until the hosts file is
+  updated.
+- Collectors per SourceId in parallel: requires a startup sweep that tells a live run from a dead
+  one, then a lease that covers only `reserve_seq` through COMMIT.
+- Follow-up cap and run length set from measured weekday busy time, printed in every envelope.
+- Extractor breakage visible: the `NoArticleBody` share per host is a ledger reading with a
+  threshold fixed before its first measurement.
+- The outbox feeds the private stream (D-7) and `derive`'s closed-window trigger.
+
+### 11.4 Gates the POC ships with (each turns red on the named mutation)
+
+- live index skips a held story → `collect.rs` passes an empty held set for live again.
+- a permanently failed document is not refetched → held reads `items` only.
+- a transiently failed document is refetched → held includes `TransientFailure`.
+- follow-up story equals item story, per host fixture → `document_of` keys on the canonical link.
+- a quiet all-held day passes `ledger --check` → the `held` subtraction is removed.
+- a target other than the run day is refused before any request → the day check is removed.
+- only admitted hosts are planned → the status filter is removed.
+- a hosts row faster than its Crawl-delay is refused → the floor check is removed.
+- an admitted row without a ledgered robots fetch is refused → the lookup is removed.
+- a redirect is a permanent failure, not followed → `max_redirects(0)` is removed.
+- CNBC valid time is the page meta → the sitemap value is used.
+- a bot-protection page is permanent → 403 is classified transient.
+- a Yahoo row outside the wire list is filtered out → exact match becomes substring match.
+- the extracted body is article text, per host → the selector widens to `<body>`.
+- no provider source file holds a sink → a sink is added outside `lib.rs`.
+
+### 11.5 Build order (each PR passes the gate alone)
+
+1. Crate skeleton, hosts and rules loaders with refusals, trimmed fixtures.
+2. Robots refresh command; loader checks the pinned digest.
+3. GNW index parser and valid time, per-(day, host) conformance, provider enum in `cmd_collect`,
+   `--window today`, end-to-end test.
+4. Redirect refusal and 3xx classification, with a stub server.
+5. Document parsers, `NoArticleBody`, `Provider::story_of`, the `item_key` gate.
+6. Held filter, ledger check; amend R16 and R20.
+7. Admit hosts, one PR each.
+8. VPS timer, follow-up cap, busy seconds in the envelope.
+9. Outbox, WAL, consumer cursor.
