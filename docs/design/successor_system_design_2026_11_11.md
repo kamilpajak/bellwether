@@ -311,17 +311,17 @@ Event-driven must not become incremental state. The four rules:
    learn.
 2. **Write, then emit, in one transaction.** The archive is the source of truth; the event is a
    notification that it grew. A lost event then costs latency, not data.
-3. **The periodic sweep stays** (every scheduled poll, architecture §11.1), as a backstop. Event-driven *plus* periodic, not instead of. A
-   silently dead consumer looks exactly like a quiet news day — the failure §1.4's ledger gap
-   already produced once.
+3. **The periodic sweep stays** (every scheduled poll, architecture §11.2), as a backstop.
+   Event-driven *plus* periodic, not instead of. A silently dead consumer looks exactly like a
+   quiet news day — the failure §1.4's ledger gap already produced once.
 4. **Salience is a function of a cutoff, not of a day:** `salient(core, T)`. The rolling threshold
    computed from a partial day differs from the same threshold at the close, so a company can be
    salient at 10:00 and not at 16:00. Without an explicit `T` the treatment value does not exist,
    and a result could be moved after the fact by choosing an hour.
 
 **Transport: an outbox table in the archive's own SQLite file, polled by cursor** (architecture §6,
-decided 2026-11-14). Kafka solves a throughput problem we do not have: 300–700 items/day is one event every
-two to five minutes.
+decided 2026-11-14). Kafka solves a throughput problem we do not have: 300–700 items/day is one
+event every two to five minutes.
 
 **Two consequences to price, not assume away.** Per-item model calls would be 300–700/day instead
 of one batch, so windowing and debounce live *inside* `modelgate` with the cost cap doing real
@@ -577,7 +577,7 @@ to pick.
 | 1 | Point-in-time core and lake reader | Complete days instead of truncated ones | done (PR #1881) |
 | 2 | **Vendor probe on three days, two vendors** | Volume and therefore cost of a year of history; archive stability under a repeated query; whether a body is returned; the distribution of publication-to-index lag, which is the input to R11 | run 2026-11-14: the NewsAPI.ai archive route is closed (509.85 USD for 12 months after one narrowing, above the registered 300 USD limit); Webz.io waits for a one-month order (`probes/vendor_probe/PREREGISTRATION.md`) |
 | 3 | Copy of the predecessor's outputs on a second host (§5.1) | Differences from the predecessor can be explained after it stops | not done; urgent, because history is rewritten in place |
-| 4 | Event-driven ingest with outbox, coverage ledger and hourly sweep | First sighting drops from 4.5 h after the close to at most one poll period (30 min in session) after the index lists the item | build order in architecture §11.5 |
+| 4 | Event-driven ingest with outbox, coverage ledger and periodic sweep | First sighting drops from 4.5 h after the close to at most one poll period plus one run after the index lists the item (architecture §11.2) | build order in architecture §11.5 |
 | 4b | Private item stream over WebSocket (D-7), on top of step 4's outbox | A second consumer, which is the only real test of whether the item contract is a contract | after step 4; schema and heartbeat designed in from the start |
 | 5 | Backfill to 246 sessions, if step 2 came out cheap | Removes six months of waiting | depends on step 2 |
 | 6 | `derive` over the days both systems cover, compared against the step-3 copy; each differing pick has a named cause | Evidence the differences are the fixes, not new defects | not designed: the cause list's format is unset (architecture §8 row H1); after step 3 |

@@ -64,6 +64,7 @@ an append-only ledger of the pairs a `derive diff` compared; whether it gates is
 | `snapshot_id` | sha256 over the canonical form of (the list of `item_id` in scope in ascending `seq`, the cutoff) | A date range is not reproducible — the archive grows under it. A snapshot is a set. The list and the cutoff are also fields of the manifest (§3.0), because neither can be read back out of a digest. |
 | `rule_version` | sha256 of the rules file (§3.3) | Rules as constants in code cannot be diffed or tested. When a hand-written gazetteer wrongly removed a real company, there was no version, no test and no record. |
 | `calendar_version` | sha256 of the session calendar, half-days and DST included. **Its own file, beside the rules file and not a group inside it** (§3.3), so a calendar edit and a rule edit are two diffs rather than one — which is what R18 needs | A half-day close is a fact that changes results and is easy to get silently wrong. |
+| `hosts_version` | sha256 of one SourceId's hosts file (§11.1) | names which hosts and paces a run was allowed to use. Kept apart from `universe_version`, which is the ticker roster. |
 | `universe_version` | sha256 of the roster the panel's tickers are drawn from, as of the snapshot's cutoff, with the delisted names either included or named as absent | **Survivorship, which the predecessor measured in both directions:** 18 tickers added retrospectively on 2026-04-19 contributed about 0.3 of an OOS α t and a PIT-95 sub-universe moved that t from 1.70 to 1.36; including delisted M&A targets flipped a train α t from +0.80 to −0.86 (`docs/inherited/paradigm_failures_postmortem.md:64` and `:67`). Without the roster as a named input a panel is reproducible and survivorship-biased at once, and `panel_id` hashes it happily. Enforcement: §8 row U1. |
 | `relation_map_version` | sha256 of the relation map `derive` reads (§4) | `has_relation` is the statistics tier's control arm and a model build sets it. Without this input a flipped control arm cannot be attributed to the build that flipped it, which `brief_id` can already do for prompts. |
 | `panel_id` | sha256 over (`snapshot_id`, `rule_version`, `calendar_version`, `universe_version`, `relation_map_version`, row set) | A panel that cannot name its inputs cannot be re-derived, and a number whose panel cannot be re-derived is an anecdote. The row set means §3.10.1's rows in canonical form, not the Arrow file's bytes. Measured 2026-11-12 over one four-row panel conforming to §3.10.1, two counterparties in its first row: arrow-rs 60.1.0 writes 2,578 bytes and pyarrow 24.0.0 writes 2,050 of the same rows, and splitting them into two record batches makes 2,634 — so the container cannot be the digest input. Those three sizes hold for that panel's own strings and metadata and no fixture is committed, so a reader measuring a four-row panel of their own reproduces the **disagreement** and not the sizes: pyarrow 24.0.0 over one built to this table on 2026-11-12 gives 2,202 in one batch against 2,786 in two. The disagreement is the claim. |
@@ -512,7 +513,8 @@ Four rules, from the memo, restated here because the contracts depend on them:
    a closed window. Incremental salience would make results depend on arrival order.
 2. **Write, then emit, in one transaction.** The archive is the source of truth; the event says it
    grew.
-3. **The periodic sweep stays** (every scheduled poll, at most 90 min apart, §11.1), as a backstop and as the thing that fills the coverage ledger even
+3. **The periodic sweep stays** (every scheduled poll, at most 90 min apart, §11.2), as a
+   backstop and as the thing that fills the coverage ledger even
    when no event fires.
 4. **Salience is a function of a cutoff, not of a day**: `salient(core, T)`. A rolling threshold
    computed from a partial day differs from the same threshold at the close, so every downstream
@@ -523,15 +525,18 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
   Rule 2 is then one SQLite transaction. An outbox in another database would be a dual write.
 - One row per closed attempt, zero-item attempts included: `event_seq`, `attempt_id`,
   `seq_lo`/`seq_hi` (a pointer into `items.seq`, never a copy), `items_new`. It is the replay log.
-- One poller inside `vault` is the outbox's only reader. It keeps its cursor outside
-  `commit.sqlite3`, polls `event_seq > cursor` every 5 s, wakes `derive` and feeds the stream
-  (§3.7). No other service opens `commit.sqlite3`; `derive` still reads a snapshot file (§4).
+- The outbox's only reader is one poller inside `vault`: `newsvault events --after <cursor>`.
+- The poller keeps its cursor outside `commit.sqlite3` and polls `event_seq > cursor` every 5 s.
+- It wakes `derive` and feeds the stream (§3.7).
+- No other service opens `commit.sqlite3`. `derive` still reads a snapshot file (§4).
 - Nothing pushes. A late poll delays an event and never loses it (rule 2).
-- At step 8 the store switches to WAL, so a long-lived reader never blocks a commit, and SQLite is
-  linked `bundled`, which replaces the note at `services/newsvault/Cargo.toml:20` and adds a C
-  compile to CI. Versions seen 2026-11-14 (`sqlite3 --version`): Mac 3.54.0, VPS 3.45.1.
-- WAL: the N1 second copy must use `.backup` or `VACUUM INTO`; a file copy loses commits still in
-  `-wal`. A read-only open of a WAL store works (checked 2026-11-14).
+- At §11.5 step 8 the store switches to WAL, so a long-lived reader never blocks a commit.
+- At the same step SQLite is linked `bundled`. This replaces the note at
+  `services/newsvault/Cargo.toml:20` and adds a C compile to CI.
+- Versions seen 2026-11-14 (`sqlite3 --version`): Mac 3.54.0, VPS 3.45.1.
+- WAL changes how N1's second copy is taken (§10, N1).
+- A read-only open of a WAL store works: checked 2026-11-14 by a reviewer with Python `sqlite3` on
+  SQLite 3.53.4, folder writable and read-only.
 - The writer lease stays whole-life until the startup sweep can tell a live run from a dead one
   (§11.3). Narrowing it earlier lets one run's sweep close another live run's open attempts
   (`news_provider::collect::sweep`; `attempts_in_flight` has no run filter).
@@ -593,7 +598,7 @@ does. Where a row's clauses differ, its status splits with them.
 | R17 | matching survives a broad corpus, over article body | two clauses. **The body half has a producer and a gate since 2026-11-13:** `edgar-press::EdgarPress::extract` returns `ExtractedBody` holding article text, built by dropping the elements the hashed rules name, stripping tags, applying the rules' entity table and collapsing whitespace, and `the_extracted_body_is_article_text_and_never_page_html_or_a_script_payload` asserts the `<script>` data layer of a committed filing fixture does not reach it. Two mutations that day, each turning that test red: skipping the `drop_elements` pass, which lets the data layer read as prose, and turning the tag strip off. The rules file is hashed, and the identity claim is narrower than it was written: `extract_rules_version` is NOT an `item_id` input, so a rules edit reaches the identity only through the bytes it changes - one byte removed from `drop_elements` moves the body and the `item_id`, while a key the extractor does not read moves the version and leaves every `item_id` identical, which is the pair of tests named after both halves. **The corpus half has no enforcement point:** two committed fixtures are not a corpus, their median extracted body is 212 characters, and the one real figure for this source is 14,039 characters over n=103 (§9). The gazetteer regression case is `derive`'s and `derive` has no code | **body text enforced for one provider; the broad corpus is design** |
 | R18 | two rule versions, one snapshot, a diff | a `derive diff` subcommand; its absence is the gap | design |
 | R19 | **a vendor is called no faster than its stated budget, counted against the bucket the vendor counts it against** | **New row 2026-11-13. Nothing in this table covered the call RATE before it:** R4 covers that a call has a ledger row and R5 that its failure is handled, and a grep of this section for `pace`, `quota`, `req/s`, `budget` and `throttl` matched only the word `workspace`. What the row claims is two things. **The budget has a producer and a scope.** `TransportProfile` carries a `RequestBudget` of a per-IP `min_interval` and, since 2026-11-14, an optional `per_host` interval; the provider states it beside the timeouts, and `providers/edgar-press` states 100 ms for both — 1 s / 10 requests, SEC's fair-access ceiling per IP as the predecessor's vendor-quota table states it (read 2026-11-13 from `apps/alphalens-pipeline/CLAUDE.md`). That ceiling is **not measured here** and the interval paces TO it with no margin under it. `BudgetScope` names the bucket one pace file counts and has two variants. `PerIp(source)`, because the caller names itself in the User-Agent and that does not scope the quota. `PerHost(HostKey)`, keyed on the request url's host and NOT on the source, for an open-web feed whose outlets each ask their own crawl delay. The host comes from `ureq::http::Uri`. `HostKey::new` is the only way to build the key: it lowercases, then refuses anything empty, with a leading dot, with an empty label or with a byte outside `[a-z0-9.-]` as `BudgetError::NotAHostKey`, so no key names a file outside `pace/` (an IPv6 literal keeps its brackets and is refused too). A url that parses with no host is refused as `BudgetError::NoHost` before any wait, never left unpaced. A url that does not parse skips the host wait: ureq 3.5.2 parses with the same `http::Uri` and fails before any socket, so it is a `Transport` failure its own attempt row records and the run goes on. The per-IP file is per SOURCE, and whether it should instead be keyed on our address alone is an open question for the owner. **What reaches `PerHost` in production is `edgar-press`'s declaration for `www.sec.gov`**, through `newsvault collect` → `Wire::new`, the only production `Wire`. With one SEC source it changes no wait — both files then advance in step — and it is declared for the bucket it adds: the per-IP file is per SOURCE, so a second SEC source would hold a second per-IP bucket, while the host file is one for both. The per-CREDENTIAL arm, where the bucket follows the key across hosts and a second key is a second bucket, is named in the type's own doc rather than written, since a variant nothing produces is a branch nothing reaches. **The wait happens before the socket and is coordinated through a FILE.** `Wire::send` is the only socket in the workspace (R4's call clause), and it reserves a slot through `Pace::reserve` using the `&dyn Clock` it already takes, then hands the answer to an injected `Sleeper` — unconditionally, so there is no zero-wait branch — before the first byte. The wait sits OUTSIDE the two instants, because `requested_at` is read after it, so `received_at - requested_at` is still the vendor's latency and not the latency plus our own queueing. No other module reads a clock for it, so R4's clock grep keeps the same two exemptions, and a send spends three clock reads, four when its profile states a per-host pace and its url parses. The files are `<store>/pace/<source>.per-ip` and `<store>/pace/<host>.per-host`, beside the archive the run writes and never a system directory; the per-IP file holds the next-allowed-call instant and the per-host file the instant its last slot was granted, so each caller adds its OWN `per_host` to it and a shorter interval cannot shorten a longer one; both are RFC 3339 with microseconds, which is one width for every instant, and the lock is held for the read-reserve-write only and released before the wait, so callers stack reservations instead of serialising on each other's wait. Shape taken from the predecessor's `sec_rate_coordinator.py`, written after the failure it prevents: three processes on one residential IP, each with its own in-process throttle, whose aggregate drew a traffic-threshold 403. **Five tests and six mutations, all run 2026-11-13.** With `Pace::reserve` returning zero — which is what this tree did until that day — all five go red. Reserving and not waiting (`let _unused = self.pace.reserve(..)`) turns `the_second_send_waits_where_the_first_did_not`, `the_wait_is_the_interval_less_the_time_already_elapsed` and `two_wires_sharing_one_pace_file_serialise_against_each_other` red. Sleeping the whole interval instead of the remainder turns the same three red, the first of them because the FIRST send would then wait too. Giving each `Pace` a file of its own — which is what an in-process limiter is — turns only `two_wires_sharing_one_pace_file_serialise_against_each_other` and the two tests about the file name red and leaves both single-`Wire` tests green, which is why that test exists: the two before it send twice through ONE `Wire` and an in-process field satisfies them. Resetting an unparseable pace value to `now` instead of refusing turns `a_pace_file_holding_a_value_this_crate_did_not_write_refuses_before_the_socket` red. Reserving before the credential check turns `a_send_whose_credential_is_absent_refuses_before_the_clock_is_read_at_all` red, which is the test that also asserts no pace file exists after a refusal — a call that cannot be made spends no slot. `ThreadSleeper::sleep` with an empty body turns `the_process_sleeper_actually_waits` red; every other test injects a recorder, so without that one test the production sleeper could be inert with the suite green, which is the hole `SystemClock` had on 2026-11-13. **The waiting is this crate's and not the caller's, since 2026-11-13.** While the sleeper was a `Wire::new` parameter, wiring production to one whose `sleep` is empty left `cargo clippy` and every test target at exit 0 — measured that day — so the limiter was a capability the caller granted. `new` now builds its own `ThreadSleeper` and the injecting constructor is `pub(crate)`, so outside this crate there is no constructor that does not sleep and the mutation no longer type-checks. **Both scopes apply to one call, host first, since 2026-11-14.** `Wire::send` takes the host wait and only then reads the clock again and reserves the per-IP slot, so a call waits out each pace in turn, and two calls to one host leave at least `per_host` less the per-IP wait owed after the host wait apart (hole 6), while calls to different hosts share only the per-IP pace. The rejected order was one reservation of both before either wait: the per-IP file holds one next-allowed instant, so an IP slot reserved before a long host wait is either spent unused — and two calls can then leave inside one interval — or, reserved at the host's instant, puts every other host's call behind that wait. **Fourteen tests and fifteen mutations, run 2026-11-14.** Deleting the host wait turns nine of the ten per-host tests in `wire.rs` red, all but the unparseable-url one, which no host wait reaches. The order is killed by `the_ip_slot_is_reserved_after_the_host_wait_and_not_before_it` alone, which runs on a clock its own waits advance: reserving the host slot, then the IP slot, then sleeping both waits — the honest form of the rejected order — reserves the IP slot at the pre-wait 60 ms instant, owes 40 ms there and leaves `13:00:00.2` in the per-IP file instead of `13:00:01.1`. On the scripted `StepClock` the same mutation left all 52 tests green, measured that day, because a scripted read answers the same whatever came before it; a plain swap of the two lines turns the same nine red, through that misalignment as much as the order. Swallowing an unreadable per-host pace file (`reserve(..)?` to `unwrap_or_default()`) turns `a_host_pace_file_holding_a_value_this_crate_did_not_write_refuses_before_any_wait` red. Keying the host file under the source turns `two_sources_asking_one_host_share_its_pace`, `one_host_spelled_in_two_cases_is_one_bucket_under_its_lowercase_name` and that unreadable-file test red. Dropping the lowercasing in `HostKey::new` turns `a_host_key_in_upper_case_is_normalised_to_one_lowercase_bucket` and the case test red, the latter only because it asserts the file NAME: asserting the waits alone, it stayed green on this machine's case-insensitive APFS disk, measured that day. Deleting any one of the four `HostKey` refusals turns `a_host_key_breaking_any_one_rule_is_refused` red, whose four inputs each break exactly one rule; `a_host_key_climbing_out_of_the_pace_directory_is_refused` holds `../../x`, which breaks three. Letting `Wire` key an invalid host as any valid one turns `a_per_host_pace_on_a_host_no_pace_file_can_be_named_after_refuses_before_any_wait` red. Refusing an unparseable url as `NoHost` turns `a_url_that_does_not_parse_skips_the_host_wait_and_fails_as_a_transport_error` red. Storing `go_at + per_host` in the host file again, so the last writer decides the spacing, turns `a_longer_host_interval_is_counted_from_a_shorter_one_s_send` red: a 1 s source sending 60 ms after a 100 ms source waited 40 ms instead of 940 ms. Replacing the `NoHost` refusal with an empty host turns `a_per_host_pace_on_a_url_with_no_host_refuses_before_any_wait` red. Setting `edgar-press`'s `per_host` to `None` turns `the_sec_profile_paces_both_our_address_and_the_sec_host_at_ten_a_second` red. **Ten holes, named rather than fixed.** (1) The flock itself has no test: the tests prove the reservation travels through the file, and that two callers cannot hold the lock at once is asserted by nothing, because a lost race needs two threads and an interleaving a test cannot fix. The property was measured by hand once, 2026-11-13: two separate OS processes against one pace file were handed exactly 20 slots of 100 ms with no slot issued twice, and the lock is released before the wait, so callers stack reservations instead of serialising on each other. A measurement is not a gate. (2) The file is per STORE, so one host running two stores holds two pace files and therefore two buckets, which a per-IP quota does not — the predecessor has the same hole across HOMEs. (3) There is no cap on a reservation far in the future: a clock that jumps forward leaves a parseable instant that makes the next send wait that long, where the predecessor resets anything beyond 5 s. (4) There is no bounded lock acquire, so a stuck holder stalls every caller rather than degrading to no wait — the predecessor's bounded `LOCK_NB` spin answers a case this tree does not have yet, and its degrade-to-no-op arm would be a branch no test here could reach. (5) R4's own two-file hole is also a pace hole: a `pub fn` inside `wire.rs` can call the private `exchange` with no permit, and now with no reservation either. (6) The per-host spacing is not exact: a call leaves after its host slot plus any per-IP wait it then owes, so two calls to one host can be closer than `per_host` by that per-IP wait — at most the per-IP queue ahead of it. Measured 2026-11-14 on the waits-advance clock with 100 ms per IP and 1 s per host: a call to another host, then two to one host, left the two 900 ms apart. (7) One `per_host` interval per profile, keyed on the exact host: a feed whose outlets ask different delays cannot state them in one profile, and `www.sec.gov` and `sec.gov` are two buckets although SEC counts one. (8) No test drives `edgar-press`'s declared profile through a real `Wire`: the provider test asserts the declaration and the `wire.rs` tests the enforcement, and the only `Wire::new` call is `newsvault`'s `main.rs`. (9) Redirects bypass the host pace of their target: ureq 3.5.2 follows up to 10 redirects by default and `Wire` does not change that, so only the host the request url names is paced, and the host a redirect leads to is neither paced nor reserved. (10) A host slot can be spent on a call never made: the host slot is reserved and slept before the per-IP reservation, so when the per-IP file then cannot be read the call is refused and the host slot stays used. This is reachable only on a pace-file error, which aborts the run. **The row's scope now covers a RETRIED call, since 2026-11-13 (R21 is the retry's home).** The driver re-attempts a transient (non-permanent) document failure — an HTTP 503 or a transport error, never a permanent 4xx or `vendor_refused` — bounded by `MAX_TRANSIENT_RETRIES` = 2, each retry its own attempt row (R4). A retry re-enters through `attempt_once` → `exchange.send`, the one socket this row paces, so it reserves a slot through `Pace::reserve` exactly as a first attempt does: the budget holds over the larger set of calls and the call RATE is unchanged. Widening `min_interval` or the `RequestBudget` to absorb the loss faster was the rejected alternative (approach B); the rate is the vendor's ceiling and is left at it, so the retry is spaced behind the queued calls and is not a faster path. That a re-queue cannot reach the socket by any faster path is the single `exchange.send` call site (grep 2026-11-13: one), a structural fact and not a test, so a future second send path would fall outside both this guarantee and its proof. The measured reason, the bound, the classification and the three enforcing tests (`a_transient_fetch_failure_is_retried_and_commits_the_item_within_one_run`, `a_permanent_fetch_failure_is_attempted_once_and_never_retried`, `a_request_that_fails_transiently_every_time_is_bounded_to_n_plus_one_attempts`) with their biting mutations live in R21's cell, not a second copy here; the gist, so this row carries its own rationale: ~8% of document fetches failed transiently on 2026-11-13 (run 1 lost 42 of 502, 15 HTTP 503 and 27 connection nulls; run 2 lost 43 of 502, a DIFFERENT subset, which is what proves the loss transient), N is a MECHANISM cap and not a figure read off that rate, and its residual is a coverage gap R20 converges. | **enforced for every call through `Wire::send`, retries included, per IP and, where the profile states one, per remote host, within the ten holes named here** |
-| R20 | **a `vendor_archive` backfill converges: a re-run fetches only the uncovered accessions, and the reader reports the gap** | **New row 2026-11-13.** Before it, `attempt_id` was keyed on `run_id`, so a fresh run re-fetched every filing a day named and could not target the gap left by the ~8% of document calls that fail transiently at the no-margin pace (R19). The fix lives in four components, each with one reason to exist. **The covered set is a read the store owns.** `newsvault::store::Committer::covered_story_ids(source, target)` returns the `story_id`s the store holds a COMMITTED item for under that window, keyed on `items` and never on an attempt's outcome: an attempt that returned ok and committed nothing is a gap, not coverage. Mutation: the read is items-driven (`FROM items i JOIN attempts a`), so only a story an item row carries is returned, and a `LEFT JOIN` on that same inner join stays green (measured 2026-11-13); the mutation that bites is reordering it to `FROM attempts a LEFT JOIN items i`, which turns `covered_story_ids_names_a_committed_story_and_not_an_ok_attempt_that_committed_nothing` red with `Sqlite(InvalidColumnType(0, "story_id", Null))`, the empty ok attempt then yielding a NULL story. **The seam is the driver and the `Archive` trait.** `news_provider::collect::attempt_once` reads the covered set once per index attempt and hands it to the provider; `Archive::covered_story_ids` and `Archive::record_planned_coverage` are the two doors, implemented by `Committer` and never by the provider, which depends on neither the store nor `rusqlite`. **The exclusion is the provider's.** `edgar-press::EdgarPress::follow_ups_to_issue` drops a `vendor_archive` follow-up whose story the covered set holds and keeps a `live_ingest` one whatever its coverage (R16), mapping a follow-up to its story by the accession its index-derived url carries — no stored `story_id` column, because the accession IS the vendor row identity (R3/R7). Mutations: returning the follow-ups unfiltered turns `a_vendor_archive_rerun_fetches_only_the_uncovered_accession` and `a_vendor_archive_follow_up_whose_story_is_covered_is_dropped_and_an_uncovered_one_is_kept` red (run 2 asks for the covered Apple again); dropping the `provenance != VendorArchive` guard turns `a_live_rerun_still_polls_every_matched_row_even_when_the_story_is_covered` and `a_live_follow_up_is_issued_even_when_its_story_is_already_covered` red. **The number is the reader's.** The index attempt records how many in-universe follow-ups it named in `attempts.matched` (NULL on a document attempt, a sweep, and a `live_ingest` index — coverage is the `vendor_archive` arm's alone, since a live re-run re-polls every row (R16) so a live shortfall is "not yet", not an unconverged backfill; a NULL `matched` is also how the reader tells an index attempt apart without a phase column); the driver records the FULL pre-exclusion count for an archive window, so the denominator is stable across runs. `newsvault::store::coverage_up_to` reports, per (source, target window), `MAX(matched)` as planned against the distinct committed stories as covered, and `newsvault ledger --check` raises `coverage_incomplete` whenever `covered < planned`. The gate fires on a gap of ANY size and never a percentage — there is no threshold to pick after seeing a result. Mutations on `a_vendor_archive_day_with_an_uncovered_accession_reports_coverage_incomplete`: dropping the `coverage_incomplete` push turns it red; `MAX(matched)` → `SUM(matched)` turns the `(2, 2)` assertion red (two runs' index attempts add to a planned of 4); making `record_planned_coverage` a no-op turns it red with no coverage row at all; and recording `matched` for a `live_ingest` index (dropping the `provenance == VendorArchive` guard in the driver) turns `a_live_window_with_an_uncovered_follow_up_reports_no_coverage_gap` red, the live window then reporting a gap. | **enforced for the `vendor_archive` arm, within these holes, the last four named 2026-11-13 by an adversarial review of this diff: coverage is per STORE, so a window read under two stores counts twice; the denominator rests on the index attempt recording `matched`, which a provider that follows up without an index phase would not; `coverage_up_to` compares a COUNT of distinct committed stories against `MAX(matched)` rather than the planned SET, so across a roster change between runs a covered story outside the planned set can numerically mask an uncovered planned one; `MAX(matched)` never decreases, so a filing that fails and then drops from the roster leaves a permanent `coverage_incomplete` nothing can clear; `record_planned_coverage` is an `UPDATE` outside the commit transaction, so a transient error there aborts the run after the items are already committed and leaves `matched` NULL until the next index run re-records it, hiding the window from `--check` meanwhile; and follow-ups are issued only from the `Index` phase, so a provider that chained documents would have its document-phase follow-ups dropped silently — `edgar-press` returns none today** |
+| R20 | **a `vendor_archive` backfill converges: a re-run fetches only the uncovered accessions, and the reader reports the gap** | **New row 2026-11-13.** Before it, `attempt_id` was keyed on `run_id`, so a fresh run re-fetched every filing a day named and could not target the gap left by the ~8% of document calls that fail transiently at the no-margin pace (R19). The fix lives in four components, each with one reason to exist. **The covered set is a read the store owns.** `newsvault::store::Committer::covered_story_ids(source, target)` returns the `story_id`s the store holds a COMMITTED item for under that window, keyed on `items` and never on an attempt's outcome: an attempt that returned ok and committed nothing is a gap, not coverage. Mutation: the read is items-driven (`FROM items i JOIN attempts a`), so only a story an item row carries is returned, and a `LEFT JOIN` on that same inner join stays green (measured 2026-11-13); the mutation that bites is reordering it to `FROM attempts a LEFT JOIN items i`, which turns `covered_story_ids_names_a_committed_story_and_not_an_ok_attempt_that_committed_nothing` red with `Sqlite(InvalidColumnType(0, "story_id", Null))`, the empty ok attempt then yielding a NULL story. **The seam is the driver and the `Archive` trait.** `news_provider::collect::attempt_once` reads the covered set once per index attempt and hands it to the provider; `Archive::covered_story_ids` and `Archive::record_planned_coverage` are the two doors, implemented by `Committer` and never by the provider, which depends on neither the store nor `rusqlite`. **The exclusion is the provider's.** `edgar-press::EdgarPress::follow_ups_to_issue` drops a `vendor_archive` follow-up whose story the covered set holds and keeps a `live_ingest` one whatever its coverage (R16; `open-web-feed` changes this at §11.5 step 4), mapping a follow-up to its story by the accession its index-derived url carries — no stored `story_id` column, because the accession IS the vendor row identity (R3/R7). Mutations: returning the follow-ups unfiltered turns `a_vendor_archive_rerun_fetches_only_the_uncovered_accession` and `a_vendor_archive_follow_up_whose_story_is_covered_is_dropped_and_an_uncovered_one_is_kept` red (run 2 asks for the covered Apple again); dropping the `provenance != VendorArchive` guard turns `a_live_rerun_still_polls_every_matched_row_even_when_the_story_is_covered` and `a_live_follow_up_is_issued_even_when_its_story_is_already_covered` red. **The number is the reader's.** The index attempt records how many in-universe follow-ups it named in `attempts.matched` (NULL on a document attempt, a sweep, and a `live_ingest` index — coverage is the `vendor_archive` arm's alone, since a live re-run re-polls every row (R16) so a live shortfall is "not yet", not an unconverged backfill; a NULL `matched` is also how the reader tells an index attempt apart without a phase column); the driver records the FULL pre-exclusion count for an archive window, so the denominator is stable across runs. `newsvault::store::coverage_up_to` reports, per (source, target window), `MAX(matched)` as planned against the distinct committed stories as covered, and `newsvault ledger --check` raises `coverage_incomplete` whenever `covered < planned`. The gate fires on a gap of ANY size and never a percentage — there is no threshold to pick after seeing a result. Mutations on `a_vendor_archive_day_with_an_uncovered_accession_reports_coverage_incomplete`: dropping the `coverage_incomplete` push turns it red; `MAX(matched)` → `SUM(matched)` turns the `(2, 2)` assertion red (two runs' index attempts add to a planned of 4); making `record_planned_coverage` a no-op turns it red with no coverage row at all; and recording `matched` for a `live_ingest` index (dropping the `provenance == VendorArchive` guard in the driver) turns `a_live_window_with_an_uncovered_follow_up_reports_no_coverage_gap` red, the live window then reporting a gap. | **enforced for the `vendor_archive` arm, within these holes, the last four named 2026-11-13 by an adversarial review of this diff: coverage is per STORE, so a window read under two stores counts twice; the denominator rests on the index attempt recording `matched`, which a provider that follows up without an index phase would not; `coverage_up_to` compares a COUNT of distinct committed stories against `MAX(matched)` rather than the planned SET, so across a roster change between runs a covered story outside the planned set can numerically mask an uncovered planned one; `MAX(matched)` never decreases, so a filing that fails and then drops from the roster leaves a permanent `coverage_incomplete` nothing can clear; `record_planned_coverage` is an `UPDATE` outside the commit transaction, so a transient error there aborts the run after the items are already committed and leaves `matched` NULL until the next index run re-records it, hiding the window from `--check` meanwhile; and follow-ups are issued only from the `Index` phase, so a provider that chained documents would have its document-phase follow-ups dropped silently — `edgar-press` returns none today** |
 | R21 | **a transient document-fetch failure is re-attempted within the run, bounded, and only a residual gap stands** | **New row 2026-11-13.** Before it, a document fetch that failed transiently was recorded and left: measured over two full-day collects, run 1 lost 42 of 502 document fetches (15 HTTP 503 and 27 connection-level nulls) and run 2 lost 43 of 502, a DIFFERENT subset — which is what proves the loss is transient and not a permanent gap. Nothing re-attempted, so the day stayed incomplete until the next run closed it (R19's no-margin pace is the cause of the 503s, R20's convergence the long-run floor). **The decision is the driver's.** `news_provider::collect`'s queue loop re-queues a failed, non-permanent attempt to the BACK of its `VecDeque` with its retry count incremented, bounded by `MAX_TRANSIENT_RETRIES` = 2; the count rides a `Queued` wrapper and never `Request`, which is hashed into `filter_params`, so a retry asks the byte-identical question and the fresh ordinal alone makes its `attempt_id` distinct. **Re-queue-to-back was chosen over an injected `Sleeper` backoff** so no second clock enters the driver: a retry's socket call is just another `attempt_once` → `exchange.send`, the one seam `Wire::send` paces through `Pace::reserve` (R19), so the limiter already spaces the retry behind the other queued calls and the rate stays wire/budget's, untouched. A bypass of the limiter is impossible here by construction — there is one `exchange.send` call site — rather than by a test. **The classification reuses what exists.** `Attempted::is_transient` is `OutcomeKind::Failed && !permanent`, which is exactly §5.1's retryable class (`vendor_unreachable`): a 503 or a transport error is transient, a 4xx or a `vendor_refused` (`permanent`) is not, and `Ok`/`Empty` are not failures — no new classifier, and a permanent refusal is NEVER re-queued, because retrying one wastes calls and reads as abuse. **The bound is a MECHANISM cap, not a rate**: 2 is a bound on the work spent per request, its only job to stop one persistently failing accession stalling the run, and it is NOT derived from the ~8% loss — picking a retry count off the measured rate would be choosing a threshold after seeing the result, which this project forbids; whatever still fails after it is a coverage gap R20 converges or the next day fills. **Each attempt, including each retry, is its own row (R4):** a retry writes its own `Opened`/`Finalised` and gets a fresh ordinal, so a retried-then-succeeded accession ends as one or more `failed` rows plus one `ok` row plus the committed item. **The exit tally counts a transient only on its FINAL, non-re-queued attempt:** `Collected::absorb` skips the outcome buckets while a transient is being re-queued, so a retried-to-success day is complete (exit 0) and a RESIDUAL transient leaves it incomplete (exit 7/8), unchanged for the residual case; the attempt row and its stored evidence are written either way. **The per-source summary diverges from the exit on purpose:** `tally_of` builds `per_source.failed`/`ok` from the attempt ROWS, so a retried-to-success day carries `exit 0` with `per_source.failed` ≥ 1 (the superseded transient) — `per_source` summarises what was attempted, the exit is the final disposition, and the two answer different questions rather than reconciling once a retry happens. **Three tests and seven mutations, run 2026-11-13 and 2026-11-14.** `a_transient_fetch_failure_is_retried_and_commits_the_item_within_one_run` — a 503-then-filing commits both filings in one run at exit 0 with two attempt rows for that url, `failed` then `ok`; setting `MAX_TRANSIENT_RETRIES` to 0 turns it red (one ask, one item, exit `partial_collect`), dropping the re-queue turns it red the same way, and counting a re-queued transient in the tally (removing `absorb`'s `!retrying` guard) turns it red as `partial_collect` with both items still committed. It also pins the per-source divergence (`exit 0` with `per_source.failed == 1`), so reconciling `per_source` to the exit — dropping the superseded transient from `tally_of` — turns it red. `a_permanent_fetch_failure_is_attempted_once_and_never_retried` — a 403 access-denied is asked exactly once; dropping the `!permanent` guard turns it red, the url then asked `MAX_TRANSIENT_RETRIES + 1` times. `a_request_that_fails_transiently_every_time_is_bounded_to_n_plus_one_attempts` — an always-503 url is asked exactly `MAX_TRANSIENT_RETRIES + 1` = 3 times and the run terminates with the gap residual; widening `retries < MAX_TRANSIENT_RETRIES` to `<=` turns it red (four asks), and dropping the bound entirely makes `collect` non-terminating against the fixture, verified under `timeout` with the run never printing a result. | **enforced for every request the driver attempts, within the holes named here: the limiter spacing the retry is covered by R19 and that a re-queue cannot bypass it is structural, not a test, so a future second send path would be uncovered; the cap is uniform, so a request deserving more or fewer attempts gets two regardless; and a retry re-asks the identical `Request`, so a vendor needing a different url or header to recover is not helped** |
 | G1 | **a workspace member inherits the lint floor** | a test in the `repo-invariants` crate, over **seven** members since 2026-11-13, `providers/edgar-press` being the newest and carrying its own `[lints] workspace = true`. It asks `cargo metadata` for the member set rather than reading `workspace.members`, because that list is **not** the member set: measured 2026-11-12, a crate reached only by a `path` dependency is a member, is compiled by `cargo clippy --locked --all-targets`, inherits nothing, and all three CI commands exit 0 over an `unwrap()` in it. The test also rejects `lints = { workspace = true }` written inside `[package]`, which cargo ignores without a warning while the crate passes clippy. It polices its own crate too. **The floor's contents, gated since 2026-11-12.** Until that day the row checked that members inherit the table and nothing checked what the table said: measured on a copy of this tree, deleting `unwrap_used = "deny"` from the root and adding an `unwrap()` to a member left `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` (not one line of it mentioning `unwrap`) and `cargo test --locked --no-fail-fast` all at exit 0, this row's test included, and the failure message would have printed a floor the root no longer held. The check now reads `[workspace.lints]` from the root manifest, builds that message from what it read instead of from a constant in the gate crate, refuses an entry at `warn` or `allow` because such an entry decorates rather than binds, and compares the set with `repo-invariants/lint-floor.snapshot`. The same mutation now exits 101 naming the entry. **Why a snapshot and not a derived expectation:** every expectation derived from the manifest disappears together with the entry it was meant to protect, so a deleted lint is only visible against a statement of the floor that lives outside the manifest. The snapshot is that statement and the one deliberate second copy of the list; editing it is the change, and the message says so. **The hole it deliberately left is half closed since 2026-11-13, by a glob rather than by a test:** `members` reads `providers/*` and `services/*`, so a crate added under either is a member by existing. A crate on disk that no `members` entry and no `path` dependency reaches is still not a member, is compiled by nothing and is invisible to all of CI — reproduced 2026-11-12 with `services/derive` holding an `unwrap()` and no registration, all three commands green — and that is now only reachable for a new TOP-LEVEL crate, because `*` at the root would match `docs`, `probes` and `target`. The glob's own cost, measured 2026-11-13 on cargo 1.99.1: it matches every directory under those two parents, a dotfile one included, and a directory with no `Cargo.toml` fails EVERY cargo command with "failed to load manifest for workspace member ... referenced via `services/*`" rather than being skipped. A loud failure instead of a silent omission is the trade. The member set it produces is unchanged, 7 members before and after, and this row's test still means what it did: the glob adds no `[lints]` stanza, so every check in this cell runs over the same seven manifests. | **enforced** |
 | U1 | **the panel names the roster it was built from** | nothing, and the gap is now one-sided rather than total. **The COLLECTION side has a producer and a column since 2026-11-13:** `universe_version` is a field of every `news_provider::Request`, it is one parameter inside that request's `filter_params`, and `attempts.universe_version` is `NOT NULL`, so an attempt cannot be filed without naming the roster it filtered by. Two mutations that day: dropping the parameter turns `two_runs_whose_rosters_differ_have_two_filter_params_digests` red, and writing a constant into the column turns `the_opened_row_carries_the_roster_digest_the_request_was_built_from` red. The §9 claim that a roster is a derive-side input is false for an EDGAR-shaped provider and is amended there: the daily index carries no ticker, so the filter is a CIK roster lookup before any per-filing request, and an absent, unparseable or empty roster is a refusal (`edgar-press::Refusal`) rather than an empty universe - the predecessor's own roster read returns `{}` on a read failure and the run then reports a quiet day. **The PANEL side is still nothing:** measured 2026-11-12, `panel-contract schema --format=json` lists 13 manifest fields and not one is a roster, and `panel-contract validate panel-contract/fixtures/corrected_panel_78460.json` exits 0 with zero findings over a manifest that names no universe. The same 13 lack `relation_map_version` too, so §2 names five inputs to `panel_id` where the gate requires three. The enforcement point is those fields becoming required in the crate, which also rewrites seven committed fixtures and R8's rule set — a decision, not an omission | **no enforcement point yet** |
@@ -621,7 +626,7 @@ does. Where a row's clauses differ, its status splits with them.
 ## 10. What this document leaves open
 
 Nothing of the shape. The two numbers this section last asked for are recorded below; what remains
-open is the memo's own list, where decision D-1 (which news vendor) blocks the rest.
+open is the memo's own list, where decision D-1 (which vendor for history) blocks the backfill.
 
 **Three decisions taken by default on 2026-11-13.** The owner was asked twice and chose neither, and
 said to build anyway, so each is the design's own recommendation and is an assumption rather than a
@@ -765,6 +770,8 @@ leaves `EdgarPress::listing_url` with no production caller. **The one place to c
 2026-11-12 by the owner).** Two parts of that stay unanswered and neither is the shape of the
 system, so neither blocks it: nobody has restored the backup and nobody has timed a restore. A
 backup nobody has restored is not yet a backup; one timed drill, recorded once, closes both.
+- Once the store runs in WAL (§6), a copy of `commit.sqlite3` must use `.backup` or `VACUUM INTO`.
+  A file copy loses commits still in `-wal`.
 
 **What the drill compares, and what the 156-of-156 does not say.** `probes/parity_baseline.py`
 computes a sha256 over the sorted distinct **vendor ids**, the lake's `id` column (§3.1's
@@ -820,7 +827,8 @@ there, and the control reproduces that zero. **The threshold choice survives**: 
 outages the 6-hour rule catches anyway, so 2 hours adds one alert in 175 days, 2026-06-03's.
 
 **What makes those two numbers wrong.** They measure the predecessor's **retrieval** coverage, not
-the world's news, so a different vendor moves them: provisional: to be re-measured against `open-web-feed` (§11) and the
+the world's news, so a different vendor moves them. They are provisional and are re-measured
+against `open-web-feed` (§11) and the
 first real vendor. The publication gap transfers where an observation gap would not, the
 predecessor's `ingested_at` spacing being its scheduler rather than the news. The record also holds
 outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.6-hour gap is one.
@@ -829,105 +837,144 @@ outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.
 
 ## 11. `open-web-feed` — our own forward news feed (decided 2026-11-14, no code yet)
 
-- **POC** (proof of concept): the first build. Each line is an owner decision of 2026-11-14.
+- Every line in §11.1 and §11.2 is an owner decision of 2026-11-14.
+- **POC** (proof of concept): the first build.
 - **Target**: the shape the crate grows into. Nothing in it is built or gated.
 - **Held**: the store already has an answer for a story, so the feed does not fetch it again.
-- **Admitted**: a hosts-file row with status `admitted`: its robots.txt allows the paths used and it
-  passed a probe.
-- `Index` request: a dated news sitemap or RSS feed. `Document` request: one article page.
-- Hosts: GNW = GlobeNewswire, PRN = PR Newswire, CNW = Canada Newswire, BI = Business Insider,
-  Fool = The Motley Fool.
+- **Admitted**: a hosts-file row with status `admitted`.
+- An admitted row's robots.txt allows the paths used, and the host passed a probe.
+- `Index` request: a dated news sitemap or RSS feed.
+- `Document` request: one article page.
+- Hosts:
+  - GNW = GlobeNewswire.
+  - PRN = PR Newswire.
+  - CNW = Canada Newswire (`www.newswire.ca`).
+  - Fed = the Federal Reserve press feed (`www.federalreserve.gov/feeds/press_all.xml`).
+  - BI = Business Insider.
+  - Fool = The Motley Fool.
 
 ### 11.1 Fixed in both layers
 
-- Crate `providers/open-web-feed/`, top-level `[lints] workspace = true`. No clock, no HTTP client.
-- Live only. `plan` refuses any target that is not the run's UTC day, before any request. No
-  `vendor_archive` request can exist. Every UTC day is collected, weekends included.
+- Crate `providers/open-web-feed/`, top-level `[lints] workspace = true`.
+- No clock and no HTTP client in the crate.
+- Live only.
+- `plan` refuses any target that is not the run's UTC day, before any request.
+- No `vendor_archive` request can exist.
+- Every UTC day is collected, weekends included.
 - Investor-relations pages are never fetched.
-- Observation time is `Wire`'s `received_at`. The store refuses one set by the provider
-  (`cmd_collect.rs:555-567`).
+- Observation time is `Wire`'s `received_at`.
+- The store refuses an observation time set by the provider (`cmd_collect.rs:555-567`).
 - Valid time per host:
-  - PRN, GNW: RSS `pubDate`.
-  - CNBC: the page's `article:published_time`, never its sitemap (§11.6).
+  - PRN, GNW, Fed: RSS `pubDate`, `ValidSource::VendorPublished`.
+  - CNW: sitemap `news:publication_date`, a full instant with offset.
+  - CNBC: the page's `article:published_time`, `ValidSource::OurExtraction`. Never its sitemap
+    (§11.6).
+  - `ValidSource::PageMetadata` stays unbuilt. Step 2 deletes its forecast at `provider.rs:39-40`.
   - Yahoo: its syndication time.
   - Fool, BI: the sitemap value.
   - Never: `lastmod`, `dateModified`, fetch time, a date folded into midnight.
 - Bot protection (HTTP 403, a challenge page, a web application firewall, DataDome) is a
-  `PermanentFailure`. It is never retried in another form.
-- robots.txt is respected. Sites' terms of use are not a criterion (owner, 2026-11-14).
-- `item_key(url)` is the one function behind `source_item_id`. A page's canonical link feeds
-  `doc_id` only.
-- Pace: `interval = max(Crawl-delay, 10 s)`. Poll every 30 min inside 13:00–20:00 UTC (the US
-  session as N2 defines it, §10), every 90 min outside. 90 min is provisional until the weekday
-  probe: GNW's Saturday window gives at most 118 min (3.93 h × 0.5).
+  `PermanentFailure`.
+- Bot protection is never retried in another form.
+- robots.txt is respected.
+- A robots.txt 404 is recorded as "no robots" and is not digest-pinned.
+- Sites' terms of use are not a criterion (owner, 2026-11-14).
+- `item_key(url)` is the one function behind `source_item_id`.
+- A page's canonical link feeds `doc_id` only.
+- Pace: `interval = max(Crawl-delay, 10 s)`.
 - A host may be slowed, never sped up.
-- Busy time = summed paced waits plus request times across hosts. Worst case ≤ 50% of a day.
-- Hosts file: one hashed file per SourceId under `providers/open-web-feed/hosts/`. Its digest is the
-  run's `hosts_version`, carried in `filter_params` beside `universe_version` (§2 keeps that name
-  for the ticker roster).
+- Busy time = summed paced waits plus request times across hosts.
+- Worst-case busy time ≤ 50% of a day.
+- Hosts file: one hashed file per SourceId under `providers/open-web-feed/hosts/`.
+- Its digest is `hosts_version` (§2), stored in its own `attempts` column and in the run envelope.
+- `universe_version` = digest of this provider's ticker roster file (empty for the POC).
+- Path filters and the Yahoo key list live in the rules file, so `extract_rules_version` covers
+  them.
 - Only admitted rows are planned.
-- Held, keyed on (SourceId, `story_id`) over every target window, never the run's window alone. A
-  story is held if it has:
-  - a committed item; or
-  - a `Document` attempt closed `Usable`, `Empty`, `PermanentFailure`, or with only unusable rows.
-    An empty or unusable page is held because re-fetching returns the same page; the raw blob
-    (§3.9) allows re-extraction.
+- Held is keyed on (SourceId, `story_id`) over every target window, never the run's window alone.
+- A story is held if it has a committed item.
+- A story is held if it has a `Document` attempt closed `Usable`, `Empty`, `PermanentFailure`, or
+  with only unusable rows.
+- An empty or unusable page is held: re-fetching returns the same page. The raw blob (§3.9) allows
+  re-extraction.
 - Not held: `TransientFailure`, interrupted by the startup sweep, in flight.
-- `Finalised` must carry the `Verdict`, so permanence is stored. Today `PermanentFailure` and
-  `TransientFailure` both map to `OutcomeKind::Failed` (`ledger.rs:216`).
-- New columns `attempts.story_id` and `attempts.held`. `ledger --check` subtracts `held`.
-- First sighting is unchanged: a skip writes no item. So R15 cannot see a re-stamped time of a held
-  story; the index value survives only in the attempt's raw blob.
-- The outcome names here are the code's; §3.2's `ok | empty | failed | collapsed` predates them.
+- `Finalised` carries the `Verdict`, so permanence is stored.
+- Today `PermanentFailure` and `TransientFailure` both map to `OutcomeKind::Failed`
+  (`ledger.rs:216`).
+- New columns `attempts.story_id` and `attempts.held`.
+- `ledger --check` subtracts `held`.
+- First sighting is unchanged: a skip writes no item.
+- So R15 cannot see a re-stamped time of a held story. The index value survives only in the
+  attempt's raw blob.
+- The outcome names here are the code's. §3.2's `ok | empty | failed | collapsed` predates them.
+- Schema changes are versioned with `PRAGMA user_version`, read at `Committer::open`.
+- A lower version is migrated by explicit `ALTER TABLE`, or a table rebuild for a `CHECK` change.
+- An unknown higher version is refused.
 
 ### 11.2 POC
 
-- One SourceId, `open_web_wires`. `open_web_outlets` arrives with its first outlet (step 6). A
-  second SourceId in one invocation needs a run envelope with a list of `hosts_version` values.
-- Hosts, in order: GNW, then PRN, CNW, Fed, Yahoo. One PR per host, as each robots fetch lands.
-- GNW: article URLs are rewritten from `www.` to `rss.`. Both hosts are GNW's own; `www.` returned
-  Akamai 403 on robots.txt twice, and its article pages were never tested.
-- Yahoo: only provider keys of wires not fetched directly: `cnwgroup.com`, `business-wire.com`,
-  `accesswire.ca`. Matched exactly, never as substrings. PRN and GNW keys would store each
-  release twice.
+- One SourceId, `open_web_wires`.
+- `open_web_outlets` arrives with its first outlet (Target).
+- A second SourceId in one invocation needs a run envelope with a list of `hosts_version` values.
+- Hosts, in order: GNW, then PRN, CNW, Fed, Yahoo (wire keys only). One PR per host, as each
+  robots fetch lands.
+- CNW and Fed are admitted only after a body probe.
+- GNW article URLs are rewritten from `www.` to `rss.`. Both hosts are GNW's own.
+- `www.globenewswire.com` returned Akamai 403 on robots.txt twice. Its article pages were never
+  tested.
+- Yahoo: only provider keys of wires not fetched directly: `business-wire.com`, `accesswire.ca`.
+- Yahoo keys match exactly, never as substrings.
+- PRN, GNW and CNW keys are excluded: they would store each release twice.
 - Deferred: Zero Hedge, Newswire.com, Business Wire direct.
-- Robots: a refresh command fetches robots.txt through `Wire` under an attempt row. The hosts file
-  pins its digest. Step 2 decides how a robots attempt is labelled in the ledger and kept out of
-  the expected-run count; it amends §10's "calendar, listing and roster are FILES" paragraph.
-- The robots and floor checks run in `newsvault`, not in the provider: only the driver can read
-  the store. It hands the provider the Crawl-delay parsed from the pinned robots blob.
-- Redirects refused: `TransportProfile.redirects = Refuse` sets `max_redirects(0)`. A 3xx is a
-  `PermanentFailure`. This closes R19 hole 9 by refusal.
+- Robots: a refresh command fetches robots.txt through `Wire` under an attempt row.
+- The hosts file pins the robots digest.
+- Step 3 decides how a robots attempt is labelled and kept out of the expected-run count.
+- Step 3 amends §10's "calendar, listing and roster are FILES" paragraph.
+- The robots and floor checks run in `newsvault`: only the driver reads the store.
+- `newsvault` hands the provider the Crawl-delay parsed from the pinned robots blob.
+- Redirects refused: `TransportProfile.redirects = Refuse` sets `max_redirects(0)`.
+- A 3xx is a `PermanentFailure`. This closes R19 hole 9 by refusal.
 - One interval for all hosts: every admitted host is at 10 s. R19 hole 7 stays open.
-- `ValidPrecision::Minute` for GNW's minute-resolution `pubDate`. It needs a new
-  `pit::datedness::Published` arm, a new `canon` stamp arm with a committed vector, and a store
-  `CHECK` change (step 3).
-- `items` gains `valid_raw`, `valid_field`, `valid_source`. `ValidSource::PageMetadata` gets its
-  producer, the CNBC parser (`provider.rs:39-47` waits for it).
-- Follow-up cap 150 per invocation, the owner's choice and not measured: 150 × 10 s = 25 min, inside
-  the 30-min poll. Overflow counts as `deferred` and is retried at the next poll.
-- A run must finish inside its poll period.
-- Conformance: a live provider is exempt from the session and listing check
-  (`conformance.rs:148-162`). Accounting is per (day, host).
-- Fixtures: trimmed real pages from the 2026-11-14 probes, a few paragraphs each, plus one synthetic
-  page whose canonical link differs from its URL.
+- `ValidPrecision::Minute` for GNW's minute-resolution `pubDate`.
+- `Minute` needs a `pit::datedness::Published` arm, a `canon` stamp arm with a committed vector, and
+  a store `CHECK` change (step 2).
+- `items` gains `valid_raw`, `valid_field`, `valid_source`.
+- Poll every 30 min from 11:00 to 22:00 UTC: pre-market through after-close releases.
+- Poll every 90 min outside it.
+- Both are owner's choices, not measured. The weekday probe checks each against its index window.
+- GNW's Saturday window allows at most 118 min (3.93 h × 0.5).
+- Follow-up cap: 150 per invocation, the owner's choice, not measured.
+- Worst case per run: (150 + index requests) × (1 + `MAX_TRANSIENT_RETRIES` = 2) × 10 s.
+- A run stops issuing requests when its busy time would pass half its poll period: 15 min inside
+  11:00–22:00 UTC, 45 min outside.
+- This deadline is what holds busy time ≤ 50% of a day.
+- Unissued follow-ups count as `deferred` and are retried at the next poll.
+- Conformance: exempt by a provider declaration, a new trait method without a default.
+- `edgar-press` declares itself session-bound, so its check stays.
+- `collect` takes `--calendar` and `--listing` per provider. The open-web run takes neither.
+- Accounting is per (day, host).
+- Fixtures: trimmed real pages from the 2026-11-14 probes, a few paragraphs each.
+- Plus one synthetic page whose canonical link differs from its URL.
 - Scheduler: a VPS timer outside the crate.
 
 ### 11.3 Target shape
 
-- Sources: every candidate that passes robots and a weekday probe, including Business Wire if it
-  becomes stable, Zero Hedge, Newswire.com (with a measured zone, date-only valid time), and Yahoo
-  outlet syndication under `open_web_outlets`.
-- Outlets under `open_web_outlets`: Fool (transcripts as their own kind), CNBC, BI.
+- Sources: every candidate that passes robots and a weekday probe.
+- Includes Business Wire if stable, Zero Hedge, Newswire.com (measured zone, date-only valid time).
+- `open_web_outlets`: Fool, CNBC, BI, Yahoo outlet syndication.
+- Fool's earnings-call transcripts are a separate item kind; the field is named when built.
 - Per-host intervals: R19 hole 7 closed (`HostPaces::Listed`).
-- Redirects followed as their own paced, ledgered requests. Needs `RawResponse` headers and
-  `Document`-phase follow-ups. Hole 9 stays closed.
-- Robots re-fetched on a schedule. A changed digest blocks the host until the hosts file is updated.
-- Collectors per SourceId in parallel. Needs a startup sweep that tells live runs from dead ones,
-  then a lease covering only `Committer::reserve` through COMMIT (§6).
-- Follow-up cap and run length set from measured weekday busy time, printed in every envelope.
-- Extractor breakage visible: the `NoArticleBody` share per host is a ledger reading, with a
-  threshold fixed before its first measurement.
+- Redirects followed as their own paced, ledgered requests. Hole 9 stays closed.
+- Following redirects needs `RawResponse` headers and `Document`-phase follow-ups.
+- Robots re-fetched on a schedule.
+- A changed robots digest blocks the host until the hosts file is updated.
+- Collectors per SourceId in parallel.
+- Parallel collectors need a startup sweep that tells live runs from dead ones.
+- Then the lease covers only `Committer::reserve` through COMMIT (§6).
+- Follow-up cap and run length set from measured weekday busy time.
+- Busy seconds printed in every envelope.
+- The `NoArticleBody` share per host is a ledger reading.
+- Its threshold is fixed before its first measurement.
 - The outbox poller wakes `derive` and feeds the private stream (D-7).
 
 ### 11.4 Gates planned (none exists yet; each joins the §8 row named when it bites)
@@ -941,42 +988,56 @@ outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.
 | follow-up story equals item story, synthetic fixture | `document_of` keys on the canonical link | R3 |
 | a quiet all-held day passes `ledger --check` | the `held` subtraction is removed | R4 |
 | a target other than the run day is refused before any request | the day check is removed | R10 |
+| a store at the previous `user_version` opens, migrates, takes a `Minute` row | the migration is removed | new row M1 |
 | only admitted hosts are planned | the status filter is removed | R19 |
 | a hosts row faster than its robots Crawl-delay is refused (newsvault) | the floor check is removed | R19 |
 | an admitted row without a ledgered robots fetch is refused (newsvault) | the lookup is removed | R4 |
 | a redirect is a permanent failure, not followed | `max_redirects(0)` is removed | R19 |
-| CNBC valid time is the page meta | the sitemap value is used | R2 |
 | a bot-protection page is permanent | 403 is classified transient | R21 |
-| a Yahoo row outside the key list is filtered out | exact match becomes substring match | R10 |
+| a Yahoo row outside the key list is filtered out | exact match becomes substring match | R3 |
 | the extracted body is article text, per host | the selector widens to `<body>` | R17 |
 | no file under `providers/open-web-feed/src` names `Sink` | a `Sink` use is added to any file there | R4 |
-| a rolled-back `record` leaves no outbox row | the insert moves outside the transaction | §6 rule 2 |
-| a zero-item attempt writes one outbox row | the insert is skipped when rows are empty | §6 rule 3 |
+| a rolled-back `record` leaves no outbox row | the insert moves outside the transaction | new row O1 |
+| a zero-item attempt writes one outbox row | the insert is skipped when rows are empty | R14 |
+| CNBC valid time is the page meta (Target) | the sitemap value is used | R13 |
 
-Unguarded in the POC: the cap of 150 and `deferred`; the stored raw valid-time fields.
+- Unguarded in the POC: the stored raw valid-time fields.
+- Unguarded in the POC: an index whose oldest item is newer than the previous poll's newest, i.e.
+  items lost between polls.
 
 ### 11.5 Build order (each PR passes the gate alone)
 
-1. Crate skeleton and loaders, built only with their first reader in step 3.
-2. Robots refresh command; newsvault checks the pinned digest and the floor.
-3. GNW end to end: index and document parsers, loaders, `--window today`, conformance exemption
-   and per-(day, host) accounting, `Minute` precision, `items` valid-time columns, `NoArticleBody`,
-   `Provider::story_of`, the `item_key` gate, an end-to-end test.
+1. Crate skeleton with `[lints] workspace = true`, so row G1 covers it.
+2. GNW end to end:
+   - hosts loader, provider table in `cmd_collect` (replacing the single `EdgarPress`);
+   - index and document parsers, `item_key`, `Provider::story_of`, `NoArticleBody`;
+   - schema versioning, `items` valid-time columns, `hosts_version` column and envelope field;
+   - `Minute` precision;
+   - conformance declaration and per-(day, host) accounting in `plan_accounts_for_every_day`;
+   - per-provider `--calendar`/`--listing`, `--window today`;
+   - an end-to-end test.
+3. Robots refresh command; `newsvault` checks the pinned digest and the floor.
 4. Held filter: `Finalised` carries the `Verdict`, `attempts.story_id`, `attempts.held`, live
    covered set, ledger check. Amends R16 and R20.
-5. Redirect refusal and 3xx classification, with a stub server.
-6. One PR per further host; `open_web_outlets` with its first outlet.
-7. VPS timer, follow-up cap, busy seconds in the envelope.
-8. Outbox, WAL, `bundled`, with its first reader `newsvault events --after <cursor>`.
+5. Redirect refusal and 3xx classification, with a loopback stub.
+6. One PR per further host.
+7. VPS timer, follow-up cap with the run deadline, busy seconds in the envelope.
+8. Outbox, WAL, `bundled`, and the §6 poller as `newsvault events --after <cursor>`.
+
+- Step 2 is the largest PR: it touches `pit`, `canon`, `news-provider`, `newsvault` and the new
+  crate.
 
 ### 11.6 Evidence, 2026-11-14 (Saturday)
 
 - Command: `curl -sS --compressed -A 'research-feed-probe/0.1' -o <body> -D <hdr> --max-time 30
-  <url>`, ≥ 5 s between requests to one host, ≤ 3 per host. Body = whitespace-collapsed `<p>` text
-  in the host's container, or JSON-LD `articleBody`, parsed offline with Python's `html.parser`.
-- Bodies: 13 article fetches, 11 reached, 2 blocked.
+  <url>`.
+- Spacing: ≥ 5 s between requests to one host, ≤ 3 per host per probe run.
+- That is below §11.1's 10 s floor. Crawl-delay was not read before every fetch.
+- Body: whitespace-collapsed `<p>` text in the host's container, or JSON-LD `articleBody`.
+- Parsed offline with Python's `html.parser`.
+- 13 article fetches: 11 reached, 2 blocked.
 
-| host | UTC | status | body chars | rule |
+| host | request start (UTC) | status | body chars | rule |
 |---|---|---|---|---|
 | prnewswire.com | 19:36:58 | 200 | 9,463 | `<p>` in `<article>` |
 | prnewswire.com | 19:37:18 | 200 | 19,337 | `<p>` in `<article>` |
@@ -996,8 +1057,8 @@ Unguarded in the POC: the cap of 150 and `deferred`; the stored raw valid-time f
   - Berkshire story: sitemap `09:02:39-04:00` (13:02:39Z); page `article:published_time`
     14:02:39Z. Wrong offset (EDT in EST season).
   - FAA story: sitemap `13:32:47-04:00` (17:32:47Z); page `datePublished` 09:26:23Z,
-    `dateModified` 18:32:47Z. The sitemap holds the modification time, also with the wrong offset.
-- Yahoo sitemap, 19:20:57Z: 1,000 rows over 18.27 h; provider keys from `image:loc`
-  (`media.zenfs.com/en/<key>/`): `cnwgroup.com` 37, `prnewswire.com` 36, `globenewswire.com` 26,
-  `business-wire.com` 6, `accesswire.ca` 6.
+    `dateModified` 18:32:47Z. The sitemap holds the modification time, with the wrong offset.
+- Yahoo sitemap, 19:20:57Z: 1,000 rows over 18.27 h.
+- Yahoo provider keys from `image:loc` (`media.zenfs.com/en/<key>/`): `cnwgroup.com` 37,
+  `prnewswire.com` 36, `globenewswire.com` 26, `business-wire.com` 6, `accesswire.ca` 6.
 - GNW RSS, 19:22:19Z: 20 items over 3.93 h.
