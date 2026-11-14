@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use pit::ObservationTime;
 
-use crate::budget::{BudgetError, BudgetScope, Pace, RequestBudget};
+use crate::budget::{BudgetError, BudgetScope, HostKey, Pace, RequestBudget};
 use crate::clock::{Clock, Sleeper, ThreadSleeper};
 use crate::ledger::{AttemptId, SendPermit};
 use crate::request::{CredentialRef, HeaderValue, Request, SourceId};
@@ -331,14 +331,16 @@ impl Wire {
         let Some(interval) = self.profile.budget.per_host else {
             return Ok(());
         };
-        let host = url
-            .parse::<ureq::http::Uri>()
-            .ok()
-            .and_then(|uri| uri.host().map(str::to_ascii_lowercase))
-            .ok_or_else(|| BudgetError::NoHost {
-                url: url.to_owned(),
-            })?;
-        let pace = Pace::beside_the_store(&self.store, &BudgetScope::PerHost(host), interval);
+        // ureq 3.5.2 parses a url with this same `http::Uri` and fails before any socket, so an
+        // unparseable one goes on to fail as a `Transport` its attempt row records.
+        let Ok(uri) = url.parse::<ureq::http::Uri>() else {
+            return Ok(());
+        };
+        let host = uri.host().ok_or_else(|| BudgetError::NoHost {
+            url: url.to_owned(),
+        })?;
+        let scope = BudgetScope::PerHost(HostKey::new(host)?);
+        let pace = Pace::beside_the_store(&self.store, &scope, interval);
         self.sleeper.sleep(pace.reserve(clock.now())?);
         Ok(())
     }
@@ -429,6 +431,11 @@ mod tests {
     const LOCALHOST: &str = "http://localhost:1/never";
     const LOCALHOST_SHOUTED: &str = "http://LOCALHOST:1/never";
     const NO_HOST: &str = "/never";
+    /// `http::Uri` keeps an IPv6 literal's brackets in its host, which no pace-file key admits.
+    const IPV6_LOOPBACK: &str = "http://[::1]:1/never";
+    const IPV6_HOST: &str = "[::1]";
+    /// A space is no url `http::Uri` parses, so ureq refuses it as a transport error.
+    const UNPARSEABLE: &str = "http://local host:1/never";
     const PACE_DIR: &str = "pace";
     const SOURCE_PACE_FILE: &str = "edgar_press.per-ip";
     const HOST_PACE_FILE: &str = "localhost.per-host";
@@ -901,6 +908,73 @@ mod tests {
                 Vec::new()
             )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_per_host_pace_on_a_host_no_pace_file_can_be_named_after_refuses_before_any_wait() -> Checked
+    {
+        let store = tempfile::tempdir()?;
+        let waits = WaitRecorder::default();
+        let refused = polite_refusal(store.path(), &waits, IPV6_LOOPBACK)?;
+        assert_eq!(
+            (refused, waits.waits()),
+            (
+                Some(SendFailure::Budget(BudgetError::NotAHostKey {
+                    host: IPV6_HOST.to_owned()
+                })),
+                Vec::new()
+            )
+        );
+        Ok(())
+    }
+
+    /// The run goes on: `collect` records a `Transport` failure on its attempt row and aborts on
+    /// a `Budget` one.
+    #[test]
+    fn a_url_that_does_not_parse_skips_the_host_wait_and_fails_as_a_transport_error() -> Checked {
+        let store = tempfile::tempdir()?;
+        let waits = WaitRecorder::default();
+        let refused = polite_refusal(store.path(), &waits, UNPARSEABLE)?;
+        assert_eq!(
+            (
+                matches!(refused, Some(SendFailure::Transport(_))),
+                waits.waits()
+            ),
+            (true, vec![NO_WAIT]),
+            "{refused:?}"
+        );
+        Ok(())
+    }
+
+    /// The host file holds the instant last granted, so the 1 s source counts its own interval
+    /// from the 100 ms source's send; holding `go_at + interval` let the last writer decide.
+    #[test]
+    fn a_longer_host_interval_is_counted_from_a_shorter_one_s_send() -> Checked {
+        let store = tempfile::tempdir()?;
+        let (brisk, polite) = (WaitRecorder::default(), WaitRecorder::default());
+        let mut brisk_profile = profile();
+        brisk_profile.budget.per_host = Some(TEST_INTERVAL);
+        let brisk_wire = Wire::with_sleeper(
+            brisk_profile,
+            held(),
+            store.path(),
+            &SourceId::new(ANOTHER_SOURCE),
+            Box::new(brisk.clone()),
+        );
+        send_to(
+            &brisk_wire,
+            &polite_clock(&[(RESERVED_AT, RESERVED_AT)]),
+            FIRST_ATTEMPT,
+            LOCALHOST,
+        )?;
+        send_to(
+            &polite_wire(store.path(), SOURCE, &polite),
+            &polite_clock(&[(SIXTY_MS_LATER, AFTER_THE_HOST_WAIT)]),
+            FIRST_ATTEMPT,
+            LOCALHOST,
+        )?;
+        assert_eq!(polite.waits(), vec![HOST_WAIT, NO_WAIT]);
         Ok(())
     }
 
