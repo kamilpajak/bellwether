@@ -18,7 +18,7 @@ them, which is what a reader needs. A script that answered its question once is 
 | file | the question it answers | when it runs again |
 |---|---|---|
 | `parity_baseline.py` | does an independent reading of the archive rules agree with the Rust one, day by day? | at every migration stage. It writes a baseline over the real lake and nothing reads it; the comparison is `newsvault_parity.py` |
-| `newsvault_parity.py` | do the two readings agree field by field, on the shapes the lake holds none of? | whenever either reader's rules change. **This is the parity gate**: its committed `expected.json` is read by `services/newsvault/tests/parity.rs`, so `cargo test` compares the Rust reader against a second implementation without running Python |
+| `newsvault_parity.py` | do the two readings agree field by field, on the shapes the lake holds none of? | whenever either reader's rules change. **This is the archive-reading parity gate** (memo §5.1): its committed `expected.json` is read by `services/newsvault/tests/parity.rs`, so `cargo test` compares the Rust reader against a second implementation without running Python |
 | `panel_recount.py` | how many company-sessions does the panel treat, under which rule version? | on every rule change, which is requirement R18 |
 | `panel_power.py` | what is the measured power of the registered procedure on this panel? | on every panel rebuild |
 | `matcher_audit.py` | what is the entity precision of the counterparty matcher, and what does the text cap cost? | on every change to the matching rules |

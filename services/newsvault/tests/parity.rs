@@ -1,8 +1,9 @@
-//! The parity gate: this reader against `probes/newsvault_parity.py`, over the sealed corpus the
-//! lake could not provide. Section 10 of architecture.md records what the 156-of-156 agreement
-//! does and does not say; the probe's `PREREGISTRATION.md` is the decision rule, and
-//! `probes/newsvault_parity/expected.json` is its committed output, which this file is the only
-//! reader of. Nothing here runs Python: the expectation is committed, so CI needs no interpreter.
+//! The archive-reading parity gate (memo §5.1): this reader against `probes/newsvault_parity.py`,
+//! over the sealed corpus the lake could not provide. Section 10 of architecture.md records what
+//! the 156-of-156 agreement does and does not say; the probe's `PREREGISTRATION.md` is the
+//! decision rule, and `probes/newsvault_parity/expected.json` is its committed output, which this
+//! file is the only reader of. Nothing here runs Python: the expectation is committed, so CI
+//! needs no interpreter.
 
 use std::error::Error;
 use std::path::{Path, PathBuf};

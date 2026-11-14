@@ -1,9 +1,9 @@
 """Independent pandas reading of the news lake, to be compared against the Rust reader.
 
-This is build step 3 of the successor memo: the frozen baseline that makes the parity
-gate exist. The point is NOT that pandas is authoritative - it is that two
-implementations written from the same stated rules must agree, and where they do not,
-the rules were ambiguous rather than one side being wrong.
+This is the archive-reading baseline of the successor memo §5.1. The point is NOT that
+pandas is authoritative - it is that two implementations written from the same stated
+rules must agree, and where they do not, the rules were ambiguous rather than one side
+being wrong.
 
 The rules, mirroring services/newsvault/src/lake.rs exactly:
   1. read every run=*.parquet under session_date=<d>/, in filename order
