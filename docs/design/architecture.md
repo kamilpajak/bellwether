@@ -730,7 +730,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
   - `leaks` counts sampled filings above the scalar, so under a max `leak_rate()` is `0.0` by construction and says nothing about the vendor; the informative count is index rows whose `Date Filed` is not their own index's day, **0 of 384 and 0 of 549** on these two days.
   - **How the number reaches a run:**
     - `--lag-policy` names a hashed policy file holding one `MeasuredLag` per (source, provenance), keyed by both because one adapter read live and read earlier are two populations (R10); `news_provider::lag_policy::LagPolicy::read` is its only constructor; `cmd_collect::open_provider` hands the entry to `EdgarPress::with_observation_lag`; the committed policy is `news-provider/policy/observation-lag.json`.
-    - The policy's bytes are archived before the plan (`cmd_collect::copy_policy_into_vault`, called from `cmd_collect::run`); the run envelope names policy, probe and lag (`cmd_collect::envelope_of`); not the item row: §3.1's `Item` has no observation-lag field, so a stored item reaches the probe through its `attempt_id` and that run's envelope.
+    - The policy's bytes are archived before the plan (`cmd_collect::copy_policy_into_vault`, called from `cmd_collect::run`); the run envelope names policy, probe and lag (`cmd_collect::envelope_of`); not the item row: §3.1's `Item` has no observation-lag field (no column added: nothing would read it), so a stored item reaches the probe through its `attempt_id` and that run's envelope.
     - Measured 2026-11-13 against live EDGAR with the policy: window `2026-11-12`, run date `2026-11-13`, 1 index request planned, `vendor_archive` arm on all 5 attempts, 4 items committed from a 3-CIK roster out of 7,805 vendor rows, 5 requests spent; without `--lag-policy` it refuses at exit 2 with `no lag entry` before any request.
   - **Which instant a backfilled row carries: `valid + seconds`, not the fetch clock (§8 row R11).** Not the fetch clock: it RECORDS when we read, years late on a real backfill. `valid + seconds` is the COUNTERFACTUAL a point-in-time study wants, one number per source, loose by the spread of acceptance times inside a filing day; a date is bounded at the END of its own calendar day plus the lag.
     - That looseness, measured on the run above while rows were still dated by the fetch clock: the four items' `observed_at` `2026-11-13T17:44:5x Z` against `valid_at + 94,922 s` differ by **not one sign** - `-5.81 h`, `-5.82 h`, `+2.17 h`, `+2.16 h`; the two negatives are the max scalar loose for a row whose own lag was `5.85 h`.
@@ -860,10 +860,10 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | story state | held? |
 |---|---|
 | has a committed item | yes |
-| `Document` attempt closed `Usable`, `Empty`, `PermanentFailure`, or with only unusable rows | yes: re-fetching an empty or unusable page returns the same page; the raw blob (§3.9) allows re-extraction |
+| `Document` attempt closed `Usable`, `Empty`, `PermanentFailure`, or with only unusable rows | yes (an `Empty` or unusable page: re-fetching returns the same page; the raw blob, §3.9, allows re-extraction) |
 | `TransientFailure`, interrupted by the startup sweep, in flight | no |
 
-- The states are `news_provider::ledger::Verdict` arms; today §3.2's `OutcomeKind` maps both failures to `failed` (`ledger.rs:216`). `Finalised` carries the `Verdict`, so permanence is stored.
+- `Usable`, `Empty`, `PermanentFailure`, `TransientFailure` are `news_provider::ledger::Verdict` arms; today §3.2's `OutcomeKind` maps both failures to `failed` (`ledger.rs:216`). `Finalised` carries the `Verdict`, so permanence is stored.
 - New columns `attempts.story_id` and `attempts.held`; `ledger --check` subtracts `held`. First sighting is unchanged: a skip writes no item. So R15 cannot see a re-stamped time of a held story; the index value survives only in the attempt's raw blob.
 - Schema versioned with `PRAGMA user_version`, read at `Committer::open`: a lower version is migrated by explicit `ALTER TABLE` (a table rebuild for a `CHECK` change); an unknown higher version is refused.
 
@@ -877,7 +877,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - The robots and floor checks run in `newsvault` (only the driver reads the store); it hands the provider the Crawl-delay parsed from the pinned robots blob.
 - Redirects refused: `TransportProfile.redirects = Refuse` sets `max_redirects(0)`; a 3xx is a `PermanentFailure`, which closes R19 hole 9 by refusal.
 - One interval for all hosts: every admitted host is at 10 s. R19 hole 7 stays open.
-- `ValidPrecision::Minute` for GNW's minute-resolution `pubDate` needs a `pit::datedness::Published` arm, a `canon` stamp arm with a committed vector, and a store `CHECK` change (step 2). `items` gains `valid_raw`, `valid_field`, `valid_source`.
+- Decided: `ValidPrecision::Minute` for GNW's minute-resolution `pubDate`. It needs a `pit::datedness::Published` arm, a `canon` stamp arm with a committed vector, and a store `CHECK` change (step 2). `items` gains `valid_raw`, `valid_field`, `valid_source`.
 
 | window (UTC) | poll every | run stops issuing requests when busy time would pass |
 |---|---|---|
