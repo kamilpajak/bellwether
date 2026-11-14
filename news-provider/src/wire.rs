@@ -325,7 +325,7 @@ impl Wire {
         }
     }
 
-    /// Taken BEFORE the per-IP slot is reserved: an IP slot reserved and then held through a 30 s
+    /// Taken BEFORE the per-IP slot is reserved: an IP slot reserved and then held through a long
     /// host wait would push every other host's call behind it (row R19).
     fn wait_out_the_host(&self, url: &str, clock: &dyn Clock) -> Result<(), BudgetError> {
         let Some(interval) = self.profile.budget.per_host else {
