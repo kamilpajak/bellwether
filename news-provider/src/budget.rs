@@ -19,33 +19,36 @@ use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 
 use crate::request::SourceId;
 
-/// Which bucket a vendor's quota counts against, and therefore which callers have to share one
-/// pace file. The other arm is per-CREDENTIAL, where the bucket follows the key across hosts and a
-/// second key is a second bucket; no vendor here has one, so it is named and not written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which bucket one pace file counts, and so which callers share it. The other arm is
+/// per-CREDENTIAL, where the bucket follows the key across hosts and a second key is a second
+/// bucket; no vendor here has one, so it is named and not written.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BudgetScope {
-    /// The host's outbound address. The caller names itself in the User-Agent and that does not
-    /// scope the quota, so every process on one host shares one bucket and two hosts hold
-    /// independent ones.
-    PerIp,
+    /// Our outbound address, per source. The caller names itself in the User-Agent and that does
+    /// not scope the quota, so every process on one host shares one bucket.
+    PerIp(SourceId),
+    /// One remote host, lowercased, and NOT the source: two sources asking one host share it.
+    PerHost(String),
 }
 
 impl BudgetScope {
-    /// The pace file's suffix, so two buckets cannot land on one file name.
-    const fn in_a_file_name(self) -> &'static str {
+    /// The pace file's name, whose suffix keeps the two kinds of bucket off one file.
+    fn file_name(&self) -> String {
         match self {
-            Self::PerIp => "per-ip",
+            Self::PerIp(source) => format!("{}.per-ip", source.as_str()),
+            Self::PerHost(host) => format!("{host}.per-host"),
         }
     }
 }
 
-/// How fast one vendor may be called, and what the limit is counted against. Stated by the
-/// provider, like the timeouts beside it.
+/// How fast one vendor may be called. Stated by the provider, like the timeouts beside it. A call
+/// owing both paces waits out each in turn, so it is held to the stricter of the two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestBudget {
-    /// The smallest gap between two calls counted against the same bucket.
+    /// The smallest gap between two calls leaving our address for this vendor.
     pub min_interval: Duration,
-    pub scope: BudgetScope,
+    /// The smallest gap between two calls to one remote host, when the vendor states one.
+    pub per_host: Option<Duration>,
 }
 
 /// Why no call could be paced. Raised before the socket, so it is never a vendor event in the
@@ -62,6 +65,9 @@ pub enum BudgetError {
     /// another writer, and both answers to "when may I call" would be invented.
     #[error("the pace file at {path} holds {held:?} and not an instant this crate wrote")]
     Unreadable { path: PathBuf, held: String },
+    /// A per-host pace and a url with no host to key it on: refused rather than left unpaced.
+    #[error("{url} names no host to key a per-host pace on")]
+    NoHost { url: String },
 }
 
 /// The directory the pace file sits in, under the store root the run writes to.
@@ -71,29 +77,25 @@ const PACE_DIR: &str = "pace";
 #[derive(Debug)]
 pub struct Pace {
     path: PathBuf,
-    budget: RequestBudget,
+    min_interval: Duration,
 }
 
 impl Pace {
-    /// `<store>/pace/<source>.<scope>` — beside the archive the run writes, never a system
-    /// directory. The hole that choice leaves is named in row R19: one host running two stores
-    /// holds two pace files and therefore two buckets, which a per-IP quota does not.
+    /// `<store>/pace/<source>.per-ip` or `<store>/pace/<host>.per-host` — beside the archive the
+    /// run writes, never a system directory. The hole that leaves is named in row R19: one host
+    /// running two stores holds two pace files and therefore two buckets.
     #[must_use]
-    pub fn beside_the_store(store: &Path, source: &SourceId, budget: RequestBudget) -> Self {
+    pub fn beside_the_store(store: &Path, scope: &BudgetScope, min_interval: Duration) -> Self {
         Self {
-            path: store.join(PACE_DIR).join(format!(
-                "{}.{}",
-                source.as_str(),
-                budget.scope.in_a_file_name()
-            )),
-            budget,
+            path: store.join(PACE_DIR).join(scope.file_name()),
+            min_interval,
         }
     }
 
     /// Reserves this caller's slot and answers how long it must wait before the socket. The lock
     /// is released before the answer comes back, so the wait is outside the critical section.
     pub fn reserve(&self, now: DateTime<Utc>) -> Result<Duration, BudgetError> {
-        let interval = TimeDelta::from_std(self.budget.min_interval)
+        let interval = TimeDelta::from_std(self.min_interval)
             .map_err(|why| self.unusable("read as an interval", &why))?;
         let file = self.open()?;
         file.lock().map_err(|why| self.unusable("locked", &why))?;
