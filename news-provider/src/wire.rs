@@ -41,8 +41,8 @@ pub struct TransportProfile {
     pub timeouts: Timeouts,
     /// Bytes of response body read before ureq refuses the rest.
     pub body_limit: u64,
-    /// How fast this vendor may be called and what the quota counts against. `Wire::new` builds
-    /// the pace file from it, so the interval has one producer: the provider.
+    /// How fast this vendor may be called, so both intervals have one producer: the provider.
+    /// `Wire::new` builds the per-IP pace file; `Wire::send` opens a per-host one per url host.
     pub budget: RequestBudget,
 }
 
@@ -412,7 +412,7 @@ mod tests {
     const ELAPSED: Duration = Duration::from_millis(60);
     const EXPECTED_WAIT: Duration = Duration::from_millis(40);
     const NO_WAIT: Duration = Duration::ZERO;
-    /// `<store>/pace/<source>.<scope>`, which is the layout `Pace::beside_the_store` states.
+    /// `<store>/pace/<source>.per-ip`, the per-IP layout `BudgetScope::file_name` states.
     const PACE_FILE: &str = "pace/edgar_press.per-ip";
     /// `RESERVED_AT` plus `TEST_INTERVAL`, in the form the pace file is written in.
     const RESERVED_UNTIL: &str = "2026-11-10T13:00:00.100000Z";

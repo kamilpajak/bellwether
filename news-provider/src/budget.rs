@@ -19,13 +19,13 @@ use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 
 use crate::request::SourceId;
 
-/// Which bucket one pace file counts, and so which callers share it. The other arm is
-/// per-CREDENTIAL, where the bucket follows the key across hosts and a second key is a second
-/// bucket; no vendor here has one, so it is named and not written.
+/// Which bucket one pace file counts, and so which callers share it. A third arm, per-CREDENTIAL,
+/// would follow the key across hosts with a second key as a second bucket; no vendor here has one,
+/// so it is named and not written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BudgetScope {
-    /// Our outbound address, per source. The caller names itself in the User-Agent and that does
-    /// not scope the quota, so every process on one host shares one bucket.
+    /// Our outbound address, keyed per SOURCE (`<source>.per-ip`): every process collecting one
+    /// source shares the bucket, and two sources on one address hold two (row R19).
     PerIp(SourceId),
     /// One remote host, lowercased, and NOT the source: two sources asking one host share it.
     PerHost(String),
@@ -42,12 +42,13 @@ impl BudgetScope {
 }
 
 /// How fast one vendor may be called. Stated by the provider, like the timeouts beside it. A call
-/// owing both paces waits out each in turn, so it is held to the stricter of the two.
+/// owing both paces waits out the host's and then our address's, so two calls to one host leave at
+/// least `per_host` less the per-IP wait owed after the host wait apart (row R19, hole 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestBudget {
     /// The smallest gap between two calls leaving our address for this vendor.
     pub min_interval: Duration,
-    /// The smallest gap between two calls to one remote host, when the vendor states one.
+    /// The gap between two host reservations to one remote host, when the vendor states one.
     pub per_host: Option<Duration>,
 }
 
