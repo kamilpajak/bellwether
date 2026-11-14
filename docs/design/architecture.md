@@ -1,30 +1,34 @@
 # Architecture
 
-**Status:** DRAFT 2026-11-11. The level below `successor_system_design_2026_11_11.md`: that memo
-names five services, their boundaries and the eighteen requirements they serve; this document says
-what crosses each boundary, in what shape, and where each requirement is actually enforced.
-
-Read the memo first. Every `R`-number here refers to one of its requirements and every requirement
-there is paired with the measurement that forced it.
+- **Status:** DRAFT 2026-11-11.
+- The level below `successor_system_design_2026_11_11.md`:
+  - that memo names five services, their boundaries and the eighteen requirements they serve;
+  - this document says what crosses each boundary, in what shape, and where each requirement is
+    actually enforced.
+- Read the memo first.
+- Every `R`-number here refers to one of the memo's requirements; every requirement there is paired
+  with the measurement that forced it.
 
 ---
 
 ## 0. What this document decides, and what it does not
 
-**Decides:** the artefacts that cross service boundaries and their required fields; which boundary
-is a file and which is a call; how identity and versioning work, so that any number can name the
-inputs that produced it; what each service does when its input is missing, stale or partial; and
-for each of the eighteen requirements, the single place it is enforced.
-
-**Defers to the memo:** why there are five services, why the build is parallel to the predecessor,
-and the decisions still open there.
-
-**Excludes on purpose:** the order-placing path and the front-end. Neither is in this repository and
-neither is reachable from it. §7 states that as a structural property rather than a policy.
-
-**The test this document is written against.** An architecture is mature when an invariant cannot be
-stated without naming where it is enforced. §8 is that table and it is the part worth attacking
-first; its status column, and no sentence anywhere, is the count of what is enforced.
+- **Decides:**
+  - the artefacts that cross service boundaries and their required fields;
+  - which boundary is a file and which is a call;
+  - how identity and versioning work, so that any number can name the inputs that produced it;
+  - what each service does when its input is missing, stale or partial;
+  - for each of the eighteen requirements, the single place it is enforced.
+- **Defers to the memo:** why there are five services, why the build is parallel to the
+  predecessor, and the decisions still open there.
+- **Excludes on purpose:** the order-placing path and the front-end.
+  - Neither is in this repository and neither is reachable from it.
+  - §7 states that as a structural property rather than a policy.
+- **The test this document is written against.**
+  - An architecture is mature when an invariant cannot be stated without naming where it is
+    enforced.
+  - §8 is that table and the part worth attacking first.
+  - §8's status column, and no sentence anywhere, is the count of what is enforced.
 
 ---
 
@@ -38,27 +42,31 @@ first; its status column, and no sentence anywhere, is the count of what is enfo
 | `propose` | Turns a panel into a ranked shortlist and the document a person reads. | one |
 | `ledger` | Reads outcomes, which nothing upstream may see. One-way edge. | one |
 
-Statistics stay in Python, inside this repository, on the far side of a file boundary from `derive`
-(§3.4). The memo's decision D-4 explains why they are not a sixth service and not a second
-repository.
+- Statistics stay in Python, inside this repository, on the far side of a file boundary from
+  `derive` (§3.4).
+- The memo's decision D-4 explains why they are not a sixth service and not a second repository.
 
 ---
 
 ## 2. Identity and versioning
 
-Nothing is named by where it came from; everything is named by what it contains, with one exception
-stated below: a dedup key must survive a correction of the contents, so `story_id` names the vendor
-row. This is what makes R18 — two panels, two rule versions, diffed — a command, not an afternoon.
-
-**The hazard that cheapness creates:** a new `rule_version` costs a command and nothing counts how
-many were tried against one snapshot — the postmortem's Pattern 6, 26 tests with Bonferroni at n=2
-where true n was ≥ 15 (`docs/inherited/paradigm_failures_postmortem.md:173`), and there a rule
-change was at least a countable commit. The smallest count: a registration field on the manifest and
-an append-only ledger of the pairs a `derive diff` compared; whether it gates is the owner's.
+- Nothing is named by where it came from; everything is named by what it contains.
+- One exception: a dedup key must survive a correction of the contents, so `story_id` names the
+  vendor row.
+- This is what makes R18 — two panels, two rule versions, diffed — a command, not an afternoon.
+- **The hazard that cheapness creates:**
+  - a new `rule_version` costs a command, and nothing counts how many were tried against one
+    snapshot;
+  - precedent: the postmortem's Pattern 6, 26 tests with Bonferroni at n=2 where true n was ≥ 15
+    (`docs/inherited/paradigm_failures_postmortem.md:173`), and there a rule change was at least a
+    countable commit;
+  - the smallest count: a registration field on the manifest and an append-only ledger of the pairs
+    a `derive diff` compared;
+  - whether it gates is the owner's.
 
 | name | derivation | why not something simpler |
 |---|---|---|
-| `item_id` | sha256 over the item's canonical form: `source`, `source_item_id`, `url`, `valid_at`, `title`, `body_ref` | A per-process hash is not an identity. The predecessor named typed artefacts with Python's `hash()`, which is randomised per process, so a resumed run could not recognise its own prior output and would have rewritten 5,756 records. This is the **content** witness and nothing else: a re-stamped time or an edited title is a new `item_id` under one `story_id`, which is how "the bytes changed" is visible at all. |
+| `item_id` | sha256 over the item's canonical form: `source`, `source_item_id`, `url`, `valid_at`, `title`, `body_ref` | A per-process hash is not an identity. The predecessor named typed artefacts with Python's `hash()`, randomised per process, so a resumed run could not recognise its own prior output and would have rewritten 5,756 records. This is the **content** witness and nothing else: a re-stamped time or an edited title is a new `item_id` under one `story_id`, which is how "the bytes changed" is visible at all. |
 | `story_id` | sha256 over (`source`, `source_item_id`) — the vendor's own identity, the one part of a row a re-stamp does not touch | **The dedup key (§5 row 5) and R15's join key**, which `item_id` cannot be: it hashes `valid_at` and `title`, the two fields under dispute, so a re-stamp would mint a fresh item instead of a disputed twin and R15 would have nothing to attach to. Measured 2026-11-12 over the lake §10 describes: of the 501 ids that appear in more than one partition, all 501 keep one url throughout, and **every one of §10's 1,225 repeat appearances carries a publication time that id did not have before** — median span between an id's first and last stamp 4 days 15:16, worst 159 days. |
 | `seq` | monotonic integer assigned by the store on commit | **The only ordering authority.** Wall clocks are evidence, never order: a fetch issued at 10:00 that commits at 10:01:10 carries data through 10:00 while one issued at 10:01 has already committed data through 10:01, so ordering by commit time returns the older data as current. Assigned since 2026-11-13 from a committed `seq_reservations` row, and read since the segment export: `publish::read_day` returns a publication day's rows through one ordering helper whose key is the `seq` column, across every segment of the partition. Mutation 2026-11-13: keying that helper on `committed_at` turns `the_ordering_helper_sorts_on_seq_and_leaves_no_row_behind` red. `newsvault day --lake` still sorts by (publication time, id) because the predecessor's lake has no `seq` — presentation only, so no consumer may read that array order as commit order. |
 | `snapshot_id` | sha256 over the canonical form of (the list of `item_id` in scope in ascending `seq`, the cutoff) | A date range is not reproducible — the archive grows under it. A snapshot is a set. The list and the cutoff are also fields of the manifest (§3.0), because neither can be read back out of a digest. |
@@ -70,21 +78,25 @@ an append-only ledger of the pairs a `derive diff` compared; whether it gates is
 | `panel_id` | sha256 over (`snapshot_id`, `rule_version`, `calendar_version`, `universe_version`, `relation_map_version`, row set) | A panel that cannot name its inputs cannot be re-derived, and a number whose panel cannot be re-derived is an anecdote. The row set means §3.10.1's rows in canonical form, not the Arrow file's bytes. Measured 2026-11-12 over one four-row panel conforming to §3.10.1, two counterparties in its first row: arrow-rs 60.1.0 writes 2,578 bytes and pyarrow 24.0.0 writes 2,050 of the same rows, and splitting them into two record batches makes 2,634 — so the container cannot be the digest input. Those three sizes hold for that panel's own strings and metadata and no fixture is committed, so a reader measuring a four-row panel of their own reproduces the **disagreement** and not the sizes: pyarrow 24.0.0 over one built to this table on 2026-11-12 gives 2,202 in one batch against 2,786 in two. The disagreement is the claim. |
 | `brief_id` | sha256 over (`panel_id`, scorer version, prompt versions, candidate set) | The proposal a person acted on must be recoverable exactly. |
 
-**Canonical form, the one convention every digest above takes** — two implementations of one digest
-rule being the defect the parity run already paid for (memo §5.1: a mismatch on all 156 days, a
-locale sort against code-point order). Fields are rendered UTF-8 and NFC-normalised and joined with
-`0x1f`, no trailing separator; a list joins its members with `0x1e` in the order its own field
-states; an instant is RFC 3339 UTC `Z` at microsecond precision beside its `valid_precision` (§3.1),
-so a `day` value and an `instant` value cannot collide; an absent optional field contributes an empty
-string; every string ordering is over raw UTF-8 bytes, never a locale's collation. Three of these
-digests have a producer since 2026-11-13 — `attempt_id` and `filter_params`, both taken by
-`news-provider`'s `AttemptSlot::open`, and `result_digest`, taken by `newsvault ledger` over the item
-ids one attempt committed — and the other four do not (§8 row R7), each landing with
-one committed test vector, which is what makes two implementations disagree loudly.
-
-**Content-addressed blobs.** Raw vendor payloads are stored once under their own digest and
-referenced. An unchanged answer costs no storage and, more importantly, does not re-stamp anything
-as current — a fresh timestamp on unchanged content is how "latest" starts lying.
+- **Canonical form, the one convention every digest above takes.**
+  - Two implementations of one digest rule is the defect the parity run already paid for (memo
+    §5.1: a mismatch on all 156 days, a locale sort against code-point order).
+  - Fields are rendered UTF-8, NFC-normalised, joined with `0x1f`, no trailing separator.
+  - A list joins its members with `0x1e` in the order its own field states.
+  - An instant is RFC 3339 UTC `Z` at microsecond precision beside its `valid_precision` (§3.1), so
+    a `day` value and an `instant` value cannot collide.
+  - An absent optional field contributes an empty string.
+  - Every string ordering is over raw UTF-8 bytes, never a locale's collation.
+  - Three of these digests have a producer since 2026-11-13:
+    - `attempt_id` and `filter_params`, both taken by `news-provider`'s `AttemptSlot::open`;
+    - `result_digest`, taken by `newsvault ledger` over the item ids one attempt committed.
+  - The other four do not (§8 row R7), each landing with one committed test vector, which is what
+    makes two implementations disagree loudly.
+- **Content-addressed blobs.**
+  - Raw vendor payloads are stored once under their own digest and referenced.
+  - An unchanged answer costs no storage.
+  - More importantly, it does not re-stamp anything as current — a fresh timestamp on unchanged
+    content is how "latest" starts lying.
 
 ---
 
@@ -92,9 +104,10 @@ as current — a fresh timestamp on unchanged content is how "latest" starts lyi
 
 ### 3.0 `Snapshot` — `vault` to `derive`, the reproducibility boundary (decided 2026-11-12)
 
-The manifest beside the Arrow file §4 names, and `derive`'s primary input, so an unstated field here
-is a guess in the next service to be built. The Arrow half carries §3.1's rows and has no wire format
-yet, on §3.10's trigger: `derive` has no code.
+- The manifest beside the Arrow file §4 names, and `derive`'s primary input: an unstated field here
+  is a guess in the next service to be built.
+- The Arrow half carries §3.1's rows and has no wire format yet, on §3.10's trigger: `derive` has no
+  code.
 
 | field | type | why it exists |
 |---|---|---|
@@ -109,7 +122,8 @@ yet, on §3.10's trigger: `derive` has no code.
 
 ### 3.1 `Item` — what `vault` stores and publishes
 
-The archive record. Every consumer sees this shape and none sees the storage behind it.
+- The archive record.
+- Every consumer sees this shape and none sees the storage behind it.
 
 | field | type | why it exists |
 |---|---|---|
@@ -133,28 +147,33 @@ The archive record. Every consumer sees this shape and none sees the storage beh
 | `vendor_tickers` | list | the vendor's own tagging, **kept and never used for matching** |
 | `vendor_duplicate_flag` | bool | the vendor's own dedup verdict, **kept and never filtered on** |
 
-The last two rows are one rule stated twice: a vendor's editorial decisions are recorded as data,
-never adopted as ours. Their dedup is unauditable by us; ours is a hashed rule with a version.
+- The last two rows are one rule: a vendor's editorial decisions are recorded as data, never adopted
+  as ours.
+- Their dedup is unauditable by us; ours is a hashed rule with a version.
 
-**The one visibility query.** `visible_at(cutoff)` is true when `valid_at <= cutoff` **and**
-`observed_at <= cutoff`. That is not fastidiousness: the half-question was asked in a retrieval test
-and admitted documents not visible at the claimed instant in 60.2% of 69 probes, while the full
-question leaked in none. How far the type system goes towards making the half-question unaskable,
-and where it stops, is §8 row R2's and nowhere else's.
+**The one visibility query.**
 
-A `day`-precision item answers it through its own arm: visible once the cutoff passes the end of that day
-**in the calendar the item names**, never UTC midnight, which is 19:00 in New York and admits the afternoon.
-An undated item is visible at no cutoff. The arm has one producer, the lake reader, which reads a
-publication value stamped exactly at midnight as a date, the predecessor's lake having no precision
-column: measured 2026-11-13 over its 779 run files and 243,226 rows, **7,767 rows (3.19%)** are stamped
-`00:00:00.000000` and for source `perplexity` it is **7,141 of 7,141**, every row. Read as instants those
-were visible from 00:00Z of their own day, so `newsvault day --at` returned them up to a day early.
+- `visible_at(cutoff)` is true when `valid_at <= cutoff` **and** `observed_at <= cutoff`.
+- Measured in a retrieval test: the half-question admitted documents not visible at the claimed
+  instant in 60.2% of 69 probes; the full question leaked in none.
+- How far the type system goes towards making the half-question unaskable, and where it stops: §8
+  row R2 and nowhere else.
+- A `day`-precision item answers it through its own arm: visible once the cutoff passes the end of
+  that day **in the calendar the item names**, never UTC midnight, which is 19:00 in New York and
+  admits the afternoon.
+- An undated item is visible at no cutoff.
+- The arm has one producer, the lake reader: it reads a publication value stamped exactly at
+  midnight as a date, because the predecessor's lake has no precision column.
+- Measured 2026-11-13 over the lake's 779 run files and 243,226 rows: **7,767 rows (3.19%)** are
+  stamped `00:00:00.000000`; for source `perplexity` it is **7,141 of 7,141**, every row.
+- Read as instants, those were visible from 00:00Z of their own day, so `newsvault day --at`
+  returned them up to a day early.
 
 ### 3.2 `Attempt` — the coverage ledger
 
-One row per attempt, written **whether or not anything came back**. This is the difference between
-"nothing happened" and "we did not look", and the predecessor could not tell them apart: one day
-held 59 items against a median of 181 and nothing recorded which it was.
+- One row per attempt, written **whether or not anything came back**.
+- This separates "nothing happened" from "we did not look". The predecessor could not tell them
+  apart: one day held 59 items against a median of 181 and nothing recorded which it was.
 
 | field | notes |
 |---|---|
@@ -166,13 +185,14 @@ held 59 items against a median of 181 and nothing recorded which it was.
 | `cost` | vendor units and currency, so the archive knows what it cost |
 | `result_digest` | sha256 of the returned id set, so a repeated query's drift is detectable |
 
-`collapsed` is its own outcome: a payload that shrank to a fraction of what the store already holds
-is a degraded fetch, not a quieter world. A throttled success looks exactly like a quiet day.
+- `collapsed` is its own outcome: a payload that shrank to a fraction of what the store already
+  holds is a degraded fetch, not a quieter world.
+- A throttled success looks exactly like a quiet day.
 
 ### 3.3 `RuleSet` — what `derive` is a function of
 
-A file, hashed, versioned, and the only place these choices exist. Constants in code cannot be
-diffed, tested or attributed.
+- A file, hashed, versioned, and the only place these choices exist.
+- Rejected: constants in code, which cannot be diffed, tested or attributed.
 
 | group | contents |
 |---|---|
@@ -180,16 +200,19 @@ diffed, tested or attributed.
 | `salience_rule` | six keys, each a value in the file and not an expression to evaluate: `counting_unit` (**D-8's, open**), `window_sessions`, `baseline_sessions`, `order_statistic`, `floor` (counted in `counting_unit`, so **D-8's too**), `tie_rule`. **Salience** is how often a counterparty's **core** — the name token a match is made on — occurs in the window ending at T, in `counting_unit`; the core is salient when that count is at or above `floor` and at or above the `order_statistic` of its own baseline |
 | `panel_rule` | `presence`: which (ticker, session) rows exist at all, and nothing else — that is the whole of what `derive` decides about the panel's shape. The winsorisation cuts and the market adjustment are the statistics tier's, below |
 
-Each gazetteer entry is a line in a file and therefore a diff. The case that motivated this: a
-hand-written gazetteer removed `Premier`, which is a real company and a real counterparty, and
-nothing recorded the error because the list lived inside a script.
+- Each gazetteer entry is a line in a file and therefore a diff.
+- The case that motivated this: a hand-written gazetteer removed `Premier`, a real company and a
+  real counterparty, and nothing recorded the error because the list lived inside a script.
 
-**The file, what `rule_version` digests, and the two keys still blank.** One JSON object, keys sorted,
-LF endings, one trailing newline; `rule_version` is sha256 of those bytes as committed, so a
-whitespace edit is a new version — wrong in the safe direction and needing no second canonicalisation.
-Gazetteers and the calendar are their own files (§2), named by path and digest so one `rule_version`
-still covers the set. The two `null`s are D-8's and only D-8's; every other value is the example's
-own, the shape being what is contracted:
+**The file, what `rule_version` digests, and the two keys still blank.**
+
+- One JSON object, keys sorted, LF endings, one trailing newline.
+- `rule_version` is sha256 of those bytes as committed, so a whitespace edit is a new version —
+  wrong in the safe direction and needing no second canonicalisation.
+- Gazetteers and the calendar are their own files (§2), named by path and digest so one
+  `rule_version` still covers the set.
+- The two `null`s are D-8's and only D-8's; every other value is the example's own, the shape being
+  what is contracted:
 
 ```json
 {"schema": "rules/1",
@@ -198,28 +221,41 @@ own, the shape being what is contracted:
  "panel_rule": {"presence": "close_on_session_and_next"}}
 ```
 
-**Where the winsorisation cuts and the market adjustment live.** Not in the rule set: both act on a
-return and §3.10.1's panel carries none, while `probes/panel_power.py` already holds both as
-literals beside its floors, alpha, draw counts and seed. Their home is that tier's own hashed params
-file, whose digest — `params_version`, named here and nowhere else — goes beside every power number.
+**Where the winsorisation cuts and the market adjustment live.**
+
+- Not in the rule set: both act on a return and §3.10.1's panel carries none.
+- `probes/panel_power.py` already holds both as literals beside its floors, alpha, draw counts and
+  seed.
+- Their home is that tier's own hashed params file; its digest — `params_version`, named here and
+  nowhere else — goes beside every power number.
 
 ### 3.4 `Panel` — `derive` to `propose`, and to the statistics tier
 
-An Arrow file plus a manifest, and not a call: the panel outlives the process. The data file is
-§3.10.1. **The manifest's field list is not here**; it is published by the crate that checks it —
-`panel-contract schema --format=json` names every field, whether it is always required, and why. The
-cost is that a reader of this section runs a binary; what it buys is one list, which the document
-can neither over-promise nor under-report.
+- An Arrow file plus a manifest, and not a call: the panel outlives the process.
+- The data file is §3.10.1.
+- **The manifest's field list is not here**; the crate that checks it publishes it:
+  `panel-contract schema --format=json` names every field, whether it is always required, and why.
+- Cost: a reader of this section runs a binary. Gain: one list, which the document can neither
+  over-promise nor under-report.
 
-**Why the field set exists**, which no field list carries. The predecessor computed power as 88.2%
-from the independent-rows formula; measured through its own randomization procedure the answer was
-27.4%, and on a corrected archive 10.9%. The formula answered a different question and nothing could
-tell. Hence `rows` is **counted**, never multiplied (the predecessor's panel was
-`len(universe) * len(sessions)`, a rectangle wearing a count's clothes), and `exchangeable_units`
-carries three keys — `count`, `unit`, `definition` — the unit's name alone not saying what made two
-exchangeable. A required field is half the fix; the other half is a consumer that **refuses** a panel
-lacking it, and that does not exist: `panel-contract` requires the field (§8 row R8) while the
-statistics code reads an ad-hoc `assign.json` + `meta.json` and counts its own units (row R9).
+**Why the field set exists**, which no field list carries.
+
+- The predecessor's power figure, by construction:
+
+| construction | power |
+|---|---|
+| independent-rows formula | 88.2% |
+| measured through the predecessor's own randomization procedure | 27.4% |
+| same, on a corrected archive | 10.9% |
+
+- The formula answered a different question and nothing could tell.
+- Hence `rows` is **counted**, never multiplied: the predecessor's panel was
+  `len(universe) * len(sessions)`, a rectangle wearing a count's clothes.
+- `exchangeable_units` carries three keys — `count`, `unit`, `definition` — because the unit's name
+  alone does not say what made two exchangeable.
+- A required field is half the fix; the other half is a consumer that **refuses** a panel lacking
+  it, and that does not exist: `panel-contract` requires the field (§8 row R8) while the statistics
+  code reads an ad-hoc `assign.json` + `meta.json` and counts its own units (row R9).
 
 ### 3.5 `ModelRequest` / `ModelResponse` — the only exit to a model
 
@@ -239,18 +275,23 @@ statistics code reads an ad-hoc `assign.json` + `meta.json` and counts its own u
 | `generation_id`, `model_build` | the dated build that answered, not the alias that was requested |
 | `cost` | charged against a per-run cap that is a hard stop, not a warning |
 
-Two rules are structural rather than advisory. **A model is never asked for a number**: the schema
-has no numeric type, so the rule cannot be broken by a careless prompt. And **a bracket condition
-never enters a prompt**: filtering by market capitalisation, date or threshold happens afterwards in
-code, where it can be tested.
+Two rules are structural, not advisory:
 
-Draw voting lives here, not in callers. The instability is a property of the model, so it is
-absorbed at the boundary: N draws, a recorded vote, and the per-draw answers kept. Measured on the
-predecessor, proposing which names are in play disagreed from draw to draw while typing the relation
-between two named companies did not — so the unstable step and the stable step are different calls,
-metered separately. The two figures are deliberately not quoted: their construction sits in the
-predecessor's archive, which D-4 leaves behind, and a number whose construction a reader cannot
-reach is an anecdote. They belong here once re-measured on a real run.
+- **A model is never asked for a number**: the schema has no numeric type, so a careless prompt
+  cannot break the rule.
+- **A bracket condition never enters a prompt**: filtering by market capitalisation, date or
+  threshold happens afterwards in code, where it can be tested.
+
+Draw voting:
+
+- Lives here, not in callers: the instability is a property of the model, so the boundary absorbs
+  it — N draws, a recorded vote, and the per-draw answers kept.
+- Measured on the predecessor: proposing which names are in play disagreed from draw to draw;
+  typing the relation between two named companies did not. So the unstable step and the stable
+  step are different calls, metered separately.
+- The two figures are not quoted: their construction sits in the predecessor's archive, which D-4
+  leaves behind, and a number whose construction a reader cannot reach is an anecdote.
+- They belong here once re-measured on a real run.
 
 ### 3.6 `Brief` — `propose` to a person
 
@@ -261,13 +302,14 @@ reach is an anecdote. They belong here once re-measured on a real run.
 | `candidates[]` | ranked; each carries the ticker, the counterparty that was in the news, the filing accession and the **character span** in it that disclosed the relationship, and the salience value at its session's T (§3.10.1) |
 | `limitations[]` | carried into the document, not left in a memo |
 
-**Fields that must be absent, enumerated so their absence is checkable:** no order, no side, no
-quantity, no position size, no entry price, no stop, no ladder. A brief that carries any of them is
-rejected by its own schema.
+**Fields that must be absent, enumerated so their absence is checkable:**
+
+- no order, no side, no quantity, no position size, no entry price, no stop, no ladder.
+- A brief that carries any of them is rejected by its own schema.
 
 ### 3.7 `StreamMessage` — the private item stream (memo decision D-7)
 
-A derived surface on `vault`, never a window onto the outbox.
+- A derived surface on `vault`, never a window onto the outbox.
 
 | field | notes |
 |---|---|
@@ -277,20 +319,23 @@ A derived surface on `vault`, never a window onto the outbox.
 | `title`, `url`, `body_ref` | |
 | `schema` | the item contract, versioned apart from the storage row |
 
-Plus a **heartbeat** carrying `seq`, an instant and items-since. Silence must be distinguishable
-from a dead stream, because a consumer reading our outage as "no news" turns our failure into theirs.
-
-No delivery guarantee and no latency promise. The archive is the source of truth and reconciliation
-is an HTTP read of it; a latency promise would need a freshness number the design does not yet have.
+- Plus a **heartbeat** carrying `seq`, an instant and items-since.
+- Silence must be distinguishable from a dead stream, because a consumer reading our outage as
+  "no news" turns our failure into theirs.
+- No delivery guarantee: the archive is the source of truth and reconciliation is an HTTP read of
+  it.
+- No latency promise: it would need a freshness number the design does not yet have.
 
 ### 3.8 `Reading` — `ledger`, one-way
 
-`ledger` consumes briefs, prices and realised outcomes and produces readings. It holds no edge back
-upstream: a service that sees outcomes must not influence the service that produces proposals, or
-selection happens under the result. **Where that is enforced: nowhere yet, and nowhere here.** No
-`ledger` exists (§3.9's service count), so a check here would pass unconditionally — §7's argument in
-the other direction. The enforcement point is `ledger`'s own test, under the condition that nothing
-it produces is an input to `derive` or `propose`.
+- `ledger` consumes briefs, prices and realised outcomes and produces readings.
+- It holds no edge back upstream: a service that sees outcomes must not influence the service that
+  produces proposals, or selection happens under the result.
+- **Where that is enforced: nowhere yet, and nowhere here.**
+  - No `ledger` exists (§3.9's service count), so a check here would pass unconditionally — §7's
+    argument in the other direction.
+  - The enforcement point is `ledger`'s own test, under the condition that nothing it produces is
+    an input to `derive` or `propose`.
 
 ### 3.9 `RawBlob` and `Expiry` — the layer a retention number may name (decided 2026-11-12)
 
@@ -300,74 +345,78 @@ it produces is an input to `derive` or `propose`.
 | L1 extracted body | `body_ref` | **not as a setting.** Matching runs over body text (R17), so an expired body cannot be re-matched under a new `rule_version`; a number here reopens memo D-2 instead of configuring it. |
 | L2 payload as received | `raw_blob_ref` | **yes.** The cost is re-extraction, and memo §6b says an index timestamp is not an immutable archive, so a re-fetch may not recover it. |
 
-**An expiry is its own row type, under the same `seq`, and not an `Attempt`.** An `Attempt` is keyed by
-what a vendor was asked (§3.2), so a deletion filed as `outcome=empty` would count as a quiet vendor
-inside the reconstruction R16 exists for. `Expiry` carries `blob_digest`, `layer`, `bytes`,
-`items_affected`, `policy_version`, `decided_at`, `deleted_at` and `seq`, and `policy_version` hashes a
-retention file as §3.3 hashes a rule file — the mechanism by which a later number is a setting. A
-consumer meets the absence at the item row's state, not at a failed blob fetch, which is why §5.1 gives
-it no code. Only `vault` may delete, and only at L2.
+**An expiry is its own row type, under the same `seq`, and not an `Attempt`.**
+- Rejected: filing a deletion as an `Attempt` with `outcome=empty`. An `Attempt` is keyed by what a vendor was asked (§3.2), so it would count as a quiet vendor inside the reconstruction R16 exists for.
+- `Expiry` carries `blob_digest`, `layer`, `bytes`, `items_affected`, `policy_version`, `decided_at`, `deleted_at` and `seq`.
+- `policy_version` hashes a retention file as §3.3 hashes a rule file — the mechanism by which a later number is a setting.
+- A consumer meets the absence at the item row's state, not at a failed blob fetch, which is why §5.1 gives it no code.
+- Only `vault` may delete, and only at L2.
 
-**Measured 2026-11-12 at 42322eb, and no gate proposed.** Two temporary fixtures in `lake.rs`, run and
-reverted: a null `body` returns `body == ""` with `unusable_rows == 0`, while dropping the column fails
-the whole day as `LakeError::MissingColumn("body")`. The inherited layout has no third state, which is
-why L1 and L2 are blobs beside the row. Nor can anything delete yet — `ls services` returns `newsvault`
-alone and no `fs::remove_*` call exists in production code; measured 2026-11-13, the two in the tree
-are both inside `store.rs`'s `mod tests`, where one deletes a stored blob to check that an item row
-naming a file that is not there is refused.
+**Measured 2026-11-12 at 42322eb, and no gate proposed.**
+- Two temporary fixtures in `lake.rs`, run and reverted:
+  - a null `body` returns `body == ""` with `unusable_rows == 0`;
+  - dropping the column fails the whole day as `LakeError::MissingColumn("body")`.
+- The inherited layout has no third state, which is why L1 and L2 are blobs beside the row.
+- Nothing can delete yet: `ls services` returns `newsvault` alone and no `fs::remove_*` call exists in production code; measured 2026-11-13, the two in the tree are both inside `store.rs`'s `mod tests`, where one deletes a stored blob to check that an item row naming a file that is not there is refused.
 
-**One row of a daily index is not dated by that index.** Measured on the same capture: the
-2026-11-10 index carries four distinct `Date Filed` values — 20261102, 20261103, 20261105 and
-20261110 — so a late submission appears in a later day's index and the index's own day is not the
-row's filing date. The column is `YYYYMMDD`, not ISO.
+**One row of a daily index is not dated by that index.**
+- Measured on the same capture: the 2026-11-10 index carries four distinct `Date Filed` values — 20261102, 20261103, 20261105 and 20261110.
+- So a late submission appears in a later day's index, and the index's own day is not the row's filing date.
+- The column is `YYYYMMDD`, not ISO.
 
-**The file count this layout produces, which is the shape of the failure it has to avoid.** Two
-blobs per committed item, not one per attempt: the raw submission `.txt` as received (§3.9's L2,
-`raw_blob_ref`) and the extracted article body (L1, `body_ref`) are disjoint and land under separate
-digests. Measured 2026-11-13 on window 2026-11-12: **916** distinct blobs — **458** distinct raw
-payloads and **458** distinct bodies — against **503** attempts (1 index, ~502 document, 458 of them
-committed and ~44 lost to the transient failures R19's no-margin pace leaves), with 918 files on disk
-because two more are the daily index payload. The blob count running far above the attempt count is
-exactly the observation the earlier one-blob-per-attempt projection named as its own falsifier, so
-the two-blob count above is the model. The per-day order of magnitude is the in-universe filing
-count: re-derived 2026-11-13 from the real `form.20261110.idx` (1,057,192 bytes, captured through
-the predecessor's own SEC client) against the 7,992 distinct CIKs of its `company_tickers.json` of
-2026-05-29, **5,429** filing rows, **391** of them 8-K or 8-K/A, and **347** of those with a CIK in
-the roster — a floor, the roster being five months old. So about 916 blob files a run and, at 252
-session days, about **231,000** a year, which is **3.5** files per directory across the two-level
-65,536-directory fan-out (230,832 / 65,536). The predecessor of this shape reached 558,235 loose
-files holding 5,197 current values because content addressing dedups identical BYTES and its
-payload's last bar was still forming, so 98.7% of what it stored were exact copies. Here the
-immutable half is the filing document at a fixed accession URL, which dedups to zero new files on a
-re-fetch; the moving tail is the daily index, which grows through the day and mints one blob per
-fetch, bounded by the number of runs in a day and not by the number of items. **What is still
-unmeasured** is the index re-fetch rate across a whole day; the observation that would now surprise
-this paragraph is one filing document whose repeated fetches carry more than one digest.
+**The file count this layout produces, which is the shape of the failure it has to avoid.**
+- Two blobs per committed item, not one per attempt: the raw submission `.txt` as received (§3.9's L2, `raw_blob_ref`) and the extracted article body (L1, `body_ref`) are disjoint and land under separate digests.
+- Measured 2026-11-13 on window 2026-11-12:
 
-**The ceiling: this settles the layer, not the number.** N4 still needs a count of days for L2 and a
-medium for what is kept past it, one number per provenance class (§3.1) being the next smallest
-form. N1 is decided (§10), so an L2 expiry demotes to the second copy rather than deleting — but
-only once that copy has been restored once, which §10 records as undone. The memo's §3 charter bars
-deleting "to another consumer's budget", which an L2 expiry under its own `policy_version` is not.
+  | count | value |
+  |---|---|
+  | distinct blobs | **916** |
+  | distinct raw payloads | **458** |
+  | distinct bodies | **458** |
+  | attempts | **503** (1 index, ~502 document, 458 of them committed and ~44 lost to the transient failures R19's no-margin pace leaves) |
+  | files on disk | 918, because two more are the daily index payload |
+
+- The blob count running far above the attempt count is exactly the observation the earlier one-blob-per-attempt projection named as its own falsifier, so the two-blob count above is the model.
+- The per-day order of magnitude is the in-universe filing count, re-derived 2026-11-13 from the real `form.20261110.idx` (1,057,192 bytes, captured through the predecessor's own SEC client) against the 7,992 distinct CIKs of its `company_tickers.json` of 2026-05-29:
+
+  | rows | count |
+  |---|---|
+  | filing rows | **5,429** |
+  | of them 8-K or 8-K/A | **391** |
+  | of those with a CIK in the roster | **347** — a floor, the roster being five months old |
+
+- So about 916 blob files a run and, at 252 session days, about **231,000** a year, which is **3.5** files per directory across the two-level 65,536-directory fan-out (230,832 / 65,536).
+- The predecessor of this shape reached 558,235 loose files holding 5,197 current values because content addressing dedups identical BYTES and its payload's last bar was still forming, so 98.7% of what it stored were exact copies.
+- Here the immutable half is the filing document at a fixed accession URL, which dedups to zero new files on a re-fetch.
+- The moving tail is the daily index, which grows through the day and mints one blob per fetch, bounded by the number of runs in a day and not by the number of items.
+- **What is still unmeasured:** the index re-fetch rate across a whole day.
+- The observation that would now surprise this paragraph: one filing document whose repeated fetches carry more than one digest.
+
+**The ceiling: this settles the layer, not the number.**
+- N4 still needs a count of days for L2 and a medium for what is kept past it; one number per provenance class (§3.1) is the next smallest form.
+- N1 is decided (§10), so an L2 expiry demotes to the second copy rather than deleting — but only once that copy has been restored once, which §10 records as undone.
+- The memo's §3 charter bars deleting "to another consumer's budget", which an L2 expiry under its own `policy_version` is not.
 
 ### 3.10 Wire formats — two of §3.0–3.8's nine contracts, decided 2026-11-12
 
-**The trigger for writing a wire format down: a second consumer that exists in code.** With one
-consumer a format is that consumer's own serialisation; with two it is a contract, and the second is
-where an unstated assumption becomes a defect. Counted over §3.0–3.8: `Panel` has two — `propose`,
-and the statistics tier whose live half is `probes/panel_power.py`, reading an ad-hoc `assign.json` +
-`meta.json` where the panel belongs. `Item` has three (§4's boundary table), none with code.
-`StreamMessage` has none, so §3.10.2 is here on D-7's instruction that the shape go in from the
-start, not on the trigger. `Snapshot` has one, `derive`. The other five wait.
+**The trigger for writing a wire format down: a second consumer that exists in code.**
+- With one consumer a format is that consumer's own serialisation; with two it is a contract, and the second is where an unstated assumption becomes a defect.
+- Counted over §3.0–3.8:
 
-**Nothing in §3.10 is enforced:** no validator exists for either format and nothing produces either
-artefact, so both subsections specify rather than check.
+  | contract | consumers |
+  |---|---|
+  | `Panel` | two — `propose`, and the statistics tier whose live half is `probes/panel_power.py`, reading an ad-hoc `assign.json` + `meta.json` where the panel belongs |
+  | `Item` | three (§4's boundary table), none with code |
+  | `StreamMessage` | none, so §3.10.2 is here on D-7's instruction that the shape go in from the start, not on the trigger |
+  | `Snapshot` | one, `derive` |
+  | the other five | wait |
+
+**Nothing in §3.10 is enforced:** no validator exists for either format and nothing produces either artefact, so both subsections specify rather than check.
 
 #### 3.10.1 `panel.data/1` — the Arrow data file beside the manifest
 
-Arrow IPC **file** format, one schema, rows in ascending `session` then ascending `ticker` as raw
-UTF-8 bytes. That is a canonical row **order**, not a canonical file: `panel_id` digests the rows in
-canonical form (§2), the Arrow bytes being a writer's and a chunking's.
+- Arrow IPC **file** format, one schema, rows in ascending `session` then ascending `ticker` as raw UTF-8 bytes.
+- That is a canonical row **order**, not a canonical file: `panel_id` digests the rows in canonical form (§2), the Arrow bytes being a writer's and a chunking's.
 
 | column | Arrow type | null | unit, and who reads it |
 |---|---|---|---|
@@ -376,30 +425,24 @@ canonical form (§2), the Arrow bytes being a writer's and a chunking's.
 | `has_relation` | `bool` | **yes, and a null means unresolved** | the statistics tier's control arm, read from the relation map (§4) and never from `derive`'s own work. Per row, not per ticker: constant across a ticker's rows today, and a point-in-time map makes it vary without a grain change. A null row is dropped or stratified, **never counted as a control**: an extraction that failed and a company with no relation were one value in the predecessor, which is how 37 of 1,672 companies sat in the control arm as eligible (memo §1.5) |
 | `salient_counterparties` | `list<struct<name: utf8 not null, salience: int64 not null>>` | no; an untreated row carries an empty list | `salience` counts in the unit named by the `salience_unit` metadata key, at T — and **T is the close of `session`** in the calendar named by `calendar_version`, while the manifest's single `cutoff` is the snapshot's visibility bound and not the treatment cut, so no row sees past its own session close. That forbids an intraday panel, which is the choice being made. The list is ordered by descending `salience`, ties by `name` ascending: unstated, it is a third way one row set digests twice. `propose` takes the counterparty, the tier takes treatment |
 
-`salience` is an integer, never a float: it counts occurrences or documents and a float can lose one.
-No `present` or `treated` column: presence is the grain, a row existing only when both closes are
-there (R8 in the shape), and treatment is a non-empty list. Three `utf8` metadata keys: `schema` =
-`panel.data/1`, so the manifest holds no second copy of the version; `panel_id`, so a stray pairing
-is detectable; `salience_unit` = `occurrences` or `documents`, so a D-8 flip shows in the data.
-**What never changes:** one row per (ticker, session) present, so the manifest's `rows` is this
-file's row count — the identity §8 row R8's ceiling asks a second reader for.
+- `salience` is an integer, never a float: it counts occurrences or documents and a float can lose one.
+- No `present` or `treated` column: presence is the grain, a row existing only when both closes are there (R8 in the shape), and treatment is a non-empty list.
+- Three `utf8` metadata keys:
+  - `schema` = `panel.data/1`, so the manifest holds no second copy of the version;
+  - `panel_id`, so a stray pairing is detectable;
+  - `salience_unit` = `occurrences` or `documents`, so a D-8 flip shows in the data.
+- **What never changes:** one row per (ticker, session) present, so the manifest's `rows` is this file's row count — the identity §8 row R8's ceiling asks a second reader for.
 
 #### 3.10.2 `newsvault.stream/1` — the private item stream
 
-One JSON object per WebSocket text frame, never an array, each carrying `type` (`item` or
-`heartbeat`) and `schema` = `newsvault.stream/1` — on every frame and not only at connect, so a
-reconnecting consumer sees it, the key spelled as `newsvault.day/1` and `panel.manifest/1` spell it.
-An item frame carries §3.7's field list and nothing of its own, instants being RFC 3339 UTC `Z`; a
-heartbeat carries `at`, `items_since` on this connection, `heartbeat_seconds`, and `seq`, the last
-the store committed. **What never changes:** `seq` is the commit order, strictly increasing, never
-re-used or re-ordered, with gaps allowed because D-7 promises no delivery — a gap is closed by the
-HTTP read, never read as an ordering. **A ceiling:** the frame carries `heartbeat_seconds` rather
-than naming one here, no measurement and no owner decision having produced one; it is a liveness
-interval, never N2's freshness target.
-
-`seq` is §2's number, not the per-invocation `sequence` of the owner's NDJSON convention, which no
-format here offers. A reader is to refuse an unknown `schema` value rather than read it
-optimistically, as `panel-contract` refuses one (`unknown_schema`).
+- One JSON object per WebSocket text frame, never an array.
+- Each frame carries `type` (`item` or `heartbeat`) and `schema` = `newsvault.stream/1` — on every frame and not only at connect, so a reconnecting consumer sees it, the key spelled as `newsvault.day/1` and `panel.manifest/1` spell it.
+- An item frame carries §3.7's field list and nothing of its own, instants being RFC 3339 UTC `Z`.
+- A heartbeat carries `at`, `items_since` on this connection, `heartbeat_seconds`, and `seq`, the last the store committed.
+- **What never changes:** `seq` is the commit order, strictly increasing, never re-used or re-ordered, with gaps allowed because D-7 promises no delivery — a gap is closed by the HTTP read, never read as an ordering.
+- **A ceiling:** the frame carries `heartbeat_seconds` rather than naming one here, no measurement and no owner decision having produced one; it is a liveness interval, never N2's freshness target.
+- `seq` is §2's number, not the per-invocation `sequence` of the owner's NDJSON convention, which no format here offers.
+- A reader is to refuse an unknown `schema` value rather than read it optimistically, as `panel-contract` refuses one (`unknown_schema`).
 
 ---
 
@@ -416,14 +459,14 @@ optimistically, as `panel-contract` refuses one (`unknown_schema`).
 | `vault` → private stream | WebSocket, best-effort | a notification, never the transport of record |
 | `vault` → `vault` consumers | HTTP read for point-in-time queries. **No code yet, and three CLI commands instead:** `newsvault day`, whose `--at` is still optional — with no `--at` it returns the whole partition and applies no visibility test — and, since 2026-11-13, `newsvault ledger` and `newsvault publish`, whose `--at` is REQUIRED, so a read with no cutoff does not parse. The client `Cargo.lock` has held since 2026-11-13 is outbound and in one crate: `ureq 3.5.2` under `news-provider`, behind `Wire` (row R4) | a point-in-time query is the only read a consumer should need, so there is one place to get the predicate right |
 
-The pattern: **anything a future reader must reproduce is a file; anything that only has to happen
-now is a call.**
+- **The pattern:** anything a future reader must reproduce is a file; anything that only has to
+  happen now is a call.
 
 ---
 
 ## 5. Failure semantics
 
-What each service does when its input is wrong, rather than what it does when everything works.
+- Scope: what each service does when its input is wrong, not what it does when everything works.
 
 | condition | behaviour | requirement |
 |---|---|---|
@@ -440,17 +483,22 @@ What each service does when its input is wrong, rather than what it does when ev
 
 ### 5.1 The error-code registry (decided 2026-11-12)
 
-**What a code is.** The `code` field of the error object a command writes to stderr before exiting
-non-zero, and nothing else. §5's nine rows are four mechanisms and only one is that object, so this
-registry points at the other three rather than naming a condition twice: §3.2's outcome values, the
-counted rows of rows 4 and 5, and `panel-contract`'s `Finding.code`. Eight rows therefore take no
-code and row 1 is the one that does. Four belong to services that do not exist — measured 2026-11-12,
-`grep -rlwE 'Attempt|Collapsed|Brief'` over `*.rs` outside `target/` matches nothing (word-bounded:
-the bare words appear in comments) and no crate depends on an HTTP client — so a code for them would
-be §8 row R12a again. Two are reachable and not errors (§3.9 owns a third), the last two monitoring.
+**What a code is.**
 
-`exit` is the contract: what a caller may branch on and a new command must implement. Where a
-binary does something else today the cell says so, measured 2026-11-12 against both.
+- The `code` field of the error object a command writes to stderr before exiting non-zero, and
+  nothing else.
+- §5's nine rows are four mechanisms and only one is that object.
+- This registry points at the other three rather than naming a condition twice: §3.2's outcome
+  values, the counted rows of rows 4 and 5, and `panel-contract`'s `Finding.code`.
+- Eight rows therefore take no code; row 1 is the one that does. Of the eight:
+  - Four belong to services that do not exist, so a code for them would be §8 row R12a again.
+    Measured 2026-11-12: `grep -rlwE 'Attempt|Collapsed|Brief'` over `*.rs` outside `target/`
+    matches nothing (word-bounded: the bare words appear in comments), and no crate depends on an
+    HTTP client.
+  - Two are reachable and not errors (§3.9 owns a third).
+  - The last two are monitoring.
+- `exit` is the contract: what a caller may branch on and a new command must implement.
+- Where a binary does something else today the cell says so, measured 2026-11-12 against both.
 
 | code | exit | the condition, and who can emit it |
 |---|---|---|
@@ -467,33 +515,43 @@ binary does something else today the cell says so, measured 2026-11-12 against b
 | `vendor_refused_all` | 8 | nothing committed and at least one PERMANENT failure. Retryable **no**: 7 is the retryable class and a total refusal must not invite a timer to hammer it |
 | `commit_failed` | 8 | the store refused an attempt's rows, with that attempt named in the envelope |
 
-Those three cells read `2` since 2026-11-13, when the fork below was taken by default as decision D1
-(§10): `newsvault` maps every non-usage failure onto `2` and `1` is "the answer is no" and nothing
-else. One test pins it, the way the defect was measured — a 7-byte parquet at a day partition's path
-exits 2, and putting that arm back on 1 turns
-`a_day_whose_parquet_cannot_be_read_exits_two_and_never_one` red. Two codes joined the table with
-that commit: `lease_held` at **7**, retryable yes, emitted by `newsvault publish` when another run
-holds the flock; and the incomplete report at **8**, which carries its result on stdout and is not
-an error object at all — `ledger` writes the days it could read and names the run envelopes it could
-not. Every other `retryable` is `no`: no command here makes a network call,
-so exit 7 had no member before `publish`. `news-provider`'s `Wire::send` can since 2026-11-13, but no CLI reaches
-it, and its two refusals (a missing credential, a failed conversation) are types rather than codes
-until `error-codes/` exists (row E1).
+- Those three cells read `2` since 2026-11-13, when the fork below was taken by default as decision
+  D1 (§10).
+- `newsvault` maps every non-usage failure onto `2`; `1` is "the answer is no" and nothing else.
+- One test pins it, the way the defect was measured: a 7-byte parquet at a day partition's path
+  exits 2, and putting that arm back on 1 turns
+  `a_day_whose_parquet_cannot_be_read_exits_two_and_never_one` red.
+- Two codes joined the table with that commit:
+  - `lease_held` at **7**, retryable yes, emitted by `newsvault publish` when another run holds the
+    flock.
+  - the incomplete report at **8**, which carries its result on stdout and is not an error object at
+    all: `ledger` writes the days it could read and names the run envelopes it could not.
+- Every other `retryable` is `no`: no command here makes a network call, so exit 7 had no member
+  before `publish`.
+- `news-provider`'s `Wire::send` can since 2026-11-13, but no CLI reaches it; its two refusals (a
+  missing credential, a failed conversation) are types rather than codes until `error-codes/` exists
+  (row E1).
 
 **One invariant over the exit codes, readable by a test: stdout is non-empty if and only if the exit
-status is 0, 1 or 8** — the companion rule D1 carries, 8 having joined the set with `ledger`'s
-incomplete report. **It is one function since 2026-11-13**, `news_provider::Exit::carries_the_result_on_stdout`,
-which `collect` branches on and `stdout_carries_the_result_for_exactly_the_exits_zero_one_and_eight`
-asserts over every arm of the exit table rather than over the two a run usually takes; returning
-`true` unconditionally turns that test red. It covers `collect` alone: `day`, `ledger` and `publish`
-still hold the rule by hand.
-Measured 2026-11-12, `panel-contract validate` on `{}` exits 1 with ten findings on stdout and
-nothing on stderr, while `newsvault day` over a 7-byte `.parquet` exited 1 with an empty stdout and
-`error: EOF: Parquet file too small` on stderr; that second case is the one D1 moved, and it exits 2
-with an empty stdout today. **What is left of the ceiling:** `1` still carries two sentences, now
-reading the same way — `{"1": "the answer is no"}` here and `{"1": "not admissible"}` there — and
-nothing checks the iff clause across the two binaries, which is a test over both schemas that does
-not exist.
+status is 0, 1 or 8.**
+
+- It is the companion rule D1 carries; 8 joined the set with `ledger`'s incomplete report.
+- **It is one function since 2026-11-13**, `news_provider::Exit::carries_the_result_on_stdout`:
+  - `collect` branches on it.
+  - `stdout_carries_the_result_for_exactly_the_exits_zero_one_and_eight` asserts it over every arm
+    of the exit table rather than over the two a run usually takes; returning `true`
+    unconditionally turns that test red.
+  - It covers `collect` alone: `day`, `ledger` and `publish` still hold the rule by hand.
+- Measured 2026-11-12:
+  - `panel-contract validate` on `{}` exits 1 with ten findings on stdout and nothing on stderr.
+  - `newsvault day` over a 7-byte `.parquet` exited 1 with an empty stdout and
+    `error: EOF: Parquet file too small` on stderr; that second case is the one D1 moved, and it
+    exits 2 with an empty stdout today.
+- **What is left of the ceiling:**
+  - `1` still carries two sentences, now reading the same way: `{"1": "the answer is no"}` here and
+    `{"1": "not admissible"}` there.
+  - Nothing checks the iff clause across the two binaries, which is a test over both schemas that
+    does not exist.
 
 ---
 
@@ -507,18 +565,19 @@ vendor  --poll/stream-->  vault: write  --same transaction-->  outbox
                                                         derive: compute over a CLOSED window
 ```
 
-Four rules, from the memo, restated here because the contracts depend on them:
+Four rules from the memo; the contracts depend on them:
 
-1. **An event triggers computation; it never accumulates it.** `derive` stays a pure function over
-   a closed window. Incremental salience would make results depend on arrival order.
-2. **Write, then emit, in one transaction.** The archive is the source of truth; the event says it
-   grew.
-3. **The periodic sweep stays** (every scheduled poll, at most 90 min apart, §11.2), as a
-   backstop and as the thing that fills the coverage ledger even
-   when no event fires.
-4. **Salience is a function of a cutoff, not of a day**: `salient(core, T)`. A rolling threshold
-   computed from a partial day differs from the same threshold at the close, so every downstream
-   claim names its `T`.
+1. **An event triggers computation; it never accumulates it.**
+   - `derive` stays a pure function over a closed window.
+   - Incremental salience would make results depend on arrival order.
+2. **Write, then emit, in one transaction.**
+   - The archive is the source of truth; the event says it grew.
+3. **The periodic sweep stays** (every scheduled poll, at most 90 min apart, §11.2):
+   - as a backstop;
+   - as the thing that fills the coverage ledger even when no event fires.
+4. **Salience is a function of a cutoff, not of a day**: `salient(core, T)`.
+   - A rolling threshold computed from a partial day differs from the same threshold at the close,
+     so every downstream claim names its `T`.
 
 Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - An `outbox` table inside `commit.sqlite3`, written inside `Committer::record`'s transaction.
@@ -550,31 +609,37 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
 ## 7. What is not reachable from here
 
-The order-placing path is in a different repository, holds the only credentials that matter, and
-accepts hand-written documents only. Nothing here holds a credential for it.
+- The order-placing path is in a different repository, holds the only credentials that matter, and
+  accepts hand-written documents only.
+- Nothing here holds a credential for it.
 
-**Where the wall is enforced, and where it is not.** Not here. A check in this repository for
-order-placing calls would pass unconditionally, because there is no such call to forbid; the
-predecessor's equivalent gate guards code that exists. If a mediating service is ever built between
-this repository and the executor, that service is where the enforcement belongs, under the condition
-§8 row R12a states. The same shape in the other direction: no backward edge from `ledger`, enforced
-at `ledger` when it exists (§3.8).
+**Where the wall is enforced, and where it is not.**
 
-Lower latency makes this boundary *more* important, not less. "We must act now" is exactly the
-argument that talks a person into automating a pick, and the boundary has to hold at the moment it
-becomes inconvenient.
+- Not here: a check in this repository for order-placing calls would pass unconditionally, because
+  there is no such call to forbid.
+- The predecessor's equivalent gate guards code that exists.
+- If a mediating service is ever built between this repository and the executor, that service is
+  where the enforcement belongs, under the condition §8 row R12a states.
+- The same shape in the other direction: no backward edge from `ledger`, enforced at `ledger` when it
+  exists (§3.8).
+- Lower latency makes this boundary *more* important, not less.
+- "We must act now" is exactly the argument that talks a person into automating a pick; the boundary
+  has to hold at the moment it becomes inconvenient.
 
 ---
 
 ## 8. Where each invariant is enforced
 
-The maturity test. An invariant with no enforcement point is a wish, and the wishes are named rather
-than hidden. **The status column is the count** — no sentence anywhere repeats it as a number,
-because a repeated count is a count that goes stale.
+- The maturity test: an invariant with no enforcement point is a wish, and the wishes are named
+  rather than hidden.
+- **The status column is the count.** No sentence anywhere repeats it as a number, because a
+  repeated count is a count that goes stale.
 
-**How to read the status column.** `design` means the enforcement point is specified and the code it
-names does not exist, so that row's `enforced by` cell says what *will* check the invariant, not what
-does. Where a row's clauses differ, its status splits with them.
+**How to read the status column.**
+
+- `design` means the enforcement point is specified and the code it names does not exist, so that
+  row's `enforced by` cell says what *will* check the invariant, not what does.
+- Where a row's clauses differ, its status splits with them.
 
 | # | invariant | enforced by | status |
 |---|---|---|---|
@@ -625,213 +690,206 @@ does. Where a row's clauses differ, its status splits with them.
 
 ## 10. What this document leaves open
 
-Nothing of the shape. The two numbers this section last asked for are recorded below; what remains
-open is the memo's own list, where decision D-1 (which vendor for history) blocks the backfill.
+- Nothing of the shape is open.
+- The two numbers this section last asked for are recorded below.
+- What remains open is the memo's own list; decision D-1 (which vendor for history) blocks the backfill.
 
-**Three decisions taken by default on 2026-11-13.** The owner was asked twice and chose neither, and
-said to build anyway, so each is the design's own recommendation and is an assumption rather than a
-settled fact. Both are one edit to reverse.
+**Three decisions taken by default on 2026-11-13.**
 
-- **D1, what `1` means.** `1` is **the answer is no**, so `newsvault ledger --check` exits 1 on a
-  coverage shortfall and `panel-contract validate` keeps its verdict there, while `input_unparseable`,
-  `input_schema_mismatch` and `io_failed` move to `2` (§5.1). Evidence that it is safe: `git grep -n
-  newsvault -- '*.yml' '*.py' '*.sh'` returned two hits on 2026-11-13, a comment in `ci.yml` and a
-  docstring in `probes/parity_baseline.py`, neither of which runs the binary. Since that day there
-  IS one caller in the tree, `probes/newsvault_parity.py`, and it reads `newsvault day`'s status:
-  `0` is a result it compares, `2` is a day that reader refused. It never reads `1`, which `day`
-  cannot return. Nothing can be known about a caller outside the tree. **The other fork is two functions:** `exit_code` in
-  `services/newsvault/src/main.rs`, beside the constants above it, decides every FAILURE exit, and
-  `news_provider::Exit` decides every exit a successful `collect` takes, including the companion
-  rule about stdout. Nothing else branches on an exit status.
-- **D3, the partition key.** The **publication day**, `items/valid_date=<D>/`, because the label is
-  then a true statement about the rows under it. Its cost is §5's own row. The cost of not having it
-  is measured: 9 of 287 items in the predecessor's `session_date=2026-07-01` partition were published
-  outside that UTC day, 3.14%. The alternative was a seq range, which can be declared complete and
-  whose day-query scan cost nobody has measured. **The fork is one constant:** `VALID_DATE` in
-  `services/newsvault/src/store.rs`, which `covered_by_a_segment()` now builds from rather than
-  repeating — review 2026-11-13 found the expression written out three times and changed one copy to
-  a different key with all 279 tests green. `publish::partition_of` is the only place it becomes a path. Since 2026-11-13 the key
-  reads `COALESCE(valid_at, valid_day, valid_refused)`, so a day-dated row is partitioned under the
-  day it names rather than under an instant nothing published.
+- The owner was asked twice, chose neither, and said to build anyway, so each is the design's own recommendation: an assumption, not a settled fact.
+- Both are one edit to reverse.
 
-- **D5, a backfill with no probe behind it.** Refused, not dated. A `vendor_archive` window is
-  refused before its first request unless a `MeasuredLag` with a probe id, a non-zero probe count
-  and a positive lag a chrono `TimeDelta` holds stands behind it (§8 row R11). **The lag that stands behind EDGAR, measured
-  2026-11-13:** `94,922 s = 26.37 h`, the MAX of 22 per-filing lags over the two days the vendor's
-  quarter listing named, each lag being the instant the vendor states it last wrote
-  `form.<day>.idx` minus that filing's own `<ACCEPTANCE-DATETIME>`. The registration, the run log
-  and the four refusals the run did not reach are `probes/observation_lag/PREREGISTRATION.md`; the
-  per-filing numbers are in `observation_lag_results.json` beside it; the run spent 27 requests of
-  a registered 30. It falls in the registered band `24 h - 7 d`, so **the backfill is permitted
-  only with the session shift written into the panel and no day column may mix backfilled and live
-  items** - every backfilled item's membership moves by more than one session. The scalar is the
-  max and not the registered p90, which would have been `57,561 s` and inside 24 h: that choice was
-  made and exercised offline before the first request and is this document's reason for the harder
-  band (the registration's own amendment dated 2026-11-13 carries the arithmetic). Its own
-  disclosure field is now empty by construction: `leaks` counts sampled filings above the scalar
-  and a max leaves none, so `leak_rate()` is `0.0` for this source and says nothing about the
-  vendor - the quantity that does is the count of index rows whose `Date Filed` is not their own
-  index's day, **0 of 384 and 0 of 549** on these two days.
-  **How the number reaches a run, since 2026-11-13.** A hashed policy file the caller names,
-  `--lag-policy`, holding one `MeasuredLag` per (source, provenance) - keyed by both, because the
-  same adapter read live and read earlier are two populations (R10) and one lag does not describe
-  both. `news_provider::lag_policy::LagPolicy::read` is its only constructor, `cmd_collect::
-  open_provider` hands the entry to `EdgarPress::with_observation_lag`, and the bytes are copied
-  into the archive at `<store>/policy/<sha256>.json` through `File::create_new` before the plan, so
-  a run that dated items keeps the file that stated the lag. The run envelope carries
-  `observation_lag_policy_version`, `observation_lag_probe_id` and `observation_lag_seconds`, or
-  `null` for a run nothing dated. The ENVELOPE and not the item row: §3.1's `Item` names no
-  observation-lag field, so a stored item is traced to the probe through its `attempt_id` and that
-  run's envelope, and no column was invented for a reader that does not exist. Measured 2026-11-13 against live EDGAR with the policy in place:
-  window `2026-11-12` on run date `2026-11-13` planned 1 index request, took the `vendor_archive`
-  arm on all 5 attempts, committed 4 items from a 3-CIK roster out of 7,805 vendor rows, and spent
-  5 requests; the same command without `--lag-policy` refuses at exit 2 with `no lag entry`
-  before any request. The committed policy is `news-provider/policy/observation-lag.json`.
-  **Which instant a backfilled row carries: `valid + seconds`, not the fetch clock (§8 row R11).**
-  The fetch clock is a RECORD of when we in fact read it and goes years late on a real backfill;
-  `valid + seconds` is the COUNTERFACTUAL a point-in-time study wants, one number for every row of a
-  source and loose by the spread of acceptance times inside a filing day. That looseness, measured
-  on the run above while rows were still dated by the fetch clock: the four committed items carried
-  `observed_at` `2026-11-13T17:44:5x Z` against `valid_at + 94,922 s`, a difference of **not one
-  sign** - `-5.81 h`, `-5.82 h`, `+2.17 h`, `+2.16 h` - the two negative rows being the max scalar
-  loose for a row whose own lag was `5.85 h`. A date is bounded at the END of its own calendar day
-  plus the lag. **Two places decide it.** `edgar-press`'s `EdgarPress::backfill_observation`,
-  `Visibility::from_backfill`'s one production caller, decides WHICH instant an archived row
-  carries; `cmd_collect`'s `Committer::rows_of`, the store's row builder, decides WHETHER a row may
-  carry a placed instant - it stores one for `vendor_archive`, refuses an archive row with none and
-  refuses a `live_ingest` row with one. The first is one vendor adapter's method only because no
-  second `vendor_archive` provider exists: when one appears, the rule moves into `pit::datedness`
-  beside `end_of_day`, so two providers cannot date the same `Published` value differently.
-  **The other fork is three places:** `news_provider::provider::probed_lag` holds the six
-  conditions, `edgar-press`'s `plan` is the one caller that asks, and `LagPolicy::read` decides
-  what a policy file may say.
-- **The provenance boundary, which D5 needs and no measurement places.** A window whose last day is
-  on or before the run's own UTC date is a live ingest and an earlier one is a vendor archive. An
-  assumption, not a figure: nothing has measured how long an EDGAR daily index keeps growing, so
-  there is no quantile to put here. **The one place to change it** is
-  `edgar-press`'s `Provider::provenance`, which is also where its fail-closed arm lives - a window
-  nothing can read takes the archive arm, the one that refuses.
-- **The backfill coverage convergence, a vertical slice 2026-11-13 (§8 row R20).** Three choices,
-  each changeable in one place. **Which arm converges:** a `vendor_archive` follow-up whose story
-  the store already holds a committed item for is dropped, while a `live_ingest` one is always
-  issued (R16), so a re-run fetches only the uncovered accessions. §11.5 step 4 changes this for
-  `open-web-feed`: a live follow-up whose story is held (§11.1) is skipped. Until then this
-  describes the code. **The one place to change it** is
-  `edgar-press`'s `EdgarPress::follow_ups_to_issue`, the provider's own method - a second provider
-  with a different vendor-row identity maps a follow-up to its story there and nowhere else. **The
-  denominator:** `MAX(matched)` over a window's index attempts, because each run's index records the
-  same in-universe count and `SUM` would multiply it by the number of runs. **The one place to
-  change it** is `newsvault::store`'s `coverage_up_to`. **The gate:** `newsvault ledger --check`
-  raises `coverage_incomplete` whenever `covered < planned`, on a gap of ANY size - no percentage and
-  no tolerance, because a threshold chosen after seeing a result is the thing this project forbids.
-  **The one place to change it** is the `coverage_incomplete` push in `cmd_ledger`'s `read`.
-- **The transient-retry bound, taken by default 2026-11-13 (§8 rows R19, R21).** A document fetch
-  that fails transiently (HTTP 503 or a transport error) is re-attempted within the run, bounded by
-  `MAX_TRANSIENT_RETRIES` = 2. The bound is a MECHANISM cap on the work spent per request - its only
-  job is to stop one persistently failing accession stalling the run - and is NOT a figure read off
-  the ~8% transient loss measured that day, because deriving a retry count from the observed rate
-  would be choosing a threshold after seeing the result, which this project forbids. Whatever still
-  fails after it is a coverage gap R20 converges or the next run fills. **The one place to change
-  it** is the `MAX_TRANSIENT_RETRIES` constant in `news_provider::collect` (re-exported from the
-  crate root); the rate it is spaced at is R19's, not this knob's.
-- **The per-host pace, taken by default 2026-11-14 (§8 row R19).** Three choices. **The key** is
-  the request url's host, lowercased, and not the source and not the registrable domain, so two
-  sources asking one host share a bucket and `sec.gov` beside `www.sec.gov` would not. **The
-  order** is host wait first, then the per-IP reservation, so a slow host never holds an IP slot
-  other hosts queue behind; its price is that two calls to one host can leave closer than
-  `per_host` by the per-IP wait owed after the host wait (§8 row R19, hole 6). **The order is
-  changed** in `Wire::send`; **the key** in `Wire::wait_out_the_host` and `HostKey::new`, with
-  the file name in `BudgetScope::file_name`, all in `news_provider`. **The SEC declaration**,
-  100 ms per host for `www.sec.gov`, the same interval as its per-IP pace, lives in `edgar-press`'s
-  `transport()`; setting it to `None` returns the run to the per-IP pace alone.
-- **The run's own key, taken by default 2026-11-13.** A run id is `<schedule slot>-<at as
-%Y%m%dT%H%M%SZ>`, or `adhoc-<at>` with no slot, and `run_date` is the UTC date of the run's own
-instant for BOTH, because no schedule registry exists to take a slot's date from (accepted attack
-A1.7 asked for the slot's date where there is one). **The one place to change it** is `run_id` in
-`services/newsvault/src/cmd_collect.rs`.
+- **D1, what `1` means.** `1` is **the answer is no**.
+  - `newsvault ledger --check` exits 1 on a coverage shortfall; `panel-contract validate` keeps its verdict there.
+  - `input_unparseable`, `input_schema_mismatch` and `io_failed` move to `2` (§5.1).
+  - Evidence that it is safe: `git grep -n
+    newsvault -- '*.yml' '*.py' '*.sh'` returned two hits on 2026-11-13, a comment in `ci.yml` and a
+    docstring in `probes/parity_baseline.py`; neither runs the binary.
+  - Since that day there IS one caller in the tree, `probes/newsvault_parity.py`; it reads `newsvault day`'s status: `0` is a result it compares, `2` is a day that reader refused. It never reads `1`, which `day` cannot return.
+  - Nothing can be known about a caller outside the tree.
+  - **The other fork is two functions:**
+    - `exit_code` in `services/newsvault/src/main.rs`, beside the constants above it, decides every FAILURE exit.
+    - `news_provider::Exit` decides every exit a successful `collect` takes, including the companion rule about stdout.
+    - Nothing else branches on an exit status.
+- **D3, the partition key.** The **publication day**, `items/valid_date=<D>/`, because the label is then a true statement about the rows under it.
+  - Its cost is §5's own row.
+  - The cost of not having it is measured: 9 of 287 items in the predecessor's `session_date=2026-07-01` partition were published outside that UTC day, 3.14%.
+  - The alternative was a seq range, which can be declared complete and whose day-query scan cost nobody has measured.
+  - **The fork is one constant:** `VALID_DATE` in `services/newsvault/src/store.rs`, which `covered_by_a_segment()` now builds from rather than repeating.
+    - Review 2026-11-13 found the expression written out three times and changed one copy to a different key with all 279 tests green.
+  - `publish::partition_of` is the only place it becomes a path.
+  - Since 2026-11-13 the key reads `COALESCE(valid_at, valid_day, valid_refused)`, so a day-dated row is partitioned under the day it names rather than under an instant nothing published.
+
+- **D5, a backfill with no probe behind it.** Refused, not dated.
+  - A `vendor_archive` window is refused before its first request unless a `MeasuredLag` with a probe id, a non-zero probe count and a positive lag a chrono `TimeDelta` holds stands behind it (§8 row R11).
+  - **The lag that stands behind EDGAR, measured 2026-11-13:** `94,922 s = 26.37 h`, the MAX of 22 per-filing lags over the two days the vendor's quarter listing named; each lag is the instant the vendor states it last wrote `form.<day>.idx` minus that filing's own `<ACCEPTANCE-DATETIME>`.
+    - The registration, the run log and the four refusals the run did not reach are `probes/observation_lag/PREREGISTRATION.md`.
+    - The per-filing numbers are in `observation_lag_results.json` beside it.
+    - The run spent 27 requests of a registered 30.
+  - It falls in the registered band `24 h - 7 d`, so **the backfill is permitted only with the session shift written into the panel and no day column may mix backfilled and live items** - every backfilled item's membership moves by more than one session.
+  - The scalar is the max and not the registered p90, which would have been `57,561 s` and inside 24 h: that choice was made and exercised offline before the first request and is this document's reason for the harder band (the registration's own amendment dated 2026-11-13 carries the arithmetic).
+  - Its own disclosure field is now empty by construction: `leaks` counts sampled filings above the scalar and a max leaves none, so `leak_rate()` is `0.0` for this source and says nothing about the vendor.
+    - The quantity that does: the count of index rows whose `Date Filed` is not their own index's day, **0 of 384 and 0 of 549** on these two days.
+  - **How the number reaches a run, since 2026-11-13.**
+    - A hashed policy file the caller names, `--lag-policy`, holding one `MeasuredLag` per (source, provenance).
+    - Keyed by both because the same adapter read live and read earlier are two populations (R10) and one lag does not describe both.
+    - `news_provider::lag_policy::LagPolicy::read` is its only constructor.
+    - `cmd_collect::
+      open_provider` hands the entry to `EdgarPress::with_observation_lag`.
+    - The bytes are copied into the archive at `<store>/policy/<sha256>.json` through `File::create_new` before the plan, so a run that dated items keeps the file that stated the lag.
+    - The run envelope carries `observation_lag_policy_version`, `observation_lag_probe_id` and `observation_lag_seconds`, or `null` for a run nothing dated.
+    - The ENVELOPE and not the item row: §3.1's `Item` names no observation-lag field, so a stored item is traced to the probe through its `attempt_id` and that run's envelope; no column was invented for a reader that does not exist.
+    - Measured 2026-11-13 against live EDGAR with the policy in place: window `2026-11-12` on run date `2026-11-13` planned 1 index request, took the `vendor_archive` arm on all 5 attempts, committed 4 items from a 3-CIK roster out of 7,805 vendor rows, and spent 5 requests.
+    - The same command without `--lag-policy` refuses at exit 2 with `no lag entry` before any request.
+    - The committed policy is `news-provider/policy/observation-lag.json`.
+  - **Which instant a backfilled row carries: `valid + seconds`, not the fetch clock (§8 row R11).**
+    - The fetch clock is a RECORD of when we in fact read it and goes years late on a real backfill.
+    - `valid + seconds` is the COUNTERFACTUAL a point-in-time study wants: one number for every row of a source, loose by the spread of acceptance times inside a filing day.
+    - That looseness, measured on the run above while rows were still dated by the fetch clock: the four committed items carried `observed_at` `2026-11-13T17:44:5x Z` against `valid_at + 94,922 s`, a difference of **not one sign** - `-5.81 h`, `-5.82 h`, `+2.17 h`, `+2.16 h`; the two negative rows are the max scalar loose for a row whose own lag was `5.85 h`.
+    - A date is bounded at the END of its own calendar day plus the lag.
+  - **Two places decide it.**
+    - `edgar-press`'s `EdgarPress::backfill_observation`, `Visibility::from_backfill`'s one production caller, decides WHICH instant an archived row carries.
+    - `cmd_collect`'s `Committer::rows_of`, the store's row builder, decides WHETHER a row may carry a placed instant: it stores one for `vendor_archive`, refuses an archive row with none and refuses a `live_ingest` row with one.
+    - The first is one vendor adapter's method only because no second `vendor_archive` provider exists: when one appears, the rule moves into `pit::datedness` beside `end_of_day`, so two providers cannot date the same `Published` value differently.
+  - **The other fork is three places:**
+    - `news_provider::provider::probed_lag` holds the six conditions.
+    - `edgar-press`'s `plan` is the one caller that asks.
+    - `LagPolicy::read` decides what a policy file may say.
+- **The provenance boundary, which D5 needs and no measurement places.**
+  - A window whose last day is on or before the run's own UTC date is a live ingest and an earlier one is a vendor archive.
+  - An assumption, not a figure: nothing has measured how long an EDGAR daily index keeps growing, so there is no quantile to put here.
+  - **The one place to change it** is `edgar-press`'s `Provider::provenance`, which is also where its fail-closed arm lives: a window nothing can read takes the archive arm, the one that refuses.
+- **The backfill coverage convergence, a vertical slice 2026-11-13 (§8 row R20).** Three choices, each changeable in one place.
+  - **Which arm converges:** a `vendor_archive` follow-up whose story the store already holds a committed item for is dropped, while a `live_ingest` one is always issued (R16), so a re-run fetches only the uncovered accessions.
+    - §11.5 step 4 changes this for `open-web-feed`: a live follow-up whose story is held (§11.1) is skipped. Until then this describes the code.
+    - **The one place to change it** is `edgar-press`'s `EdgarPress::follow_ups_to_issue`, the provider's own method; a second provider with a different vendor-row identity maps a follow-up to its story there and nowhere else.
+  - **The denominator:** `MAX(matched)` over a window's index attempts, because each run's index records the same in-universe count and `SUM` would multiply it by the number of runs.
+    - **The one place to change it** is `newsvault::store`'s `coverage_up_to`.
+  - **The gate:** `newsvault ledger --check` raises `coverage_incomplete` whenever `covered < planned`, on a gap of ANY size - no percentage and no tolerance, because a threshold chosen after seeing a result is the thing this project forbids.
+    - **The one place to change it** is the `coverage_incomplete` push in `cmd_ledger`'s `read`.
+- **The transient-retry bound, taken by default 2026-11-13 (§8 rows R19, R21).**
+  - A document fetch that fails transiently (HTTP 503 or a transport error) is re-attempted within the run, bounded by `MAX_TRANSIENT_RETRIES` = 2.
+  - The bound is a MECHANISM cap on the work spent per request; its only job is to stop one persistently failing accession stalling the run.
+  - It is NOT a figure read off the ~8% transient loss measured that day, because deriving a retry count from the observed rate would be choosing a threshold after seeing the result, which this project forbids.
+  - Whatever still fails after it is a coverage gap R20 converges or the next run fills.
+  - **The one place to change it** is the `MAX_TRANSIENT_RETRIES` constant in `news_provider::collect` (re-exported from the crate root); the rate it is spaced at is R19's, not this knob's.
+- **The per-host pace, taken by default 2026-11-14 (§8 row R19).** Three choices.
+  - **The key** is the request url's host, lowercased, and not the source and not the registrable domain, so two sources asking one host share a bucket and `sec.gov` beside `www.sec.gov` would not.
+  - **The order** is host wait first, then the per-IP reservation, so a slow host never holds an IP slot other hosts queue behind.
+    - Its price: two calls to one host can leave closer than `per_host` by the per-IP wait owed after the host wait (§8 row R19, hole 6).
+  - Where to change, all in `news_provider`:
+    - **The order is changed** in `Wire::send`.
+    - **The key** in `Wire::wait_out_the_host` and `HostKey::new`, with the file name in `BudgetScope::file_name`.
+  - **The SEC declaration**, 100 ms per host for `www.sec.gov`, the same interval as its per-IP pace, lives in `edgar-press`'s `transport()`; setting it to `None` returns the run to the per-IP pace alone.
+- **The run's own key, taken by default 2026-11-13.**
+  - A run id is `<schedule slot>-<at as
+    %Y%m%dT%H%M%SZ>`, or `adhoc-<at>` with no slot.
+  - `run_date` is the UTC date of the run's own instant for BOTH, because no schedule registry exists to take a slot's date from (accepted attack A1.7 asked for the slot's date where there is one).
+  - **The one place to change it** is `run_id` in `services/newsvault/src/cmd_collect.rs`.
 
 **The calendar, the listing and the roster are FILES the caller names, taken by default
-2026-11-13.** The quarter listing is a vendor payload and fetching it would be an HTTP call, so it
-would need an attempt row of its own and a third request phase; until that exists the listing is a
-hashed input file like the calendar, which keeps a collection reproducible from the files alone and
-leaves `EdgarPress::listing_url` with no production caller. **The one place to change it** is
-`cmd_collect::inputs`.
+2026-11-13.**
 
-**The vendor's timeouts and body limit, the first an assumption and the second now measured.** All
-  nine timeouts are one value. The body limit is 8 MiB against a full daily index of **1,057,192 B**
-  for 2026-11-10 (5,429 filing rows) and **1,520,327 B** for 2026-11-12 (7,805 rows), both read as
-  received by `probes/observation_lag/probe.py` on 2026-11-13. The vendor's own quarter listing
-  states those two files as `'1033 KB'` and `'1485 KB'`, rounded to KB and not bytes, so the listing
-  is not a source of a byte figure. The earlier "about 600 KB" came from the 110-byte row width of a
-  hand-written fixture; the real rows are 194 bytes.
-  **The one place to change them** is `edgar-press`'s `Provider::transport`.
+- The quarter listing is a vendor payload; fetching it would be an HTTP call, so it would need an attempt row of its own and a third request phase.
+- Until that exists the listing is a hashed input file like the calendar, which keeps a collection reproducible from the files alone and leaves `EdgarPress::listing_url` with no production caller.
+- **The one place to change it** is `cmd_collect::inputs`.
+
+**The vendor's timeouts and body limit, the first an assumption and the second now measured.**
+
+- All nine timeouts are one value.
+- The body limit is 8 MiB against a full daily index, both read as received by `probes/observation_lag/probe.py` on 2026-11-13:
+
+  | day | bytes | filing rows |
+  |---|---|---|
+  | 2026-11-10 | **1,057,192 B** | 5,429 |
+  | 2026-11-12 | **1,520,327 B** | 7,805 |
+
+- The vendor's own quarter listing states those two files as `'1033 KB'` and `'1485 KB'`, rounded to KB and not bytes, so the listing is not a source of a byte figure.
+- The earlier "about 600 KB" came from the 110-byte row width of a hand-written fixture; the real rows are 194 bytes.
+- **The one place to change them** is `edgar-press`'s `Provider::transport`.
 
 **The archive's second copy: the VPS, with the provider's own backup behind it (N1, decided
-2026-11-12 by the owner).** Two parts of that stay unanswered and neither is the shape of the
-system, so neither blocks it: nobody has restored the backup and nobody has timed a restore. A
-backup nobody has restored is not yet a backup; one timed drill, recorded once, closes both.
+2026-11-12 by the owner).**
+
+- Two parts stay unanswered; neither is the shape of the system, so neither blocks it:
+  - nobody has restored the backup;
+  - nobody has timed a restore.
+- A backup nobody has restored is not yet a backup; one timed drill, recorded once, closes both.
 - Once the store runs in WAL (§6), a copy of `commit.sqlite3` must use `.backup` or `VACUUM INTO`.
   A file copy loses commits still in `-wal`.
 
-**What the drill compares, and what the 156-of-156 does not say.** `probes/parity_baseline.py`
-computes a sha256 over the sorted distinct **vendor ids**, the lake's `id` column (§3.1's
-`source_item_id`). (1) **Not** over `item_id` (§2): that digest has producers since 2026-11-13 but
-only in the new archive, so the lake number shows the id **set** came back and would match with
-every title, body and url different. (2) It agreed on **156 of 156** days, re-derived 2026-11-12,
-over a corpus holding none of the shapes the two readers can disagree on: across 779 run files and
-243,226 rows, zero null ids, zero empty-string ids, zero null publication or ingest times, zero
-inverted rows, no file missing `tickers`. So `unusable_rows` and §5's rows 4 and 5 have never fired
-on real data, and the number says the lake is clean, not that two readers encode one rule.
+**What the drill compares, and what the 156-of-156 does not say.**
 
-**The comparator exists since 2026-11-13**, which closes the third thing that was not true of it
-and makes the first two measurable rather than merely admitted. `newsvault day` emits an `id_digest`
-and a `content_digest` — the second over every field of every item in id order, each value
-length-prefixed, so a matching id set with a different title no longer passes. `probes/newsvault_parity.py`
-computes both in pandas and compares every reported field day by day, exiting 1 on any difference;
-its decision rule was registered before it ran (`probes/newsvault_parity/PREREGISTRATION.md`) and
-its run log is in that file. The corpus it runs over is committed, 9 partitions and 11 run files,
-one partition per shape the lake lacks: a null id, a real empty-string id, a null publication time,
-a null ingest time, an inverted row at both precisions, a re-stamped repeat, a repeat arriving with
-an earlier observation, a day-dated value beside an instant one, and a run file missing a column.
-Its first run disagreed on exactly one of them and the reader changed (row R3). **CI runs no
-Python**, so the gate is the probe's committed output: `services/newsvault/tests/parity.rs` is the
-only reader of `expected.json`. What it still does not cover: the corpus is synthetic rather than a
-sample, both readers read the same parquet bytes through two arrow bindings, and the new archive's
-own rows have no second reader.
+- `probes/parity_baseline.py` computes a sha256 over the sorted distinct **vendor ids**, the lake's `id` column (§3.1's `source_item_id`).
+- (1) **Not** over `item_id` (§2): that digest has producers since 2026-11-13 but only in the new archive, so the lake number shows the id **set** came back and would match with every title, body and url different.
+- (2) It agreed on **156 of 156** days, re-derived 2026-11-12, over a corpus holding none of the shapes the two readers can disagree on: across 779 run files and 243,226 rows, zero null ids, zero empty-string ids, zero null publication or ingest times, zero inverted rows, no file missing `tickers`.
+  - So `unusable_rows` and §5's rows 4 and 5 have never fired on real data, and the number says the lake is clean, not that two readers encode one rule.
 
-**The risk the owner accepted, stated rather than implied.** Both copies sit in one provider and one
-account, so a disk, a kernel or a bad deployment is covered and a billing, suspension or credential
-loss is not. A copy at a second provider was the alternative and was not taken.
+**The comparator exists since 2026-11-13**, which closes the third thing that was not true of it and makes the first two measurable rather than merely admitted.
 
-**Freshness: 2 hours inside the US session, 6 hours outside it (N2, measured 2026-11-12).** The
-alert is the age of the newest item, per §5's "a consumer is silently dead" row. Measured over the
-predecessor's lake — 156 partitions, 779 run files, 243,226 raw rows, publication times from
-2026-05-19 to 2026-11-10 — as gaps between consecutive publication instants over **61,282** distinct
-items, the union of distinct `id` values across the archive, a gap being a property of the archive
-and not of a partition. Memo §5.1's **62,507** is the same archive counted per partition and summed,
-double-counting 1,225 repeats of 501 ids (row R3's grain); both re-derived 2026-11-12 in one pass.
+- `newsvault day` emits an `id_digest` and a `content_digest`.
+  - The second is over every field of every item in id order, each value length-prefixed, so a matching id set with a different title no longer passes.
+- `probes/newsvault_parity.py` computes both in pandas and compares every reported field day by day, exiting 1 on any difference.
+- Its decision rule was registered before it ran (`probes/newsvault_parity/PREREGISTRATION.md`); its run log is in that file.
+- The corpus it runs over is committed, 9 partitions and 11 run files, one partition per shape the lake lacks:
+  - a null id;
+  - a real empty-string id;
+  - a null publication time;
+  - a null ingest time;
+  - an inverted row at both precisions;
+  - a re-stamped repeat;
+  - a repeat arriving with an earlier observation;
+  - a day-dated value beside an instant one;
+  - a run file missing a column.
+- Its first run disagreed on exactly one of them and the reader changed (row R3).
+- **CI runs no Python**, so the gate is the probe's committed output: `services/newsvault/tests/parity.rs` is the only reader of `expected.json`.
+- What it still does not cover:
+  - the corpus is synthetic rather than a sample;
+  - both readers read the same parquet bytes through two arrow bindings;
+  - the new archive's own rows have no second reader.
+
+**The risk the owner accepted, stated rather than implied.**
+
+- Both copies sit in one provider and one account.
+- Covered: a disk, a kernel or a bad deployment. Not covered: a billing, suspension or credential loss.
+- A copy at a second provider was the alternative and was not taken.
+
+**Freshness: 2 hours inside the US session, 6 hours outside it (N2, measured 2026-11-12).**
+
+- The alert is the age of the newest item, per §5's "a consumer is silently dead" row.
+- Measured over the predecessor's lake — 156 partitions, 779 run files, 243,226 raw rows, publication times from 2026-05-19 to 2026-11-10 — as gaps between consecutive publication instants over **61,282** distinct items.
+  - **61,282** is the union of distinct `id` values across the archive, a gap being a property of the archive and not of a partition.
+  - Memo §5.1's **62,507** is the same archive counted per partition and summed, double-counting 1,225 repeats of 501 ids (row R3's grain).
+  - Both re-derived 2026-11-12 in one pass.
 
 | window | p50 | p90 | p99 | p99.9 | worst |
 |---|---|---|---|---|---|
 | 13:00–20:00 UTC, the US session | 1.0 min | 10.1 min | 26.7 min | 50.3 min | **1.2 h** |
 | outside it | 0.3 min | 13.0 min | 45.0 min | 105.1 min | 332.6 h |
 
-**What would have fired is not what that table says.** A gap's quantile is bucketed by the hour it
-**starts**, while the alert asks whether the newest item's age is over the threshold at an instant
-inside the window — so a gap starting 12:10 UTC and running to 15:00 is an out-of-session gap and an
-in-session alert. `probes/news_gap.py` now prints both, measured 2026-11-12: **2 h in
-session fires four times** (2026-05-19 → 06-02, 332.6 h; 06-02 → 06-03, 16.8 h; 06-03 12:10 → 15:00,
-**2.8 h**; 06-05 → 06-08, 93.2 h) and 6 h outside fires three, those same episodes without the
-2.8-hour one. All four start outside the session, which is why gap-start bucketing reports zero
-there, and the control reproduces that zero. **The threshold choice survives**: three of the four are
-outages the 6-hour rule catches anyway, so 2 hours adds one alert in 175 days, 2026-06-03's.
+**What would have fired is not what that table says.**
 
-**What makes those two numbers wrong.** They measure the predecessor's **retrieval** coverage, not
-the world's news, so a different vendor moves them. They are provisional and are re-measured
-against `open-web-feed` (§11) and the
-first real vendor. The publication gap transfers where an observation gap would not, the
-predecessor's `ingested_at` spacing being its scheduler rather than the news. The record also holds
-outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.6-hour gap is one.
+- A gap's quantile is bucketed by the hour it **starts**, while the alert asks whether the newest item's age is over the threshold at an instant inside the window.
+  - So a gap starting 12:10 UTC and running to 15:00 is an out-of-session gap and an in-session alert.
+- `probes/news_gap.py` now prints both, measured 2026-11-12:
+
+  | episode | gap | 2 h in session | 6 h outside |
+  |---|---|---|---|
+  | 2026-05-19 → 06-02 | 332.6 h | fires | fires |
+  | 06-02 → 06-03 | 16.8 h | fires | fires |
+  | 06-03 12:10 → 15:00 | **2.8 h** | fires | does not fire |
+  | 06-05 → 06-08 | 93.2 h | fires | fires |
+
+  - **2 h in session fires four times**; 6 h outside fires three, those same episodes without the 2.8-hour one.
+- All four start outside the session, which is why gap-start bucketing reports zero there; the control reproduces that zero.
+- **The threshold choice survives**: three of the four are outages the 6-hour rule catches anyway, so 2 hours adds one alert in 175 days, 2026-06-03's.
+
+**What makes those two numbers wrong.**
+
+- They measure the predecessor's **retrieval** coverage, not the world's news, so a different vendor moves them.
+- They are provisional and are re-measured against `open-web-feed` (§11) and the first real vendor.
+- The publication gap transfers where an observation gap would not, the predecessor's `ingested_at` spacing being its scheduler rather than the news.
+- The record also holds outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.6-hour gap is one.
 
 ---
 
@@ -895,8 +953,8 @@ outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.
 - A story is held if it has a committed item.
 - A story is held if it has a `Document` attempt closed `Usable`, `Empty`, `PermanentFailure`, or
   with only unusable rows.
-- An empty or unusable page is held: re-fetching returns the same page. The raw blob (§3.9) allows
-  re-extraction.
+- An empty or unusable page is held: re-fetching returns the same page.
+- The raw blob (§3.9) allows re-extraction.
 - Not held: `TransientFailure`, interrupted by the startup sweep, in flight.
 - `Finalised` carries the `Verdict`, so permanence is stored.
 - Today `PermanentFailure` and `TransientFailure` both map to `OutcomeKind::Failed`
@@ -906,7 +964,8 @@ outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.
 - First sighting is unchanged: a skip writes no item.
 - So R15 cannot see a re-stamped time of a held story. The index value survives only in the
   attempt's raw blob.
-- The outcome names here are the code's. §3.2's `ok | empty | failed | collapsed` predates them.
+- The outcome names here are the code's.
+- §3.2's `ok | empty | failed | collapsed` predates them.
 - Schema changes are versioned with `PRAGMA user_version`, read at `Committer::open`.
 - A lower version is migrated by explicit `ALTER TABLE`, or a table rebuild for a `CHECK` change.
 - An unknown higher version is refused.
@@ -916,12 +975,13 @@ outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.
 - One SourceId, `open_web_wires`.
 - `open_web_outlets` arrives with its first outlet (Target).
 - A second SourceId in one invocation needs a run envelope with a list of `hosts_version` values.
-- Hosts, in order: GNW, then PRN, CNW, Fed, Yahoo (wire keys only). One PR per host, as each
-  robots fetch lands.
+- Hosts, in order: GNW, then PRN, CNW, Fed, Yahoo (wire keys only).
+- One PR per host, as each robots fetch lands.
 - CNW and Fed are admitted only after a body probe.
-- GNW article URLs are rewritten from `www.` to `rss.`. Both hosts are GNW's own.
-- `www.globenewswire.com` returned Akamai 403 on robots.txt twice. Its article pages were never
-  tested.
+- GNW article URLs are rewritten from `www.` to `rss.`.
+- Both hosts are GNW's own.
+- `www.globenewswire.com` returned Akamai 403 on robots.txt twice.
+- `www.globenewswire.com` article pages were never tested.
 - Yahoo: only provider keys of wires not fetched directly: `business-wire.com`, `accesswire.ca`.
 - Yahoo keys match exactly, never as substrings.
 - PRN, GNW and CNW keys are excluded: they would store each release twice.
@@ -933,15 +993,18 @@ outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.
 - The robots and floor checks run in `newsvault`: only the driver reads the store.
 - `newsvault` hands the provider the Crawl-delay parsed from the pinned robots blob.
 - Redirects refused: `TransportProfile.redirects = Refuse` sets `max_redirects(0)`.
-- A 3xx is a `PermanentFailure`. This closes R19 hole 9 by refusal.
-- One interval for all hosts: every admitted host is at 10 s. R19 hole 7 stays open.
+- A 3xx is a `PermanentFailure`.
+- This closes R19 hole 9 by refusal.
+- One interval for all hosts: every admitted host is at 10 s.
+- R19 hole 7 stays open.
 - `ValidPrecision::Minute` for GNW's minute-resolution `pubDate`.
 - `Minute` needs a `pit::datedness::Published` arm, a `canon` stamp arm with a committed vector, and
   a store `CHECK` change (step 2).
 - `items` gains `valid_raw`, `valid_field`, `valid_source`.
 - Poll every 30 min from 11:00 to 22:00 UTC: pre-market through after-close releases.
 - Poll every 90 min outside it.
-- Both are owner's choices, not measured. The weekday probe checks each against its index window.
+- Both are owner's choices, not measured.
+- The weekday probe checks each against its index window.
 - GNW's Saturday window allows at most 118 min (3.93 h × 0.5).
 - Follow-up cap: 150 per invocation, the owner's choice, not measured.
 - Worst case per run: (150 + index requests) × (1 + `MAX_TRANSIENT_RETRIES` = 2) × 10 s.
@@ -962,7 +1025,8 @@ outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.
 - Sources: every candidate that passes robots and a weekday probe.
 - Includes Business Wire if stable, Zero Hedge, Newswire.com (measured zone, date-only valid time).
 - `open_web_outlets`: Fool, CNBC, BI, Yahoo outlet syndication.
-- Fool's earnings-call transcripts are a separate item kind; the field is named when built.
+- Fool's earnings-call transcripts are a separate item kind.
+- That item kind's field is named when built.
 - Per-host intervals: R19 hole 7 closed (`HostPaces::Listed`).
 - Redirects followed as their own paced, ledgered requests. Hole 9 stays closed.
 - Following redirects needs `RawResponse` headers and `Document`-phase follow-ups.
@@ -1032,7 +1096,8 @@ outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.
 - Command: `curl -sS --compressed -A 'research-feed-probe/0.1' -o <body> -D <hdr> --max-time 30
   <url>`.
 - Spacing: ≥ 5 s between requests to one host, ≤ 3 per host per probe run.
-- That is below §11.1's 10 s floor. Crawl-delay was not read before every fetch.
+- That is below §11.1's 10 s floor.
+- Crawl-delay was not read before every fetch.
 - Body: whitespace-collapsed `<p>` text in the host's container, or JSON-LD `articleBody`.
 - Parsed offline with Python's `html.parser`.
 - 13 article fetches: 11 reached, 2 blocked.
