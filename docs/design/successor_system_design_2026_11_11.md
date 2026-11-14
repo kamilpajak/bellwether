@@ -573,7 +573,7 @@ to pick.
 | # | Deliverable | Unblocks | State |
 |---|---|---|---|
 | 1 | Point-in-time core and lake reader | Complete days instead of truncated ones | done (PR #1881) |
-| 2 | **Vendor probe on three days, two vendors** | Volume and therefore cost of a year of history ($82 vs $2,738); archive stability under a repeated query; whether a body is returned; the distribution of publication-to-index lag, which is the input to R11 | one day of work; most urgent |
+| 2 | **Vendor probe on three days, two vendors** | Volume and therefore cost of a year of history; archive stability under a repeated query; whether a body is returned; the distribution of publication-to-index lag, which is the input to R11 | run 2026-11-14: NewsAPI.ai closed at 509.85 USD, Webz.io waits for a one-month order (`probes/vendor_probe/PREREGISTRATION.md`) |
 | 3 | Off-box copy of the predecessor's outputs (§5.1) | Differences from the predecessor can be explained after it stops | not done; perishable, because history is rewritten in place |
 | 4 | Event-driven ingest with outbox, coverage ledger and hourly sweep | First sighting drops from 4.5 h after the close to about a minute after publication | after step 2 |
 | 4b | Private item stream over WebSocket (D-7), on top of step 4's outbox | A second consumer, which is the only real test of whether the item contract is a contract | after step 4; schema and heartbeat designed in from the start |
