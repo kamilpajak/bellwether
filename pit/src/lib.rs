@@ -321,6 +321,8 @@ mod tests {
         }
     }
     const COMPILE_FAIL: &str = "compile_fail";
+    /// A bare fence: rustdoc compiles and runs it, where `ignore` or `no_run` would skip the run.
+    const RUN: &str = "";
     const COMPILE_FAIL_BLOCK: usize = 0;
     const POSITIVE_CONTROL_BLOCK: usize = 1;
     const VENDOR_SEEN_AT: &str = "2026-07-01T10:00:00Z";
@@ -349,6 +351,16 @@ mod tests {
             .step_by(2)
             .map(str::to_owned)
             .collect()
+    }
+
+    fn block(index: usize) -> String {
+        doc_blocks().get(index).cloned().unwrap_or_default()
+    }
+
+    /// The fence's annotation EXACTLY, not a prefix: `compile_fail,ignore` starts with
+    /// `compile_fail` and rustdoc does not run it (mutation 2026-11-15, §8 row R2).
+    fn annotation(block: &str) -> &str {
+        block.lines().next().unwrap_or_default()
     }
 
     fn lag(seconds: i64) -> MeasuredLag {
@@ -489,20 +501,15 @@ mod tests {
     /// these two pin is the import path: wrong in the control and the pair goes silently green.
     #[test]
     fn the_two_instants_still_cannot_be_compared_with_each_other_after_the_move() {
-        let block = doc_blocks()
-            .get(COMPILE_FAIL_BLOCK)
-            .cloned()
-            .unwrap_or_default();
-        assert!(block.starts_with(COMPILE_FAIL), "{block}");
+        let block = block(COMPILE_FAIL_BLOCK);
+        assert_eq!(annotation(&block), COMPILE_FAIL, "{block}");
         assert!(block.contains(DOC_IMPORT), "{block}");
     }
 
     #[test]
     fn the_positive_control_for_the_compile_fail_block_imports_from_the_new_path() {
-        let block = doc_blocks()
-            .get(POSITIVE_CONTROL_BLOCK)
-            .cloned()
-            .unwrap_or_default();
+        let block = block(POSITIVE_CONTROL_BLOCK);
+        assert_eq!(annotation(&block), RUN, "{block}");
         assert!(block.contains(DOC_IMPORT), "{block}");
     }
 }
