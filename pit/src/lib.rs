@@ -325,6 +325,7 @@ mod tests {
     const RUN: &str = "";
     const COMPILE_FAIL_BLOCK: usize = 0;
     const POSITIVE_CONTROL_BLOCK: usize = 1;
+    const FENCE: &str = "```";
     const VENDOR_SEEN_AT: &str = "2026-07-01T10:00:00Z";
     const THE_RUN_THAT_READ_IT: &str = "2026-07-02T00:34:00Z";
     const WHOLE_MICROSECOND: &str = "2026-07-01T12:00:00.000001Z";
@@ -341,16 +342,34 @@ mod tests {
         }
     }
 
-    /// The header's fenced blocks, in order. The fence is assembled rather than written out, so
-    /// this function's own text does not split the file it reads.
-    fn doc_blocks() -> Vec<String> {
-        let fence = format!("//! {}", "```");
+    /// The `//!` header's lines only: splitting the whole file let a missing closing fence pull in
+    /// the test module, whose `DOC_IMPORT` constant then satisfied the control (mutation 2026-11-15).
+    fn header() -> Vec<&'static str> {
         include_str!("lib.rs")
-            .split(&fence)
-            .skip(1)
-            .step_by(2)
-            .map(str::to_owned)
+            .lines()
+            .take_while(|line| line.starts_with("//!"))
+            .map(|line| line.strip_prefix("//!").unwrap_or(line))
+            .map(|line| line.strip_prefix(' ').unwrap_or(line))
             .collect()
+    }
+
+    fn is_fence(line: &str) -> bool {
+        line.starts_with(FENCE)
+    }
+
+    /// The header's fenced blocks in order, each as its annotation line then its body.
+    fn doc_blocks() -> Vec<String> {
+        let mut blocks = Vec::new();
+        let mut open: Option<String> = None;
+        for line in header() {
+            match (open.take(), is_fence(line)) {
+                (None, true) => open = Some(line[FENCE.len()..].to_owned()),
+                (None, false) => {}
+                (Some(block), true) => blocks.push(block),
+                (Some(block), false) => open = Some(format!("{block}\n{line}")),
+            }
+        }
+        blocks
     }
 
     fn block(index: usize) -> String {
@@ -511,5 +530,13 @@ mod tests {
         let block = block(POSITIVE_CONTROL_BLOCK);
         assert_eq!(annotation(&block), RUN, "{block}");
         assert!(block.contains(DOC_IMPORT), "{block}");
+    }
+
+    /// The two tests above read blocks by position, so a decoy pair placed first would let the
+    /// real pair be switched off (mutation 2026-11-15): the header holds these two and no other.
+    #[test]
+    fn the_header_holds_exactly_the_compile_fail_block_and_its_control_both_closed() {
+        let fences = header().into_iter().filter(|line| is_fence(line)).count();
+        assert_eq!((doc_blocks().len(), fences), (2, 4));
     }
 }
