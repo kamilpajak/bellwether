@@ -12,8 +12,9 @@
 ## 0. TL;DR and framing
 
 Build a successor **in parallel**, in Rust, and stop adding features to the current pipeline while
-keeping it fully maintained. Do **not** rebuild the broker rail. Register a **parity gate** with a
-date, because a parallel build without one becomes two systems forever.
+keeping it fully maintained. Do **not** rebuild the broker rail. Register a **handover criterion**
+(D-5), because a parallel build without one becomes two systems forever. Output parity with the
+predecessor is not that criterion (§5.1).
 
 Three asymmetries decide this, and they are the whole argument:
 
@@ -27,7 +28,7 @@ Three asymmetries decide this, and they are the whole argument:
    collapse the wait entirely (§6), which is the single highest-value unknown in this memo.
 
 What this memo does **not** do: choose a vendor, resolve the storage-licence question, specify the
-service contracts, or set the parity-gate date. Those are §8, listed as open rather than written
+service contracts, or set the handover criterion. Those are §8, listed as open rather than written
 around.
 
 ---
@@ -377,8 +378,24 @@ newline) and once in Python (code-point order, no trailing newline). The counts 
 An instrument that introduces its own difference will report a defect that does not exist, so the
 two sides must share one digest function, not two implementations of one.
 
-**The frozen outputs must be captured while the old system still runs.** After it is switched off
-there is nothing to compare against and the gate stops existing.
+**Output parity with the predecessor is not a target (2026-11-14).** Input parity, above, stays.
+- The successor fixes the predecessor's defects, so matching its outputs means copying them: the
+  200-item cap (§1.1), last-run timestamps (§1.3), a price snapshot its own code calls "Snapshot,
+  not PIT" (`edgar_fundamentals.py:635-638`).
+- Model use differs by design. Predecessor: a model picks candidate tickers per theme on every run;
+  91 of 238 pairs got split votes at temperature 0 (`channel_assessor.py:61-66`). Successor: a model
+  builds the relation map once, as a hashed file (architecture §4); `derive` matches against it with
+  no model. Candidate sets differ by construction.
+- What remains: every difference from the predecessor's picks needs a named cause. An unexplained
+  difference is a defect on our side.
+- The forcing function moves to D-5: switch-off follows a handover criterion, not a number match.
+- The predecessor still runs (verified on its host 2026-11-14: build timer active, brief for
+  2026-11-13 written that day). Its outputs are parquet under `~/.alphalens/`, 179 days
+  2026-05-19 → 2026-11-13. Postgres is a lossy mirror: 103 columns against up to 181.
+- Its history is rewritten in place: briefs for 05-19 → 10-29 were rewritten on 2026-10-30, with
+  one day backed up; outcome files are recomputed daily. One copy, one host.
+- So: one off-box copy of `~/.alphalens/` now, kept for explaining differences, not for a gate. The
+  predecessor is not switched off before that copy exists.
 
 ### 5.2 "No new features" cannot mean "no maintenance"
 
@@ -513,9 +530,9 @@ must not influence the service that produces proposals, or selection happens und
 |---|---|---|
 | D-1 | **Which news vendor**, and whether one or two (live vs archive). | §6. Blocked on the probe below. |
 | D-2 | ~~**Storage licence.**~~ **CLOSED 2026-11-11 by the owner:** not treated as a constraint for a private, single-user research archive. The archive holds full article text. Recorded because the alternative it displaced — storing hashes, spans and quotations instead — would have made re-matching after a rule change impossible, so the decision bought that capability. | — |
-| D-3 | **The parity-gate date.** | Named in §5.1 as the cure for "parallel forever" and deliberately left unset here, which is the same defect one level up. |
+| D-3 | ~~**The parity-gate date.**~~ **Void 2026-11-14:** output parity is not a target (§5.1). | The forcing function it carried moves to D-5. |
 | D-4 | ~~**Repo topology.**~~ **CLOSED 2026-11-11 by the owner: three repositories.** This repository keeps the front-end, the thin API, the five data-collection units and — as an **archive** — the dead lab and its memos. A second holds the broker rail and the backtester, never rewritten. The successor is a third, polyglot, but its Python is a **fresh** statistics tier of roughly one to two thousand lines rather than the 9,602 lines of `diagnostics` / `eval` / `preaudit` / `retrospective_audit` / `gates`, which served closed paradigms and stay behind. | Buys the one gate that today's worst error needed: the panel artefact and the power routine live in one repository, so a test can require that the panel declares its number of exchangeable units and that the power routine refuses to run without it. Across a repository boundary that gate cannot be written, and the 88.2%-versus-27.4% error of §1.8 is precisely what it catches. Inherits one known hazard: a polyglot CI needs path filters, and in this project the `.github/` filters must be mirrored into the post-deploy check under a different pathspec syntax — a coupling that has already caused a failure once, so it belongs in the gate list rather than being discovered later. |
-| D-5 | **Brief handover criterion.** "Then the old pipeline can stop" is not testable as written. | Without a number, the transition has no end. |
+| D-5 | **Brief handover criterion.** "Then the old pipeline can stop" is not testable as written. | Without a number, the transition has no end. Since 2026-11-14 it is the only forcing function (§5.1). |
 | D-6 | **Does the pipeline ever need to propose on the session it observes?** | If yes, `vault` needs a run before 16:00 ET and the partial-day problem of §4 rule 4 becomes load-bearing. If no, today's cadence suffices and §4 buys only honesty, not tradability. |
 | D-7 | ~~**A published item stream?**~~ **CLOSED 2026-11-11 by the owner: build the WebSocket, keep it private for now.** It is a **derived surface** on `vault`, never a window onto the outbox: it publishes versioned *items*, not internal events, so a change to `newsvault`'s row shape cannot break a consumer. Each message carries both timestamps and a monotonic sequence number, so a consumer decides its own point-in-time cut and can order by our sequence instead of trusting clocks. A heartbeat is mandatory, because silence must be distinguishable from a dead stream — 2026-07-11 held 59 items against a median of 181 and nothing said which it was. No delivery guarantee and no latency promise: the archive remains the source of truth (§4 rule 2) and reconciliation is an HTTP read, while a latency promise would need N2, which has no number. | **"Private" is a property of who holds credentials, not of whether a contract exists.** The payload shape and the heartbeat go in from the start even while nobody else connects, because retrofitting them after a consumer depends on the stream is a breaking change in someone else's system. The tripwire: the schema freezes at the **first external connection**, not at a later decision. Note also that this is the **third** consumer of one store — briefs want 200 items, the study wants completeness, a stream wants latency — and §1.1 is the record of what happened the last time one store served two consumers with different needs. |
 | D-8 | **Does salience count occurrences or documents?** Today `n(c, x)` counts **occurrences** of a core, so one 650,000-character EDGAR exhibit naming Honeywell forty times counts the same as forty separate articles about Honeywell. The candidate rule counts **items** mentioning the core instead: "how many news items named this counterparty today", not "how many times was it written". | Unmeasured, and it is the last hypothesis that could reverse §1.9's power collapse, because long-document inflation is the plausible source of the earnings-season concentration. It is a `matcher` rule change, so R18 governs it: the two panels must be produced and diffed rather than swapped. Not a free choice either way — occurrence counting is defensible and document counting is defensible, so whichever is chosen must be chosen before its power is known. |
@@ -545,12 +562,12 @@ to pick.
 |---|---|---|---|
 | 1 | Point-in-time core and lake reader | Complete days instead of truncated ones | done (PR #1881) |
 | 2 | **Vendor probe on three days, two vendors** | Volume and therefore cost of a year of history ($82 vs $2,738); archive stability under a repeated query; whether a body is returned; the distribution of publication-to-index lag, which is the input to R11 | one day of work; most urgent |
-| 3 | Frozen outputs of the current system over several dozen days | The parity gate begins to exist. Without it, steps 6 and 7 are a bet | cheapest, most important |
+| 3 | Off-box copy of the predecessor's outputs (§5.1) | Differences from the predecessor can be explained after it stops | not done; before any switch-off |
 | 4 | Event-driven ingest with outbox, coverage ledger and hourly sweep | First sighting drops from 4.5 h after the close to about a minute after publication | after step 2 |
 | 4b | Private item stream over WebSocket (D-7), on top of step 4's outbox | A second consumer, which is the only real test of whether the item contract is a contract | after step 4; schema and heartbeat designed in from the start |
 | 5 | Backfill to 246 sessions, if step 2 came out cheap | Removes six months of waiting | depends on step 2 |
-| 6 | `derive` reproducing the frozen outputs to the number | Evidence the successor can do what the current system does | designed |
-| 7 | `modelgate`, then `propose` taking over brief production | Only now may the old pipeline stop | requires step 6 |
+| 6 | `derive` over the full archive; each difference from the predecessor's picks has a named cause | Evidence the differences are the fixes, not new defects | designed |
+| 7 | `modelgate`, then `propose` taking over brief production | The old pipeline may stop once D-5 is met | requires step 6 |
 
 ---
 
