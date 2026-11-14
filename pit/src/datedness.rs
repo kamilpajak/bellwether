@@ -3,7 +3,7 @@
 //! [`Datedness`] is where it stops being assumed: a date is carried as a date and never folded
 //! into a fabricated midnight instant.
 
-use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
@@ -104,17 +104,38 @@ impl Datedness {
 }
 
 /// The last microsecond of `day` in the calendar `tz` names, or `None` when `tz` is not an IANA
-/// zone name or the next day's local midnight falls in a daylight-saving gap.
+/// zone name. When the next local midnight falls in a daylight-saving gap, the day ends where the
+/// gap starts, which is the instant of the first local time after it.
 #[must_use]
 pub fn end_of_day(day: NaiveDate, tz: &str) -> Option<DateTime<Utc>> {
     let zone: Tz = tz.parse().ok()?;
-    let next_day = day.succ_opt()?;
+    let midnight = day.succ_opt()?.and_time(NaiveTime::MIN);
     // `.latest()` of an ambiguous local midnight, never `.earliest()`: the later instant is the
     // later bound, and a later bound cannot admit the item sooner.
-    let starts = zone
-        .from_local_datetime(&next_day.and_time(NaiveTime::MIN))
-        .latest()?;
+    let starts = match zone.from_local_datetime(&midnight).latest() {
+        Some(starts) => starts,
+        None => first_local_time_after_a_gap(zone, midnight)?,
+    };
     Some(starts.with_timezone(&Utc) - Duration::microseconds(1))
+}
+
+/// Pacific/Apia skipped the whole of 2011-12-30, so a gap can be a day long.
+const LONGEST_GAP_MINUTES: i64 = 2 * 24 * 60;
+const SECONDS_PER_MINUTE: i64 = 60;
+
+/// The first local time at or after `inside` that exists, found to the second: tzdb transitions
+/// fall on whole seconds, and the gap is one contiguous run of local times that do not exist.
+fn first_local_time_after_a_gap(zone: Tz, inside: NaiveDateTime) -> Option<DateTime<Tz>> {
+    let exists = |local: &NaiveDateTime| zone.from_local_datetime(local).earliest();
+    let minute = (1..=LONGEST_GAP_MINUTES)
+        .map(|minutes| inside + Duration::minutes(minutes))
+        .find(|local| exists(local).is_some())?;
+    let first = (1..SECONDS_PER_MINUTE)
+        .map(|seconds| minute - Duration::seconds(seconds))
+        .take_while(|local| exists(local).is_some())
+        .last()
+        .unwrap_or(minute);
+    exists(&first)
 }
 
 #[cfg(test)]
@@ -142,6 +163,10 @@ mod tests {
     const DAY_BEFORE_HAVANA_FALLS_BACK: &str = "2026-10-31";
     /// One microsecond before 05:00Z; the earlier midnight, 04:00Z, would end it an hour sooner.
     const END_OF_THAT_DAY_AT_THE_LATER_MIDNIGHT: &str = "2026-11-01T04:59:59.999999Z";
+    /// Havana springs forward at its 2026-03-08 midnight, so the day before has no local midnight
+    /// to end at; the gap starts at 00:00 CST, which is 05:00Z.
+    const DAY_BEFORE_HAVANA_SPRINGS_FORWARD: &str = "2026-03-07";
+    const END_OF_THAT_DAY_WHERE_THE_GAP_STARTS: &str = "2026-03-08T04:59:59.999999Z";
     const EVERY_CUTOFF: [&str; 3] = [
         "1970-01-01T00:00:00Z",
         "2026-07-09T00:00:00Z",
@@ -246,14 +271,21 @@ mod tests {
         }
     }
 
-    /// Havana falls back from CDT to CST at 01:00 on 2026-11-01, so its local midnight is both
-    /// 04:00Z and 05:00Z: found 2026-11-14 by scanning every chrono-tz 0.10.4 zone over
-    /// 1990-2029 (308 ambiguous midnights). New York has none, so no other test sees the choice.
+    /// Section 8 row R11, the ambiguous midnight.
     #[test]
     fn a_day_ending_at_an_ambiguous_midnight_ends_at_the_later_of_its_two_instants() {
         assert_eq!(
             end_of_day(day(DAY_BEFORE_HAVANA_FALLS_BACK), HAVANA),
             Some(at(END_OF_THAT_DAY_AT_THE_LATER_MIDNIGHT))
+        );
+    }
+
+    /// Section 8 row R11, the midnight inside a gap.
+    #[test]
+    fn a_day_whose_next_midnight_falls_in_a_gap_ends_where_the_gap_starts() {
+        assert_eq!(
+            end_of_day(day(DAY_BEFORE_HAVANA_SPRINGS_FORWARD), HAVANA),
+            Some(at(END_OF_THAT_DAY_WHERE_THE_GAP_STARTS))
         );
     }
 
