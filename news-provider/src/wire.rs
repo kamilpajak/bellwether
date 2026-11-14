@@ -369,6 +369,7 @@ mod tests {
     };
     use crate::budget::{BudgetError, RequestBudget};
     use crate::clock::testing::{StepClock, WaitRecorder};
+    use crate::clock::{Clock, Sleeper};
     use crate::ledger::tests::{at, Recorder};
     use crate::ledger::{AttemptSlot, SendPermit};
     use crate::provider::Provenance;
@@ -377,6 +378,7 @@ mod tests {
         TargetWindow,
     };
     use canon::FileDigest;
+    use chrono::{DateTime, TimeDelta, Utc};
     use std::path::Path;
     use std::time::Duration;
 
@@ -513,7 +515,7 @@ mod tests {
         send_to(wire, clock, ordinal, REFUSED)
     }
 
-    fn send_to(wire: &Wire, clock: &StepClock, ordinal: u32, url: &str) -> Checked {
+    fn send_to(wire: &Wire, clock: &dyn Clock, ordinal: u32, url: &str) -> Checked {
         let mut sink = Recorder::default();
         let Some(permit) = permit(&mut sink, ordinal) else {
             return Err("no permit".into());
@@ -545,6 +547,62 @@ mod tests {
             .flat_map(|(host, ip)| [*host, *ip, REQUESTED_AT, RECEIVED_AT])
             .collect();
         StepClock::over(&reads)
+    }
+
+    /// A clock its own waits advance, so each read sees the instant the waits before it left.
+    #[derive(Debug, Clone)]
+    struct WaitedClock {
+        now: std::rc::Rc<std::cell::Cell<DateTime<Utc>>>,
+        waits: WaitRecorder,
+    }
+
+    impl WaitedClock {
+        fn at(instant: &str) -> Result<Self, chrono::ParseError> {
+            Ok(Self {
+                now: std::rc::Rc::new(std::cell::Cell::new(instant.parse()?)),
+                waits: WaitRecorder::default(),
+            })
+        }
+
+        fn elapse(&self, how_long: Duration) {
+            if let Some(later) = TimeDelta::from_std(how_long)
+                .ok()
+                .and_then(|step| self.now.get().checked_add_signed(step))
+            {
+                self.now.set(later);
+            }
+        }
+    }
+
+    impl Clock for WaitedClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.now.get()
+        }
+    }
+
+    impl Sleeper for WaitedClock {
+        fn sleep(&self, how_long: Duration) {
+            self.waits.sleep(how_long);
+            self.elapse(how_long);
+        }
+    }
+
+    fn polite_refusal(
+        store: &Path,
+        waits: &WaitRecorder,
+        url: &str,
+    ) -> Result<Option<SendFailure>, Box<dyn std::error::Error>> {
+        let mut sink = Recorder::default();
+        let Some(permit) = permit(&mut sink, FIRST_ATTEMPT) else {
+            return Err("no permit".into());
+        };
+        let asked = Request {
+            url: url.to_owned(),
+            ..request()
+        };
+        Ok(polite_wire(store, SOURCE, waits)
+            .send(permit, &asked, &polite_clock(&[(RESERVED_AT, RESERVED_AT)]))
+            .err())
     }
 
     /// Two sends through one polite `Wire`, 60 ms apart, the second paying its host wait in full.
@@ -796,15 +854,31 @@ mod tests {
         Ok(())
     }
 
-    /// Reserved at 60 ms instead, the IP slot would sit unused through the host wait while every
-    /// other host's call queued behind it; reserved after, the IP file names the later instant.
+    /// Measured 2026-11-14: on a `StepClock`, reserving both slots and then sleeping both waits
+    /// kept the whole suite green, because a scripted read answers the same whatever came before.
     #[test]
     fn the_ip_slot_is_reserved_after_the_host_wait_and_not_before_it() -> Checked {
         let store = tempfile::tempdir()?;
-        two_polite_sends(store.path(), &WaitRecorder::default(), LOCALHOST, LOCALHOST)?;
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let wire = Wire::with_sleeper(
+            polite_profile(),
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        send_to(&wire, &clock, FIRST_ATTEMPT, LOCALHOST)?;
+        clock.elapse(ELAPSED);
+        send_to(&wire, &clock, SECOND_ATTEMPT, LOCALHOST)?;
         assert_eq!(
-            std::fs::read_to_string(store.path().join(PACE_FILE))?,
-            IP_RESERVED_AFTER_THE_HOST_WAIT
+            (
+                clock.waits.waits(),
+                std::fs::read_to_string(store.path().join(PACE_FILE))?
+            ),
+            (
+                vec![NO_WAIT, NO_WAIT, HOST_WAIT, NO_WAIT],
+                IP_RESERVED_AFTER_THE_HOST_WAIT.to_owned()
+            )
         );
         Ok(())
     }
@@ -856,24 +930,35 @@ mod tests {
     fn a_per_host_pace_on_a_url_with_no_host_refuses_before_any_wait() -> Checked {
         let store = tempfile::tempdir()?;
         let waits = WaitRecorder::default();
-        let mut sink = Recorder::default();
-        let Some(permit) = permit(&mut sink, FIRST_ATTEMPT) else {
-            return Err("no permit".into());
-        };
-        let asked = Request {
-            url: NO_HOST.to_owned(),
-            ..request()
-        };
-        let refused = polite_wire(store.path(), SOURCE, &waits).send(
-            permit,
-            &asked,
-            &polite_clock(&[(RESERVED_AT, RESERVED_AT)]),
-        );
+        let refused = polite_refusal(store.path(), &waits, NO_HOST)?;
         assert_eq!(
-            (refused.err(), waits.waits()),
+            (refused, waits.waits()),
             (
                 Some(SendFailure::Budget(BudgetError::NoHost {
                     url: NO_HOST.to_owned()
+                })),
+                Vec::new()
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_host_pace_file_holding_a_value_this_crate_did_not_write_refuses_before_any_wait() -> Checked
+    {
+        let store = tempfile::tempdir()?;
+        let pace_dir = store.path().join(PACE_DIR);
+        std::fs::create_dir_all(&pace_dir)?;
+        let pace = pace_dir.join(HOST_PACE_FILE);
+        std::fs::write(&pace, NOT_AN_INSTANT)?;
+        let waits = WaitRecorder::default();
+        let refused = polite_refusal(store.path(), &waits, LOCALHOST)?;
+        assert_eq!(
+            (refused, waits.waits()),
+            (
+                Some(SendFailure::Budget(BudgetError::Unreadable {
+                    path: pace,
+                    held: NOT_AN_INSTANT.to_owned(),
                 })),
                 Vec::new()
             )
