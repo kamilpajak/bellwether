@@ -312,16 +312,16 @@ Event-driven must not become incremental state. The four rules:
 2. **Write, then emit, in one transaction.** The archive is the source of truth; the event is a
    notification that it grew. A lost event then costs latency, not data.
 3. **The periodic sweep stays** (every scheduled poll, architecture §11.2), as a backstop.
-   Event-driven *plus* periodic, not instead of. A silently dead consumer looks exactly like a quiet news day — the failure §1.4's ledger gap
-   already produced once.
+   Event-driven *plus* periodic, not instead of. A silently dead consumer looks exactly like a
+   quiet news day — the failure §1.4's ledger gap already produced once.
 4. **Salience is a function of a cutoff, not of a day:** `salient(core, T)`. The rolling threshold
    computed from a partial day differs from the same threshold at the close, so a company can be
    salient at 10:00 and not at 16:00. Without an explicit `T` the treatment value does not exist,
    and a result could be moved after the fact by choosing an hour.
 
 **Transport: an outbox table in the archive's own SQLite file, polled by cursor** (architecture §6,
-decided 2026-11-14). Kafka solves a throughput problem we do not have: 300–700 items/day is one event every
-two to five minutes.
+decided 2026-11-14). Kafka solves a throughput problem we do not have: 300–700 items/day is one
+event every two to five minutes.
 
 **Two consequences to price, not assume away.** Per-item model calls would be 300–700/day instead
 of one batch, so windowing and debounce live *inside* `modelgate` with the cost cap doing real

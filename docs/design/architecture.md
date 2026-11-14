@@ -827,7 +827,8 @@ there, and the control reproduces that zero. **The threshold choice survives**: 
 outages the 6-hour rule catches anyway, so 2 hours adds one alert in 175 days, 2026-06-03's.
 
 **What makes those two numbers wrong.** They measure the predecessor's **retrieval** coverage, not
-the world's news, so a different vendor moves them: so they are provisional and are re-measured against `open-web-feed` (§11) and the
+the world's news, so a different vendor moves them. They are provisional and are re-measured
+against `open-web-feed` (§11) and the
 first real vendor. The publication gap transfers where an observation gap would not, the
 predecessor's `ingested_at` spacing being its scheduler rather than the news. The record also holds
 outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.6-hour gap is one.
@@ -868,6 +869,7 @@ outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.
   - CNW: sitemap `news:publication_date`, a full instant with offset.
   - CNBC: the page's `article:published_time`, `ValidSource::OurExtraction`. Never its sitemap
     (§11.6).
+  - `ValidSource::PageMetadata` stays unbuilt. Step 2 deletes its forecast at `provider.rs:39-40`.
   - Yahoo: its syndication time.
   - Fool, BI: the sitemap value.
   - Never: `lastmod`, `dateModified`, fetch time, a date folded into midnight.
@@ -885,8 +887,9 @@ outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.
 - Worst-case busy time ≤ 50% of a day.
 - Hosts file: one hashed file per SourceId under `providers/open-web-feed/hosts/`.
 - Its digest is `hosts_version` (§2), stored in its own `attempts` column and in the run envelope.
-- `universe_version` for this provider = digest of its row-selection rules (path filters, Yahoo key
-  list).
+- `universe_version` = digest of this provider's ticker roster file (empty for the POC).
+- Path filters and the Yahoo key list live in the rules file, so `extract_rules_version` covers
+  them.
 - Only admitted rows are planned.
 - Held is keyed on (SourceId, `story_id`) over every target window, never the run's window alone.
 - A story is held if it has a committed item.
@@ -913,7 +916,8 @@ outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.
 - One SourceId, `open_web_wires`.
 - `open_web_outlets` arrives with its first outlet (Target).
 - A second SourceId in one invocation needs a run envelope with a list of `hosts_version` values.
-- Hosts, in order: GNW, then PRN, CNW, Fed. One PR per host, as each robots fetch lands.
+- Hosts, in order: GNW, then PRN, CNW, Fed, Yahoo (wire keys only). One PR per host, as each
+  robots fetch lands.
 - CNW and Fed are admitted only after a body probe.
 - GNW article URLs are rewritten from `www.` to `rss.`. Both hosts are GNW's own.
 - `www.globenewswire.com` returned Akamai 403 on robots.txt twice. Its article pages were never
@@ -941,7 +945,9 @@ outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.
 - GNW's Saturday window allows at most 118 min (3.93 h × 0.5).
 - Follow-up cap: 150 per invocation, the owner's choice, not measured.
 - Worst case per run: (150 + index requests) × (1 + `MAX_TRANSIENT_RETRIES` = 2) × 10 s.
-- A run stops issuing follow-ups when the next request would end past its poll period.
+- A run stops issuing requests when its busy time would pass half its poll period: 15 min inside
+  11:00–22:00 UTC, 45 min outside.
+- This deadline is what holds busy time ≤ 50% of a day.
 - Unissued follow-ups count as `deferred` and are retried at the next poll.
 - Conformance: exempt by a provider declaration, a new trait method without a default.
 - `edgar-press` declares itself session-bound, so its check stays.
@@ -982,7 +988,7 @@ outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.
 | follow-up story equals item story, synthetic fixture | `document_of` keys on the canonical link | R3 |
 | a quiet all-held day passes `ledger --check` | the `held` subtraction is removed | R4 |
 | a target other than the run day is refused before any request | the day check is removed | R10 |
-| a store at the previous `user_version` opens, migrates, takes a `Minute` row | the migration is removed | R13 |
+| a store at the previous `user_version` opens, migrates, takes a `Minute` row | the migration is removed | new row M1 |
 | only admitted hosts are planned | the status filter is removed | R19 |
 | a hosts row faster than its robots Crawl-delay is refused (newsvault) | the floor check is removed | R19 |
 | an admitted row without a ledgered robots fetch is refused (newsvault) | the lookup is removed | R4 |
@@ -1007,11 +1013,12 @@ outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.
    - index and document parsers, `item_key`, `Provider::story_of`, `NoArticleBody`;
    - schema versioning, `items` valid-time columns, `hosts_version` column and envelope field;
    - `Minute` precision;
-   - conformance declaration, per-provider `--calendar`/`--listing`, `--window today`;
+   - conformance declaration and per-(day, host) accounting in `plan_accounts_for_every_day`;
+   - per-provider `--calendar`/`--listing`, `--window today`;
    - an end-to-end test.
 3. Robots refresh command; `newsvault` checks the pinned digest and the floor.
-4. Held filter: `Finalised` carries the `Verdict`, `attempts.story_id`, `attempts.held`, live covered
-   set, ledger check. Amends R16 and R20.
+4. Held filter: `Finalised` carries the `Verdict`, `attempts.story_id`, `attempts.held`, live
+   covered set, ledger check. Amends R16 and R20.
 5. Redirect refusal and 3xx classification, with a loopback stub.
 6. One PR per further host.
 7. VPS timer, follow-up cap with the run deadline, busy seconds in the envelope.
@@ -1024,8 +1031,8 @@ outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.
 
 - Command: `curl -sS --compressed -A 'research-feed-probe/0.1' -o <body> -D <hdr> --max-time 30
   <url>`.
-- Spacing: ≥ 5 s between requests to one host, ≤ 3 per host per probe run. That is below §11.1's
-  10 s floor. Crawl-delay was not read before every fetch.
+- Spacing: ≥ 5 s between requests to one host, ≤ 3 per host per probe run.
+- That is below §11.1's 10 s floor. Crawl-delay was not read before every fetch.
 - Body: whitespace-collapsed `<p>` text in the host's container, or JSON-LD `articleBody`.
 - Parsed offline with Python's `html.parser`.
 - 13 article fetches: 11 reached, 2 blocked.
