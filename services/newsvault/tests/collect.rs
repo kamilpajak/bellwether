@@ -54,6 +54,9 @@ const MICROSOFT_URL: &str =
 
 const OK: u16 = 200;
 const FORBIDDEN: u16 = 403;
+/// A server error, which `edgar-press::classify` reads as transient from the status alone (the body
+/// is not consulted for a 5xx), so any body fixture states it.
+const SERVICE_UNAVAILABLE: u16 = 503;
 
 const EXIT_OK: i32 = 0;
 const EXIT_USAGE: i32 = 2;
@@ -174,6 +177,74 @@ impl Exchange for Payloads {
     }
 }
 
+/// Answers from a per-url SEQUENCE, so one url can fail on its first call and succeed on the next,
+/// which a static `Payloads` cannot say. Past the end of a url's sequence it repeats the last
+/// answer, so an always-failing url is one entry long. Records every url it was asked for, like
+/// `Payloads`, so a retry is visible as a second ask.
+struct Flaky {
+    answers: BTreeMap<String, Vec<(u16, Vec<u8>)>>,
+    calls: RefCell<BTreeMap<String, usize>>,
+    asked: RefCell<Vec<String>>,
+}
+
+impl Flaky {
+    fn of(answers: &[(&str, &[(u16, &str)])]) -> Result<Self, Box<dyn Error>> {
+        let mut held = BTreeMap::new();
+        for (url, sequence) in answers {
+            let mut responses = Vec::new();
+            for (status, name) in *sequence {
+                responses.push((*status, std::fs::read(fixture(name))?));
+            }
+            held.insert((*url).to_owned(), responses);
+        }
+        Ok(Self {
+            answers: held,
+            calls: RefCell::new(BTreeMap::new()),
+            asked: RefCell::new(Vec::new()),
+        })
+    }
+}
+
+impl Exchange for Flaky {
+    fn send(
+        &self,
+        permit: SendPermit,
+        request: &Request,
+        clock: &dyn Clock,
+    ) -> Result<RawResponse, SendFailure> {
+        self.asked.borrow_mut().push(request.url.clone());
+        let attempt = permit.attempt_id().clone();
+        let requested_at = ObservationTime::new(clock.now());
+        let received_at = ObservationTime::new(clock.now());
+        let nth = {
+            let mut calls = self.calls.borrow_mut();
+            let seen = calls.entry(request.url.clone()).or_insert(0);
+            let nth = *seen;
+            *seen += 1;
+            nth
+        };
+        let answer = self
+            .answers
+            .get(&request.url)
+            .and_then(|sequence| sequence.get(nth.min(sequence.len().saturating_sub(1))));
+        match answer {
+            Some((status, body)) => Ok(RawResponse::new(
+                attempt,
+                *status,
+                body.clone(),
+                requested_at,
+                received_at,
+            )),
+            None => Err(SendFailure::Transport(news_provider::TransportError::new(
+                attempt,
+                requested_at,
+                received_at,
+                format!("no fixture answers {}", request.url),
+            ))),
+        }
+    }
+}
+
 /// A real archive whose `commit` refuses one attempt, which is the only way to reach the
 /// `commit_failed` bucket of the exit table without corrupting a store.
 struct Refusing {
@@ -236,11 +307,12 @@ impl Archive for Refusing {
     }
 }
 
-/// One run through the library, with the exchange the caller chose.
+/// One run through the library, with the exchange the caller chose (static `Payloads` or a
+/// sequenced `Flaky`).
 fn collected(
     store: &Path,
     window: &str,
-    exchange: &Payloads,
+    exchange: &dyn Exchange,
 ) -> Result<cmd_collect::Answer, Box<dyn Error>> {
     let ask = ask(store, window);
     let provider = cmd_collect::open_provider(&ask)?;
@@ -1166,6 +1238,147 @@ fn a_live_window_with_an_uncovered_follow_up_reports_no_coverage_gap() -> TestRe
             .any(|finding| finding.code == "coverage_incomplete"),
         "{:?}",
         report.check.findings
+    );
+    Ok(())
+}
+
+/// The outcomes of every attempt row the run made against one url, in attempt order. A retry shows
+/// as a second entry, so a transient-then-success document reads `["failed", "ok"]`.
+fn outcomes_for(answer: &cmd_collect::Answer, url: &str) -> Vec<String> {
+    answer.envelope["attempts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|attempt| attempt["url"].as_str() == Some(url))
+        .filter_map(|attempt| attempt["outcome"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// §8 row R21. A document whose fetch fails transiently (an HTTP 503) is re-queued and re-attempted
+/// within the SAME run, so the item it names is committed and the day is complete rather than left
+/// to the next run. Microsoft answers 503 once and then its real filing; the run ends with one
+/// failed attempt row and one ok attempt row for that url, both filings committed, and exit 0.
+/// Mutation 2026-11-13: setting `MAX_TRANSIENT_RETRIES` to 0, or dropping the re-queue in
+/// `collect`'s queue loop, turns this red — Microsoft is asked once, stays failed, one filing
+/// commits and the run exits `partial_collect`.
+#[test]
+fn a_transient_fetch_failure_is_retried_and_commits_the_item_within_one_run() -> TestResult {
+    let root = TempDir::new()?;
+    let flaky = Flaky::of(&[
+        (INDEX_URL, &[(OK, "form.20261110.idx")]),
+        (APPLE_URL, &[(OK, "filing_8k_apple.txt")]),
+        (
+            MICROSOFT_URL,
+            &[
+                (SERVICE_UNAVAILABLE, "error_403_traffic.html"),
+                (OK, "filing_8k_microsoft_no_acceptance.txt"),
+            ],
+        ),
+    ])?;
+    let answer = collected(root.path(), A_LISTED_SESSION, &flaky)?;
+    assert_eq!(
+        (
+            answer.exit,
+            answer.envelope["items_committed"].as_u64(),
+            flaky
+                .asked
+                .borrow()
+                .iter()
+                .filter(|url| *url == MICROSOFT_URL)
+                .count(),
+        ),
+        (Exit::Ok, Some(u64::from(IN_UNIVERSE_FILINGS)), 2),
+        "{:#}",
+        answer.envelope
+    );
+    assert_eq!(
+        outcomes_for(&answer, MICROSOFT_URL),
+        vec!["failed".to_owned(), "ok".to_owned()],
+        "{:#}",
+        answer.envelope
+    );
+    // per_source.failed counts the failed attempt ROW even though the retry succeeded and the run
+    // exits Ok: per_source summarises attempts, the exit is final disposition, and the two diverge
+    // once a transient is retried (§8 row R21). This pins that divergence.
+    assert_eq!(
+        (
+            answer.exit,
+            answer.envelope["per_source"][0]["failed"].as_u64()
+        ),
+        (Exit::Ok, Some(1)),
+        "{:#}",
+        answer.envelope
+    );
+    Ok(())
+}
+
+/// §8 row R21. A PERMANENT failure (a 4xx carrying the generic access-denied body) is attempted
+/// exactly once and never re-queued: retrying a permanent refusal wastes calls and reads as abuse.
+/// Mutation 2026-11-13: making the retry test in `collect` fire for a permanent failure (re-queuing
+/// whenever the outcome is `failed`, dropping the `!permanent` guard) turns this red — Microsoft is
+/// then asked `MAX_TRANSIENT_RETRIES + 1` times.
+#[test]
+fn a_permanent_fetch_failure_is_attempted_once_and_never_retried() -> TestResult {
+    let root = TempDir::new()?;
+    let refused = Payloads::of(&[
+        (INDEX_URL, OK, "form.20261110.idx"),
+        (APPLE_URL, OK, "filing_8k_apple.txt"),
+        (MICROSOFT_URL, FORBIDDEN, "error_403_access_denied.xml"),
+    ])?;
+    let answer = collected(root.path(), A_LISTED_SESSION, &refused)?;
+    assert_eq!(
+        (
+            answer.exit,
+            answer.envelope["items_committed"].as_u64(),
+            asked(&refused)
+                .iter()
+                .filter(|url| *url == MICROSOFT_URL)
+                .count(),
+        ),
+        (Exit::PartialCollect, Some(1), 1),
+        "{:#}",
+        answer.envelope
+    );
+    assert_eq!(
+        outcomes_for(&answer, MICROSOFT_URL),
+        vec!["failed".to_owned()]
+    );
+    Ok(())
+}
+
+/// §8 row R21. The retry is BOUNDED: a request that fails transiently on every attempt produces
+/// exactly `MAX_TRANSIENT_RETRIES + 1` attempt rows and the run terminates, rather than looping
+/// forever. Microsoft answers 503 on every call; it is asked three times (one initial attempt plus
+/// two re-queues) and no more, Apple still commits, and the residual gap leaves the run
+/// `partial_collect`. Mutation 2026-11-13: widening the bound from `retries < MAX_TRANSIENT_RETRIES`
+/// to `retries <= MAX_TRANSIENT_RETRIES` turns this red (four asks, not three); dropping the bound
+/// entirely makes `collect` non-terminating against this fixture, which the test surfaces as a hang.
+#[test]
+fn a_request_that_fails_transiently_every_time_is_bounded_to_n_plus_one_attempts() -> TestResult {
+    let root = TempDir::new()?;
+    let always = Payloads::of(&[
+        (INDEX_URL, OK, "form.20261110.idx"),
+        (APPLE_URL, OK, "filing_8k_apple.txt"),
+        (MICROSOFT_URL, SERVICE_UNAVAILABLE, "error_403_traffic.html"),
+    ])?;
+    let answer = collected(root.path(), A_LISTED_SESSION, &always)?;
+    let microsoft_attempts = asked(&always)
+        .iter()
+        .filter(|url| *url == MICROSOFT_URL)
+        .count();
+    assert_eq!(
+        (answer.exit, answer.envelope["items_committed"].as_u64()),
+        (Exit::PartialCollect, Some(1)),
+        "{:#}",
+        answer.envelope
+    );
+    assert_eq!(
+        microsoft_attempts,
+        usize::try_from(news_provider::MAX_TRANSIENT_RETRIES + 1).unwrap_or(usize::MAX),
+    );
+    assert_eq!(
+        outcomes_for(&answer, MICROSOFT_URL),
+        vec!["failed".to_owned(); microsoft_attempts]
     );
     Ok(())
 }

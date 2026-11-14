@@ -44,6 +44,10 @@ impl Exchange for Wire {
     }
 }
 
+/// Bound on retry work per request — a MECHANISM cap, never derived from an observed loss rate
+/// (§8 row R21, §10). A permanent failure (4xx, `vendor_refused`) is never re-queued.
+pub const MAX_TRANSIENT_RETRIES: u32 = 2;
+
 /// What the archive refused, and which act asked. The act is what the exit table reads: a refused
 /// commit is `commit_failed` and a refused read is not.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
@@ -373,16 +377,50 @@ pub fn collect<A: Archive>(
         run: run.run,
         baseline: &baseline,
     };
-    let mut queue: VecDeque<Request> = plan.requests.into_iter().collect();
+    let mut queue: VecDeque<Queued> = plan
+        .requests
+        .into_iter()
+        .map(Queued::first_attempt)
+        .collect();
     let mut ordinal = 0;
-    while let Some(request) = queue.pop_front() {
+    while let Some(Queued { request, retries }) = queue.pop_front() {
         let attempted = attempt_once(&driving, archive, &request, ordinal)?;
         ordinal += 1;
-        collected.absorb(&attempted);
-        queue.extend(attempted.follow_ups);
+        // Re-queue a transient failure under the cap to the BACK, so the pace limiter (R19) spaces
+        // the retry; it is just another `attempt_once`, so it cannot bypass the send seam. §8 R21.
+        let retrying = attempted.is_transient() && retries < MAX_TRANSIENT_RETRIES;
+        collected.absorb(&attempted, retrying);
+        queue.extend(attempted.follow_ups.into_iter().map(Queued::first_attempt));
+        if retrying {
+            queue.push_back(Queued {
+                request,
+                retries: retries + 1,
+            });
+        }
     }
     collected.per_source = vec![tally_of(&source, &collected)];
     Ok(collected)
+}
+
+/// A request waiting in the driver's queue and how many times it has already been re-attempted
+/// after a transient failure. The count rides the queue slot rather than [`Request`], because a
+/// `Request` is hashed into the ledger (`filter_params`) and a retry asks the identical question —
+/// the row must keep saying what was asked, and the fresh ordinal alone makes the retry's
+/// `attempt_id` distinct.
+struct Queued {
+    request: Request,
+    retries: u32,
+}
+
+impl Queued {
+    /// A request that has not yet been attempted. Both the plan's own requests and every follow-up
+    /// enter the queue this way; only a re-queue after a transient failure carries a non-zero count.
+    const fn first_attempt(request: Request) -> Self {
+        Self {
+            request,
+            retries: 0,
+        }
+    }
 }
 
 /// What every attempt of one run is driven with. Grouped because all five are fixed for the whole
@@ -404,6 +442,17 @@ struct Attempted {
     bytes_written: u64,
     blob_written: bool,
     committed: Committed,
+}
+
+impl Attempted {
+    /// A failed outcome the classifier did NOT call permanent: an HTTP 503 or a transport error,
+    /// which §5.1 marks retryable (`vendor_unreachable`). The only input the driver's retry
+    /// decision reads, derived from the fields already here rather than a new classifier: a
+    /// permanent 4xx or `vendor_refused` is `Failed` with `permanent`, and `Ok`/`Empty` are not
+    /// failures at all.
+    const fn is_transient(&self) -> bool {
+        matches!(self.kind, OutcomeKind::Failed) && !self.permanent
+    }
 }
 
 fn attempt_once<A: Archive>(
@@ -539,14 +588,19 @@ fn sweep<A: Archive>(
 }
 
 impl Collected {
-    fn absorb(&mut self, attempted: &Attempted) {
-        match attempted.kind {
-            OutcomeKind::Ok => self.tally.ok += 1,
-            OutcomeKind::Empty => self.tally.empty += 1,
-            OutcomeKind::Failed if attempted.permanent => self.tally.permanent += 1,
-            OutcomeKind::Failed => self.tally.transient += 1,
-            // The sweep's attempts are counted where they are closed, not here.
-            OutcomeKind::Interrupted => {}
+    /// `retrying` true = the driver will re-queue this transient failure, so its outcome is held
+    /// out of the exit tally (the request's final disposition is still pending); the attempt ROW
+    /// is recorded either way — "we looked and failed" holds whatever the retry does (R4). §8 R21.
+    fn absorb(&mut self, attempted: &Attempted, retrying: bool) {
+        if !retrying {
+            match attempted.kind {
+                OutcomeKind::Ok => self.tally.ok += 1,
+                OutcomeKind::Empty => self.tally.empty += 1,
+                OutcomeKind::Failed if attempted.permanent => self.tally.permanent += 1,
+                OutcomeKind::Failed => self.tally.transient += 1,
+                // The sweep's attempts are counted where they are closed, not here.
+                OutcomeKind::Interrupted => {}
+            }
         }
         self.tally.committed += attempted.committed.items_committed;
         self.tally.commit_refused += u32::from(attempted.row.commit_refused.is_some());
