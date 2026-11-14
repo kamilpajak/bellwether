@@ -1,0 +1,17 @@
+# Standalone crate on purpose: this is its OWN workspace (the empty [workspace] table below), so it
+# is NOT a member of the bellwether workspace. A probe keeps its own HTTP client, which
+# repo_invariants::clients forbids any workspace member but news-provider from declaring. Run with:
+#   cargo run --manifest-path probes/vendor_probe/Cargo.toml -- --days 2026-07-01 2026-07-15 2026-08-12
+[package]
+name = "vendor_probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+ureq = { version = "2.10", features = ["json"] }
+serde_json = "1"
+chrono = "0.4"
+sha2 = "0.10"
