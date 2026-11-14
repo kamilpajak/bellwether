@@ -368,8 +368,8 @@ mod tests {
         Credentials, RawResponse, SendFailure, Timeouts, TransportProfile, Wire, USER_AGENT,
     };
     use crate::budget::{BudgetError, RequestBudget};
-    use crate::clock::testing::{StepClock, WaitRecorder};
-    use crate::clock::{Clock, Sleeper};
+    use crate::clock::testing::{StepClock, WaitRecorder, WaitedClock};
+    use crate::clock::Clock;
     use crate::ledger::tests::{at, Recorder};
     use crate::ledger::{AttemptSlot, SendPermit};
     use crate::provider::Provenance;
@@ -378,7 +378,6 @@ mod tests {
         TargetWindow,
     };
     use canon::FileDigest;
-    use chrono::{DateTime, TimeDelta, Utc};
     use std::path::Path;
     use std::time::Duration;
 
@@ -547,44 +546,6 @@ mod tests {
             .flat_map(|(host, ip)| [*host, *ip, REQUESTED_AT, RECEIVED_AT])
             .collect();
         StepClock::over(&reads)
-    }
-
-    /// A clock its own waits advance, so each read sees the instant the waits before it left.
-    #[derive(Debug, Clone)]
-    struct WaitedClock {
-        now: std::rc::Rc<std::cell::Cell<DateTime<Utc>>>,
-        waits: WaitRecorder,
-    }
-
-    impl WaitedClock {
-        fn at(instant: &str) -> Result<Self, chrono::ParseError> {
-            Ok(Self {
-                now: std::rc::Rc::new(std::cell::Cell::new(instant.parse()?)),
-                waits: WaitRecorder::default(),
-            })
-        }
-
-        fn elapse(&self, how_long: Duration) {
-            if let Some(later) = TimeDelta::from_std(how_long)
-                .ok()
-                .and_then(|step| self.now.get().checked_add_signed(step))
-            {
-                self.now.set(later);
-            }
-        }
-    }
-
-    impl Clock for WaitedClock {
-        fn now(&self) -> DateTime<Utc> {
-            self.now.get()
-        }
-    }
-
-    impl Sleeper for WaitedClock {
-        fn sleep(&self, how_long: Duration) {
-            self.waits.sleep(how_long);
-            self.elapse(how_long);
-        }
     }
 
     fn polite_refusal(
@@ -872,7 +833,7 @@ mod tests {
         send_to(&wire, &clock, SECOND_ATTEMPT, LOCALHOST)?;
         assert_eq!(
             (
-                clock.waits.waits(),
+                clock.waits(),
                 std::fs::read_to_string(store.path().join(PACE_FILE))?
             ),
             (

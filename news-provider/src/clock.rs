@@ -43,7 +43,7 @@ impl Sleeper for ThreadSleeper {
 #[cfg(test)]
 pub(crate) mod testing {
     use super::{Clock, Sleeper, SystemClock, ThreadSleeper};
-    use chrono::{DateTime, Utc};
+    use chrono::{DateTime, TimeDelta, Utc};
     use std::time::Duration;
 
     /// A clock handing out a stated sequence, so a test can say which read got which instant.
@@ -97,6 +97,48 @@ pub(crate) mod testing {
     impl Sleeper for WaitRecorder {
         fn sleep(&self, how_long: Duration) {
             self.0.borrow_mut().push(how_long);
+        }
+    }
+
+    /// A clock its own waits advance, so each read sees the instant the waits before it left.
+    #[derive(Debug, Clone)]
+    pub(crate) struct WaitedClock {
+        now: std::rc::Rc<std::cell::Cell<DateTime<Utc>>>,
+        waits: WaitRecorder,
+    }
+
+    impl WaitedClock {
+        pub(crate) fn at(instant: &str) -> Result<Self, chrono::ParseError> {
+            Ok(Self {
+                now: std::rc::Rc::new(std::cell::Cell::new(instant.parse()?)),
+                waits: WaitRecorder::default(),
+            })
+        }
+
+        pub(crate) fn elapse(&self, how_long: Duration) {
+            if let Some(later) = TimeDelta::from_std(how_long)
+                .ok()
+                .and_then(|step| self.now.get().checked_add_signed(step))
+            {
+                self.now.set(later);
+            }
+        }
+
+        pub(crate) fn waits(&self) -> Vec<Duration> {
+            self.waits.waits()
+        }
+    }
+
+    impl Clock for WaitedClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.now.get()
+        }
+    }
+
+    impl Sleeper for WaitedClock {
+        fn sleep(&self, how_long: Duration) {
+            self.waits.sleep(how_long);
+            self.elapse(how_long);
         }
     }
 
