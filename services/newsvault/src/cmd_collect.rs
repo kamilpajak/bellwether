@@ -553,6 +553,11 @@ impl Committer {
             // own publication plus the probed lag put it, which only the provider can compute
             // because only the provider holds the lag. Never a fallback between the two.
             let observed = match (item.provenance, item.observed) {
+                (Provenance::LiveIngest, Some(_)) => {
+                    return Err(StoreError::LiveItemPlacedItsOwnObservation {
+                        item: item.source_item_id.clone(),
+                    })
+                }
                 (_, Some(placed)) => placed,
                 (Provenance::VendorArchive, None) => {
                     return Err(StoreError::ArchiveItemHasNoObservation {
@@ -661,6 +666,35 @@ mod tests {
         );
         assert!(
             matches!(refused, Err(StoreError::ArchiveItemHasNoObservation { .. })),
+            "{refused:?}"
+        );
+    }
+
+    /// A live item that placed an instant of its own would replace the fetch clock, and an earlier
+    /// one dates it before we read it.
+    #[test]
+    fn a_live_row_that_placed_its_own_observation_is_refused() {
+        let Ok(temp) = TempDir::new() else { return };
+        let Ok(store) = Committer::open(temp.path(), &RunId::new(RUN)) else {
+            return;
+        };
+        let Ok(raw) = Committer::put_blob(&store, b"payload") else {
+            return;
+        };
+        let live = CollectedItem {
+            provenance: Provenance::LiveIngest,
+            ..archived(Some(ObservationTime::new(instant(PUBLISHED_AT + 1))))
+        };
+        let refused = store.rows_of(
+            &[live],
+            Some(raw.hex()),
+            ObservationTime::new(instant(FETCHED_AT)),
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(StoreError::LiveItemPlacedItsOwnObservation { .. })
+            ),
             "{refused:?}"
         );
     }
