@@ -37,6 +37,8 @@ const APPLE_ACCEPTED_AT: &str = "2026-11-10T21:32:15Z";
 const APPLE_OBSERVED_AT: &str = "2026-11-10T23:32:15Z";
 /// `AN_ARCHIVED_SESSION` ends at 05:00Z less one microsecond in New York; plus the same 7,200 s.
 const ARCHIVED_DAY_OBSERVED_AT: &str = "2026-11-10T06:59:59.999999Z";
+/// Fits a `TimeDelta`, which holds `i64::MAX` milliseconds, and carries 2026 past year 262,143.
+const SECONDS_PAST_THE_LAST_INSTANT: i64 = 1_000_000_000_000_000;
 const APPLE_ACCESSION: &str = "0000320193-26-000071";
 /// The second in-universe filing of the fixture index, which is the uncovered one in the
 /// convergence tests below.
@@ -329,8 +331,7 @@ fn a_backfilled_item_observes_at_its_publication_plus_the_probed_lag_and_not_at_
     Ok(())
 }
 
-/// The day arm of the same rule: the bound is the END of the archived day in New York plus the
-/// lag. Measured 2026-11-14: bounding at the START of the day instead left every other test green.
+/// §8 row R11, the day arm: the END of the archived day in New York plus the lag.
 #[test]
 fn a_backfilled_day_dated_item_observes_at_the_end_of_its_own_day_plus_the_probed_lag() -> Outcome {
     let provider = probed()?;
@@ -339,6 +340,26 @@ fn a_backfilled_day_dated_item_observes_at_the_end_of_its_own_day_plus_the_probe
         only_item(&provider.extract(&request, &blob("filing_8k_microsoft_no_acceptance.txt")))?;
     assert_eq!(precision_of(&item.valid), ValidPrecision::Day);
     assert_eq!(item.observed, Some(at(ARCHIVED_DAY_OBSERVED_AT)));
+    Ok(())
+}
+
+/// §8 row R11: a lag `probed_lag` admits can still carry a publication past the last instant
+/// chrono holds. The row is filed unusable under its own reason, never as an undated item.
+#[test]
+fn an_archived_item_whose_observation_no_instant_can_hold_is_unusable_and_says_why() -> Outcome {
+    let provider = provider()?.with_observation_lag(MeasuredLag {
+        probe_id: "pplx-2026-11-11".to_owned(),
+        probes: 69,
+        leaks: 0,
+        seconds: SECONDS_PAST_THE_LAST_INSTANT,
+    });
+    let request = archived_document_request(&provider)?;
+    let extracted = provider.extract(&request, &blob("filing_8k_apple.txt"));
+    let reasons: Vec<UnusableReason> = extracted.unusable.iter().map(|row| row.reason).collect();
+    assert_eq!(
+        (extracted.items.len(), reasons),
+        (0, vec![UnusableReason::NoRepresentableObservation])
+    );
     Ok(())
 }
 

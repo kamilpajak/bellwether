@@ -152,6 +152,9 @@ pub enum UnusableReason {
     /// No field of the payload yielded a publication value. Includes the sixtieth second, which
     /// `canon` refuses and Python's `fromisoformat` refuses too.
     NoParseableValidTime,
+    /// A `vendor_archive` item whose publication plus the probed lag is past the last instant
+    /// chrono holds, `pit::PitError::LagOutOfRange`: no observation can be placed for it.
+    NoRepresentableObservation,
 }
 
 /// An unusable row carries the WHOLE item and the payload it came out of, so the evidence is in
@@ -341,9 +344,12 @@ const NO_LAG_AT_ALL: &str = "no lag entry";
 const NO_PROBE_BEHIND_IT: &str = "no probe id";
 const NO_PROBES_SO_NO_LEAK_RATE: &str = "zero probes, so no leak rate";
 const A_LAG_OF_ZERO_IS_PUBLICATION_INSTANT_VISIBILITY: &str = "zero seconds";
+const A_NEGATIVE_LAG_OBSERVES_BEFORE_PUBLICATION: &str = "negative seconds";
+const A_LAG_NO_DURATION_HOLDS: &str = "more seconds than a duration holds";
 
 /// The lag a `vendor_archive` window may be dated through, or why there is none. Called before the
-/// first request, so an unprobed backfill is a refusal rather than a stored leak.
+/// first request, so an unprobed backfill is a refusal rather than a stored leak. Why here and not
+/// in `LagPolicy::read`: architecture.md section 8 row R11.
 pub fn probed_lag<'a>(
     source: &SourceId,
     window: &TargetWindow,
@@ -363,6 +369,12 @@ pub fn probed_lag<'a>(
     }
     if lag.seconds == 0 {
         return Err(refuse(A_LAG_OF_ZERO_IS_PUBLICATION_INSTANT_VISIBILITY));
+    }
+    if lag.seconds < 0 {
+        return Err(refuse(A_NEGATIVE_LAG_OBSERVES_BEFORE_PUBLICATION));
+    }
+    if chrono::TimeDelta::try_seconds(lag.seconds).is_none() {
+        return Err(refuse(A_LAG_NO_DURATION_HOLDS));
     }
     Ok(lag)
 }
@@ -537,6 +549,33 @@ mod tests {
         for (lag, expected) in cases {
             assert_eq!(
                 probed_lag(&source(), &window(), lag.as_ref()).err(),
+                expected,
+                "{lag:?}"
+            );
+        }
+    }
+
+    /// Section 8 row R11: either lag passes every emptiness check above and still cannot date an
+    /// item, so it is refused before the first request rather than at commit.
+    #[test]
+    fn a_lag_that_cannot_date_an_item_is_refused_before_any_request() {
+        let probed = MeasuredLag {
+            probe_id: "pplx-2026-11-11".to_owned(),
+            probes: 69,
+            leaks: 0,
+            seconds: 7_200,
+        };
+        let cases = [
+            (-7_200, refusal("negative seconds")),
+            (i64::MAX / 2, refusal("more seconds than a duration holds")),
+        ];
+        for (seconds, expected) in cases {
+            let lag = MeasuredLag {
+                seconds,
+                ..probed.clone()
+            };
+            assert_eq!(
+                probed_lag(&source(), &window(), Some(&lag)).err(),
                 expected,
                 "{lag:?}"
             );

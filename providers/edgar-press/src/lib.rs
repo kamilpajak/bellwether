@@ -24,7 +24,7 @@ use news_provider::request::{days_of, HeaderValue, Request, RequestPhase};
 use news_provider::wire::{RawResponse, Timeouts, TransportError, TransportProfile};
 use news_provider::{CredentialRef, SourceId, TargetWindow, Verdict};
 use pit::datedness::{end_of_day, Published};
-use pit::{MeasuredLag, ObservationTime, ValidTime, Visibility};
+use pit::{MeasuredLag, ObservationTime, PitError, ValidTime, Visibility};
 
 /// The adapter's own name, which is the only thing that tells ours from a purchased one besides
 /// the [`Provenance`] it returns.
@@ -262,6 +262,7 @@ impl EdgarPress {
         let form = labelled(&text, &self.parsed.form_field).unwrap_or_default();
         let (valid, valid_raw, valid_field) = self.publication(&text, &request.target_window);
         let url = request.url.clone();
+        let observation = self.backfill_observation(request.provenance, valid);
         let item = CollectedItem {
             source: SourceId::new(SOURCE),
             source_item_id: accession.clone(),
@@ -273,13 +274,15 @@ impl EdgarPress {
             valid_field,
             valid_source: ValidSource::VendorPublished,
             provenance: request.provenance,
-            observed: self.backfill_observation(request.provenance, valid),
+            observed: observation.as_ref().map_or(None, |placed| *placed),
             body: self.body(&text),
         };
         let unusable = if accession.trim().is_empty() {
             Some(UnusableReason::BlankSourceItemId)
         } else if precision_of(&item.valid) == ValidPrecision::Unknown {
             Some(UnusableReason::NoParseableValidTime)
+        } else if observation.is_err() {
+            Some(UnusableReason::NoRepresentableObservation)
         } else {
             None
         };
@@ -337,30 +340,31 @@ impl EdgarPress {
 
     /// Where a backfilled item's observation goes: its own publication plus the probed lag, via
     /// [`Visibility::from_backfill`], which is the only constructor that takes a [`MeasuredLag`].
-    /// `None` for a live ingest, whose observation is the fetch instant the driver already holds.
+    /// `Ok(None)` for a live ingest, whose observation is the fetch instant the driver holds.
     ///
     /// A DATE has no instant, so its publication bound is the END of that day in its own calendar
-    /// and the lag is added to that: an upper bound on top of an upper bound, which is the safe
-    /// direction - it can only make an item less visible, never more. A window with no lag behind
-    /// it is refused by `plan` before any request (decision D5), so `None` here reaches the store
-    /// only on a path that bypassed planning, and the store refuses it.
+    /// and the lag is added to that: an upper bound on top of an upper bound, which can only make
+    /// an item less visible. Which `Ok(None)` arms an archive item can reach: section 8 row R11.
     fn backfill_observation(
         &self,
         provenance: Provenance,
         valid: Published,
-    ) -> Option<ObservationTime> {
+    ) -> Result<Option<ObservationTime>, PitError> {
         if provenance != Provenance::VendorArchive {
-            return None;
+            return Ok(None);
         }
-        let lag = self.lag.as_ref()?;
+        let Some(lag) = self.lag.as_ref() else {
+            return Ok(None);
+        };
         let bound = match valid {
             Published::At(instant) => instant,
-            Published::On { day, tz } => ValidTime::new(end_of_day(day, tz)?),
-            Published::Unknown => return None,
+            Published::On { day, tz } => match end_of_day(day, tz) {
+                Some(ends) => ValidTime::new(ends),
+                None => return Ok(None),
+            },
+            Published::Unknown => return Ok(None),
         };
-        Visibility::from_backfill(bound, lag)
-            .ok()
-            .map(|visible| visible.observed())
+        Visibility::from_backfill(bound, lag).map(|visible| Some(visible.observed()))
     }
 
     fn instant(&self, raw: &str) -> Option<DateTime<Utc>> {
