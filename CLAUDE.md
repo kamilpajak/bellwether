@@ -62,6 +62,17 @@ only claimed.
 - No vendor call outside an open attempt row, and an attempt row is written whether or not anything
   came back. "Nothing happened" and "we did not look" must stay different.
 
+## Writing markdown
+
+- Lines you add or change in a committed `.md` file are bullets and tables, not prose paragraphs.
+- Never edit text under a preregistration freeze or in `docs/inherited/`; add a dated section.
+- One fact per bullet. Delete every word whose removal loses no fact.
+- Keep a conditional rule (if / unless / because) in one bullet or table cell; never split it.
+- Never shorten by dropping a number, its construction, its date or a caveat.
+- No recap or transition text. Point to the section that already states the fact.
+- Keep a decision's reason only as the rejected alternative plus the symptom that killed it.
+- Compare three or more values in a table, never in a sentence.
+
 ## Decided by default, not settled
 
 - Exit `1` means "the answer is no", never "an error happened"; errors use 2, 4, 7 and 8.
