@@ -277,3 +277,8 @@ answered on each, every lag was positive, and both write instants sat inside the
 names. Two documents answered `503` — one per day — and are reported as unusable rather than
 dropped. The second run of these same two days, no sooner than 7 days later, is still owed: these
 numbers cannot tell a final index file from one rewritten before the probe read it.
+
+## 2026-11-15, a pointer above went stale; nothing above is edited
+
+- The registration text cites `edgar-press`'s `BODY_LIMIT` comment for the 5,429 filing rows of 2026-11-10 and their construction. That comment now states the measured index sizes instead; the row counts and bytes are in the run section above and in `docs/design/architecture.md` §10.
+- "About 600 KB each" above came from the fixture's 110-byte rows. The indexes read in the run were 1,057,192 B (2026-11-10) and 1,520,327 B (2026-11-12).

@@ -66,9 +66,8 @@ const FORBIDDEN: u16 = 403;
 /// this tree has timed an EDGAR response, so there is no quantile to quote. `transport()` below is
 /// the one place to change it.
 const VENDOR_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
-/// Construction: the 2026-11-10 daily index holds 5,429 filing rows (measured by download
-/// 2026-11-12) at the 110-byte fixed width the committed fixture's header carries, so a full index
-/// is about 600 KB. The order of magnitude of room is an assumption, like the timeout above.
+/// Full daily indexes read 1,057,192 B and 1,520,327 B (2026-11-10, 2026-11-12; read as received
+/// by `probes/observation_lag/probe.py` on 2026-11-13). Construction: architecture.md §10.
 const BODY_LIMIT: u64 = 8 * 1_024 * 1_024;
 /// 1 s / 10 requests. SEC's fair-access ceiling is 10 requests a second per IP as the
 /// predecessor's vendor-quota table states it (read 2026-11-13 from
