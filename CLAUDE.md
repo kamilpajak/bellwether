@@ -62,6 +62,15 @@ only claimed.
 - No vendor call outside an open attempt row, and an attempt row is written whether or not anything
   came back. "Nothing happened" and "we did not look" must stay different.
 
+## Writing markdown
+
+- Write every committed `.md` file as bullets and tables. No prose paragraphs.
+- One fact per bullet. Delete every word whose removal loses no fact.
+- Never shorten by dropping a number, its construction, its date or a caveat.
+- No motivation, recap or transition text. Point to the section that already states the fact.
+- Compare three or more values in a table, never in a sentence.
+- Before committing a `.md` diff, delete each line whose removal would cause no mistake.
+
 ## Decided by default, not settled
 
 - Exit `1` means "the answer is no", never "an error happened"; errors use 2, 4, 7 and 8.
