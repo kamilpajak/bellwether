@@ -35,6 +35,8 @@ const AN_INVERTED_WINDOW: &str = "2026-11-12..2026-11-09";
 const APPLE_ACCEPTED_AT: &str = "2026-11-10T21:32:15Z";
 /// `APPLE_ACCEPTED_AT` plus the 7,200 s `probed()` stands behind.
 const APPLE_OBSERVED_AT: &str = "2026-11-10T23:32:15Z";
+/// `AN_ARCHIVED_SESSION` ends at 05:00Z less one microsecond in New York; plus the same 7,200 s.
+const ARCHIVED_DAY_OBSERVED_AT: &str = "2026-11-10T06:59:59.999999Z";
 const APPLE_ACCESSION: &str = "0000320193-26-000071";
 /// The second in-universe filing of the fixture index, which is the uncovered one in the
 /// convergence tests below.
@@ -314,9 +316,7 @@ fn a_window_that_is_not_a_day_or_a_range_is_refused_rather_than_planned_as_nothi
     Ok(())
 }
 
-/// §8 row R11's other half. The lag opened the gate on 2026-11-13 and nothing used it: every stored
-/// row still took its observation from the fetch clock, which dates an archived filing as though we
-/// had read it the moment it was published. `from_backfill` had no caller anywhere in the tree.
+/// §8 row R11: a backfilled item is dated by `from_backfill`, never by the fetch clock.
 #[test]
 fn a_backfilled_item_observes_at_its_publication_plus_the_probed_lag_and_not_at_the_fetch(
 ) -> Outcome {
@@ -326,6 +326,19 @@ fn a_backfilled_item_observes_at_its_publication_plus_the_probed_lag_and_not_at_
     assert_eq!(item.provenance, Provenance::VendorArchive);
     // The Apple fixture is accepted at 21:32:15Z and the probed lag is 7,200 s.
     assert_eq!(item.observed, Some(at(APPLE_OBSERVED_AT)));
+    Ok(())
+}
+
+/// The day arm of the same rule: the bound is the END of the archived day in New York plus the
+/// lag. Measured 2026-11-14: bounding at the START of the day instead left every other test green.
+#[test]
+fn a_backfilled_day_dated_item_observes_at_the_end_of_its_own_day_plus_the_probed_lag() -> Outcome {
+    let provider = probed()?;
+    let request = archived_document_request(&provider)?;
+    let item =
+        only_item(&provider.extract(&request, &blob("filing_8k_microsoft_no_acceptance.txt")))?;
+    assert_eq!(precision_of(&item.valid), ValidPrecision::Day);
+    assert_eq!(item.observed, Some(at(ARCHIVED_DAY_OBSERVED_AT)));
     Ok(())
 }
 
