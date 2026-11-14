@@ -527,6 +527,21 @@ fn a_user_agent_without_a_contact_is_refused_at_startup_and_never_recorded_as_a_
     Ok(())
 }
 
+/// R19. The SEC ceiling paces our address and the SEC host both, so the per-host bucket is the
+/// one a second SEC source would share; without it each source holds a per-IP file of its own.
+#[test]
+fn the_sec_profile_paces_both_our_address_and_the_sec_host_at_ten_a_second() -> Outcome {
+    let tenth_of_a_second = std::time::Duration::from_millis(100);
+    assert_eq!(
+        provider()?.transport().budget,
+        news_provider::RequestBudget {
+            min_interval: tenth_of_a_second,
+            per_host: Some(tenth_of_a_second),
+        }
+    );
+    Ok(())
+}
+
 /// R6. The predecessor's own roster read catches the unparseable case, logs a warning and returns
 /// an empty map, and the run then reports a quiet day.
 #[test]

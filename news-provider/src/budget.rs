@@ -1,7 +1,7 @@
 //! How fast a vendor may be called, and the cross-process file that holds it to that. One locked
-//! file carries the wall instant of the next allowed call; the lock is held for the
-//! read-reserve-write and never across the wait, so callers stack reservations instead of
-//! serialising on each other's wait.
+//! file per bucket carries one wall instant (`BudgetScope::held` says which); the lock is held
+//! for the read-reserve-write and never across the wait, so callers stack reservations instead
+//! of serialising on each other's wait.
 //!
 //! The shape is the predecessor's `sec_rate_coordinator.py`, written after the failure it
 //! prevents: three processes on one residential IP, each with its own in-process throttle, whose
@@ -19,33 +19,74 @@ use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 
 use crate::request::SourceId;
 
-/// Which bucket a vendor's quota counts against, and therefore which callers have to share one
-/// pace file. The other arm is per-CREDENTIAL, where the bucket follows the key across hosts and a
-/// second key is a second bucket; no vendor here has one, so it is named and not written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which bucket one pace file counts, and so which callers share it. A third arm, per-CREDENTIAL,
+/// would follow the key across hosts with a second key as a second bucket; no vendor here has one,
+/// so it is named and not written.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BudgetScope {
-    /// The host's outbound address. The caller names itself in the User-Agent and that does not
-    /// scope the quota, so every process on one host shares one bucket and two hosts hold
-    /// independent ones.
-    PerIp,
+    /// Our outbound address, keyed per SOURCE (`<source>.per-ip`): every process collecting one
+    /// source shares the bucket, and two sources on one address hold two (row R19).
+    PerIp(SourceId),
+    /// One remote host, and NOT the source: two sources asking one host share it.
+    PerHost(HostKey),
+}
+
+/// A remote host as a pace-file name: lowercased, then only `[a-z0-9.-]`, not empty, no leading
+/// dot and no empty label. The field is private, so no caller can name a file outside `pace/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostKey(String);
+
+impl HostKey {
+    /// Upper case is normalised, not refused: a url's host is case-insensitive (RFC 3986 §3.2.2).
+    pub fn new(host: &str) -> Result<Self, BudgetError> {
+        let key = host.to_ascii_lowercase();
+        let allowed =
+            |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b".-".contains(&byte);
+        if key.is_empty() || key.starts_with('.') || key.contains("..") || !key.bytes().all(allowed)
+        {
+            return Err(BudgetError::NotAHostKey {
+                host: host.to_owned(),
+            });
+        }
+        Ok(Self(key))
+    }
 }
 
 impl BudgetScope {
-    /// The pace file's suffix, so two buckets cannot land on one file name.
-    const fn in_a_file_name(self) -> &'static str {
+    /// The pace file's name, whose suffix keeps the two kinds of bucket off one file.
+    fn file_name(&self) -> String {
         match self {
-            Self::PerIp => "per-ip",
+            Self::PerIp(source) => format!("{}.per-ip", source.as_str()),
+            Self::PerHost(host) => format!("{}.per-host", host.0),
+        }
+    }
+
+    /// The per-IP file holds the next allowed instant; the per-host file holds the instant last
+    /// granted, so each caller adds its OWN `per_host` and a shorter one cannot shorten a longer.
+    const fn held(&self) -> Held {
+        match self {
+            Self::PerIp(_) => Held::NextAllowed,
+            Self::PerHost(_) => Held::LastGranted,
         }
     }
 }
 
-/// How fast one vendor may be called, and what the limit is counted against. Stated by the
-/// provider, like the timeouts beside it.
+/// What the instant in one pace file means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    NextAllowed,
+    LastGranted,
+}
+
+/// How fast one vendor may be called. Stated by the provider, like the timeouts beside it. A call
+/// owing both paces waits out the host's and then our address's, so two calls to one host leave at
+/// least `per_host` less the per-IP wait owed after the host wait apart (row R19, hole 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestBudget {
-    /// The smallest gap between two calls counted against the same bucket.
+    /// The smallest gap between two calls leaving our address for this vendor.
     pub min_interval: Duration,
-    pub scope: BudgetScope,
+    /// The gap between two host reservations to one remote host, when the vendor states one.
+    pub per_host: Option<Duration>,
 }
 
 /// Why no call could be paced. Raised before the socket, so it is never a vendor event in the
@@ -62,6 +103,12 @@ pub enum BudgetError {
     /// another writer, and both answers to "when may I call" would be invented.
     #[error("the pace file at {path} holds {held:?} and not an instant this crate wrote")]
     Unreadable { path: PathBuf, held: String },
+    /// A per-host pace and a url with no host to key it on: refused rather than left unpaced.
+    #[error("{url} names no host to key a per-host pace on")]
+    NoHost { url: String },
+    /// A host that is not a safe pace-file name, such as an IPv6 literal: refused, not unpaced.
+    #[error("{host} is not a host a per-host pace file can be named after")]
+    NotAHostKey { host: String },
 }
 
 /// The directory the pace file sits in, under the store root the run writes to.
@@ -71,29 +118,27 @@ const PACE_DIR: &str = "pace";
 #[derive(Debug)]
 pub struct Pace {
     path: PathBuf,
-    budget: RequestBudget,
+    min_interval: Duration,
+    held: Held,
 }
 
 impl Pace {
-    /// `<store>/pace/<source>.<scope>` — beside the archive the run writes, never a system
-    /// directory. The hole that choice leaves is named in row R19: one host running two stores
-    /// holds two pace files and therefore two buckets, which a per-IP quota does not.
+    /// `<store>/pace/<source>.per-ip` or `<store>/pace/<host>.per-host` — beside the archive the
+    /// run writes, never a system directory. The hole that leaves is named in row R19: one host
+    /// running two stores holds two pace files and therefore two buckets.
     #[must_use]
-    pub fn beside_the_store(store: &Path, source: &SourceId, budget: RequestBudget) -> Self {
+    pub fn beside_the_store(store: &Path, scope: &BudgetScope, min_interval: Duration) -> Self {
         Self {
-            path: store.join(PACE_DIR).join(format!(
-                "{}.{}",
-                source.as_str(),
-                budget.scope.in_a_file_name()
-            )),
-            budget,
+            path: store.join(PACE_DIR).join(scope.file_name()),
+            min_interval,
+            held: scope.held(),
         }
     }
 
     /// Reserves this caller's slot and answers how long it must wait before the socket. The lock
     /// is released before the answer comes back, so the wait is outside the critical section.
     pub fn reserve(&self, now: DateTime<Utc>) -> Result<Duration, BudgetError> {
-        let interval = TimeDelta::from_std(self.budget.min_interval)
+        let interval = TimeDelta::from_std(self.min_interval)
             .map_err(|why| self.unusable("read as an interval", &why))?;
         let file = self.open()?;
         file.lock().map_err(|why| self.unusable("locked", &why))?;
@@ -131,16 +176,22 @@ impl Pace {
         let mut held = String::new();
         file.read_to_string(&mut held)
             .map_err(|why| self.unusable("read", &why))?;
-        let go_at = match self.prior(&held)? {
-            // A reservation already in the past is owed nothing: nobody used that slot.
-            Some(prior) => prior.max(now),
-            None => now,
+        let next_allowed = match (self.prior(&held)?, self.held) {
+            (Some(prior), Held::NextAllowed) => Some(prior),
+            (Some(granted), Held::LastGranted) => Some(granted + interval),
+            (None, _) => None,
+        };
+        // A reservation already in the past is owed nothing: nobody used that slot.
+        let go_at = next_allowed.map_or(now, |next| next.max(now));
+        let written = match self.held {
+            Held::NextAllowed => go_at + interval,
+            Held::LastGranted => go_at,
         };
         file.set_len(0)
             .map_err(|why| self.unusable("truncated", &why))?;
         file.seek(SeekFrom::Start(0))
             .map_err(|why| self.unusable("rewound", &why))?;
-        file.write_all(stamp(go_at + interval).as_bytes())
+        file.write_all(stamp(written).as_bytes())
             .map_err(|why| self.unusable("written", &why))?;
         Ok(go_at)
     }
@@ -173,4 +224,39 @@ impl Pace {
 /// both be cleared by.
 fn stamp(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Micros, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BudgetError, HostKey};
+
+    const SHOUTED: &str = "WWW.SEC.GOV";
+    const SEC: &str = "www.sec.gov";
+    const TRAVERSAL: &str = "../../x";
+    /// Each breaks exactly one rule, so deleting any one rule lets its row through.
+    const ONE_RULE_BROKEN_EACH: [&str; 4] = ["", ".sec.gov", "www..sec.gov", "[::1]"];
+
+    #[test]
+    fn a_host_key_in_upper_case_is_normalised_to_one_lowercase_bucket() {
+        assert_eq!(HostKey::new(SHOUTED), Ok(HostKey(SEC.to_owned())));
+    }
+
+    #[test]
+    fn a_host_key_climbing_out_of_the_pace_directory_is_refused() {
+        assert_eq!(
+            HostKey::new(TRAVERSAL),
+            Err(BudgetError::NotAHostKey {
+                host: TRAVERSAL.to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn a_host_key_breaking_any_one_rule_is_refused() {
+        let admitted: Vec<&str> = ONE_RULE_BROKEN_EACH
+            .into_iter()
+            .filter(|host| HostKey::new(host).is_ok())
+            .collect();
+        assert_eq!(admitted, Vec::<&str>::new());
+    }
 }

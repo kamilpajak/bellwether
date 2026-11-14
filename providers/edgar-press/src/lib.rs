@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use canon::{Digest, FileDigest};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
-use news_provider::budget::{BudgetScope, RequestBudget};
+use news_provider::budget::RequestBudget;
 use news_provider::provider::{
     precision_of, probed_lag, Calendar, CollectedItem, Extracted, ExtractedBody, Listing,
     NotPlanned, Plan, PlanRefusal, Provenance, Provider, RawBlob, UnusableReason, UnusableRow,
@@ -437,11 +437,11 @@ impl Provider for EdgarPress {
                 recv_body: VENDOR_PATIENCE,
             },
             body_limit: BODY_LIMIT,
-            // Per IP: the contact above identifies this caller and does not scope the quota, so
-            // every process on this host shares one bucket however many of them there are.
+            // Per IP, because the contact above does not scope the quota; per host as well, keyed
+            // on `www.sec.gov` and not on this source, so a second SEC source shares the bucket.
             budget: RequestBudget {
                 min_interval: SEC_MIN_INTERVAL,
-                scope: BudgetScope::PerIp,
+                per_host: Some(SEC_MIN_INTERVAL),
             },
         }
     }

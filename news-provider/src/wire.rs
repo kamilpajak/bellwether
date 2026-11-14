@@ -6,12 +6,12 @@
 //! else can know when an answer arrived. The pace wait is read from the same clock, before the
 //! socket, because `send` is the one place every vendor call passes through.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use pit::ObservationTime;
 
-use crate::budget::{BudgetError, Pace, RequestBudget};
+use crate::budget::{BudgetError, BudgetScope, HostKey, Pace, RequestBudget};
 use crate::clock::{Clock, Sleeper, ThreadSleeper};
 use crate::ledger::{AttemptId, SendPermit};
 use crate::request::{CredentialRef, HeaderValue, Request, SourceId};
@@ -41,8 +41,8 @@ pub struct TransportProfile {
     pub timeouts: Timeouts,
     /// Bytes of response body read before ureq refuses the rest.
     pub body_limit: u64,
-    /// How fast this vendor may be called and what the quota counts against. `Wire::new` builds
-    /// the pace file from it, so the interval has one producer: the provider.
+    /// How fast this vendor may be called, so both intervals have one producer: the provider.
+    /// `Wire::new` builds the per-IP pace file; `Wire::send` opens a per-host one per url host.
     pub budget: RequestBudget,
 }
 
@@ -203,6 +203,8 @@ pub struct Wire {
     profile: TransportProfile,
     credentials: Credentials,
     pace: Pace,
+    /// Where a per-host pace file is opened, one per remote host a request names.
+    store: PathBuf,
     sleeper: Box<dyn Sleeper>,
 }
 
@@ -235,7 +237,11 @@ impl Wire {
         source: &SourceId,
         sleeper: Box<dyn Sleeper>,
     ) -> Self {
-        let pace = Pace::beside_the_store(store, source, profile.budget);
+        let pace = Pace::beside_the_store(
+            store,
+            &BudgetScope::PerIp(source.clone()),
+            profile.budget.min_interval,
+        );
         let timeouts = profile.timeouts;
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(timeouts.global))
@@ -257,6 +263,7 @@ impl Wire {
             profile,
             credentials,
             pace,
+            store: store.to_path_buf(),
             sleeper,
         }
     }
@@ -296,6 +303,7 @@ impl Wire {
         let headers = self.headers_for(request)?;
         // The pace wait is owed only by a call that is going to be made, so it comes after the
         // credential check. Unconditional, with no zero-wait branch for a test to leave uncovered.
+        self.wait_out_the_host(&request.url, clock)?;
         self.sleeper.sleep(self.pace.reserve(clock.now())?);
         let requested_at = ObservationTime::new(clock.now());
         let answered = self.exchange(&request.url, &headers);
@@ -315,6 +323,26 @@ impl Wire {
                 detail,
             ))),
         }
+    }
+
+    /// Taken BEFORE the per-IP slot is reserved: an IP slot reserved and then held through a long
+    /// host wait would push every other host's call behind it (row R19).
+    fn wait_out_the_host(&self, url: &str, clock: &dyn Clock) -> Result<(), BudgetError> {
+        let Some(interval) = self.profile.budget.per_host else {
+            return Ok(());
+        };
+        // ureq 3.5.2 parses a url with this same `http::Uri` and fails before any socket, so an
+        // unparseable one goes on to fail as a `Transport` its attempt row records.
+        let Ok(uri) = url.parse::<ureq::http::Uri>() else {
+            return Ok(());
+        };
+        let host = uri.host().ok_or_else(|| BudgetError::NoHost {
+            url: url.to_owned(),
+        })?;
+        let scope = BudgetScope::PerHost(HostKey::new(host)?);
+        let pace = Pace::beside_the_store(&self.store, &scope, interval);
+        self.sleeper.sleep(pace.reserve(clock.now())?);
+        Ok(())
     }
 
     /// The socket, and the only call to the agent. Between the two clock reads in [`Wire::send`],
@@ -341,8 +369,9 @@ mod tests {
     use super::{
         Credentials, RawResponse, SendFailure, Timeouts, TransportProfile, Wire, USER_AGENT,
     };
-    use crate::budget::{BudgetError, BudgetScope, RequestBudget};
-    use crate::clock::testing::{StepClock, WaitRecorder};
+    use crate::budget::{BudgetError, RequestBudget};
+    use crate::clock::testing::{StepClock, WaitRecorder, WaitedClock};
+    use crate::clock::Clock;
     use crate::ledger::tests::{at, Recorder};
     use crate::ledger::{AttemptSlot, SendPermit};
     use crate::provider::Provenance;
@@ -386,11 +415,31 @@ mod tests {
     const ELAPSED: Duration = Duration::from_millis(60);
     const EXPECTED_WAIT: Duration = Duration::from_millis(40);
     const NO_WAIT: Duration = Duration::ZERO;
-    /// `<store>/pace/<source>.<scope>`, which is the layout `Pace::beside_the_store` states.
+    /// `<store>/pace/<source>.per-ip`, the per-IP layout `BudgetScope::file_name` states.
     const PACE_FILE: &str = "pace/edgar_press.per-ip";
     /// `RESERVED_AT` plus `TEST_INTERVAL`, in the form the pace file is written in.
     const RESERVED_UNTIL: &str = "2026-11-10T13:00:00.100000Z";
     const NOT_AN_INSTANT: &str = "soon";
+    const HOST_INTERVAL: Duration = Duration::from_secs(1);
+    /// `HOST_INTERVAL` less `ELAPSED`: what a second send to one host owes it.
+    const HOST_WAIT: Duration = Duration::from_millis(940);
+    /// `RESERVED_AT` plus `HOST_INTERVAL`, which is where a host wait taken in full ends.
+    const AFTER_THE_HOST_WAIT: &str = "2026-11-10T13:00:01Z";
+    /// The per-IP slot reserved at `AFTER_THE_HOST_WAIT`, in the pace file's form.
+    const IP_RESERVED_AFTER_THE_HOST_WAIT: &str = "2026-11-10T13:00:01.100000Z";
+    /// A second loopback host that refuses at once, and the same host as a url may shout it.
+    const LOCALHOST: &str = "http://localhost:1/never";
+    const LOCALHOST_SHOUTED: &str = "http://LOCALHOST:1/never";
+    const NO_HOST: &str = "/never";
+    /// `http::Uri` keeps an IPv6 literal's brackets in its host, which no pace-file key admits.
+    const IPV6_LOOPBACK: &str = "http://[::1]:1/never";
+    const IPV6_HOST: &str = "[::1]";
+    /// A space is no url `http::Uri` parses, so ureq refuses it as a transport error.
+    const UNPARSEABLE: &str = "http://local host:1/never";
+    const PACE_DIR: &str = "pace";
+    const SOURCE_PACE_FILE: &str = "edgar_press.per-ip";
+    const HOST_PACE_FILE: &str = "localhost.per-host";
+    const ANOTHER_SOURCE: &str = "another_source";
     /// Any roster bytes: these tests are about the socket.
     const ROSTER: &[u8] = b"{\"320193\":\"AAPL\"}";
 
@@ -415,9 +464,16 @@ mod tests {
             body_limit: TEST_BODY_LIMIT,
             budget: RequestBudget {
                 min_interval: TEST_INTERVAL,
-                scope: BudgetScope::PerIp,
+                per_host: None,
             },
         }
+    }
+
+    /// The same profile with a per-host pace ten times the per-IP one, as a crawl delay is.
+    fn polite_profile() -> TransportProfile {
+        let mut polite = profile();
+        polite.budget.per_host = Some(HOST_INTERVAL);
+        polite
     }
 
     fn request() -> Request {
@@ -462,14 +518,70 @@ mod tests {
     /// the two tests below send twice through ONE of them, which an in-process limiter satisfies,
     /// so the cross-instance test is the only one that is about the file.
     fn send_through(wire: &Wire, clock: &StepClock, ordinal: u32) -> Checked {
+        send_to(wire, clock, ordinal, REFUSED)
+    }
+
+    fn send_to(wire: &Wire, clock: &dyn Clock, ordinal: u32, url: &str) -> Checked {
         let mut sink = Recorder::default();
         let Some(permit) = permit(&mut sink, ordinal) else {
             return Err("no permit".into());
         };
-        match wire.send(permit, &request(), clock) {
+        let asked = Request {
+            url: url.to_owned(),
+            ..request()
+        };
+        match wire.send(permit, &asked, clock) {
             Err(SendFailure::Transport(_)) => Ok(()),
             other => Err(format!("{other:?}").into()),
         }
+    }
+
+    fn polite_wire(store: &Path, source: &str, waits: &WaitRecorder) -> Wire {
+        Wire::with_sleeper(
+            polite_profile(),
+            held(),
+            store,
+            &SourceId::new(source),
+            Box::new(waits.clone()),
+        )
+    }
+
+    /// Per send: the host reservation, the IP reservation after the host wait, both instants.
+    fn polite_clock(sends: &[(&str, &str)]) -> StepClock {
+        let reads: Vec<&str> = sends
+            .iter()
+            .flat_map(|(host, ip)| [*host, *ip, REQUESTED_AT, RECEIVED_AT])
+            .collect();
+        StepClock::over(&reads)
+    }
+
+    fn polite_refusal(
+        store: &Path,
+        waits: &WaitRecorder,
+        url: &str,
+    ) -> Result<Option<SendFailure>, Box<dyn std::error::Error>> {
+        let mut sink = Recorder::default();
+        let Some(permit) = permit(&mut sink, FIRST_ATTEMPT) else {
+            return Err("no permit".into());
+        };
+        let asked = Request {
+            url: url.to_owned(),
+            ..request()
+        };
+        Ok(polite_wire(store, SOURCE, waits)
+            .send(permit, &asked, &polite_clock(&[(RESERVED_AT, RESERVED_AT)]))
+            .err())
+    }
+
+    /// Two sends through one polite `Wire`, 60 ms apart, the second paying its host wait in full.
+    fn two_polite_sends(store: &Path, waits: &WaitRecorder, first: &str, second: &str) -> Checked {
+        let wire = polite_wire(store, SOURCE, waits);
+        let clock = polite_clock(&[
+            (RESERVED_AT, RESERVED_AT),
+            (SIXTY_MS_LATER, AFTER_THE_HOST_WAIT),
+        ]);
+        send_to(&wire, &clock, FIRST_ATTEMPT, first)?;
+        send_to(&wire, &clock, SECOND_ATTEMPT, second)
     }
 
     fn held() -> Credentials {
@@ -674,6 +786,210 @@ mod tests {
         let refused = wire(held(), store.path(), &waits).send(permit, &request(), &clock);
         assert_eq!(
             (refused.err(), waits.waits()),
+            (
+                Some(SendFailure::Budget(BudgetError::Unreadable {
+                    path: pace,
+                    held: NOT_AN_INSTANT.to_owned(),
+                })),
+                Vec::new()
+            )
+        );
+        Ok(())
+    }
+
+    /// Waits in order: host then IP for the first send, then for the second.
+    #[test]
+    fn a_second_send_to_one_host_waits_out_the_host_pace_and_not_only_the_ip_one() -> Checked {
+        let store = tempfile::tempdir()?;
+        let waits = WaitRecorder::default();
+        two_polite_sends(store.path(), &waits, LOCALHOST, LOCALHOST)?;
+        assert_eq!(waits.waits(), vec![NO_WAIT, NO_WAIT, HOST_WAIT, NO_WAIT]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_send_to_another_host_owes_only_the_ip_pace() -> Checked {
+        let store = tempfile::tempdir()?;
+        let waits = WaitRecorder::default();
+        let wire = polite_wire(store.path(), SOURCE, &waits);
+        let clock = polite_clock(&[(RESERVED_AT, RESERVED_AT), (SIXTY_MS_LATER, SIXTY_MS_LATER)]);
+        send_to(&wire, &clock, FIRST_ATTEMPT, REFUSED)?;
+        send_to(&wire, &clock, SECOND_ATTEMPT, LOCALHOST)?;
+        assert_eq!(
+            waits.waits(),
+            vec![NO_WAIT, NO_WAIT, NO_WAIT, EXPECTED_WAIT]
+        );
+        Ok(())
+    }
+
+    /// Measured 2026-11-14: on a `StepClock`, reserving both slots and then sleeping both waits
+    /// kept the whole suite green, because a scripted read answers the same whatever came before.
+    #[test]
+    fn the_ip_slot_is_reserved_after_the_host_wait_and_not_before_it() -> Checked {
+        let store = tempfile::tempdir()?;
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let wire = Wire::with_sleeper(
+            polite_profile(),
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        send_to(&wire, &clock, FIRST_ATTEMPT, LOCALHOST)?;
+        clock.elapse(ELAPSED);
+        send_to(&wire, &clock, SECOND_ATTEMPT, LOCALHOST)?;
+        assert_eq!(
+            (
+                clock.waits(),
+                std::fs::read_to_string(store.path().join(PACE_FILE))?
+            ),
+            (
+                vec![NO_WAIT, NO_WAIT, HOST_WAIT, NO_WAIT],
+                IP_RESERVED_AFTER_THE_HOST_WAIT.to_owned()
+            )
+        );
+        Ok(())
+    }
+
+    /// The file NAME is asserted, not only the waits: on a case-insensitive disk (APFS by default)
+    /// an unlowercased key passed the waits alone, measured 2026-11-14.
+    #[test]
+    fn one_host_spelled_in_two_cases_is_one_bucket_under_its_lowercase_name() -> Checked {
+        let store = tempfile::tempdir()?;
+        let waits = WaitRecorder::default();
+        two_polite_sends(store.path(), &waits, LOCALHOST_SHOUTED, LOCALHOST)?;
+        let mut files: Vec<String> = std::fs::read_dir(store.path().join(PACE_DIR))?
+            .map(|entry| entry.map(|found| found.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<_, _>>()?;
+        files.sort();
+        assert_eq!(
+            (waits.waits(), files),
+            (
+                vec![NO_WAIT, NO_WAIT, HOST_WAIT, NO_WAIT],
+                vec![SOURCE_PACE_FILE.to_owned(), HOST_PACE_FILE.to_owned()]
+            )
+        );
+        Ok(())
+    }
+
+    /// Two sources hold two per-IP files, so only a host file keyed on the host alone makes the
+    /// second source wait.
+    #[test]
+    fn two_sources_asking_one_host_share_its_pace() -> Checked {
+        let store = tempfile::tempdir()?;
+        let (first, second) = (WaitRecorder::default(), WaitRecorder::default());
+        send_to(
+            &polite_wire(store.path(), SOURCE, &first),
+            &polite_clock(&[(RESERVED_AT, RESERVED_AT)]),
+            FIRST_ATTEMPT,
+            LOCALHOST,
+        )?;
+        send_to(
+            &polite_wire(store.path(), ANOTHER_SOURCE, &second),
+            &polite_clock(&[(SIXTY_MS_LATER, AFTER_THE_HOST_WAIT)]),
+            FIRST_ATTEMPT,
+            LOCALHOST,
+        )?;
+        assert_eq!(second.waits(), vec![HOST_WAIT, NO_WAIT]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_per_host_pace_on_a_url_with_no_host_refuses_before_any_wait() -> Checked {
+        let store = tempfile::tempdir()?;
+        let waits = WaitRecorder::default();
+        let refused = polite_refusal(store.path(), &waits, NO_HOST)?;
+        assert_eq!(
+            (refused, waits.waits()),
+            (
+                Some(SendFailure::Budget(BudgetError::NoHost {
+                    url: NO_HOST.to_owned()
+                })),
+                Vec::new()
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_per_host_pace_on_a_host_no_pace_file_can_be_named_after_refuses_before_any_wait() -> Checked
+    {
+        let store = tempfile::tempdir()?;
+        let waits = WaitRecorder::default();
+        let refused = polite_refusal(store.path(), &waits, IPV6_LOOPBACK)?;
+        assert_eq!(
+            (refused, waits.waits()),
+            (
+                Some(SendFailure::Budget(BudgetError::NotAHostKey {
+                    host: IPV6_HOST.to_owned()
+                })),
+                Vec::new()
+            )
+        );
+        Ok(())
+    }
+
+    /// The run goes on: `collect` records a `Transport` failure on its attempt row and aborts on
+    /// a `Budget` one.
+    #[test]
+    fn a_url_that_does_not_parse_skips_the_host_wait_and_fails_as_a_transport_error() -> Checked {
+        let store = tempfile::tempdir()?;
+        let waits = WaitRecorder::default();
+        let refused = polite_refusal(store.path(), &waits, UNPARSEABLE)?;
+        assert_eq!(
+            (
+                matches!(refused, Some(SendFailure::Transport(_))),
+                waits.waits()
+            ),
+            (true, vec![NO_WAIT]),
+            "{refused:?}"
+        );
+        Ok(())
+    }
+
+    /// The host file holds the instant last granted, so the 1 s source counts its own interval
+    /// from the 100 ms source's send; holding `go_at + interval` let the last writer decide.
+    #[test]
+    fn a_longer_host_interval_is_counted_from_a_shorter_one_s_send() -> Checked {
+        let store = tempfile::tempdir()?;
+        let (brisk, polite) = (WaitRecorder::default(), WaitRecorder::default());
+        let mut brisk_profile = profile();
+        brisk_profile.budget.per_host = Some(TEST_INTERVAL);
+        let brisk_wire = Wire::with_sleeper(
+            brisk_profile,
+            held(),
+            store.path(),
+            &SourceId::new(ANOTHER_SOURCE),
+            Box::new(brisk.clone()),
+        );
+        send_to(
+            &brisk_wire,
+            &polite_clock(&[(RESERVED_AT, RESERVED_AT)]),
+            FIRST_ATTEMPT,
+            LOCALHOST,
+        )?;
+        send_to(
+            &polite_wire(store.path(), SOURCE, &polite),
+            &polite_clock(&[(SIXTY_MS_LATER, AFTER_THE_HOST_WAIT)]),
+            FIRST_ATTEMPT,
+            LOCALHOST,
+        )?;
+        assert_eq!(polite.waits(), vec![HOST_WAIT, NO_WAIT]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_host_pace_file_holding_a_value_this_crate_did_not_write_refuses_before_any_wait() -> Checked
+    {
+        let store = tempfile::tempdir()?;
+        let pace_dir = store.path().join(PACE_DIR);
+        std::fs::create_dir_all(&pace_dir)?;
+        let pace = pace_dir.join(HOST_PACE_FILE);
+        std::fs::write(&pace, NOT_AN_INSTANT)?;
+        let waits = WaitRecorder::default();
+        let refused = polite_refusal(store.path(), &waits, LOCALHOST)?;
+        assert_eq!(
+            (refused, waits.waits()),
             (
                 Some(SendFailure::Budget(BudgetError::Unreadable {
                     path: pace,
