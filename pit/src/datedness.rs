@@ -138,6 +138,10 @@ mod tests {
     const END_OF_THE_DAY_IN_UTC: &str = "2026-07-01T23:59:59.999999Z";
     /// Past the end of the UTC day and four hours short of the end of the New York one.
     const UTC_MIDNIGHT_AFTER_THE_DAY: &str = "2026-07-02T00:00:00Z";
+    const HAVANA: &str = "America/Havana";
+    const DAY_BEFORE_HAVANA_FALLS_BACK: &str = "2026-10-31";
+    /// One microsecond before 05:00Z; the earlier midnight, 04:00Z, would end it an hour sooner.
+    const END_OF_THAT_DAY_AT_THE_LATER_MIDNIGHT: &str = "2026-11-01T04:59:59.999999Z";
     const EVERY_CUTOFF: [&str; 3] = [
         "1970-01-01T00:00:00Z",
         "2026-07-09T00:00:00Z",
@@ -240,6 +244,17 @@ mod tests {
         for cutoff in EVERY_CUTOFF {
             assert!(!item.visible_at(Cutoff::new(at(cutoff))), "{cutoff}");
         }
+    }
+
+    /// Havana falls back from CDT to CST at 01:00 on 2026-11-01, so its local midnight is both
+    /// 04:00Z and 05:00Z: found 2026-11-14 by scanning every chrono-tz 0.10.4 zone over
+    /// 1990-2029 (308 ambiguous midnights). New York has none, so no other test sees the choice.
+    #[test]
+    fn a_day_ending_at_an_ambiguous_midnight_ends_at_the_later_of_its_two_instants() {
+        assert_eq!(
+            end_of_day(day(DAY_BEFORE_HAVANA_FALLS_BACK), HAVANA),
+            Some(at(END_OF_THAT_DAY_AT_THE_LATER_MIDNIGHT))
+        );
     }
 
     /// `tz` is a public field, so an unresolvable zone name is reachable from any caller.
