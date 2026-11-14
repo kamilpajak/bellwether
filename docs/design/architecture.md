@@ -434,7 +434,7 @@ What each service does when its input is wrong, rather than what it does when ev
 | a panel lacks `exchangeable_units` | `panel-contract validate` calls the manifest not admissible. The statistics tier is *to* refuse to run and does not: it reads an ad-hoc assignment file, not the manifest | **R8** today, **R9** for the refusal |
 | a brief carries an order-shaped field | rejected by schema | **R12b** |
 | a count is taken over a partition's files | not a count. The partition key is the **publication day** (decision D3, §10), so a backfill appends a second segment into a months-old partition and no partition is ever closed: measured 2026-11-13, a second run exporting one late item leaves two segment files in one `valid_date=` directory, both current. Every count is therefore a `seq`-bounded query over the commit log, and `ledger` reports `unpublished_seq_ranges` so the rows no segment carries are a number rather than a silence | **R13**, and decision D3 |
-| an event is lost | latency, not data: the archive is the source of truth and the hourly sweep closes the gap | memo §4 rule 2 |
+| an event is lost | latency, not data: the archive is the source of truth and the periodic sweep closes the gap | memo §4 rule 2 |
 | a consumer is silently dead | detected by lag and backlog depth, not by staleness; the threshold on the age of the newest item is §10's N2 | memo §4 rule 3 |
 
 ### 5.1 The error-code registry (decided 2026-11-12)
@@ -512,29 +512,34 @@ Four rules, from the memo, restated here because the contracts depend on them:
    a closed window. Incremental salience would make results depend on arrival order.
 2. **Write, then emit, in one transaction.** The archive is the source of truth; the event says it
    grew.
-3. **The hourly sweep stays**, as a backstop and as the thing that fills the coverage ledger even
+3. **The periodic sweep stays** (every scheduled poll, at most 90 min apart, §11.1), as a backstop and as the thing that fills the coverage ledger even
    when no event fires.
 4. **Salience is a function of a cutoff, not of a day**: `salient(core, T)`. A rolling threshold
    computed from a partial day differs from the same threshold at the close, so every downstream
    claim names its `T`.
 
-Transport, decided by the owner 2026-11-14 (no code yet; §11 build step 9):
-- An `outbox` table inside `commit.sqlite3`, written inside `Committer::record`'s transaction. Rule 2
-  is then one SQLite transaction. An outbox in any other database would be a dual write.
-- One row per closed attempt, including zero-item attempts: `event_seq`, `attempt_id`, `seq_lo`/`seq_hi`
-  (a pointer into `items.seq`, never a copy), `items_new`. The table is the replay log.
-- Consumers keep their own cursor, outside `commit.sqlite3`, and poll `event_seq > cursor` every 5 s.
-  No push: a late wake costs latency, not data (rule 2).
-- The store switches to WAL, so a long-lived reader never blocks a commit. SQLite is linked
-  `bundled`: the Mac had 3.54.0 and the VPS 3.45.1 (`sqlite3 --version`, 2026-11-14).
-- The writer lease stays whole-life. Narrowing it lets one run's startup sweep close another live
-  run's open attempts (`news-provider/src/collect.rs:573-588`).
-- Polling cost, measured 2026-11-14 with Python `sqlite3` on SQLite 3.53.4, laptop: 10,000
-  `PRAGMA data_version` in 33.2 ms. Order of magnitude only, not through `rusqlite`.
-- Reversed if: a second host must write the same archive; or more than 10 commits per second; or
-  p95 first-sighting-to-frame latency exceeds about one minute with the poll interval as its larger
-  part.
-- A broker would solve a throughput problem this system does not have.
+Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
+- An `outbox` table inside `commit.sqlite3`, written inside `Committer::record`'s transaction.
+  Rule 2 is then one SQLite transaction. An outbox in another database would be a dual write.
+- One row per closed attempt, zero-item attempts included: `event_seq`, `attempt_id`,
+  `seq_lo`/`seq_hi` (a pointer into `items.seq`, never a copy), `items_new`. It is the replay log.
+- One poller inside `vault` is the outbox's only reader. It keeps its cursor outside
+  `commit.sqlite3`, polls `event_seq > cursor` every 5 s, wakes `derive` and feeds the stream
+  (§3.7). No other service opens `commit.sqlite3`; `derive` still reads a snapshot file (§4).
+- Nothing pushes. A late poll delays an event and never loses it (rule 2).
+- At step 8 the store switches to WAL, so a long-lived reader never blocks a commit, and SQLite is
+  linked `bundled`, which replaces the note at `services/newsvault/Cargo.toml:20` and adds a C
+  compile to CI. Versions seen 2026-11-14 (`sqlite3 --version`): Mac 3.54.0, VPS 3.45.1.
+- WAL: the N1 second copy must use `.backup` or `VACUUM INTO`; a file copy loses commits still in
+  `-wal`. A read-only open of a WAL store works (checked 2026-11-14).
+- The writer lease stays whole-life until the startup sweep can tell a live run from a dead one
+  (§11.3). Narrowing it earlier lets one run's sweep close another live run's open attempts
+  (`news_provider::collect::sweep`; `attempts_in_flight` has no run filter).
+- Polling cost, measured 2026-11-14, Python `sqlite3` on SQLite 3.53.4, laptop, one connection,
+  WAL file: 10,000 `SELECT … WHERE event_seq > ?` in 12.2 ms. Not measured through `rusqlite`.
+- Reversed if: a second host must write the archive or read the outbox; more than 10 commits per
+  second; or p95 latency from `observed_at` to the stream frame (§3.10.2) exceeds 60 s with the
+  5 s poll as its larger part.
 
 ---
 
@@ -597,7 +602,7 @@ does. Where a row's clauses differ, its status splits with them.
 
 ---
 
-## 9. Alternatives considered and rejected
+## 9. Alternatives considered
 
 | alternative | why not |
 |---|---|
@@ -605,7 +610,7 @@ does. Where a row's clauses differ, its status splits with them.
 | Kafka for the event bus | solves throughput we do not have — a few hundred items a day is one event every few minutes — and adds infrastructure a one-person system must then operate. An outbox table inside `commit.sqlite3` is already durable and is itself the replay log. |
 | a Postgres outbox with `LISTEN`/`NOTIFY` | rule 2 holds only inside one engine, so an outbox next to `commit.sqlite3` is a dual write, and keeping it atomic means moving the whole archive. The Postgres that "already runs in production" is the predecessor's container: no host port, holds `auth_user`, no automated backup, allowed to stop at memo step 7. `NOTIFY` is not queued for a disconnected listener, so a consumer polls by cursor anyway. Rejected 2026-11-14. |
 | Common Crawl's CC-NEWS as the archive | probed and rejected: 7 of our own 287 items for one test day, 2 of our 17 publishers crawled at all, zero tier-1 US financial outlets in 72,000 records, 4.19 TB for ten months, and no index at all, so no URL lookup and no aimed range request. |
-| **collecting the news ourselves** — publisher RSS, EDGAR, or crawling the open web — instead of buying it | **Chosen by the owner 2026-11-14 for the forward feed** (§11); history stays a one-time vendor purchase (`probes/vendor_probe/PREREGISTRATION.md`). The pre-registered usability bar is a median article body of 2,000 characters, because R17 matches over body text (`probes/vendor_probe/PREREGISTRATION.md`, Q3). Against it, the predecessor's own RSS path has a median body of **117** characters — short of the bar by more than an order of magnitude, so RSS alone is a snippet feed whatever it costs. Its EDGAR path clears the bar on either of the two figures the probes carry, and they disagree: `panel_recount.py` and memo §1.9 say 50,622 characters, `matcher_audit.py` says 14,039. The 14,039 one IS re-derivable today in one command through the compiled reader and no Python: `newsvault day 2026-07-01 --lake ~/thematic_news_lake --format json`, grouping body lengths by source, gives `edgar_press_release` n=103 median 14,039 characters (and `rss` n=103 median 120, `polygon` n=76 median 426, `perplexity` n=5 median 235), re-derived 2026-11-12. It is one day's median and therefore provisional. The 50,622 one is not re-derivable: `panel_recount.py` dies on an uninstallable import (`probes/README.md`). So "in-house" has to name its sources before it can be costed: EDGAR-only, RSS and crawling the open web have different bodies, different volumes and different costs, and CC-NEWS in the row above is the cheap version of the third. The forward feed therefore fetches article pages, not RSS snippets: on 2026-11-14, 11 article pages over 6 hosts gave 2,281 to 28,038 characters each (§11). |
+| **collecting the news ourselves** — publisher RSS, EDGAR, or crawling the open web — instead of buying it | **Chosen by the owner 2026-11-14 for the forward feed** (§11); history stays a one-time vendor purchase (`probes/vendor_probe/PREREGISTRATION.md`). The pre-registered usability bar is a median article body of 2,000 characters, because R17 matches over body text (`probes/vendor_probe/PREREGISTRATION.md`, Q3). Against it, the predecessor's own RSS path has a median body of **117** characters — short of the bar by more than an order of magnitude, so RSS alone is a snippet feed whatever it costs. Its EDGAR path clears the bar on either of the two figures the probes carry, and they disagree: `panel_recount.py` and memo §1.9 say 50,622 characters, `matcher_audit.py` says 14,039. The 14,039 one IS re-derivable today in one command through the compiled reader and no Python: `newsvault day 2026-07-01 --lake ~/thematic_news_lake --format json`, grouping body lengths by source, gives `edgar_press_release` n=103 median 14,039 characters (and `rss` n=103 median 120, `polygon` n=76 median 426, `perplexity` n=5 median 235), re-derived 2026-11-12. It is one day's median and therefore provisional. The 50,622 one is not re-derivable: `panel_recount.py` dies on an uninstallable import (`probes/README.md`). So "in-house" has to name its sources before it can be costed: EDGAR-only, RSS and crawling the open web have different bodies, different volumes and different costs, and CC-NEWS in the row above is the cheap version of the third. The forward feed therefore fetches article pages, not RSS snippets: on 2026-11-14, 11 article pages over 6 hosts gave 2,281 to 28,038 characters each, and 2 more were blocked (§11.6). |
 | a single news vendor for both the live stream and the archive | no vendor reviewed does both: the one with a 2014 archive filters on publication date only, and the one documenting an index-time filter has it behind a quoted Enterprise plan. So provenance labelling is necessary rather than avoidable. |
 | incremental salience, updated per event | makes the result depend on arrival order, which destroys the determinism the panel contract is built on |
 | the statistics tier as a separate repository | the panel handover is where the worst measured error happened, and a test can only span it from inside one tree |
@@ -704,7 +709,9 @@ settled fact. Both are one edit to reverse.
 - **The backfill coverage convergence, a vertical slice 2026-11-13 (§8 row R20).** Three choices,
   each changeable in one place. **Which arm converges:** a `vendor_archive` follow-up whose story
   the store already holds a committed item for is dropped, while a `live_ingest` one is always
-  issued (R16), so a re-run fetches only the uncovered accessions. **The one place to change it** is
+  issued (R16), so a re-run fetches only the uncovered accessions. §11.5 step 4 changes this for
+  `open-web-feed`: a live follow-up whose story is held (§11.1) is skipped. Until then this
+  describes the code. **The one place to change it** is
   `edgar-press`'s `EdgarPress::follow_ups_to_issue`, the provider's own method - a second provider
   with a different vendor-row identity maps a follow-up to its story there and nowhere else. **The
   denominator:** `MAX(matched)` over a window's index attempts, because each run's index records the
@@ -813,109 +820,184 @@ there, and the control reproduces that zero. **The threshold choice survives**: 
 outages the 6-hour rule catches anyway, so 2 hours adds one alert in 175 days, 2026-06-03's.
 
 **What makes those two numbers wrong.** They measure the predecessor's **retrieval** coverage, not
-the world's news, so a different vendor moves them: provisional on D-1, to be re-measured against the
+the world's news, so a different vendor moves them: provisional: to be re-measured against `open-web-feed` (§11) and the
 first real vendor. The publication gap transfers where an observation gap would not, the
 predecessor's `ingested_at` spacing being its scheduler rather than the news. The record also holds
 outages already — 161 of the 175 days hold an item, 14 hold none, and the 332.6-hour gap is one.
 
 ---
 
-## 11. `open-web-feed` — the own forward news feed (decided 2026-11-14, no code yet)
+## 11. `open-web-feed` — our own forward news feed (decided 2026-11-14, no code yet)
 
-Two layers. **POC** is what gets built first; each line is an owner decision of 2026-11-14.
-**Target** is the shape the crate grows into; nothing in it is built or gated yet. Probe numbers
-(Saturday 2026-11-14, one request per verdict) are in the session's probe reports, not here; the
-weekday re-probe replaces them.
+- **POC** (proof of concept): the first build. Each line is an owner decision of 2026-11-14.
+- **Target**: the shape the crate grows into. Nothing in it is built or gated.
+- **Held**: the store already has an answer for a story, so the feed does not fetch it again.
+- **Admitted**: a hosts-file row with status `admitted`: its robots.txt allows the paths used and it
+  passed a probe.
+- `Index` request: a dated news sitemap or RSS feed. `Document` request: one article page.
+- Hosts: GNW = GlobeNewswire, PRN = PR Newswire, CNW = Canada Newswire, BI = Business Insider,
+  Fool = The Motley Fool.
 
 ### 11.1 Fixed in both layers
 
 - Crate `providers/open-web-feed/`, top-level `[lints] workspace = true`. No clock, no HTTP client.
-- Two SourceIds: `open-web-wires`, `open-web-outlets`. Live only: `plan` refuses any target that is
-  not the run's UTC day, before any request. No `VendorArchive` request can exist.
-- Index = dated news sitemap or RSS. Document = one article page. Investor-relations pages: never.
-- Observation time = `Wire`'s `received_at`. A provider-set observation is refused by the store.
-- Valid time, per host: PRN and GNW RSS `pubDate`; CNBC page `article:published_time`, never its
-  sitemap (wrong offset 2 of 2, modification time 1 of 2); Yahoo = syndication time; Fool and BI
-  sitemap value. Never `lastmod`, `dateModified`, fetch time, or a date folded into midnight.
-- Bot protection (403, challenge, WAF, DataDome) = `PermanentFailure`, never retried in another
-  shape. robots.txt is respected; sites' terms of use are not a criterion (owner, 2026-11-14).
-- `item_key(url)` is the one function behind `source_item_id`; `story_of` and `document_of` both
-  call it. A page's canonical link feeds `doc_id` only.
-- Pace: `interval = max(Crawl-delay, 10 s)`; poll every 30 min in the US session, 90 min outside;
-  a host may be slowed, never sped up; worst-case busy time ≤ 50% of a day.
-- Pace tables: one hashed file per SourceId under `providers/open-web-feed/hosts/`; its digest is the
-  run's `universe_version`. The loader refuses, before any request: an interval under the rule, a
-  duplicate or invalid host, an admitted row with no ledgered robots fetch. Only admitted rows are
-  planned.
-- "Already fetched": a story is held if it has a committed item or a Document attempt closed
-  `Usable`, `Empty`, `PermanentFailure`, or with only unusable rows. Not held: `TransientFailure`,
-  `Interrupted`, in flight. New `attempts.story_id` and `attempts.held`; `ledger --check` subtracts
-  `held`. First sighting is unchanged: a skip writes no item.
+- Live only. `plan` refuses any target that is not the run's UTC day, before any request. No
+  `vendor_archive` request can exist. Every UTC day is collected, weekends included.
+- Investor-relations pages are never fetched.
+- Observation time is `Wire`'s `received_at`. The store refuses one set by the provider
+  (`cmd_collect.rs:555-567`).
+- Valid time per host:
+  - PRN, GNW: RSS `pubDate`.
+  - CNBC: the page's `article:published_time`, never its sitemap (§11.6).
+  - Yahoo: its syndication time.
+  - Fool, BI: the sitemap value.
+  - Never: `lastmod`, `dateModified`, fetch time, a date folded into midnight.
+- Bot protection (HTTP 403, a challenge page, a web application firewall, DataDome) is a
+  `PermanentFailure`. It is never retried in another form.
+- robots.txt is respected. Sites' terms of use are not a criterion (owner, 2026-11-14).
+- `item_key(url)` is the one function behind `source_item_id`. A page's canonical link feeds
+  `doc_id` only.
+- Pace: `interval = max(Crawl-delay, 10 s)`. Poll every 30 min inside 13:00–20:00 UTC (the US
+  session as N2 defines it, §10), every 90 min outside. 90 min is provisional until the weekday
+  probe: GNW's Saturday window gives at most 118 min (3.93 h × 0.5).
+- A host may be slowed, never sped up.
+- Busy time = summed paced waits plus request times across hosts. Worst case ≤ 50% of a day.
+- Hosts file: one hashed file per SourceId under `providers/open-web-feed/hosts/`. Its digest is the
+  run's `hosts_version`, carried in `filter_params` beside `universe_version` (§2 keeps that name
+  for the ticker roster).
+- Only admitted rows are planned.
+- Held, keyed on (SourceId, `story_id`) over every target window, never the run's window alone. A
+  story is held if it has:
+  - a committed item; or
+  - a `Document` attempt closed `Usable`, `Empty`, `PermanentFailure`, or with only unusable rows.
+    An empty or unusable page is held because re-fetching returns the same page; the raw blob
+    (§3.9) allows re-extraction.
+- Not held: `TransientFailure`, interrupted by the startup sweep, in flight.
+- `Finalised` must carry the `Verdict`, so permanence is stored. Today `PermanentFailure` and
+  `TransientFailure` both map to `OutcomeKind::Failed` (`ledger.rs:216`).
+- New columns `attempts.story_id` and `attempts.held`. `ledger --check` subtracts `held`.
+- First sighting is unchanged: a skip writes no item. So R15 cannot see a re-stamped time of a held
+  story; the index value survives only in the attempt's raw blob.
+- The outcome names here are the code's; §3.2's `ok | empty | failed | collapsed` predates them.
 
 ### 11.2 POC
 
-- Sources: GNW (`rss.globenewswire.com`, www→rss host rewrite) first; then PRN, Yahoo (wire
-  provider keys only), Fool, CNBC, BI, CNW, one PR each, as each robots fetch lands. Fed in
-  `open-web-wires`. Zero Hedge and Newswire.com deferred.
-- Robots: a separate refresh command fetches robots.txt through `Wire` under an attempt row; the
-  hosts file pins its digest. No third `RequestPhase`.
-- Redirects refused: `TransportProfile.redirects = Refuse`, a 3xx is `PermanentFailure`.
-- One interval for all hosts (all admitted hosts are 10 s); R19 hole 7 stays open.
-- `ValidPrecision::Minute` for GNW's minute-resolution `pubDate`.
-- `items` keeps the raw valid-time value, its field and its source, so the CNBC rule is checkable
-  from the archive.
-- Follow-up cap 150 per run; overflow counted as `deferred`, retried next poll. A run must finish
-  inside its poll period.
-- Permanent failures count as held (changes R16 and R20).
-- Fixtures: trimmed real pages from the 2026-11-14 probes, a few paragraphs each.
-- Outbox: the SQLite table of §6, a separate PR after the held filter.
-- Scheduler: a VPS timer outside the crate. One invocation runs both SourceIds under one lease.
+- One SourceId, `open_web_wires`. `open_web_outlets` arrives with its first outlet (step 6). A
+  second SourceId in one invocation needs a run envelope with a list of `hosts_version` values.
+- Hosts, in order: GNW, then PRN, CNW, Fed, Yahoo. One PR per host, as each robots fetch lands.
+- GNW: article URLs are rewritten from `www.` to `rss.`. Both hosts are GNW's own; `www.` returned
+  Akamai 403 on robots.txt twice, and its article pages were never tested.
+- Yahoo: only provider keys of wires not fetched directly: `cnwgroup.com`, `business-wire.com`,
+  `accesswire.ca`. Matched exactly, never as substrings. PRN and GNW keys would store each
+  release twice.
+- Deferred: Zero Hedge, Newswire.com, Business Wire direct.
+- Robots: a refresh command fetches robots.txt through `Wire` under an attempt row. The hosts file
+  pins its digest. Step 2 decides how a robots attempt is labelled in the ledger and kept out of
+  the expected-run count; it amends §10's "calendar, listing and roster are FILES" paragraph.
+- The robots and floor checks run in `newsvault`, not in the provider: only the driver can read
+  the store. It hands the provider the Crawl-delay parsed from the pinned robots blob.
+- Redirects refused: `TransportProfile.redirects = Refuse` sets `max_redirects(0)`. A 3xx is a
+  `PermanentFailure`. This closes R19 hole 9 by refusal.
+- One interval for all hosts: every admitted host is at 10 s. R19 hole 7 stays open.
+- `ValidPrecision::Minute` for GNW's minute-resolution `pubDate`. It needs a new
+  `pit::datedness::Published` arm, a new `canon` stamp arm with a committed vector, and a store
+  `CHECK` change (step 3).
+- `items` gains `valid_raw`, `valid_field`, `valid_source`. `ValidSource::PageMetadata` gets its
+  producer, the CNBC parser (`provider.rs:39-47` waits for it).
+- Follow-up cap 150 per invocation, the owner's choice and not measured: 150 × 10 s = 25 min, inside
+  the 30-min poll. Overflow counts as `deferred` and is retried at the next poll.
+- A run must finish inside its poll period.
+- Conformance: a live provider is exempt from the session and listing check
+  (`conformance.rs:148-162`). Accounting is per (day, host).
+- Fixtures: trimmed real pages from the 2026-11-14 probes, a few paragraphs each, plus one synthetic
+  page whose canonical link differs from its URL.
+- Scheduler: a VPS timer outside the crate.
 
 ### 11.3 Target shape
 
 - Sources: every candidate that passes robots and a weekday probe, including Business Wire if it
   becomes stable, Zero Hedge, Newswire.com (with a measured zone, date-only valid time), and Yahoo
-  outlet syndication under `open-web-outlets`.
-- Per-host intervals: R19 hole 7 closed (`HostPaces::Listed`), so one slow host does not slow the
-  rest.
-- Redirects followed as their own paced, ledgered requests: `RawResponse` carries headers and the
-  driver accepts Document-phase follow-ups (closes R19 hole 9).
-- Robots re-fetched on a schedule; a changed robots digest blocks the host until the hosts file is
-  updated.
-- Collectors per SourceId in parallel: requires a startup sweep that tells a live run from a dead
-  one, then a lease that covers only `reserve_seq` through COMMIT.
+  outlet syndication under `open_web_outlets`.
+- Outlets under `open_web_outlets`: Fool (transcripts as their own kind), CNBC, BI.
+- Per-host intervals: R19 hole 7 closed (`HostPaces::Listed`).
+- Redirects followed as their own paced, ledgered requests. Needs `RawResponse` headers and
+  `Document`-phase follow-ups. Hole 9 stays closed.
+- Robots re-fetched on a schedule. A changed digest blocks the host until the hosts file is updated.
+- Collectors per SourceId in parallel. Needs a startup sweep that tells live runs from dead ones,
+  then a lease covering only `Committer::reserve` through COMMIT (§6).
 - Follow-up cap and run length set from measured weekday busy time, printed in every envelope.
-- Extractor breakage visible: the `NoArticleBody` share per host is a ledger reading with a
+- Extractor breakage visible: the `NoArticleBody` share per host is a ledger reading, with a
   threshold fixed before its first measurement.
-- The outbox feeds the private stream (D-7) and `derive`'s closed-window trigger.
+- The outbox poller wakes `derive` and feeds the private stream (D-7).
 
-### 11.4 Gates the POC ships with (each turns red on the named mutation)
+### 11.4 Gates planned (none exists yet; each joins the §8 row named when it bites)
 
-- live index skips a held story → `collect.rs` passes an empty held set for live again.
-- a permanently failed document is not refetched → held reads `items` only.
-- a transiently failed document is refetched → held includes `TransientFailure`.
-- follow-up story equals item story, per host fixture → `document_of` keys on the canonical link.
-- a quiet all-held day passes `ledger --check` → the `held` subtraction is removed.
-- a target other than the run day is refused before any request → the day check is removed.
-- only admitted hosts are planned → the status filter is removed.
-- a hosts row faster than its Crawl-delay is refused → the floor check is removed.
-- an admitted row without a ledgered robots fetch is refused → the lookup is removed.
-- a redirect is a permanent failure, not followed → `max_redirects(0)` is removed.
-- CNBC valid time is the page meta → the sitemap value is used.
-- a bot-protection page is permanent → 403 is classified transient.
-- a Yahoo row outside the wire list is filtered out → exact match becomes substring match.
-- the extracted body is article text, per host → the selector widens to `<body>`.
-- no provider source file holds a sink → a sink is added outside `lib.rs`.
+| gate | turns red when | §8 row |
+|---|---|---|
+| a live index skips a held story | `collect.rs` passes an empty held set for live again | R16, R20 |
+| a story held under yesterday's window is skipped today | the held read filters on `target_window` | R16, R20 |
+| a permanently failed document is not refetched | held reads `items` only | R16 |
+| a transiently failed document is refetched | held includes `TransientFailure` | R21 |
+| follow-up story equals item story, synthetic fixture | `document_of` keys on the canonical link | R3 |
+| a quiet all-held day passes `ledger --check` | the `held` subtraction is removed | R4 |
+| a target other than the run day is refused before any request | the day check is removed | R10 |
+| only admitted hosts are planned | the status filter is removed | R19 |
+| a hosts row faster than its robots Crawl-delay is refused (newsvault) | the floor check is removed | R19 |
+| an admitted row without a ledgered robots fetch is refused (newsvault) | the lookup is removed | R4 |
+| a redirect is a permanent failure, not followed | `max_redirects(0)` is removed | R19 |
+| CNBC valid time is the page meta | the sitemap value is used | R2 |
+| a bot-protection page is permanent | 403 is classified transient | R21 |
+| a Yahoo row outside the key list is filtered out | exact match becomes substring match | R10 |
+| the extracted body is article text, per host | the selector widens to `<body>` | R17 |
+| no file under `providers/open-web-feed/src` names `Sink` | a `Sink` use is added to any file there | R4 |
+| a rolled-back `record` leaves no outbox row | the insert moves outside the transaction | §6 rule 2 |
+| a zero-item attempt writes one outbox row | the insert is skipped when rows are empty | §6 rule 3 |
+
+Unguarded in the POC: the cap of 150 and `deferred`; the stored raw valid-time fields.
 
 ### 11.5 Build order (each PR passes the gate alone)
 
-1. Crate skeleton, hosts and rules loaders with refusals, trimmed fixtures.
-2. Robots refresh command; loader checks the pinned digest.
-3. GNW index parser and valid time, per-(day, host) conformance, provider enum in `cmd_collect`,
-   `--window today`, end-to-end test.
-4. Redirect refusal and 3xx classification, with a stub server.
-5. Document parsers, `NoArticleBody`, `Provider::story_of`, the `item_key` gate.
-6. Held filter, ledger check; amend R16 and R20.
-7. Admit hosts, one PR each.
-8. VPS timer, follow-up cap, busy seconds in the envelope.
-9. Outbox, WAL, consumer cursor.
+1. Crate skeleton and loaders, built only with their first reader in step 3.
+2. Robots refresh command; newsvault checks the pinned digest and the floor.
+3. GNW end to end: index and document parsers, loaders, `--window today`, conformance exemption
+   and per-(day, host) accounting, `Minute` precision, `items` valid-time columns, `NoArticleBody`,
+   `Provider::story_of`, the `item_key` gate, an end-to-end test.
+4. Held filter: `Finalised` carries the `Verdict`, `attempts.story_id`, `attempts.held`, live
+   covered set, ledger check. Amends R16 and R20.
+5. Redirect refusal and 3xx classification, with a stub server.
+6. One PR per further host; `open_web_outlets` with its first outlet.
+7. VPS timer, follow-up cap, busy seconds in the envelope.
+8. Outbox, WAL, `bundled`, with its first reader `newsvault events --after <cursor>`.
+
+### 11.6 Evidence, 2026-11-14 (Saturday)
+
+- Command: `curl -sS --compressed -A 'research-feed-probe/0.1' -o <body> -D <hdr> --max-time 30
+  <url>`, ≥ 5 s between requests to one host, ≤ 3 per host. Body = whitespace-collapsed `<p>` text
+  in the host's container, or JSON-LD `articleBody`, parsed offline with Python's `html.parser`.
+- Bodies: 13 article fetches, 11 reached, 2 blocked.
+
+| host | UTC | status | body chars | rule |
+|---|---|---|---|---|
+| prnewswire.com | 19:36:58 | 200 | 9,463 | `<p>` in `<article>` |
+| prnewswire.com | 19:37:18 | 200 | 19,337 | `<p>` in `<article>` |
+| rss.globenewswire.com | 19:36:54 | 200 | 5,117 | `<p>` in `div.main-body-container` |
+| cnbc.com | 19:37:19 | 200 | 6,891 | `<p>` in `div.ArticleBody-articleBody` |
+| cnbc.com | 19:37:49 | 200 | 4,910 | same |
+| fool.com | 19:37:51 | 200 | 4,467 | `<p>` in `<main>` |
+| fool.com (transcript) | 19:37:59 | 200 | 28,038 | `<p>` in `<main>` |
+| businessinsider.com | 19:37:51 | 200 | 2,281 | JSON-LD `articleBody` |
+| businessinsider.com | 19:37:59 | 200 | 3,719 | JSON-LD `articleBody` |
+| finance.yahoo.com (GNW release) | 19:37:52 | 200 | 5,395 | `<p>` in `<article>` |
+| finance.yahoo.com (Fool copy) | 19:38:00 | 200 | 5,174 | `<p>` in `<article>` |
+| benzinga.com | 19:36:59 | 403 | 0 | Cloudflare block page |
+| marketbeat.com | 19:37:49 | 403 | 0 | Cloudflare JS challenge |
+
+- CNBC sitemap vs page, 2 of 2 checked:
+  - Berkshire story: sitemap `09:02:39-04:00` (13:02:39Z); page `article:published_time`
+    14:02:39Z. Wrong offset (EDT in EST season).
+  - FAA story: sitemap `13:32:47-04:00` (17:32:47Z); page `datePublished` 09:26:23Z,
+    `dateModified` 18:32:47Z. The sitemap holds the modification time, also with the wrong offset.
+- Yahoo sitemap, 19:20:57Z: 1,000 rows over 18.27 h; provider keys from `image:loc`
+  (`media.zenfs.com/en/<key>/`): `cnwgroup.com` 37, `prnewswire.com` 36, `globenewswire.com` 26,
+  `business-wire.com` 6, `accesswire.ca` 6.
+- GNW RSS, 19:22:19Z: 20 items over 3.93 h.

@@ -300,10 +300,8 @@ components *removed* a standing signal instead of raising one.
 
 §1.4 is the motivation: a clock-driven ingest structurally cannot deliver same-session news.
 
-The vendor under consideration offers no webhook; its `minuteStreamArticles` endpoint returns
-articles added to its index in the last minute, with a `minutesAgo` parameter for catch-up
-(checked 2026-11-11; not confirmed against official docs, see §6). So **we** produce the events: a
-one-minute poll, then an event emitted after the write.
+The forward feed is our own (architecture §11, decided 2026-11-14): an index poll every 30 min in
+the US session and 90 min outside it, then an event emitted after the write.
 
 Event-driven must not become incremental state. The four rules:
 
@@ -313,7 +311,7 @@ Event-driven must not become incremental state. The four rules:
    learn.
 2. **Write, then emit, in one transaction.** The archive is the source of truth; the event is a
    notification that it grew. A lost event then costs latency, not data.
-3. **The hourly sweep stays**, as a backstop. Event-driven *plus* periodic, not instead of. A
+3. **The periodic sweep stays** (every scheduled poll, architecture §11.1), as a backstop. Event-driven *plus* periodic, not instead of. A
    silently dead consumer looks exactly like a quiet news day — the failure §1.4's ledger gap
    already produced once.
 4. **Salience is a function of a cutoff, not of a day:** `salient(core, T)`. The rolling threshold
@@ -544,7 +542,7 @@ must not influence the service that produces proposals, or selection happens und
 
 | # | Decision | What hangs on it |
 |---|---|---|
-| D-1 | **Which news vendor**, and whether one or two (live vs archive). | §6. NewsAPI.ai's archive route is closed by the probe; Webz.io is pending (§10 step 2). |
+| D-1 | **Which vendor for history** (one-time purchase). The live feed is our own (architecture §11, 2026-11-14). | §6. NewsAPI.ai's archive route is closed by the probe; Webz.io is pending (§10 step 2). |
 | D-2 | ~~**Storage licence.**~~ **CLOSED 2026-11-11 by the owner:** not treated as a constraint for a private, single-user research archive. The archive holds full article text. Recorded because the alternative it displaced — storing hashes, spans and quotations instead — would have made re-matching after a rule change impossible, so the decision bought that capability. | — |
 | D-3 | ~~**The parity-gate date.**~~ **Void 2026-11-14 by the owner:** output parity is not a target (§5.1). | — |
 | D-4 | ~~**Repo topology.**~~ **CLOSED 2026-11-11 by the owner: three repositories.** This repository keeps the front-end, the thin API, the five data-collection units and — as an **archive** — the dead lab and its memos. A second holds the broker rail and the backtester, never rewritten. The successor is a third, polyglot, but its Python is a **fresh** statistics tier of roughly one to two thousand lines rather than the 9,602 lines of `diagnostics` / `eval` / `preaudit` / `retrospective_audit` / `gates`, which served closed paradigms and stay behind. | Buys the one gate that today's worst error needed: the panel artefact and the power routine live in one repository, so a test can require that the panel declares its number of exchangeable units and that the power routine refuses to run without it. Across a repository boundary that gate cannot be written, and the 88.2%-versus-27.4% error of §1.8 is precisely what it catches. Inherits one known hazard: a polyglot CI needs path filters, and in this project the `.github/` filters must be mirrored into the post-deploy check under a different pathspec syntax — a coupling that has already caused a failure once, so it belongs in the gate list rather than being discovered later. |
@@ -579,7 +577,7 @@ to pick.
 | 1 | Point-in-time core and lake reader | Complete days instead of truncated ones | done (PR #1881) |
 | 2 | **Vendor probe on three days, two vendors** | Volume and therefore cost of a year of history; archive stability under a repeated query; whether a body is returned; the distribution of publication-to-index lag, which is the input to R11 | run 2026-11-14: the NewsAPI.ai archive route is closed (509.85 USD for 12 months after one narrowing, above the registered 300 USD limit); Webz.io waits for a one-month order (`probes/vendor_probe/PREREGISTRATION.md`) |
 | 3 | Copy of the predecessor's outputs on a second host (§5.1) | Differences from the predecessor can be explained after it stops | not done; urgent, because history is rewritten in place |
-| 4 | Event-driven ingest with outbox, coverage ledger and hourly sweep | First sighting drops from 4.5 h after the close to about a minute after publication | after step 2 |
+| 4 | Event-driven ingest with outbox, coverage ledger and hourly sweep | First sighting drops from 4.5 h after the close to at most one poll period (30 min in session) after the index lists the item | build order in architecture §11.5 |
 | 4b | Private item stream over WebSocket (D-7), on top of step 4's outbox | A second consumer, which is the only real test of whether the item contract is a contract | after step 4; schema and heartbeat designed in from the start |
 | 5 | Backfill to 246 sessions, if step 2 came out cheap | Removes six months of waiting | depends on step 2 |
 | 6 | `derive` over the days both systems cover, compared against the step-3 copy; each differing pick has a named cause | Evidence the differences are the fixes, not new defects | not designed: the cause list's format is unset (architecture §8 row H1); after step 3 |
