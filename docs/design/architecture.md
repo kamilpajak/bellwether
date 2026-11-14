@@ -154,7 +154,7 @@
 **The one visibility query.**
 
 - `visible_at(cutoff)` is true when `valid_at <= cutoff` **and** `observed_at <= cutoff`.
-- Measured in a retrieval test: the half-question admitted documents not visible at the claimed
+- Why both halves, measured in a retrieval test: the half-question admitted documents not visible at the claimed
   instant in 60.2% of 69 probes; the full question leaked in none.
 - How far the type system goes towards making the half-question unaskable, and where it stops: §8
   row R2 and nowhere else.
@@ -192,7 +192,7 @@
 ### 3.3 `RuleSet` — what `derive` is a function of
 
 - A file, hashed, versioned, and the only place these choices exist.
-- Rejected: constants in code, which cannot be diffed, tested or attributed.
+- Constants in code cannot be diffed, tested or attributed.
 
 | group | contents |
 |---|---|
@@ -322,9 +322,9 @@ Draw voting:
 - Plus a **heartbeat** carrying `seq`, an instant and items-since.
 - Silence must be distinguishable from a dead stream, because a consumer reading our outage as
   "no news" turns our failure into theirs.
-- No delivery guarantee: the archive is the source of truth and reconciliation is an HTTP read of
-  it.
-- No latency promise: it would need a freshness number the design does not yet have.
+- No delivery guarantee and no latency promise.
+  - The archive is the source of truth and reconciliation is an HTTP read of it.
+  - A latency promise would need a freshness number the design does not yet have.
 
 ### 3.8 `Reading` — `ledger`, one-way
 
@@ -390,7 +390,7 @@ Draw voting:
 - Here the immutable half is the filing document at a fixed accession URL, which dedups to zero new files on a re-fetch.
 - The moving tail is the daily index, which grows through the day and mints one blob per fetch, bounded by the number of runs in a day and not by the number of items.
 - **What is still unmeasured:** the index re-fetch rate across a whole day.
-- The observation that would now surprise this paragraph: one filing document whose repeated fetches carry more than one digest.
+- The observation that would now surprise this file-count estimate: one filing document whose repeated fetches carry more than one digest.
 
 **The ceiling: this settles the layer, not the number.**
 - N4 still needs a count of days for L2 and a medium for what is kept past it; one number per provenance class (§3.1) is the next smallest form.
@@ -565,7 +565,7 @@ vendor  --poll/stream-->  vault: write  --same transaction-->  outbox
                                                         derive: compute over a CLOSED window
 ```
 
-Four rules from the memo; the contracts depend on them:
+Four rules from the memo, restated here because the contracts depend on them:
 
 1. **An event triggers computation; it never accumulates it.**
    - `derive` stays a pure function over a closed window.
@@ -616,13 +616,13 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 **Where the wall is enforced, and where it is not.**
 
 - Not here: a check in this repository for order-placing calls would pass unconditionally, because
-  there is no such call to forbid.
-- The predecessor's equivalent gate guards code that exists.
+  there is no such call to forbid; the predecessor's equivalent gate guards code that exists.
 - If a mediating service is ever built between this repository and the executor, that service is
   where the enforcement belongs, under the condition §8 row R12a states.
 - The same shape in the other direction: no backward edge from `ledger`, enforced at `ledger` when it
   exists (§3.8).
-- Lower latency makes this boundary *more* important, not less.
+**Lower latency makes this boundary *more* important, not less.**
+
 - "We must act now" is exactly the argument that talks a person into automating a pick; the boundary
   has to hold at the moment it becomes inconvenient.
 
@@ -699,9 +699,9 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - The owner was asked twice, chose neither, and said to build anyway, so each is the design's own recommendation: an assumption, not a settled fact.
 - Both are one edit to reverse.
 
-- **D1, what `1` means.** `1` is **the answer is no**.
-  - `newsvault ledger --check` exits 1 on a coverage shortfall; `panel-contract validate` keeps its verdict there.
-  - `input_unparseable`, `input_schema_mismatch` and `io_failed` move to `2` (§5.1).
+- **D1, what `1` means.** `1` is **the answer is no**, so:
+  - `newsvault ledger --check` exits 1 on a coverage shortfall; `panel-contract validate` keeps its verdict there;
+  - while `input_unparseable`, `input_schema_mismatch` and `io_failed` move to `2` (§5.1).
   - Evidence that it is safe: `git grep -n
     newsvault -- '*.yml' '*.py' '*.sh'` returned two hits on 2026-11-13, a comment in `ci.yml` and a
     docstring in `probes/parity_baseline.py`; neither runs the binary.
@@ -733,7 +733,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
   - **How the number reaches a run, since 2026-11-13.**
     - A hashed policy file the caller names, `--lag-policy`, holding one `MeasuredLag` per (source, provenance).
     - Keyed by both because the same adapter read live and read earlier are two populations (R10) and one lag does not describe both.
-    - `news_provider::lag_policy::LagPolicy::read` is its only constructor.
+    - `news_provider::lag_policy::LagPolicy::read` is the policy file's only constructor.
     - `cmd_collect::
       open_provider` hands the entry to `EdgarPress::with_observation_lag`.
     - The bytes are copied into the archive at `<store>/policy/<sha256>.json` through `File::create_new` before the plan, so a run that dated items keeps the file that stated the lag.
@@ -811,7 +811,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 **The archive's second copy: the VPS, with the provider's own backup behind it (N1, decided
 2026-11-12 by the owner).**
 
-- Two parts stay unanswered; neither is the shape of the system, so neither blocks it:
+- Two parts of that stay unanswered; neither is the shape of the system, so neither blocks it:
   - nobody has restored the backup;
   - nobody has timed a restore.
 - A backup nobody has restored is not yet a backup; one timed drill, recorded once, closes both.
@@ -850,8 +850,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
 **The risk the owner accepted, stated rather than implied.**
 
-- Both copies sit in one provider and one account.
-- Covered: a disk, a kernel or a bad deployment. Not covered: a billing, suspension or credential loss.
+- Both copies sit in one provider and one account, so a disk, a kernel or a bad deployment is covered and a billing, suspension or credential loss is not.
 - A copy at a second provider was the alternative and was not taken.
 
 **Freshness: 2 hours inside the US session, 6 hours outside it (N2, measured 2026-11-12).**
@@ -993,8 +992,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - The robots and floor checks run in `newsvault`: only the driver reads the store.
 - `newsvault` hands the provider the Crawl-delay parsed from the pinned robots blob.
 - Redirects refused: `TransportProfile.redirects = Refuse` sets `max_redirects(0)`.
-- A 3xx is a `PermanentFailure`.
-- This closes R19 hole 9 by refusal.
+- A 3xx is a `PermanentFailure`; this closes R19 hole 9 by refusal.
 - One interval for all hosts: every admitted host is at 10 s.
 - R19 hole 7 stays open.
 - `ValidPrecision::Minute` for GNW's minute-resolution `pubDate`.
@@ -1003,8 +1001,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - `items` gains `valid_raw`, `valid_field`, `valid_source`.
 - Poll every 30 min from 11:00 to 22:00 UTC: pre-market through after-close releases.
 - Poll every 90 min outside it.
-- Both are owner's choices, not measured.
-- The weekday probe checks each against its index window.
+- Both poll periods are owner's choices, not measured; the weekday probe checks each against its index window.
 - GNW's Saturday window allows at most 118 min (3.93 h × 0.5).
 - Follow-up cap: 150 per invocation, the owner's choice, not measured.
 - Worst case per run: (150 + index requests) × (1 + `MAX_TRANSIENT_RETRIES` = 2) × 10 s.
@@ -1025,8 +1022,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - Sources: every candidate that passes robots and a weekday probe.
 - Includes Business Wire if stable, Zero Hedge, Newswire.com (measured zone, date-only valid time).
 - `open_web_outlets`: Fool, CNBC, BI, Yahoo outlet syndication.
-- Fool's earnings-call transcripts are a separate item kind.
-- That item kind's field is named when built.
+- Fool's earnings-call transcripts are a separate item kind; the field is named when built.
 - Per-host intervals: R19 hole 7 closed (`HostPaces::Listed`).
 - Redirects followed as their own paced, ledgered requests. Hole 9 stays closed.
 - Following redirects needs `RawResponse` headers and `Document`-phase follow-ups.
