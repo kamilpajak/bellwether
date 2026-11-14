@@ -54,7 +54,8 @@ MIN_INTERVAL_S = 0.5
 TIMEOUT_S = 30.0
 # <ACCEPTANCE-DATETIME> sits on the third line of a filing's header.
 DOC_PREFIX_BYTES = 16 * 1024
-# Half edgar-press's BODY_LIMIT, against an index of about 600 KB.
+# Half edgar-press's BODY_LIMIT; of the two indexes read 2026-11-13 the larger is 1,520,327 B
+# (docs/design/architecture.md §10).
 INDEX_READ_CAP = 4 * 1024 * 1024
 
 P90 = 0.9
