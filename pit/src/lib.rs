@@ -169,6 +169,8 @@ pub enum PitError {
     },
     #[error("measured lag {0} s is negative")]
     NegativeLag(i64),
+    #[error("valid time {valid} plus a lag of {seconds} s is past the last instant chrono holds")]
+    LagOutOfRange { valid: DateTime<Utc>, seconds: i64 },
 }
 
 /// The pair of instants that decides whether an item may enter an analysis.
@@ -227,9 +229,16 @@ impl Visibility {
         if lag.seconds < 0 {
             return Err(PitError::NegativeLag(lag.seconds));
         }
+        let out_of_range = PitError::LagOutOfRange {
+            valid: valid.0,
+            seconds: lag.seconds,
+        };
+        let observed = Duration::try_seconds(lag.seconds)
+            .and_then(|after| valid.0.checked_add_signed(after))
+            .ok_or(out_of_range)?;
         Ok(Self {
             valid,
-            observed: ObservationTime(valid.0 + Duration::seconds(lag.seconds)),
+            observed: ObservationTime(observed),
         })
     }
 
@@ -432,6 +441,22 @@ mod tests {
     fn negative_lag_is_rejected() {
         let err = Visibility::from_backfill(ValidTime::new(at(0)), &lag(-1)).unwrap_err();
         assert_eq!(err, PitError::NegativeLag(-1));
+    }
+
+    /// `i64::MAX / 2` is more seconds than a `TimeDelta` holds; `10^15` fits in one and still
+    /// carries 2026 past year 262,143. Unchecked, both panic inside chrono 0.4.45.
+    #[test]
+    fn a_lag_past_the_last_representable_instant_is_refused_rather_than_panicking() {
+        let valid = ValidTime::new(utc(1_762_810_335, 0));
+        for seconds in [i64::MAX / 2, 1_000_000_000_000_000] {
+            assert_eq!(
+                Visibility::from_backfill(valid, &lag(seconds)),
+                Err(PitError::LagOutOfRange {
+                    valid: valid.inner(),
+                    seconds,
+                })
+            );
+        }
     }
 
     #[test]

@@ -237,6 +237,10 @@ pub enum StoreError {
     /// the leak §8 row R11 exists to refuse.
     #[error("item {item} is a vendor archive row with no observation the probed lag could place")]
     ArchiveItemHasNoObservation { item: String },
+    /// A `live_ingest` item's observation is the fetch instant the driver holds; one the provider
+    /// placed would override it, and an earlier one is lookahead.
+    #[error("item {item} is a live ingest row that placed an observation of its own")]
+    LiveItemPlacedItsOwnObservation { item: String },
     /// A replay must be a no-op, which it can only be when it is the SAME claim: a second
     /// `record` of one attempt carrying a different item set is a different claim and was
     /// accepted silently, returning `changed: false` and filing nothing - found by review
