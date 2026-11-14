@@ -121,4 +121,4 @@ cargo run -p newsvault -- collect --source edgar_press --window 2026-11-10 \
 
 Early. One of the five services named in the design exists, and the design itself is a draft with
 decisions still open — including which news vendor the archive is built on, and the handover
-criterion that decides when the predecessor may stop.
+criterion that, with build steps 3 and 6, decides when the predecessor may stop.

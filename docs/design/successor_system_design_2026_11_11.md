@@ -14,7 +14,7 @@
 Build a successor **in parallel**, in Rust, and stop adding features to the current pipeline while
 keeping it fully maintained. Do **not** rebuild the broker rail. Register a **handover criterion**
 (D-5), because a parallel build without one becomes two systems forever. Output parity with the
-predecessor is not that criterion (§5.1). D-5 has no number yet.
+predecessor is not that criterion (§5.1).
 
 Three asymmetries decide this, and they are the whole argument:
 
@@ -336,11 +336,13 @@ not less.
 
 ## 5. Transition
 
-### 5.1 Parallel build, with a forcing function
+### 5.1 Parallel build, and what may end it
 
 This is the same work as a staged migration with the irreversible step removed — and with it, the
 only thing that forced completion. The replacement is the handover criterion D-5 (§8). What must
-match the predecessor is the **input**: two independent readers of the lake, compared below.
+match is the **reading of the archive**: the successor's reader and an independent second reader of
+the same lake, compared below. The predecessor's own input is the capped view of §1.1, and the
+successor does not reproduce it.
 
 Demonstrated on 2026-11-11 over the **whole archive**, not a sample. Two implementations written
 independently from the same stated rules — one in Rust, one in pandas — were run over all 156 lake
@@ -377,37 +379,39 @@ newline) and once in Python (code-point order, no trailing newline). The counts 
 An instrument that introduces its own difference will report a defect that does not exist, so the
 two sides must share one digest function, not two implementations of one.
 
-**Output parity with the predecessor is not a target (decided by the owner 2026-11-14).** Input
-parity, above, stays. Predecessor paths below are in AlphaLens at `a8af4753`, under
-`apps/alphalens-pipeline/alphalens_pipeline/`.
+**Output parity with the predecessor is not a target (decided by the owner 2026-11-14).** The
+archive-reading comparison above stays. The predecessor's code is AlphaLens, its repository; paths
+below are at commit `a8af4753`, under `apps/alphalens-pipeline/alphalens_pipeline/`.
 - The successor fixes the predecessor's defects, so matching its outputs means copying them: the
   200-item cap (§1.1), last-run timestamps (§1.3), a price snapshot its own code calls "Snapshot,
   not PIT" (`data/store/edgar_fundamentals.py:635-638`).
-- Model use differs by design. Predecessor: a model picks candidate tickers per theme on every run
-  (`thematic/mapping/theme_mapper.py:1-10`); the same model gave split votes on 91 of 238
-  channel-support pairs at temperature 0 (a retrospective, cited at
-  `thematic/mapping/channel_assessor.py:61-66`). Successor: a model builds the relation map as a
-  versioned, hashed file (architecture §4), and `derive` matches against it with no model.
-  Candidate sets differ by construction.
-- What remains: every difference from the predecessor's picks needs a named cause, and an
-  unexplained difference is treated as a defect on our side until explained. **Unenforced:** no
-  cause list, diff artefact or test exists yet. "Differs by construction" is not a cause; a cause
-  names the fix (for example the 200-item cap) that produced the difference.
-- The forcing function moves to D-5. D-5 has no number yet, so until it has one nothing forces
-  completion.
-- The predecessor still runs. Read-only checks on its host, 2026-11-14:
-  `systemctl --user list-timers --all` shows `alphalens-thematic-build` active (last run that day
-  13:32 UTC); `thematic_briefs/2026-11-13.parquet` was written 2026-11-14 14:01. Briefs are parquet
-  under `~/.alphalens/thematic_briefs/`, 179 files, 2026-05-19 → 2026-11-13. The Postgres table
-  `briefs_brief` mirrors them with 103 columns, while the parquet files carry 69 to 181 columns
-  (column counts per file).
-- Its history is rewritten in place: every brief file for 2026-05-19 → 2026-10-29 has mtime
-  2026-10-30 15:10, and only one day's previous version was kept (`_backup_pre_pr185/`). Outcome
-  files in `population_ladders/` are recomputed daily: 244 had mtime 2026-11-14. All of it is a
-  single copy on a single host.
-- So: one off-box copy of the predecessor's outputs now, with a sha256 manifest, kept for
-  explaining differences and not as a gate. Never a whole-database dump: the Postgres mirror also
-  holds `auth_user`. The predecessor is not switched off before that copy exists.
+- Model use differs by design. The predecessor asks a model for candidate tickers per theme, frozen
+  per (date, config version) and re-rolled when the config changes
+  (`thematic/mapping/theme_mapper.py:1-10`, `:434-437`). A second call to the same model rates
+  whether the news supports each candidate; it split its votes on 91 of 238 such pairs at
+  temperature 0 (a 2026-08-19 retrospective, PR #1065, cited at
+  `thematic/mapping/channel_assessor.py:12-13` and `:61-66`). The successor has a model build the
+  relation map as a versioned, hashed file (architecture §4), and `derive` matches against it with
+  no model. So candidate sets differ, and the named cause is this change of model use.
+- Every difference between `derive`'s picks and the predecessor's needs a named cause: the fix that
+  produced it, for example the 200-item cap. An unexplained difference is treated as a defect on our
+  side until explained. Its status is architecture §8 row H1.
+- On 2026-11-14 the predecessor still ran. Read-only checks on its host (local time CET, UTC+1):
+  `systemctl --user list-timers --all` showed `alphalens-thematic-build` active, last run 12:32
+  UTC, firing at 04:30, 08:30 and 12:30 UTC. `thematic_briefs/2026-11-13.parquet` was written
+  2026-11-14 13:01 UTC. Briefs are parquet under `~/.alphalens/thematic_briefs/`, 179 files,
+  2026-05-19 → 2026-11-13. The Postgres table `briefs_brief` mirrors them with 101 columns
+  (`information_schema.columns`), against 69 to 181 in the parquet files (pyarrow schema per file),
+  so a copy takes the parquet files and not the mirror.
+- Its history is rewritten in place. Every brief file for 2026-05-19 → 2026-10-29 has mtime
+  2026-10-30 14:10–14:13 UTC, and no copy from before that rewrite was kept; the only backup,
+  `_backup_pre_pr185/` from 2026-05-22, holds one day. In `population_ladders/`, 86 of 179 per-date
+  outcome files and 156 of 2,040 price caches had mtime 2026-11-14 (`find -newermt`). All of it is
+  a single copy on a single host.
+- Therefore one copy of the predecessor's outputs goes to a second host now, with a sha256
+  manifest. It is kept to explain differences, not to pass or fail the successor. Never a
+  whole-database dump: the Postgres mirror also holds `auth_user`. The predecessor stops only as
+  step 7 of §10 states.
 
 ### 5.2 "No new features" cannot mean "no maintenance"
 
@@ -432,8 +436,8 @@ refresh is a stopped money rail.
 **107,838** lines touch the broker rail (counted 2026-11-11 by `grep -l` over
 `apps/alphalens-research/tests/test_*.py`; the two sets overlap, so they do not sum to the suite's
 277,978 lines). Those tests encode years of edge cases found by production incidents and do not
-port. §5.1's characterisation approach is the mitigation; it is partial, and saying otherwise would
-be false.
+port. What the characterisation approach recovers is in §11; it is partial, and saying otherwise
+would be false.
 
 **What does carry over**, inherited deliberately rather than rewritten: the bitemporal schema; the
 append-only lake; the one-door money path with hand-written picks; the methodology gates; the
@@ -483,7 +487,8 @@ Checked against official pages on 2026-11-11:
 | price | $90/mo for 5,000 tokens; archive search 5 tokens per searched year; 100 articles per search; overage $0.015/token | custom quote for the 2019 archive | ~$70/mo at 15,000 results; archive quoted separately |
 
 Backfill cost from the published NewsAPI.ai pricing at our measured volume (§1.1: 287–678 distinct
-items/day), one year of history: **$82–$192**. At 10,000 articles/day the same year is $2,738. The
+items/day), one year of history: **$82–$192**. At 10,000 articles/day the same year is $2,738.
+Measured by step 2 on 2026-11-14: 509.85 USD for 12 months at NewsAPI.ai after one narrowing (§10). The
 difference is not in the price list; it is in how broadly we query — and the query must **not** be
 narrowed by a bracket condition, for the same reason a market-cap constraint never goes into a
 prompt. Query broadly, filter locally.
@@ -540,11 +545,11 @@ must not influence the service that produces proposals, or selection happens und
 
 | # | Decision | What hangs on it |
 |---|---|---|
-| D-1 | **Which news vendor**, and whether one or two (live vs archive). | §6. Blocked on the probe below. |
+| D-1 | **Which news vendor**, and whether one or two (live vs archive). | §6. NewsAPI.ai's archive route is closed by the probe; Webz.io is pending (§10 step 2). |
 | D-2 | ~~**Storage licence.**~~ **CLOSED 2026-11-11 by the owner:** not treated as a constraint for a private, single-user research archive. The archive holds full article text. Recorded because the alternative it displaced — storing hashes, spans and quotations instead — would have made re-matching after a rule change impossible, so the decision bought that capability. | — |
-| D-3 | ~~**The parity-gate date.**~~ **Void 2026-11-14 by the owner:** output parity is not a target (§5.1). | The forcing function it carried moves to D-5. |
+| D-3 | ~~**The parity-gate date.**~~ **Void 2026-11-14 by the owner:** output parity is not a target (§5.1). | — |
 | D-4 | ~~**Repo topology.**~~ **CLOSED 2026-11-11 by the owner: three repositories.** This repository keeps the front-end, the thin API, the five data-collection units and — as an **archive** — the dead lab and its memos. A second holds the broker rail and the backtester, never rewritten. The successor is a third, polyglot, but its Python is a **fresh** statistics tier of roughly one to two thousand lines rather than the 9,602 lines of `diagnostics` / `eval` / `preaudit` / `retrospective_audit` / `gates`, which served closed paradigms and stay behind. | Buys the one gate that today's worst error needed: the panel artefact and the power routine live in one repository, so a test can require that the panel declares its number of exchangeable units and that the power routine refuses to run without it. Across a repository boundary that gate cannot be written, and the 88.2%-versus-27.4% error of §1.8 is precisely what it catches. Inherits one known hazard: a polyglot CI needs path filters, and in this project the `.github/` filters must be mirrored into the post-deploy check under a different pathspec syntax — a coupling that has already caused a failure once, so it belongs in the gate list rather than being discovered later. |
-| D-5 | **Brief handover criterion.** "Then the old pipeline can stop" is not testable as written. | Without a number, the transition has no end. Since 2026-11-14 it is the only forcing function (§5.1), and it has no number, so today nothing forces completion. |
+| D-5 | **Brief handover criterion:** the testable condition under which `propose` replaces the predecessor's briefs (§10 step 7). | The only forcing function (§5.1). It has no number, so nothing forces the transition to end. |
 | D-6 | **Does the pipeline ever need to propose on the session it observes?** | If yes, `vault` needs a run before 16:00 ET and the partial-day problem of §4 rule 4 becomes load-bearing. If no, today's cadence suffices and §4 buys only honesty, not tradability. |
 | D-7 | ~~**A published item stream?**~~ **CLOSED 2026-11-11 by the owner: build the WebSocket, keep it private for now.** It is a **derived surface** on `vault`, never a window onto the outbox: it publishes versioned *items*, not internal events, so a change to `newsvault`'s row shape cannot break a consumer. Each message carries both timestamps and a monotonic sequence number, so a consumer decides its own point-in-time cut and can order by our sequence instead of trusting clocks. A heartbeat is mandatory, because silence must be distinguishable from a dead stream — 2026-07-11 held 59 items against a median of 181 and nothing said which it was. No delivery guarantee and no latency promise: the archive remains the source of truth (§4 rule 2) and reconciliation is an HTTP read, while a latency promise would need N2, which has no number. | **"Private" is a property of who holds credentials, not of whether a contract exists.** The payload shape and the heartbeat go in from the start even while nobody else connects, because retrofitting them after a consumer depends on the stream is a breaking change in someone else's system. The tripwire: the schema freezes at the **first external connection**, not at a later decision. Note also that this is the **third** consumer of one store — briefs want 200 items, the study wants completeness, a stream wants latency — and §1.1 is the record of what happened the last time one store served two consumers with different needs. |
 | D-8 | **Does salience count occurrences or documents?** Today `n(c, x)` counts **occurrences** of a core, so one 650,000-character EDGAR exhibit naming Honeywell forty times counts the same as forty separate articles about Honeywell. The candidate rule counts **items** mentioning the core instead: "how many news items named this counterparty today", not "how many times was it written". | Unmeasured, and it is the last hypothesis that could reverse §1.9's power collapse, because long-document inflation is the plausible source of the earnings-season concentration. It is a `matcher` rule change, so R18 governs it: the two panels must be produced and diffed rather than swapped. Not a free choice either way — occurrence counting is defensible and document counting is defensible, so whichever is chosen must be chosen before its power is known. |
@@ -573,13 +578,13 @@ to pick.
 | # | Deliverable | Unblocks | State |
 |---|---|---|---|
 | 1 | Point-in-time core and lake reader | Complete days instead of truncated ones | done (PR #1881) |
-| 2 | **Vendor probe on three days, two vendors** | Volume and therefore cost of a year of history; archive stability under a repeated query; whether a body is returned; the distribution of publication-to-index lag, which is the input to R11 | run 2026-11-14: NewsAPI.ai closed at 509.85 USD, Webz.io waits for a one-month order (`probes/vendor_probe/PREREGISTRATION.md`) |
-| 3 | Off-box copy of the predecessor's outputs (§5.1) | Differences from the predecessor can be explained after it stops | not done; perishable, because history is rewritten in place |
+| 2 | **Vendor probe on three days, two vendors** | Volume and therefore cost of a year of history; archive stability under a repeated query; whether a body is returned; the distribution of publication-to-index lag, which is the input to R11 | run 2026-11-14: the NewsAPI.ai archive route is closed (509.85 USD for 12 months after one narrowing, above the registered 300 USD limit); Webz.io waits for a one-month order (`probes/vendor_probe/PREREGISTRATION.md`) |
+| 3 | Copy of the predecessor's outputs on a second host (§5.1) | Differences from the predecessor can be explained after it stops | not done; urgent, because history is rewritten in place |
 | 4 | Event-driven ingest with outbox, coverage ledger and hourly sweep | First sighting drops from 4.5 h after the close to about a minute after publication | after step 2 |
 | 4b | Private item stream over WebSocket (D-7), on top of step 4's outbox | A second consumer, which is the only real test of whether the item contract is a contract | after step 4; schema and heartbeat designed in from the start |
 | 5 | Backfill to 246 sessions, if step 2 came out cheap | Removes six months of waiting | depends on step 2 |
-| 6 | `derive` over the days both systems cover; each difference from the predecessor's picks has a named cause | Evidence the differences are the fixes, not new defects | designed |
-| 7 | `modelgate`, then `propose` taking over brief production | The old pipeline may stop once D-5 is met | requires steps 3 and 6 |
+| 6 | `derive` over the days both systems cover, compared against the step-3 copy; each differing pick has a named cause | Evidence the differences are the fixes, not new defects | not designed: the cause list's format is unset (architecture §8 row H1); after step 3 |
+| 7 | `modelgate`, then `propose` taking over brief production | The predecessor may stop once D-5 is met | requires steps 3 and 6 |
 
 ---
 
@@ -593,7 +598,8 @@ to pick.
   is a rule that quietly stopped applying. They must be written at the start, not later.
 - **Vendor facts are vendor claims.** Pricing, archive depth and token costs in §6 were read off
   the vendors' own pages on 2026-11-11 and are not our measurement. The backfill cost is computed
-  from those claims and our measured volume; our actual query volume is unknown until step 2.
+  from those claims and our measured volume; the measured query volume is in
+  `probes/vendor_probe/PREREGISTRATION.md`.
 - **The characterisation approach recovers some, not all,** of the 77,540 lines of behavioural
-  knowledge in the `thematic` test corpus. Since 2026-11-14 it compares inputs exactly and outputs
-  only by named cause (§5.1), so it recovers less than first planned.
+  knowledge in the `thematic` test corpus. It compares the archive reading exactly and outputs
+  only by named cause (§5.1), so it does not recover what those tests encode about outputs.
