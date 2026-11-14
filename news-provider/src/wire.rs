@@ -428,6 +428,9 @@ mod tests {
     const LOCALHOST: &str = "http://localhost:1/never";
     const LOCALHOST_SHOUTED: &str = "http://LOCALHOST:1/never";
     const NO_HOST: &str = "/never";
+    const PACE_DIR: &str = "pace";
+    const SOURCE_PACE_FILE: &str = "edgar_press.per-ip";
+    const HOST_PACE_FILE: &str = "localhost.per-host";
     const ANOTHER_SOURCE: &str = "another_source";
     /// Any roster bytes: these tests are about the socket.
     const ROSTER: &[u8] = b"{\"320193\":\"AAPL\"}";
@@ -806,12 +809,24 @@ mod tests {
         Ok(())
     }
 
+    /// The file NAME is asserted, not only the waits: on a case-insensitive disk (APFS by default)
+    /// an unlowercased key passed the waits alone, measured 2026-11-14.
     #[test]
-    fn one_host_spelled_in_two_cases_is_one_bucket() -> Checked {
+    fn one_host_spelled_in_two_cases_is_one_bucket_under_its_lowercase_name() -> Checked {
         let store = tempfile::tempdir()?;
         let waits = WaitRecorder::default();
-        two_polite_sends(store.path(), &waits, LOCALHOST, LOCALHOST_SHOUTED)?;
-        assert_eq!(waits.waits(), vec![NO_WAIT, NO_WAIT, HOST_WAIT, NO_WAIT]);
+        two_polite_sends(store.path(), &waits, LOCALHOST_SHOUTED, LOCALHOST)?;
+        let mut files: Vec<String> = std::fs::read_dir(store.path().join(PACE_DIR))?
+            .map(|entry| entry.map(|found| found.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<_, _>>()?;
+        files.sort();
+        assert_eq!(
+            (waits.waits(), files),
+            (
+                vec![NO_WAIT, NO_WAIT, HOST_WAIT, NO_WAIT],
+                vec![SOURCE_PACE_FILE.to_owned(), HOST_PACE_FILE.to_owned()]
+            )
+        );
         Ok(())
     }
 
