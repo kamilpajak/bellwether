@@ -64,12 +64,14 @@ only claimed.
 
 ## Writing markdown
 
-- Write every committed `.md` file as bullets and tables. No prose paragraphs.
+- Lines you add or change in a committed `.md` file are bullets and tables, not prose paragraphs.
+- Never edit text under a preregistration freeze or in `docs/inherited/`; add a dated section.
 - One fact per bullet. Delete every word whose removal loses no fact.
+- Keep a conditional rule (if / unless / because) in one bullet or table cell; never split it.
 - Never shorten by dropping a number, its construction, its date or a caveat.
-- No motivation, recap or transition text. Point to the section that already states the fact.
+- No recap or transition text. Point to the section that already states the fact.
+- Keep a decision's reason only as the rejected alternative plus the symptom that killed it.
 - Compare three or more values in a table, never in a sentence.
-- Before committing a `.md` diff, delete each line whose removal would cause no mistake.
 
 ## Decided by default, not settled
 
