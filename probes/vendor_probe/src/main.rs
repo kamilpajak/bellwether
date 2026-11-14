@@ -1,28 +1,15 @@
-//! Step 2 of the successor memo: the three-day probe at news vendors (Rust port of the former
-//! `probe.py`). It answers four questions no documentation can, because they depend on OUR broad
-//! query rather than on the vendor's feature list:
+//! The news-vendor probe (Rust port of the former `probe.py`). Its four questions (Q1 volume, Q2
+//! stability, Q3 body, Q4 lag) and their decision rules are in `PREREGISTRATION.md` beside this crate.
 //!
-//!   Q1 VOLUME     how many articles a day does a BROAD query return? This is the whole cost of
-//!                 history. The query is deliberately NOT narrowed to our bracket - a vendor-side
-//!                 filter would become an unauditable part of the measurement, the same reason a
-//!                 market-cap condition never goes into a prompt.
-//!   Q2 STABILITY  does the same past-day query, repeated later, return the same set? One run
-//!                 cannot answer this; this run records a digest of the id set, and a later run
-//!                 with --compare answers it.
-//!   Q3 BODY       a full article body, or a snippet? Measured as the length distribution of
-//!                 whatever text field the vendor provides.
-//!   Q4 LAG        the distribution of (index time - publication time), the input to R11.
-//!
-//! Scratchpad code on purpose, and a STANDALONE crate (its own workspace): a probe talks to a
-//! vendor URL directly, which production code here may not, so it keeps its own HTTP client
-//! outside the workspace's one-client invariant (repo_invariants::clients). If a vendor is adopted
-//! its calls move behind news-provider's canonical client; this stays as the record of why.
+//! A standalone crate (its own `[workspace]`): `repo_invariants::clients` forbids an HTTP client in
+//! any workspace member but news-provider, and a probe talks to vendor URLs directly.
 //!
 //! Reads no outcome and spends only vendor quota.
 
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
+use std::path::Path;
 use std::process::ExitCode;
 use std::thread::sleep;
 use std::time::Duration;
@@ -31,7 +18,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const OUT: &str = "probes/vendor_probe/vendor_probe_results.json";
+const OUT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/vendor_probe_results.json");
 /// A day needing more than 1,200 articles answers Q1 already.
 const PAGE_CAP: usize = 12;
 /// Measured 2026-11-14: 9 Webz.io News API requests cost 4.59 USD (~0.51 each). One page already
@@ -44,6 +31,11 @@ const KEY_NAMES: [&str; 4] = [
     "WEBZ_API_KEY",
     "PERIGON_API_KEY",
 ];
+const KEY_HINT: &str =
+    "keys: NEWSAPI_AI_KEY (newsapi.ai), NEWSCATCHER_API_KEY (newscatcherapi.com), \
+                        WEBZ_API_KEY (api.webz.io), PERIGON_API_KEY (perigon.io)";
+/// Exit status for a usage or setup error; nothing is requested and nothing is written.
+const EXIT_USAGE: u8 = 2;
 
 /// Replace any configured key found in `text`. Used before anything is printed or written, because
 /// this script's output lands in a PUBLIC repository and an error echo can carry a key.
@@ -59,16 +51,15 @@ fn scrub(text: &str) -> String {
     out
 }
 
+fn key_present(name: &str) -> bool {
+    env::var(name).is_ok_and(|v| !v.is_empty())
+}
+
 /// Missing input aborts; an empty fallback is forbidden (R6).
 fn need(name: &str) -> Result<String, String> {
     match env::var(name) {
         Ok(v) if !v.is_empty() => Ok(v),
-        _ => Err(format!(
-            "missing key {name} in the environment.\n  \
-             NEWSAPI_AI_KEY      -> free plan at newsapi.ai (2000 searches)\n  \
-             NEWSCATCHER_API_KEY -> free plan at newscatcherapi.com\n  \
-             WEBZ_API_KEY        -> api.webz.io token"
-        )),
+        _ => Err(format!("missing key {name}; {KEY_HINT}")),
     }
 }
 
@@ -121,6 +112,25 @@ fn parse_ts(s: &str) -> Option<i64> {
     None
 }
 
+/// The UTC day after `day`, as YYYY-MM-DD.
+fn next_day(day: &str) -> Result<String, String> {
+    Ok(NaiveDate::parse_from_str(day, "%Y-%m-%d")
+        .map_err(|e| e.to_string())?
+        .succ_opt()
+        .ok_or("date overflow")?
+        .format("%Y-%m-%d")
+        .to_string())
+}
+
+/// Paging is exhausted when every reported result was fetched; with no reported total, the
+/// adapter's own end-of-results signal decides.
+fn exhausted(fetched: usize, total: Option<u64>, no_total_signal: bool) -> bool {
+    match total {
+        Some(t) => fetched as u64 >= t,
+        None => no_total_signal,
+    }
+}
+
 /// One normalised article: only the four fields every question needs.
 struct Item {
     id: String,
@@ -134,6 +144,9 @@ struct VendorResult {
     day: String,
     pages: usize,
     note: Option<String>,
+    /// The vendor-reported result count for the query: Q1's daily volume.
+    total: Option<u64>,
+    exhausted: bool,
     items: Vec<Item>,
 }
 
@@ -145,13 +158,13 @@ type Probe = fn(&str) -> Result<VendorResult, String>;
 fn probe_newsapi_ai(day: &str) -> Result<VendorResult, String> {
     let key = need("NEWSAPI_AI_KEY")?;
     // The key goes in the POST body, never the URL: ureq (like httpx) can put the request URL into
-    // an error, and this script writes errors into a PUBLIC results file; a key in the query string
-    // would be published by one 401. Requests stay sequential (documented 5-simultaneous limit).
+    // an error, and an error is written to the results file. Sequential: 5-simultaneous limit.
     let url = "https://eventregistry.org/api/v1/article/getArticles";
     let a = agent();
     let mut raw: Vec<Value> = Vec::new();
     let mut pages = 0;
-    let mut note = None;
+    let mut total: Option<u64> = None;
+    let mut last_short = false;
     for page in 1..=PAGE_CAP {
         let body = json!({
             "apiKey": key,
@@ -174,12 +187,13 @@ fn probe_newsapi_ai(day: &str) -> Result<VendorResult, String> {
             .cloned()
             .unwrap_or_default();
         pages += 1;
-        if let Some(total) = block.get("totalResults") {
-            note = Some(format!("totalResults={total}"));
+        if let Some(t) = block.get("totalResults").and_then(|x| x.as_u64()) {
+            total = Some(t);
         }
         let n = got.len();
         raw.extend(got);
-        if n < 100 {
+        last_short = n < 100;
+        if last_short {
             break;
         }
     }
@@ -189,41 +203,36 @@ fn probe_newsapi_ai(day: &str) -> Result<VendorResult, String> {
             id: str_at(a, "uri")
                 .or_else(|| str_at(a, "url"))
                 .unwrap_or_default(),
-            published: str_at(a, "dateTimePub").or_else(|| str_at(a, "dateTime")),
+            // No fallback to `dateTime`: that is the index time, and lag would read 0 s.
+            published: str_at(a, "dateTimePub"),
             indexed: str_at(a, "dateTime"),
             body_len: body_len(a, "body"),
         })
-        .collect();
+        .collect::<Vec<_>>();
     Ok(VendorResult {
         vendor: "newsapi.ai",
         day: day.to_string(),
         pages,
-        note,
+        note: total.map(|t| format!("totalResults={t}")),
+        exhausted: exhausted(items.len(), total, last_short),
+        total,
         items,
     })
 }
 
-/// NewsCatcher legacy "News API" (POST https://api.newscatcherapi.com/news-api/articles, header
-/// `x-api-key`). Diagnosed live 2026-11-14: this key authenticates on THIS endpoint and is rejected
-/// by the v3 host (v3-api.newscatcherapi.com, 401). Three limits of this endpoint/plan, each a
-/// finding rather than a bug: it has NO `by_parse_date` (no index-time filter, so Q4 has no index
-/// timestamp); `q` rejects a match-all (a bare `*` is refused and stopwords are stripped), so the
-/// query is a broad set of common content terms rather than "everything"; and this plan is
-/// COUNT-ONLY - it returns `total_hits` (so Q1 volume is measurable) but an EMPTY `articles` array,
-/// so Q3 (body) and Q4 (lag) and the section-6 index filter all need a higher plan.
+/// NewsCatcher legacy News API (`x-api-key` header). Measured 2026-11-14: the key gets 401 from the v3
+/// host; this endpoint has no `by_parse_date`, refuses a match-all `q`, and on this plan returns
+/// `total_hits` with an empty `articles` array.
 fn probe_newscatcher(day: &str) -> Result<VendorResult, String> {
     let key = need("NEWSCATCHER_API_KEY")?;
     let url = "https://api.newscatcherapi.com/news-api/articles";
-    let to = NaiveDate::parse_from_str(day, "%Y-%m-%d")
-        .map_err(|e| e.to_string())?
-        .succ_opt()
-        .ok_or("date overflow")?
-        .format("%Y-%m-%d")
-        .to_string();
+    let to = next_day(day)?;
     let a = agent();
     let mut raw: Vec<Value> = Vec::new();
     let mut pages = 0;
-    let mut total: Option<Value> = None;
+    let mut total: Option<u64> = None;
+    let mut no_more = false;
+    let mut refused_deep = None;
     for page in 1..=PAGE_CAP.min(10) {
         // page * 100 <= 1000; pace to stay under the ~1 req/s concurrency limit (429 otherwise)
         sleep(Duration::from_millis(1100));
@@ -236,20 +245,11 @@ fn probe_newscatcher(day: &str) -> Result<VendorResult, String> {
             "page": page,
             "page_size": 100,
         });
-        let send = a.post(url).set("x-api-key", &key).send_json(body);
-        let resp = match send {
+        let resp = match a.post(url).set("x-api-key", &key).send_json(body) {
             Ok(r) => r,
-            Err(ureq::Error::Status(code, r)) => {
-                if pages == 0 {
-                    let b = r.into_string().unwrap_or_default();
-                    return Ok(VendorResult {
-                        vendor: "newscatcher",
-                        day: day.to_string(),
-                        pages,
-                        note: Some(scrub(&format!("http {code}: {}", short(&b)))),
-                        items: Vec::new(),
-                    });
-                }
+            // The documented deep-page refusal (page * page_size > 1000) ends paging, unexhausted.
+            Err(ureq::Error::Status(422, r)) if pages > 0 => {
+                refused_deep = Some(err_text(ureq::Error::Status(422, r)));
                 break;
             }
             Err(e) => return Err(err_text(e)),
@@ -261,20 +261,24 @@ fn probe_newscatcher(day: &str) -> Result<VendorResult, String> {
             .cloned()
             .unwrap_or_default();
         if total.is_none() {
-            total = j.get("total_hits").cloned();
+            total = j.get("total_hits").and_then(|x| x.as_u64());
         }
         let total_pages = j.get("total_pages").and_then(|x| x.as_u64()).unwrap_or(0);
         pages += 1;
         let n = got.len();
         raw.extend(got);
-        if n < 100 || (total_pages != 0 && page as u64 >= total_pages) {
+        no_more = n < 100 || (total_pages != 0 && page as u64 >= total_pages);
+        if no_more {
             break;
         }
     }
-    let note = Some(format!(
+    let mut note = format!(
         "total_hits={} legacy news-api; count-only plan (articles empty); no by_parse_date",
-        total.unwrap_or(Value::Null)
-    ));
+        total.map_or("null".to_string(), |t| t.to_string())
+    );
+    if let Some(r) = &refused_deep {
+        note.push_str(&format!("; page {} refused: {r}", pages + 1));
+    }
     let items = raw
         .iter()
         .map(|a| Item {
@@ -293,22 +297,20 @@ fn probe_newscatcher(day: &str) -> Result<VendorResult, String> {
                 }
             },
         })
-        .collect();
+        .collect::<Vec<_>>();
     Ok(VendorResult {
         vendor: "newscatcher",
         day: day.to_string(),
         pages,
-        note,
+        note: Some(note),
+        exhausted: refused_deep.is_none() && exhausted(items.len(), total, no_more),
+        total,
         items,
     })
 }
 
-/// Webz.io News API (api.webz.io/api/news). Added 2026-11-14 (see the pre-registration's dated
-/// amendment). The token goes in an Authorization: Bearer header, never the URL (public results
-/// file). `ts` filters by CRAWL time; a window older than 31 days needs allowNewsHistory=true and
-/// the default ascending crawl sort. A 2026-07 day is a 3-6 month window (3 credits/request) within
-/// the ~1-year news history; the deeper archive is a sales-gated ordered dataset, not this endpoint.
-/// An empty or 4xx result IS the Q1/archive-access answer for Webz (R6), not a crash.
+/// Webz.io News API, token in a Bearer header. `ts` filters by CRAWL time with no end bound, and a
+/// window older than 31 days needs `allowNewsHistory=true` (3 credits/request at 3-6 months).
 fn probe_webz(day: &str) -> Result<VendorResult, String> {
     let key = need("WEBZ_API_KEY")?;
     let start = NaiveDate::parse_from_str(day, "%Y-%m-%d")
@@ -323,7 +325,8 @@ fn probe_webz(day: &str) -> Result<VendorResult, String> {
     let a = agent();
     let mut raw: Vec<Value> = Vec::new();
     let mut pages = 0;
-    let mut total: Option<Value> = None;
+    let mut total: Option<u64> = None;
+    let mut more: Option<i64> = None;
     let mut next: Option<String> = None;
     for _ in 0..WEBZ_PAGE_CAP {
         sleep(Duration::from_millis(1100)); // Webz documents ~1 request/second
@@ -343,39 +346,24 @@ fn probe_webz(day: &str) -> Result<VendorResult, String> {
                 .set("Authorization", &bearer)
                 .call(),
         };
-        let j: Value = match send {
-            Ok(r) => r.into_json().map_err(|e| e.to_string())?,
-            // A 4xx/429 on the history window IS the archive-access finding, not a crash.
-            Err(ureq::Error::Status(code, r)) => {
-                let body = r.into_string().unwrap_or_default();
-                return Ok(VendorResult {
-                    vendor: "webz.io",
-                    day: day.to_string(),
-                    pages,
-                    note: Some(scrub(&format!("http {code}: {}", short(&body)))),
-                    items: Vec::new(),
-                });
-            }
-            Err(e) => return Err(err_text(e)),
-        };
+        let j: Value = send
+            .map_err(err_text)?
+            .into_json()
+            .map_err(|e| e.to_string())?;
         let posts = j
             .get("posts")
             .and_then(|x| x.as_array())
             .cloned()
             .unwrap_or_default();
         if total.is_none() {
-            total = j.get("total_results").cloned();
+            total = j.get("total_results").and_then(|x| x.as_u64());
         }
         pages += 1;
-        // Keep every post in the ts-window (crawl >= day start); the note records that this is
-        // "from the day onward", not one calendar day, because the News API has no end bound.
+        // Every post in the ts-window (crawl >= day start), not one calendar day: no end bound.
         raw.extend(posts.iter().cloned());
-        let more = j
-            .get("more_results_available")
-            .and_then(|x| x.as_i64())
-            .unwrap_or(0);
+        more = j.get("more_results_available").and_then(|x| x.as_i64());
         next = j.get("next").and_then(|x| x.as_str()).map(str::to_string);
-        if posts.is_empty() || more == 0 || next.is_none() {
+        if posts.is_empty() || more == Some(0) || next.is_none() {
             break;
         }
     }
@@ -394,37 +382,33 @@ fn probe_webz(day: &str) -> Result<VendorResult, String> {
             indexed: str_at(p, "crawled"),
             body_len: body_len(p, "text"),
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let exhausted = match more {
+        Some(m) => m == 0,
+        None => exhausted(items.len(), total, false),
+    };
     Ok(VendorResult {
         vendor: "webz.io",
         day: day.to_string(),
         pages,
         note,
+        total,
+        exhausted,
         items,
     })
 }
 
-/// Perigon (GET https://api.perigon.io/v1/articles/all, header `x-api-key`). Added 2026-11-14 (see
-/// the pre-registration amendment). Broad English news for one publication day (`from`/`to`, where
-/// `to` is exclusive). It exposes BOTH `pubDate` (publication) and `addDate` (first ingestion), so
-/// Q4 lag is measurable directly - the point-in-time feature memo section 6 valued - and
-/// `addDateFrom`/`addDateTo` are an index-time FILTER if the vendor is adopted. Historical depth may
-/// be a paid tier, so a 2026-07 query may return nothing on this key, which is itself the Q1 /
-/// archive-access finding. `numResults` is the volume (it caps at 10000). The response can carry raw
-/// control characters inside article bodies (invalid strict JSON), so it is sanitised before parsing.
+/// Perigon `articles/all` (`x-api-key` header), one publication day, `to` exclusive; `pubDate` and
+/// `addDate` make Q4 direct, `numResults` caps at 10000. Measured 2026-11-14: bodies carry raw
+/// control characters (invalid strict JSON) in a one-line response, so they become spaces.
 fn probe_perigon(day: &str) -> Result<VendorResult, String> {
     let key = need("PERIGON_API_KEY")?;
-    let to = NaiveDate::parse_from_str(day, "%Y-%m-%d")
-        .map_err(|e| e.to_string())?
-        .succ_opt()
-        .ok_or("date overflow")?
-        .format("%Y-%m-%d")
-        .to_string();
+    let to = next_day(day)?;
     let a = agent();
     // Per-key request quota. One request suffices: numResults is Q1, and its 100 articles are the Q3
     // and Q4 samples.
     sleep(Duration::from_millis(1100));
-    let resp = a
+    let text = a
         .get("https://api.perigon.io/v1/articles/all")
         .set("x-api-key", &key)
         .query("language", "en")
@@ -432,30 +416,16 @@ fn probe_perigon(day: &str) -> Result<VendorResult, String> {
         .query("to", &to)
         .query("sortBy", "date")
         .query("size", "100")
-        .call();
-    let text = match resp {
-        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
-        Err(ureq::Error::Status(code, r)) => {
-            let b = r.into_string().unwrap_or_default();
-            return Ok(VendorResult {
-                vendor: "perigon",
-                day: day.to_string(),
-                pages: 0,
-                note: Some(scrub(&format!("http {code}: {}", short(&b)))),
-                items: Vec::new(),
-            });
-        }
-        Err(e) => return Err(err_text(e)),
-    };
-    // Perigon emits raw control characters inside article bodies, which is invalid strict JSON; the
-    // response is a single line, so replacing every control character with a space fixes it without
-    // touching structure.
+        .call()
+        .map_err(err_text)?
+        .into_string()
+        .map_err(|e| e.to_string())?;
     let clean: String = text
         .chars()
         .map(|c| if (c as u32) < 0x20 { ' ' } else { c })
         .collect();
     let j: Value = serde_json::from_str(&clean).map_err(|e| e.to_string())?;
-    let total = j.get("numResults").cloned();
+    let total = j.get("numResults").and_then(|x| x.as_u64());
     let got = j
         .get("articles")
         .and_then(|x| x.as_array())
@@ -463,7 +433,7 @@ fn probe_perigon(day: &str) -> Result<VendorResult, String> {
         .unwrap_or_default();
     let note = Some(format!(
         "numResults={} (caps at 10000); pubDate+addDate exposed (index-time); addDateFrom/To filter available",
-        total.unwrap_or(Value::Null)
+        total.map_or("null".to_string(), |t| t.to_string())
     ));
     let items = got
         .iter()
@@ -475,22 +445,25 @@ fn probe_perigon(day: &str) -> Result<VendorResult, String> {
             indexed: str_at(p, "addDate"),
             body_len: body_len(p, "content"),
         })
-        .collect();
+        .collect::<Vec<_>>();
     Ok(VendorResult {
         vendor: "perigon",
         day: day.to_string(),
         pages: 1,
         note,
+        exhausted: exhausted(items.len(), total, got.len() < 100),
+        total,
         items,
     })
 }
 
-fn vendors() -> Vec<(&'static str, Probe)> {
+/// (vendor name, the environment key it needs, its probe).
+fn vendors() -> Vec<(&'static str, &'static str, Probe)> {
     vec![
-        ("newsapi.ai", probe_newsapi_ai),
-        ("newscatcher", probe_newscatcher),
-        ("webz.io", probe_webz),
-        ("perigon", probe_perigon),
+        ("newsapi.ai", "NEWSAPI_AI_KEY", probe_newsapi_ai),
+        ("newscatcher", "NEWSCATCHER_API_KEY", probe_newscatcher),
+        ("webz.io", "WEBZ_API_KEY", probe_webz),
+        ("perigon", "PERIGON_API_KEY", probe_perigon),
     ]
 }
 
@@ -549,18 +522,21 @@ fn summarise(res: &VendorResult) -> Value {
     };
     let empty = bodies.iter().filter(|b| **b == 0).count();
     let neg = lags.iter().filter(|l| **l < 0).count();
+    let no_pub = res.items.iter().filter(|i| i.published.is_none()).count();
     json!({
         "vendor": res.vendor,
         "day": res.day,
         "pages": res.pages,
         "note": res.note,
+        "total_reported": res.total,
         "articles": res.items.len(),
         "distinct_ids": ids.len(),
         "id_digest": id_digest,
-        "paging_exhausted": res.pages < PAGE_CAP,
+        "paging_exhausted": res.exhausted,
         "body_len_median": median_usize(&bodies),
         "body_len_p90": quantile(&bodies.iter().map(|b| *b as i64).collect::<Vec<_>>(), 0.9),
         "body_empty_share": round4(empty as f64 / bodies.len().max(1) as f64),
+        "published_missing": no_pub,
         "lag_measured_for": lags.len(),
         "lag_seconds_median": quantile(&lags, 0.5),
         "lag_seconds_p90": quantile(&lags, 0.9),
@@ -580,7 +556,7 @@ struct Args {
 
 fn parse_args() -> Result<Args, String> {
     let argv: Vec<String> = env::args().skip(1).collect();
-    let known: Vec<String> = vendors().iter().map(|(n, _)| n.to_string()).collect();
+    let known: Vec<String> = vendors().iter().map(|(n, _, _)| n.to_string()).collect();
     let mut days = Vec::new();
     let mut vendors = known.clone();
     let mut compare = None;
@@ -589,12 +565,15 @@ fn parse_args() -> Result<Args, String> {
         match argv[i].as_str() {
             "--days" => {
                 i += 1;
-                vendors_list(&argv, &mut i, &mut days);
+                list_after(&argv, &mut i, &mut days);
             }
             "--vendors" => {
                 i += 1;
                 let mut got = Vec::new();
-                vendors_list(&argv, &mut i, &mut got);
+                list_after(&argv, &mut i, &mut got);
+                if got.is_empty() {
+                    return Err(format!("--vendors needs at least one of {known:?}"));
+                }
                 for v in &got {
                     if !known.contains(v) {
                         return Err(format!("unknown vendor {v}; choose from {known:?}"));
@@ -604,7 +583,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--compare" => {
                 i += 1;
-                compare = argv.get(i).cloned();
+                match argv.get(i) {
+                    Some(p) if !p.starts_with("--") => compare = Some(p.clone()),
+                    _ => return Err("--compare needs a baseline file path".to_string()),
+                }
                 i += 1;
             }
             other => return Err(format!("unexpected argument {other}")),
@@ -621,34 +603,95 @@ fn parse_args() -> Result<Args, String> {
 }
 
 /// Consume the run of non-flag tokens following a list flag into `out`.
-fn vendors_list(argv: &[String], i: &mut usize, out: &mut Vec<String>) {
+fn list_after(argv: &[String], i: &mut usize, out: &mut Vec<String>) {
     while *i < argv.len() && !argv[*i].starts_with("--") {
         out.push(argv[*i].clone());
         *i += 1;
     }
 }
 
+/// Every key the selected vendors need, checked before the first request.
+fn check_keys(selected: &[String]) -> Result<(), String> {
+    let missing: Vec<&str> = vendors()
+        .into_iter()
+        .filter(|(n, k, _)| selected.iter().any(|s| s == n) && !key_present(k))
+        .map(|(_, k, _)| k)
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "missing keys in the environment: {}; {KEY_HINT}",
+            missing.join(", ")
+        ))
+    }
+}
+
+/// The output directory must exist and accept a file before any request is spent.
+fn check_out_writable() -> Result<(), String> {
+    let dir = Path::new(OUT).parent().ok_or("output path has no parent")?;
+    let probe = dir.join(".vendor_probe_write_check");
+    fs::write(&probe, b"").map_err(|e| format!("cannot write to {}: {e}", dir.display()))?;
+    fs::remove_file(&probe).map_err(|e| format!("cannot remove {}: {e}", probe.display()))
+}
+
+/// Q2's baseline, read and refused before the first request when it is this run's own output.
+fn load_baseline(cmp: &str) -> Result<Value, String> {
+    let cmp_abs = fs::canonicalize(cmp).map_err(|_| format!("no baseline file: {cmp}"))?;
+    if fs::canonicalize(OUT).is_ok_and(|o| o == cmp_abs) {
+        return Err(format!(
+            "--compare points at this run's own output ({OUT}). Copy it to another name."
+        ));
+    }
+    let text = fs::read_to_string(&cmp_abs).map_err(|e| format!("cannot read {cmp}: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("cannot parse baseline {cmp}: {e}"))
+}
+
+/// A row's field as display text: a string without quotes, anything else as JSON.
+fn cell(v: &Value, key: &str) -> String {
+    match v.get(key) {
+        Some(Value::String(s)) => s.clone(),
+        Some(x) => x.to_string(),
+        None => String::new(),
+    }
+}
+
 fn main() -> ExitCode {
-    let args = match parse_args() {
-        Ok(a) => a,
+    let setup = parse_args().and_then(|args| {
+        check_keys(&args.vendors)?;
+        check_out_writable()?;
+        let baseline = match &args.compare {
+            Some(cmp) => Some(load_baseline(cmp)?),
+            None => None,
+        };
+        Ok((args, baseline))
+    });
+    let (args, baseline) = match setup {
+        Ok(x) => x,
         Err(e) => {
             eprintln!("{e}");
-            return ExitCode::from(2);
+            return ExitCode::from(EXIT_USAGE);
         }
     };
 
     let table = vendors();
     let mut rows: Vec<Value> = Vec::new();
     for v in &args.vendors {
-        let probe = table.iter().find(|(n, _)| n == v).map(|(_, f)| *f);
+        let probe = table.iter().find(|(n, _, _)| n == v).map(|(_, _, f)| *f);
         let Some(probe) = probe else { continue };
         for day in &args.days {
             match probe(day) {
                 Ok(res) => {
                     let s = summarise(&res);
                     println!(
-                        "  {v} {day}: {} art., {} pages, body median {} chars, lag median {} s",
-                        s["articles"], s["pages"], s["body_len_median"], s["lag_seconds_median"]
+                        "  {v} {day}: {} art. of {} reported, {} pages, body median {} chars, \
+                         lag median {} s, {} without publication time",
+                        s["articles"],
+                        s["total_reported"],
+                        s["pages"],
+                        s["body_len_median"],
+                        s["lag_seconds_median"],
+                        s["published_missing"]
                     );
                     rows.push(s);
                 }
@@ -657,35 +700,13 @@ fn main() -> ExitCode {
                     // is committed in a public repository.
                     let detail = scrub(&e);
                     println!("  {v} {day}: FAILED {}", short(&detail));
-                    rows.push(json!({"vendor": v, "day": day, "error": short(&detail)}));
+                    rows.push(json!({
+                        "vendor": v,
+                        "day": day,
+                        "error": short(&detail),
+                        "paging_exhausted": false,
+                    }));
                 }
-            }
-        }
-    }
-
-    // Q2 is answered BEFORE the results are written: writing first would overwrite the baseline
-    // that --compare reads, and a run compared against its own fresh output always reports "same".
-    let mut baseline: Option<Value> = None;
-    if let Some(cmp) = &args.compare {
-        let cmp_abs = fs::canonicalize(cmp).unwrap_or_else(|_| cmp.into());
-        let out_abs = fs::canonicalize(OUT).unwrap_or_else(|_| OUT.into());
-        if cmp_abs == out_abs {
-            eprintln!(
-                "--compare points at this run's own output ({OUT}). Copy it to another name."
-            );
-            return ExitCode::from(2);
-        }
-        match fs::read_to_string(cmp) {
-            Ok(text) => match serde_json::from_str(&text) {
-                Ok(j) => baseline = Some(j),
-                Err(e) => {
-                    eprintln!("cannot parse baseline {cmp}: {e}");
-                    return ExitCode::from(2);
-                }
-            },
-            Err(_) => {
-                eprintln!("no baseline file: {cmp}");
-                return ExitCode::from(2);
             }
         }
     }
@@ -694,53 +715,59 @@ fn main() -> ExitCode {
     let out = json!({"fetched_at": stamp, "rows": rows});
     if let Err(e) = fs::write(OUT, serde_json::to_string_pretty(&out).unwrap_or_default()) {
         eprintln!("cannot write {OUT}: {e}");
-        return ExitCode::from(2);
+        return ExitCode::from(EXIT_USAGE);
     }
 
     println!(
-        "\n{:14} {:12} {:>6} {:>9} {:>11} {:>12} {:>11}",
-        "vendor", "day", "art.", "exhaust", "body med.", "lag med.", "lag p90"
+        "\n{:14} {:12} {:>6} {:>9} {:>11} {:>12} {:>11} {:>7}",
+        "vendor", "day", "art.", "exhaust", "body med.", "lag med.", "lag p90", "no pub"
     );
     for r in &rows {
         if let Some(err) = r.get("error").and_then(|x| x.as_str()) {
             println!(
                 "{:14} {:12} ERROR: {}",
-                s(r, "vendor"),
-                s(r, "day"),
+                cell(r, "vendor"),
+                cell(r, "day"),
                 short(err)
             );
             continue;
         }
         println!(
-            "{:14} {:12} {:>6} {:>9} {:>11} {:>12} {:>11}",
-            s(r, "vendor"),
-            s(r, "day"),
-            r["articles"],
-            r["paging_exhausted"],
-            r["body_len_median"],
-            r["lag_seconds_median"],
-            r["lag_seconds_p90"]
+            "{:14} {:12} {:>6} {:>9} {:>11} {:>12} {:>11} {:>7}",
+            cell(r, "vendor"),
+            cell(r, "day"),
+            cell(r, "articles"),
+            cell(r, "paging_exhausted"),
+            cell(r, "body_len_median"),
+            cell(r, "lag_seconds_median"),
+            cell(r, "lag_seconds_p90"),
+            cell(r, "published_missing")
         );
     }
 
-    // Q1: cost of a year, from newsapi.ai's published token pricing.
+    // Q1: the vendor-reported daily volume; a cost only for newsapi.ai, whose pricing the formula is.
     println!(
-        "\nQ1 cost of a year of history (newsapi.ai pricing: 5 tokens/searched year,\n   \
-         100 articles/search, overage $0.015/token):"
+        "\nQ1 daily volume (vendor-reported total). Cost of a year for newsapi.ai only, at its\n   \
+         pricing: 5 tokens/searched year, 100 articles/search, overage $0.015/token:"
     );
     for r in &rows {
-        let articles = r.get("articles").and_then(|x| x.as_u64()).unwrap_or(0);
-        if r.get("error").is_some() || articles == 0 {
+        if r.get("error").is_some() {
             continue;
         }
-        let searches = articles.div_ceil(100);
+        let (vendor, day) = (cell(r, "vendor"), cell(r, "day"));
+        let Some(volume) = r.get("total_reported").and_then(|x| x.as_u64()) else {
+            println!("   {vendor:14} {day}: no total reported");
+            continue;
+        };
+        if vendor != "newsapi.ai" {
+            println!("   {vendor:14} {day}: {volume} articles/day");
+            continue;
+        }
+        let searches = volume.div_ceil(100);
         let tokens_year = searches * 5 * 365;
         println!(
-            "   {:14} {}: {} searches/day -> {} tokens/year -> ${:.0}",
-            s(r, "vendor"),
-            s(r, "day"),
-            searches,
-            tokens_year,
+            "   {vendor:14} {day}: {volume} articles/day -> {searches} searches/day -> \
+             {tokens_year} tokens/year -> ${:.0}",
             tokens_year as f64 * 0.015
         );
     }
@@ -754,8 +781,10 @@ fn main() -> ExitCode {
                 .unwrap_or_default();
             println!("\nQ2 archive stability (same set over time?):");
             for r in &rows {
-                let key = (s(r, "vendor"), s(r, "day"));
-                let prior = old.iter().find(|o| (s(o, "vendor"), s(o, "day")) == key);
+                let key = (cell(r, "vendor"), cell(r, "day"));
+                let prior = old
+                    .iter()
+                    .find(|o| (cell(o, "vendor"), cell(o, "day")) == key);
                 let Some(prior) = prior else { continue };
                 if r.get("error").is_some() {
                     continue;
@@ -783,11 +812,4 @@ fn main() -> ExitCode {
     }
     println!("\nwrote {OUT}");
     ExitCode::SUCCESS
-}
-
-fn s(v: &Value, key: &str) -> String {
-    v.get(key)
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string()
 }

@@ -98,10 +98,10 @@ cargo run --manifest-path probes/vendor_probe/Cargo.toml -- \
 
 Rewritten from Python to Rust 2026-11-14 (a standalone crate with its own HTTP client, so it stays
 outside the workspace's one-client invariant, `repo_invariants::clients`). The keys come from the
-environment — `NEWSAPI_AI_KEY`, `NEWSCATCHER_API_KEY`, `WEBZ_API_KEY`, loaded from `~/.secrets` — and
-the probe aborts with a named error if one is absent rather than reporting an empty result, which is
-requirement R6 applied to itself. The three days are chosen to match days already measured in our
-own archive, which held 287, 560 and 678 distinct items respectively.
+environment — `NEWSAPI_AI_KEY`, `NEWSCATCHER_API_KEY`, `WEBZ_API_KEY`, `PERIGON_API_KEY`, loaded from
+`~/.secrets` — and the probe aborts with a named error if one is absent rather than reporting an
+empty result, which is requirement R6 applied to itself. The three days are chosen to match days
+already measured in our own archive, which held 287, 560 and 678 distinct items respectively.
 
 ## Amendment 2026-11-14 — a third vendor, Webz.io
 

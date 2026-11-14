@@ -1,7 +1,5 @@
-# Standalone crate on purpose: this is its OWN workspace (the empty [workspace] table below), so it
-# is NOT a member of the bellwether workspace. A probe keeps its own HTTP client, which
-# repo_invariants::clients forbids any workspace member but news-provider from declaring. Run with:
-#   cargo run --manifest-path probes/vendor_probe/Cargo.toml -- --days 2026-07-01 2026-07-15 2026-08-12
+# Its own workspace (the empty [workspace] below), outside bellwether's: repo_invariants::clients
+# forbids an HTTP client in any member but news-provider. Run as PREREGISTRATION.md "Running it" says.
 [package]
 name = "vendor_probe"
 version = "0.1.0"
