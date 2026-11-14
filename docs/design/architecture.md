@@ -17,7 +17,7 @@ inputs that produced it; what each service does when its input is missing, stale
 for each of the eighteen requirements, the single place it is enforced.
 
 **Defers to the memo:** why there are five services, why the build is parallel to the predecessor,
-and the five decisions still open there.
+and the decisions still open there.
 
 **Excludes on purpose:** the order-placing path and the front-end. Neither is in this repository and
 neither is reachable from it. §7 states that as a structural property rather than a policy.

@@ -1,7 +1,6 @@
 """Independent pandas reading of the news lake, to be compared against the Rust reader.
 
-This is the input-parity baseline of the successor memo §5.1 (input parity, not output
-parity, which §5.1 drops). The point is NOT that pandas is authoritative - it is that two
+This is the input-parity baseline of the successor memo §5.1. The point is NOT that pandas is authoritative - it is that two
 implementations written from the same stated rules must agree, and where they do not,
 the rules were ambiguous rather than one side being wrong.
 
