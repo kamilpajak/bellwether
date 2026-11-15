@@ -10,12 +10,13 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use news_provider::{
-    Clock, Exchange, Exit, PlanRefusal, RawResponse, Request, SendFailure, SendPermit,
-    TransportError,
+    Archive, ArchiveError, AttemptEvent, AttemptReceipt, Clock, CollectedItem, Committed, Exchange,
+    Exit, LedgerError, PlanRefusal, RawResponse, Request, RunId, SendFailure, SendPermit, Sink,
+    SourceId, TargetWindow, TransportError,
 };
 use newsvault::cmd_collect::{self, Ask, CollectRunError};
 use newsvault::cmd_items::{self, PerStory};
-use newsvault::store::{StoreError, COMMIT_LOG, SCHEMA_VERSION};
+use newsvault::store::{Committer, StoreError, COMMIT_LOG, SCHEMA_VERSION};
 use open_web_feed::OpenWebFeed;
 use pit::ObservationTime;
 use rusqlite::{Connection, OpenFlags};
@@ -1038,6 +1039,7 @@ fn a_path_or_unreadable_robots_refusal_names_its_fact_and_suggests_no_refresh() 
 /// A second poll of the same day, and the first poll of the next day.
 const LATER_THE_SAME_DAY: &str = "2026-11-14T19:05:00Z";
 const THE_NEXT_DAY: &str = "2026-11-15T09:00:00Z";
+const LATER_THE_NEXT_DAY: &str = "2026-11-15T15:00:00Z";
 /// `RELEASES` index of the page answered with `synthetic_no_article_container.html`.
 const NO_ARTICLE: usize = 2;
 
@@ -1178,6 +1180,122 @@ fn a_document_that_yielded_only_unusable_rows_is_not_fetched_again() -> TestResu
     Ok(())
 }
 
+/// A real store whose first `commit` of a run refuses: the index attempt, since a live poll
+/// opens no other attempt before it.
+struct RefusingTheIndex {
+    store: Committer,
+    commits: RefCell<usize>,
+}
+
+impl Sink for RefusingTheIndex {
+    fn write(&mut self, event: &AttemptEvent) -> Result<(), LedgerError> {
+        self.store.write(event)
+    }
+}
+
+impl Archive for RefusingTheIndex {
+    fn put_blob(&self, payload: &[u8]) -> Result<String, ArchiveError> {
+        Archive::put_blob(&self.store, payload)
+    }
+
+    fn commit(
+        &mut self,
+        closed: AttemptReceipt,
+        items: &[CollectedItem],
+        raw_blob: Option<&str>,
+        observed: ObservationTime,
+    ) -> Result<Committed, ArchiveError> {
+        if self.commits.replace_with(|nth| *nth + 1) == 0 {
+            return Err(ArchiveError {
+                act: "commit",
+                detail: "refused the index".to_owned(),
+            });
+        }
+        Archive::commit(&mut self.store, closed, items, raw_blob, observed)
+    }
+
+    fn ok_vendor_rows(&self, source: &SourceId) -> Result<Vec<u32>, ArchiveError> {
+        Archive::ok_vendor_rows(&self.store, source)
+    }
+
+    fn attempts_in_flight(&self) -> Result<Vec<String>, ArchiveError> {
+        Archive::attempts_in_flight(&self.store)
+    }
+
+    fn covered_story_ids(
+        &self,
+        source: &SourceId,
+        target_window: &TargetWindow,
+    ) -> Result<std::collections::BTreeSet<String>, ArchiveError> {
+        Archive::covered_story_ids(&self.store, source, target_window)
+    }
+
+    fn held_story_ids(
+        &self,
+        source: &SourceId,
+    ) -> Result<std::collections::BTreeSet<String>, ArchiveError> {
+        Archive::held_story_ids(&self.store, source)
+    }
+
+    fn record_planned_coverage(
+        &mut self,
+        attempt_id: &str,
+        matched: u32,
+    ) -> Result<(), ArchiveError> {
+        Archive::record_planned_coverage(&mut self.store, attempt_id, matched)
+    }
+
+    fn record_held(&mut self, attempt_id: &str, held: u32) -> Result<(), ArchiveError> {
+        Archive::record_held(&mut self.store, attempt_id, held)
+    }
+}
+
+/// Section 3.2 `held`: an index whose commit the store refused stays open with no `vendor_rows`,
+/// so it records no `held` either. Mutation 2026-11-15, collect.rs recording `held` whatever the
+/// commit answered: red.
+#[test]
+fn a_live_index_whose_commit_was_refused_records_no_held() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let exchange = Gnw::day()?;
+    poll(root.path(), RUN_AT, "first", &exchange)?;
+    let ask = Ask {
+        at: instant(LATER_THE_SAME_DAY),
+        schedule: Some("refused".to_owned()),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let run = RunId::new("refused");
+    let mut archive = RefusingTheIndex {
+        store: Committer::open(root.path(), &run)?,
+        commits: RefCell::new(0),
+    };
+    let driven = cmd_collect::drive(
+        &ask,
+        opened.provider.as_ref(),
+        &mut archive,
+        &exchange,
+        &At(instant(LATER_THE_SAME_DAY)),
+        &run,
+    )?;
+    drop(archive);
+    let db = Connection::open_with_flags(
+        root.path().join(COMMIT_LOG),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let refused: (Option<i64>, Option<i64>) = db.query_row(
+        "SELECT vendor_rows, held FROM attempts WHERE story_id IS NULL
+         ORDER BY opened_at DESC, attempt_id DESC LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(
+        (driven.collected.exit(), refused),
+        (Exit::CommitFailed, (None, None))
+    );
+    Ok(())
+}
+
 const EXIT_OK: i32 = 0;
 /// Past both polls, so the ledger reads every row they wrote.
 const LEDGER_AT: &str = "2026-11-16T00:00:00Z";
@@ -1196,16 +1314,14 @@ fn an_all_held_next_day(store: &Path) -> TestResult {
     Ok(())
 }
 
-/// Section 11.4, §8 R4: an all-held day commits nothing against three vendor rows and is not a
-/// finding, in the library read and in the binary's exit. Mutations 2026-11-15, the `- row.held`
-/// subtraction removed and `record_held` made a no-op: red.
-#[test]
-fn a_quiet_day_whose_every_listed_story_is_held_passes_ledger_check() -> TestResult {
-    let root = TempDir::new()?;
-    an_all_held_next_day(root.path())?;
+/// `(vendor_rows, held, rows_committed)` per source of 2026-11-15, the check's finding codes from
+/// the library read, and the binary's `--check` exit.
+type NextDayLedger = (Vec<(i64, i64, i64)>, Vec<&'static str>, Option<i32>);
+
+fn ledger_of_the_next_day(store: &Path) -> Result<NextDayLedger, Box<dyn Error>> {
     let day: chrono::NaiveDate = NEXT_DAY_DATE.parse()?;
     let report = newsvault::cmd_ledger::read(
-        root.path(),
+        store,
         &newsvault::cmd_ledger::Ask {
             at: instant(LEDGER_AT),
             from: day,
@@ -1216,13 +1332,13 @@ fn a_quiet_day_whose_every_listed_story_is_held_passes_ledger_check() -> TestRes
             check: true,
         },
     )?;
-    let counts: Vec<(i64, i64, i64)> = report
+    let counts = report
         .days
         .iter()
         .flat_map(|one| &one.per_source)
         .map(|row| (row.vendor_rows, row.held, row.rows_committed))
         .collect();
-    let codes: Vec<&str> = report
+    let codes = report
         .check
         .findings
         .iter()
@@ -1230,7 +1346,7 @@ fn a_quiet_day_whose_every_listed_story_is_held_passes_ledger_check() -> TestRes
         .collect();
     let exit = Command::new(env!("CARGO_BIN_EXE_newsvault"))
         .arg("ledger")
-        .args(["--store", &root.path().to_string_lossy()])
+        .args(["--store", &store.to_string_lossy()])
         .args([
             "--at",
             LEDGER_AT,
@@ -1243,9 +1359,33 @@ fn a_quiet_day_whose_every_listed_story_is_held_passes_ledger_check() -> TestRes
         .output()?
         .status
         .code();
+    Ok((counts, codes, exit))
+}
+
+/// Section 11.4, §8 R4: an all-held day commits nothing against three vendor rows and is not a
+/// finding, in the library read and in the binary's exit. Mutations 2026-11-15, the `- row.held`
+/// subtraction removed and `record_held` made a no-op: red.
+#[test]
+fn a_quiet_day_whose_every_listed_story_is_held_passes_ledger_check() -> TestResult {
+    let root = TempDir::new()?;
+    an_all_held_next_day(root.path())?;
     assert_eq!(
-        (counts, codes, exit),
-        (vec![(3, 3, 0)], Vec::<&str>::new(), Some(EXIT_OK))
+        ledger_of_the_next_day(root.path())?,
+        (vec![(3, 3, 0)], Vec::new(), Some(EXIT_OK))
+    );
+    Ok(())
+}
+
+/// §8 R4: `held` adds up over the day's runs as `vendor_rows` does. Mutation 2026-11-15, cmd_ledger
+/// `row.held += entry.held` made `=`: red.
+#[test]
+fn two_all_held_polls_of_one_day_hold_every_vendor_row_of_both() -> TestResult {
+    let root = TempDir::new()?;
+    an_all_held_next_day(root.path())?;
+    poll(root.path(), LATER_THE_NEXT_DAY, "third", &Gnw::day()?)?;
+    assert_eq!(
+        ledger_of_the_next_day(root.path())?,
+        (vec![(6, 6, 0)], Vec::new(), Some(EXIT_OK))
     );
     Ok(())
 }

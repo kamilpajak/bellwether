@@ -402,7 +402,7 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
     let mut statement = db.prepare(&format!(
         "SELECT run_id, source, COALESCE(outcome, '{IN_FLIGHT}') AS state, COUNT(*),
                 SUM(COALESCE(vendor_rows, 0)), SUM(COALESCE(items_new, 0)),
-                SUM(COALESCE(held, 0))
+                SUM(CASE WHEN vendor_rows IS NOT NULL THEN COALESCE(held, 0) ELSE 0 END)
          FROM attempts WHERE opened_at <= ?1
          GROUP BY run_id, source, state
          ORDER BY run_id, source, state"

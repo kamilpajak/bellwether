@@ -396,6 +396,78 @@ fn check_still_flags_zero_rows_when_held_covers_only_part_of_the_vendor_rows() -
     Ok(())
 }
 
+/// The human renderer carries `held` as the JSON row does. Mutation 2026-11-15, `held` dropped
+/// from `render_human`: red.
+#[test]
+fn the_human_ledger_states_the_held_count_of_the_json_row() -> TestResult {
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    db.execute(
+        "UPDATE attempts SET held = 58 WHERE attempt_id = 'a-0704-edgar-0'",
+        [],
+    )?;
+    drop(db);
+    let json = over(&root, ZERO_ITEM_DAY, ZERO_ITEM_DAY)?.json()?;
+    let held = per_source(&json, ZERO_ITEM_DAY, EDGAR)
+        .and_then(|edgar| edgar.get("held"))
+        .and_then(Value::as_i64)
+        .ok_or("the JSON row has no held")?;
+    let human = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .arg("ledger")
+        .args(["--store", &root.path().to_string_lossy()])
+        .args(["--at", AT, "--format", "human"])
+        .args(["--from", ZERO_ITEM_DAY, "--to", ZERO_ITEM_DAY])
+        .output()?
+        .stdout;
+    let line = String::from_utf8(human)?
+        .lines()
+        .find(|line| line.trim_start().starts_with(EDGAR))
+        .map(str::to_owned)
+        .ok_or("no human line names the source")?;
+    let word_after = |name: &str| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        words
+            .iter()
+            .position(|word| *word == name)
+            .and_then(|at| words.get(at + 1))
+            .map(|word| (*word).to_owned())
+    };
+    assert_eq!((word_after("held"), held), (Some("58".to_owned()), 58));
+    Ok(())
+}
+
+/// Section 3.2 `held`: only a row carrying `vendor_rows` adds its `held`, so an unclosed index
+/// row holding 60 cannot outweigh 59 vendor rows. Mutation 2026-11-15, the ledger summing `held`
+/// over every row again: red.
+#[test]
+fn check_still_flags_zero_rows_when_an_unclosed_row_carries_held() -> TestResult {
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    db.execute(
+        "INSERT INTO attempts (attempt_id, run_id, source, target_window, filter_params,
+             opened_at, held, universe_version)
+         VALUES ('a-0704-edgar-1', 'run-0704-a', 'edgar_press', '2026-07-04', 'fp-index',
+             '2026-07-04T00:34:41.000000Z', 60, 'uv-roster-2026-05-29')",
+        [],
+    )?;
+    drop(db);
+    let answer = run(
+        &root,
+        &["--from", ZERO_ITEM_DAY, "--to", ZERO_ITEM_DAY, "--check"],
+    )?;
+    let report = answer.json()?;
+    let held = per_source(&report, ZERO_ITEM_DAY, EDGAR).and_then(|edgar| edgar.get("held"));
+    assert_eq!(
+        (answer.code, codes(&report), held),
+        (
+            EXIT_NO,
+            vec!["rows_committed_zero_against_vendor_rows".to_owned()],
+            Some(&Value::from(0))
+        )
+    );
+    Ok(())
+}
+
 #[test]
 fn a_limited_ledger_states_matched_and_returned_and_truncated() -> TestResult {
     let root = fixture()?;

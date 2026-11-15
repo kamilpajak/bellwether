@@ -564,7 +564,7 @@ fn attempt_once<A: Archive>(
             } else {
                 provider.follow_ups_to_issue(extracted.follow_ups, &stories)
             };
-            if !archived {
+            if !archived && refusal.is_none() {
                 let held = matched.saturating_sub(count(issued.len()));
                 archive.record_held(&attempt_id, held)?;
             }
