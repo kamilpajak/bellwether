@@ -142,18 +142,22 @@
 ### 3.1 `Item` — what `vault` stores and publishes
 
 - The archive record; every consumer sees this shape, none the storage behind it.
-- Stored today: `items` in `services/newsvault/src/store.rs` at `PRAGMA user_version` 1: the
+- Stored today: `items` in `services/newsvault/src/store.rs` at `PRAGMA user_version` 2: the
   frozen v0 DDL `SCHEMA_V0` plus `MIGRATIONS[0]`, which rebuilds `items` (SQLite's table-rebuild
-  procedure: foreign keys off around one transaction, `PRAGMA foreign_key_check` before commit); exported as `publish::SegmentRow` with `source`
+  procedure: foreign keys off around one transaction, `PRAGMA foreign_key_check` before commit),
+  plus `MIGRATIONS[1]`, which creates `robots` (§3.2); exported as `publish::SegmentRow` with `source`
   joined from `attempts`; `requested_at` and `received_at` live on `attempts`, reached through
   `attempt_id`.
 - Schema versioning (§11.1), since 2026-11-15:
-  - a store is brought to user_version 1 in one transaction by `Committer::open`: `SCHEMA_V0`
-    (`CREATE TABLE IF NOT EXISTS`) creates each v0 table the store lacks, then `MIGRATIONS[0]`.
-  - a v0 table the store already holds is compared first with `SCHEMA_V0`'s columns (`PRAGMA
-    table_info`: name, type, NOT NULL, default, primary key); a difference is refused with
-    `StoreError::V0ShapeDiffers` naming each `table.column`, exit 2, store left at user_version 0,
-    no repair step: §8 row M1.
+  - a store is brought to user_version 2 in one transaction by `Committer::open`: `SCHEMA_V0`
+    (`CREATE TABLE IF NOT EXISTS`) creates each v0 table the store lacks, then each
+    `MIGRATIONS[i]` from the version it holds.
+  - a store at user_version `n` below 2 is compared first with the columns of `SCHEMA_V0` replayed
+    with `MIGRATIONS[..n]` in memory (`PRAGMA table_info`: name, type, NOT NULL, default, primary
+    key); a difference is refused with `StoreError::ShapeDiffers { found, columns }` naming each
+    `table.column`, exit 2, store left at user_version `n`, no repair step: §8 row M1.
+  - at user_version 0 a table the store lacks is skipped, because `SCHEMA_V0` creates it whole; at
+    1 every column of a missing table is named.
   - a migration step SQLite refuses is `StoreError::MigrationFailed { from, step, cause }`, exit
     2, store left at user_version `from`; `cause` is SQLite's message without the SQL batch
     (review 2026-11-15 measured 2,040 bytes of stderr, most of it the batch, before):
@@ -163,7 +167,7 @@
     the v0 tables the store lacks"; review 2026-11-15 read "the step to user_version 0" for it:
     `a_failure_creating_the_v0_tables_is_named_as_that_step` (mutations 2026-11-15, labelled
     `ToUserVersion(0)` / left unwrapped: each red).
-  - a user_version above 1 is refused (`StoreError::SchemaVersion`):
+  - a user_version above 2 is refused (`StoreError::SchemaVersion`):
     `a_store_at_an_unknown_higher_user_version_is_refused` (mutation 2026-11-15, refusal removed:
     red).
   - `collect` refuses that store before its policy copy, run envelope and lease, so the store
@@ -171,7 +175,8 @@
     `a_run_against_a_store_at_a_newer_user_version_leaves_the_store_unchanged` (mutation
     2026-11-15, the check removed: red; review 2026-11-15 measured a `runs/` file and a `LOCK`
     left behind before it).
-  - the same check refuses a v0 store whose columns differ from `SCHEMA_V0`, read-only:
+  - the same check refuses a store below 2 whose columns differ from its version's shape,
+    read-only (`store::refuse_an_unreadable_version`, also called by `robots refresh`):
     `a_run_against_a_v0_store_of_another_shape_leaves_the_store_unchanged` (mutation 2026-11-15,
     the v0 check removed: red; review 2026-11-15 measured `LOCK` and a `runs/` file left behind).
   - unguarded: a v0 store whose migration step SQLite refuses still gets `LOCK` and a run
@@ -182,7 +187,7 @@
     exit 2) and the store stays at user_version 0:
     `a_v0_store_holding_an_item_with_no_attempt_is_refused_rather_than_migrated` (mutation
     2026-11-15, the `foreign_key_check` result ignored: red).
-  - `items` and `ledger` open read-only, cannot migrate, and refuse every user_version but 1 with
+  - `items` and `ledger` open read-only, cannot migrate, and refuse every user_version but 2 with
     `StoreError::SchemaVersion`, exit 2: `a_reader_refuses_a_store_at_another_user_version`
     (mutation 2026-11-15, the check removed from either reader: red).
   - so a v0 store is unreadable by `items` and `ledger` until a writer (`collect`, `publish`) opens
@@ -303,7 +308,7 @@
 - One row per attempt, written **whether or not anything came back**, so "nothing happened" and "we
   did not look" differ. The predecessor could not tell them apart: one day held 59 items against a
   median of 181 and nothing recorded which it was.
-- Stored as `attempts` in `services/newsvault/src/store.rs` (user_version 1, §3.1), written from
+- Stored as `attempts` in `services/newsvault/src/store.rs` (user_version 2, §3.1), written from
   `news_provider::ledger::AttemptEvent`; every field below is a column there except
   `result_digest`, and the table holds more (`universe_version`, `matched`, `baseline_*`, `closed_at`).
 
@@ -320,6 +325,23 @@
 
 - No money arm (owner, 2026-11-15): one is added to `Cost` with the first metered vendor. Rejected
   now: an arm nothing produces is a branch nothing reaches.
+
+**`robots`: one row per answered robots.txt fetch (user_version 2, `MIGRATIONS[1]`).**
+
+| column | notes |
+|---|---|
+| `attempt_id` | primary key and foreign key to the fetch's `attempts` row, `source` `robots` (§10) |
+| `host` | the lowercased hosts-file host the fetch asked |
+| `answer` | `present` (HTTP 200) \| `absent` (HTTP 404), `CHECK`ed; any other status files no row (§11.2) |
+| `blob` | the body as received, foreign key to `blobs`; set only for `present`, which the Rust enum `store::RobotsAnswer::{Present(BlobDigest), Absent}` holds and no `CHECK` repeats |
+
+- One door, `Committer::record_robots(AttemptReceipt, host, RobotsAnswer, at)`: `record`'s checks
+  (opened here, closed here, an abandoned attempt carries nothing, a replay must be the same row),
+  then the `Answered` and `Finalised` events, the blob's index row and the `robots` row in one
+  transaction: `a_robots_row_and_its_attempt_events_commit_in_one_transaction` (mutation
+  2026-11-15, the insert moved after `COMMIT`: red).
+- Producer: `newsvault robots refresh` (§11.2). Reader: none yet; the collect-side robots check is
+  §11.5 step 3's second half.
 
 - `collapsed` is designed as its own outcome: a payload that shrank to a fraction of what the store
   already holds is a degraded fetch, not a quieter world, and a throttled success looks exactly like
@@ -634,8 +656,9 @@ Draw voting:
 
 **What the binaries write today** (read from both `main.rs` files 2026-11-14, re-read 2026-11-15).
 
-- Only `newsvault collect` writes a `code` to stderr, through `emit_collect_error` (an object under
-  `--format=json`), and only for `vendor_unreachable`.
+- Only `newsvault collect` and `newsvault robots refresh` write a `code` to stderr, through
+  `emit_collect_error` and `emit_robots_error` (an object under `--format=json`), and only for
+  `vendor_unreachable`.
 - The three exit-8 `collect` codes ride the stdout envelope as `exit.error_code`.
 - Every other failure of either binary writes `error: <text>` or `usage error: <text>` with no
   `code`, so for those codes the exit status is the whole machine-readable answer.
@@ -646,7 +669,7 @@ Draw voting:
 | `input_absent` | a required input file is missing (row 1). `vault`, `panel-contract`. In `collect`, exit 4: an absent hosts file or `open-web-feed` rules file, and a hosts file admitting no host, which would plan zero requests (`an_open_web_run_with_an_absent_or_empty_hosts_file_or_an_absent_rules_file_exits_four`; mutations 2026-11-15, the arm removed: red; its `RulesAbsent` alternative removed: red, green before the rules case). An absent `edgar-press` rules file exits 2 |
 | `day_absent` | narrower: the store is there, the day is not in it (row 1), kept apart for the reason the coverage ledger exists. `vault`. Measured 2026-11-12, two states reach it through one `LakeError::MissingDay`: an absent partition directory, and one holding no run file |
 | `input_unparseable` | the file is present and is not what the contract says. `vault`, `panel-contract` |
-| `input_schema_mismatch` | a required column is absent or has an unusable type; or the commit log's `user_version` is above the writer's, or is not the one `items` and `ledger` read (`StoreError::SchemaVersion`, §3.1); or a user_version 0 store whose columns differ from `SCHEMA_V0` (`StoreError::V0ShapeDiffers`) or whose migration step SQLite refused (`StoreError::MigrationFailed`), both leaving the store at its old user_version (§3.1). `vault` |
+| `input_schema_mismatch` | a required column is absent or has an unusable type; or the commit log's `user_version` is above the writer's, or is not the one `items` and `ledger` read (`StoreError::SchemaVersion`, §3.1); or a store below the current user_version whose columns differ from that version's shape (`StoreError::ShapeDiffers`) or whose migration step SQLite refused (`StoreError::MigrationFailed`), both leaving the store at its old user_version (§3.1). `vault` |
 | `io_failed` | a read or write the filesystem refused for another reason. Every CLI |
 | `roster_absent` | the in-universe roster is missing or names no CIK. `vault`'s `collect`, before the first request |
 | `credential_contact_missing` | the User-Agent carries no contact address, read from the chosen source's own variable (§11.2). A startup refusal, never a vendor event in the coverage ledger |
@@ -663,6 +686,19 @@ Draw voting:
 - One test pins it, the way the defect was measured: a 7-byte parquet at a day partition's path
   exits 2, and putting that arm back on 1 turns
   `a_day_whose_parquet_cannot_be_read_exits_two_and_never_one` red.
+- `newsvault robots refresh` exits (`cmd_robots::RobotsExit`, over `news_provider::Tally::exit`
+  with each answered row counted as committed):
+
+| exit | when | stdout |
+|---|---|---|
+| 0 | every row answered (200 or 404) and every admitted pin matches | the `newsvault.robots/1` report |
+| 1 | every row answered and an admitted row's pin differs (D1, "the answer is no"): `a_fetched_robots_digest_other_than_the_pin_exits_one_and_names_both` | the report |
+| 8 | a row failed: `partial_collect` when another row answered, `vendor_refused_all` when none did and one failure is permanent | the report |
+| 7 | every row failed transiently: `vendor_unreachable` | empty; the error object on stderr |
+
+  - `--source edgar_press` is `invalid_argument` (`RobotsError::NoHostsFile`); the hosts file's
+    own refusals are `collect`'s, through `OpenWebFeed::open`. Its new error codes arrive with their
+    first emitter, the collect-side check (§11.5 step 3).
 - The incomplete report at **8** carries its result on stdout and is not an error object:
   `ledger` writes the days it could read and names the run envelopes it could not.
 - `Wire::send`'s refusals (reached by `newsvault collect` since 2026-11-13) are
@@ -815,7 +851,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | U1 | **the panel names the roster it was built from** | collection side: `news_provider::Request.universe_version` inside `filter_params`; `attempts.universe_version` is `NOT NULL`; `news_provider::request::tests::two_runs_whose_rosters_differ_have_two_filter_params_digests`, `newsvault::store::tests::the_opened_row_carries_the_roster_digest_the_request_was_built_from`<br>absent, unparseable or empty roster: `edgar-press::Refusal` (§9)<br>panel side: nothing | **no enforcement point yet**: the panel side has none; the collection side has only a producer, a column and the two tests in the enforced-by cell<br>unguarded: `panel-contract schema` lists 13 manifest fields, none a roster or `relation_map_version` (measured 2026-11-12), so §2 names five `panel_id` inputs where the gate requires three<br>making them required rewrites seven fixtures and R8: a decision, not an omission |
 | E1 | an error code is never renamed, and no code reaches stderr from outside the table | §5.1 stderr codes: nothing; design: workspace member `error-codes/` with `const CODES`, `codes.snapshot`, a snapshot test, and a constructor taking `&'static Code`<br>`panel-contract`'s 15 stdout `Finding` codes: renaming any one turns a named test red (`cargo test -p panel-contract --lib`, measured 2026-11-12) | **no enforcement point yet** for §5.1's codes<br>renaming the 15 `Finding` codes: **enforced**<br>unguarded: a new code needs no table entry and no review<br>unguarded: repurposing a code is not checkable |
 | H1 | every difference between `derive`'s picks and the predecessor's has a named cause (memo §5.1, build step 6) | nothing: no cause list, diff artefact or test exists | **no enforcement point yet** |
-| M1 | a store at the previous `user_version` opens, migrates and takes a row of every precision the current one stores (§11.1) | `Committer::open` → `migrate`: `newsvault::store::tests::a_store_at_the_previous_user_version_opens_migrates_and_takes_a_minute_row`; carried: `a_migrated_v0_store_keeps_every_v0_column_of_every_row_and_both_indexes` (v0 fixture: one instant, one day+tz and one refused row, `seq` 7..9, every nullable v0 column set, `valid_disputed` 1; all 15 v0 columns compared by `quote()` before and after, and the `items_by_story`/`items_by_doc` index names) | **enforced** from user_version 0 to 1: mutations 2026-11-15, the `items` rebuild replaced by the three `ADD COLUMN`s / every migration step skipped: red<br>carried columns and indexes **enforced** since 2026-11-15: mutations that day, the copy reduced to 11 columns without `seq`, `doc_id`, `earliest_valid_at`, `body_blob` / `doc_id` and `earliest_valid_at` dropped / both `CREATE INDEX` lines dropped: each green before the carried test, red after<br>a v0 store written by an older binary: **enforced** for a missing column since 2026-11-15: `a_v0_store_whose_attempts_predate_matched_is_refused_and_left_at_user_version_zero` (fixture: `attempts` as written before 067a0bd, 2026-11-13, 22 columns, no `matched`); mutation that day, the shape check skipped: red. Before it, review 2026-11-15 measured a scratch store of that shape (1,006 attempt rows) migrate to user_version 1 without `matched`, then `ledger` exit 2 on `no such column: a.matched`. Refused, not repaired: only scratch stores have that shape (R11 search, 2026-11-15)<br>a column whose name matches and whose type, NOT NULL, default or key differs: **enforced** since 2026-11-15: `a_v0_store_whose_column_differs_in_type_not_null_default_or_key_is_refused` (four fixtures: `attempts.slots TEXT`, `run_id` without NOT NULL, `outcome DEFAULT 'x'`, `attempt_id UNIQUE` for PRIMARY KEY); mutations that day, each of the four `PRAGMA table_info` fields read as a constant: each red<br>unguarded: on `attempts`, `blobs`, `seq_reservations` and `published`, the v0 tables `MIGRATIONS[0]` does not rebuild, table-level UNIQUE, CHECK and FOREIGN KEY clauses, AUTOINCREMENT, WITHOUT ROWID and indexes are not compared (review 2026-11-15: `attempts` with `UNIQUE(run_id)` added reached user_version 1 with the clause kept)<br>unguarded: a v0 migration step SQLite refuses leaves `LOCK` and a run envelope under `collect` (§3.1) |
+| M1 | a store at the previous `user_version` opens, migrates and takes a row of every precision the current one stores (§11.1) | `Committer::open` → `migrate`: `newsvault::store::tests::a_store_at_the_previous_user_version_opens_migrates_and_takes_a_minute_row` (from 0); `a_store_at_user_version_one_opens_migrates_to_two_and_takes_a_robots_row` (from 1); carried from 1: `a_v1_store_keeps_every_v1_column_of_every_row` (one row in each of the five v1 tables, every column compared by `quote()`); shape at 1: `a_v1_store_whose_columns_differ_is_refused_and_left_at_user_version_one` (`attempts.hosts_version INTEGER`, `published` dropped; both `Committer::open` and `refuse_an_unreadable_version`); carried: `a_migrated_v0_store_keeps_every_v0_column_of_every_row_and_both_indexes` (v0 fixture: one instant, one day+tz and one refused row, `seq` 7..9, every nullable v0 column set, `valid_disputed` 1; all 15 v0 columns compared by `quote()` before and after, and the `items_by_story`/`items_by_doc` index names) | **enforced** from user_version 0 to 1: mutations 2026-11-15, the `items` rebuild replaced by the three `ADD COLUMN`s / every migration step skipped: red<br>**enforced** from 1 to 2 since 2026-11-15: mutations that day, `MIGRATIONS[1]` emptied: red; the shape check skipped at 1: red; a table missing at 1 skipped as at 0: red; `DELETE FROM published` added to `MIGRATIONS[1]`: the carried test red<br>carried columns and indexes **enforced** since 2026-11-15: mutations that day, the copy reduced to 11 columns without `seq`, `doc_id`, `earliest_valid_at`, `body_blob` / `doc_id` and `earliest_valid_at` dropped / both `CREATE INDEX` lines dropped: each green before the carried test, red after<br>a v0 store written by an older binary: **enforced** for a missing column since 2026-11-15 (`StoreError::ShapeDiffers { found: 0, .. }`): `a_v0_store_whose_attempts_predate_matched_is_refused_and_left_at_user_version_zero` (fixture: `attempts` as written before 067a0bd, 2026-11-13, 22 columns, no `matched`); mutation that day, the shape check skipped: red. Before it, review 2026-11-15 measured a scratch store of that shape (1,006 attempt rows) migrate to user_version 1 without `matched`, then `ledger` exit 2 on `no such column: a.matched`. Refused, not repaired: only scratch stores have that shape (R11 search, 2026-11-15)<br>a column whose name matches and whose type, NOT NULL, default or key differs: **enforced** since 2026-11-15: `a_v0_store_whose_column_differs_in_type_not_null_default_or_key_is_refused` (four fixtures: `attempts.slots TEXT`, `run_id` without NOT NULL, `outcome DEFAULT 'x'`, `attempt_id UNIQUE` for PRIMARY KEY); mutations that day, each of the four `PRAGMA table_info` fields read as a constant: each red<br>unguarded: on `attempts`, `blobs`, `seq_reservations` and `published`, the v0 tables `MIGRATIONS[0]` does not rebuild, table-level UNIQUE, CHECK and FOREIGN KEY clauses, AUTOINCREMENT, WITHOUT ROWID and indexes are not compared (review 2026-11-15: `attempts` with `UNIQUE(run_id)` added reached user_version 1 with the clause kept)<br>unguarded: a v0 migration step SQLite refuses leaves `LOCK` and a run envelope under `collect` (§3.1) |
 
 ---
 
@@ -875,7 +911,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - The owner was asked twice, chose neither, and said to build anyway: each is the design's own recommendation, an assumption, not a settled fact, reversed where its fork bullet names (two functions for D1, one constant for D3, three places for D5).
 - **D1, what `1` means.** `1` is **the answer is no**: `newsvault ledger --check` exits 1 on a coverage shortfall and `panel-contract validate` keeps its verdict there; `input_unparseable`, `input_schema_mismatch` and `io_failed` exit `2` (§5.1).
   - Callers: `git grep -n newsvault -- '*.yml' '*.py' '*.sh'` on 2026-11-13 returned two hits, a comment in `ci.yml` and a docstring in `probes/parity_baseline.py`, neither runs the binary; the one caller in the tree now is `probes/newsvault_parity.py`, reading `newsvault day`'s `0` (a result it compares) and `2` (a day that reader refused), never `1`, which `day` cannot return. Callers outside the tree: unknowable.
-  - **The other fork is two functions:** `exit_code` in `services/newsvault/src/main.rs` decides every FAILURE exit; `news_provider::Exit` decides every exit a successful `collect` takes, including the stdout rule; nothing else branches on an exit status.
+  - **The other fork is three functions:** `exit_code` in `services/newsvault/src/main.rs` decides every FAILURE exit; `news_provider::Exit` decides every exit a successful `collect` takes, including the stdout rule; `cmd_robots::RobotsExit` decides a successful `robots refresh`'s, its 1 included, and defers to `news_provider::Exit` for 7 and 8; nothing else branches on an exit status.
 - **D3, the partition key.** The **publication day**, `items/valid_date=<D>/`, because the label is then a true statement about the rows under it; a day-dated row goes under the day it names, not under an instant nothing published. Its cost is §5's own row.
   - Cost of not having it, measured: 9 of 287 items in the predecessor's `session_date=2026-07-01` partition were published outside that UTC day, 3.14%.
   - Not a seq range: it can be declared complete, but its day-query scan cost is unmeasured.
@@ -918,10 +954,15 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
   - **The one place to change it** is `run_id` in `services/newsvault/src/cmd_collect.rs`.
 
 **The calendar, the listing and the roster are FILES the caller names, taken by default
-2026-11-13.**
+2026-11-13; robots.txt is a fetched vendor payload, since 2026-11-15.**
 
-- Not a fetched quarter listing: it is a vendor payload, so fetching it needs an attempt row of its own and a third request phase; until those exist, as a hashed input file it keeps a collection reproducible from the files alone and leaves `EdgarPress::listing_url` with no production caller. **The one place to change it** is `cmd_collect::inputs`.
+- Not a fetched quarter listing: as a hashed input file it keeps a collection reproducible from the files alone and leaves `EdgarPress::listing_url` with no production caller. **The one place to change it** is `cmd_collect::inputs`.
 - Required for `edgar_press` and refused for `open_web_wires`, which takes a hosts file instead (§11.2's flag table); which source takes which is `cmd_collect::open_provider`.
+- robots.txt is fetched, under attempt rows of its own: `attempts.source` `robots` (`cmd_robots::ROBOTS_SOURCE`), run envelopes of kind `robots_refresh`, phase `Index`, no third `RequestPhase`. A caller-named hashed file, the hosts file, pins its digest (§11.1). The fetch is `newsvault robots refresh` (§11.2).
+  - Rejected: a third `RequestPhase`, which forces `classify` and `extract` arms in `edgar-press` and `open-web-feed` that no request reaches. Rejected: source `open_web_wires`, whose `ok` rows with `vendor_rows` 0 would pull down `ok_vendor_rows`' trailing median and appear in that source's ledger rows.
+  - The ledger counts only `collect` envelopes in `runs_observed`, `runs_expected`, `runs_unfinished` and the per-source day rows, and takes every kind for the orphan check; the asking clock skips `source = 'robots'`. So a robots 403 is no `holds_a_failure` finding and a robots run fills no missing collect run: `a_robots_refresh_run_is_not_counted_against_expected_runs`, `a_robots_refresh_runs_attempts_are_not_orphans`, `a_robots_fetch_moves_neither_the_asking_clock_nor_a_ledger_check_finding` (mutations 2026-11-15, every envelope counted / `known_runs` from `collect` only / the asking-clock filter removed: each red). Rejected: no envelope, or one in a subfolder: the robots attempts would be orphans and `ledger` would exit 8.
+  - `kind` is optional inside `newsvault.run/1`, absent read as `collect` and never written for it, so every earlier envelope and the ledger golden file are unchanged. **The one place to change it** is `cmd_ledger::RunKind`.
+  - `no_registered_source_is_named_robots`: a registered source of that name would vanish from the asking clock.
 
 **The vendor's timeouts and body limit, the first an assumption and the second now measured.**
 
@@ -997,9 +1038,20 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | the page depth bound, 112 = 14 (the untrimmed GNW article, measured 2026-11-15) × 8; the margin is the builder's (§11.1) | `DEEPEST_PAGE`, `providers/open-web-feed/src/parse.rs` |
 | a page with two containers, or not UTF-8, is unusable rather than read from its first container or decoded lossily (review remedy, 2026-11-15) | `parse::page`, same file |
 
+**Defaults taken by the builder on 2026-11-15, open-web step 3 (§11.5), not by the owner.**
+
+| default | rejected, and why | where it is changed |
+|---|---|---|
+| a robots attempt is `source` `robots`, `target_window` the lowercased host, phase `Index`, `live_ingest`, `universe_version` the digest of zero bytes, `hosts_version` the hosts file's, through the open-web `TransportProfile` and `open_web_wires` pace files | the robots bullet above | `cmd_robots::request_for`; the `Wire` in `main.rs` |
+| the link from fetch to bytes is the `robots` table (§3.2) | an `attempts.raw_blob` column, which moves `blobs_indexed` for every run and the ledger golden file | `MIGRATIONS[1]`, `Committer::record_robots` |
+| the pin is one hosts-row field `robots`: 64 lowercase hex of the body as received after content decoding, or `absent`; required on admitted rows, optional on candidates; schema `open-web-feed.hosts/2` | a state plus a digest, which can disagree; `null`, which cannot tell "forgotten" from "404" | `RobotsPin::read` and `read_hosts`, `providers/open-web-feed/src/hosts.rs` |
+| 200 present (ok); 404 absent (empty), no digest; any other 4xx (403, 410) failed permanent; 429, a 5xx and a transport error failed transient; no robots row for a failure; one attempt per row, no retry, no startup sweep | RFC 9309's "4xx means allow all", which admits `www.globenewswire.com`, whose robots.txt answered an Akamai 403 (§11.2) | `cmd_robots::verdict_of` |
+| a refresh fetches every row, admitted and candidate, writes attempt rows, `robots` rows, blobs and an envelope, and never the hosts file; a pin that differs exits 1 with both digests | rewriting the hosts file, which re-admits a host whose robots changed without a person looking | `cmd_robots::run`, `exit_of` |
+| CLI `newsvault robots refresh --source open_web_wires --hosts --rules [--store] [--dry-run] [--non-interactive] [--format]`, run id `robots-<YYYYmmddTHHMMSSZ>` from the clock, no `--at` | | `RobotsAction` in `main.rs`; `cmd_robots::run` |
+
 ---
 
-## 11. `open-web-feed` — our own forward news feed (decided 2026-11-14; §11.5 steps 1 and 2 are built; `newsvault collect` drives it)
+## 11. `open-web-feed` — our own forward news feed (decided 2026-11-14; §11.5 steps 1 and 2 and step 3's refresh command are built; `newsvault collect` drives it)
 
 - Every line in §11.1 and §11.2 is an owner decision of 2026-11-14, except the `ValidSource` cells of §11.1's valid-time table and the bullet below that table, both decided 2026-11-15, and the sub-bullets marked `Built 2026-11-15`, which record what was built; the choices among them the owner did not make are listed in §10's 2026-11-15 defaults table.
 
@@ -1030,7 +1082,9 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | a `path_prefix` not starting with `/` | `a_path_filter_not_starting_with_a_slash_is_refused` |
 | a `valid_format` that does not print 2026-11-14T19:07Z as text `minute_of` reads back as that minute, or prints second 31 differently from second 0 | `a_valid_format_that_does_not_read_back_a_minute_is_refused` (fixture: `%S` added; two mutations, the whole check and the seconds half: both red); `a_valid_format_whose_minute_does_not_parse_back_is_refused` (fixture `%d %b %H:%M GMT`, no year, so only the read-back half refuses it; mutation 2026-11-15, `is_some_and` → `is_none_or`: red, green with clippy clean before the test) |
 
-  - Hosts file `hosts/open_web_wires.hosts.json`: one row, GNW (`rss.globenewswire.com`, index `https://rss.globenewswire.com/rssfeed/`) admitted. Unguarded until step 3: its admission rests on the 2026-11-14 robots fetch made outside the ledger (200, `Allow: /news-release/`, no Crawl-delay), and the row pins no robots digest.
+  - Hosts file `hosts/open_web_wires.hosts.json`, schema `open-web-feed.hosts/2`: one row, GNW (`rss.globenewswire.com`, index `https://rss.globenewswire.com/rssfeed/`) admitted, `robots` pinned to `eb8bb698171dd56c139c224c9217070adf9947f6ed6cd02336eba55aa4155bfe`: the sha256 of the 2026-11-14 fetch of its robots.txt (4,354 B, HTTP 200, `date` 19:21:07 GMT, decompressed by `curl --compressed`), committed byte for byte as `tests/fixtures/gnw/robots_rss_globenewswire_com.txt` (`the_committed_hosts_file_pins_the_committed_robots_body`). Unknown: whether the live bytes are still identical, and whether `ureq`'s decoding gives curl's bytes; a first live refresh that differs exits 1 and the pin is edited by hand.
+    - An admitted row with no pin, and a pin that is neither 64 lowercase hex nor `absent`, are `HostsUnparseable`: `an_admitted_hosts_row_without_a_robots_pin_is_refused`, `a_robots_pin_that_is_neither_64_lowercase_hex_nor_absent_is_refused` (mutations 2026-11-15, the admitted check removed / any text read as a digest: each red).
+    - Unguarded until step 3's second half: `collect` does not read the pin, so GNW's admission still rests on a fetch no collect run checks.
   - Rules file `rules/open-web-feed.rules.json`: per rule the `pubDate` field and its exact minute format, the path filter `/news-release/`, the `www.` → `rss.` rewrite, the title and canonical picks, the container and paragraph selectors; its digest is `extract_rules_version`.
   - Classify: index 200 with rows `Usable`, with none `Empty`, not RSS `PermanentFailure`; document 200 `Usable` (extraction decides `NoArticleBody`, `PageNotUtf8`, `PageTooDeep`, `ArticleContainerAmbiguous`); 429, 5xx and transport errors transient, except a body over `BODY_LIMIT` (2 MiB), permanent (§8 row R21); every other status permanent.
   - Precision ceiling `Minute`; a `pubDate` with seconds is `NoParseableValidTime`, never an instant. So is a `pubDate` the rule's format does not print back byte for byte: chrono's `%Y` read `Sat, 14 Nov 26 19:00 GMT` as the year 26, and `%H` read `9:05` (review 2026-11-15); `a_globenewswire_pubdate_is_a_minute_and_never_an_instant` (mutation 2026-11-15, the round trip removed: red). Unknown: how GNW spells a day before the 10th; the 20 items of 2026-11-14 are all day 14. Today `Sun, 01 Nov 2026 19:00 GMT` is a minute and `Sun, 1 Nov 2026 19:00 GMT` is `NoParseableValidTime` (chrono reads both; only `01` prints back): `a_single_digit_day_is_a_minute_only_when_zero_padded` (mutations 2026-11-15, the round trip removed / the reprint under `%-d`: each red). The rule changes only after a real GNW `pubDate` on days 1-9 is recorded.
@@ -1094,7 +1148,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
 - `Usable`, `Empty`, `PermanentFailure`, `TransientFailure` are `news_provider::ledger::Verdict` arms; today §3.2's `OutcomeKind` maps both failures to `failed` (`Outcome::decide`, `news-provider/src/ledger.rs`). `Finalised` carries `Outcome`, not the `Verdict` (`news_provider::ledger::AttemptEvent::Finalised`), so permanence is not stored until §11.5 step 4.
 - New columns `attempts.story_id` and `attempts.held`; `ledger --check` subtracts `held`. First sighting is unchanged: a skip writes no item. So R15 cannot see a re-stamped time of a held story; the index value survives only in the attempt's raw blob.
-- Schema versioned with `PRAGMA user_version`, read at `Committer::open`: a lower version is migrated by explicit `ALTER TABLE` (a table rebuild for a `CHECK` change); an unknown higher version is refused. Built 2026-11-15 at user_version 1 (§3.1); step 2 grows that one migration rather than adding a version per commit.
+- Schema versioned with `PRAGMA user_version`, read at `Committer::open`: a lower version is migrated by explicit `ALTER TABLE` (a table rebuild for a `CHECK` change); an unknown higher version is refused. Built 2026-11-15 at user_version 1 (§3.1); step 2 grew that one migration rather than adding a version per commit; step 3 added user_version 2, the `robots` table.
 
 ### 11.2 POC
 
@@ -1103,7 +1157,12 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - Hosts, in order: GNW, then PRN, CNW, Fed, Yahoo (wire keys only). One PR per host, as each robots fetch lands. CNW and Fed are admitted only after a body probe.
 - GNW article URLs are rewritten from `www.` to `rss.` (both GNW's own): `www.globenewswire.com` returned Akamai 403 on robots.txt twice; its article pages were never tested.
 - Yahoo: only provider keys of wires not fetched directly (`business-wire.com`, `accesswire.ca`), matched exactly, never as substrings. Not PRN, GNW, CNW keys: each release would be stored twice. Deferred: Zero Hedge, Newswire.com, Business Wire direct.
-- Robots: a refresh command fetches robots.txt through `Wire` under an attempt row; the hosts file pins the robots digest. Step 3 decides how a robots attempt is labelled and kept out of the expected-run count, and amends §10's "calendar, listing and roster are FILES" paragraph.
+- Robots: a refresh command fetches robots.txt through `Wire` under an attempt row; the hosts file pins the robots digest. How a robots attempt is labelled and kept out of the expected-run count: §10's "calendar, listing and roster are FILES" paragraph.
+  - Built 2026-11-15: `newsvault robots refresh` (`services/newsvault/src/cmd_robots.rs`), one request `https://<host>/robots.txt` per hosts-file row under an `AttemptSlot`, through the collector's `Wire`, credential and pace files; the body of a 200 is a blob linked by the `robots` table (§3.2); its exits are §5.1's; `newsvault schema` path `["robots", "refresh"]`, checked against the parser by `every_option_the_robots_refresh_parser_takes_is_in_the_machine_readable_schema`.
+  - Tests over a stub `Exchange` and a fixed clock: `a_robots_refresh_writes_one_attempt_per_hosts_row_under_source_robots`; `a_robots_404_is_recorded_as_absent_and_pins_no_digest` (mutation 2026-11-15, 404 a failure: red); `a_robots_403_5xx_or_transport_error_is_a_failed_attempt_with_no_robots_row` (mutation 2026-11-15, 403 absent: red); `a_fetched_robots_digest_other_than_the_pin_exits_one_and_names_both` (mutation 2026-11-15, `matches_pin` always true: red); `a_robots_refresh_dry_run_plans_one_url_per_row_and_writes_nothing`, through the library and the binary.
+  - Unguarded: `Wire` still follows redirects (R19 hole 9 until step 5), so a redirected robots.txt is stored under the host that was asked.
+  - Unguarded: a refresh that never runs, or dies, is invisible to the ledger, which counts only `collect` envelopes; no timer runs it (step 7).
+  - No run against a live host yet.
 - The robots and floor checks run in `newsvault` (only the driver reads the store); it hands the provider the Crawl-delay parsed from the pinned robots blob.
 - Redirects refused: `TransportProfile.redirects = Refuse` sets `max_redirects(0)`; a 3xx is a `PermanentFailure`, which closes R19 hole 9 by refusal.
 - One interval for all hosts: every admitted host is at 10 s. R19 hole 7 stays open.
@@ -1225,6 +1284,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
      - every poll re-fetches every follow-up, held or not, until step 4.
      - no run against the live host yet.
 3. Robots refresh command; `newsvault` checks the pinned digest and the floor.
+   - Built 2026-11-15: the refresh command, the `robots` table at user_version 2, the hosts-file pin (§11.1, §11.2), the envelope `kind` (§10). Not yet: the collect-side digest and floor checks.
 4. Held filter: `Finalised` carries the `Verdict`, `attempts.story_id`, `attempts.held`, live covered set, ledger check. Amends R16 and R20.
 5. Redirect refusal and 3xx classification, with a loopback stub.
 6. One PR per further host.

@@ -1,1 +1,1 @@
-{"schema":"open-web-feed.hosts/1","hosts":[{"host":"[::1]","status":"admitted","index_url":"https://[::1]/rssfeed/","rule":"gnw"}]}
+{"schema":"open-web-feed.hosts/2","hosts":[{"host":"[::1]","status":"admitted","robots":"eb8bb698171dd56c139c224c9217070adf9947f6ed6cd02336eba55aa4155bfe","index_url":"https://[::1]/rssfeed/","rule":"gnw"}]}

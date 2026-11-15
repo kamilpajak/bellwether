@@ -109,11 +109,12 @@ PRAGMA synchronous = FULL;
 ";
 
 /// The `PRAGMA user_version` this build writes, and the only one a read-only reader accepts.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// Version `i + 1` is reached from version `i` by `MIGRATIONS[i]`, run by [`migrate`] with
 /// foreign keys off, as SQLite's twelve-step table rebuild (lang_altertable.html) requires.
-const MIGRATIONS: [&str; 1] = ["
+const MIGRATIONS: [&str; 2] = [
+    "
 -- The hosts file a run was admitted under: architecture.md section 2's `hosts_version` row. NULL
 -- for a provider that reads no hosts file.
 ALTER TABLE attempts ADD COLUMN hosts_version TEXT;
@@ -157,7 +158,18 @@ DROP TABLE items;
 ALTER TABLE items_v1 RENAME TO items;
 CREATE INDEX items_by_story ON items(story_id);
 CREATE INDEX items_by_doc ON items(doc_id);
-"];
+",
+    "
+-- One row per answered robots.txt fetch: architecture.md section 3.1's robots table. A blob only
+-- when the answer is `present`, which `RobotsAnswer` holds and no CHECK repeats.
+CREATE TABLE robots (
+    attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id),
+    host       TEXT NOT NULL,
+    answer     TEXT NOT NULL CHECK (answer IN ('present', 'absent')),
+    blob       TEXT REFERENCES blobs(digest)
+);
+",
+];
 
 /// The frozen user_version 0 DDL; how a store reaches user_version 1: architecture.md §3.1.
 ///
@@ -327,11 +339,12 @@ pub enum StoreError {
     /// `SCHEMA_V0` is `CREATE TABLE IF NOT EXISTS`, so it cannot add a column to a v0 table an
     /// older binary wrote: `attempts` before `matched` (067a0bd) migrated to 1 without it.
     #[error(
-        "the commit log at user_version 0 differs from SCHEMA_V0 in {}; no migration repairs \
-         that, so the store is left at user_version 0",
+        "the commit log at user_version {found} differs from {} in {}; no migration repairs \
+         that, so the store is left at user_version {found}",
+        declared_by(*.found),
         .columns.join(", ")
     )]
-    V0ShapeDiffers { columns: Vec<String> },
+    ShapeDiffers { found: usize, columns: Vec<String> },
     /// `cause` is SQLite's message alone: the error rusqlite returns carries the whole batch.
     #[error(
         "migrating the commit log from user_version {from} failed {step}: {cause}; the store is \
@@ -346,6 +359,14 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+/// What the shape of a store at `found` is compared against, as the refusal names it.
+fn declared_by(found: usize) -> String {
+    match found {
+        0 => "SCHEMA_V0".to_owned(),
+        _ => format!("SCHEMA_V0 plus MIGRATIONS[..{found}]"),
+    }
 }
 
 /// Where a migration stopped: `SCHEMA_V0` is not a step to a version, so it is named on its own.
@@ -386,6 +407,32 @@ pub struct ItemRow {
     pub observed: ObservationTime,
     pub raw_blob: BlobDigest,
     pub body_blob: Option<BlobDigest>,
+}
+
+/// What a robots.txt fetch answered (architecture.md section 11.1): a 200 is `Present` with the
+/// body as received, a 404 is `Absent` and pins no digest. Any other status files no robots row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RobotsAnswer {
+    Present(BlobDigest),
+    Absent,
+}
+
+impl RobotsAnswer {
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Present(_) => "present",
+            Self::Absent => "absent",
+        }
+    }
+
+    #[must_use]
+    pub const fn blob(&self) -> Option<&BlobDigest> {
+        match self {
+            Self::Present(digest) => Some(digest),
+            Self::Absent => None,
+        }
+    }
 }
 
 /// What one [`Committer::record`] committed. `changed` is false for a replay, which returns the
@@ -539,13 +586,19 @@ pub fn refuse_an_unreadable_version(root: &Path) -> Result<(), StoreError> {
             expected: SCHEMA_VERSION,
         });
     }
-    if found == 0 {
-        let columns = v0_columns_that_differ(&db)?;
-        if !columns.is_empty() {
-            return Err(StoreError::V0ShapeDiffers { columns });
-        }
+    match usize::try_from(found) {
+        Ok(older) if older < MIGRATIONS.len() => refuse_another_shape(&db, older),
+        _ => Ok(()),
     }
-    Ok(())
+}
+
+fn refuse_another_shape(db: &Connection, found: usize) -> Result<(), StoreError> {
+    let columns = columns_that_differ(db, found)?;
+    if columns.is_empty() {
+        Ok(())
+    } else {
+        Err(StoreError::ShapeDiffers { found, columns })
+    }
 }
 
 /// Brings a store from the version it holds to [`SCHEMA_VERSION`] in one transaction, so a crash
@@ -573,11 +626,8 @@ fn migrate(db: &mut Connection) -> Result<(), StoreError> {
 
 fn migrate_from(db: &mut Connection, from: usize) -> Result<(), StoreError> {
     let transaction = db.transaction()?;
+    refuse_another_shape(&transaction, from)?;
     if from == 0 {
-        let columns = v0_columns_that_differ(&transaction)?;
-        if !columns.is_empty() {
-            return Err(StoreError::V0ShapeDiffers { columns });
-        }
         transaction
             .execute_batch(SCHEMA_V0)
             .map_err(step_failed(from, MigrationStep::CreatingTheV0Tables))?;
@@ -628,11 +678,15 @@ fn columns_of(db: &Connection, table: &str) -> Result<BTreeMap<String, ColumnSha
     Ok(columns)
 }
 
-/// Every `table.column` of a v0 table the store holds whose shape is not the one `SCHEMA_V0`
-/// declares. A v0 table the store lacks is absent here, because `SCHEMA_V0` creates it whole.
-fn v0_columns_that_differ(db: &Connection) -> Result<Vec<String>, StoreError> {
+/// Every `table.column` whose shape differs from the one a store at `found` was written with:
+/// `SCHEMA_V0` replayed with `MIGRATIONS[..found]`. A table a v0 store lacks is absent here,
+/// because `SCHEMA_V0` creates it whole; a table a later version lacks names each of its columns.
+fn columns_that_differ(db: &Connection, found: usize) -> Result<Vec<String>, StoreError> {
     let frozen = Connection::open_in_memory()?;
     frozen.execute_batch(SCHEMA_V0)?;
+    for step in MIGRATIONS.iter().take(found) {
+        frozen.execute_batch(step)?;
+    }
     let mut statement = frozen.prepare(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
          ORDER BY name",
@@ -642,16 +696,16 @@ fn v0_columns_that_differ(db: &Connection) -> Result<Vec<String>, StoreError> {
         .collect::<Result<Vec<String>, _>>()?;
     let mut differing = Vec::new();
     for table in tables {
-        let found = columns_of(db, &table)?;
-        if found.is_empty() {
+        let held = columns_of(db, &table)?;
+        if held.is_empty() && found == 0 {
             continue;
         }
         let declared = columns_of(&frozen, &table)?;
-        let names: BTreeSet<&String> = declared.keys().chain(found.keys()).collect();
+        let names: BTreeSet<&String> = declared.keys().chain(held.keys()).collect();
         differing.extend(
             names
                 .into_iter()
-                .filter(|name| declared.get(*name) != found.get(*name))
+                .filter(|name| declared.get(*name) != held.get(*name))
                 .map(|name| format!("{table}.{name}")),
         );
     }
@@ -892,49 +946,16 @@ impl Committer {
             self.pending.retain(|event| attempt_of(event) != attempt);
             return Ok(standing);
         }
-        if !self.was_opened(&attempt)? {
-            return Err(StoreError::AttemptNotOpened { attempt });
-        }
-        if !self.pending.iter().any(|event| closes(event, &attempt)) {
-            return Err(StoreError::AttemptNotClosed { attempt });
-        }
-        if !rows.is_empty() && closed.outcome().kind() == OutcomeKind::Interrupted {
-            return Err(StoreError::ItemsUnderAbandonedAttempt { attempt });
-        }
-        let mut lengths = Vec::new();
-        for digest in referenced_blobs(rows) {
-            let bytes = self.blobs.len_of(&digest)?;
-            lengths.push((digest, bytes));
-        }
+        self.admits(&attempt, &closed, !rows.is_empty())?;
+        let lengths = self.lengths_of(referenced_blobs(rows))?;
         let reserved = self.reserve(&attempt, rows.len(), committed_at)?;
-        let events: Vec<AttemptEvent> = self
-            .pending
-            .iter()
-            .filter(|event| attempt_of(event) == attempt)
-            .cloned()
-            .collect();
+        let events = self.pending_of(&attempt);
         let stamped = stamp(committed_at.inner());
-        let mut blobs_indexed = 0;
-        let mut bytes = 0;
         let transaction = self.db.transaction()?;
         for event in &events {
             apply(&transaction, event)?;
         }
-        for (digest, length) in &lengths {
-            let inserted = transaction.execute(
-                "INSERT INTO blobs (digest, bytes, first_indexed_at) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(digest) DO NOTHING",
-                params![
-                    digest.hex(),
-                    i64::try_from(*length).unwrap_or(i64::MAX),
-                    stamped
-                ],
-            )?;
-            if inserted == 1 {
-                blobs_indexed += 1;
-                bytes += length;
-            }
-        }
+        let (blobs_indexed, bytes) = index_blobs(&transaction, &lengths, &stamped)?;
         let mut items_new: i64 = 0;
         if let Some((seq_lo, _)) = reserved {
             for (offset, row) in rows.iter().enumerate() {
@@ -992,6 +1013,109 @@ impl Committer {
             bytes,
             changed: true,
         })
+    }
+
+    /// The door for a robots.txt answer: `record`'s checks, then the attempt's pending events, the
+    /// blob's index row and the `robots` row in one transaction (architecture.md section 3.1).
+    pub fn record_robots(
+        &mut self,
+        closed: AttemptReceipt,
+        host: &str,
+        answer: &RobotsAnswer,
+        committed_at: ObservationTime,
+    ) -> Result<CommitReceipt, StoreError> {
+        let attempt = closed.attempt_id().hex().to_owned();
+        if let Some(standing) = self.standing(&attempt)? {
+            if self.robots_row(&attempt)? != Some((host.to_owned(), answer.clone())) {
+                return Err(StoreError::ReplayWithDifferentItems { attempt });
+            }
+            self.pending.retain(|event| attempt_of(event) != attempt);
+            return Ok(standing);
+        }
+        self.admits(&attempt, &closed, true)?;
+        let lengths = self.lengths_of(answer.blob().into_iter().cloned().collect())?;
+        let events = self.pending_of(&attempt);
+        let stamped = stamp(committed_at.inner());
+        let transaction = self.db.transaction()?;
+        for event in &events {
+            apply(&transaction, event)?;
+        }
+        let (blobs_indexed, bytes) = index_blobs(&transaction, &lengths, &stamped)?;
+        transaction.execute(
+            "INSERT INTO robots (attempt_id, host, answer, blob) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                attempt,
+                host,
+                answer.name(),
+                answer.blob().map(BlobDigest::hex)
+            ],
+        )?;
+        transaction.commit()?;
+        self.pending.retain(|event| attempt_of(event) != attempt);
+        Ok(CommitReceipt {
+            attempt_id: attempt,
+            seq_lo: None,
+            seq_hi: None,
+            items_committed: 0,
+            blobs_indexed,
+            bytes,
+            changed: true,
+        })
+    }
+
+    /// The robots row an attempt filed, as `record_robots` was handed it.
+    fn robots_row(&self, attempt: &str) -> Result<Option<(String, RobotsAnswer)>, StoreError> {
+        let row: Option<(String, Option<String>)> = self
+            .db
+            .query_row(
+                "SELECT host, blob FROM robots WHERE attempt_id = ?1",
+                params![attempt],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            Some((host, Some(hex))) => Some((host, RobotsAnswer::Present(self.blob_named(&hex)?))),
+            Some((host, None)) => Some((host, RobotsAnswer::Absent)),
+            None => None,
+        })
+    }
+
+    /// The checks every door makes: the attempt was opened here, closed here, and an abandoned
+    /// one carries nothing.
+    fn admits(
+        &self,
+        attempt: &str,
+        closed: &AttemptReceipt,
+        carries: bool,
+    ) -> Result<(), StoreError> {
+        let attempt = attempt.to_owned();
+        if !self.was_opened(&attempt)? {
+            return Err(StoreError::AttemptNotOpened { attempt });
+        }
+        if !self.pending.iter().any(|event| closes(event, &attempt)) {
+            return Err(StoreError::AttemptNotClosed { attempt });
+        }
+        if carries && closed.outcome().kind() == OutcomeKind::Interrupted {
+            return Err(StoreError::ItemsUnderAbandonedAttempt { attempt });
+        }
+        Ok(())
+    }
+
+    fn lengths_of(&self, digests: Vec<BlobDigest>) -> Result<Vec<(BlobDigest, u64)>, StoreError> {
+        let mut lengths = Vec::new();
+        for digest in digests {
+            let bytes = self.blobs.len_of(&digest)?;
+            lengths.push((digest, bytes));
+        }
+        Ok(lengths)
+    }
+
+    fn pending_of(&self, attempt: &str) -> Vec<AttemptEvent> {
+        self.pending
+            .iter()
+            .filter(|event| attempt_of(event) == attempt)
+            .cloned()
+            .collect()
     }
 
     /// The standing receipt of an attempt already closed in the log, so a replay is a no-op. A
@@ -1138,6 +1262,32 @@ impl Sink for Committer {
             }
         }
     }
+}
+
+/// Index rows for blobs already on disk; counts only the rows this transaction added.
+fn index_blobs(
+    db: &Connection,
+    lengths: &[(BlobDigest, u64)],
+    stamped: &str,
+) -> Result<(u32, u64), StoreError> {
+    let mut indexed = 0;
+    let mut bytes = 0;
+    for (digest, length) in lengths {
+        let inserted = db.execute(
+            "INSERT INTO blobs (digest, bytes, first_indexed_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(digest) DO NOTHING",
+            params![
+                digest.hex(),
+                i64::try_from(*length).unwrap_or(i64::MAX),
+                stamped
+            ],
+        )?;
+        if inserted == 1 {
+            indexed += 1;
+            bytes += length;
+        }
+    }
+    Ok((indexed, bytes))
 }
 
 /// Which attempt an event is about.
@@ -1414,8 +1564,8 @@ mod tests {
 
     use super::{
         first_observed, fs, newest_visible_publication, params, stamp, user_version, Committer,
-        ItemRow, LedgerError, MigrationStep, ObservationTime, RunId, Sink, StoreError, COMMIT_LOG,
-        SCHEMA_V0, SCHEMA_VERSION,
+        ItemRow, LedgerError, MigrationStep, ObservationTime, RobotsAnswer, RunId, Sink,
+        StoreError, COMMIT_LOG, MIGRATIONS, SCHEMA_V0, SCHEMA_VERSION,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -2058,7 +2208,7 @@ mod tests {
         assert!(
             matches!(
                 &refused,
-                Err(StoreError::V0ShapeDiffers { columns }) if columns == &["attempts.matched"]
+                Err(StoreError::ShapeDiffers { found: 0, columns }) if columns == &["attempts.matched"]
             ),
             "{refused:?}"
         );
@@ -2101,7 +2251,7 @@ mod tests {
             db.execute_batch(&SCHEMA_V0.replacen(declared, written, 1))?;
             drop(db);
             let refused = match open(&temp) {
-                Err(StoreError::V0ShapeDiffers { columns }) => columns,
+                Err(StoreError::ShapeDiffers { found: 0, columns }) => columns,
                 other => vec![format!("{other:?}")],
             };
             let db = Connection::open(temp.path().join(COMMIT_LOG))?;
@@ -2157,6 +2307,218 @@ mod tests {
                  store lacks: there is already an index named published; the store is left at \
                  user_version 0"
             )
+        );
+        Ok(())
+    }
+
+    /// Every table a user_version 1 store holds, in the order the carried test reads them.
+    const V1_TABLES: [&str; 5] = [
+        "attempts",
+        "blobs",
+        "items",
+        "seq_reservations",
+        "published",
+    ];
+    const ROBOTS_HOST: &str = "rss.globenewswire.com";
+
+    /// A v1 store written with the frozen DDL replayed to user_version 1 and no later step: one
+    /// row in every table, every nullable column set, a minute item and a hosts version.
+    fn a_store_at_user_version_one(temp: &TempDir) -> TestResult {
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch(SCHEMA_V0)?;
+        db.execute_batch(MIGRATIONS[0])?;
+        db.pragma_update(None, "user_version", 1)?;
+        db.execute_batch(
+            "INSERT INTO attempts VALUES ('a v1 attempt', 'a v1 run', 'open_web_wires',
+                 '2026-11-14', 'f', 'u', '1970-01-01T00:00:01.000000Z',
+                 '1970-01-01T00:00:02.000000Z', '1970-01-01T00:00:03.000000Z', 200, 0, 'ok', 3, 1,
+                 3, 3, 1, 'trailing median', 1.5, 1, '1970-01-01T00:00:04.000000Z',
+                 '1970-01-01T00:00:05.000000Z', 'a v1 sweep', 'a v1 hosts file');
+             INSERT INTO blobs VALUES ('a v1 blob', 1, '1970-01-01T00:00:01.000000Z'),
+                                      ('a v1 body', 2, '1970-01-01T00:00:01.000000Z');
+             INSERT INTO items VALUES (11, 'a v1 minute', 'a v1 story', 'a v1 doc', 'a v1 attempt',
+                 NULL, NULL, NULL, '2026-11-14T19:00:00.000000Z', NULL,
+                 '2026-11-14T19:00:29.000000Z', 1, '2026-11-14T18:59:00.000000Z', 'a v1 blob',
+                 'a v1 body', '2026-11-14T19:00:30.000000Z', 'Sat, 14 Nov 2026 19:00 GMT',
+                 'pubDate', 'vendor_published');
+             INSERT INTO seq_reservations VALUES (5, 'a v1 attempt', 11, 11,
+                 '2026-11-14T19:00:30.000000Z');
+             INSERT INTO published VALUES ('a v1 segment', 'a v1 run', '2026-11-14', 'items/x',
+                 11, 11, 1, '2026-11-14T19:01:00.000000Z');",
+        )?;
+        Ok(())
+    }
+
+    /// Each row of each v1 table as one SQL-quoted text over every column, in rowid order.
+    fn v1_rows(db: &Connection) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let mut rows = Vec::new();
+        for table in V1_TABLES {
+            let columns = super::columns_of(db, table)?;
+            let quoted: Vec<String> = columns
+                .keys()
+                .map(|column| format!("quote({column})"))
+                .collect();
+            let mut statement = db.prepare(&format!(
+                "SELECT '{table}|' || {} FROM {table} ORDER BY rowid",
+                quoted.join(" || '|' || ")
+            ))?;
+            rows.extend(
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<String>, _>>()?,
+            );
+        }
+        Ok(rows)
+    }
+
+    /// Opens one attempt for `ROBOTS_HOST` under source `robots` and closes it ok.
+    fn closed_robots_attempt(
+        store: &mut Committer,
+    ) -> Result<news_provider::AttemptReceipt, Box<dyn std::error::Error>> {
+        let request = Request {
+            source: SourceId::new("robots"),
+            target_window: TargetWindow::new(ROBOTS_HOST),
+            ..request()
+        };
+        let slot = AttemptSlot::open(store, &request, &RunId::new(RUN), 0, at(1))?;
+        let answer = RawResponse::new(
+            slot.attempt_id().clone(),
+            STATUS_OK,
+            PAYLOAD.to_vec(),
+            at(2),
+            at(3),
+        );
+        let outcome = Outcome::decide(&Verdict::Usable, 0, &Baseline::from_trailing_ok(&[]));
+        Ok(slot.close(store, outcome, &Ok(answer), at(4))?)
+    }
+
+    fn robots_rows(store: &Committer) -> Result<Vec<(String, String, Option<String>)>, StoreError> {
+        let mut statement = store
+            .db
+            .prepare("SELECT host, answer, blob FROM robots ORDER BY attempt_id")?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// §8 row M1 from user_version 1: the step to 2 adds `robots`, and a robots answer lands in it.
+    #[test]
+    fn a_store_at_user_version_one_opens_migrates_to_two_and_takes_a_robots_row() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_one(&temp)?;
+        let mut store = open(&temp)?;
+        let closed = closed_robots_attempt(&mut store)?;
+        let body = store.put_blob(PAYLOAD)?;
+        store.record_robots(
+            closed,
+            ROBOTS_HOST,
+            &RobotsAnswer::Present(body.clone()),
+            at(5),
+        )?;
+        assert_eq!(
+            (user_version(&store.db)?, robots_rows(&store)?),
+            (
+                2,
+                vec![(
+                    ROBOTS_HOST.to_owned(),
+                    "present".to_owned(),
+                    Some(body.hex().to_owned())
+                )]
+            )
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the per-version shape check at user_version 1: a column of another type and a
+    /// table the store lacks are each named, and the store stays at 1.
+    #[test]
+    fn a_v1_store_whose_columns_differ_is_refused_and_left_at_user_version_one() -> TestResult {
+        let fixtures = [
+            (
+                "ALTER TABLE attempts DROP COLUMN hosts_version;
+                 ALTER TABLE attempts ADD COLUMN hosts_version INTEGER;",
+                vec!["attempts.hosts_version".to_owned()],
+            ),
+            (
+                "DROP TABLE published;",
+                [
+                    "path",
+                    "published_at",
+                    "rows",
+                    "run_id",
+                    "segment_digest",
+                    "seq_hi",
+                    "seq_lo",
+                    "valid_date",
+                ]
+                .map(|column| format!("published.{column}"))
+                .to_vec(),
+            ),
+        ];
+        let mut named = Vec::new();
+        for (edit, _) in &fixtures {
+            let temp = TempDir::new()?;
+            a_store_at_user_version_one(&temp)?;
+            let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+            db.execute_batch(edit)?;
+            drop(db);
+            let read_only = super::refuse_an_unreadable_version(temp.path());
+            let refused = match open(&temp) {
+                Err(StoreError::ShapeDiffers { found: 1, columns }) => columns,
+                other => vec![format!("{other:?}")],
+            };
+            let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+            named.push((refused, read_only.is_err(), user_version(&db)?));
+        }
+        assert_eq!(
+            named,
+            fixtures
+                .into_iter()
+                .map(|(_, columns)| (columns, true, 1))
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the carried half from user_version 1: every column of every row of every v1
+    /// table, compared by `quote()` before and after.
+    #[test]
+    fn a_v1_store_keeps_every_v1_column_of_every_row() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_one(&temp)?;
+        let v1 = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let before = v1_rows(&v1)?;
+        drop(v1);
+        let store = open(&temp)?;
+        assert_eq!(before.len(), V1_TABLES.len() + 1);
+        assert_eq!(v1_rows(&store.db)?, before);
+        Ok(())
+    }
+
+    /// The robots row, the blob's index row and the attempt's `Answered` and `Finalised` events
+    /// are one transaction: a robots insert refused (a row already filed under the attempt by
+    /// hand) leaves the attempt open and the blob unindexed.
+    #[test]
+    fn a_robots_row_and_its_attempt_events_commit_in_one_transaction() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let closed = closed_robots_attempt(&mut store)?;
+        let attempt = closed.attempt_id().hex().to_owned();
+        store.db.execute(
+            "INSERT INTO robots (attempt_id, host, answer) VALUES (?1, 'by hand', 'absent')",
+            params![attempt],
+        )?;
+        let body = store.put_blob(PAYLOAD)?;
+        let refused = store.record_robots(closed, ROBOTS_HOST, &RobotsAnswer::Present(body), at(5));
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(
+            (
+                finalised(&store)?,
+                count(&store, "blobs")?,
+                count(&store, "robots")?
+            ),
+            (0, 0, 1)
         );
         Ok(())
     }

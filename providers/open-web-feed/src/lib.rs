@@ -25,7 +25,8 @@ use pit::datedness::{Minute, Published};
 use pit::ObservationTime;
 use serde_json::{Map, Value};
 
-use crate::hosts::{read_hosts, HostRow, Hosts, HOSTS_SCHEMA};
+pub use crate::hosts::RobotsPin;
+use crate::hosts::{read_hosts, HostRow, Hosts, Status, HOSTS_SCHEMA};
 use crate::rules::{parse_rules, Rule, RULES_SCHEMA};
 
 pub const SOURCE: &str = "open_web_wires";
@@ -118,6 +119,14 @@ pub enum Refusal {
     },
 }
 
+/// One hosts row as `OpenWebFeed::host_pins` hands it out. `host` is lowercased.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPin {
+    pub host: String,
+    pub admitted: bool,
+    pub robots: Option<RobotsPin>,
+}
+
 #[derive(Debug)]
 pub struct OpenWebFeed {
     hosts: Hosts,
@@ -155,6 +164,21 @@ impl OpenWebFeed {
             rules_version: FileDigest::of(&rules_bytes),
             rewrites,
         })
+    }
+
+    /// Every row of the hosts file, admitted and candidate, with its robots pin: what `newsvault
+    /// robots refresh` asks and compares (section 11.2).
+    #[must_use]
+    pub fn host_pins(&self) -> Vec<HostPin> {
+        self.hosts
+            .rows
+            .iter()
+            .map(|row| HostPin {
+                host: row.host.clone(),
+                admitted: row.status == Status::Admitted,
+                robots: row.robots.clone(),
+            })
+            .collect()
     }
 
     /// `hosts_version`: the sha256 of the hosts file as read.

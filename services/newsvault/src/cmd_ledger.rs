@@ -10,9 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Days, NaiveDate, Utc};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
+use crate::cmd_robots::ROBOTS_SOURCE;
 use crate::store::{
     coverage_up_to, newest_visible_publication, require_current_version, unpublished_seq_ranges,
     SeqRange, WindowCoverage, COMMIT_LOG, RUNS_DIR,
@@ -207,6 +208,27 @@ pub struct Envelope {
     pub expected_runs: u32,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// Absent in every file written before `robots_refresh` existed, so absent reads as `collect`
+    /// and a `collect` envelope is written without it.
+    #[serde(default, skip_serializing_if = "RunKind::is_collect")]
+    pub kind: RunKind,
+}
+
+/// Which command wrote a run envelope. Only `collect` runs are due, counted and reported per day;
+/// every kind is a known run for an attempt (architecture.md section 10, robots).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunKind {
+    #[default]
+    Collect,
+    RobotsRefresh,
+}
+
+impl RunKind {
+    #[must_use]
+    pub const fn is_collect(&self) -> bool {
+        matches!(self, Self::Collect)
+    }
 }
 
 /// One attempt's state as the one GROUP BY returns it.
@@ -478,9 +500,10 @@ fn freshness(
     at: &str,
     cutoff: DateTime<Utc>,
 ) -> Result<Freshness, LedgerReadError> {
+    // A robots fetch asks a host, not a source, so it says nothing about any source's freshness.
     let newest_request: Option<String> = db.query_row(
-        "SELECT MAX(requested_at) FROM attempts WHERE requested_at <= ?1",
-        [at],
+        "SELECT MAX(requested_at) FROM attempts WHERE requested_at <= ?1 AND source <> ?2",
+        params![at, ROBOTS_SOURCE],
         |row| row.get(0),
     )?;
     // Both halves of the visibility question, which is the one `pit` exists for: a publication
@@ -536,7 +559,7 @@ fn day_row(
 ) -> DayRow {
     let today: Vec<&Envelope> = envelopes
         .iter()
-        .filter(|envelope| envelope.run_date == date)
+        .filter(|envelope| envelope.run_date == date && envelope.kind.is_collect())
         .collect();
     let runs: BTreeSet<&str> = today.iter().map(|run| run.run_id.as_str()).collect();
     let observed = u32::try_from(today.len()).unwrap_or(u32::MAX);

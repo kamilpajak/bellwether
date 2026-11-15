@@ -116,7 +116,13 @@ export BELLWETHER_FEED_CONTACT='bellwether-feed <your address>'
 cargo run -p newsvault -- collect --source open_web_wires --window today \
   --hosts providers/open-web-feed/hosts/open_web_wires.hosts.json \
   --rules providers/open-web-feed/rules/open-web-feed.rules.json --dry-run --format json
+cargo run -p newsvault -- robots refresh --source open_web_wires \
+  --hosts providers/open-web-feed/hosts/open_web_wires.hosts.json \
+  --rules providers/open-web-feed/rules/open-web-feed.rules.json --dry-run --format json
 ```
+
+`robots refresh` fetches each hosts-file row's robots.txt under the ledger and compares it with the
+row's `robots` pin; it never writes the hosts file. Exit 1 means a pin differs.
 
 `unwrap`, `expect` and `panic!` are denied by lint and `unsafe` is forbidden. The table is
 `[workspace.lints]` in the root `Cargo.toml`, and each crate opts in with

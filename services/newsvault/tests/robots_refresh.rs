@@ -1,0 +1,523 @@
+//! `newsvault robots refresh` over a stub `Exchange` and a fixed clock, never the network
+//! (architecture.md section 11.2), and what the ledger reads of the runs it leaves (section 10).
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::error::Error;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use canon::FileDigest;
+use chrono::{DateTime, Utc};
+use news_provider::{
+    Clock, Exchange, RawResponse, Request, SendFailure, SendPermit, TransportError,
+};
+use newsvault::cmd_collect::Registered;
+use newsvault::cmd_ledger;
+use newsvault::cmd_robots::{self, Ask, RobotsExit, ROBOTS_SOURCE};
+use newsvault::store::{COMMIT_LOG, RUNS_DIR};
+use pit::ObservationTime;
+use rusqlite::{Connection, OpenFlags};
+use serde_json::Value;
+use tempfile::TempDir;
+
+type TestResult = Result<(), Box<dyn Error>>;
+
+const SOURCE: &str = "open_web_wires";
+const CONTACT: &str = "bellwether collector contact@example.test";
+const NOW: &str = "2026-11-15T10:00:00Z";
+const RUN_DAY: &str = "2026-11-15";
+const RUN_ID: &str = "robots-20261115T100000Z";
+const GNW_HOST: &str = "rss.globenewswire.com";
+const GNW_ROBOTS: &str = "https://rss.globenewswire.com/robots.txt";
+const PRN_ROBOTS: &str = "https://www.prnewswire.com/robots.txt";
+/// The committed hosts file's pin: `robots_rss_globenewswire_com.txt`'s sha256.
+const GNW_PIN: &str = "eb8bb698171dd56c139c224c9217070adf9947f6ed6cd02336eba55aa4155bfe";
+const PRN_BODY: &[u8] = b"User-agent: *\nDisallow: /search/\n";
+const CHANGED_BODY: &[u8] = b"User-agent: *\nDisallow: /\n";
+const OK: u16 = 200;
+const NOT_FOUND: u16 = 404;
+const FORBIDDEN: u16 = 403;
+const UNAVAILABLE: u16 = 503;
+const EXIT_OK: i32 = 0;
+const RUNS_BELOW_EXPECTED: &str = "runs_below_expected";
+const HOLDS_A_FAILURE: &str = "holds_a_failure";
+
+fn provider_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../providers/open-web-feed")
+}
+
+fn committed_hosts() -> PathBuf {
+    provider_dir().join("hosts/open_web_wires.hosts.json")
+}
+
+/// The committed GNW row admitted, and a PRN candidate with no pin.
+fn two_row_hosts() -> PathBuf {
+    provider_dir().join("tests/fixtures/hosts/one_admitted_one_candidate.json")
+}
+
+fn gnw_body() -> Result<Vec<u8>, std::io::Error> {
+    std::fs::read(provider_dir().join("tests/fixtures/gnw/robots_rss_globenewswire_com.txt"))
+}
+
+fn ask(store: &Path, hosts: PathBuf) -> Ask {
+    Ask {
+        source: SOURCE.to_owned(),
+        hosts,
+        rules: provider_dir().join("rules/open-web-feed.rules.json"),
+        store: store.to_path_buf(),
+        contact: CONTACT.to_owned(),
+        dry_run: false,
+    }
+}
+
+struct Fixed;
+
+impl Clock for Fixed {
+    fn now(&self) -> DateTime<Utc> {
+        NOW.parse().unwrap_or(DateTime::UNIX_EPOCH)
+    }
+}
+
+/// Each url answered with a status and a body; a url it does not hold fails in transport.
+struct Robots {
+    answers: BTreeMap<String, (u16, Vec<u8>)>,
+    asked: RefCell<Vec<String>>,
+}
+
+impl Robots {
+    fn of(answers: &[(&str, u16, &[u8])]) -> Self {
+        Self {
+            answers: answers
+                .iter()
+                .map(|(url, status, body)| ((*url).to_owned(), (*status, body.to_vec())))
+                .collect(),
+            asked: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl Exchange for Robots {
+    fn send(
+        &self,
+        permit: SendPermit,
+        request: &Request,
+        clock: &dyn Clock,
+    ) -> Result<RawResponse, SendFailure> {
+        self.asked.borrow_mut().push(request.url.clone());
+        let attempt = permit.attempt_id().clone();
+        let at = ObservationTime::new(clock.now());
+        match self.answers.get(&request.url) {
+            Some((status, body)) => Ok(RawResponse::new(attempt, *status, body.clone(), at, at)),
+            None => Err(SendFailure::Transport(TransportError::new(
+                attempt,
+                at,
+                at,
+                format!("no stub answers {}", request.url),
+            ))),
+        }
+    }
+}
+
+fn refreshed(
+    store: &Path,
+    hosts: PathBuf,
+    exchange: &Robots,
+) -> Result<cmd_robots::Answer, Box<dyn Error>> {
+    let ask = ask(store, hosts);
+    let feed = cmd_robots::open(&ask)?;
+    Ok(cmd_robots::run(&ask, &feed, exchange, &Fixed)?)
+}
+
+fn read_only(store: &Path) -> Result<Connection, rusqlite::Error> {
+    Connection::open_with_flags(store.join(COMMIT_LOG), OpenFlags::SQLITE_OPEN_READ_ONLY)
+}
+
+/// `(host, answer, blob)` of one robots row.
+type RobotsRow = (String, String, Option<String>);
+/// `(source, target_window, outcome)` of one attempt.
+type AttemptRow = (String, String, String);
+
+fn robots_rows(store: &Path) -> Result<Vec<RobotsRow>, Box<dyn Error>> {
+    let db = read_only(store)?;
+    let mut statement = db.prepare("SELECT host, answer, blob FROM robots ORDER BY host")?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn attempts(store: &Path) -> Result<Vec<AttemptRow>, Box<dyn Error>> {
+    let db = read_only(store)?;
+    let mut statement =
+        db.prepare("SELECT source, target_window, outcome FROM attempts ORDER BY target_window")?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn first_row(answer: &cmd_robots::Answer) -> Value {
+    answer.report["rows"][0].clone()
+}
+
+fn ledger(store: &Path, expected_runs: Option<u32>) -> Result<cmd_ledger::Report, Box<dyn Error>> {
+    Ok(cmd_ledger::read(
+        store,
+        &cmd_ledger::Ask {
+            at: "2026-11-15T23:00:00Z".parse()?,
+            from: RUN_DAY.parse()?,
+            to: RUN_DAY.parse()?,
+            source: None,
+            expected_runs,
+            limit: None,
+            check: true,
+        },
+    )?)
+}
+
+fn finding_codes(report: &cmd_ledger::Report) -> Vec<&'static str> {
+    report
+        .check
+        .findings
+        .iter()
+        .map(|found| found.code)
+        .collect()
+}
+
+#[test]
+fn a_robots_refresh_writes_one_attempt_per_hosts_row_under_source_robots() -> TestResult {
+    let root = TempDir::new()?;
+    let body = gnw_body()?;
+    let exchange = Robots::of(&[(GNW_ROBOTS, OK, &body), (PRN_ROBOTS, OK, PRN_BODY)]);
+    let answer = refreshed(root.path(), two_row_hosts(), &exchange)?;
+    let db = read_only(root.path())?;
+    let versions: Vec<(String, Option<String>)> = db
+        .prepare("SELECT run_id, hosts_version FROM attempts")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let hosts_version = FileDigest::of(&std::fs::read(two_row_hosts())?);
+    assert_eq!(
+        (
+            answer.exit,
+            exchange.asked.borrow().clone(),
+            attempts(root.path())?,
+            versions,
+        ),
+        (
+            RobotsExit::Ok,
+            vec![GNW_ROBOTS.to_owned(), PRN_ROBOTS.to_owned()],
+            vec![
+                (
+                    ROBOTS_SOURCE.to_owned(),
+                    GNW_HOST.to_owned(),
+                    "ok".to_owned()
+                ),
+                (
+                    ROBOTS_SOURCE.to_owned(),
+                    "www.prnewswire.com".to_owned(),
+                    "ok".to_owned()
+                ),
+            ],
+            vec![(RUN_ID.to_owned(), Some(hosts_version.hex().to_owned())); 2],
+        )
+    );
+    assert_eq!(
+        robots_rows(root.path())?,
+        vec![
+            (
+                GNW_HOST.to_owned(),
+                "present".to_owned(),
+                Some(GNW_PIN.to_owned())
+            ),
+            (
+                "www.prnewswire.com".to_owned(),
+                "present".to_owned(),
+                Some(FileDigest::of(PRN_BODY).hex().to_owned())
+            ),
+        ]
+    );
+    let envelope: Value = serde_json::from_slice(&std::fs::read(
+        root.path().join(RUNS_DIR).join(format!("{RUN_ID}.json")),
+    )?)?;
+    assert_eq!(
+        (envelope["kind"].as_str(), envelope["finished_at"].is_null()),
+        (Some("robots_refresh"), false)
+    );
+    // The candidate pins nothing, so it has no answer to the pin question.
+    assert_eq!(
+        answer.report["rows"][1]["matches_pin"],
+        Value::Null,
+        "{:#}",
+        answer.report
+    );
+    Ok(())
+}
+
+/// Section 11.1: a 404 is "no robots", recorded and not digest-pinned. Mutation 2026-11-15, 404
+/// mapped to a failure: red.
+#[test]
+fn a_robots_404_is_recorded_as_absent_and_pins_no_digest() -> TestResult {
+    let root = TempDir::new()?;
+    let exchange = Robots::of(&[(GNW_ROBOTS, NOT_FOUND, b"not here")]);
+    let answer = refreshed(root.path(), committed_hosts(), &exchange)?;
+    let row = first_row(&answer);
+    assert_eq!(
+        (
+            robots_rows(root.path())?,
+            attempts(root.path())?,
+            row["answer"].as_str(),
+            row["fetched_sha256"].clone(),
+        ),
+        (
+            vec![(GNW_HOST.to_owned(), "absent".to_owned(), None)],
+            vec![(
+                ROBOTS_SOURCE.to_owned(),
+                GNW_HOST.to_owned(),
+                "empty".to_owned()
+            )],
+            Some("absent"),
+            Value::Null,
+        )
+    );
+    Ok(())
+}
+
+/// Section 11.1: bot protection is permanent and a 4xx is not "allow all"; a rate limit, a 5xx
+/// and a lost connection are transient. None files a robots row. Mutation 2026-11-15, 403 mapped
+/// to absent: red.
+#[test]
+fn a_robots_403_5xx_or_transport_error_is_a_failed_attempt_with_no_robots_row() -> TestResult {
+    let mut seen = Vec::new();
+    for (answers, exit) in [
+        (vec![(GNW_ROBOTS, FORBIDDEN, &b"Access Denied"[..])], 8),
+        (vec![(GNW_ROBOTS, UNAVAILABLE, &b""[..])], 7),
+        (Vec::new(), 7),
+    ] {
+        let root = TempDir::new()?;
+        let answer = refreshed(root.path(), committed_hosts(), &Robots::of(&answers))?;
+        seen.push((
+            robots_rows(root.path())?.len(),
+            attempts(root.path())?,
+            first_row(&answer)["answer"].as_str().map(str::to_owned),
+            answer.exit.code(),
+            answer.exit.carries_the_result_on_stdout(),
+        ));
+        assert_eq!(answer.exit.code(), exit);
+    }
+    let failed = (
+        0,
+        vec![(
+            ROBOTS_SOURCE.to_owned(),
+            GNW_HOST.to_owned(),
+            "failed".to_owned(),
+        )],
+        Some("failed".to_owned()),
+    );
+    assert_eq!(
+        seen,
+        vec![
+            (failed.0, failed.1.clone(), failed.2.clone(), 8, true),
+            (failed.0, failed.1.clone(), failed.2.clone(), 7, false),
+            (failed.0, failed.1, failed.2, 7, false),
+        ]
+    );
+    Ok(())
+}
+
+/// Decision D1: a changed robots.txt is "the answer is no", reported with both digests, and the
+/// hosts file is left as it was. Mutation 2026-11-15, `matches_pin` always true: red.
+#[test]
+fn a_fetched_robots_digest_other_than_the_pin_exits_one_and_names_both() -> TestResult {
+    let root = TempDir::new()?;
+    let before = std::fs::read(committed_hosts())?;
+    let exchange = Robots::of(&[(GNW_ROBOTS, OK, CHANGED_BODY)]);
+    let answer = refreshed(root.path(), committed_hosts(), &exchange)?;
+    let row = first_row(&answer);
+    let changed = FileDigest::of(CHANGED_BODY);
+    assert_eq!(
+        (
+            answer.exit,
+            answer.exit.carries_the_result_on_stdout(),
+            row["fetched_sha256"].as_str(),
+            row["pinned"].as_str(),
+            row["matches_pin"].as_bool(),
+            std::fs::read(committed_hosts())? == before,
+        ),
+        (
+            RobotsExit::PinDiffers,
+            true,
+            Some(changed.hex()),
+            Some(GNW_PIN),
+            Some(false),
+            true,
+        )
+    );
+    Ok(())
+}
+
+/// The library dry run and the binary's: one url per row, nothing written, nothing sent.
+#[test]
+fn a_robots_refresh_dry_run_plans_one_url_per_row_and_writes_nothing() -> TestResult {
+    let root = TempDir::new()?;
+    let store = root.path().join("vault");
+    let exchange = Robots::of(&[]);
+    let ask = Ask {
+        dry_run: true,
+        ..ask(&store, two_row_hosts())
+    };
+    let feed = cmd_robots::open(&ask)?;
+    let answer = cmd_robots::run(&ask, &feed, &exchange, &Fixed)?;
+    let urls = |report: &Value| -> Vec<String> {
+        report["rows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row["url"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let output = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .args(["robots", "refresh", "--source", SOURCE, "--dry-run"])
+        .args(["--format", "json", "--non-interactive"])
+        .arg("--hosts")
+        .arg(two_row_hosts())
+        .arg("--rules")
+        .arg(&ask.rules)
+        .arg("--store")
+        .arg(&store)
+        .env("BELLWETHER_FEED_CONTACT", CONTACT)
+        .stdin(Stdio::null())
+        .output()?;
+    let printed: Value = serde_json::from_slice(&output.stdout)?;
+    let planned = vec![GNW_ROBOTS.to_owned(), PRN_ROBOTS.to_owned()];
+    assert_eq!(
+        (
+            answer.exit,
+            urls(&answer.report),
+            exchange.asked.borrow().len(),
+            output.status.code(),
+            urls(&printed),
+            store.exists(),
+        ),
+        (
+            RobotsExit::Ok,
+            planned.clone(),
+            0,
+            Some(EXIT_OK),
+            planned,
+            false
+        )
+    );
+    Ok(())
+}
+
+/// Section 10: a robots run is not a collect run, so it fills no expected run. Mutation
+/// 2026-11-15, `day_row` counting every envelope: red.
+#[test]
+fn a_robots_refresh_run_is_not_counted_against_expected_runs() -> TestResult {
+    let root = TempDir::new()?;
+    let body = gnw_body()?;
+    refreshed(
+        root.path(),
+        committed_hosts(),
+        &Robots::of(&[(GNW_ROBOTS, OK, &body)]),
+    )?;
+    let report = ledger(root.path(), Some(1))?;
+    let day = report.days.first().ok_or("one day")?;
+    assert_eq!(
+        (day.runs_observed, finding_codes(&report)),
+        (0, vec![RUNS_BELOW_EXPECTED])
+    );
+    Ok(())
+}
+
+/// Every kind of envelope names a known run, so a robots attempt is no orphan and the report is
+/// complete. Mutation 2026-11-15, `known_runs` built from `collect` envelopes only: red.
+#[test]
+fn a_robots_refresh_runs_attempts_are_not_orphans() -> TestResult {
+    let root = TempDir::new()?;
+    let body = gnw_body()?;
+    refreshed(
+        root.path(),
+        committed_hosts(),
+        &Robots::of(&[(GNW_ROBOTS, OK, &body)]),
+    )?;
+    let report = ledger(root.path(), None)?;
+    assert_eq!(
+        (
+            report.attempts_without_a_run_envelope.len(),
+            report.is_complete()
+        ),
+        (0, true)
+    );
+    Ok(())
+}
+
+/// A robots fetch asks a host, not a source: it moves no asking clock and a failed one is no
+/// `holds_a_failure`. Its signal is the refresh's own exit. Mutation 2026-11-15, the asking
+/// clock's `source <> 'robots'` removed: red.
+#[test]
+fn a_robots_fetch_moves_neither_the_asking_clock_nor_a_ledger_check_finding() -> TestResult {
+    let root = TempDir::new()?;
+    let exchange = Robots::of(&[(GNW_ROBOTS, FORBIDDEN, b"Access Denied")]);
+    refreshed(root.path(), committed_hosts(), &exchange)?;
+    let report = ledger(root.path(), None)?;
+    assert_eq!(
+        (
+            report.freshness.asking_clock.newest.clone(),
+            finding_codes(&report).contains(&HOLDS_A_FAILURE),
+            report
+                .days
+                .iter()
+                .map(|day| day.per_source.len())
+                .sum::<usize>(),
+        ),
+        (None, false, 0)
+    );
+    Ok(())
+}
+
+/// `ROBOTS_SOURCE` is kept out of the ledger by name, so a source of that name would vanish.
+#[test]
+fn no_registered_source_is_named_robots() {
+    assert!(Registered::ALL
+        .iter()
+        .all(|entry| entry.source() != ROBOTS_SOURCE));
+}
+
+/// The hand-written manifest against the parser it describes, as the collect test does.
+#[test]
+fn every_option_the_robots_refresh_parser_takes_is_in_the_machine_readable_schema() -> TestResult {
+    let binary = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_newsvault"))
+            .args(args)
+            .output()
+    };
+    let help =
+        String::from_utf8_lossy(&binary(&["robots", "refresh", "--help"])?.stdout).to_string();
+    let schema: Value = serde_json::from_slice(&binary(&["schema", "--format", "json"])?.stdout)?;
+    let named: Vec<String> = schema["commands"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|command| command["path"] == serde_json::json!(["robots", "refresh"]))
+        .and_then(|command| command["options"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|option| option["name"].as_str().map(|name| name.replace('_', "-")))
+        .collect();
+    let mut missing = Vec::new();
+    for word in help.split_whitespace() {
+        let flag = word.trim_end_matches(|c: char| !c.is_alphanumeric());
+        if let Some(long) = flag.strip_prefix("--") {
+            if !long.is_empty() && long != "help" && !named.contains(&long.to_owned()) {
+                missing.push(long.to_owned());
+            }
+        }
+    }
+    assert!(
+        !named.is_empty() && missing.is_empty(),
+        "{named:?} {missing:?}"
+    );
+    Ok(())
+}

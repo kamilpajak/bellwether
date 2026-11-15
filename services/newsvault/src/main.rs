@@ -10,10 +10,11 @@ use std::process::ExitCode;
 use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use news_provider::{Clock, Credentials, RunId, SystemClock, Wire};
+use news_provider::{Clock, Credentials, Provider, RunId, SystemClock, Wire};
 use newsvault::cmd_collect::{self, CollectRunError};
 use newsvault::cmd_items;
 use newsvault::cmd_ledger::{self, Ask, LedgerReadError, Report};
+use newsvault::cmd_robots::{self, RobotsError};
 use newsvault::lake::{Day, LakeError, LakeReader};
 use newsvault::publish::{publish_run, Fsync, PublishError};
 use newsvault::store::{Committer, StoreError};
@@ -178,9 +179,41 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
+    /// robots.txt of every hosts-file row, fetched under the ledger.
+    Robots {
+        #[command(subcommand)]
+        action: RobotsAction,
+    },
     /// Machine-readable description of this tool.
     Schema {
         #[arg(long, value_enum, default_value_t = Format::Json)]
+        format: Format,
+    },
+}
+
+#[derive(Subcommand)]
+enum RobotsAction {
+    /// Fetches each hosts-file row's robots.txt once, admitted and candidate, under an attempt
+    /// row, and compares it with the row's pin. Never writes the hosts file.
+    Refresh {
+        /// Source id whose hosts file is read: open_web_wires.
+        #[arg(long)]
+        source: String,
+        /// The hosts file, hashed; every row is asked.
+        #[arg(long)]
+        hosts: PathBuf,
+        /// The open-web-feed rules file the hosts rows name.
+        #[arg(long)]
+        rules: PathBuf,
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Plans one url per row and mutates nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Accepted and does nothing: no command here prompts or reads stdin.
+        #[arg(long)]
+        non_interactive: bool,
+        #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
 }
@@ -230,6 +263,9 @@ fn prefix_of(failure: &anyhow::Error) -> &'static str {
     if failure
         .downcast_ref::<CollectRunError>()
         .is_some_and(CollectRunError::is_usage)
+        || failure
+            .downcast_ref::<RobotsError>()
+            .is_some_and(RobotsError::is_usage)
     {
         "usage error"
     } else {
@@ -275,6 +311,17 @@ fn exit_code(failure: &anyhow::Error) -> u8 {
             ) => EXIT_NOT_FOUND,
             CollectRunError::Store(StoreError::LeaseHeld(_)) => EXIT_LEASE_HELD,
             // invalid_argument, input_unparseable, credential_contact_missing and io_failed.
+            _ => EXIT_USAGE,
+        };
+    }
+    if let Some(robots) = failure.downcast_ref::<RobotsError>() {
+        return match robots {
+            RobotsError::OpenWebRefused(
+                open_web_feed::Refusal::HostsAbsent(_)
+                | open_web_feed::Refusal::RulesAbsent(_)
+                | open_web_feed::Refusal::NoHostAdmitted(_),
+            ) => EXIT_NOT_FOUND,
+            RobotsError::Store(StoreError::LeaseHeld(_)) => EXIT_LEASE_HELD,
             _ => EXIT_USAGE,
         };
     }
@@ -420,6 +467,47 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 code => Verdict::No(code),
             })
         }
+        Command::Robots {
+            action:
+                RobotsAction::Refresh {
+                    source,
+                    hosts,
+                    rules,
+                    store,
+                    dry_run,
+                    non_interactive: _,
+                    format,
+                },
+        } => {
+            let registered = cmd_robots::registered(&source)?;
+            let ask = cmd_robots::Ask {
+                source,
+                hosts,
+                rules,
+                store: vault_root(store),
+                contact: contact(registered),
+                dry_run,
+            };
+            let feed = cmd_robots::open(&ask)?;
+            // The collector's profile, credential and pace files: a robots fetch waits for the
+            // same per-IP and per-host slots a collect run does.
+            let wire = Wire::new(
+                feed.transport(),
+                Credentials::default().with(registered.credential(), ask.contact.clone()),
+                &ask.store,
+                &feed.source(),
+            );
+            let answer = cmd_robots::run(&ask, &feed, &wire, &SystemClock)?;
+            if answer.exit.carries_the_result_on_stdout() {
+                emit_robots(&answer.report, format)?;
+            } else {
+                emit_robots_error(&answer, format)?;
+            }
+            Ok(match answer.exit.code() {
+                0 => Verdict::Ok,
+                code => Verdict::No(code),
+            })
+        }
         Command::Items {
             at,
             store,
@@ -512,6 +600,43 @@ fn emit_collect_error(answer: &cmd_collect::Answer, format: Format) -> anyhow::R
         "message": "the run reached no usable payload",
         "retryable": answer.exit.retryable(),
         "details": answer.envelope,
+        "suggestions": [std::env::args().collect::<Vec<String>>()],
+    });
+    let err = std::io::stderr();
+    let mut err = err.lock();
+    match format {
+        Format::Json => writeln!(err, "{object}")?,
+        Format::Human => writeln!(
+            err,
+            "error: {} (retryable {})",
+            answer.exit.error_code().unwrap_or_default(),
+            answer.exit.retryable()
+        )?,
+    }
+    Ok(())
+}
+
+fn emit_robots(report: &serde_json::Value, format: Format) -> anyhow::Result<()> {
+    let out = std::io::stdout();
+    let mut out = out.lock();
+    match format {
+        Format::Json => {
+            serde_json::to_writer_pretty(&mut out, report)?;
+            writeln!(out)?;
+        }
+        Format::Human => cmd_robots::render_human(report, &mut out)?,
+    }
+    Ok(())
+}
+
+/// Exit 7, every row failed transiently: the report rides the error object, never stdout.
+fn emit_robots_error(answer: &cmd_robots::Answer, format: Format) -> anyhow::Result<()> {
+    let object = serde_json::json!({
+        "schema": "newsvault.error/1",
+        "code": answer.exit.error_code(),
+        "message": "no robots.txt answered",
+        "retryable": answer.exit.retryable(),
+        "details": answer.report,
         "suggestions": [std::env::args().collect::<Vec<String>>()],
     });
     let err = std::io::stderr();
@@ -791,6 +916,34 @@ fn print_schema(format: Format) {
                     {"name": "format", "type": "enum", "values": ["human", "json"]}
                 ],
                 "output": "newsvault.publish/1",
+                "mutates": true
+            },
+            {
+                "path": ["robots", "refresh"],
+                "summary": "Fetches each hosts-file row's robots.txt under an attempt row and compares it with the row's pin.",
+                "options": [
+                    {"name": "source", "type": "enum", "required": true,
+                     "values": [open_web_feed::SOURCE],
+                     "doc": "edgar_press reads no hosts file and is invalid_argument"},
+                    {"name": "hosts", "type": "path", "required": true,
+                     "doc": "every row, admitted and candidate, is asked once; the file is never written"},
+                    {"name": "rules", "type": "path", "required": true},
+                    {"name": "store", "type": "path"},
+                    {"name": "dry_run", "type": "flag",
+                     "doc": "plans one url per row and mutates nothing"},
+                    {"name": "non_interactive", "type": "flag",
+                     "doc": "accepted and does nothing: no command here prompts or reads stdin"},
+                    {"name": "format", "type": "enum", "values": ["human", "json"]}
+                ],
+                "env": [{"name": "BELLWETHER_FEED_CONTACT", "source": "open_web_wires",
+                         "doc": "the contact address the open-web User-Agent carries"}],
+                "output": cmd_robots::SCHEMA,
+                "exits": {
+                    "0": "every row answered and every admitted pin matches",
+                    "1": "every row answered and an admitted pin differs",
+                    "7": "every row failed transiently",
+                    "8": "a row failed"
+                },
                 "mutates": true
             },
             {"path": ["schema"], "summary": "This document.", "mutates": false}

@@ -20,7 +20,7 @@ use open_web_feed::OpenWebFeed;
 use pit::{MeasuredLag, ObservationTime};
 use serde_json::{json, Value};
 
-use crate::cmd_ledger::{Envelope, RUN_ENVELOPE_SCHEMA};
+use crate::cmd_ledger::{Envelope, RunKind, RUN_ENVELOPE_SCHEMA};
 use crate::store::{Committer, ItemRow, StoreError, POLICY_DIR, RUNS_DIR};
 
 /// `/2` since 2026-11-15: `calendar_version` became nullable, a type change, and `window`,
@@ -29,7 +29,7 @@ pub const SCHEMA: &str = "newsvault.collect/2";
 /// What a run with no schedule slot is keyed by, so an ad-hoc run still has a run id and a
 /// partition key (accepted attack A1.7).
 const ADHOC: &str = "adhoc";
-const RUN_ID_FORMAT: &str = "%Y%m%dT%H%M%SZ";
+pub(crate) const RUN_ID_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 const STAGING_PREFIX: &str = ".tmp-";
 /// The one window spelling that is not a day: the UTC date of the run's own `at`.
 pub const TODAY: &str = "today";
@@ -533,6 +533,7 @@ pub fn run(
         expected_runs: ask.expected_runs,
         started_at: ask.at,
         finished_at: None,
+        kind: RunKind::Collect,
     };
     // Before the lease, so a run that never gets one is a record rather than a hole.
     write_envelope(&ask.store, &envelope)?;
@@ -611,7 +612,7 @@ fn run_id(ask: &Ask) -> String {
 
 /// tmp + rename, like every other file in the layout: a run killed while its envelope is rewritten
 /// otherwise leaves unparseable JSON and disables the command whose job is to report the kill.
-fn write_envelope(root: &Path, envelope: &Envelope) -> Result<(), CollectRunError> {
+pub(crate) fn write_envelope(root: &Path, envelope: &Envelope) -> Result<(), CollectRunError> {
     let runs = root.join(RUNS_DIR);
     std::fs::create_dir_all(&runs)?;
     let staging = runs.join(format!("{STAGING_PREFIX}{}.json", envelope.run_id));
