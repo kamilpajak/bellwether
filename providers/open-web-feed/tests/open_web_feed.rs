@@ -14,8 +14,8 @@ use news_provider::provider::{
 };
 use news_provider::request::{HeaderValue, Request, RequestPhase};
 use news_provider::{
-    AttemptSlot, CredentialRef, RawResponse, RunId, TargetWindow, TransportError, TransportKind,
-    Verdict,
+    AttemptSlot, CredentialRef, RawResponse, Redirects, RunId, TargetWindow, TransportError,
+    TransportKind, Verdict,
 };
 use open_web_feed::{
     AdmittedPath, HostPin, OpenWebFeed, Refusal, RobotsPin, CONTACT_CREDENTIAL, SOURCE,
@@ -87,6 +87,9 @@ const OUTSIDE_THE_CONTAINER: [&str; 5] = [
 const FIRST_ATTEMPT: u32 = 0;
 const OK: u16 = 200;
 const REQUEST_TIMEOUT: u16 = 408;
+/// RFC 9110's 3xx codes but 305 (deprecated) and 306 (unused); a `Refuse` profile hands each to
+/// `classify` as an answer.
+const REDIRECTS: [u16; 7] = [300, 301, 302, 303, 304, 307, 308];
 
 fn crate_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -346,7 +349,6 @@ fn every_other_client_error_is_permanent_and_a_rate_limit_or_server_error_is_tra
         (401, Verdict::PermanentFailure),
         (404, Verdict::PermanentFailure),
         (410, Verdict::PermanentFailure),
-        (301, Verdict::PermanentFailure),
         (429, Verdict::TransientFailure),
         (500, Verdict::TransientFailure),
         (503, Verdict::TransientFailure),
@@ -369,6 +371,22 @@ fn a_408_request_timeout_is_transient() -> Outcome {
             verdict(&provider, &request, REQUEST_TIMEOUT, b"")?,
             Verdict::TransientFailure
         );
+    }
+    Ok(())
+}
+
+/// `Redirects::Refuse` hands every 3xx to `classify` as the answer (§11.2); none is retried.
+#[test]
+fn a_redirect_is_permanent_never_transient() -> Outcome {
+    let provider = provider()?;
+    for request in [index_request(&provider)?, article_request(&provider)?] {
+        for status in REDIRECTS {
+            assert_eq!(
+                verdict(&provider, &request, status, b"")?,
+                Verdict::PermanentFailure,
+                "{status}"
+            );
+        }
     }
     Ok(())
 }
@@ -984,6 +1002,13 @@ fn a_live_follow_up_whose_story_is_held_is_dropped_and_an_unheld_one_kept() -> O
 }
 
 // ---- transport ----
+
+/// §11.2: a hop ureq follows is a request no pace file and no attempt row sees (row R19).
+#[test]
+fn the_profile_refuses_every_redirect() -> Outcome {
+    assert_eq!(provider()?.transport().redirects, Redirects::Refuse);
+    Ok(())
+}
 
 #[test]
 fn the_profile_paces_every_host_and_our_address_at_one_request_per_ten_seconds() -> Outcome {

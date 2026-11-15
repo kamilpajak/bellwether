@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use news_provider::{Clock, Credentials, Provider, RunId, SystemClock, Wire};
+use news_provider::{Clock, RunId, SystemClock};
 use newsvault::cmd_collect::{self, CollectRunError};
 use newsvault::cmd_items;
 use newsvault::cmd_ledger::{self, Ask, LedgerReadError, Report};
@@ -446,16 +446,7 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 dry_run,
             };
             let opened = cmd_collect::open_provider(&ask)?;
-            // The provider's profile, this crate's socket, and the credential by name: the
-            // address is substituted inside `Wire::send` and reaches no plan and no ledger row.
-            let wire = Wire::new(
-                opened.provider.transport(),
-                Credentials::default().with(opened.registered.credential(), ask.contact.clone()),
-                // The pace file goes beside this run's own store, and the production sleeper is
-                // the only thing in the tree that really waits.
-                &ask.store,
-                &opened.provider.source(),
-            );
+            let wire = cmd_collect::wire_for(&ask, &opened);
             let answer = match cmd_collect::run(&ask, &opened, &wire, &clock) {
                 Ok(answer) => answer,
                 Err(refused) => {
@@ -498,14 +489,7 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 dry_run,
             };
             let feed = cmd_robots::open(&ask)?;
-            // The collector's profile, credential and pace files: a robots fetch waits for the
-            // same per-IP and per-host slots a collect run does.
-            let wire = Wire::new(
-                feed.transport(),
-                Credentials::default().with(registered.credential(), ask.contact.clone()),
-                &ask.store,
-                &feed.source(),
-            );
+            let wire = cmd_robots::wire_for(&ask, &feed);
             let answer = cmd_robots::run(&ask, &feed, &wire, &SystemClock)?;
             match answer.emitted(std::env::args().collect()) {
                 cmd_robots::Emitted::Stdout(report) => emit_robots(&report, format)?,

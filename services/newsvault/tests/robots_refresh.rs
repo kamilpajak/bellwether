@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use canon::FileDigest;
 use chrono::{DateTime, Utc};
 use news_provider::{
-    Clock, Exchange, RawResponse, Request, SendFailure, SendPermit, TransportError,
+    Clock, Exchange, Provider, RawResponse, Request, SendFailure, SendPermit, TransportError,
 };
 use newsvault::cmd_collect::Registered;
 use newsvault::cmd_ledger;
@@ -20,6 +20,8 @@ use pit::ObservationTime;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use tempfile::TempDir;
+
+mod loopback;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -31,11 +33,13 @@ const RUN_ID: &str = "robots-20261115T100000Z";
 const GNW_HOST: &str = "rss.globenewswire.com";
 const GNW_ROBOTS: &str = "https://rss.globenewswire.com/robots.txt";
 const PRN_ROBOTS: &str = "https://www.prnewswire.com/robots.txt";
+const ROBOTS_PATH: &str = "/robots.txt";
 /// The committed hosts file's pin: `robots_rss_globenewswire_com.txt`'s sha256.
 const GNW_PIN: &str = "eb8bb698171dd56c139c224c9217070adf9947f6ed6cd02336eba55aa4155bfe";
 const PRN_BODY: &[u8] = b"User-agent: *\nDisallow: /search/\n";
 const CHANGED_BODY: &[u8] = b"User-agent: *\nDisallow: /\n";
 const OK: u16 = 200;
+const MOVED_PERMANENTLY: u16 = 301;
 const NOT_FOUND: u16 = 404;
 const FORBIDDEN: u16 = 403;
 const UNAVAILABLE: u16 = 503;
@@ -350,6 +354,100 @@ fn a_robots_408_stays_a_permanent_failure_with_no_robots_row() -> TestResult {
             answer.exit.code()
         ),
         (0, vec![Some("permanent_failure".to_owned())], EXIT_PARTIAL)
+    );
+    Ok(())
+}
+
+/// What one refresh left when GNW's robots url went through the real open-web `Wire` to a loopback
+/// server answering `301 Location: /elsewhere`, where `/elsewhere` serves the pinned body: robots
+/// rows, (outcome, status, verdict) per attempt, the reported row's answer and status, the exit,
+/// the urls sent and the paths the server saw.
+type Refreshed = (
+    usize,
+    Vec<(String, Option<i64>, Option<String>)>,
+    (Option<String>, Option<i64>),
+    u8,
+    Vec<String>,
+    Vec<String>,
+);
+
+fn refreshed_through_a_redirect(body_over_the_limit: bool) -> Result<Refreshed, Box<dyn Error>> {
+    let root = TempDir::new()?;
+    let ask = ask(root.path(), committed_hosts());
+    let feed = cmd_robots::open(&ask)?;
+    let server = if body_over_the_limit {
+        let over = usize::try_from(feed.transport().body_limit)? + 1;
+        loopback::Loopback::redirecting_with(ROBOTS_PATH, vec![b'x'; over], gnw_body()?)?
+    } else {
+        loopback::Loopback::redirecting(ROBOTS_PATH, gnw_body()?)?
+    };
+    let unanswered = Robots::of(&[]);
+    let exchange = loopback::Relay {
+        stub: &unanswered,
+        wire: cmd_robots::wire_for(&ask, &feed),
+        relayed: BTreeMap::from([(GNW_ROBOTS.to_owned(), server.url(ROBOTS_PATH))]),
+        asked: RefCell::default(),
+    };
+    let answer = cmd_robots::run(&ask, &feed, &exchange, &Fixed)?;
+    let (sent, hops) = (exchange.sent(), server.seen()?);
+    server.finish()?;
+    let recorded: Vec<(String, Option<i64>, Option<String>)> = read_only(root.path())?
+        .prepare("SELECT outcome, transport_status, verdict FROM attempts")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    let row = first_row(&answer);
+    Ok((
+        robots_rows(root.path())?.len(),
+        recorded,
+        (
+            row["answer"].as_str().map(str::to_owned),
+            row["transport_status"].as_i64(),
+        ),
+        answer.exit.code(),
+        sent,
+        hops,
+    ))
+}
+
+/// Both refusals below leave this.
+fn refused_robots_redirect() -> Refreshed {
+    (
+        0,
+        vec![(
+            "failed".to_owned(),
+            Some(i64::from(MOVED_PERMANENTLY)),
+            Some("permanent_failure".to_owned()),
+        )],
+        (
+            Some("failed".to_owned()),
+            Some(i64::from(MOVED_PERMANENTLY)),
+        ),
+        EXIT_PARTIAL,
+        vec![GNW_ROBOTS.to_owned()],
+        vec![ROBOTS_PATH.to_owned()],
+    )
+}
+
+/// Section 11.2, §11.5 step 5: the refresh's open-web `Wire` refuses a robots.txt 3xx, so the
+/// target, which serves the pinned body, is never fetched. Mutations 2026-11-15, open-web following
+/// one redirect / a 3xx mapped to `Empty` or `Usable` in `verdict_of`: each red.
+#[test]
+fn a_robots_redirect_is_a_permanent_failure_with_no_robots_row_and_its_target_never_fetched(
+) -> TestResult {
+    assert_eq!(
+        refreshed_through_a_redirect(false)?,
+        refused_robots_redirect()
+    );
+    Ok(())
+}
+
+/// A robots 301 whose body is over the profile's limit fails as `BodyOverLimit` and keeps the 301
+/// on its attempt row and in the report.
+#[test]
+fn a_robots_redirect_whose_body_is_over_the_limit_keeps_its_status() -> TestResult {
+    assert_eq!(
+        refreshed_through_a_redirect(true)?,
+        refused_robots_redirect()
     );
     Ok(())
 }

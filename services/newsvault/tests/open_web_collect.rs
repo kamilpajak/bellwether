@@ -23,6 +23,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use tempfile::TempDir;
 
+mod loopback;
 mod seed;
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -501,19 +502,21 @@ fn an_admitted_row_without_a_ledgered_robots_fetch_is_refused() -> TestResult {
     assert_eq!(verdict(&refused), "unverified none");
     assert_eq!(exchange.asked.borrow().len(), 0);
     assert!(snapshot(empty.path()).is_empty());
-    let failed_only = TempDir::new()?;
-    seed::refresh(
-        failed_only.path(),
-        &hosts(),
-        ROBOTS_EARLIER,
-        (FORBIDDEN, b"Access Denied"),
-    )?;
-    let before = snapshot(failed_only.path());
-    assert_eq!(
-        collected(failed_only.path(), hosts(), false)?,
-        "unverified none"
-    );
-    assert_eq!(snapshot(failed_only.path()), before);
+    for failed in [
+        (FORBIDDEN, b"Access Denied".as_slice()),
+        (MOVED_PERMANENTLY, b"moved".as_slice()),
+    ] {
+        let failed_only = TempDir::new()?;
+        seed::refresh(failed_only.path(), &hosts(), ROBOTS_EARLIER, failed)?;
+        let before = snapshot(failed_only.path());
+        assert_eq!(
+            collected(failed_only.path(), hosts(), false)?,
+            "unverified none",
+            "{}",
+            failed.0
+        );
+        assert_eq!(snapshot(failed_only.path()), before);
+    }
     Ok(())
 }
 
@@ -576,14 +579,24 @@ fn an_admitted_row_pinned_absent_is_admitted_only_by_a_ledgered_404() -> TestRes
     Ok(())
 }
 
-/// A failed fetch files no robots row, so it neither admits nor un-admits a host. Mutation
-/// 2026-11-15, the reader left-joining `attempts` to `robots`: red.
+/// A failed fetch files no robots row, so it neither admits nor un-admits a host; a 3xx is one
+/// (section 11.2). Mutation 2026-11-15, the reader left-joining `attempts` to `robots`: red.
 #[test]
 fn a_failed_robots_fetch_after_a_matching_one_leaves_the_host_admitted() -> TestResult {
-    let root = TempDir::new()?;
-    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
-    seed::refresh(root.path(), &hosts(), ROBOTS_LATER, (UNAVAILABLE, b""))?;
-    assert_eq!(collected(root.path(), hosts(), true)?, "admitted");
+    for failed in [
+        (UNAVAILABLE, b"".as_slice()),
+        (MOVED_PERMANENTLY, b"moved".as_slice()),
+    ] {
+        let root = TempDir::new()?;
+        seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+        seed::refresh(root.path(), &hosts(), ROBOTS_LATER, failed)?;
+        assert_eq!(
+            collected(root.path(), hosts(), true)?,
+            "admitted",
+            "{}",
+            failed.0
+        );
+    }
     Ok(())
 }
 
@@ -1055,14 +1068,28 @@ impl Clock for At {
 
 /// One live collect of the clock's own day at `at`, keyed by `schedule` so two polls of one store
 /// never share a run id.
-fn poll(store: &Path, at: &str, schedule: &str, exchange: &Gnw) -> Result<Exit, Box<dyn Error>> {
+fn poll(
+    store: &Path,
+    at: &str,
+    schedule: &str,
+    exchange: &dyn Exchange,
+) -> Result<Exit, Box<dyn Error>> {
+    Ok(polled(store, at, schedule, exchange)?.exit)
+}
+
+fn polled(
+    store: &Path,
+    at: &str,
+    schedule: &str,
+    exchange: &dyn Exchange,
+) -> Result<cmd_collect::Answer, Box<dyn Error>> {
     let ask = Ask {
         at: instant(at),
         schedule: Some(schedule.to_owned()),
         ..ask(store, cmd_collect::TODAY)
     };
     let opened = cmd_collect::open_provider(&ask)?;
-    Ok(cmd_collect::run(&ask, &opened, exchange, &At(instant(at)))?.exit)
+    Ok(cmd_collect::run(&ask, &opened, exchange, &At(instant(at)))?)
 }
 
 fn release_url(index: usize) -> Result<String, Box<dyn Error>> {
@@ -1126,23 +1153,151 @@ fn a_permanently_failed_document_is_not_fetched_again() -> TestResult {
     Ok(())
 }
 
-/// Section 11.1, owner decision of 2026-11-15 (§10): a 3xx is a permanent verdict, so it is not
-/// retried in-run, and it holds nothing, so the next poll asks again. Mutation 2026-11-15, the
-/// held read's 3xx exclusion dropped: red.
-#[test]
-fn a_document_answered_with_a_redirect_is_fetched_again_by_the_next_poll() -> TestResult {
+/// A release's first attempt row: its `transport_status` and `verdict`.
+fn first_attempt_of(root: &Path, release: usize) -> Result<(Option<i64>, String), Box<dyn Error>> {
+    let db = Connection::open_with_flags(root.join(COMMIT_LOG), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let (key, _, _, _) = RELEASES.get(release).ok_or("no such release")?;
+    let story = digest(canon::digest::story_id(SOURCE, key)).ok_or("story id")?;
+    Ok(db.query_row(
+        "SELECT transport_status, verdict FROM attempts WHERE story_id = ?1
+         ORDER BY opened_at, attempt_id LIMIT 1",
+        [&story],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?)
+}
+
+/// What two polls of one day left when release 0 went through the real open-web `Wire` to a
+/// loopback server answering its path `301 Location: /elsewhere`: how often the first poll sent
+/// release 0, the urls the second sent, the paths the server saw in each, release 0's first
+/// attempt row, the status the first envelope reported for it, and both exits.
+struct TwoPolls {
+    first_times: usize,
+    second: Vec<String>,
+    hops: (Vec<String>, Vec<String>),
+    first_attempt: (Option<i64>, String),
+    reported: Vec<Option<i64>>,
+    exits: (Exit, Exit),
+}
+
+/// The 301's body: the loopback server's own short one, or one byte over the profile's limit.
+#[derive(Clone, Copy)]
+enum MovedBody {
+    Short,
+    OverTheLimit,
+}
+
+fn polled_twice_through_a_redirect(moved_body: MovedBody) -> Result<TwoPolls, Box<dyn Error>> {
     let root = TempDir::new()?;
     seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
     let redirected = release_url(0)?;
-    let exchange = Gnw::day()?.answering(&redirected, &[MOVED_PERMANENTLY]);
-    poll(root.path(), RUN_AT, "first", &exchange)?;
-    let (first, _) = exchange.sent();
-    poll(root.path(), LATER_THE_SAME_DAY, "second", &exchange)?;
-    let (second, _) = exchange.sent();
-    let times = first.iter().filter(|url| **url == redirected).count();
+    let gnw = Gnw::day()?;
+    let moved = release_0_path()?;
+    let arrived = gnw.pages.get(&redirected).ok_or("no page")?.clone();
+    let ask = ask(root.path(), cmd_collect::TODAY);
+    let opened = cmd_collect::open_provider(&ask)?;
+    let server = match moved_body {
+        MovedBody::Short => loopback::Loopback::redirecting(&moved, arrived)?,
+        MovedBody::OverTheLimit => {
+            let over = usize::try_from(opened.provider.transport().body_limit)? + 1;
+            loopback::Loopback::redirecting_with(&moved, vec![b'x'; over], arrived)?
+        }
+    };
+    let exchange = loopback::Relay {
+        stub: &gnw,
+        wire: cmd_collect::wire_for(&ask, &opened),
+        relayed: BTreeMap::from([(redirected.clone(), server.url(&moved))]),
+        asked: RefCell::default(),
+    };
+    let first_answer = polled(root.path(), RUN_AT, "first", &exchange)?;
+    let (first, first_hops) = (exchange.sent(), server.seen()?);
+    let second_exit = poll(root.path(), LATER_THE_SAME_DAY, "second", &exchange)?;
+    let (second, second_hops) = (exchange.sent(), server.seen()?);
+    server.finish()?;
+    let reported = first_answer.envelope["attempts"]
+        .as_array()
+        .ok_or("no attempts in the envelope")?
+        .iter()
+        .filter(|row| row["url"].as_str() == Some(redirected.as_str()))
+        .map(|row| row["transport_status"].as_i64())
+        .collect();
+    Ok(TwoPolls {
+        first_times: first.iter().filter(|url| **url == redirected).count(),
+        second,
+        hops: (first_hops, second_hops),
+        first_attempt: first_attempt_of(root.path(), 0)?,
+        reported,
+        exits: (first_answer.exit, second_exit),
+    })
+}
+
+/// Release 0's path as the loopback server sees it.
+fn release_0_path() -> Result<String, Box<dyn Error>> {
+    let (_, path) = RELEASES[0]
+        .0
+        .split_once('/')
+        .ok_or("release 0 has no path")?;
+    Ok(format!("/{path}"))
+}
+
+/// Section 11.1, owner decision of 2026-11-15 (§10), §11.5 step 5: the 3xx is the answer, a
+/// permanent verdict that holds nothing, so the next poll asks again and the hop is never sent.
+/// Mutations 2026-11-15: open-web following one redirect, or the held read's 3xx exclusion
+/// dropped: red.
+#[test]
+fn a_document_answered_with_a_redirect_is_fetched_again_by_the_next_poll() -> TestResult {
+    let polled = polled_twice_through_a_redirect(MovedBody::Short)?;
+    let moved = release_0_path()?;
     assert_eq!(
-        (times, second),
-        (1, vec![INDEX.to_owned(), redirected.clone()])
+        (
+            polled.first_times,
+            polled.second,
+            polled.hops,
+            polled.first_attempt,
+            polled.reported,
+            polled.exits,
+        ),
+        (
+            1,
+            vec![INDEX.to_owned(), release_url(0)?],
+            (vec![moved.clone()], vec![moved]),
+            (
+                Some(i64::from(MOVED_PERMANENTLY)),
+                "permanent_failure".to_owned()
+            ),
+            vec![Some(i64::from(MOVED_PERMANENTLY))],
+            (Exit::PartialCollect, Exit::VendorRefusedAll),
+        )
+    );
+    Ok(())
+}
+
+/// A 301 whose body is over open-web's `BODY_LIMIT` fails as `BodyOverLimit`, and the failure keeps
+/// the 301, so it is not held either (section 11.1). Before 2026-11-15 its status was NULL and the
+/// story was held for good.
+#[test]
+fn a_redirect_whose_body_is_over_the_limit_is_fetched_again_by_the_next_poll() -> TestResult {
+    let polled = polled_twice_through_a_redirect(MovedBody::OverTheLimit)?;
+    let moved = release_0_path()?;
+    assert_eq!(
+        (
+            polled.first_times,
+            polled.second,
+            polled.hops,
+            polled.first_attempt,
+            polled.reported,
+            polled.exits,
+        ),
+        (
+            1,
+            vec![INDEX.to_owned(), release_url(0)?],
+            (vec![moved.clone()], vec![moved]),
+            (
+                Some(i64::from(MOVED_PERMANENTLY)),
+                "permanent_failure".to_owned()
+            ),
+            vec![Some(i64::from(MOVED_PERMANENTLY))],
+            (Exit::PartialCollect, Exit::VendorRefusedAll),
+        )
     );
     Ok(())
 }

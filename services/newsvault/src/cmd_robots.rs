@@ -9,9 +9,9 @@ use std::path::PathBuf;
 use canon::FileDigest;
 use chrono::{DateTime, Utc};
 use news_provider::{
-    AttemptSlot, Baseline, BudgetError, Clock, Counts, Exchange, Exit, LedgerError, Outcome,
-    OutcomeKind, Provenance, RawResponse, Request, RequestPhase, RunId, SendFailure, SourceId,
-    Tally, TargetWindow, TransportError, TransportKind, Verdict,
+    AttemptSlot, Baseline, BudgetError, Clock, Counts, Credentials, Exchange, Exit, LedgerError,
+    Outcome, OutcomeKind, Provenance, Provider, RawResponse, Request, RequestPhase, RunId,
+    SendFailure, SourceId, Tally, TargetWindow, TransportError, TransportKind, Verdict, Wire,
 };
 use open_web_feed::{HostPin, OpenWebFeed};
 use pit::ObservationTime;
@@ -171,6 +171,19 @@ pub fn open(ask: &Ask) -> Result<OpenWebFeed, RobotsError> {
     Ok(OpenWebFeed::open(&ask.hosts, &ask.rules, &ask.contact)?)
 }
 
+/// The one place a refresh builds its `Wire`, for `main.rs` and the loopback test alike: the
+/// collector's open-web profile, credential and pace files, so a robots fetch waits for the same
+/// per-IP and per-host slots a collect run does.
+#[must_use]
+pub fn wire_for(ask: &Ask, feed: &OpenWebFeed) -> Wire {
+    Wire::new(
+        feed.transport(),
+        Credentials::default().with(Registered::OpenWebWires.credential(), ask.contact.clone()),
+        &ask.store,
+        &feed.source(),
+    )
+}
+
 /// What one row's fetch left: `None` fields on a dry run, which asks nothing.
 struct Fetched {
     attempt_id: Option<String>,
@@ -298,7 +311,10 @@ fn fetch(
     };
     Ok(Fetched {
         attempt_id: Some(attempt_id),
-        transport_status: answer.as_ref().ok().map(RawResponse::status),
+        transport_status: match &answer {
+            Ok(response) => Some(response.status()),
+            Err(failed) => failed.status(),
+        },
         verdict: Some(verdict),
         outcome: Some(kind),
         robots,
