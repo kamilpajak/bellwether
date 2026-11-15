@@ -35,6 +35,7 @@ const REAL_ROWS: u32 = 3;
 const REAL_ARTICLE: &str = "article_3403075.html";
 const ARTICLE_URL: &str = "https://rss.globenewswire.com/news-release/2026/11/14/3403075/0/en/usta-florida-releases-2026-state-of-florida-tennis-report.html";
 const ARTICLE_WWW_URL: &str = "https://www.globenewswire.com/news-release/2026/11/14/3403075/0/en/usta-florida-releases-2026-state-of-florida-tennis-report.html";
+const ARTICLE_UPPER_CASE_URL: &str = "https://WWW.GlobeNewswire.com/news-release/2026/11/14/3403075/0/en/usta-florida-releases-2026-state-of-florida-tennis-report.html";
 const ARTICLE_KEY: &str = "rss.globenewswire.com/news-release/2026/11/14/3403075/0/en/usta-florida-releases-2026-state-of-florida-tennis-report.html";
 const ARTICLE_TITLE: &str = "USTA FLORIDA RELEASES 2026 STATE OF FLORIDA TENNIS REPORT";
 /// The three real `pubDate` values, minutes only, as the 2026-11-14 19:22:19Z feed spelled them.
@@ -55,6 +56,7 @@ const SCHEME_RELATIVE_CANONICAL: &str =
     "//rss.globenewswire.com/en/news-release/2026/11/14/3403075/0/en/a-relative-slug.html";
 const RESOLVED_CANONICAL: &str =
     "https://rss.globenewswire.com/en/news-release/2026/11/14/3403075/0/en/a-relative-slug.html";
+const EMPTY_PARAGRAPHS_PAGE: &str = "synthetic_empty_paragraphs.html";
 const NO_CONTAINER_PAGE: &str = "synthetic_no_article_container.html";
 const BOT_PROTECTION_PAGE: &str = "akamai_403_access_denied.html";
 const ARTICLE_PARAGRAPHS: usize = 3;
@@ -359,16 +361,26 @@ fn an_index_is_usable_with_rows_empty_without_and_permanent_when_it_is_not_rss()
     Ok(())
 }
 
-/// `classify`'s refusal of a host no row admits is what keeps `extract` from reading it.
+/// `classify`'s refusal of a host no row admits is what keeps `extract` from reading it: a host
+/// the file never names, and a `candidate` row's host. Mutation 2026-11-15, `admitted_row`
+/// matching any row: green before the candidate case.
 #[test]
 fn an_answer_from_a_host_no_row_admits_is_permanent() -> Outcome {
-    let provider = provider()?;
-    let mut request = article_request(&provider)?;
-    request.url = "https://www.prnewswire.com/news-releases/a.html".to_owned();
-    assert_eq!(
-        verdict(&provider, &request, OK, &gnw(REAL_ARTICLE))?,
-        Verdict::PermanentFailure
-    );
+    let with_a_candidate = OpenWebFeed::open(
+        &hosts_fixture("one_admitted_one_candidate.json"),
+        &rules_path(),
+        CONTACT,
+    )?;
+    for provider in [provider()?, with_a_candidate] {
+        let mut request = article_request(&provider)?;
+        request.url = "https://www.prnewswire.com/news-releases/a.html".to_owned();
+        assert_eq!(
+            verdict(&provider, &request, OK, &gnw(REAL_ARTICLE))?,
+            Verdict::PermanentFailure
+        );
+        let extracted = provider.extract(&request, &blob(gnw(REAL_ARTICLE)));
+        assert_eq!((extracted.items.len(), extracted.unusable.len()), (0, 0));
+    }
     Ok(())
 }
 
@@ -443,6 +455,11 @@ fn www_and_rss_links_of_one_release_share_one_item_key() -> Outcome {
         Some(ARTICLE_KEY)
     );
     assert_eq!(provider.item_key(ARTICLE_URL).as_deref(), Some(ARTICLE_KEY));
+    // Mutation 2026-11-15, the host's case kept: green before this case.
+    assert_eq!(
+        provider.item_key(ARTICLE_UPPER_CASE_URL).as_deref(),
+        Some(ARTICLE_KEY)
+    );
     assert_eq!(
         provider
             .item_key(&format!("{ARTICLE_URL}?utm=x#top"))
@@ -583,6 +600,20 @@ fn a_relative_canonical_link_is_resolved_against_the_page_url_before_it_reaches_
             ARTICLE_URL,
             ARTICLE_URL
         ]
+    );
+    Ok(())
+}
+
+/// The other half of `NoArticleBody` (section 11.5 step 2): a container holding only empty or
+/// whitespace paragraphs. Mutation 2026-11-15, the empty-paragraph filter removed: green before.
+#[test]
+fn a_container_holding_only_empty_paragraphs_is_unusable_as_no_article_body() -> Outcome {
+    let provider = provider()?;
+    let page = blob(gnw(EMPTY_PARAGRAPHS_PAGE));
+    let row = only_unusable(&provider.extract(&article_request(&provider)?, &page))?;
+    assert_eq!(
+        (row.reason, row.item.body.as_ref()),
+        (UnusableReason::NoArticleBody, None)
     );
     Ok(())
 }
