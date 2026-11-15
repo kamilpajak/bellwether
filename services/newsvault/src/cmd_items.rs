@@ -365,8 +365,8 @@ mod tests {
     /// GNW's RSS `pubDate` of 2026-11-14, `Sat, 14 Nov 2026 19:00 GMT`, read inside that minute.
     const A_PUBLICATION_MINUTE: &str = "2026-11-14T19:00:00Z";
     const READ_INSIDE_IT: &str = "2026-11-14T19:00:30Z";
-    const ONE_MICROSECOND_BEFORE_IT_CLOSES: &str = "2026-11-14T19:00:59.999998Z";
-    const THE_LAST_MICROSECOND_OF_IT: &str = "2026-11-14T19:00:59.999999Z";
+    const ONE_MICROSECOND_BEFORE_IT_CLOSES: &str = "2026-11-14T19:00:59.999999Z";
+    const WHEN_IT_CLOSES: &str = "2026-11-14T19:01:00Z";
     const AFTER_THE_MINUTE_BEFORE_THE_FETCH: &str = "2026-11-14T19:02:00Z";
 
     fn ask(at: &str) -> Result<Ask, chrono::ParseError> {
@@ -398,7 +398,7 @@ mod tests {
         for cutoff in [
             READ_INSIDE_IT,
             ONE_MICROSECOND_BEFORE_IT_CLOSES,
-            THE_LAST_MICROSECOND_OF_IT,
+            WHEN_IT_CLOSES,
         ] {
             let report = read(root.path(), &ask(cutoff)?)?;
             precisions.push(

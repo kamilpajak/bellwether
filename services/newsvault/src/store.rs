@@ -1286,15 +1286,16 @@ fn dispute(
 }
 
 /// The newest publication value visible at `at` (RFC 3339 UTC, microseconds), for the ledger's
-/// publication clock. A minute counts once its LAST microsecond has passed and is reported as the
-/// stored minute, never as an instant inside it.
+/// publication clock. A minute counts from the start of the NEXT minute, as `pit`'s minute arm
+/// counts it, and is reported as the stored minute, never as an instant inside it.
 pub fn newest_visible_publication(db: &Connection, at: &str) -> Result<Option<String>, StoreError> {
     Ok(db.query_row(
         "SELECT MAX(value) FROM (
              SELECT valid_at AS value FROM items WHERE valid_at <= ?1 AND observed_at <= ?1
              UNION ALL
              SELECT valid_minute FROM items
-              WHERE substr(valid_minute, 1, 17) || '59.999999Z' <= ?1 AND observed_at <= ?1)",
+              WHERE strftime('%Y-%m-%dT%H:%M:%S.000000Z', valid_minute, '+1 minute') <= ?1
+                AND observed_at <= ?1)",
         [at],
         |row| row.get(0),
     )?)
@@ -1448,9 +1449,10 @@ mod tests {
     /// 00:02 and 00:03 UTC on 1970-01-01, whole minutes on the same clock as `VALID_AT`.
     const A_PUBLICATION_MINUTE: i64 = 120 * SECOND;
     const A_LATER_PUBLICATION_MINUTE: i64 = 180 * SECOND;
-    /// Inside `A_PUBLICATION_MINUTE`, and its last microsecond.
+    /// Inside `A_PUBLICATION_MINUTE`, its last microsecond, and the instant it closes.
     const INSIDE_THAT_MINUTE: &str = "1970-01-01T00:02:30.000000Z";
-    const THAT_MINUTE_CLOSES: &str = "1970-01-01T00:02:59.999999Z";
+    const ONE_MICROSECOND_BEFORE_THAT_MINUTE_CLOSES: &str = "1970-01-01T00:02:59.999999Z";
+    const THAT_MINUTE_CLOSES: &str = "1970-01-01T00:03:00.000000Z";
     const INSERTED_BY_HAND: &str = "INSERT INTO items (item_id, story_id, attempt_id, valid_at,
          valid_minute, observed_at, valid_disputed, raw_blob, committed_at, valid_source)
          SELECT 'by hand', 'by hand', attempt_id, ?1, ?2, ?3, 0, raw_blob, ?3, ?4 FROM items";
@@ -2839,11 +2841,13 @@ mod tests {
         };
         store.record(closed, &[minute_row(&store, &read_inside)?], at(5))?;
         assert_eq!(
-            (
-                newest_visible_publication(&store.db, INSIDE_THAT_MINUTE)?,
-                newest_visible_publication(&store.db, THAT_MINUTE_CLOSES)?
-            ),
-            (None, Some(stamped(A_PUBLICATION_MINUTE)))
+            [
+                INSIDE_THAT_MINUTE,
+                ONE_MICROSECOND_BEFORE_THAT_MINUTE_CLOSES,
+                THAT_MINUTE_CLOSES
+            ]
+            .map(|at| newest_visible_publication(&store.db, at).ok().flatten()),
+            [None, None, Some(stamped(A_PUBLICATION_MINUTE))]
         );
         Ok(())
     }

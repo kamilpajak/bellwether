@@ -30,11 +30,11 @@ impl Minute {
         self.0
     }
 
-    /// The minute's last microsecond, or `None` past the last instant chrono holds.
+    /// The first instant after the minute, or `None` past the last instant chrono holds. An
+    /// inclusive last microsecond admitted the item at 19:00:59.999999, before 19:00 had closed.
     #[must_use]
-    pub fn end(self) -> Option<DateTime<Utc>> {
-        self.0
-            .checked_add_signed(Duration::minutes(1) - Duration::microseconds(1))
+    pub fn closes(self) -> Option<DateTime<Utc>> {
+        self.0.checked_add_signed(Duration::minutes(1))
     }
 }
 
@@ -137,9 +137,11 @@ impl Datedness {
     pub fn visible_at(&self, cutoff: Cutoff) -> bool {
         match self {
             Self::Dated(v) => v.visible_at(cutoff),
-            // From the minute's LAST microsecond: from its start is the fold the day arm refuses.
+            // From the minute's close: from its start is the fold the day arm refuses.
             Self::MinuteDated { minute, observed } => {
-                minute.end().is_some_and(|ends| cutoff.inner() >= ends)
+                minute
+                    .closes()
+                    .is_some_and(|closes| cutoff.inner() >= closes)
                     && cutoff.admits_observation(*observed)
             }
             // The end of the day in the WINDOW'S OWN calendar, not UTC: a day bounded by UTC
@@ -242,8 +244,10 @@ mod tests {
     /// GNW's RSS `pubDate` of 2026-11-14, `Sat, 14 Nov 2026 19:00 GMT`.
     const A_PUBLICATION_MINUTE: &str = "2026-11-14T19:00:00Z";
     const INSIDE_THAT_MINUTE: &str = "2026-11-14T19:00:30Z";
-    const ONE_MICROSECOND_BEFORE_IT_CLOSES: &str = "2026-11-14T19:00:59.999998Z";
-    const THE_LAST_MICROSECOND_OF_THAT_MINUTE: &str = "2026-11-14T19:00:59.999999Z";
+    const ONE_MICROSECOND_BEFORE_IT_CLOSES: &str = "2026-11-14T19:00:59.999999Z";
+    /// A cutoff is not truncated to the microsecond, so a nanosecond short of the close is one.
+    const ONE_NANOSECOND_BEFORE_IT_CLOSES: &str = "2026-11-14T19:00:59.999999999Z";
+    const WHEN_THAT_MINUTE_CLOSES: &str = "2026-11-14T19:01:00Z";
     const BEFORE_THAT_MINUTE_STARTS: &str = "2026-11-14T18:59:59.999999Z";
     const AFTER_THE_MINUTE_BEFORE_THE_FETCH: &str = "2026-11-14T19:02:00Z";
     const FETCHED_AFTER_THAT_MINUTE: &str = "2026-11-14T19:05:00Z";
@@ -402,10 +406,11 @@ mod tests {
         let visible = [
             INSIDE_THAT_MINUTE,
             ONE_MICROSECOND_BEFORE_IT_CLOSES,
-            THE_LAST_MICROSECOND_OF_THAT_MINUTE,
+            ONE_NANOSECOND_BEFORE_IT_CLOSES,
+            WHEN_THAT_MINUTE_CLOSES,
         ]
         .map(|cutoff| item.visible_at(Cutoff::new(at(cutoff))));
-        assert_eq!(visible, [false, false, true]);
+        assert_eq!(visible, [false, false, false, true]);
     }
 
     /// The observation half: mutation 2026-11-15 dropped `admits_observation` from the minute arm
