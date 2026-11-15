@@ -15,7 +15,7 @@ use news_provider::{
 };
 use newsvault::cmd_collect::{self, Ask, CollectRunError};
 use newsvault::cmd_items::{self, PerStory};
-use newsvault::store::{StoreError, COMMIT_LOG};
+use newsvault::store::{StoreError, COMMIT_LOG, SCHEMA_VERSION};
 use open_web_feed::OpenWebFeed;
 use pit::ObservationTime;
 use rusqlite::{Connection, OpenFlags};
@@ -52,7 +52,8 @@ const ROBOTS_LATER: &str = "2026-11-14T18:00:00Z";
 /// The committed hosts file's GNW pin, `robots_rss_globenewswire_com.txt`'s sha256.
 const GNW_PIN: &str = "eb8bb698171dd56c139c224c9217070adf9947f6ed6cd02336eba55aa4155bfe";
 const CHANGED_ROBOTS: &[u8] = b"User-agent: *\nDisallow: /\n";
-const NEWER_STORE: i32 = 3;
+/// One above `store::SCHEMA_VERSION`, which this build must refuse.
+const NEWER_STORE: i32 = SCHEMA_VERSION + 1;
 
 /// The three `rssfeed_3_items.xml` links after the www -> rss rewrite, the page each is answered
 /// with, its pubDate text, and the canonical link that page names (`None`: not committed).

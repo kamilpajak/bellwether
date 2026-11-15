@@ -142,22 +142,23 @@
 ### 3.1 `Item` — what `vault` stores and publishes
 
 - The archive record; every consumer sees this shape, none the storage behind it.
-- Stored today: `items` in `services/newsvault/src/store.rs` at `PRAGMA user_version` 2: the
+- Stored today: `items` in `services/newsvault/src/store.rs` at `PRAGMA user_version` 3: the
   frozen v0 DDL `SCHEMA_V0` plus `MIGRATIONS[0]`, which rebuilds `items` (SQLite's table-rebuild
   procedure: foreign keys off around one transaction, `PRAGMA foreign_key_check` before commit),
-  plus `MIGRATIONS[1]`, which creates `robots` (§3.2); exported as `publish::SegmentRow` with `source`
+  plus `MIGRATIONS[1]`, which creates `robots` (§3.2), plus `MIGRATIONS[2]`, which adds
+  `attempts.verdict` (§3.2); exported as `publish::SegmentRow` with `source`
   joined from `attempts`; `requested_at` and `received_at` live on `attempts`, reached through
   `attempt_id`.
 - Schema versioning (§11.1), since 2026-11-15:
-  - a store is brought to user_version 2 in one transaction by `Committer::open`: `SCHEMA_V0`
+  - a store is brought to user_version 3 in one transaction by `Committer::open`: `SCHEMA_V0`
     (`CREATE TABLE IF NOT EXISTS`) creates each v0 table the store lacks, then each
     `MIGRATIONS[i]` from the version it holds.
-  - a store at user_version `n` below 2 is compared first with the columns of `SCHEMA_V0` replayed
+  - a store at user_version `n` below 3 is compared first with the columns of `SCHEMA_V0` replayed
     with `MIGRATIONS[..n]` in memory (`PRAGMA table_info`: name, type, NOT NULL, default, primary
     key); a difference is refused with `StoreError::ShapeDiffers { found, columns }` naming each
     `table.column`, exit 2, store left at user_version `n`, no repair step: §8 row M1.
   - at user_version 0 a table the store lacks is skipped, because `SCHEMA_V0` creates it whole; at
-    1 every column of a missing table is named.
+    1 and 2 every column of a missing table is named.
   - a migration step SQLite refuses is `StoreError::MigrationFailed { from, step, cause }`, exit
     2, store left at user_version `from`; `cause` is SQLite's message without the SQL batch
     (review 2026-11-15 measured 2,040 bytes of stderr, most of it the batch, before):
@@ -167,7 +168,7 @@
     the v0 tables the store lacks"; review 2026-11-15 read "the step to user_version 0" for it:
     `a_failure_creating_the_v0_tables_is_named_as_that_step` (mutations 2026-11-15, labelled
     `ToUserVersion(0)` / left unwrapped: each red).
-  - a user_version above 2 is refused (`StoreError::SchemaVersion`):
+  - a user_version above 3 is refused (`StoreError::SchemaVersion`):
     `a_store_at_an_unknown_higher_user_version_is_refused` (mutation 2026-11-15, refusal removed:
     red).
   - `collect` refuses that store before its policy copy, run envelope and lease, so the store
@@ -175,7 +176,7 @@
     `a_run_against_a_store_at_a_newer_user_version_leaves_the_store_unchanged` (mutation
     2026-11-15, the check removed: red; review 2026-11-15 measured a `runs/` file and a `LOCK`
     left behind before it).
-  - the same check refuses a store below 2 whose columns differ from its version's shape,
+  - the same check refuses a store below 3 whose columns differ from its version's shape,
     read-only (`store::refuse_an_unreadable_version`):
     `a_run_against_a_v0_store_of_another_shape_leaves_the_store_unchanged` (mutation 2026-11-15,
     the v0 check removed: red; review 2026-11-15 measured `LOCK` and a `runs/` file left behind).
@@ -191,11 +192,13 @@
     exit 2) and the store stays at user_version 0:
     `a_v0_store_holding_an_item_with_no_attempt_is_refused_rather_than_migrated` (mutation
     2026-11-15, the `foreign_key_check` result ignored: red).
-  - `items` and `ledger` open read-only, cannot migrate, and refuse every user_version but 2 with
+  - `items` and `ledger` open read-only, cannot migrate, and refuse every user_version but 3 with
     `StoreError::SchemaVersion`, exit 2: `a_reader_refuses_a_store_at_another_user_version`
     (mutation 2026-11-15, the check removed from either reader: red).
-  - so a v0 store is unreadable by `items` and `ledger` until a writer (`collect`, `publish`) opens
-    it.
+  - so a store below 3 is unreadable by `items` and `ledger` until a writer (`collect`, `publish`)
+    opens it.
+  - `store::RobotsLedger::open` (§8 row R4, robots clause) accepts any user_version up to 3, so
+    `collect` reads a v2 store's `robots` table before the same run migrates it.
 - No column today: `source_item_id`, `provenance` (§8 row R10), `data_through` (§8 row R13),
   `title`, `url`, `lang`, `body_ref`'s `present` \| `expired` state,
   `vendor_tickers`, `vendor_duplicate_flag`.
@@ -312,7 +315,7 @@
 - One row per attempt, written **whether or not anything came back**, so "nothing happened" and "we
   did not look" differ. The predecessor could not tell them apart: one day held 59 items against a
   median of 181 and nothing recorded which it was.
-- Stored as `attempts` in `services/newsvault/src/store.rs` (user_version 2, §3.1), written from
+- Stored as `attempts` in `services/newsvault/src/store.rs` (user_version 3, §3.1), written from
   `news_provider::ledger::AttemptEvent`; every field below is a column there except
   `result_digest`, and the table holds more (`universe_version`, `matched`, `baseline_*`, `closed_at`).
 
@@ -323,6 +326,7 @@
 | `hosts_version` | the hosts file the request's host was admitted under (§2), from `Request.hosts_version` via `Opened`; outside `filter_params` (`requests_that_differ_only_in_hosts_version_have_one_filter_params_digest`). NULL for a provider that reads no hosts file (`edgar-press`); `open-web-feed` sets it on every request: `the_opened_row_carries_the_hosts_version_the_request_was_built_from` (mutation 2026-11-15, `Opened` carries `None`: red) |
 | `requested_at`, `received_at`, `transport_status` | |
 | `outcome` | `ok` \| `empty` \| `failed` \| `interrupted` \| `collapsed`; the built four are `news_provider::ledger::OutcomeKind::name`, `collapsed` is designed and NOT built (below) |
+| `verdict` | `usable` \| `empty` \| `permanent_failure` \| `transient_failure` (`Verdict::name`, `CHECK`ed), set by `Outcome::decide` and carried by `Finalised` inside `Outcome`; tells the two `failed` kinds apart for §11.1's held table. NULL for an abandoned attempt and for every row closed before user_version 3, not backfilled (`failed` names neither kind): `every_verdict_reaches_the_verdict_column_by_its_own_name_and_an_abandoned_attempt_none` (mutation 2026-11-15, `apply` writes NULL: red); `every_verdict_name_is_one_the_verdict_check_admits`, control `failed` refused (mutation that day, `transient_failure` removed from the CHECK: red); `news_provider::ledger::tests::a_finalised_outcome_carries_its_verdict_and_an_abandoned_one_none` (mutation that day, `decide` stores `Usable`: red). No reader on a real path until §11.5 step 4's held read |
 | `vendor_rows`, `items_new` | **R16.** Rows the payload held before our filtering; first sightings per `story_id` (§8 row R16). Written when `items_new` is zero, so poll events are recoverable, not only content changes: content-hash dedup is right for storage and destroys exactly this |
 | `slots` | the only cost recorded: 1 when the send permit was taken, else 0; NULL when abandoned (`Cost::Slots`) |
 | `result_digest` | sha256 over the set of `item_id`s the attempt committed, ordered over raw UTF-8 bytes and deduplicated, so a repeated query's drift is detectable and a reordered answer is not drift. Not a column: `newsvault ledger` computes it and reports drift per (`source`, `target_window`) |
@@ -875,7 +879,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | U1 | **the panel names the roster it was built from** | collection side: `news_provider::Request.universe_version` inside `filter_params`; `attempts.universe_version` is `NOT NULL`; `news_provider::request::tests::two_runs_whose_rosters_differ_have_two_filter_params_digests`, `newsvault::store::tests::the_opened_row_carries_the_roster_digest_the_request_was_built_from`<br>absent, unparseable or empty roster: `edgar-press::Refusal` (§9)<br>panel side: nothing | **no enforcement point yet**: the panel side has none; the collection side has only a producer, a column and the two tests in the enforced-by cell<br>unguarded: `panel-contract schema` lists 13 manifest fields, none a roster or `relation_map_version` (measured 2026-11-12), so §2 names five `panel_id` inputs where the gate requires three<br>making them required rewrites seven fixtures and R8: a decision, not an omission |
 | E1 | an error code is never renamed, and no code reaches stderr from outside the table | §5.1 stderr codes: nothing; design: workspace member `error-codes/` with `const CODES`, `codes.snapshot`, a snapshot test, and a constructor taking `&'static Code`<br>`panel-contract`'s 15 stdout `Finding` codes: renaming any one turns a named test red (`cargo test -p panel-contract --lib`, measured 2026-11-12) | **no enforcement point yet** for §5.1's codes<br>renaming the 15 `Finding` codes: **enforced**<br>unguarded: a new code needs no table entry and no review<br>unguarded: repurposing a code is not checkable |
 | H1 | every difference between `derive`'s picks and the predecessor's has a named cause (memo §5.1, build step 6) | nothing: no cause list, diff artefact or test exists | **no enforcement point yet** |
-| M1 | a store at the previous `user_version` opens, migrates and takes a row of every precision the current one stores (§11.1) | `Committer::open` → `migrate`: `newsvault::store::tests::a_store_at_the_previous_user_version_opens_migrates_and_takes_a_minute_row` (from 0); `a_store_at_user_version_one_opens_migrates_to_two_and_takes_a_robots_row` (from 1); carried from 1: `a_v1_store_keeps_every_v1_column_of_every_row` (one row in each of the five v1 tables, every column compared by `quote()`); shape at 1: `a_v1_store_whose_columns_differ_is_refused_and_left_at_user_version_one` (`attempts.hosts_version INTEGER`, `published` dropped; both `Committer::open` and `refuse_an_unreadable_version`); carried: `a_migrated_v0_store_keeps_every_v0_column_of_every_row_and_both_indexes` (v0 fixture: one instant, one day+tz and one refused row, `seq` 7..9, every nullable v0 column set, `valid_disputed` 1; all 15 v0 columns compared by `quote()` before and after, and the `items_by_story`/`items_by_doc` index names) | **enforced** from user_version 0 to 1: mutations 2026-11-15, the `items` rebuild replaced by the three `ADD COLUMN`s / every migration step skipped: red<br>**enforced** from 1 to 2 since 2026-11-15: mutations that day, `MIGRATIONS[1]` emptied: red; the shape check skipped at 1: red; a table missing at 1 skipped as at 0: red; `DELETE FROM published` added to `MIGRATIONS[1]`: the carried test red<br>carried columns and indexes **enforced** since 2026-11-15: mutations that day, the copy reduced to 11 columns without `seq`, `doc_id`, `earliest_valid_at`, `body_blob` / `doc_id` and `earliest_valid_at` dropped / both `CREATE INDEX` lines dropped: each green before the carried test, red after<br>a v0 store written by an older binary: **enforced** for a missing column since 2026-11-15 (`StoreError::ShapeDiffers { found: 0, .. }`): `a_v0_store_whose_attempts_predate_matched_is_refused_and_left_at_user_version_zero` (fixture: `attempts` as written before 067a0bd, 2026-11-13, 22 columns, no `matched`); mutation that day, the shape check skipped: red. Before it, review 2026-11-15 measured a scratch store of that shape (1,006 attempt rows) migrate to user_version 1 without `matched`, then `ledger` exit 2 on `no such column: a.matched`. Refused, not repaired: only scratch stores have that shape (R11 search, 2026-11-15)<br>a column whose name matches and whose type, NOT NULL, default or key differs: **enforced** since 2026-11-15: `a_v0_store_whose_column_differs_in_type_not_null_default_or_key_is_refused` (four fixtures: `attempts.slots TEXT`, `run_id` without NOT NULL, `outcome DEFAULT 'x'`, `attempt_id UNIQUE` for PRIMARY KEY); mutations that day, each of the four `PRAGMA table_info` fields read as a constant: each red<br>unguarded: on `attempts`, `blobs`, `seq_reservations` and `published`, the v0 tables `MIGRATIONS[0]` does not rebuild, table-level UNIQUE, CHECK and FOREIGN KEY clauses, AUTOINCREMENT, WITHOUT ROWID and indexes are not compared (review 2026-11-15: `attempts` with `UNIQUE(run_id)` added reached user_version 1 with the clause kept)<br>unguarded: a v0 migration step SQLite refuses leaves `LOCK` and a run envelope under `collect` (§3.1) |
+| M1 | a store at the previous `user_version` opens, migrates and takes a row of every precision the current one stores (§11.1) | `Committer::open` → `migrate`: `newsvault::store::tests::a_store_at_the_previous_user_version_opens_migrates_and_takes_a_minute_row` (from 0); `a_store_at_user_version_one_opens_migrates_to_two_and_takes_a_robots_row` (from 1); carried from 1: `a_v1_store_keeps_every_v1_column_of_every_row` (one row in each of the five v1 tables, every v1 column compared by `quote()`); shape at 1: `a_v1_store_whose_columns_differ_is_refused_and_left_at_user_version_one` (`attempts.hosts_version INTEGER`, `published` dropped; both `Committer::open` and `refuse_an_unreadable_version`); `a_store_at_user_version_two_opens_migrates_to_three_and_takes_a_verdict` (from 2); carried from 2: `a_v2_store_keeps_every_v2_column_of_every_row` (the v1 fixture plus one `robots` row, every v2 column compared by `quote()`, the new `verdict` NULL); shape at 2: `a_v2_store_whose_columns_differ_is_refused_and_left_at_user_version_two` (`robots.host INTEGER`, `robots` dropped; both entry points); carried: `a_migrated_v0_store_keeps_every_v0_column_of_every_row_and_both_indexes` (v0 fixture: one instant, one day+tz and one refused row, `seq` 7..9, every nullable v0 column set, `valid_disputed` 1; all 15 v0 columns compared by `quote()` before and after, and the `items_by_story`/`items_by_doc` index names) | **enforced** from user_version 0 to 1: mutations 2026-11-15, the `items` rebuild replaced by the three `ADD COLUMN`s / every migration step skipped: red<br>**enforced** from 1 to 2 since 2026-11-15: mutations that day, `MIGRATIONS[1]` emptied: red; the shape check skipped at 1: red; a table missing at 1 skipped as at 0: red; `DELETE FROM published` added to `MIGRATIONS[1]`: the carried test red<br>**enforced** from 2 to 3 since 2026-11-15: mutations that day, `MIGRATIONS[2]` emptied: red; the shape check skipped at 2: red; `UPDATE attempts SET outcome = NULL` added to `MIGRATIONS[2]`: the carried test red. A copy of a test-made v2 store (9 attempts, 5 blobs, 4 items, 4 reservations, 1 robots row; no production store exists, R11 search 2026-11-15) migrated by an `edgar_press` collect over 2026-11-11, a day the fixture calendar closes, `planned_requests` 0 in the dry run first: user_version 3, every v2 column of all 23 rows identical by `quote()`, `verdict` NULL on all 9 attempts (2026-11-15, by hand, not committed)<br>carried columns and indexes **enforced** since 2026-11-15: mutations that day, the copy reduced to 11 columns without `seq`, `doc_id`, `earliest_valid_at`, `body_blob` / `doc_id` and `earliest_valid_at` dropped / both `CREATE INDEX` lines dropped: each green before the carried test, red after<br>a v0 store written by an older binary: **enforced** for a missing column since 2026-11-15 (`StoreError::ShapeDiffers { found: 0, .. }`): `a_v0_store_whose_attempts_predate_matched_is_refused_and_left_at_user_version_zero` (fixture: `attempts` as written before 067a0bd, 2026-11-13, 22 columns, no `matched`); mutation that day, the shape check skipped: red. Before it, review 2026-11-15 measured a scratch store of that shape (1,006 attempt rows) migrate to user_version 1 without `matched`, then `ledger` exit 2 on `no such column: a.matched`. Refused, not repaired: only scratch stores have that shape (R11 search, 2026-11-15)<br>a column whose name matches and whose type, NOT NULL, default or key differs: **enforced** since 2026-11-15: `a_v0_store_whose_column_differs_in_type_not_null_default_or_key_is_refused` (four fixtures: `attempts.slots TEXT`, `run_id` without NOT NULL, `outcome DEFAULT 'x'`, `attempt_id UNIQUE` for PRIMARY KEY); mutations that day, each of the four `PRAGMA table_info` fields read as a constant: each red<br>unguarded: on `attempts`, `blobs`, `seq_reservations` and `published`, the v0 tables `MIGRATIONS[0]` does not rebuild, table-level UNIQUE, CHECK and FOREIGN KEY clauses, AUTOINCREMENT, WITHOUT ROWID and indexes are not compared (review 2026-11-15: `attempts` with `UNIQUE(run_id)` added reached user_version 1 with the clause kept)<br>unguarded: a v0 migration step SQLite refuses leaves `LOCK` and a run envelope under `collect` (§3.1) |
 
 ---
 
@@ -1179,9 +1183,10 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | `Document` attempt closed `Usable`, `Empty`, `PermanentFailure`, or with only unusable rows | yes (an `Empty` or unusable page: re-fetching returns the same page; the raw blob, §3.9, allows re-extraction) |
 | `TransientFailure`, interrupted by the startup sweep, in flight | no |
 
-- `Usable`, `Empty`, `PermanentFailure`, `TransientFailure` are `news_provider::ledger::Verdict` arms; today §3.2's `OutcomeKind` maps both failures to `failed` (`Outcome::decide`, `news-provider/src/ledger.rs`). `Finalised` carries `Outcome`, not the `Verdict` (`news_provider::ledger::AttemptEvent::Finalised`), so permanence is not stored until §11.5 step 4.
+- `Usable`, `Empty`, `PermanentFailure`, `TransientFailure` are `news_provider::ledger::Verdict` arms; §3.2's `OutcomeKind` maps both failures to `failed` (`Outcome::decide`, `news-provider/src/ledger.rs`). `Finalised` carries the `Verdict` inside `Outcome` (`Outcome::verdict`, None from `Outcome::abandoned`), stored as `attempts.verdict` (§3.2), since 2026-11-15.
+  - `Outcome` derives `PartialEq`, so receipts compared in tests compare verdicts too; a replay with the same items and another verdict is still accepted, because the replay rule compares items only (`StoreError::ReplayWithDifferentItems`).
 - New columns `attempts.story_id` and `attempts.held`; `ledger --check` subtracts `held`. First sighting is unchanged: a skip writes no item. So R15 cannot see a re-stamped time of a held story; the index value survives only in the attempt's raw blob.
-- Schema versioned with `PRAGMA user_version`, read at `Committer::open`: a lower version is migrated by explicit `ALTER TABLE` (a table rebuild for a `CHECK` change); an unknown higher version is refused. Built 2026-11-15 at user_version 1 (§3.1); step 2 grew that one migration rather than adding a version per commit; step 3 added user_version 2, the `robots` table.
+- Schema versioned with `PRAGMA user_version`, read at `Committer::open`: a lower version is migrated by explicit `ALTER TABLE` (a table rebuild for a `CHECK` change); an unknown higher version is refused. Built 2026-11-15 at user_version 1 (§3.1); step 2 grew that one migration rather than adding a version per commit; step 3 added user_version 2, the `robots` table; step 4 adds user_version 3, `attempts.verdict` first.
 
 ### 11.2 POC
 

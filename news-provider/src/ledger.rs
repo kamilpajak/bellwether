@@ -120,6 +120,19 @@ pub enum Verdict {
     TransientFailure,
 }
 
+impl Verdict {
+    /// The `attempts.verdict` label, which keeps permanence apart from the `failed` outcome.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Usable => "usable",
+            Self::Empty => "empty",
+            Self::PermanentFailure => "permanent_failure",
+            Self::TransientFailure => "transient_failure",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutcomeKind {
     Ok,
@@ -201,6 +214,7 @@ impl Baseline {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Outcome {
     kind: OutcomeKind,
+    verdict: Option<Verdict>,
     counts: Option<Counts>,
     baseline: Option<Baseline>,
 }
@@ -218,6 +232,7 @@ impl Outcome {
         };
         Self {
             kind,
+            verdict: Some(*verdict),
             counts: Some(Counts { vendor_rows }),
             baseline: Some(baseline.against(vendor_rows)),
         }
@@ -229,6 +244,7 @@ impl Outcome {
     pub fn abandoned() -> Self {
         Self {
             kind: OutcomeKind::Interrupted,
+            verdict: None,
             counts: None,
             baseline: None,
         }
@@ -237,6 +253,12 @@ impl Outcome {
     #[must_use]
     pub const fn kind(&self) -> OutcomeKind {
         self.kind
+    }
+
+    /// None for an abandoned attempt: nobody read an answer it never had.
+    #[must_use]
+    pub const fn verdict(&self) -> Option<Verdict> {
+        self.verdict
     }
 
     #[must_use]
@@ -474,11 +496,19 @@ pub(crate) mod tests {
     /// Lower of the two middles of `[3, 11, 45, 181]`.
     const LOWER_MEDIAN: u32 = 11;
     const OPENED_ONLY: [&str; 1] = ["opened"];
-    const EVERY_VERDICT: [(Verdict, OutcomeKind); 4] = [
-        (Verdict::Usable, OutcomeKind::Ok),
-        (Verdict::Empty, OutcomeKind::Empty),
-        (Verdict::PermanentFailure, OutcomeKind::Failed),
-        (Verdict::TransientFailure, OutcomeKind::Failed),
+    const EVERY_VERDICT: [(Verdict, OutcomeKind, &str); 4] = [
+        (Verdict::Usable, OutcomeKind::Ok, "usable"),
+        (Verdict::Empty, OutcomeKind::Empty, "empty"),
+        (
+            Verdict::PermanentFailure,
+            OutcomeKind::Failed,
+            "permanent_failure",
+        ),
+        (
+            Verdict::TransientFailure,
+            OutcomeKind::Failed,
+            "transient_failure",
+        ),
     ];
 
     /// Every event it was handed, in order, plus an optional refusal at a stated write.
@@ -701,17 +731,34 @@ pub(crate) mod tests {
 
     #[test]
     fn a_verdict_match_is_total_so_a_new_arm_does_not_compile_until_it_is_handled() {
-        for (verdict, expected) in EVERY_VERDICT {
-            // `Outcome::decide`'s match carries no wildcard; this table is the other half, so a
-            // fifth arm has to appear here too before the suite compiles.
+        for (verdict, expected, label) in EVERY_VERDICT {
+            // `Outcome::decide`'s and `Verdict::name`'s matches carry no wildcard; this table is
+            // the other half, so a fifth arm has to appear here too before the suite compiles.
             let named = match verdict {
-                Verdict::Usable => OutcomeKind::Ok,
-                Verdict::Empty => OutcomeKind::Empty,
-                Verdict::PermanentFailure | Verdict::TransientFailure => OutcomeKind::Failed,
+                Verdict::Usable => (OutcomeKind::Ok, "usable"),
+                Verdict::Empty => (OutcomeKind::Empty, "empty"),
+                Verdict::PermanentFailure => (OutcomeKind::Failed, "permanent_failure"),
+                Verdict::TransientFailure => (OutcomeKind::Failed, "transient_failure"),
             };
             let decided = Outcome::decide(&verdict, VENDOR_ROWS, &baseline());
-            assert_eq!((named, decided.kind()), (expected, expected));
+            assert_eq!(
+                (named, (decided.kind(), verdict.name())),
+                ((expected, label), (expected, label))
+            );
         }
+    }
+
+    #[test]
+    fn a_finalised_outcome_carries_its_verdict_and_an_abandoned_one_none() {
+        let decided: Vec<Option<Verdict>> = EVERY_VERDICT
+            .iter()
+            .map(|(verdict, _, _)| Outcome::decide(verdict, VENDOR_ROWS, &baseline()).verdict())
+            .collect();
+        let expected: Vec<Option<Verdict>> = EVERY_VERDICT
+            .iter()
+            .map(|(verdict, _, _)| Some(*verdict))
+            .collect();
+        assert_eq!((decided, Outcome::abandoned().verdict()), (expected, None));
     }
 
     /// The floor this waits for needs our own construction: `Baseline.ratio` is written on every
