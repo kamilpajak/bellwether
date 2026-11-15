@@ -32,7 +32,8 @@ pub enum BudgetScope {
 }
 
 /// A remote host as a pace-file name: lowercased, then only `[a-z0-9.-]`, not empty, no leading
-/// or trailing dot and no empty label: `host.` and `host` are one host and would be two keys. The field is private, so no caller can name a file outside `pace/`.
+/// or trailing dot, no empty label (architecture.md section 10, per-host pace). The field is
+/// private, so no caller can name a file outside `pace/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostKey(String);
 

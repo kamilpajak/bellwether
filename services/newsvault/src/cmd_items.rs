@@ -224,11 +224,9 @@ fn in_range(row: &Row, ask: &Ask) -> bool {
     after && before && sourced
 }
 
-/// Every predicate comes from `pit`: an instant row through `Visibility`, a minute row through
-/// `Datedness::of_minute`, a day row through the end of that day in its OWN calendar. A day bounded by UTC midnight is 19:00 in New York and admits
-/// the afternoon, which is the 13 h of lookahead the two day columns exist to remove. The zone is
-/// a stored string rather than the `&'static str` `Datedness::DayDated` carries, so this reaches
-/// `end_of_day` directly instead of rebuilding that value.
+/// Every predicate comes from `pit`: instant via `Visibility`, minute via `Datedness::of_minute`,
+/// day via `end_of_day` in the row's own calendar (architecture.md section 3.1). The zone is a
+/// stored string, not the `&'static str` `Datedness::DayDated` needs, so no `DayDated` is built.
 fn visible_at(row: &Row, cutoff: Cutoff) -> bool {
     if let Some(minute) = &row.valid_minute {
         let (Some(minute), Some(observed)) = (

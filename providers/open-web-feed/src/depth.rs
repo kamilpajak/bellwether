@@ -1,8 +1,7 @@
 //! A page's nesting depth, read from its source tags before html5ever parses it: html5ever's
-//! cost grows with its stack of open elements (review 2026-11-15, release mode: 2,000 / 4,000 /
-//! 8,000 nested `<div>` parsed in 0.009 / 0.024 / 0.068 s). The count is meant never to fall below
+//! cost grows with its stack of open elements. The count is meant never to fall below
 //! html5ever's own depth, less the `html` and `body` it implies when the source omits them;
-//! architecture.md section 11.1 names what it does not model.
+//! architecture.md section 11.1 holds the timings and names what it does not model.
 
 const VOID: [&str; 15] = [
     "area", "base", "br", "col", "embed", "hr", "img", "input", "keygen", "link", "meta", "param",
