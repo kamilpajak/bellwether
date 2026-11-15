@@ -305,6 +305,27 @@ fn an_open_web_run_collects_a_globenewswire_day_end_to_end() -> TestResult {
     Ok(())
 }
 
+/// Section 5.1 `invalid_argument`: the driven path refuses the window before `commit.sqlite3`, the
+/// lock or a run envelope exist. Mutation 2026-11-15, `refuse_the_window` removed: red.
+#[test]
+fn a_driven_collect_refuses_an_unreadable_or_off_day_window_before_writing_anything() -> TestResult
+{
+    for window in ["garbage", YESTERDAY] {
+        let root = TempDir::new()?;
+        let ask = ask(root.path(), window);
+        let opened = cmd_collect::open_provider(&ask)?;
+        let exchange = Gnw::day()?;
+        let refused = cmd_collect::run(&ask, &opened, &exchange, &Fixed);
+        assert!(
+            matches!(refused, Err(CollectRunError::WindowRefused(_))),
+            "{window}: {refused:?}"
+        );
+        let left = [COMMIT_LOG, "LOCK", "runs"].map(|name| root.path().join(name).exists());
+        assert_eq!(left, [false; 3], "{window}");
+    }
+    Ok(())
+}
+
 /// Section 8 row R10, the driver half: a window that is not the run's UTC day sends nothing, and
 /// the binary exits 2. Mutation 2026-11-15: removing the run-day check in `plan` turns this red.
 #[test]

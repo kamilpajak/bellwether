@@ -516,6 +516,7 @@ pub fn run(
             today,
         });
     }
+    refuse_the_window(ask, provider)?;
     let run = RunId::new(run_id.clone());
     // Before the policy copy, the envelope and the lease: a store at a newer user_version or of
     // another v0 shape is left as found. A v0 step SQLite refuses still leaves a run record.
@@ -546,6 +547,23 @@ pub fn run(
         exit: driven.collected.exit(),
         envelope: envelope_of(ask, opened, &run_id, run_date, &driven, true),
     })
+}
+
+/// A driven run's window refusal before the store, the lock or an envelope exists (section 5.1).
+/// Only `WindowRefused`: edgar's no-lag `PlanRefused` keeps its policy copy and envelope (D5),
+/// and an unreadable input is still reported by `drive`, after the envelope, as before.
+fn refuse_the_window(ask: &Ask, provider: &dyn Provider) -> Result<(), CollectRunError> {
+    let Ok((calendar, listing)) = inputs(ask) else {
+        return Ok(());
+    };
+    let at = ObservationTime::new(ask.at);
+    match provider.plan(&target_of(ask), calendar.as_ref(), listing.as_ref(), at) {
+        Err(refusal) => match CollectRunError::of_plan(refusal) {
+            refused @ CollectRunError::WindowRefused(_) => Err(refused),
+            _ => Ok(()),
+        },
+        Ok(_) => Ok(()),
+    }
 }
 
 /// The plan alone, which is what `--dry-run` returns: everything except the mutation.
