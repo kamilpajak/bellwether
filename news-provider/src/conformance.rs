@@ -119,14 +119,12 @@ pub fn breaches(provider: &dyn Provider, subject: &Subject) -> Vec<Breach> {
 
 /// Every day the window names is asked for by at least one request or named by exactly one
 /// `NotPlanned` row, never both, and no (day, host) pair is asked twice. A whole-window row (an
-/// unreadable or empty window) accounts for the window instead.
+/// unreadable or empty window) accounts for the window instead, when it is the plan's only content.
 fn plan_accounts_for_every_day(target: &TargetWindow, plan: &crate::Plan) -> Vec<Breach> {
-    if plan
-        .not_planned
-        .iter()
-        .any(|(window, _)| window.as_str() == target.as_str())
-    {
-        return Vec::new();
+    if let ([], [(window, _)]) = (plan.requests.as_slice(), plan.not_planned.as_slice()) {
+        if window.as_str() == target.as_str() {
+            return Vec::new();
+        }
     }
     let breach = |detail: String| Breach {
         check: PLAN_ACCOUNTS_FOR_EVERY_DAY,
@@ -237,6 +235,8 @@ mod tests {
     const CALENDAR: &[u8] = br#"{"schema":"calendar/1","sessions":["2026-11-09","2026-11-10"]}"#;
     const WINDOW: &str = "2026-11-09..2026-11-10";
     const CLOSED_DAY: &str = "2026-11-07";
+    /// The one-day target an every-UTC-day provider plans.
+    const ONE_DAY: &str = "2026-11-14";
     const INDEX_URL: &str = "https://example.test/index";
     const SECOND_HOST_URL: &str = "https://second.example.test/index";
     /// `HostKey::new` refuses the underscore.
@@ -261,6 +261,10 @@ mod tests {
         AskAHostThisSeamCannotKey,
         AskForADayAndAlsoNotPlanIt,
         NotPlanADayTwice,
+        /// Against the one-day target `ONE_DAY`, whose whole-window row is also its day's row.
+        AskTheOneDayTwiceAndAlsoNotPlanIt,
+        /// Not a breach: a one-day target accounted for by its whole-window row alone.
+        NotPlanTheOneDayWindow,
     }
 
     struct Mock {
@@ -398,6 +402,10 @@ mod tests {
                     self.request("2026-11-09"),
                     self.request_at("2026-11-10", UNKEYABLE_HOST_URL),
                 ],
+                Break::AskTheOneDayTwiceAndAlsoNotPlanIt => {
+                    vec![self.request(ONE_DAY), self.request(ONE_DAY)]
+                }
+                Break::NotPlanTheOneDayWindow => Vec::new(),
                 _ => vec![self.request("2026-11-09"), self.request("2026-11-10")],
             };
             let _ = target;
@@ -408,6 +416,9 @@ mod tests {
             let not_planned = match self.how {
                 Break::AskForADayAndAlsoNotPlanIt => vec![unlisted],
                 Break::NotPlanADayTwice => vec![unlisted.clone(), unlisted],
+                Break::AskTheOneDayTwiceAndAlsoNotPlanIt | Break::NotPlanTheOneDayWindow => {
+                    vec![(TargetWindow::new(ONE_DAY), NotPlanned::WindowNotPublished)]
+                }
                 _ => Vec::new(),
             };
             let requests = match self.how {
@@ -487,15 +498,24 @@ mod tests {
         calendar: Option<&Calendar>,
         listing: Option<&Listing>,
     ) -> Vec<&'static str> {
+        found_for(WINDOW, mock, calendar, listing)
+    }
+
+    fn found_for(
+        window: &str,
+        mock: &Mock,
+        calendar: Option<&Calendar>,
+        listing: Option<&Listing>,
+    ) -> Vec<&'static str> {
         let payloads = [(
-            mock.request(WINDOW),
+            mock.request(window),
             RawBlob {
                 digest: "d".to_owned(),
                 bytes: Vec::new(),
             },
         )];
         let subject = Subject {
-            target: TargetWindow::new(WINDOW),
+            target: TargetWindow::new(window),
             calendar,
             listing,
             at: ObservationTime::new(AT.parse().unwrap_or(DateTime::<Utc>::UNIX_EPOCH)),
@@ -539,6 +559,24 @@ mod tests {
         for (how, expected) in cases {
             assert!(found(how).contains(&expected), "{how:?} raised nothing");
         }
+    }
+
+    /// Review 2026-11-15: on a one-day target the whole-window row is that day's row, and its
+    /// exemption once hid a day asked twice and also not planned. The control keeps the row alone
+    /// accounting for the window.
+    #[test]
+    fn a_one_day_target_asked_twice_and_also_not_planned_is_named_and_its_row_alone_is_not() {
+        let one_day = |how| found_for(ONE_DAY, &Mock::every_utc_day(how), None, None);
+        assert_eq!(
+            (
+                one_day(Break::AskTheOneDayTwiceAndAlsoNotPlanIt),
+                one_day(Break::NotPlanTheOneDayWindow)
+            ),
+            (
+                vec![PLAN_ACCOUNTS_FOR_EVERY_DAY, PLAN_ACCOUNTS_FOR_EVERY_DAY],
+                Vec::new()
+            )
+        );
     }
 
     /// Architecture.md section 11.2: accounting is per (day, host), so an open-web plan asking one
