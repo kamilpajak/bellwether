@@ -181,7 +181,7 @@ CREATE TABLE IF NOT EXISTS seq_reservations (
     reserved_at  TEXT NOT NULL
 );
 -- One row per exported segment, committed only once the file is at its final name. The grain is
--- (run, publication day) and not the attempt: architecture.md section 10, D3.
+-- (run, publication day) and not the attempt, as the `publish` module header states.
 CREATE TABLE IF NOT EXISTS published (
     segment_digest TEXT PRIMARY KEY,
     run_id         TEXT NOT NULL,
@@ -1135,7 +1135,7 @@ mod tests {
     const SENTINEL: &[u8] = b"a staged file a crash left behind";
     const STATUS_OK: u16 = 200;
     /// Distinct values, so a swap of the two columns is visible. 59 is the day the collapse
-    /// outcome exists for (architecture.md section 3.2).
+    /// outcome exists for (`news_provider::ledger`'s `TRAILING_MEDIAN` comment).
     const VENDOR_ROWS: u32 = 59;
     /// A permanent failure brought nothing back, so the two verdicts carry different counts and a
     /// swap of their outcome labels is visible in what the baseline reader returns.

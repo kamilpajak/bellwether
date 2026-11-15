@@ -1,7 +1,6 @@
 //! The driver. `fetch` is not on [`Provider`], so this is what opens a slot, spends its permit,
 //! classifies the answer, stores the payload, extracts it and closes the attempt - one HTTP call
-//! per written ledger row. Why the provider does not do it: `docs/design/architecture.md` section 8
-//! row R4.
+//! per written ledger row.
 //!
 //! Two seams, so a run is drivable over stored payloads with no network and over a real archive
 //! with no provider: [`Exchange`] is the socket, whose only implementation that opens one is
@@ -182,7 +181,7 @@ impl Exit {
         match self {
             Self::Ok => 0,
             // 8 and not 7 for a total refusal: 7 is the retryable class and a permanent refusal
-            // must not invite a timer to hammer it (architecture.md section 5.1).
+            // must not invite a timer to hammer it.
             Self::PartialCollect | Self::VendorRefusedAll | Self::CommitFailed => 8,
             Self::VendorUnreachable => 7,
         }

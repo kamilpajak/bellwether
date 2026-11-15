@@ -631,9 +631,17 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - No other service opens `commit.sqlite3`. `derive` still reads a snapshot file (§4).
 - Nothing pushes: a late poll delays an event and never loses it (rule 2).
 - At §11.5 step 8 the store switches to WAL, so a long-lived reader never blocks a commit.
-- At the same step SQLite is linked `bundled`, replacing the note at
-  `services/newsvault/Cargo.toml:20` and adding a C compile to CI.
-- Versions seen 2026-11-14 (`sqlite3 --version`): Mac 3.54.0, VPS 3.45.1.
+- At the same step SQLite is linked `bundled`, replacing the no-`bundled` note in
+  `services/newsvault/Cargo.toml` and adding a C compile to CI.
+- SQLite versions seen:
+
+| host | date | construction | version |
+|---|---|---|---|
+| Mac | 2026-11-13 | stated in the `services/newsvault/Cargo.toml` note until 2026-11-15; command not recorded | 3.54.0 |
+| Mac | 2026-11-14 | `sqlite3 --version` | 3.54.0 |
+| Mac | 2026-11-15 | `/usr/bin/sqlite3 --version` | 3.54.0 |
+| VPS | 2026-11-14 | `sqlite3 --version` | 3.45.1 |
+
 - WAL changes how N1's second copy is taken (§10, N1).
 - A read-only open of a WAL store works: checked 2026-11-14 by a reviewer with Python `sqlite3` on
   SQLite 3.53.4, folder writable and read-only.
@@ -873,7 +881,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
 ## 11. `open-web-feed` — our own forward news feed (decided 2026-11-14, no code yet)
 
-- Every line in §11.1 and §11.2 is an owner decision of 2026-11-14.
+- Every line in §11.1 and §11.2 is an owner decision of 2026-11-14, except the `ValidSource` cells of §11.1's valid-time table: decided 2026-11-15 (the bullet below that table).
 
 | term | meaning |
 |---|---|
@@ -898,12 +906,13 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | CNW | sitemap `news:publication_date`, a full instant with offset, `ValidSource::VendorPublished` |
 | CNBC | the page's `article:published_time`, `ValidSource::OurExtraction`; never its sitemap (§11.6) |
 | Yahoo | its syndication time field, `ValidSource::VendorPublished`; the field is named in its host PR |
-| Fool, BI | the sitemap value, `ValidSource::VendorPublished` |
+| Fool, BI | the sitemap's publication field, `ValidSource::VendorPublished`; the field is named in their host PR, as Yahoo's is |
 | never | `lastmod`, `dateModified`, fetch time, a date folded into midnight |
 
 - `ValidSource::PageMetadata` stays unbuilt; step 2 deletes its forecast at `provider.rs:39-40`.
 - **`ValidSource` per host, decided 2026-11-15 by the owner.** Both arms exist (`provider.rs:42-47`); `CollectedItem.valid_source` is required (`provider.rs:133`); no item from CNW, Yahoo, Fool or BI is built yet, so no code changed.
-  - `VendorPublished`: a value read from a structured feed field the publisher states (RSS `pubDate`, sitemap `news:publication_date`, a sitemap's publication value, Yahoo's syndication time field).
+  - `VendorPublished`: a value read from a structured feed field the publisher states (RSS `pubDate`, sitemap `news:publication_date`, a sitemap's publication field, Yahoo's syndication time field).
+  - `lastmod` stays excluded (the `never` row), so only a sitemap's publication field is `VendorPublished`, and a sitemap with no publication field gives no valid time.
   - `OurExtraction`: a value read out of an article page under a hashed rule (CNBC's `article:published_time`).
   - Rejected: `OurExtraction` for sitemaps, because the arm would then mean "we parsed XML" and no longer separate "the publisher stated it" from "we inferred it from the page".
 - Bot protection (HTTP 403, a challenge page, a web application firewall, DataDome) is a `PermanentFailure`, never retried in another form.
