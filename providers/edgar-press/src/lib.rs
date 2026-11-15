@@ -339,9 +339,9 @@ impl EdgarPress {
     /// [`Visibility::from_backfill`], which is the only constructor that takes a [`MeasuredLag`].
     /// `Ok(None)` for a live ingest, whose observation is the fetch instant the driver holds.
     ///
-    /// A DATE has no instant, so the bound is the END of the INDEX's day in the rules' zone, not
-    /// of the row's `Date Filed`: a late row is first listed on the index's day (§3.9). Lag on top
-    /// of an upper bound can only make an item less visible. Reachable `Ok(None)` arms: §8 row R11.
+    /// A DATE has no instant, so the bound is the later END of two days: the row's `Date Filed` and
+    /// the index that first lists it (§3.9). Lag on top of an upper bound can only make an item
+    /// less visible. Reachable `Ok(None)` arms: §8 row R11.
     fn backfill_observation(
         &self,
         request: &Request,
@@ -355,13 +355,15 @@ impl EdgarPress {
         };
         let bound = match valid {
             Published::At(instant) => instant,
-            Published::On { .. } | Published::Unknown => {
+            Published::On { day, tz } => {
                 let listed = days_of(&request.target_window).and_then(|days| days.first().copied());
-                match listed.and_then(|day| end_of_day(day, self.parsed.zone)) {
-                    Some(ends) => ValidTime::new(ends),
-                    None => return Ok(None),
+                let listed_ends = listed.and_then(|listed| end_of_day(listed, self.parsed.zone));
+                match (end_of_day(day, tz), listed_ends) {
+                    (Some(filed), Some(listed)) => ValidTime::new(filed.max(listed)),
+                    _ => return Ok(None),
                 }
             }
+            Published::Unknown => return Ok(None),
         };
         Visibility::from_backfill(bound, lag).map(|visible| Some(visible.observed()))
     }

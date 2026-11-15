@@ -37,6 +37,12 @@ const APPLE_ACCEPTED_AT: &str = "2026-11-10T21:32:15Z";
 const APPLE_OBSERVED_AT: &str = "2026-11-10T23:32:15Z";
 /// `AN_ARCHIVED_SESSION` ends at 05:00Z less one microsecond in New York; plus the same 7,200 s.
 const ARCHIVED_DAY_OBSERVED_AT: &str = "2026-11-10T06:59:59.999999Z";
+/// `AN_ARCHIVED_SESSION` as the `Date Filed` column spells it.
+const ARCHIVED_DATE_FILED: &str = "20261109";
+/// `A_LISTED_SESSION` as the column spells it: a `Date Filed` later than `AN_ARCHIVED_SESSION`.
+const LISTED_DATE_FILED: &str = "20261110";
+/// `A_LISTED_SESSION` ends at 05:00Z on 2026-11-11 less one microsecond; plus the same 7,200 s.
+const LISTED_DAY_OBSERVED_AT: &str = "2026-11-11T06:59:59.999999Z";
 /// Fits a `TimeDelta`, which holds `i64::MAX` milliseconds, and carries 2026 past year 262,143.
 const SECONDS_PAST_THE_LAST_INSTANT: i64 = 1_000_000_000_000_000;
 const APPLE_ACCESSION: &str = "0000320193-26-000071";
@@ -338,15 +344,24 @@ fn a_backfilled_item_observes_at_its_publication_plus_the_probed_lag_and_not_at_
     Ok(())
 }
 
-/// §8 row R11, the day arm: the END of the archived day in New York plus the lag.
+/// §8 row R11, the day arm: a row filed on the day its index lists it observes at the END of that
+/// day in New York plus the lag.
 #[test]
 fn a_backfilled_day_dated_item_observes_at_the_end_of_its_own_day_plus_the_probed_lag() -> Outcome {
     let provider = probed()?;
-    let request = archived_document_request(&provider)?;
+    let request = listed_document_request(&provider, AN_ARCHIVED_SESSION, ARCHIVED_DATE_FILED)?;
     let item =
         only_item(&provider.extract(&request, &blob("filing_8k_microsoft_no_acceptance.txt")))?;
-    assert_eq!(precision_of(&item.valid), ValidPrecision::Day);
-    assert_eq!(item.observed, Some(at(ARCHIVED_DAY_OBSERVED_AT)));
+    assert_eq!(
+        (item.valid, item.observed),
+        (
+            Published::On {
+                day: AN_ARCHIVED_SESSION.parse()?,
+                tz: "America/New_York"
+            },
+            Some(at(ARCHIVED_DAY_OBSERVED_AT))
+        )
+    );
     Ok(())
 }
 
@@ -732,8 +747,26 @@ fn a_filing_with_no_acceptance_instant_and_no_readable_date_filed_is_unusable_ra
     Ok(())
 }
 
-/// One index row in the vendor's layout, listed in a later day's index than its own `Date Filed`.
-fn late_index(date_filed: &str) -> RawBlob {
+/// §8 row R11: an archived row with no publication value has nothing to add the lag to, so its
+/// unusable row places no observation rather than one taken from the index's day.
+#[test]
+fn an_archived_filing_with_no_readable_date_filed_places_no_observation() -> Outcome {
+    let provider = probed()?;
+    let request = listed_document_request(&provider, AN_ARCHIVED_SESSION, NOT_A_DATE_FILED)?;
+    let extracted = provider.extract(&request, &blob("filing_8k_microsoft_no_acceptance.txt"));
+    assert_eq!(
+        extracted
+            .unusable
+            .iter()
+            .map(|row| (row.reason, row.item.observed))
+            .collect::<Vec<_>>(),
+        vec![(UnusableReason::NoParseableValidTime, None)]
+    );
+    Ok(())
+}
+
+/// One index row in the vendor's layout carrying `date_filed`, whatever day's index lists it.
+fn one_row_index(date_filed: &str) -> RawBlob {
     let bytes = format!(
         "Form Type   Company Name           CIK         Date Filed  File Name\n\
          ---------------------------------------------------------------------\n\
@@ -746,17 +779,18 @@ fn late_index(date_filed: &str) -> RawBlob {
     }
 }
 
-fn late_document_request(
+fn listed_document_request(
     provider: &EdgarPress,
     index_day: &str,
+    date_filed: &str,
 ) -> Result<Request, Box<dyn std::error::Error>> {
     let index = index_request(provider, index_day)?;
     provider
-        .extract(&index, &late_index(LATE_DATE_FILED))
+        .extract(&index, &one_row_index(date_filed))
         .follow_ups
         .first()
         .cloned()
-        .ok_or_else(|| "the late index yielded no follow-up".to_string().into())
+        .ok_or_else(|| "the one-row index yielded no follow-up".to_string().into())
 }
 
 /// §3.9: the 2026-11-10 index carries `Date Filed` 20261102, 20261103, 20261105 and 20261110. A
@@ -765,7 +799,7 @@ fn late_document_request(
 fn a_late_row_with_no_acceptance_instant_lands_on_its_own_date_filed_and_not_the_index_day(
 ) -> Outcome {
     let provider = provider()?;
-    let request = late_document_request(&provider, A_LISTED_SESSION)?;
+    let request = listed_document_request(&provider, A_LISTED_SESSION, LATE_DATE_FILED)?;
     let item =
         only_item(&provider.extract(&request, &blob("filing_8k_microsoft_no_acceptance.txt")))?;
     assert_eq!(
@@ -786,18 +820,34 @@ fn a_late_row_with_no_acceptance_instant_lands_on_its_own_date_filed_and_not_the
     Ok(())
 }
 
-/// §8 row R11: the row's `Date Filed` moves the publication but never the observation. A late row
-/// was first listed on its index's day, so the backfill bound stays the end of THAT day.
+/// §8 row R11: a late row was first listed on its index's day, so the backfill bound is the end of
+/// THAT day and not of its earlier `Date Filed`.
 #[test]
 fn a_late_rows_backfilled_observation_is_dated_by_its_index_day_and_not_its_date_filed() -> Outcome
 {
     let provider = probed()?;
-    let request = late_document_request(&provider, AN_ARCHIVED_SESSION)?;
+    let request = listed_document_request(&provider, AN_ARCHIVED_SESSION, LATE_DATE_FILED)?;
     let item =
         only_item(&provider.extract(&request, &blob("filing_8k_microsoft_no_acceptance.txt")))?;
     assert_eq!(
         (precision_of(&item.valid), item.observed),
         (ValidPrecision::Day, Some(at(ARCHIVED_DAY_OBSERVED_AT)))
+    );
+    Ok(())
+}
+
+/// §8 row R11: a `Date Filed` later than the index listing it still bounds the observation, so an
+/// item is never observed before its own publication day has closed.
+#[test]
+fn a_rows_backfilled_observation_is_not_before_the_end_of_a_date_filed_later_than_its_index_day(
+) -> Outcome {
+    let provider = probed()?;
+    let request = listed_document_request(&provider, AN_ARCHIVED_SESSION, LISTED_DATE_FILED)?;
+    let item =
+        only_item(&provider.extract(&request, &blob("filing_8k_microsoft_no_acceptance.txt")))?;
+    assert_eq!(
+        (item.valid_raw.as_str(), item.observed),
+        (LISTED_DATE_FILED, Some(at(LISTED_DAY_OBSERVED_AT)))
     );
     Ok(())
 }
