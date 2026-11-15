@@ -219,8 +219,11 @@
 | `requested_at`, `received_at`, `transport_status` | |
 | `outcome` | `ok` \| `empty` \| `failed` \| `interrupted` \| `collapsed`; the built four are `news_provider::ledger::OutcomeKind::name`, `collapsed` is designed and NOT built (below) |
 | `vendor_rows`, `items_new` | **R16.** Rows the payload held before our filtering; first sightings per `story_id` (§8 row R16). Written when `items_new` is zero, so poll events are recoverable, not only content changes: content-hash dedup is right for storage and destroys exactly this |
-| `slots` (designed: `cost`) | designed as vendor units and currency, so the archive knows what it cost; NOT built. Built: the only cost recorded, 1 when the send permit was taken, else 0; NULL when abandoned (`Cost::Slots`). No money: no metered arm until a metered vendor arrives |
+| `slots` | the only cost recorded: 1 when the send permit was taken, else 0; NULL when abandoned (`Cost::Slots`) |
 | `result_digest` | sha256 over the set of `item_id`s the attempt committed, ordered over raw UTF-8 bytes and deduplicated, so a repeated query's drift is detectable and a reordered answer is not drift. Not a column: `newsvault ledger` computes it and reports drift per (`source`, `target_window`) |
+
+- No money arm (owner, 2026-11-15): one is added to `Cost` with the first metered vendor. Rejected
+  now: an arm nothing produces is a branch nothing reaches.
 
 - `collapsed` is designed as its own outcome: a payload that shrank to a fraction of what the store
   already holds is a degraded fetch, not a quieter world, and a throttled success looks exactly like
@@ -892,14 +895,17 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | host | valid time |
 |---|---|
 | PRN, GNW, Fed | RSS `pubDate`, `ValidSource::VendorPublished` |
-| CNW | sitemap `news:publication_date`, a full instant with offset; no `ValidSource` named |
+| CNW | sitemap `news:publication_date`, a full instant with offset, `ValidSource::VendorPublished` |
 | CNBC | the page's `article:published_time`, `ValidSource::OurExtraction`; never its sitemap (§11.6) |
-| Yahoo | its syndication time; neither its field nor a `ValidSource` named |
-| Fool, BI | the sitemap value; no `ValidSource` named |
+| Yahoo | its syndication time field, `ValidSource::VendorPublished`; the field is named in its host PR |
+| Fool, BI | the sitemap value, `ValidSource::VendorPublished` |
 | never | `lastmod`, `dateModified`, fetch time, a date folded into midnight |
 
 - `ValidSource::PageMetadata` stays unbuilt; step 2 deletes its forecast at `provider.rs:39-40`.
-- Open (owner): `ValidSource` for CNW, Yahoo, Fool, BI. `ValidSource` has two arms, `VendorPublished` and `OurExtraction` (`provider.rs:42-47`), and `CollectedItem.valid_source` is a required field (`provider.rs:133`), so no item from these hosts can be built until one is named; this blocks the CNW and Yahoo host PRs (§11.2, §11.5 step 6) and the Fool and BI outlets (§11.3).
+- **`ValidSource` per host, decided 2026-11-15 by the owner.** Both arms exist (`provider.rs:42-47`); `CollectedItem.valid_source` is required (`provider.rs:133`); no item from CNW, Yahoo, Fool or BI is built yet, so no code changed.
+  - `VendorPublished`: a value read from a structured feed field the publisher states (RSS `pubDate`, sitemap `news:publication_date`, a sitemap's publication value, Yahoo's syndication time field).
+  - `OurExtraction`: a value read out of an article page under a hashed rule (CNBC's `article:published_time`).
+  - Rejected: `OurExtraction` for sitemaps, because the arm would then mean "we parsed XML" and no longer separate "the publisher stated it" from "we inferred it from the page".
 - Bot protection (HTTP 403, a challenge page, a web application firewall, DataDome) is a `PermanentFailure`, never retried in another form.
 - robots.txt is respected; a robots.txt 404 is recorded as "no robots" and is not digest-pinned. Sites' terms of use are not a criterion (owner, 2026-11-14).
 - `item_key(url)` is the one function behind `source_item_id`; a page's canonical link feeds `doc_id` only.

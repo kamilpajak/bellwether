@@ -104,7 +104,7 @@ pub enum Refusal {
     #[error("the quarter listing is present and is not a directory listing: {0}")]
     ListingUnparseable(String),
     /// Registry code `credential_contact_missing`, exit 2. A startup refusal and never a vendor
-    /// failure recorded in the coverage ledger (design.md section 3).
+    /// failure recorded in the coverage ledger (architecture.md section 5.1).
     #[error("the {CONTACT_CREDENTIAL} credential carries no contact address")]
     ContactMissing,
 }

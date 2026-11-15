@@ -22,8 +22,8 @@ impl BlobDigest {
     }
 }
 
-/// Hex characters per directory level, two levels deep, which is the layout design.md section 5
-/// states.
+/// Hex characters per directory level, two levels deep: the 65,536-directory fan-out
+/// architecture.md section 3.9 counts files against.
 const FAN_OUT: usize = 2;
 
 #[derive(Debug)]

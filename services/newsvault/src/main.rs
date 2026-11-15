@@ -184,7 +184,7 @@ enum Format {
 }
 
 /// `all` is the default on purpose: a default that silently collapses rows is R1's defect moved
-/// into the view (design.md section 4).
+/// into the view (architecture.md section 8 row R1).
 #[derive(Clone, Copy, ValueEnum)]
 enum Story {
     All,

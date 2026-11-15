@@ -4,7 +4,7 @@
 //! `docs/design/architecture.md` section 3.2.
 //!
 //! A provider never holds a `Sink`: the driver opens and closes every slot. Why that is stronger
-//! than letting `fetch` do it is `docs/design/design.md` section 2.2.
+//! than letting `fetch` do it is `docs/design/architecture.md` section 8 row R4.
 
 use canon::digest::attempt_id;
 use canon::{CanonError, Digest, FileDigest};
@@ -110,7 +110,7 @@ impl AttemptEvent {
 }
 
 /// What the vendor's answer was, read from the body as well as the status. There is no `Premature`
-/// arm and that is a resolution rather than an omission: `docs/design/design.md` section 2.4.
+/// arm and that is a resolution rather than an omission: `edgar-press`'s crate header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     Usable,

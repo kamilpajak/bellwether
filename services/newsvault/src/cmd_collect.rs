@@ -1,5 +1,5 @@
 //! `newsvault collect` - the one command that writes to the archive. What it reports and which
-//! exit each state takes are design.md section 4; the exit table itself is
+//! exit each state takes are architecture.md section 5.1; the exit table itself is
 //! `news_provider::Tally::exit` and is not restated here.
 //!
 //! The run envelope is on disk with `finished_at` null BEFORE the lease is attempted, so a run

@@ -1,7 +1,7 @@
 //! The append-only segment export. One parquet segment per (run, publication day), written to a
 //! staging name, fsynced with its directory, renamed, and only then does its `Published` row
-//! commit. The grain, the file counts behind it and the partition key are design.md section 5;
-//! none of that is restated here.
+//! commit. The partition key is architecture.md section 10, D3, and what a partition's file count
+//! does not say is section 5's partition row; neither is restated here.
 
 use std::collections::BTreeMap;
 use std::fs::File;

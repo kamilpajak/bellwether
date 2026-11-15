@@ -1,6 +1,6 @@
-//! `newsvault ledger` - the coverage reader, written before the first collector run. Which
-//! fields it must carry and why `--at` is required are design.md section 4; the ledger row itself
-//! is architecture.md section 3.2. Neither is restated here.
+//! `newsvault ledger` - the coverage reader, written before the first collector run. Why `--at`
+//! is required is architecture.md section 4's last row; the ledger row itself is section 3.2.
+//! Neither is restated here.
 //!
 //! The reader comes first on the predecessor's evidence: its lake had no reader in code, and the
 //! divergence between what it stored and what production used surfaced six months later as
@@ -251,7 +251,7 @@ pub fn read(root: &Path, ask: &Ask) -> Result<Report, LedgerReadError> {
         let mut row = day_row(date, &envelopes, &grouped, &in_flight, &answers_by_run, ask);
         matched += row.per_source.len();
         // The check runs over the whole day, before any cap: a cap that hides a finding is worse
-        // than no cap, which is design.md section 4's reason for `truncated`.
+        // than no cap (architecture.md section 8 row R16), which is the reason for `truncated`.
         findings.extend(findings_for(&row));
         if let Some(limit) = ask.limit {
             row.per_source.truncate(limit);

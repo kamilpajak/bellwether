@@ -206,7 +206,7 @@ impl NotPlanned {
     }
 
     /// Whether not asking was the right answer. A clean reason keeps a run's exit at 0; an unclean
-    /// one is incomplete work (design.md section 4's exit table).
+    /// one is incomplete work (architecture.md section 5.1's exit table).
     #[must_use]
     pub const fn clean(self) -> bool {
         match self {
