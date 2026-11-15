@@ -1010,9 +1010,9 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
 ### 11.5 Build order (each PR passes the gate alone)
 
-1. Crate skeleton with `[lints] workspace = true`, so row G1 covers it. Built with no dependency and no item; each mutation of the new crate turned one named test red, 2026-11-15:
+1. Crate skeleton with `[lints] workspace = true`, so row G1 covers it. Built with no dependency and no item; each mutation of the new crate turned the named tests red, 2026-11-15:
    - `[lints]` stanza deleted: `every_workspace_member_inherits_the_lint_floor` (G1)
-   - `ureq` added: `only_the_seam_crate_declares_an_http_client` (R4)
+   - `ureq` added: `only_the_seam_crate_declares_an_http_client` and `the_seam_crate_declares_the_only_client_this_workspace_holds` (R4)
    - a `Utc::now` read added: `no_provider_and_no_part_of_the_seam_outside_wire_and_clock_reads_a_clock` (R4)
 2. GNW end to end, the largest PR (touches `pit`, `canon`, `news-provider`, `newsvault` and the new crate): hosts loader, provider table in `cmd_collect` (replacing the single `EdgarPress`); index and document parsers, `item_key`, `Provider::story_of`, `NoArticleBody`; schema versioning, `items` valid-time columns, `hosts_version` column and envelope field; `Minute` precision; conformance declaration and per-(day, host) accounting in `plan_accounts_for_every_day`; per-provider `--calendar`/`--listing`, `--window today`; an end-to-end test.
 3. Robots refresh command; `newsvault` checks the pinned digest and the floor.
