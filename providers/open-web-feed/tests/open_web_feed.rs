@@ -469,6 +469,19 @@ fn www_and_rss_links_of_one_release_share_one_item_key() -> Outcome {
     Ok(())
 }
 
+/// `item_key` is `story_id`'s input, so a spelling `HostKey` refuses would key a second story.
+#[test]
+fn a_url_with_a_port_or_a_userinfo_has_no_item_key() -> Outcome {
+    let provider = provider()?;
+    for url in [
+        ARTICLE_URL.replacen(GNW_HOST, &format!("{GNW_HOST}:443"), 1),
+        ARTICLE_URL.replacen(GNW_HOST, &format!("u@{GNW_HOST}"), 1),
+    ] {
+        assert_eq!(provider.item_key(&url), None, "{url}");
+    }
+    Ok(())
+}
+
 // ---- document ----
 
 #[test]
@@ -590,6 +603,9 @@ fn a_relative_canonical_link_is_resolved_against_the_page_url_before_it_reaches_
         "javascript:void(0)",
         A_CANONICAL_WITH_A_PORT,
         A_CANONICAL_ON_A_HOST_KEY_REFUSES,
+        A_SCHEME_RELATIVE_CANONICAL_WITH_A_PORT,
+        "https://",
+        "https:///news-release/x.html",
     ] {
         let written = page.replace(RELATIVE_CANONICAL, href).into_bytes();
         canonicals.push(only_item(&provider.extract(&request, &blob(written)))?.canonical_url);
@@ -602,15 +618,21 @@ fn a_relative_canonical_link_is_resolved_against_the_page_url_before_it_reaches_
             ARTICLE_URL,
             ARTICLE_URL,
             A_CANONICAL_WITH_A_PORT,
-            A_CANONICAL_ON_A_HOST_KEY_REFUSES
+            A_CANONICAL_ON_A_HOST_KEY_REFUSES,
+            A_CANONICAL_WITH_A_PORT,
+            ARTICLE_URL,
+            ARTICLE_URL
         ]
     );
     Ok(())
 }
 
-/// Absolute hrefs `host_and_path` refuses; review 2026-11-15 found both replaced by the page url.
+/// Absolute hrefs `host_and_path` refuses; review 2026-11-15 found both replaced by the page url,
+/// and the scheme-relative spelling still replaced after that fix (a second `doc_id` for one link).
 const A_CANONICAL_WITH_A_PORT: &str = "https://www.globenewswire.com:443/news-release/x.html";
 const A_CANONICAL_ON_A_HOST_KEY_REFUSES: &str = "https://other_host.example/x.html";
+const A_SCHEME_RELATIVE_CANONICAL_WITH_A_PORT: &str =
+    "//www.globenewswire.com:443/news-release/x.html";
 
 /// The other half of `NoArticleBody` (section 11.5 step 2): a container holding only empty or
 /// whitespace paragraphs. Mutation 2026-11-15, the empty-paragraph filter removed: green before.
@@ -790,6 +812,19 @@ fn a_rules_file_with_a_selector_nothing_can_parse_is_refused() {
         ),
         Some(Refusal::RulesUnparseable { .. })
     ));
+}
+
+/// Otherwise `item_key` would take whichever rewrite the map kept last.
+#[test]
+fn a_host_two_rules_rewrite_to_two_hosts_is_refused() {
+    let path = rules_fixture("rules_conflicting_rewrite.json");
+    assert_eq!(
+        refusal_of(&hosts_path(), &path, CONTACT),
+        Some(Refusal::RulesUnparseable {
+            path,
+            why: "www.globenewswire.com is rewritten to two hosts".to_owned()
+        })
+    );
 }
 
 #[test]

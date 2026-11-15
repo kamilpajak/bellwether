@@ -400,34 +400,35 @@ impl Provider for OpenWebFeed {
 /// A url's lowercased host and its path (`/` when empty), without scheme, port, query or
 /// fragment. `None` for another scheme, a userinfo or port, or a host `HostKey` refuses.
 pub(crate) fn host_and_path(url: &str) -> Option<(String, String)> {
-    let rest = SCHEMES.iter().find_map(|scheme| {
-        let head = url.get(..scheme.len())?;
-        head.eq_ignore_ascii_case(scheme)
-            .then(|| url.get(scheme.len()..))
-            .flatten()
-    })?;
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(end);
+    let (authority, tail) = authority_and_tail(url)?;
     news_provider::HostKey::new(authority).ok()?;
     let path = tail.split(['?', '#']).next().unwrap_or("");
     let path = if path.is_empty() { "/" } else { path };
     Some((authority.to_ascii_lowercase(), path.to_owned()))
 }
 
-/// A canonical href as an absolute url: as written when it already is one, a root- or
-/// scheme-relative one resolved against `base`, anything else `None`. Another host is kept, because
-/// `doc_id` is a cross-source identity.
+/// The text after an http(s) scheme, split where the authority ends; `None` for another scheme.
+fn authority_and_tail(url: &str) -> Option<(&str, &str)> {
+    let rest = SCHEMES.iter().find_map(|scheme| {
+        let head = url.get(..scheme.len())?;
+        head.eq_ignore_ascii_case(scheme)
+            .then(|| url.get(scheme.len()..))
+            .flatten()
+    })?;
+    Some(rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len())))
+}
+
+/// A canonical href as an absolute url: a scheme- or scheme-relative one as written (`https:`
+/// prefixed) when it names any authority, port and userinfo kept; a root-relative one resolved
+/// against `base`; anything else `None`. Another host is kept, because `doc_id` is cross-source.
 fn absolute(href: &str, base: &str) -> Option<String> {
-    let has_scheme = SCHEMES.iter().any(|scheme| {
-        href.get(..scheme.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
-    });
-    if has_scheme {
-        return Some(href.to_owned());
-    }
-    if let Some(rest) = href.strip_prefix("//") {
-        let resolved = format!("https://{rest}");
-        return host_and_path(&resolved).is_some().then_some(resolved);
+    let written = if href.starts_with("//") {
+        format!("https:{href}")
+    } else {
+        href.to_owned()
+    };
+    if let Some((authority, _)) = authority_and_tail(&written) {
+        return (!authority.is_empty()).then_some(written);
     }
     let (host, _) = host_and_path(base)?;
     href.starts_with('/')
