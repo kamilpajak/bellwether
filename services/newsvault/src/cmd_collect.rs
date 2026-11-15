@@ -217,8 +217,8 @@ pub fn drive<A: Archive>(
         &Run {
             run,
             target: &target,
-            calendar: &calendar,
-            listing: &listing,
+            calendar: Some(&calendar),
+            listing: Some(&listing),
             at: ObservationTime::new(ask.at),
         },
     )?;
@@ -281,8 +281,19 @@ fn planned(
     let provider = &opened.provider;
     let (calendar, listing) = inputs(ask)?;
     let target = TargetWindow::new(&ask.window);
+    let (calendar_in, listing_in) = (Some(&calendar), Some(&listing));
+    // The same refusal `news_provider::collect` gives first, so a dry run cannot plan what a run
+    // would refuse.
+    provider
+        .cadence()
+        .admits(&provider.source(), calendar_in, listing_in)?;
     let plan = provider
-        .plan(&target, &calendar, &listing, ObservationTime::new(ask.at))
+        .plan(
+            &target,
+            calendar_in,
+            listing_in,
+            ObservationTime::new(ask.at),
+        )
         .map_err(CollectRunError::PlanRefused)?;
     let driven = Driven {
         collected: Collected::of_plan(&plan, &provider.source()),

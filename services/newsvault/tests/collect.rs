@@ -15,6 +15,7 @@ use news_provider::{
     Committed, Exchange, Exit, HeaderValue, LedgerError, Provenance, RawResponse, Request,
     RequestPhase, RunId, SendFailure, SendPermit, Sink, SourceId, TargetWindow,
 };
+use news_provider::{CollectError, PlanRefusal, Run};
 use newsvault::cmd_collect::{self, Ask};
 use newsvault::cmd_items::{self, PerStory};
 use newsvault::cmd_ledger;
@@ -580,6 +581,105 @@ fn a_commit_the_store_refused_exits_eight_and_names_the_attempt() -> TestResult 
     assert_eq!(collected.exit(), Exit::CommitFailed);
     assert_eq!(named.len(), 1, "{:?}", collected.attempts);
     assert!(named[0].contains("refused attempt"), "{named:?}");
+    Ok(())
+}
+
+/// An archive that records every call made to it, so "refused before anything" is a count.
+#[derive(Default)]
+struct Untouched {
+    calls: RefCell<Vec<&'static str>>,
+}
+
+impl Untouched {
+    fn touched(&self, call: &'static str) -> ArchiveError {
+        self.calls.borrow_mut().push(call);
+        ArchiveError {
+            act: call,
+            detail: "this archive was not to be touched".to_owned(),
+        }
+    }
+}
+
+impl Sink for Untouched {
+    fn write(&mut self, _event: &AttemptEvent) -> Result<(), LedgerError> {
+        self.calls.borrow_mut().push("write");
+        Ok(())
+    }
+}
+
+impl Archive for Untouched {
+    fn put_blob(&self, _payload: &[u8]) -> Result<String, ArchiveError> {
+        Err(self.touched("put_blob"))
+    }
+
+    fn commit(
+        &mut self,
+        _closed: AttemptReceipt,
+        _items: &[CollectedItem],
+        _raw_blob: Option<&str>,
+        _observed: ObservationTime,
+    ) -> Result<Committed, ArchiveError> {
+        Err(self.touched("commit"))
+    }
+
+    fn ok_vendor_rows(&self, _source: &SourceId) -> Result<Vec<u32>, ArchiveError> {
+        Err(self.touched("ok_vendor_rows"))
+    }
+
+    fn attempts_in_flight(&self) -> Result<Vec<String>, ArchiveError> {
+        Err(self.touched("attempts_in_flight"))
+    }
+
+    fn covered_story_ids(
+        &self,
+        _source: &SourceId,
+        _target_window: &TargetWindow,
+    ) -> Result<std::collections::BTreeSet<String>, ArchiveError> {
+        Err(self.touched("covered_story_ids"))
+    }
+
+    fn record_planned_coverage(
+        &mut self,
+        _attempt_id: &str,
+        _matched: u32,
+    ) -> Result<(), ArchiveError> {
+        Err(self.touched("record_planned_coverage"))
+    }
+}
+
+/// Architecture.md section 11.2: a run whose inputs do not match the provider's declaration is
+/// refused by the driver before the startup sweep reads the archive and before any send.
+#[test]
+fn a_session_bound_run_with_no_calendar_is_refused_before_any_request() -> TestResult {
+    let root = TempDir::new()?;
+    let ask = ask(root.path(), A_LISTED_SESSION);
+    let opened = cmd_collect::open_provider(&ask)?;
+    let listing = edgar_press::read_listing(&std::fs::read(&ask.listing)?)?;
+    let exchange = Payloads::a_good_day()?;
+    let mut archive = Untouched::default();
+    let refused = news_provider::collect(
+        &opened.provider,
+        &mut archive,
+        &exchange,
+        &Fixed,
+        &Run {
+            run: &RunId::new("run-no-calendar"),
+            target: &TargetWindow::new(A_LISTED_SESSION),
+            calendar: None,
+            listing: Some(&listing),
+            at: ObservationTime::new(at()),
+        },
+    );
+    let named = matches!(
+        refused,
+        Err(CollectError::Planning(PlanRefusal::InputsDoNotMatchCadence { why, .. }))
+            if why == "has no calendar"
+    );
+    assert!(named, "{refused:?}");
+    assert_eq!(
+        (exchange.sends(), archive.calls.borrow().clone()),
+        (0, Vec::<&str>::new())
+    );
     Ok(())
 }
 

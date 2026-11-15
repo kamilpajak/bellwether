@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use pit::ObservationTime;
 
-use crate::budget::{BudgetError, BudgetScope, HostKey, Pace, RequestBudget};
+use crate::budget::{host_of, BudgetError, BudgetScope, Pace, RequestBudget};
 use crate::clock::{Clock, Sleeper, ThreadSleeper};
 use crate::ledger::{AttemptId, SendPermit};
 use crate::request::{CredentialRef, HeaderValue, Request, SourceId};
@@ -333,13 +333,10 @@ impl Wire {
         };
         // ureq 3.5.2 parses a url with this same `http::Uri` and fails before any socket, so an
         // unparseable one goes on to fail as a `Transport` its attempt row records.
-        let Ok(uri) = url.parse::<ureq::http::Uri>() else {
+        let Some(host) = host_of(url)? else {
             return Ok(());
         };
-        let host = uri.host().ok_or_else(|| BudgetError::NoHost {
-            url: url.to_owned(),
-        })?;
-        let scope = BudgetScope::PerHost(HostKey::new(host)?);
+        let scope = BudgetScope::PerHost(host);
         let pace = Pace::beside_the_store(&self.store, &scope, interval);
         self.sleeper.sleep(pace.reserve(clock.now())?);
         Ok(())

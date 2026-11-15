@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 
-use canon::FileDigest;
+use canon::{Digest, FileDigest};
 use chrono::NaiveDate;
 use pit::datedness::Published;
 use pit::{MeasuredLag, ObservationTime};
@@ -36,8 +36,7 @@ impl Provenance {
     }
 }
 
-/// Where a publication value came from. `PageMetadata` is not here: it has no producer until RSS
-/// and open-web crawling arrive, and an enum member nothing constructs is a branch nothing reaches.
+/// Where a publication value came from (architecture.md section 11.1's `ValidSource` per host).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidSource {
     /// The vendor stated it, in a field this provider names.
@@ -156,9 +155,8 @@ pub struct CollectedItem {
     pub body: Option<ExtractedBody>,
 }
 
-/// Why a row cannot enter the archive as an item. Both arms are reachable from one committed
-/// filing fixture apiece; a row is stored with its evidence rather than dropped, so this is a
-/// label and not a discard (architecture.md section 5 row 4).
+/// Why a row cannot enter the archive as an item. A row is stored with its evidence rather than
+/// dropped, so this is a label and not a discard (architecture.md section 5 row 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnusableReason {
     /// The predecessor's three real empty-string ids came back as ONE item with two publication
@@ -170,6 +168,9 @@ pub enum UnusableReason {
     /// A `vendor_archive` item whose publication plus the probed lag is past the last instant
     /// chrono holds, `pit::PitError::LagOutOfRange`: no observation can be placed for it.
     NoRepresentableObservation,
+    /// A page whose article container is absent or yields zero paragraph text. The rule is fixed
+    /// before its first measurement, as architecture.md section 11.3 requires of its threshold.
+    NoArticleBody,
 }
 
 /// An unusable row carries the WHOLE item and the payload it came out of, so the evidence is in
@@ -353,6 +354,77 @@ pub enum PlanRefusal {
         window: String,
         why: &'static str,
     },
+    /// The run's calendar and listing are not what the provider's [`Cadence`] takes. A calendar
+    /// handed to an every-day provider would be silently ignored; without one a session-bound
+    /// provider cannot plan.
+    #[error("{source_id} is {cadence} and {why}")]
+    InputsDoNotMatchCadence {
+        source_id: String,
+        cadence: &'static str,
+        why: &'static str,
+    },
+}
+
+const HAS_NO_CALENDAR: &str = "has no calendar";
+const HAS_NO_LISTING: &str = "has no listing";
+const WAS_HANDED_A_CALENDAR: &str = "was handed a calendar";
+const WAS_HANDED_A_LISTING: &str = "was handed a listing";
+
+/// Which days a provider asks for, declared by the provider (architecture.md section 11.2's
+/// conformance bullet). The driver refuses a run whose inputs do not match before anything is
+/// planned, and the conformance harness holds only `SessionBound` to the listed-session check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cadence {
+    /// Only days a session calendar opens and the vendor's own listing names.
+    SessionBound,
+    /// Every UTC day, weekends included; takes no calendar and no listing.
+    EveryUtcDay,
+}
+
+impl Cadence {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::SessionBound => "session_bound",
+            Self::EveryUtcDay => "every_utc_day",
+        }
+    }
+
+    /// Refuses a calendar or listing this cadence does not take, and a missing one it needs.
+    pub fn admits(
+        self,
+        source: &SourceId,
+        calendar: Option<&Calendar>,
+        listing: Option<&Listing>,
+    ) -> Result<(), PlanRefusal> {
+        match (self, calendar, listing) {
+            (Self::SessionBound, _, _) => listed_sessions(source, calendar, listing).map(drop),
+            (Self::EveryUtcDay, None, None) => Ok(()),
+            (Self::EveryUtcDay, Some(_), _) => Err(mismatch(self, source, WAS_HANDED_A_CALENDAR)),
+            (Self::EveryUtcDay, None, Some(_)) => Err(mismatch(self, source, WAS_HANDED_A_LISTING)),
+        }
+    }
+}
+
+fn mismatch(cadence: Cadence, source: &SourceId, why: &'static str) -> PlanRefusal {
+    PlanRefusal::InputsDoNotMatchCadence {
+        source_id: source.as_str().to_owned(),
+        cadence: cadence.name(),
+        why,
+    }
+}
+
+/// The calendar and listing a [`Cadence::SessionBound`] plan reads, or the refusal naming which
+/// one is missing.
+pub fn listed_sessions<'a>(
+    source: &SourceId,
+    calendar: Option<&'a Calendar>,
+    listing: Option<&'a Listing>,
+) -> Result<(&'a Calendar, &'a Listing), PlanRefusal> {
+    let session_bound = |why| mismatch(Cadence::SessionBound, source, why);
+    let calendar = calendar.ok_or_else(|| session_bound(HAS_NO_CALENDAR))?;
+    let listing = listing.ok_or_else(|| session_bound(HAS_NO_LISTING))?;
+    Ok((calendar, listing))
 }
 
 const NO_LAG_AT_ALL: &str = "no lag entry";
@@ -416,13 +488,18 @@ pub trait Provider: Send + Sync {
     /// filtered by even when it planned no request at all (architecture.md section 8 row U1).
     fn universe_version(&self) -> FileDigest;
 
-    /// Takes the calendar AND the vendor's own listing, so a non-session day is zero requests and
-    /// an unpublished day is a planning fact rather than a vendor verdict.
+    /// Which days `plan` asks for, and so which of a calendar and a listing it takes. No default:
+    /// a provider that forgot to declare would inherit a claim it never made.
+    fn cadence(&self) -> Cadence;
+
+    /// A [`Cadence::SessionBound`] plan takes the calendar AND the vendor's own listing, so a
+    /// non-session day is zero requests and an unpublished day is a planning fact rather than a
+    /// vendor verdict; [`listed_sessions`] refuses either one missing.
     fn plan(
         &self,
         target: &TargetWindow,
-        calendar: &Calendar,
-        listing: &Listing,
+        calendar: Option<&Calendar>,
+        listing: Option<&Listing>,
         at: ObservationTime,
     ) -> Result<Plan, PlanRefusal>;
 
@@ -442,21 +519,25 @@ pub trait Provider: Send + Sync {
     /// story is covered is dropped, so a re-run converges on full coverage without re-fetching what
     /// the store already holds; a `live_ingest` follow-up is always issued, because a live sweep
     /// must poll every matched row (§8 row R16). The driver reads the covered set from the archive
-    /// and hands it in; mapping a follow-up to its story is the provider's, because only it knows
-    /// its vendor's row identity. Not a parameter of `extract`, which stays pure over bytes and
-    /// rules: the covered set is run state, not payload.
+    /// and hands it in; a follow-up's story is [`Provider::story_of`]. Not a parameter of
+    /// `extract`, which stays pure over bytes and rules: the covered set is run state, not payload.
     fn follow_ups_to_issue(
         &self,
         follow_ups: Vec<Request>,
         covered: &BTreeSet<String>,
     ) -> Vec<Request>;
+
+    /// The `story_id` a follow-up's item will carry, from the request alone and so before any
+    /// fetch; the provider's, because only it knows its vendor's row identity. `None` when the
+    /// request does not name its story, and such a follow-up is never treated as covered.
+    fn story_of(&self, follow_up: &Request) -> Option<Digest>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        precision_of, probed_lag, stamp_of, Calendar, CalendarError, PlanRefusal, TargetWindow,
-        ValidPrecision,
+        precision_of, probed_lag, stamp_of, Cadence, Calendar, CalendarError, Listing, PlanRefusal,
+        TargetWindow, ValidPrecision,
     };
     use crate::SourceId;
     use chrono::{DateTime, Utc};
@@ -487,6 +568,45 @@ mod tests {
             window: WINDOW.to_owned(),
             why,
         })
+    }
+
+    /// Each cadence over all four presences of (calendar, listing): exactly one is admitted.
+    #[test]
+    fn each_cadence_admits_exactly_the_inputs_it_declares_and_names_the_one_it_refuses() {
+        let Ok(calendar) = Calendar::read(GOOD_CALENDAR) else {
+            assert_eq!(GOOD_CALENDAR, b"a readable calendar");
+            return;
+        };
+        let listing = Listing::of_days(&[]);
+        let refused = |cadence: Cadence, why: &'static str| {
+            Err(PlanRefusal::InputsDoNotMatchCadence {
+                source_id: SOURCE.to_owned(),
+                cadence: cadence.name(),
+                why,
+            })
+        };
+        let (session, every) = (Cadence::SessionBound, Cadence::EveryUtcDay);
+        let cases = [
+            (session, true, true, Ok(())),
+            (session, false, true, refused(session, "has no calendar")),
+            (session, true, false, refused(session, "has no listing")),
+            (session, false, false, refused(session, "has no calendar")),
+            (every, false, false, Ok(())),
+            (every, true, false, refused(every, "was handed a calendar")),
+            (every, false, true, refused(every, "was handed a listing")),
+            (every, true, true, refused(every, "was handed a calendar")),
+        ];
+        for (cadence, with_calendar, with_listing, expected) in cases {
+            let admitted = cadence.admits(
+                &source(),
+                with_calendar.then_some(&calendar),
+                with_listing.then_some(&listing),
+            );
+            assert_eq!(
+                admitted, expected,
+                "{cadence:?} {with_calendar} {with_listing}"
+            );
+        }
     }
 
     /// `no_item_is_finer_than_the_ceiling` reads this order: a minute under a day ceiling is a

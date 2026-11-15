@@ -134,8 +134,10 @@ pub enum CollectError {
 pub struct Run<'a> {
     pub run: &'a RunId,
     pub target: &'a TargetWindow,
-    pub calendar: &'a Calendar,
-    pub listing: &'a Listing,
+    /// Present exactly when the provider's [`crate::Cadence`] takes them; [`collect`] refuses
+    /// any other combination before it touches the archive.
+    pub calendar: Option<&'a Calendar>,
+    pub listing: Option<&'a Listing>,
     /// The run's own observation instant, which decides each request's provenance. Injected,
     /// because a provider may not read a clock.
     pub at: ObservationTime,
@@ -361,6 +363,9 @@ pub fn collect<A: Archive>(
     run: &Run,
 ) -> Result<Collected, CollectError> {
     let source = provider.source();
+    provider
+        .cadence()
+        .admits(&source, run.calendar, run.listing)?;
     // Before this run opens anything of its own, so the sweep never sees its own attempts.
     let swept = sweep(archive, run.run, ObservationTime::new(clock.now()))?;
     let plan = provider.plan(run.target, run.calendar, run.listing, run.at)?;

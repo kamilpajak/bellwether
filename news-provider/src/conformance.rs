@@ -3,16 +3,18 @@
 //! hides which failure (CONTRIBUTING.md, "What was measured").
 //!
 //! It is not a gate over the provider's own vendor behaviour - that is the adapter's test suite.
-//! It checks the four claims the seam makes about ANY provider: a plan accounts for every day its
-//! window names, it asks only for days both the calendar and the listing allow, extraction is pure
-//! over (bytes, rules), and a payload's counts add up.
+//! It checks the claims the seam makes about ANY provider: a plan accounts for every day its window
+//! names and asks each (day, host) at most once, a session-bound plan asks only for days both the
+//! calendar and the listing allow, extraction is pure over (bytes, rules), and a payload's counts
+//! add up.
 
 use std::collections::BTreeMap;
 
 use pit::ObservationTime;
 
+use crate::budget::host_of;
 use crate::ledger::{AttemptEvent, LedgerError, Sink};
-use crate::provider::{precision_of, Calendar, Listing, Provider, RawBlob};
+use crate::provider::{precision_of, Cadence, Calendar, Listing, Provider, RawBlob};
 use crate::request::{days_of, Request, TargetWindow};
 use chrono::NaiveDate;
 
@@ -36,12 +38,13 @@ pub const THE_COUNTS_ADD_UP: &str = "the_counts_add_up";
 pub const NO_ITEM_IS_FINER_THAN_THE_CEILING: &str = "no_item_is_finer_than_the_ceiling";
 
 /// What the harness needs to ask its questions: the inputs of one planned run, plus one stored
-/// payload per shape the adapter's own fixtures carry.
+/// payload per shape the adapter's own fixtures carry. `calendar` and `listing` are what the
+/// provider's [`Cadence`] takes, as in [`crate::Run`].
 #[derive(Debug)]
 pub struct Subject<'a> {
     pub target: TargetWindow,
-    pub calendar: &'a Calendar,
-    pub listing: &'a Listing,
+    pub calendar: Option<&'a Calendar>,
+    pub listing: Option<&'a Listing>,
     pub at: ObservationTime,
     pub payloads: &'a [(Request, RawBlob)],
 }
@@ -57,11 +60,13 @@ pub fn breaches(provider: &dyn Provider, subject: &Subject) -> Vec<Breach> {
     ) {
         Ok(plan) => {
             found.extend(plan_accounts_for_every_day(&subject.target, &plan));
-            found.extend(plan_asks_only_for_a_listed_session(
-                subject.calendar,
-                subject.listing,
-                &plan,
-            ));
+            if provider.cadence() == Cadence::SessionBound {
+                found.extend(plan_asks_only_for_a_listed_session(
+                    subject.calendar,
+                    subject.listing,
+                    &plan,
+                ));
+            }
         }
         Err(refusal) => found.push(Breach {
             check: PLAN_ACCOUNTS_FOR_EVERY_DAY,
@@ -112,8 +117,9 @@ pub fn breaches(provider: &dyn Provider, subject: &Subject) -> Vec<Breach> {
     found
 }
 
-/// Every day the window names appears once, as a request or as a `NotPlanned` row. A whole-window
-/// row (an unreadable or empty window) accounts for the window instead.
+/// Every day the window names is asked for by at least one request or named by exactly one
+/// `NotPlanned` row, never both, and no (day, host) pair is asked twice. A whole-window row (an
+/// unreadable or empty window) accounts for the window instead.
 fn plan_accounts_for_every_day(target: &TargetWindow, plan: &crate::Plan) -> Vec<Breach> {
     if plan
         .not_planned
@@ -122,38 +128,65 @@ fn plan_accounts_for_every_day(target: &TargetWindow, plan: &crate::Plan) -> Vec
     {
         return Vec::new();
     }
-    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let breach = |detail: String| Breach {
+        check: PLAN_ACCOUNTS_FOR_EVERY_DAY,
+        detail,
+    };
+    let mut found = Vec::new();
+    let mut asked: BTreeMap<(String, String), usize> = BTreeMap::new();
     for request in &plan.requests {
-        *seen
-            .entry(request.target_window.as_str().to_owned())
-            .or_default() += 1;
+        match host_of(&request.url) {
+            Ok(Some(host)) => {
+                let day = request.target_window.as_str().to_owned();
+                *asked.entry((day, host.as_str().to_owned())).or_default() += 1;
+            }
+            Ok(None) | Err(_) => found.push(breach(format!(
+                "{} names no host this seam can key",
+                request.url
+            ))),
+        }
     }
+    for ((day, host), times) in &asked {
+        if *times > 1 {
+            found.push(breach(format!("{day} at {host} is asked {times} times")));
+        }
+    }
+    let mut not_planned: BTreeMap<String, usize> = BTreeMap::new();
     for (window, _) in &plan.not_planned {
-        *seen.entry(window.as_str().to_owned()).or_default() += 1;
+        *not_planned.entry(window.as_str().to_owned()).or_default() += 1;
     }
-    days_or_none(target)
-        .iter()
-        .filter_map(
-            |day| match seen.get(&day.to_string()).copied().unwrap_or(0) {
-                1 => None,
-                times => Some(Breach {
-                    check: PLAN_ACCOUNTS_FOR_EVERY_DAY,
-                    detail: format!("{day} appears {times} times in the plan"),
-                }),
-            },
-        )
-        .collect()
+    for day in days_or_none(target) {
+        let day = day.to_string();
+        let requests = plan
+            .requests
+            .iter()
+            .filter(|request| request.target_window.as_str() == day)
+            .count();
+        let rows = not_planned.get(&day).copied().unwrap_or(0);
+        if (requests == 0 && rows != 1) || (requests > 0 && rows > 0) {
+            found.push(breach(format!(
+                "{day} has {requests} requests and {rows} not-planned rows"
+            )));
+        }
+    }
+    found
 }
 
+/// A missing calendar or listing allows no day, so a session-bound plan handed neither is a breach
+/// on every request rather than a pass.
 fn plan_asks_only_for_a_listed_session(
-    calendar: &Calendar,
-    listing: &Listing,
+    calendar: Option<&Calendar>,
+    listing: Option<&Listing>,
     plan: &crate::Plan,
 ) -> Vec<Breach> {
+    let listed = |day: NaiveDate| {
+        calendar.is_some_and(|calendar| calendar.is_session(day))
+            && listing.is_some_and(|listing| listing.names(day))
+    };
     plan.requests
         .iter()
         .flat_map(|request| days_or_none(&request.target_window))
-        .filter(|day| !calendar.is_session(*day) || !listing.names(*day))
+        .filter(|day| !listed(*day))
         .map(|day| Breach {
             check: PLAN_ASKS_ONLY_FOR_A_LISTED_SESSION,
             detail: format!("{day} is closed or unlisted and the plan asks for it"),
@@ -187,13 +220,13 @@ mod tests {
     };
     use crate::budget::RequestBudget;
     use crate::provider::{
-        Calendar, CollectedItem, Extracted, Listing, Plan, PlanRefusal, Provenance, Provider,
-        RawBlob, ValidPrecision, ValidSource,
+        Cadence, Calendar, CollectedItem, Extracted, Listing, NotPlanned, Plan, PlanRefusal,
+        Provenance, Provider, RawBlob, ValidPrecision, ValidSource,
     };
     use crate::request::{HeaderValue, Request, RequestPhase};
     use crate::wire::{RawResponse, Timeouts, TransportError, TransportProfile};
     use crate::{SourceId, TargetWindow, Verdict};
-    use canon::FileDigest;
+    use canon::{Digest, FileDigest};
     use chrono::{DateTime, NaiveDate, Utc};
     use pit::datedness::Published;
     use pit::{ObservationTime, ValidTime};
@@ -204,6 +237,10 @@ mod tests {
     const CALENDAR: &[u8] = br#"{"schema":"calendar/1","sessions":["2026-11-09","2026-11-10"]}"#;
     const WINDOW: &str = "2026-11-09..2026-11-10";
     const CLOSED_DAY: &str = "2026-11-07";
+    const INDEX_URL: &str = "https://example.test/index";
+    const SECOND_HOST_URL: &str = "https://second.example.test/index";
+    /// `HostKey::new` refuses the underscore.
+    const UNKEYABLE_HOST_URL: &str = "https://exa_mple.test/index";
     const AT: &str = "2026-11-10T18:00:00Z";
     const PATIENCE: Duration = Duration::from_secs(1);
     const ONE_ROW: u32 = 1;
@@ -218,10 +255,17 @@ mod tests {
         ExtractDifferentlyEachTime,
         MiscountVendorRows,
         ClaimAnInstantUnderADayCeiling,
+        /// Not a breach: one day from two hosts is two (day, host) pairs.
+        AskOneDayFromTwoHosts,
+        AskOneDayAndHostTwice,
+        AskAHostThisSeamCannotKey,
+        AskForADayAndAlsoNotPlanIt,
+        NotPlanADayTwice,
     }
 
     struct Mock {
         how: Break,
+        cadence: Cadence,
         extractions: AtomicU32,
     }
 
@@ -229,17 +273,29 @@ mod tests {
         fn breaking(how: Break) -> Self {
             Self {
                 how,
+                cadence: Cadence::SessionBound,
                 extractions: AtomicU32::new(0),
             }
         }
 
+        fn every_utc_day(how: Break) -> Self {
+            Self {
+                cadence: Cadence::EveryUtcDay,
+                ..Self::breaking(how)
+            }
+        }
+
         fn request(&self, window: &str) -> Request {
+            self.request_at(window, INDEX_URL)
+        }
+
+        fn request_at(&self, window: &str, url: &str) -> Request {
             Request {
                 source: SourceId::new(SOURCE),
                 target_window: TargetWindow::new(window),
                 phase: RequestPhase::Index,
                 provenance: Provenance::LiveIngest,
-                url: "https://example.test/index".to_owned(),
+                url: url.to_owned(),
                 headers: Vec::new(),
                 params: Vec::new(),
                 universe_version: FileDigest::of(ROSTER),
@@ -310,11 +366,15 @@ mod tests {
             FileDigest::of(ROSTER)
         }
 
+        fn cadence(&self) -> Cadence {
+            self.cadence
+        }
+
         fn plan(
             &self,
             target: &TargetWindow,
-            _calendar: &Calendar,
-            _listing: &Listing,
+            _calendar: Option<&Calendar>,
+            _listing: Option<&Listing>,
             _at: ObservationTime,
         ) -> Result<Plan, PlanRefusal> {
             let requests = match self.how {
@@ -324,12 +384,39 @@ mod tests {
                     self.request("2026-11-10"),
                     self.request(CLOSED_DAY),
                 ],
+                Break::AskOneDayFromTwoHosts => vec![
+                    self.request("2026-11-09"),
+                    self.request("2026-11-10"),
+                    self.request_at("2026-11-10", SECOND_HOST_URL),
+                ],
+                Break::AskOneDayAndHostTwice => vec![
+                    self.request("2026-11-09"),
+                    self.request("2026-11-10"),
+                    self.request("2026-11-10"),
+                ],
+                Break::AskAHostThisSeamCannotKey => vec![
+                    self.request("2026-11-09"),
+                    self.request_at("2026-11-10", UNKEYABLE_HOST_URL),
+                ],
                 _ => vec![self.request("2026-11-09"), self.request("2026-11-10")],
             };
             let _ = target;
+            let unlisted = (
+                TargetWindow::new("2026-11-10"),
+                NotPlanned::WindowNotPublished,
+            );
+            let not_planned = match self.how {
+                Break::AskForADayAndAlsoNotPlanIt => vec![unlisted],
+                Break::NotPlanADayTwice => vec![unlisted.clone(), unlisted],
+                _ => Vec::new(),
+            };
+            let requests = match self.how {
+                Break::NotPlanADayTwice => vec![self.request("2026-11-09")],
+                _ => requests,
+            };
             Ok(Plan {
                 requests,
-                not_planned: Vec::new(),
+                not_planned,
             })
         }
 
@@ -377,6 +464,10 @@ mod tests {
         ) -> Vec<Request> {
             follow_ups
         }
+
+        fn story_of(&self, _follow_up: &Request) -> Option<Digest> {
+            None
+        }
     }
 
     fn found(how: Break) -> Vec<&'static str> {
@@ -388,7 +479,14 @@ mod tests {
             .filter_map(|day| day.parse().ok())
             .collect();
         let listing = Listing::of_days(&days);
-        let mock = Mock::breaking(how);
+        found_in(&Mock::breaking(how), Some(&calendar), Some(&listing))
+    }
+
+    fn found_in(
+        mock: &Mock,
+        calendar: Option<&Calendar>,
+        listing: Option<&Listing>,
+    ) -> Vec<&'static str> {
         let payloads = [(
             mock.request(WINDOW),
             RawBlob {
@@ -398,12 +496,12 @@ mod tests {
         )];
         let subject = Subject {
             target: TargetWindow::new(WINDOW),
-            calendar: &calendar,
-            listing: &listing,
+            calendar,
+            listing,
             at: ObservationTime::new(AT.parse().unwrap_or(DateTime::<Utc>::UNIX_EPOCH)),
             payloads: &payloads,
         };
-        breaches(&mock, &subject)
+        breaches(mock, &subject)
             .into_iter()
             .map(|breach| breach.check)
             .collect()
@@ -427,9 +525,39 @@ mod tests {
                 Break::ClaimAnInstantUnderADayCeiling,
                 NO_ITEM_IS_FINER_THAN_THE_CEILING,
             ),
+            (Break::AskOneDayAndHostTwice, PLAN_ACCOUNTS_FOR_EVERY_DAY),
+            (
+                Break::AskAHostThisSeamCannotKey,
+                PLAN_ACCOUNTS_FOR_EVERY_DAY,
+            ),
+            (
+                Break::AskForADayAndAlsoNotPlanIt,
+                PLAN_ACCOUNTS_FOR_EVERY_DAY,
+            ),
+            (Break::NotPlanADayTwice, PLAN_ACCOUNTS_FOR_EVERY_DAY),
         ];
         for (how, expected) in cases {
             assert!(found(how).contains(&expected), "{how:?} raised nothing");
         }
+    }
+
+    /// Architecture.md section 11.2: accounting is per (day, host), so an open-web plan asking one
+    /// day of two wires is not a day asked twice.
+    #[test]
+    fn two_hosts_on_one_day_account_once_each() {
+        assert_eq!(found(Break::AskOneDayFromTwoHosts), Vec::<&str>::new());
+    }
+
+    /// Handed no calendar and no listing, as its cadence requires, an every-day plan is not a
+    /// breach of a check that would allow no day at all.
+    #[test]
+    fn an_every_utc_day_provider_is_not_held_to_the_listed_session_check() {
+        let mock = Mock::every_utc_day(Break::Nothing);
+        assert_eq!(found_in(&mock, None, None), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn a_session_bound_provider_that_asks_for_a_closed_day_is_still_named() {
+        assert!(found(Break::AskForAClosedDay).contains(&PLAN_ASKS_ONLY_FOR_A_LISTED_SESSION));
     }
 }

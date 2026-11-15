@@ -50,6 +50,22 @@ impl HostKey {
         }
         Ok(Self(key))
     }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A url's host as a [`HostKey`], by the one rule `Wire`'s host pace and the conformance harness's
+/// per-(day, host) accounting share. `Ok(None)` when `ureq::http::Uri` cannot parse the url.
+pub(crate) fn host_of(url: &str) -> Result<Option<HostKey>, BudgetError> {
+    let Ok(uri) = url.parse::<ureq::http::Uri>() else {
+        return Ok(None);
+    };
+    let host = uri.host().ok_or_else(|| BudgetError::NoHost {
+        url: url.to_owned(),
+    })?;
+    HostKey::new(host).map(Some)
 }
 
 impl BudgetScope {
