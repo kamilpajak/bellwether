@@ -9,8 +9,8 @@ use canon::FileDigest;
 use chrono::{DateTime, Utc};
 use news_provider::conformance::{breaches, RecordingSink, Subject};
 use news_provider::provider::{
-    precision_of, Cadence, Calendar, CollectedItem, Extracted, Listing, PlanRefusal, Provenance,
-    Provider, RawBlob, UnusableReason, UnusableRow, ValidPrecision, ValidSource,
+    precision_of, Cadence, Calendar, CollectedItem, DecidedBy, Extracted, Listing, PlanRefusal,
+    Provenance, Provider, RawBlob, UnusableReason, UnusableRow, ValidPrecision, ValidSource,
 };
 use news_provider::request::{HeaderValue, Request, RequestPhase};
 use news_provider::{
@@ -921,6 +921,46 @@ fn a_page_with_no_article_container_is_unusable_as_no_article_body() -> Outcome 
         (UnusableReason::NoArticleBody, page.digest.as_str(), None)
     );
     assert_eq!(row.item.title, "A Page Without Its Article");
+    Ok(())
+}
+
+/// Section 11.1, owner decision of 2026-11-15: the listed time came from the index row, so a later
+/// listing can correct it; the four page reasons cannot be. A bad listing outranks a bad page.
+#[test]
+fn an_unparseable_listed_time_is_decided_by_the_index_row_and_a_page_reason_by_the_page() -> Outcome
+{
+    let provider = provider()?;
+    let request = article_request(&provider)?;
+    let unlisted = Request {
+        listed_date: Some(NOT_A_MINUTE_PUB_DATES[0].to_owned()),
+        ..request.clone()
+    };
+    let mut too_deep = "<html><body>".to_owned();
+    too_deep.push_str(&"<div>".repeat(DEEPEST_PAGE));
+    let mut not_utf8 = gnw(REAL_ARTICLE);
+    not_utf8.extend_from_slice(&[0xFF, 0xFE]);
+    let decided = |request: &Request, page: Vec<u8>| -> Result<_, Box<dyn std::error::Error>> {
+        let row = only_unusable(&provider.extract(request, &blob(page)))?;
+        Ok((row.reason, row.decided_by))
+    };
+    assert_eq!(
+        [
+            decided(&unlisted, gnw(REAL_ARTICLE))?,
+            decided(&request, gnw(NO_CONTAINER_PAGE))?,
+            decided(&request, not_utf8)?,
+            decided(&request, too_deep.into_bytes())?,
+            decided(&request, gnw(TWO_CONTAINERS_PAGE))?,
+            decided(&unlisted, gnw(NO_CONTAINER_PAGE))?,
+        ],
+        [
+            (UnusableReason::NoParseableValidTime, DecidedBy::IndexRow),
+            (UnusableReason::NoArticleBody, DecidedBy::Page),
+            (UnusableReason::PageNotUtf8, DecidedBy::Page),
+            (UnusableReason::PageTooDeep, DecidedBy::Page),
+            (UnusableReason::ArticleContainerAmbiguous, DecidedBy::Page),
+            (UnusableReason::NoParseableValidTime, DecidedBy::IndexRow),
+        ]
+    );
     Ok(())
 }
 

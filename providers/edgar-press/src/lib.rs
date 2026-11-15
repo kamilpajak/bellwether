@@ -16,9 +16,9 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeDelta, TimeZone, Utc};
 use chrono_tz::Tz;
 use news_provider::budget::RequestBudget;
 use news_provider::provider::{
-    listed_sessions, precision_of, probed_lag, Cadence, Calendar, CollectedItem, Extracted,
-    ExtractedBody, Listing, NotPlanned, Plan, PlanRefusal, Provenance, Provider, RawBlob,
-    UnusableReason, UnusableRow, ValidPrecision, ValidSource,
+    listed_sessions, precision_of, probed_lag, Cadence, Calendar, CollectedItem, DecidedBy,
+    Extracted, ExtractedBody, Listing, NotPlanned, Plan, PlanRefusal, Provenance, Provider,
+    RawBlob, UnusableReason, UnusableRow, ValidPrecision, ValidSource,
 };
 use news_provider::request::{days_of, HeaderValue, Request, RequestPhase};
 use news_provider::wire::{RawResponse, Timeouts, TransportError, TransportKind, TransportProfile};
@@ -298,6 +298,8 @@ impl EdgarPress {
                 follow_ups: Vec::new(),
                 unusable: vec![UnusableRow {
                     reason,
+                    // Page for every reason: edgar's live ingest ignores the held set (§10).
+                    decided_by: DecidedBy::Page,
                     item,
                     raw_blob: raw.digest.clone(),
                 }],

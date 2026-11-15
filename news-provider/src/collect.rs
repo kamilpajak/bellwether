@@ -12,10 +12,10 @@ use pit::ObservationTime;
 
 use crate::clock::Clock;
 use crate::ledger::{
-    abandon, AttemptId, AttemptReceipt, AttemptSlot, Baseline, LedgerError, Outcome, OutcomeKind,
-    SendPermit, Sink, Verdict,
+    abandon, AttemptId, AttemptReceipt, AttemptSlot, Baseline, Counts, LedgerError, Outcome,
+    OutcomeKind, SendPermit, Sink, Verdict,
 };
-use crate::provider::{CollectedItem, Plan, Provenance, Provider, RawBlob};
+use crate::provider::{CollectedItem, DecidedBy, Plan, Provenance, Provider, RawBlob};
 use crate::request::{Request, RequestPhase, RunId, SourceId, TargetWindow};
 use crate::wire::{RawResponse, SendFailure, Wire};
 use crate::{Calendar, Listing, PlanRefusal};
@@ -102,8 +102,8 @@ pub trait Archive: Sink {
 
     /// The story ids this archive holds under `source` across EVERY target window: a committed
     /// item, or a closed Document attempt whose verdict was usable, empty or permanent. A transient
-    /// failure, a permanent failure answered with a 3xx, a swept attempt and one in flight hold
-    /// nothing (architecture.md section 11.1).
+    /// failure, a permanent failure answered with a 3xx, a usable attempt with an unusable row the
+    /// index row decided, a swept attempt and one in flight hold nothing (section 11.1).
     fn held_story_ids(
         &self,
         source: &SourceId,
@@ -526,15 +526,26 @@ fn attempt_once<A: Archive>(
         )),
         _ => None,
     };
-    let (vendor_rows, filtered_out, unusable_rows) = match &extracted {
+    let (vendor_rows, filtered_out, unusable_rows, listing_unusable) = match &extracted {
         Some(extracted) => (
             extracted.vendor_rows,
             extracted.filtered_out,
             count(extracted.unusable.len()),
+            count(
+                extracted
+                    .unusable
+                    .iter()
+                    .filter(|row| row.decided_by == DecidedBy::IndexRow)
+                    .count(),
+            ),
         ),
-        None => (0, 0, 0),
+        None => (0, 0, 0, 0),
     };
-    let outcome = Outcome::decide(&verdict, vendor_rows, baseline);
+    let counts = Counts {
+        vendor_rows,
+        listing_unusable,
+    };
+    let outcome = Outcome::decide(&verdict, counts, baseline);
     let kind = outcome.kind();
     let closed = slot.close(archive, outcome, &answer, ObservationTime::new(clock.now()))?;
     let (status, observed) = match &answer {

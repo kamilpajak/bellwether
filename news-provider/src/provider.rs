@@ -179,11 +179,23 @@ pub enum UnusableReason {
     ArticleContainerAmbiguous,
 }
 
+/// Which input decided an [`UnusableReason`]. Not a method on the reason: edgar reads its
+/// `BlankSourceItemId` off the page, open-web reads its own off the url the index gave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecidedBy {
+    /// The index row the request was planned from, which a later listing can correct: such a
+    /// story is fetched again (architecture.md section 11.1).
+    IndexRow,
+    /// The fetched page itself, which a refetch of the same url would answer the same way.
+    Page,
+}
+
 /// An unusable row carries the WHOLE item and the payload it came out of, so the evidence is in
 /// the archive rather than in a log line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnusableRow {
     pub reason: UnusableReason,
+    pub decided_by: DecidedBy,
     pub item: CollectedItem,
     pub raw_blob: String,
 }

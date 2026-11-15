@@ -1188,8 +1188,8 @@ mod tests {
     use canon::FileDigest;
     use news_provider::provider::CollectedItem;
     use news_provider::{
-        AttemptSlot, Baseline, Outcome, RawResponse, Request, RequestPhase, RunId, SourceId,
-        TargetWindow, ValidSource, Verdict,
+        AttemptSlot, Baseline, Counts, Outcome, RawResponse, Request, RequestPhase, RunId,
+        SourceId, TargetWindow, ValidSource, Verdict,
     };
     use pit::datedness::Published;
     use pit::{ObservationTime, ValidTime};
@@ -1345,7 +1345,14 @@ mod tests {
         let at = ObservationTime::new(instant(FETCHED_AT));
         let slot = AttemptSlot::open(&mut store, &request, None, &RunId::new(RUN), 0, at)?;
         let answer = RawResponse::new(slot.attempt_id().clone(), 200, b"payload".to_vec(), at, at);
-        let outcome = Outcome::decide(&Verdict::Usable, 1, &Baseline::from_trailing_ok(&[1]));
+        let outcome = Outcome::decide(
+            &Verdict::Usable,
+            Counts {
+                vendor_rows: 1,
+                listing_unusable: 0,
+            },
+            &Baseline::from_trailing_ok(&[1]),
+        );
         let closed = slot.close(&mut store, outcome, &Ok(answer), at)?;
         store.record(closed, &rows, at)?;
         drop(store);

@@ -16,8 +16,9 @@ use std::time::Duration;
 use canon::{Digest, FileDigest};
 use chrono::NaiveDateTime;
 use news_provider::provider::{
-    Cadence, Calendar, CollectedItem, Extracted, ExtractedBody, Listing, Plan, PlanRefusal,
-    Provenance, Provider, RawBlob, UnusableReason, UnusableRow, ValidPrecision, ValidSource,
+    Cadence, Calendar, CollectedItem, DecidedBy, Extracted, ExtractedBody, Listing, Plan,
+    PlanRefusal, Provenance, Provider, RawBlob, UnusableReason, UnusableRow, ValidPrecision,
+    ValidSource,
 };
 use news_provider::request::{days_of, HeaderValue, Request, RequestPhase};
 use news_provider::wire::{RawResponse, Timeouts, TransportError, TransportKind, TransportProfile};
@@ -356,18 +357,20 @@ impl OpenWebFeed {
             observed: None,
             body,
         };
+        // The url and the listed time both came from the index row; only the body is the page's.
         let unusable = if item.source_item_id.is_empty() {
-            Some(UnusableReason::BlankSourceItemId)
+            Some((UnusableReason::BlankSourceItemId, DecidedBy::IndexRow))
         } else if item.valid == Published::Unknown {
-            Some(UnusableReason::NoParseableValidTime)
+            Some((UnusableReason::NoParseableValidTime, DecidedBy::IndexRow))
         } else {
-            page.body.err()
+            page.body.err().map(|reason| (reason, DecidedBy::Page))
         };
         let (items, unusable) = match unusable {
-            Some(reason) => (
+            Some((reason, decided_by)) => (
                 Vec::new(),
                 vec![UnusableRow {
                     reason,
+                    decided_by,
                     item,
                     raw_blob: raw.digest.clone(),
                 }],

@@ -9,9 +9,9 @@ use std::path::PathBuf;
 use canon::FileDigest;
 use chrono::{DateTime, Utc};
 use news_provider::{
-    AttemptSlot, Baseline, BudgetError, Clock, Exchange, Exit, LedgerError, Outcome, OutcomeKind,
-    Provenance, RawResponse, Request, RequestPhase, RunId, SendFailure, SourceId, Tally,
-    TargetWindow, TransportError, TransportKind, Verdict,
+    AttemptSlot, Baseline, BudgetError, Clock, Counts, Exchange, Exit, LedgerError, Outcome,
+    OutcomeKind, Provenance, RawResponse, Request, RequestPhase, RunId, SendFailure, SourceId,
+    Tally, TargetWindow, TransportError, TransportKind, Verdict,
 };
 use open_web_feed::{HostPin, OpenWebFeed};
 use pit::ObservationTime;
@@ -281,7 +281,14 @@ fn fetch(
         (Ok(_), Verdict::Empty) => Some(RobotsAnswer::Absent),
         _ => None,
     };
-    let outcome = Outcome::decide(&verdict, NO_VENDOR_ROWS, &Baseline::from_trailing_ok(&[]));
+    let outcome = Outcome::decide(
+        &verdict,
+        Counts {
+            vendor_rows: NO_VENDOR_ROWS,
+            listing_unusable: 0,
+        },
+        &Baseline::from_trailing_ok(&[]),
+    );
     let kind = outcome.kind();
     let closed = slot.close(store, outcome, &answer, ObservationTime::new(clock.now()))?;
     let at = closed.closed_at();

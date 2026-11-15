@@ -1190,8 +1190,8 @@ fn a_document_answered_408_is_fetched_again_by_the_next_poll() -> TestResult {
     Ok(())
 }
 
-/// Section 11.1: a page that yielded only unusable rows is a usable verdict with no item, and is
-/// held. Mutation 2026-11-15, the held read keeping its items arm only: red.
+/// Section 11.1: a page that yielded only unusable rows the PAGE decided is a usable verdict with
+/// no item, and is held. Mutation 2026-11-15, the held read keeping its items arm only: red.
 #[test]
 fn a_document_that_yielded_only_unusable_rows_is_not_fetched_again() -> TestResult {
     let root = TempDir::new()?;
@@ -1220,6 +1220,96 @@ fn a_document_that_yielded_only_unusable_rows_is_not_fetched_again() -> TestResu
             second.contains(&no_article)
         ),
         (true, 0, false)
+    );
+    Ok(())
+}
+
+/// A third poll of the same day, after `LATER_THE_SAME_DAY`.
+const LATEST_THE_SAME_DAY: &str = "2026-11-14T19:10:00Z";
+/// Release 0's pubDate, and the same instant with seconds, which §11.1 reads as no minute.
+const LISTED: &str = "<pubDate>Sat, 14 Nov 2026 19:00 GMT</pubDate>";
+const LISTED_WITH_SECONDS: &str = "<pubDate>Sat, 14 Nov 2026 19:00:00 GMT</pubDate>";
+
+/// `Gnw::day`'s index with release 0's pubDate given seconds: NoParseableValidTime, decided by the
+/// index row.
+fn an_index_whose_first_listing_does_not_parse(gnw: &Gnw) -> Result<Vec<u8>, Box<dyn Error>> {
+    let index = String::from_utf8(gnw.pages.get(INDEX).ok_or("no index")?.clone())?;
+    if index.matches(LISTED).count() != 1 {
+        return Err("release 0's pubDate is not in the index once".into());
+    }
+    Ok(index.replacen(LISTED, LISTED_WITH_SECONDS, 1).into_bytes())
+}
+
+/// The `valid_minute` of every item committed under `RELEASES[release]`'s story.
+fn minutes_of(root: &Path, release: usize) -> Result<Vec<Option<String>>, Box<dyn Error>> {
+    let db = Connection::open_with_flags(root.join(COMMIT_LOG), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let (key, _, _, _) = RELEASES.get(release).ok_or("no such release")?;
+    let story = digest(canon::digest::story_id(SOURCE, key)).ok_or("story id")?;
+    let mut statement = db.prepare("SELECT valid_minute FROM items WHERE story_id = ?1")?;
+    let minutes = statement
+        .query_map([&story], |row| row.get(0))?
+        .collect::<Result<Vec<Option<String>>, _>>()?;
+    Ok(minutes)
+}
+
+/// Section 11.1, owner decision of 2026-11-15 (§10): an unusable row the index row decided holds
+/// nothing, so once the listing parses the next poll commits the story. Mutations in §8 row R16.
+#[test]
+fn a_document_whose_listed_time_did_not_parse_is_fetched_again_and_committed_once_the_listing_parses(
+) -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let release = release_url(0)?;
+    let mut exchange = Gnw::day()?;
+    let listed = exchange.pages.get(INDEX).ok_or("no index")?.clone();
+    let unparsed = an_index_whose_first_listing_does_not_parse(&exchange)?;
+    exchange.pages.insert(INDEX.to_owned(), unparsed);
+    poll(root.path(), RUN_AT, "first", &exchange)?;
+    let (first, _) = exchange.sent();
+    let after_first = minutes_of(root.path(), 0)?;
+    exchange.pages.insert(INDEX.to_owned(), listed);
+    poll(root.path(), LATER_THE_SAME_DAY, "second", &exchange)?;
+    let (second, _) = exchange.sent();
+    assert_eq!(
+        (
+            first.contains(&release),
+            after_first,
+            second,
+            minutes_of(root.path(), 0)?
+        ),
+        (
+            true,
+            Vec::new(),
+            vec![INDEX.to_owned(), release.clone()],
+            vec![Some("2026-11-14T19:00:00.000000Z".to_owned())]
+        )
+    );
+    Ok(())
+}
+
+/// The cost of the rule above (§11.1): a listing that never parses is fetched by every poll while
+/// the index names it. Mutations in §8 row R16.
+#[test]
+fn a_story_whose_listing_stays_unparseable_is_fetched_by_every_poll() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let release = release_url(0)?;
+    let mut exchange = Gnw::day()?;
+    let unparsed = an_index_whose_first_listing_does_not_parse(&exchange)?;
+    exchange.pages.insert(INDEX.to_owned(), unparsed);
+    let mut fetched = Vec::new();
+    for (at, schedule) in [
+        (RUN_AT, "first"),
+        (LATER_THE_SAME_DAY, "second"),
+        (LATEST_THE_SAME_DAY, "third"),
+    ] {
+        poll(root.path(), at, schedule, &exchange)?;
+        let (sent, _) = exchange.sent();
+        fetched.push(sent.iter().filter(|url| **url == release).count());
+    }
+    assert_eq!(
+        (fetched, minutes_of(root.path(), 0)?),
+        (vec![1, 1, 1], Vec::new())
     );
     Ok(())
 }

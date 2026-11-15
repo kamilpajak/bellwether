@@ -493,8 +493,8 @@ pub(crate) mod tests {
     use canon::{FileDigest, Stamp};
     use chrono::DateTime;
     use news_provider::{
-        AttemptSlot, Baseline, Outcome, Provenance, RawResponse, Request, RequestPhase, RunId,
-        SourceId, TargetWindow, ValidSource, Verdict,
+        AttemptSlot, Baseline, Counts, Outcome, Provenance, RawResponse, Request, RequestPhase,
+        RunId, SourceId, TargetWindow, ValidSource, Verdict,
     };
     use pit::datedness::{Minute, Published};
     use pit::{ObservationTime, ValidTime};
@@ -591,7 +591,10 @@ pub(crate) mod tests {
         );
         let outcome = Outcome::decide(
             &Verdict::Usable,
-            VENDOR_ROWS,
+            Counts {
+                vendor_rows: VENDOR_ROWS,
+                listing_unusable: 0,
+            },
             &Baseline::from_trailing_ok(&TRAILING_OK),
         );
         let closed = slot.close(store, outcome, &Ok(answer), at(observed))?;
