@@ -60,6 +60,10 @@ const LATE_ACCEPTANCE_RAW: &str = "20261102100000";
 const ON_TIME_ACCEPTANCE_RAW: &str = "20261109163215";
 /// `ON_TIME_ACCEPTANCE_RAW` plus the 7,200 s `probed()` stands behind.
 const ON_TIME_OBSERVED_AT: &str = "2026-11-09T23:32:15Z";
+/// 18:00:00 New York on Friday 2026-11-06, after hours, so its `Date Filed` is Monday's index day.
+const AFTER_HOURS_ACCEPTANCE_RAW: &str = "20261106180000";
+/// `AN_ARCHIVED_SESSION` starts at 05:00Z in New York; plus the same 7,200 s.
+const ARCHIVED_DAY_START_OBSERVED_AT: &str = "2026-11-09T07:00:00Z";
 /// ISO, which the real column never carries.
 const NOT_A_DATE_FILED: &str = "2026-11-02";
 /// The acceptance field as the filing header spells it, kept as `valid_raw` so a replay re-parses
@@ -892,6 +896,31 @@ fn an_on_time_row_with_an_acceptance_instant_observes_at_its_acceptance_plus_the
     let request = listed_document_request(&provider, AN_ARCHIVED_SESSION, ARCHIVED_DATE_FILED)?;
     let item = only_item(&provider.extract(&request, &filing_accepted_at(ON_TIME_ACCEPTANCE_RAW)))?;
     assert_eq!(item.observed, Some(at(ON_TIME_OBSERVED_AT)));
+    Ok(())
+}
+
+/// §8 row R11: a row the index lists on its own day but accepted on an earlier one, here a Friday
+/// after hours listed on Monday, is not observed before its index's day starts plus the lag.
+#[test]
+fn an_on_time_row_accepted_before_its_index_day_is_not_observed_before_that_day_starts_plus_the_lag(
+) -> Outcome {
+    let provider = probed()?;
+    let request = listed_document_request(&provider, AN_ARCHIVED_SESSION, ARCHIVED_DATE_FILED)?;
+    let item =
+        only_item(&provider.extract(&request, &filing_accepted_at(AFTER_HOURS_ACCEPTANCE_RAW)))?;
+    assert_eq!(item.observed, Some(at(ARCHIVED_DAY_START_OBSERVED_AT)));
+    Ok(())
+}
+
+/// §8 row R11: a row with an acceptance instant and no readable `Date Filed` is not known to be
+/// on time, so it is bounded by the end of its index's day plus the lag, as a late row is.
+#[test]
+fn an_acceptance_instant_row_with_no_readable_date_filed_is_bounded_by_its_index_days_end(
+) -> Outcome {
+    let provider = probed()?;
+    let request = listed_document_request(&provider, AN_ARCHIVED_SESSION, NOT_A_DATE_FILED)?;
+    let item = only_item(&provider.extract(&request, &filing_accepted_at(LATE_ACCEPTANCE_RAW)))?;
+    assert_eq!(item.observed, Some(at(ARCHIVED_DAY_OBSERVED_AT)));
     Ok(())
 }
 

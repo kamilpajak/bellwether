@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use canon::{Digest, FileDigest};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeDelta, TimeZone, Utc};
 use chrono_tz::Tz;
 use news_provider::budget::RequestBudget;
 use news_provider::provider::{
@@ -343,8 +343,9 @@ impl EdgarPress {
     /// the index that first lists it (§3.9). Lag on top of an upper bound can only make an item
     /// less visible. Reachable `Ok(None)` arms: §8 row R11.
     ///
-    /// An instant keeps its own bound only on a row whose `Date Filed` is the index's day, the one
-    /// population the lag was probed on (§10, D5); any other row is bounded by the index's day too.
+    /// An instant floored at the START of the index's day bounds a row whose readable `Date Filed`
+    /// is that day, the only rows the lag was probed on (§8 row R11); the END of the index's day
+    /// bounds any other row.
     fn backfill_observation(
         &self,
         request: &Request,
@@ -362,7 +363,12 @@ impl EdgarPress {
             return Ok(None);
         };
         let bound = match valid {
-            Published::At(instant) if filed_day(request) == listed => instant,
+            Published::At(instant) if filed_day(request) == listed => {
+                match listed.and_then(|listed| start_of_day(listed, self.parsed.zone)) {
+                    Some(listed_starts) => ValidTime::new(instant.inner().max(listed_starts)),
+                    None => return Ok(None),
+                }
+            }
             Published::At(instant) => ValidTime::new(instant.inner().max(listed_ends)),
             Published::On { day, tz } => match end_of_day(day, tz) {
                 Some(filed) => ValidTime::new(filed.max(listed_ends)),
@@ -616,6 +622,12 @@ pub fn read_listing(bytes: &[u8]) -> Result<Listing, Refusal> {
 }
 
 /// The `Date Filed` of the index row behind a follow-up; `None` when absent or not `YYYYMMDD`.
+/// The first microsecond of `day` in `tz`: one past the end of the day before, so a gap or an
+/// ambiguous midnight resolves exactly as [`end_of_day`] resolves it.
+fn start_of_day(day: NaiveDate, tz: &str) -> Option<DateTime<Utc>> {
+    end_of_day(day.pred_opt()?, tz)?.checked_add_signed(TimeDelta::microseconds(1))
+}
+
 fn filed_day(request: &Request) -> Option<NaiveDate> {
     let raw = request.listed_date.as_deref()?;
     NaiveDate::parse_from_str(raw.trim(), INDEX_DATE).ok()
