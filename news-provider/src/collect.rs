@@ -116,6 +116,11 @@ pub trait Archive: Sink {
         attempt_id: &str,
         matched: u32,
     ) -> Result<(), ArchiveError>;
+
+    /// Records how many of a live index attempt's follow-ups were not issued because
+    /// [`Archive::held_story_ids`] held their story: section 11.1's `held`, which `ledger --check`
+    /// subtracts from `vendor_rows`. Written whatever the count, 0 included.
+    fn record_held(&mut self, attempt_id: &str, held: u32) -> Result<(), ArchiveError>;
 }
 
 /// Why a run could not be driven at all. A vendor's own answer is never one of these: it is a
@@ -543,21 +548,27 @@ fn attempt_once<A: Archive>(
         Err(refused) => (Committed::default(), Some(refused.detail)),
     };
     // A vendor_archive index records `matched` and hands over one window's covered set (R20); a
-    // live index records no `matched` and hands over the held set of every window (§11.1, R16).
+    // live index records `held` and hands over the held set of every window (§11.1, R16).
     let follow_ups = match extracted {
         Some(extracted) if request.phase == RequestPhase::Index => {
             let matched = count(extracted.follow_ups.len());
-            let stories = if request.provenance == Provenance::VendorArchive {
+            let archived = request.provenance == Provenance::VendorArchive;
+            let stories = if archived {
                 archive.record_planned_coverage(&attempt_id, matched)?;
                 archive.covered_story_ids(&request.source, &request.target_window)?
             } else {
                 archive.held_story_ids(&request.source)?
             };
-            if matched == 0 {
+            let issued = if matched == 0 {
                 Vec::new()
             } else {
                 provider.follow_ups_to_issue(extracted.follow_ups, &stories)
+            };
+            if !archived {
+                let held = matched.saturating_sub(count(issued.len()));
+                archive.record_held(&attempt_id, held)?;
             }
+            issued
         }
         _ => Vec::new(),
     };

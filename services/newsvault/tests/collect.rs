@@ -318,6 +318,10 @@ impl Archive for Refusing {
     ) -> Result<(), ArchiveError> {
         Archive::record_planned_coverage(&mut self.store, attempt_id, matched)
     }
+
+    fn record_held(&mut self, attempt_id: &str, held: u32) -> Result<(), ArchiveError> {
+        Archive::record_held(&mut self.store, attempt_id, held)
+    }
 }
 
 /// One run through the library, with the exchange the caller chose (static `Payloads` or a
@@ -682,6 +686,10 @@ impl Archive for Untouched {
         _matched: u32,
     ) -> Result<(), ArchiveError> {
         Err(self.touched("record_planned_coverage"))
+    }
+
+    fn record_held(&mut self, _attempt_id: &str, _held: u32) -> Result<(), ArchiveError> {
+        Err(self.touched("record_held"))
     }
 }
 
@@ -1279,11 +1287,22 @@ fn asked(exchange: &Payloads) -> Vec<String> {
     exchange.asked.borrow().clone()
 }
 
+/// `attempts.held` of every index row (no story, and edgar fetches no robots), oldest first.
+fn index_held(root: &Path) -> Result<Vec<Option<i64>>, Box<dyn Error>> {
+    let db = Connection::open_with_flags(root.join(COMMIT_LOG), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let held = db
+        .prepare("SELECT held FROM attempts WHERE story_id IS NULL ORDER BY opened_at, attempt_id")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<Option<i64>>, _>>()?;
+    Ok(held)
+}
+
 /// §8 row R20, the whole point of this change. A backfill re-run of one window re-fetches only the
 /// accessions the store does not already hold a committed item for: run 1 leaves Microsoft
 /// uncovered, and run 2 asks for the index and Microsoft alone, never Apple again. Mutation
 /// 2026-11-13: making `EdgarPress::follow_ups_to_issue` return its input unfiltered turns this red
-/// (run 2 asks for Apple too).
+/// (run 2 asks for Apple too). Section 11.1: `held` is the live arm's, so both archive index rows
+/// keep it NULL. Mutation 2026-11-15, the driver writing `held` on the archive arm too: red.
 #[test]
 fn a_vendor_archive_rerun_fetches_only_the_uncovered_accession() -> TestResult {
     let root = TempDir::new()?;
@@ -1300,8 +1319,11 @@ fn a_vendor_archive_rerun_fetches_only_the_uncovered_accession() -> TestResult {
     let answer = cmd_collect::run(&second, &opened, &good, &Fixed)?;
     assert_eq!(answer.exit, Exit::Ok, "{:#}", answer.envelope);
     assert_eq!(
-        asked(&good),
-        vec![INDEX_URL.to_owned(), MICROSOFT_URL.to_owned()]
+        (asked(&good), index_held(root.path())?),
+        (
+            vec![INDEX_URL.to_owned(), MICROSOFT_URL.to_owned()],
+            vec![None, None]
+        )
     );
     Ok(())
 }
@@ -1309,7 +1331,7 @@ fn a_vendor_archive_rerun_fetches_only_the_uncovered_accession() -> TestResult {
 /// §8 row R16. A live ingest polls every matched row, so a live re-run fetches BOTH documents even
 /// though run 1 committed them: coverage skips the archive arm alone. Mutation 2026-11-13:
 /// dropping the `provenance != VendorArchive` guard in `follow_ups_to_issue` turns this red (run 2
-/// asks for the index alone).
+/// asks for the index alone). Edgar live issues every follow-up, so each index row holds 0.
 #[test]
 fn a_live_rerun_still_polls_every_matched_row_even_when_the_story_is_covered() -> TestResult {
     let root = TempDir::new()?;
@@ -1323,12 +1345,15 @@ fn a_live_rerun_still_polls_every_matched_row_even_when_the_story_is_covered() -
     let good = Payloads::a_good_day()?;
     cmd_collect::run(&second, &opened, &good, &Fixed)?;
     assert_eq!(
-        asked(&good),
-        vec![
-            INDEX_URL.to_owned(),
-            APPLE_URL.to_owned(),
-            MICROSOFT_URL.to_owned()
-        ]
+        (asked(&good), index_held(root.path())?),
+        (
+            vec![
+                INDEX_URL.to_owned(),
+                APPLE_URL.to_owned(),
+                MICROSOFT_URL.to_owned()
+            ],
+            vec![Some(0), Some(0)]
+        )
     );
     Ok(())
 }

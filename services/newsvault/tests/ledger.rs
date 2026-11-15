@@ -356,6 +356,46 @@ fn check_exits_one_when_a_source_returns_zero_items_against_a_non_zero_vendor_ro
     Ok(())
 }
 
+/// Section 11.1: `held` is subtracted, so 58 of 59 held still leaves one row nothing answered, and
+/// the finding names both numbers. Mutation 2026-11-15, any non-zero `held` suppressing the
+/// finding: red.
+#[test]
+fn check_still_flags_zero_rows_when_held_covers_only_part_of_the_vendor_rows() -> TestResult {
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    db.execute(
+        "UPDATE attempts SET held = 58 WHERE attempt_id = 'a-0704-edgar-0'",
+        [],
+    )?;
+    drop(db);
+    let answer = run(
+        &root,
+        &["--from", ZERO_ITEM_DAY, "--to", ZERO_ITEM_DAY, "--check"],
+    )?;
+    let report = answer.json()?;
+    let details: Vec<&str> = report
+        .get("check")
+        .and_then(|check| check.get("findings"))
+        .and_then(Value::as_array)
+        .map(|findings| {
+            findings
+                .iter()
+                .filter_map(|finding| finding.get("detail").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    let held = per_source(&report, ZERO_ITEM_DAY, EDGAR).and_then(|edgar| edgar.get("held"));
+    assert_eq!(
+        (answer.code, details, held),
+        (
+            EXIT_NO,
+            vec!["59 vendor rows, 58 held, and no item row committed"],
+            Some(&Value::from(58))
+        )
+    );
+    Ok(())
+}
+
 #[test]
 fn a_limited_ledger_states_matched_and_returned_and_truncated() -> TestResult {
     let root = fixture()?;

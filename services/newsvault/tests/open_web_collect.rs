@@ -1177,3 +1177,102 @@ fn a_document_that_yielded_only_unusable_rows_is_not_fetched_again() -> TestResu
     );
     Ok(())
 }
+
+const EXIT_OK: i32 = 0;
+/// Past both polls, so the ledger reads every row they wrote.
+const LEDGER_AT: &str = "2026-11-16T00:00:00Z";
+/// Prefix-compared against stored stamps, which carry microseconds the clock constants lack.
+const NEXT_DAY_DATE: &str = "2026-11-15";
+/// After both robots seeds and at or before the first poll's index row.
+const FIRST_POLL_HOUR: &str = "2026-11-14T19";
+
+/// Run 1 commits the day's three stories under 2026-11-14; run 2, on 2026-11-15, lists the same
+/// three and finds every one held.
+fn an_all_held_next_day(store: &Path) -> TestResult {
+    seed_gnw(store, &hosts(), ROBOTS_EARLIER)?;
+    let exchange = Gnw::day()?;
+    poll(store, RUN_AT, "first", &exchange)?;
+    poll(store, THE_NEXT_DAY, "second", &exchange)?;
+    Ok(())
+}
+
+/// Section 11.4, §8 R4: an all-held day commits nothing against three vendor rows and is not a
+/// finding, in the library read and in the binary's exit. Mutations 2026-11-15, the `- row.held`
+/// subtraction removed and `record_held` made a no-op: red.
+#[test]
+fn a_quiet_day_whose_every_listed_story_is_held_passes_ledger_check() -> TestResult {
+    let root = TempDir::new()?;
+    an_all_held_next_day(root.path())?;
+    let day: chrono::NaiveDate = NEXT_DAY_DATE.parse()?;
+    let report = newsvault::cmd_ledger::read(
+        root.path(),
+        &newsvault::cmd_ledger::Ask {
+            at: instant(LEDGER_AT),
+            from: day,
+            to: day,
+            source: None,
+            expected_runs: None,
+            limit: None,
+            check: true,
+        },
+    )?;
+    let counts: Vec<(i64, i64, i64)> = report
+        .days
+        .iter()
+        .flat_map(|one| &one.per_source)
+        .map(|row| (row.vendor_rows, row.held, row.rows_committed))
+        .collect();
+    let codes: Vec<&str> = report
+        .check
+        .findings
+        .iter()
+        .map(|finding| finding.code)
+        .collect();
+    let exit = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .arg("ledger")
+        .args(["--store", &root.path().to_string_lossy()])
+        .args([
+            "--at",
+            LEDGER_AT,
+            "--from",
+            NEXT_DAY_DATE,
+            "--to",
+            NEXT_DAY_DATE,
+        ])
+        .args(["--check", "--format", "json"])
+        .output()?
+        .status
+        .code();
+    assert_eq!(
+        (counts, codes, exit),
+        (vec![(3, 3, 0)], Vec::<&str>::new(), Some(EXIT_OK))
+    );
+    Ok(())
+}
+
+/// Section 11.1, `attempts.held`: `matched - issued` on a live index row, 0 included, and NULL on
+/// a Document row. Mutation 2026-11-15, `record_held` made a no-op: red.
+#[test]
+fn an_all_held_index_attempt_records_its_held_count() -> TestResult {
+    let root = TempDir::new()?;
+    an_all_held_next_day(root.path())?;
+    let db = Connection::open_with_flags(
+        root.path().join(COMMIT_LOG),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let held_of = |filter: &str| -> Result<Vec<Option<i64>>, rusqlite::Error> {
+        db.prepare(&format!(
+            "SELECT held FROM attempts WHERE {filter} ORDER BY opened_at, attempt_id"
+        ))?
+        .query_map([NEXT_DAY_DATE, FIRST_POLL_HOUR], |row| row.get(0))?
+        .collect()
+    };
+    let next_day_rows = held_of("opened_at > ?1 AND ?2 IS NOT NULL")?;
+    let first_index = held_of("story_id IS NULL AND opened_at >= ?2 AND opened_at < ?1")?;
+    let documents = held_of("story_id IS NOT NULL AND ?1 IS NOT NULL AND ?2 IS NOT NULL")?;
+    assert_eq!(
+        (next_day_rows, first_index, documents),
+        (vec![Some(3)], vec![Some(0)], vec![None; RELEASES.len()])
+    );
+    Ok(())
+}

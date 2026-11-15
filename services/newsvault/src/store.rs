@@ -179,6 +179,9 @@ ALTER TABLE attempts ADD COLUMN verdict TEXT
 -- The story a Document attempt fetched, from `Provider::story_of` at open: section 11.1's held
 -- key. NULL for an index or robots attempt and for every row opened before user_version 3.
 ALTER TABLE attempts ADD COLUMN story_id TEXT;
+-- Section 11.1's `held`: follow-ups a LIVE index attempt did not issue because the store already
+-- held them, `matched - issued`. NULL on every other row and on every row before user_version 3.
+ALTER TABLE attempts ADD COLUMN held INTEGER;
 ",
 ];
 
@@ -1042,6 +1045,17 @@ impl Committer {
         self.db.execute(
             "UPDATE attempts SET matched = ?2 WHERE attempt_id = ?1",
             params![attempt_id, matched],
+        )?;
+        Ok(())
+    }
+
+    /// Records how many follow-ups a live index attempt left unissued because the store held them:
+    /// section 11.1's `held`, the number `ledger --check` subtracts. Same shape as
+    /// [`Committer::record_planned_coverage`]: its own `UPDATE` after the commit.
+    pub fn record_held(&mut self, attempt_id: &str, held: u32) -> Result<(), StoreError> {
+        self.db.execute(
+            "UPDATE attempts SET held = ?2 WHERE attempt_id = ?1",
+            params![attempt_id, held],
         )?;
         Ok(())
     }
@@ -2686,9 +2700,11 @@ mod tests {
         )?)
     }
 
-    /// §8 row M1 from user_version 2: the step to 3 adds `attempts.verdict` and
-    /// `attempts.story_id`, and a Document attempt's verdict and story land in them. Mutations
-    /// 2026-11-15, `MIGRATIONS[2]` emptied and its `story_id` line alone removed: red.
+    const HELD: u32 = 2;
+
+    /// §8 row M1 from user_version 2: the step to 3 adds `attempts.verdict`, `attempts.story_id`
+    /// and `attempts.held`, and a verdict, a story and a held count land in them. Mutations
+    /// 2026-11-15, `MIGRATIONS[2]` emptied and its `story_id` or `held` line alone removed: red.
     #[test]
     fn a_store_at_user_version_two_opens_migrates_to_three_and_takes_a_verdict() -> TestResult {
         let temp = TempDir::new()?;
@@ -2706,24 +2722,32 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
+        store.record_held(&attempt, HELD)?;
+        let held: Option<u32> = store.db.query_row(
+            "SELECT held FROM attempts WHERE attempt_id = ?1",
+            params![attempt],
+            |row| row.get(0),
+        )?;
         assert_eq!(
             (
                 user_version(&store.db)?,
                 verdict_of(&store, &attempt)?,
-                story_of_row(&store, &attempt)?
+                story_of_row(&store, &attempt)?,
+                held
             ),
             (
                 3,
                 Some("permanent_failure".to_owned()),
-                Some(story_hex(SOURCE, STORY))
+                Some(story_hex(SOURCE, STORY)),
+                Some(HELD)
             )
         );
         Ok(())
     }
 
     /// §8 row M1, the carried half from user_version 2: every column of every row of every v2
-    /// table, compared by `quote()`; the v2 attempt gains a NULL verdict and story and nothing
-    /// else, because neither is backfilled.
+    /// table, compared by `quote()`; the v2 attempt gains a NULL verdict, story and held and
+    /// nothing else, because none is backfilled.
     #[test]
     fn a_v2_store_keeps_every_v2_column_of_every_row() -> TestResult {
         let temp = TempDir::new()?;
@@ -2734,11 +2758,17 @@ mod tests {
         let store = open(&temp)?;
         let after = quoted_rows(&store.db, 2, &V2_TABLES)?;
         assert_eq!(before.len(), V2_TABLES.len() + 1);
+        let held: Option<i64> = store.db.query_row(
+            "SELECT held FROM attempts WHERE attempt_id = 'a v1 attempt'",
+            [],
+            |row| row.get(0),
+        )?;
         let added = (
             verdict_of(&store, "a v1 attempt")?,
             story_of_row(&store, "a v1 attempt")?,
+            held,
         );
-        assert_eq!((after, added), (before, (None, None)));
+        assert_eq!((after, added), (before, (None, None, None)));
         Ok(())
     }
 

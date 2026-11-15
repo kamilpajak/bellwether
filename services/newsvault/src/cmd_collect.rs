@@ -1086,6 +1086,11 @@ impl Archive for Committer {
         Committer::record_planned_coverage(self, attempt_id, matched)
             .map_err(|why| refused("record planned coverage", &why))
     }
+
+    fn record_held(&mut self, attempt_id: &str, held: u32) -> Result<(), ArchiveError> {
+        Committer::record_held(self, attempt_id, held)
+            .map_err(|why| refused("record the held count", &why))
+    }
 }
 
 fn refused(act: &'static str, why: &StoreError) -> ArchiveError {
