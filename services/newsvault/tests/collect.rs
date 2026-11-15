@@ -11,8 +11,8 @@ use std::process::{Command, Stdio};
 use chrono::{DateTime, NaiveDate, Utc};
 use news_provider::{
     Archive, ArchiveError, AttemptEvent, AttemptReceipt, AttemptSlot, Clock, CollectedItem,
-    Committed, Exchange, Exit, HeaderValue, LedgerError, Provenance, RawResponse, Request,
-    RequestPhase, RunId, SendFailure, SendPermit, Sink, SourceId, TargetWindow,
+    Committed, CredentialRef, Exchange, Exit, HeaderValue, LedgerError, Provenance, RawResponse,
+    Request, RequestPhase, RunId, SendFailure, SendPermit, Sink, SourceId, TargetWindow,
 };
 use news_provider::{CollectError, PlanRefusal, Run};
 use newsvault::cmd_collect::{self, Ask};
@@ -1876,6 +1876,30 @@ fn an_open_web_run_with_an_absent_or_empty_hosts_file_exits_four() -> TestResult
         exits.push((answered.code, answered.stdout.len()));
     }
     assert_eq!(exits, vec![(EXIT_NOT_FOUND, 0), (EXIT_NOT_FOUND, 0)]);
+    Ok(())
+}
+
+/// The table's credential name is the one the provider's own User-Agent asks `Wire` for; a
+/// mismatch stores the contact where `Wire::send` never reads it. Mutation 2026-11-15: the
+/// open-web entry naming edgar's credential was green before this.
+#[test]
+fn every_registered_credential_is_the_one_its_providers_user_agent_names() -> TestResult {
+    let root = TempDir::new()?;
+    let mut named = Vec::new();
+    for ask in [
+        ask(root.path(), A_LISTED_SESSION),
+        open_web_ask(root.path(), SATURDAY_AT),
+    ] {
+        let opened = cmd_collect::open_provider(&ask)?;
+        named.push((
+            opened.provider.transport().user_agent,
+            HeaderValue::FromCredential(CredentialRef::new(opened.registered.credential())),
+        ));
+    }
+    assert_eq!(named.len(), cmd_collect::Registered::ALL.len());
+    for (asked_for, held_under) in named {
+        assert_eq!(asked_for, held_under);
+    }
     Ok(())
 }
 
