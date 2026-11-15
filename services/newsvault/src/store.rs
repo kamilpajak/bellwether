@@ -111,16 +111,52 @@ PRAGMA synchronous = FULL;
 /// The `PRAGMA user_version` this build writes, and the only one a read-only reader accepts.
 pub const SCHEMA_VERSION: i32 = 1;
 
-/// Version `i + 1` is reached from version `i` by `MIGRATIONS[i]`. `ADD COLUMN` cannot add a
-/// `NOT NULL` column without a default, so the three valid-evidence columns are nullable here and
-/// NULL only on rows committed at user_version 0.
+/// Version `i + 1` is reached from version `i` by `MIGRATIONS[i]`, run by [`migrate`] with
+/// foreign keys off, as SQLite's twelve-step table rebuild (lang_altertable.html) requires.
 const MIGRATIONS: [&str; 1] = ["
-ALTER TABLE items ADD COLUMN valid_raw TEXT;
-ALTER TABLE items ADD COLUMN valid_field TEXT;
-ALTER TABLE items ADD COLUMN valid_source TEXT;
 -- The hosts file a run was admitted under: architecture.md section 2's `hosts_version` row. NULL
 -- for a provider that reads no hosts file.
 ALTER TABLE attempts ADD COLUMN hosts_version TEXT;
+-- A CHECK cannot be altered in place, so `items` is rebuilt. The evidence columns stay nullable:
+-- a row committed at user_version 0 has none, and an invented value is the empty fallback.
+CREATE TABLE items_v1 (
+    seq               INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id           TEXT NOT NULL,
+    story_id          TEXT NOT NULL,
+    doc_id            TEXT,
+    attempt_id        TEXT NOT NULL REFERENCES attempts(attempt_id),
+    valid_at          TEXT,
+    valid_day         TEXT,
+    valid_tz          TEXT,
+    -- A publication MINUTE as its first microsecond, the text `item_id` digests beside the tag
+    -- `minute`. Never in `valid_at`, where a reader would take it for the instant at :00.
+    valid_minute      TEXT,
+    valid_refused     TEXT,
+    observed_at       TEXT NOT NULL,
+    valid_disputed    INTEGER NOT NULL,
+    earliest_valid_at TEXT,
+    raw_blob          TEXT NOT NULL REFERENCES blobs(digest),
+    body_blob         TEXT REFERENCES blobs(digest),
+    committed_at      TEXT NOT NULL,
+    valid_raw         TEXT,
+    valid_field       TEXT,
+    valid_source      TEXT,
+    UNIQUE(item_id, attempt_id),
+    CHECK ((valid_at IS NOT NULL) + (valid_day IS NOT NULL) + (valid_minute IS NOT NULL)
+           + (valid_refused IS NOT NULL) = 1),
+    CHECK ((valid_day IS NULL) = (valid_tz IS NULL)),
+    CHECK (valid_source IN ('vendor_published', 'our_extraction'))
+);
+INSERT INTO items_v1
+    (seq, item_id, story_id, doc_id, attempt_id, valid_at, valid_day, valid_tz, valid_refused,
+     observed_at, valid_disputed, earliest_valid_at, raw_blob, body_blob, committed_at)
+SELECT seq, item_id, story_id, doc_id, attempt_id, valid_at, valid_day, valid_tz, valid_refused,
+       observed_at, valid_disputed, earliest_valid_at, raw_blob, body_blob, committed_at
+FROM items;
+DROP TABLE items;
+ALTER TABLE items_v1 RENAME TO items;
+CREATE INDEX items_by_story ON items(story_id);
+CREATE INDEX items_by_doc ON items(doc_id);
 "];
 
 /// The frozen user_version 0 DDL; every store, new or old, is created from it and then migrated.
@@ -220,9 +256,10 @@ CREATE TABLE IF NOT EXISTS published (
 ";
 
 /// Which publication day a row is partitioned under: decision D3, taken by default
-/// (architecture.md section 10). [`SCHEMA_V0`]'s CHECK makes exactly one of the two columns
-/// non-null, so every row has one.
-const VALID_DATE: &str = "substr(COALESCE(i.valid_at, i.valid_day, i.valid_refused), 1, 10)";
+/// (architecture.md section 10). The items CHECK makes exactly one of the four columns non-null,
+/// so every row has one. A minute's day is its UTC day, the calendar its value is stated in.
+pub(crate) const VALID_DATE: &str =
+    "substr(COALESCE(i.valid_at, i.valid_day, i.valid_minute, i.valid_refused), 1, 10)";
 
 /// Whether a segment already carries a row: the same publication day AND inside that segment's
 /// seq range. Never the range alone - one run exports several days and their ranges interleave.
@@ -283,6 +320,10 @@ pub enum StoreError {
     /// refuses every version but its own. Code `input_schema_mismatch` (architecture.md 5.1).
     #[error("the commit log is at schema user_version {found}; this build reads {expected}")]
     SchemaVersion { found: i32, expected: i32 },
+    /// SQLite's rebuild procedure checks foreign keys before it commits, because they are off
+    /// while it runs; a v0 row naming an absent parent is refused rather than carried forward.
+    #[error("the migration found {table} row {rowid} naming a parent row the store does not hold")]
+    MigrationFoundADanglingReference { table: String, rowid: i64 },
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -300,8 +341,8 @@ pub struct ItemRow {
     /// canonicalisation is a hashed rule the provider owns.
     pub doc_id: Option<Digest>,
     /// The publication value with its precision, never an instant a date was folded into:
-    /// `Published::On` reaches `items.valid_day` and `items.valid_tz` and no cutoff reads it as
-    /// an instant. [`Published::Unknown`] is refused by [`Committer::record`].
+    /// `Published::On` reaches `items.valid_day` and `items.valid_tz`, `Published::AtMinute`
+    /// reaches `items.valid_minute`, and no cutoff reads either as an instant. [`Published::Unknown`] is refused by [`Committer::record`].
     pub valid: Published,
     /// The publication value as the payload spelled it, the field it came from and who stated
     /// it: `news_provider::CollectedItem`'s evidence columns, stored so a replay can re-parse it.
@@ -341,6 +382,7 @@ pub struct ExportRow {
     pub valid_at: Option<String>,
     pub valid_day: Option<String>,
     pub valid_tz: Option<String>,
+    pub valid_minute: Option<String>,
     pub valid_refused: Option<String>,
     pub observed_at: String,
     pub valid_disputed: bool,
@@ -463,12 +505,28 @@ fn migrate(db: &mut Connection) -> Result<(), StoreError> {
     if from == MIGRATIONS.len() {
         return Ok(());
     }
+    // A no-op inside a transaction (SQLite docs, PRAGMA foreign_keys), so set around it.
+    db.pragma_update(None, "foreign_keys", false)?;
+    let migrated = migrate_from(db, from);
+    db.pragma_update(None, "foreign_keys", true)?;
+    migrated
+}
+
+fn migrate_from(db: &mut Connection, from: usize) -> Result<(), StoreError> {
     let transaction = db.transaction()?;
     if from == 0 {
         transaction.execute_batch(SCHEMA_V0)?;
     }
     for step in MIGRATIONS.iter().skip(from) {
         transaction.execute_batch(step)?;
+    }
+    let dangling: Option<(String, i64)> = transaction
+        .query_row("PRAGMA foreign_key_check", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .optional()?;
+    if let Some((table, rowid)) = dangling {
+        return Err(StoreError::MigrationFoundADanglingReference { table, rowid });
     }
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
@@ -548,9 +606,9 @@ impl Committer {
     pub fn unpublished_rows(&self) -> Result<Vec<ExportRow>, StoreError> {
         let mut statement = self.db.prepare(&format!(
             "SELECT i.seq, i.item_id, i.story_id, i.doc_id, i.attempt_id, a.source,
-                    i.valid_at, i.valid_day, i.valid_tz, i.valid_refused, i.observed_at,
-                    i.valid_disputed, i.earliest_valid_at, i.raw_blob, i.body_blob,
-                    i.committed_at, {VALID_DATE}
+                    i.valid_at, i.valid_day, i.valid_tz, i.valid_minute, i.valid_refused,
+                    i.observed_at, i.valid_disputed, i.earliest_valid_at, i.raw_blob,
+                    i.body_blob, i.committed_at, {VALID_DATE}
              FROM items i JOIN attempts a ON a.attempt_id = i.attempt_id
              WHERE NOT {}
              ORDER BY i.seq",
@@ -568,14 +626,15 @@ impl Committer {
                     valid_at: row.get(6)?,
                     valid_day: row.get(7)?,
                     valid_tz: row.get(8)?,
-                    valid_refused: row.get(9)?,
-                    observed_at: row.get(10)?,
-                    valid_disputed: row.get(11)?,
-                    earliest_valid_at: row.get(12)?,
-                    raw_blob: row.get(13)?,
-                    body_blob: row.get(14)?,
-                    committed_at: row.get(15)?,
-                    valid_date: row.get(16)?,
+                    valid_minute: row.get(9)?,
+                    valid_refused: row.get(10)?,
+                    observed_at: row.get(11)?,
+                    valid_disputed: row.get(12)?,
+                    earliest_valid_at: row.get(13)?,
+                    raw_blob: row.get(14)?,
+                    body_blob: row.get(15)?,
+                    committed_at: row.get(16)?,
+                    valid_date: row.get(17)?,
                 })
             })?
             .collect::<Result<Vec<ExportRow>, _>>()?;
@@ -757,8 +816,7 @@ impl Committer {
                 let story = row.story_id.hex();
                 let observed_at = stamp(row.observed.inner());
                 let published = publication(row)?;
-                let (disputed, earliest) =
-                    dispute(&transaction, story, published.instant.as_ref())?;
+                let (disputed, earliest) = dispute(&transaction, story, &published)?;
                 if wins(first_observed(&transaction, story)?.as_ref(), &observed_at) {
                     items_new += 1;
                 }
@@ -766,9 +824,10 @@ impl Committer {
                     "INSERT INTO items
                          (seq, item_id, story_id, doc_id, attempt_id, valid_at, valid_day,
                           valid_tz, valid_refused, observed_at, valid_disputed, earliest_valid_at,
-                          raw_blob, body_blob, committed_at, valid_raw, valid_field, valid_source)
+                          raw_blob, body_blob, committed_at, valid_raw, valid_field, valid_source,
+                          valid_minute)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                             ?16, ?17, ?18)",
+                             ?16, ?17, ?18, ?19)",
                     params![
                         seq_lo + i64::try_from(offset).unwrap_or(0),
                         row.item_id.hex(),
@@ -787,7 +846,8 @@ impl Committer {
                         stamped,
                         row.valid_raw,
                         row.valid_field,
-                        row.valid_source.name()
+                        row.valid_source.name(),
+                        published.minute
                     ],
                 )?;
             }
@@ -998,6 +1058,7 @@ fn datedness(row: &ItemRow) -> Datedness {
                 observed: row.observed,
             },
         },
+        Published::AtMinute(minute) => Datedness::of_minute(minute, row.observed),
         Published::On { day, tz } => Datedness::DayDated {
             day,
             tz,
@@ -1009,12 +1070,14 @@ fn datedness(row: &ItemRow) -> Datedness {
     }
 }
 
-/// The publication value as its columns. Exactly one of the three carries it, which is what the
+/// The publication value as its columns. Exactly one of the four carries it, which is what the
 /// schema's own CHECK says.
+#[derive(Default)]
 struct Publication {
     instant: Option<String>,
     day: Option<String>,
     zone: Option<&'static str>,
+    minute: Option<String>,
     refused: Option<String>,
 }
 
@@ -1022,37 +1085,40 @@ impl Publication {
     fn instant(at: String) -> Self {
         Self {
             instant: Some(at),
-            day: None,
-            zone: None,
-            refused: None,
+            ..Self::default()
+        }
+    }
+
+    fn minute(starts: String) -> Self {
+        Self {
+            minute: Some(starts),
+            ..Self::default()
         }
     }
 
     fn day(day: NaiveDate, zone: &'static str) -> Self {
         Self {
-            instant: None,
             day: Some(day.to_string()),
             zone: Some(zone),
-            refused: None,
+            ..Self::default()
         }
     }
 
     fn refused(at: String) -> Self {
         Self {
-            instant: None,
-            day: None,
-            zone: None,
             refused: Some(at),
+            ..Self::default()
         }
     }
 }
 
-/// A date reaches `valid_day` and `valid_tz`, an instant reaches `valid_at`, and an instant its
-/// own observation preceded reaches `valid_refused`. An item carrying no publication value at all
+/// A date reaches `valid_day` and `valid_tz`, an instant reaches `valid_at`, a minute reaches
+/// `valid_minute`, and a value its own observation preceded reaches `valid_refused`. An item carrying no publication value at all
 /// is refused rather than given an invented one.
 fn publication(row: &ItemRow) -> Result<Publication, StoreError> {
     match datedness(row) {
         Datedness::Dated(window) => Ok(Publication::instant(stamp(window.valid().inner()))),
+        Datedness::MinuteDated { minute, .. } => Ok(Publication::minute(stamp(minute.start()))),
         Datedness::DayDated { day, tz, .. } => Ok(Publication::day(day, tz)),
         // `lower_bound` is `None` for exactly one publication value, the unknown one, so this is
         // where a row with nothing to store in any of the three columns is turned away.
@@ -1083,19 +1149,23 @@ fn wins(kept: Option<&String>, observed_at: &str) -> bool {
 }
 
 /// `valid_disputed` and `earliest_valid_at` for a row about to be inserted, against the twins the
-/// store already holds under its `story_id`. Set on the ARRIVING row, which is what leaves the
-/// earlier twin byte-identical: architecture.md section 3.1's two rows.
+/// store already holds under its `story_id` IN THE SAME COLUMN, so `earliest_valid_at` has the
+/// arriving row's precision. Set on the ARRIVING row, which leaves the earlier twin byte-identical.
 fn dispute(
     db: &Connection,
     story: &str,
-    valid_at: Option<&String>,
+    published: &Publication,
 ) -> Result<(bool, Option<String>), StoreError> {
-    let Some(valid_at) = valid_at else {
-        return Ok((false, None));
+    let (column, valid_at) = match (&published.instant, &published.minute) {
+        (Some(instant), _) => ("valid_at", instant),
+        (None, Some(minute)) => ("valid_minute", minute),
+        (None, None) => return Ok((false, None)),
     };
     let (low, high): (Option<String>, Option<String>) = db.query_row(
-        "SELECT MIN(valid_at), MAX(valid_at) FROM items
-         WHERE story_id = ?1 AND valid_at IS NOT NULL",
+        &format!(
+            "SELECT MIN({column}), MAX({column}) FROM items
+             WHERE story_id = ?1 AND {column} IS NOT NULL"
+        ),
         params![story],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -1108,6 +1178,21 @@ fn dispute(
         _ => valid_at.clone(),
     });
     Ok((disputed, earliest))
+}
+
+/// The newest publication value visible at `at` (RFC 3339 UTC, microseconds), for the ledger's
+/// publication clock. A minute counts once its LAST microsecond has passed and is reported as the
+/// stored minute, never as an instant inside it.
+pub fn newest_visible_publication(db: &Connection, at: &str) -> Result<Option<String>, StoreError> {
+    Ok(db.query_row(
+        "SELECT MAX(value) FROM (
+             SELECT valid_at AS value FROM items WHERE valid_at <= ?1 AND observed_at <= ?1
+             UNION ALL
+             SELECT valid_minute FROM items
+              WHERE substr(valid_minute, 1, 17) || '59.999999Z' <= ?1 AND observed_at <= ?1)",
+        [at],
+        |row| row.get(0),
+    )?)
 }
 
 fn outcome_name(kind: OutcomeKind) -> &'static str {
@@ -1196,14 +1281,15 @@ mod tests {
         abandon, AttemptEvent, AttemptSlot, Baseline, Outcome, Provenance, RawResponse, Request,
         RequestPhase, SourceId, TargetWindow, ValidSource, Verdict,
     };
-    use pit::datedness::Published;
+    use pit::datedness::{Minute, Published};
     use pit::ValidTime;
     use rusqlite::Connection;
     use tempfile::TempDir;
 
     use super::{
-        first_observed, fs, params, stamp, user_version, Committer, ItemRow, LedgerError,
-        ObservationTime, RunId, Sink, StoreError, COMMIT_LOG, SCHEMA_V0, SCHEMA_VERSION,
+        first_observed, fs, newest_visible_publication, params, stamp, user_version, Committer,
+        ItemRow, LedgerError, ObservationTime, RunId, Sink, StoreError, COMMIT_LOG, SCHEMA_V0,
+        SCHEMA_VERSION,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1254,6 +1340,15 @@ mod tests {
     const VALID_AT_PAST_THE_SECOND: i64 = VALID_AT + 123_456;
     /// A date with no hour, which is what a filing carrying no acceptance instant publishes at.
     const A_PUBLICATION_DAY: &str = "2026-11-10";
+    /// 00:02 and 00:03 UTC on 1970-01-01, whole minutes on the same clock as `VALID_AT`.
+    const A_PUBLICATION_MINUTE: i64 = 120 * SECOND;
+    const A_LATER_PUBLICATION_MINUTE: i64 = 180 * SECOND;
+    /// Inside `A_PUBLICATION_MINUTE`, and its last microsecond.
+    const INSIDE_THAT_MINUTE: &str = "1970-01-01T00:02:30.000000Z";
+    const THAT_MINUTE_CLOSES: &str = "1970-01-01T00:02:59.999999Z";
+    const INSERTED_BY_HAND: &str = "INSERT INTO items (item_id, story_id, attempt_id, valid_at,
+         valid_minute, observed_at, valid_disputed, raw_blob, committed_at, valid_source)
+         SELECT 'by hand', 'by hand', attempt_id, ?1, ?2, ?3, 0, raw_blob, ?3, ?4 FROM items";
     const NEW_YORK: &str = "America/New_York";
 
     const DOC_IMPORT: &str = "use newsvault::store::{Committer, ItemRow};";
@@ -1360,6 +1455,31 @@ mod tests {
             raw_blob: store.put_blob(spec.payload)?,
             body_blob: None,
         })
+    }
+
+    /// [`row`] restated as a minute: `item_id` digests the minute tag, and `valid` is a minute.
+    fn minute_row(store: &Committer, spec: &Spec) -> Result<ItemRow, Box<dyn std::error::Error>> {
+        let minute = Minute::new(instant(spec.valid)).map_err(|failure| failure.to_string())?;
+        Ok(ItemRow {
+            item_id: item_id(&ItemFields {
+                source: spec.source,
+                source_item_id: spec.source_item_id,
+                url: URL,
+                valid: Stamp::Minute(minute.start()),
+                title: spec.title,
+                body_ref: None,
+            })
+            .map_err(|failure| failure.to_string())?,
+            valid: Published::AtMinute(minute),
+            ..row(store, spec)?
+        })
+    }
+
+    fn minute_spec() -> Spec<'static> {
+        Spec {
+            valid: A_PUBLICATION_MINUTE,
+            ..spec(STORY)
+        }
     }
 
     fn story_hex(source: &str, source_item_id: &str) -> String {
@@ -1564,6 +1684,7 @@ mod tests {
             "SELECT seq || '|' || item_id || '|' || story_id || '|' || IFNULL(doc_id, '')
                  || '|' || attempt_id || '|' || IFNULL(valid_at, '')
                  || '|' || IFNULL(valid_day, '') || '|' || IFNULL(valid_tz, '')
+                 || '|' || IFNULL(valid_minute, '')
                  || '|' || IFNULL(valid_refused, '') || '|' || observed_at
                  || '|' || valid_disputed || '|' || IFNULL(earliest_valid_at, '')
                  || '|' || raw_blob || '|' || IFNULL(body_blob, '') || '|' || committed_at
@@ -1647,24 +1768,62 @@ mod tests {
         Ok(())
     }
 
-    /// The v0 row keeps NULL in the evidence columns, which is the one state they may be NULL in.
+    /// §8 row M1. The v0 row keeps NULL in the evidence columns, the one state they may be NULL
+    /// in, and a minute row lands in the column the rebuilt table added.
     #[test]
-    fn a_store_at_the_previous_user_version_opens_and_migrates() -> TestResult {
+    fn a_store_at_the_previous_user_version_opens_migrates_and_takes_a_minute_row() -> TestResult {
         let temp = TempDir::new()?;
         a_store_at_user_version_zero(&temp)?;
         let mut store = open(&temp)?;
         let closed = closed_attempt(&mut store, 0, Verdict::Usable)?;
-        store.record(closed, &[row(&store, &spec(STORY))?], at(5))?;
+        store.record(closed, &[minute_row(&store, &minute_spec())?], at(5))?;
         let mut statement = store
             .db
-            .prepare("SELECT valid_raw FROM items ORDER BY seq")?;
-        let raw = statement
-            .query_map([], |row| row.get::<_, Option<String>>(0))?
+            .prepare("SELECT valid_raw, valid_minute FROM items ORDER BY seq")?;
+        let stored = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(
-            (user_version(&store.db)?, raw),
-            (SCHEMA_VERSION, vec![None, Some(VALID_RAW.to_owned())])
+            (user_version(&store.db)?, stored),
+            (
+                SCHEMA_VERSION,
+                vec![
+                    (None, None),
+                    (
+                        Some(VALID_RAW.to_owned()),
+                        Some(stamped(A_PUBLICATION_MINUTE))
+                    )
+                ]
+            )
         );
+        Ok(())
+    }
+
+    /// Foreign keys are off while the table is rebuilt (SQLite's procedure), so nothing but the
+    /// closing `foreign_key_check` stops a v0 row whose attempt is absent from being carried on.
+    #[test]
+    fn a_v0_store_holding_an_item_with_no_attempt_is_refused_rather_than_migrated() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_zero(&temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute("DELETE FROM attempts", [])?;
+        drop(db);
+        let refused = open(&temp);
+        assert!(
+            matches!(
+                &refused,
+                Err(StoreError::MigrationFoundADanglingReference { table, rowid: 1 })
+                    if table == "items"
+            ),
+            "{refused:?}"
+        );
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        assert_eq!(user_version(&db)?, 0);
         Ok(())
     }
 
@@ -2330,6 +2489,120 @@ mod tests {
             "{refused:?}"
         );
         assert_eq!(count(&store, "items")?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_minute_precision_value_is_stored_as_a_minute_and_never_as_an_instant() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let closed = closed_attempt(&mut store, 0, Verdict::Usable)?;
+        store.record(closed, &[minute_row(&store, &minute_spec())?], at(5))?;
+        let stored: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = store.db.query_row(
+            "SELECT valid_at, valid_minute, valid_day, valid_refused FROM items",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            stored,
+            (None, Some(stamped(A_PUBLICATION_MINUTE)), None, None)
+        );
+        Ok(())
+    }
+
+    /// The exactly-one CHECK names the minute column: written past `record`, a row carrying both
+    /// a minute and an instant is refused by the table itself.
+    #[test]
+    fn a_row_holding_a_minute_and_an_instant_is_refused_by_the_schema() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let closed = closed_attempt(&mut store, 0, Verdict::Usable)?;
+        store.record(closed, &[row(&store, &spec(STORY))?], at(5))?;
+        let both = store.db.execute(
+            INSERTED_BY_HAND,
+            params![
+                stamped(A_PUBLICATION_MINUTE),
+                stamped(A_PUBLICATION_MINUTE),
+                stamped(OBSERVED_AT),
+                ValidSource::VendorPublished.name()
+            ],
+        );
+        assert!(both.is_err(), "{both:?}");
+        assert_eq!(count(&store, "items")?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_valid_source_no_variant_names_is_refused_by_the_schema() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let closed = closed_attempt(&mut store, 0, Verdict::Usable)?;
+        store.record(closed, &[row(&store, &spec(STORY))?], at(5))?;
+        let named = |source: &str| {
+            store.db.execute(
+                INSERTED_BY_HAND,
+                params![
+                    Option::<String>::None,
+                    stamped(A_PUBLICATION_MINUTE),
+                    stamped(OBSERVED_AT),
+                    source
+                ],
+            )
+        };
+        assert!(named("guessed").is_err());
+        assert_eq!(named(ValidSource::OurExtraction.name())?, 1);
+        Ok(())
+    }
+
+    /// R15 within the minute column. Across precisions (minute against instant or day) nothing is
+    /// compared, which §8 row R15 records as unguarded.
+    #[test]
+    fn a_re_stamped_minute_is_disputed_on_the_arriving_row_with_the_earlier_minute() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let first = closed_attempt(&mut store, 0, Verdict::Usable)?;
+        store.record(first, &[minute_row(&store, &minute_spec())?], at(5))?;
+        let second = closed_attempt(&mut store, 1, Verdict::Usable)?;
+        let twin = minute_row(
+            &store,
+            &Spec {
+                valid: A_LATER_PUBLICATION_MINUTE,
+                observed: OBSERVED_LATER,
+                ..spec(STORY)
+            },
+        )?;
+        store.record(second, &[twin], at(6))?;
+        assert_eq!(
+            disputes(&store)?,
+            vec![(0, None), (1, Some(stamped(A_PUBLICATION_MINUTE)))]
+        );
+        Ok(())
+    }
+
+    /// The ledger's publication clock: a minute is not fresh news until it has closed, and is
+    /// then reported as the stored minute and not as an instant inside it.
+    #[test]
+    fn a_minute_is_not_the_newest_publication_until_its_minute_has_closed() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let closed = closed_attempt(&mut store, 0, Verdict::Usable)?;
+        let read_inside = Spec {
+            observed: A_PUBLICATION_MINUTE,
+            ..minute_spec()
+        };
+        store.record(closed, &[minute_row(&store, &read_inside)?], at(5))?;
+        assert_eq!(
+            (
+                newest_visible_publication(&store.db, INSIDE_THAT_MINUTE)?,
+                newest_visible_publication(&store.db, THAT_MINUTE_CLOSES)?
+            ),
+            (None, Some(stamped(A_PUBLICATION_MINUTE)))
+        );
         Ok(())
     }
 

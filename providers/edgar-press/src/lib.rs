@@ -377,7 +377,8 @@ impl EdgarPress {
                 Some(filed) => ValidTime::new(filed.max(listed_ends)),
                 None => return Ok(None),
             },
-            Published::Unknown => return Ok(None),
+            // `publication` never states a minute: EDGAR's acceptance field carries seconds.
+            Published::AtMinute(_) | Published::Unknown => return Ok(None),
         };
         Visibility::from_backfill(bound, lag).map(|visible| Some(visible.observed()))
     }

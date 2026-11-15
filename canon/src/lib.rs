@@ -25,6 +25,7 @@ const SEPARATORS: [char; 3] = [FIELD, LIST, TAG];
 const INSTANT_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6fZ";
 const DAY_FORMAT: &str = "%Y-%m-%d";
 const INSTANT_TAG: &str = "instant";
+const MINUTE_TAG: &str = "minute";
 const DAY_TAG: &str = "day";
 const CREDENTIAL_TAG: &str = "credential";
 /// chrono carries a leap second's extra second in the nanosecond field rather than in `second`.
@@ -86,6 +87,8 @@ impl Domain {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stamp {
     Instant(DateTime<Utc>),
+    /// A minute as its first microsecond: it differs from that instant only by its tag.
+    Minute(DateTime<Utc>),
     /// The date as published, never a fabricated instant inside it.
     Day(NaiveDate),
 }
@@ -160,18 +163,21 @@ fn render(field: &Field, out: &mut String) -> Result<(), CanonError> {
                 write_value(member, out)?;
             }
         }
-        Field::Stamp(Stamp::Instant(at)) => {
-            if at.timestamp_subsec_nanos() >= LEAP_SECOND_NANOS {
-                return Err(CanonError::SixtiethSecond);
-            }
-            tagged(INSTANT_TAG, &at.format(INSTANT_FORMAT).to_string(), out)?;
-        }
+        Field::Stamp(Stamp::Instant(at)) => tagged(INSTANT_TAG, &instant_text(at)?, out)?,
+        Field::Stamp(Stamp::Minute(starts)) => tagged(MINUTE_TAG, &instant_text(starts)?, out)?,
         Field::Stamp(Stamp::Day(day)) => {
             tagged(DAY_TAG, &day.format(DAY_FORMAT).to_string(), out)?;
         }
         Field::Credential(name) => tagged(CREDENTIAL_TAG, name, out)?,
     }
     Ok(())
+}
+
+fn instant_text(at: DateTime<Utc>) -> Result<String, CanonError> {
+    if at.timestamp_subsec_nanos() >= LEAP_SECOND_NANOS {
+        return Err(CanonError::SixtiethSecond);
+    }
+    Ok(at.format(INSTANT_FORMAT).to_string())
 }
 
 /// A tag and the value it qualifies, in that order. Section 2 says the precision tag travels

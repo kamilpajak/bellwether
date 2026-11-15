@@ -62,6 +62,7 @@ impl ValidSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ValidPrecision {
     Instant,
+    Minute,
     Day,
     Unknown,
 }
@@ -71,6 +72,7 @@ impl ValidPrecision {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Instant => "instant",
+            Self::Minute => "minute",
             Self::Day => "day",
             Self::Unknown => "unknown",
         }
@@ -84,6 +86,7 @@ impl ValidPrecision {
 pub const fn stamp_of(published: &Published) -> Option<canon::Stamp> {
     match published {
         Published::At(valid) => Some(canon::Stamp::Instant(valid.inner())),
+        Published::AtMinute(minute) => Some(canon::Stamp::Minute(minute.start())),
         Published::On { day, .. } => Some(canon::Stamp::Day(*day)),
         Published::Unknown => None,
     }
@@ -95,6 +98,7 @@ pub const fn stamp_of(published: &Published) -> Option<canon::Stamp> {
 pub const fn precision_of(published: &Published) -> ValidPrecision {
     match published {
         Published::At(_) => ValidPrecision::Instant,
+        Published::AtMinute(_) => ValidPrecision::Minute,
         Published::On { .. } => ValidPrecision::Day,
         Published::Unknown => ValidPrecision::Unknown,
     }
@@ -450,8 +454,13 @@ pub trait Provider: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{probed_lag, Calendar, CalendarError, PlanRefusal, TargetWindow};
+    use super::{
+        precision_of, probed_lag, stamp_of, Calendar, CalendarError, PlanRefusal, TargetWindow,
+        ValidPrecision,
+    };
     use crate::SourceId;
+    use chrono::{DateTime, Utc};
+    use pit::datedness::{Minute, Published};
     use pit::MeasuredLag;
 
     const SOURCE: &str = "edgar_press";
@@ -478,6 +487,27 @@ mod tests {
             window: WINDOW.to_owned(),
             why,
         })
+    }
+
+    /// `no_item_is_finer_than_the_ceiling` reads this order: a minute under a day ceiling is a
+    /// breach, a minute under an instant ceiling is not.
+    #[test]
+    fn a_minute_is_coarser_than_an_instant_and_finer_than_a_day() {
+        assert!(ValidPrecision::Instant < ValidPrecision::Minute);
+        assert!(ValidPrecision::Minute < ValidPrecision::Day);
+    }
+
+    #[test]
+    fn a_minute_publication_value_reaches_canon_and_the_label_as_a_minute() {
+        let Ok(minute) = Minute::new(DateTime::<Utc>::UNIX_EPOCH) else {
+            assert_eq!("a whole minute", "refused");
+            return;
+        };
+        let published = Published::AtMinute(minute);
+        assert_eq!(
+            (stamp_of(&published), precision_of(&published).label()),
+            (Some(canon::Stamp::Minute(minute.start())), "minute")
+        );
     }
 
     #[test]

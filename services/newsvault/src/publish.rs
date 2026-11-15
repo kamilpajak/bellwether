@@ -263,6 +263,8 @@ pub struct SegmentRow {
     /// instant: architecture.md section 3.1's `valid_precision` row.
     pub valid_day: Option<String>,
     pub valid_tz: Option<String>,
+    /// A publication MINUTE as its first microsecond, never read as that instant.
+    pub valid_minute: Option<String>,
     pub valid_refused: Option<String>,
     pub observed_at: String,
     pub valid_disputed: bool,
@@ -325,6 +327,7 @@ fn read_segment(path: &Path, into: &mut Vec<SegmentRow>) -> Result<(), PublishEr
             "valid_at",
             "valid_day",
             "valid_tz",
+            "valid_minute",
             "valid_refused",
             "observed_at",
             "earliest_valid_at",
@@ -333,11 +336,11 @@ fn read_segment(path: &Path, into: &mut Vec<SegmentRow>) -> Result<(), PublishEr
             "committed_at",
         ]
         .map(|column| utf8(&batch, column));
-        let [item_id, story_id, doc_id, attempt_id, source, valid_at, valid_day, valid_tz, valid_refused, observed_at, earliest_valid_at, raw_blob, body_blob, committed_at] =
+        let [item_id, story_id, doc_id, attempt_id, source, valid_at, valid_day, valid_tz, valid_minute, valid_refused, observed_at, earliest_valid_at, raw_blob, body_blob, committed_at] =
             text;
         let (item_id, story_id, doc_id) = (item_id?, story_id?, doc_id?);
         let (attempt_id, source, valid_at) = (attempt_id?, source?, valid_at?);
-        let (valid_day, valid_tz) = (valid_day?, valid_tz?);
+        let (valid_day, valid_tz, valid_minute) = (valid_day?, valid_tz?, valid_minute?);
         let (valid_refused, observed_at) = (valid_refused?, observed_at?);
         let (earliest_valid_at, raw_blob) = (earliest_valid_at?, raw_blob?);
         let (body_blob, committed_at) = (body_blob?, committed_at?);
@@ -352,6 +355,7 @@ fn read_segment(path: &Path, into: &mut Vec<SegmentRow>) -> Result<(), PublishEr
                 valid_at: optional(&valid_at, row),
                 valid_day: optional(&valid_day, row),
                 valid_tz: optional(&valid_tz, row),
+                valid_minute: optional(&valid_minute, row),
                 valid_refused: optional(&valid_refused, row),
                 observed_at: required(&observed_at, "observed_at", row)?,
                 valid_disputed: disputed.value(row),
@@ -378,6 +382,7 @@ fn segment_schema() -> SchemaRef {
         text("valid_at", true),
         text("valid_day", true),
         text("valid_tz", true),
+        text("valid_minute", true),
         text("valid_refused", true),
         text("observed_at", false),
         Field::new("valid_disputed", DataType::Boolean, false),
@@ -406,6 +411,7 @@ fn batch(rows: &[ExportRow]) -> Result<RecordBatch, arrow::error::ArrowError> {
         text(|row| row.valid_at.clone()),
         text(|row| row.valid_day.clone()),
         text(|row| row.valid_tz.clone()),
+        text(|row| row.valid_minute.clone()),
         text(|row| row.valid_refused.clone()),
         text(|row| Some(row.observed_at.clone())),
         Arc::new(BooleanArray::from(
@@ -482,7 +488,7 @@ fn optional(column: &StringArray, row: usize) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use canon::digest::{item_id, story_id, ItemFields};
     use canon::{FileDigest, Stamp};
     use chrono::DateTime;
@@ -490,7 +496,7 @@ mod tests {
         AttemptSlot, Baseline, Outcome, Provenance, RawResponse, Request, RequestPhase, RunId,
         SourceId, TargetWindow, ValidSource, Verdict,
     };
-    use pit::datedness::Published;
+    use pit::datedness::{Minute, Published};
     use pit::{ObservationTime, ValidTime};
     use tempfile::TempDir;
 
@@ -555,7 +561,7 @@ mod tests {
 
     /// The same door, with the publication value stated: an instant and a bare day are two
     /// different stored shapes and the segment carries both.
-    fn commit_valued(
+    pub(crate) fn commit_valued(
         store: &mut Committer,
         source_item_id: &str,
         published: Published,
@@ -614,7 +620,7 @@ mod tests {
         Ok(())
     }
 
-    fn open(root: &TempDir, run: &str) -> Result<Committer, crate::store::StoreError> {
+    pub(crate) fn open(root: &TempDir, run: &str) -> Result<Committer, crate::store::StoreError> {
         Committer::open(root.path(), &RunId::new(run))
     }
 
@@ -830,6 +836,7 @@ mod tests {
                 valid_at: row.valid_at.clone(),
                 valid_day: row.valid_day.clone(),
                 valid_tz: row.valid_tz.clone(),
+                valid_minute: row.valid_minute.clone(),
                 valid_refused: row.valid_refused.clone(),
                 observed_at: row.observed_at.clone(),
                 valid_disputed: row.valid_disputed,
@@ -881,6 +888,62 @@ mod tests {
     }
 
     #[test]
+    fn a_minute_dated_row_reaches_the_segment_with_its_minute() -> TestResult {
+        let root = TempDir::new()?;
+        let mut store = open(&root, FIRST_RUN)?;
+        let minute = Minute::new(valid(SIX_MONTHS_EARLIER).inner())?;
+        commit_valued(
+            &mut store,
+            "0000320193-26-000071",
+            Published::AtMinute(minute),
+            Stamp::Minute(minute.start()),
+            OBSERVED_FIRST,
+        )?;
+        publish_run(&mut store, &Fsync, at(OBSERVED_FIRST))?;
+        let read = read_day(root.path(), PARTITION_SIX_MONTHS_EARLIER)?;
+        let dated: Vec<(Option<String>, Option<String>)> = read
+            .iter()
+            .map(|row| (row.valid_at.clone(), row.valid_minute.clone()))
+            .collect();
+        assert_eq!(
+            dated,
+            vec![(None, Some("2026-01-10T14:00:00.000000Z".to_owned()))]
+        );
+        Ok(())
+    }
+
+    /// A segment written before `valid_minute` existed is refused by name, never read as a row
+    /// with no minute. No such segment exists outside tests (§8 row R11, search of 2026-11-15).
+    #[test]
+    fn a_segment_without_the_minute_column_is_refused_by_the_reader() -> TestResult {
+        let root = TempDir::new()?;
+        let mut store = open(&root, FIRST_RUN)?;
+        commit_one(
+            &mut store,
+            "0000320193-26-000071",
+            SIX_MONTHS_EARLIER,
+            OBSERVED_FIRST,
+        )?;
+        let whole = super::batch(&store.unpublished_rows()?)?;
+        let kept: Vec<usize> = (0..whole.num_columns())
+            .filter(|index| whole.schema().field(*index).name() != "valid_minute")
+            .collect();
+        let older = whole.project(&kept)?;
+        let partition = partition_of(root.path(), PARTITION_SIX_MONTHS_EARLIER);
+        std::fs::create_dir_all(&partition)?;
+        let file = std::fs::File::create(partition.join(segment_name(1, 1)))?;
+        let mut writer = super::ArrowWriter::try_new(file, older.schema(), None)?;
+        writer.write(&older)?;
+        writer.close()?;
+        let refused = read_day(root.path(), PARTITION_SIX_MONTHS_EARLIER);
+        assert!(
+            matches!(refused, Err(PublishError::MissingColumn("valid_minute"))),
+            "{refused:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn changing_the_one_segment_constructor_to_file_create_turns_the_write_gate_red() -> TestResult
     {
         let root = TempDir::new()?;
@@ -913,6 +976,7 @@ mod tests {
             valid_at: None,
             valid_day: None,
             valid_tz: None,
+            valid_minute: None,
             valid_refused: None,
             observed_at: String::new(),
             valid_disputed: false,

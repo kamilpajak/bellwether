@@ -14,8 +14,8 @@ use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
 use crate::store::{
-    coverage_up_to, require_current_version, unpublished_seq_ranges, SeqRange, WindowCoverage,
-    COMMIT_LOG, RUNS_DIR,
+    coverage_up_to, newest_visible_publication, require_current_version, unpublished_seq_ranges,
+    SeqRange, WindowCoverage, COMMIT_LOG, RUNS_DIR,
 };
 
 pub const SCHEMA: &str = "newsvault.ledger/1";
@@ -485,11 +485,7 @@ fn freshness(
     )?;
     // Both halves of the visibility question, which is the one `pit` exists for: a publication
     // value we had not read yet is not freshness.
-    let newest_publication: Option<String> = db.query_row(
-        "SELECT MAX(valid_at) FROM items WHERE valid_at <= ?1 AND observed_at <= ?1",
-        [at],
-        |row| row.get(0),
-    )?;
+    let newest_publication = newest_visible_publication(db, at)?;
     Ok(Freshness {
         asking_clock: age(newest_request, cutoff),
         publication_clock: age(newest_publication, cutoff),

@@ -3,11 +3,54 @@
 //! [`Datedness`] is where it stops being assumed: a date is carried as a date and never folded
 //! into a fabricated midnight instant.
 
-use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
-use crate::{Cutoff, ObservationTime, ValidTime, Visibility};
+use crate::{Cutoff, ObservationTime, PitError, ValidTime, Visibility};
+
+/// A publication value stated to the whole minute in UTC, such as an RSS `pubDate` of
+/// `Sat, 14 Nov 2026 19:00 GMT`. Not a [`ValidTime`], so no cutoff reads it as the instant at :00.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "DateTime<Utc>", into = "DateTime<Utc>")]
+pub struct Minute(DateTime<Utc>);
+
+impl Minute {
+    /// A value carrying seconds or sub-seconds is refused, never truncated to its minute.
+    pub fn new(start: DateTime<Utc>) -> Result<Self, PitError> {
+        if start.second() != 0 || start.nanosecond() != 0 {
+            return Err(PitError::MinuteWithSeconds(start));
+        }
+        Ok(Self(start))
+    }
+
+    /// The minute's first microsecond, for ordering, display and `canon` only. Never a cutoff.
+    #[must_use]
+    pub const fn start(self) -> DateTime<Utc> {
+        self.0
+    }
+
+    /// The minute's last microsecond, or `None` past the last instant chrono holds.
+    #[must_use]
+    pub fn end(self) -> Option<DateTime<Utc>> {
+        self.0
+            .checked_add_signed(Duration::minutes(1) - Duration::microseconds(1))
+    }
+}
+
+impl TryFrom<DateTime<Utc>> for Minute {
+    type Error = PitError;
+
+    fn try_from(start: DateTime<Utc>) -> Result<Self, Self::Error> {
+        Self::new(start)
+    }
+}
+
+impl From<Minute> for DateTime<Utc> {
+    fn from(minute: Minute) -> Self {
+        minute.0
+    }
+}
 
 /// The publication value of an item. Comparable and printable, and **not** a [`ValidTime`], so it
 /// cannot reach a cutoff: `Cutoff::admits_valid` takes a `ValidTime` and this is not one. That is
@@ -15,6 +58,7 @@ use crate::{Cutoff, ObservationTime, ValidTime, Visibility};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Published {
     At(ValidTime),
+    AtMinute(Minute),
     /// A date with no hour, in the calendar `tz` names.
     On {
         day: NaiveDate,
@@ -30,6 +74,7 @@ impl Published {
     pub fn lower_bound(self) -> Option<DateTime<Utc>> {
         match self {
             Self::At(valid) => Some(valid.inner()),
+            Self::AtMinute(minute) => Some(minute.start()),
             Self::On { day, tz } => {
                 let zone: Tz = tz.parse().ok()?;
                 let starts = zone
@@ -46,6 +91,9 @@ impl std::fmt::Display for Published {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::At(valid) => write!(f, "{}", valid.inner()),
+            Self::AtMinute(minute) => {
+                write!(f, "{} (minute)", minute.start().format("%F %H:%M UTC"))
+            }
             Self::On { day, tz } => write!(f, "{day} ({tz} day)"),
             Self::Unknown => write!(f, "unknown"),
         }
@@ -57,6 +105,11 @@ impl std::fmt::Display for Published {
 pub enum Datedness {
     /// Both instants known. Reuses [`Visibility`] unchanged.
     Dated(Visibility),
+    /// A publication MINUTE; built by [`Datedness::of_minute`], which owns its one refusal.
+    MinuteDated {
+        minute: Minute,
+        observed: ObservationTime,
+    },
     /// A publication DATE with no hour, in the calendar `tz` names.
     DayDated {
         day: NaiveDate,
@@ -68,11 +121,27 @@ pub enum Datedness {
 }
 
 impl Datedness {
+    /// `Undated` only when the observation precedes the minute's START: a page read at 19:00:30
+    /// can state 19:00, so comparing against the minute's end would refuse an honest row.
+    #[must_use]
+    pub fn of_minute(minute: Minute, observed: ObservationTime) -> Self {
+        if observed.inner() < minute.start() {
+            Self::Undated { observed }
+        } else {
+            Self::MinuteDated { minute, observed }
+        }
+    }
+
     /// The only visibility query for an item whose publication time may be a date.
     #[must_use]
     pub fn visible_at(&self, cutoff: Cutoff) -> bool {
         match self {
             Self::Dated(v) => v.visible_at(cutoff),
+            // From the minute's LAST microsecond: from its start is the fold the day arm refuses.
+            Self::MinuteDated { minute, observed } => {
+                minute.end().is_some_and(|ends| cutoff.inner() >= ends)
+                    && cutoff.admits_observation(*observed)
+            }
             // The end of the day in the WINDOW'S OWN calendar, not UTC: a day bounded by UTC
             // midnight is 19:00 New York and admits the afternoon. An unresolvable zone leaves
             // the item invisible rather than falling back to UTC.
@@ -89,6 +158,7 @@ impl Datedness {
     pub fn published(&self) -> Published {
         match self {
             Self::Dated(v) => Published::At(v.valid()),
+            Self::MinuteDated { minute, .. } => Published::AtMinute(*minute),
             Self::DayDated { day, tz, .. } => Published::On { day: *day, tz },
             Self::Undated { .. } => Published::Unknown,
         }
@@ -98,7 +168,9 @@ impl Datedness {
     pub fn observed(&self) -> ObservationTime {
         match self {
             Self::Dated(v) => v.observed(),
-            Self::DayDated { observed, .. } | Self::Undated { observed } => *observed,
+            Self::MinuteDated { observed, .. }
+            | Self::DayDated { observed, .. }
+            | Self::Undated { observed } => *observed,
         }
     }
 }
@@ -140,8 +212,8 @@ fn first_local_time_after_a_gap(zone: Tz, inside: NaiveDateTime) -> Option<DateT
 
 #[cfg(test)]
 mod tests {
-    use super::{end_of_day, Datedness};
-    use crate::{Cutoff, ObservationTime, ValidTime, Visibility};
+    use super::{end_of_day, Datedness, Minute};
+    use crate::{Cutoff, ObservationTime, PitError, ValidTime, Visibility};
     use chrono::{DateTime, NaiveDate, Utc};
 
     const NEW_YORK: &str = "America/New_York";
@@ -167,6 +239,14 @@ mod tests {
     /// to end at; the gap starts at 00:00 CST, which is 05:00Z.
     const DAY_BEFORE_HAVANA_SPRINGS_FORWARD: &str = "2026-03-07";
     const END_OF_THAT_DAY_WHERE_THE_GAP_STARTS: &str = "2026-03-08T04:59:59.999999Z";
+    /// GNW's RSS `pubDate` of 2026-11-14, `Sat, 14 Nov 2026 19:00 GMT`.
+    const A_PUBLICATION_MINUTE: &str = "2026-11-14T19:00:00Z";
+    const INSIDE_THAT_MINUTE: &str = "2026-11-14T19:00:30Z";
+    const ONE_MICROSECOND_BEFORE_IT_CLOSES: &str = "2026-11-14T19:00:59.999998Z";
+    const THE_LAST_MICROSECOND_OF_THAT_MINUTE: &str = "2026-11-14T19:00:59.999999Z";
+    const BEFORE_THAT_MINUTE_STARTS: &str = "2026-11-14T18:59:59.999999Z";
+    const A_SECOND_INTO_THE_MINUTE: &str = "2026-11-14T19:00:01Z";
+    const A_MICROSECOND_INTO_THE_MINUTE: &str = "2026-11-14T19:00:00.000001Z";
     const EVERY_CUTOFF: [&str; 3] = [
         "1970-01-01T00:00:00Z",
         "2026-07-09T00:00:00Z",
@@ -184,6 +264,19 @@ mod tests {
         match text.parse::<NaiveDate>() {
             Ok(date) => date,
             Err(_) => NaiveDate::MIN,
+        }
+    }
+
+    fn minute(text: &str) -> Option<Minute> {
+        Minute::new(at(text)).ok()
+    }
+
+    fn minute_dated_observed_at(observed: &str) -> Datedness {
+        match minute(A_PUBLICATION_MINUTE) {
+            Some(published) => Datedness::of_minute(published, ObservationTime::new(at(observed))),
+            None => Datedness::Undated {
+                observed: ObservationTime::new(at(observed)),
+            },
         }
     }
 
@@ -299,5 +392,46 @@ mod tests {
                 "{cutoff}"
             );
         }
+    }
+
+    #[test]
+    fn a_minute_value_is_invisible_until_its_minute_has_closed() {
+        let item = minute_dated_observed_at(INSIDE_THAT_MINUTE);
+        let visible = [
+            INSIDE_THAT_MINUTE,
+            ONE_MICROSECOND_BEFORE_IT_CLOSES,
+            THE_LAST_MICROSECOND_OF_THAT_MINUTE,
+        ]
+        .map(|cutoff| item.visible_at(Cutoff::new(at(cutoff))));
+        assert_eq!(visible, [false, false, true]);
+    }
+
+    #[test]
+    fn an_observation_inside_its_own_minute_is_not_refused() {
+        let item = minute_dated_observed_at(INSIDE_THAT_MINUTE);
+        assert!(matches!(item, Datedness::MinuteDated { .. }), "{item:?}");
+    }
+
+    #[test]
+    fn an_observation_before_its_minute_starts_is_refused_to_undated() {
+        let item = minute_dated_observed_at(BEFORE_THAT_MINUTE_STARTS);
+        assert!(matches!(item, Datedness::Undated { .. }), "{item:?}");
+    }
+
+    /// Through the constructor and through serde, which is a second constructor.
+    #[test]
+    fn a_minute_constructor_refuses_a_value_with_seconds() {
+        for carrying in [A_SECOND_INTO_THE_MINUTE, A_MICROSECOND_INTO_THE_MINUTE] {
+            assert_eq!(
+                Minute::new(at(carrying)),
+                Err(PitError::MinuteWithSeconds(at(carrying)))
+            );
+            let wire = format!("\"{carrying}\"");
+            assert!(serde_json::from_str::<Minute>(&wire).is_err(), "{wire}");
+        }
+        assert_eq!(
+            minute(A_PUBLICATION_MINUTE).map(Minute::start),
+            Some(at(A_PUBLICATION_MINUTE))
+        );
     }
 }
