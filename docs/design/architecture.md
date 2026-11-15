@@ -951,11 +951,26 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - They measure the predecessor's **retrieval** coverage, not the world's news, so a different vendor moves them; provisional, re-measured against `open-web-feed` (§11) and the first real vendor.
 - The publication gap transfers where an observation gap would not, because the predecessor's `ingested_at` spacing is its scheduler, not the news; the record already holds outages: 161 of the 175 days hold an item, 14 hold none, and the 332.6-hour gap is one.
 
+**Defaults taken by the builder on 2026-11-15, open-web step 2 (§11.5), not by the owner.**
+
+- Construction: the review of 2026-11-15 listed the step-2 lines that state a choice; each was checked against the 2026-11-14 owner lines of §11.1 and §11.2, and those the owner lines already decide are left out (`universe_version` as the digest of zero bytes is the owner's "empty for the POC"; `Minute` precision is the owner's "Decided" bullet). The reason behind each default was not recorded when it was taken.
+
+| default | where it is changed |
+|---|---|
+| a 429, a 5xx and a transport error are transient; every other non-200 status is permanent (the owner decided only bot protection, permanent) | `OpenWebFeed::classify`, `providers/open-web-feed/src/lib.rs` |
+| a `pubDate` carrying seconds is `NoParseableValidTime`, never truncated to its minute | `minute_of`, same file |
+| a minute is visible from its last microsecond and only once observed; stored `Undated` only when observed before the minute starts (§3.1) | `Datedness::of_minute` and `Datedness::visible_at`, `pit/src/datedness.rs` |
+| `item_key` is the rewritten, lowercased host plus the path, without scheme, query or fragment | `OpenWebFeed::item_key` and `host_and_path`, `providers/open-web-feed/src/lib.rs` |
+| a relative canonical href is resolved against the page's url; another host is kept (§11.1) | `absolute`, same file |
+| credential name `open_web_contact`, read from `BELLWETHER_FEED_CONTACT` | `CONTACT_CREDENTIAL` in that file; `Registered::contact_variable` in `cmd_collect.rs` |
+| a second distinct `--source` is refused (§11.2) | `Registered::chosen`, `cmd_collect.rs` |
+| an `EveryUtcDay` run whose `--at` is not the clock's UTC day is refused (§11.2) | `cmd_collect::run` |
+
 ---
 
 ## 11. `open-web-feed` — our own forward news feed (decided 2026-11-14; §11.5 steps 1 and 2 are built; `newsvault collect` drives it)
 
-- Every line in §11.1 and §11.2 is an owner decision of 2026-11-14, except the `ValidSource` cells of §11.1's valid-time table and the bullet below that table, both decided 2026-11-15.
+- Every line in §11.1 and §11.2 is an owner decision of 2026-11-14, except the `ValidSource` cells of §11.1's valid-time table and the bullet below that table, both decided 2026-11-15, and the sub-bullets marked `Built 2026-11-15`, which record what was built; the choices among them the owner did not make are listed in §10's 2026-11-15 defaults table.
 
 | term | meaning |
 |---|---|
@@ -1046,7 +1061,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
 | flag | `edgar_press` | `open_web_wires` | decided by |
 |---|---|---|---|
-| `--calendar`, `--listing` | required | refused | `Registered::cadence`, equal to the opened provider's `Cadence` (`every_registered_cadence_is_the_one_its_provider_declares`) |
+| `--calendar`, `--listing` | required | refused | `Registered::cadence`, equal to the opened provider's `Cadence` (`every_registered_cadence_is_the_one_its_provider_declares`; mutation 2026-11-15, the open-web entry `SessionBound`: red) |
 | `--roster` | required | refused | the table |
 | `--hosts` | refused | required | the table |
 | `--lag-policy` | optional | refused (live only) | `open_provider` |
@@ -1089,7 +1104,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | a Yahoo row outside the key list is filtered out | exact match becomes substring match | R3 |
 | (a) a quiet all-held day passes `ledger --check`; (b) an admitted row without a ledgered robots fetch is refused (newsvault) | (a) the `held` subtraction is removed; (b) the lookup is removed | R4 |
 | (b) a hosts row faster than its robots Crawl-delay is refused (newsvault); (c) a redirect is a permanent failure, not followed | (b) the floor check is removed; (c) `max_redirects(0)` is removed | R19 |
-| the extracted body is article text, per further host (GNW's bites, §8 R17) | the selector widens to `<body>` | R17 |
+| the extracted body is article text, per further host | the selector widens to `<body>` | R17 |
 | a rolled-back `record` leaves no outbox row | the insert moves outside the transaction | new row O1 |
 | a zero-item attempt writes one outbox row | the insert is skipped when rows are empty | R14 |
 | CNBC valid time is the page meta (Target) | the sitemap value is used | R13 |
@@ -1118,7 +1133,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
    - Only release 3403075 is a real page; the other two links are answered with the synthetic pages (§11.2 Fixtures).
    - The clock sits inside the 19:00 minute, not after every `pubDate`: at a later clock every observation postdates every minute's end, and `items --at` could not show the minute rule.
    - R10 driver half: `an_open_web_run_for_yesterday_sends_nothing` (§8 row R10).
-   - Every mutation named for step 2 in this document was re-run on the final tree, 2026-11-15, one at a time, with `cargo test --locked -p <crate> --no-fail-fast -- <test>`: 50 of 50 turned their named tests red; 2 needed a second, corrected mutation (`cmd_items`'s first version called a private `pit` method and did not build; the segment reader's anchor matched 3 functions).
+   - Every mutation named for step 2 in this document was re-run on the final tree, 2026-11-15, one at a time, with `cargo test --locked -p <crate> --no-fail-fast -- <test>`: 50 of 50 turned their named tests red, but the table below accounts for 49 (5 named rows and 44 others; review 2026-11-15) and which mutation is the 50th is not known; 2 needed a second, corrected mutation (`cmd_items`'s first version called a private `pit` method and did not build; the segment reader's anchor matched 3 functions).
 
 | mutation | named test red |
 |---|---|
@@ -1128,6 +1143,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | `cmd_items` minute visible from its start | `a_minute_dated_item_is_invisible_until_its_minute_has_closed`, `an_open_web_run_collects_a_globenewswire_day_end_to_end` |
 | envelope `hosts_version` null | `the_run_envelope_names_the_hosts_file_it_was_allowed_to_use`, `an_open_web_run_collects_a_globenewswire_day_end_to_end` |
 | the other 44, as named in §3.1, §3.2, §8 rows R3, R4, R7, R13, R15, R17, R19, R21, M1 and §11.1, §11.2 | each its own named test |
+| review round 2026-11-15: 18 mutations, each run once its new test was written, as named beside those tests in §2, §3.1, §5.1, §8 rows R3, R13, R17, R19, M1 and §11.1, §11.2 | each its own named test |
 
    - Holes step 2 leaves open:
      - GNW's admission rests on the 2026-11-14 robots fetch made outside the ledger until step 3 (§11.1).
