@@ -1908,7 +1908,10 @@ fn a_run_against_a_store_at_a_newer_user_version_leaves_the_store_unchanged() ->
         .err()
         .map(|error| error.to_string())
         .unwrap_or_default();
-    assert!(said.contains("user_version 2"), "{said}");
+    assert!(
+        said.contains(&format!("user_version {A_NEWER_USER_VERSION}")),
+        "{said}"
+    );
     assert_eq!(digests(root.path()), before);
     Ok(())
 }

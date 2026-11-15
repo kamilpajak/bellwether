@@ -588,6 +588,8 @@ fn a_relative_canonical_link_is_resolved_against_the_page_url_before_it_reaches_
         SCHEME_RELATIVE_CANONICAL,
         "a.html",
         "javascript:void(0)",
+        A_CANONICAL_WITH_A_PORT,
+        A_CANONICAL_ON_A_HOST_KEY_REFUSES,
     ] {
         let written = page.replace(RELATIVE_CANONICAL, href).into_bytes();
         canonicals.push(only_item(&provider.extract(&request, &blob(written)))?.canonical_url);
@@ -598,11 +600,17 @@ fn a_relative_canonical_link_is_resolved_against_the_page_url_before_it_reaches_
             RESOLVED_CANONICAL,
             RESOLVED_CANONICAL,
             ARTICLE_URL,
-            ARTICLE_URL
+            ARTICLE_URL,
+            A_CANONICAL_WITH_A_PORT,
+            A_CANONICAL_ON_A_HOST_KEY_REFUSES
         ]
     );
     Ok(())
 }
+
+/// Absolute hrefs `host_and_path` refuses; review 2026-11-15 found both replaced by the page url.
+const A_CANONICAL_WITH_A_PORT: &str = "https://www.globenewswire.com:443/news-release/x.html";
+const A_CANONICAL_ON_A_HOST_KEY_REFUSES: &str = "https://other_host.example/x.html";
 
 /// The other half of `NoArticleBody` (section 11.5 step 2): a container holding only empty or
 /// whitespace paragraphs. Mutation 2026-11-15, the empty-paragraph filter removed: green before.

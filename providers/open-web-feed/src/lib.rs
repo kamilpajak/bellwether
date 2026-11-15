@@ -418,7 +418,11 @@ pub(crate) fn host_and_path(url: &str) -> Option<(String, String)> {
 /// scheme-relative one resolved against `base`, anything else `None`. Another host is kept, because
 /// `doc_id` is a cross-source identity.
 fn absolute(href: &str, base: &str) -> Option<String> {
-    if host_and_path(href).is_some() {
+    let has_scheme = SCHEMES.iter().any(|scheme| {
+        href.get(..scheme.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+    });
+    if has_scheme {
         return Some(href.to_owned());
     }
     if let Some(rest) = href.strip_prefix("//") {
