@@ -325,12 +325,12 @@ impl EdgarPress {
             }
         }
         let raw = request.listed_date.clone().unwrap_or_default();
-        let valid = match NaiveDate::parse_from_str(raw.trim(), INDEX_DATE) {
-            Ok(day) => Published::On {
+        let valid = match filed_day(request) {
+            Some(day) => Published::On {
                 day,
                 tz: self.parsed.zone,
             },
-            Err(_) => Published::Unknown,
+            None => Published::Unknown,
         };
         (valid, raw, DATE_FILED.to_owned())
     }
@@ -342,6 +342,9 @@ impl EdgarPress {
     /// A DATE has no instant, so the bound is the later END of two days: the row's `Date Filed` and
     /// the index that first lists it (§3.9). Lag on top of an upper bound can only make an item
     /// less visible. Reachable `Ok(None)` arms: §8 row R11.
+    ///
+    /// An instant keeps its own bound only on a row whose `Date Filed` is the index's day, the one
+    /// population the lag was probed on (§10, D5); any other row is bounded by the index's day too.
     fn backfill_observation(
         &self,
         request: &Request,
@@ -353,16 +356,18 @@ impl EdgarPress {
         let Some(lag) = self.lag.as_ref() else {
             return Ok(None);
         };
+        let listed = days_of(&request.target_window).and_then(|days| days.first().copied());
+        let Some(listed_ends) = listed.and_then(|listed| end_of_day(listed, self.parsed.zone))
+        else {
+            return Ok(None);
+        };
         let bound = match valid {
-            Published::At(instant) => instant,
-            Published::On { day, tz } => {
-                let listed = days_of(&request.target_window).and_then(|days| days.first().copied());
-                let listed_ends = listed.and_then(|listed| end_of_day(listed, self.parsed.zone));
-                match (end_of_day(day, tz), listed_ends) {
-                    (Some(filed), Some(listed)) => ValidTime::new(filed.max(listed)),
-                    _ => return Ok(None),
-                }
-            }
+            Published::At(instant) if filed_day(request) == listed => instant,
+            Published::At(instant) => ValidTime::new(instant.inner().max(listed_ends)),
+            Published::On { day, tz } => match end_of_day(day, tz) {
+                Some(filed) => ValidTime::new(filed.max(listed_ends)),
+                None => return Ok(None),
+            },
             Published::Unknown => return Ok(None),
         };
         Visibility::from_backfill(bound, lag).map(|visible| Some(visible.observed()))
@@ -608,6 +613,12 @@ pub fn read_listing(bytes: &[u8]) -> Result<Listing, Refusal> {
         })
         .unwrap_or_default();
     Ok(Listing::of_days(&days))
+}
+
+/// The `Date Filed` of the index row behind a follow-up; `None` when absent or not `YYYYMMDD`.
+fn filed_day(request: &Request) -> Option<NaiveDate> {
+    let raw = request.listed_date.as_deref()?;
+    NaiveDate::parse_from_str(raw.trim(), INDEX_DATE).ok()
 }
 
 fn day_of_index_name(name: &str) -> Option<NaiveDate> {
