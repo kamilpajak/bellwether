@@ -147,6 +147,15 @@ pub enum CollectRunError {
         pinned: String,
         why: RobotsError,
     },
+    /// Code `robots_refused`, exit 2: the pinned blob's bytes on disk hash to `found`, not the pin.
+    #[error(
+        "admitted host {host} pins robots {pinned}, and its stored blob now hashes to {found}"
+    )]
+    RobotsBlobAltered {
+        host: String,
+        pinned: String,
+        found: String,
+    },
     /// Code `robots_refused`, exit 2: the pinned robots.txt disallows a path the row asks.
     #[error("the pinned robots.txt of admitted host {host} disallows {path}, which its row asks")]
     RobotsDisallowsPath { host: String, path: String },
@@ -192,6 +201,7 @@ impl CollectRunError {
             | Self::RobotsUnverified { .. }
             | Self::RobotsRefused { .. }
             | Self::RobotsUnreadable { .. }
+            | Self::RobotsBlobAltered { .. }
             | Self::RobotsDisallowsPath { .. }
             | Self::PaceBelowFloor { .. }
             | Self::Store(_)
@@ -333,6 +343,8 @@ pub enum PinnedRobots {
     Read(Robots),
     /// No blob of the pinned digest was in the store when the provider was opened.
     BlobMissing,
+    /// The pinned blob's bytes hash to this digest instead of the pin.
+    Altered(String),
     Unreadable(RobotsError),
 }
 
@@ -466,11 +478,13 @@ fn admitted_robots(
     let mut admitted = Vec::new();
     for row in feed.host_pins().into_iter().filter(|row| row.admitted) {
         let robots = match &row.robots {
-            Some(RobotsPin::Sha256(hex)) => match crate::store::blob_bytes(store, hex)? {
-                Some(body) => {
+            Some(RobotsPin::Sha256(hex)) => match crate::store::blob_bytes(store, hex) {
+                Ok(Some(body)) => {
                     Robots::parse(&body).map_or_else(PinnedRobots::Unreadable, PinnedRobots::Read)
                 }
-                None => PinnedRobots::BlobMissing,
+                Ok(None) => PinnedRobots::BlobMissing,
+                Err(StoreError::BlobAltered { found, .. }) => PinnedRobots::Altered(found),
+                Err(other) => return Err(other.into()),
             },
             Some(RobotsPin::Absent) | None => PinnedRobots::NoRobots,
         };
@@ -756,6 +770,13 @@ fn refuse_what_the_pinned_robots_forbids(
                 host: row.host.clone(),
                 fetched: Some(pinned.clone()),
                 pinned,
+            })
+        }
+        PinnedRobots::Altered(found) => {
+            return Err(CollectRunError::RobotsBlobAltered {
+                host: row.host.clone(),
+                pinned,
+                found: found.clone(),
             })
         }
         PinnedRobots::Unreadable(why) => {

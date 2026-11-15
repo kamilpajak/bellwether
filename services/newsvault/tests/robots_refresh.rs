@@ -14,8 +14,8 @@ use news_provider::{
 };
 use newsvault::cmd_collect::Registered;
 use newsvault::cmd_ledger;
-use newsvault::cmd_robots::{self, Ask, RobotsExit, ROBOTS_SOURCE};
-use newsvault::store::{COMMIT_LOG, RUNS_DIR};
+use newsvault::cmd_robots::{self, Ask, RobotsError, RobotsExit, ROBOTS_SOURCE};
+use newsvault::store::{StoreError, COMMIT_LOG, RUNS_DIR};
 use pit::ObservationTime;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
@@ -408,6 +408,58 @@ fn a_robots_refresh_dry_run_plans_one_url_per_row_and_writes_nothing() -> TestRe
             false
         )
     );
+    Ok(())
+}
+
+/// Every path under `root`, relative, so a refusal can be shown to have written nothing.
+fn paths(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path.clone());
+            }
+            found.extend(path.strip_prefix(root).ok().map(Path::to_path_buf));
+        }
+    }
+    found.sort();
+    found
+}
+
+/// §3.1: a store of another shape is refused before the envelope, the lease and any send, and a
+/// dry run says so too. Mutations 2026-11-15, the `refuse_an_unreadable_version` call removed /
+/// placed after the dry-run return again: each red.
+#[test]
+fn a_robots_refresh_refuses_a_store_of_another_shape_and_leaves_it_as_found() -> TestResult {
+    let mut seen = Vec::new();
+    for dry_run in [false, true] {
+        let root = TempDir::new()?;
+        let db = Connection::open(root.path().join(COMMIT_LOG))?;
+        db.execute_batch("CREATE TABLE attempts (attempt_id TEXT PRIMARY KEY)")?;
+        drop(db);
+        let before = paths(root.path());
+        let exchange = Robots::of(&[]);
+        let ask = Ask {
+            dry_run,
+            ..ask(root.path(), committed_hosts())
+        };
+        let feed = cmd_robots::open(&ask)?;
+        let refused = cmd_robots::run(&ask, &feed, &exchange, &Fixed);
+        seen.push((
+            matches!(
+                refused,
+                Err(RobotsError::Store(StoreError::ShapeDiffers {
+                    found: 0,
+                    ..
+                }))
+            ),
+            paths(root.path()) == before,
+            exchange.asked.borrow().len(),
+        ));
+    }
+    assert_eq!(seen, vec![(true, true, 0); 2]);
     Ok(())
 }
 

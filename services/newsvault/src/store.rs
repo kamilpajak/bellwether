@@ -325,6 +325,17 @@ pub enum StoreError {
     ReplayWithDifferentItems { attempt: String },
     #[error("no blob is stored under {digest}")]
     BlobAbsent { digest: String },
+    /// `BlobStore::put` keeps a file that exists, so a refresh cannot repair this one.
+    #[error("the blob stored under {digest} now hashes to {found}")]
+    BlobAltered { digest: String, found: String },
+    /// `record_robots`' replay rule; a robots attempt carries no items, so it is not
+    /// `ReplayWithDifferentItems`. Each side is `host answer [digest]`.
+    #[error("robots attempt {attempt} was recorded as {recorded}, and its replay says {replayed}")]
+    RobotsReplayDiffers {
+        attempt: String,
+        recorded: String,
+        replayed: String,
+    },
     /// `canon` refuses a value holding a canonical-form separator and an instant whose seconds
     /// field is 60, and an item whose fields cannot be put in canonical form has no identity.
     #[error("item {item} has no canonical identity: {why}")]
@@ -594,12 +605,21 @@ pub fn refuse_an_unreadable_version(root: &Path) -> Result<(), StoreError> {
 }
 
 /// The bytes of the blob `hex` names in the store at `root`, `None` when no such file is there.
-/// Read without the commit log: the pinned robots body `collect` parses (section 11.2).
+/// Read without the commit log: the pinned robots body `collect` parses (section 11.2). Bytes
+/// that no longer hash to `hex` are `BlobAltered`.
 pub fn blob_bytes(root: &Path, hex: &str) -> Result<Option<Vec<u8>>, StoreError> {
     let blobs = BlobStore::new(root.join(BLOB_DIR).join(BLOB_SPACE));
     match blobs.named(hex) {
-        Some(digest) => Ok(Some(std::fs::read(blobs.path_of(&digest))?)),
+        Some(digest) => Ok(Some(blobs.read_verified(&digest)?)),
         None => Ok(None),
+    }
+}
+
+/// One robots row as `StoreError::RobotsReplayDiffers` names it.
+fn described(host: &str, answer: &RobotsAnswer) -> String {
+    match answer.blob() {
+        Some(blob) => format!("{host} {} {}", answer.name(), blob.hex()),
+        None => format!("{host} {}", answer.name()),
     }
 }
 
@@ -1099,8 +1119,17 @@ impl Committer {
     ) -> Result<CommitReceipt, StoreError> {
         let attempt = closed.attempt_id().hex().to_owned();
         if let Some(standing) = self.standing(&attempt)? {
-            if self.robots_row(&attempt)? != Some((host.to_owned(), answer.clone())) {
-                return Err(StoreError::ReplayWithDifferentItems { attempt });
+            let recorded = self.robots_row(&attempt)?;
+            let replayed = (host.to_owned(), answer.clone());
+            if recorded.as_ref() != Some(&replayed) {
+                return Err(StoreError::RobotsReplayDiffers {
+                    attempt,
+                    recorded: recorded.as_ref().map_or_else(
+                        || "no robots row".to_owned(),
+                        |(host, answer)| described(host, answer),
+                    ),
+                    replayed: described(&replayed.0, &replayed.1),
+                });
             }
             self.pending.retain(|event| attempt_of(event) != attempt);
             return Ok(standing);
@@ -2592,6 +2621,47 @@ mod tests {
                 count(&store, "robots")?
             ),
             (0, 0, 1)
+        );
+        Ok(())
+    }
+
+    /// §3.2: a robots replay must be the same row; an identical one files nothing. Mutation
+    /// 2026-11-15, the replay comparison in `record_robots` skipped: red.
+    #[test]
+    fn a_robots_replay_naming_another_host_or_answer_is_refused() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let body = store.put_blob(PAYLOAD)?;
+        let present = RobotsAnswer::Present(body.clone());
+        let first = closed_robots_attempt(&mut store)?;
+        store.record_robots(first, ROBOTS_HOST, &present, at(5))?;
+        let other_host = "www.prnewswire.com";
+        let mut refused = Vec::new();
+        for (host, answer) in [
+            (ROBOTS_HOST, RobotsAnswer::Absent),
+            (other_host, present.clone()),
+        ] {
+            let again = closed_robots_attempt(&mut store)?;
+            refused.push(match store.record_robots(again, host, &answer, at(6)) {
+                Err(StoreError::RobotsReplayDiffers {
+                    recorded, replayed, ..
+                }) => (recorded, replayed),
+                other => (format!("{other:?}"), String::new()),
+            });
+        }
+        let again = closed_robots_attempt(&mut store)?;
+        let same = store.record_robots(again, ROBOTS_HOST, &present, at(7))?;
+        let recorded = format!("{ROBOTS_HOST} present {}", body.hex());
+        assert_eq!(
+            (refused, same.changed, robots_rows(&store)?.len()),
+            (
+                vec![
+                    (recorded.clone(), format!("{ROBOTS_HOST} absent")),
+                    (recorded, format!("{other_host} present {}", body.hex())),
+                ],
+                false,
+                1
+            )
         );
         Ok(())
     }

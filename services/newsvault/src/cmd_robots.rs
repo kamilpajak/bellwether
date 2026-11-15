@@ -163,6 +163,9 @@ pub fn run(
     let started = clock.now();
     let run_id = format!("{RUN_PREFIX}-{}", started.format(RUN_ID_FORMAT));
     let rows = feed.host_pins();
+    // Read-only, so before the dry-run answer too: a store this build cannot open is left as
+    // found, and a dry run says so rather than exiting 0.
+    crate::store::refuse_an_unreadable_version(&ask.store)?;
     if ask.dry_run {
         let planned = rows
             .iter()
@@ -176,9 +179,6 @@ pub fn run(
             .collect::<Vec<Fetched>>();
         return Ok(answer_of(ask, feed, &run_id, started, &rows, &planned));
     }
-    // Before the envelope and the lease, as `collect::run` does: a store this build cannot open is
-    // left as found.
-    crate::store::refuse_an_unreadable_version(&ask.store)?;
     let envelope = Envelope {
         schema: RUN_ENVELOPE_SCHEMA.to_owned(),
         run_id: run_id.clone(),

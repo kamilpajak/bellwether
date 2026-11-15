@@ -15,7 +15,7 @@ use news_provider::{
 };
 use newsvault::cmd_collect::{self, Ask, CollectRunError};
 use newsvault::cmd_items::{self, PerStory};
-use newsvault::store::COMMIT_LOG;
+use newsvault::store::{StoreError, COMMIT_LOG};
 use open_web_feed::OpenWebFeed;
 use pit::ObservationTime;
 use rusqlite::{Connection, OpenFlags};
@@ -52,6 +52,7 @@ const ROBOTS_LATER: &str = "2026-11-14T18:00:00Z";
 /// The committed hosts file's GNW pin, `robots_rss_globenewswire_com.txt`'s sha256.
 const GNW_PIN: &str = "eb8bb698171dd56c139c224c9217070adf9947f6ed6cd02336eba55aa4155bfe";
 const CHANGED_ROBOTS: &[u8] = b"User-agent: *\nDisallow: /\n";
+const NEWER_STORE: i32 = 3;
 
 /// The three `rssfeed_3_items.xml` links after the www -> rss rewrite, the page each is answered
 /// with, its pubDate text, and the canonical link that page names (`None`: not committed).
@@ -445,6 +446,7 @@ fn verdict(answered: &Result<cmd_collect::Answer, CollectRunError>) -> String {
         }
         Err(CollectRunError::RobotsRefused { fetched, .. }) => format!("refused {fetched}"),
         Err(CollectRunError::RobotsUnreadable { why, .. }) => format!("unreadable: {why}"),
+        Err(CollectRunError::RobotsBlobAltered { found, .. }) => format!("altered {found}"),
         Err(CollectRunError::RobotsDisallowsPath { path, .. }) => format!("disallows {path}"),
         Err(CollectRunError::PaceBelowFloor {
             per_host, floor, ..
@@ -568,16 +570,92 @@ fn a_candidate_row_needs_no_robots_fetch() -> TestResult {
 fn a_pinned_robots_blob_missing_on_disk_is_unverified() -> TestResult {
     let root = TempDir::new()?;
     seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
-    let blob = root
-        .path()
-        .join("blobs/sha256")
-        .join(&GNW_PIN[..2])
-        .join(&GNW_PIN[2..4])
-        .join(GNW_PIN);
-    std::fs::remove_file(blob)?;
+    std::fs::remove_file(gnw_blob(root.path()))?;
     assert_eq!(
         collected(root.path(), hosts(), false)?,
         format!("unverified {GNW_PIN}")
+    );
+    Ok(())
+}
+
+fn gnw_blob(store: &Path) -> PathBuf {
+    store
+        .join("blobs/sha256")
+        .join(&GNW_PIN[..2])
+        .join(&GNW_PIN[2..4])
+        .join(GNW_PIN)
+}
+
+/// The pinned blob is re-hashed when read: bytes changed on disk are not the pin, and a later
+/// refresh keeps the changed file, so it repairs nothing and no refresh is suggested. Mutation
+/// 2026-11-15, the hash comparison in `BlobStore::read_verified` removed: red.
+#[test]
+fn a_pinned_robots_blob_changed_on_disk_is_refused_and_suggests_no_refresh() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    std::fs::write(gnw_blob(root.path()), CHANGED_ROBOTS)?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_LATER)?;
+    let found = canon::FileDigest::of(CHANGED_ROBOTS).hex().to_owned();
+    let output = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .args([
+            "collect",
+            "--source",
+            SOURCE,
+            "--window",
+            cmd_collect::TODAY,
+        ])
+        .args(["--at", RUN_AT, "--format", "json", "--dry-run"])
+        .arg("--store")
+        .arg(root.path())
+        .arg("--hosts")
+        .arg(hosts())
+        .arg("--rules")
+        .arg(provider_dir().join("rules/open-web-feed.rules.json"))
+        .env("BELLWETHER_FEED_CONTACT", CONTACT)
+        .stdin(Stdio::null())
+        .output()?;
+    let error: Value = serde_json::from_slice(&output.stderr)?;
+    assert_eq!(
+        (
+            collected(root.path(), hosts(), true)?,
+            output.status.code(),
+            error["code"].clone(),
+            error["details"]["found"].clone(),
+            error["suggestions"].clone(),
+        ),
+        (
+            format!("altered {found}"),
+            Some(EXIT_USAGE),
+            Value::from("robots_refused"),
+            Value::from(found.as_str()),
+            Value::Array(Vec::new()),
+        )
+    );
+    Ok(())
+}
+
+/// The robots check reads the store before the version check, and a store above this build's
+/// user_version is a version refusal there, not `robots_unverified`. Mutation 2026-11-15, the
+/// version check in `RobotsLedger::open` removed: red.
+#[test]
+fn an_open_web_collect_against_a_newer_store_is_a_version_refusal() -> TestResult {
+    let root = TempDir::new()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    db.pragma_update(None, "user_version", NEWER_STORE)?;
+    drop(db);
+    let ask = ask(root.path(), cmd_collect::TODAY);
+    let opened = cmd_collect::open_provider(&ask)?;
+    let refused = cmd_collect::run(&ask, &opened, &Gnw::day()?, &Fixed);
+    assert!(
+        matches!(
+            refused,
+            Err(CollectRunError::Store(StoreError::SchemaVersion {
+                found: NEWER_STORE,
+                ..
+            }))
+        ),
+        "{}",
+        verdict(&refused)
     );
     Ok(())
 }

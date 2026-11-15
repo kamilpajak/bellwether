@@ -664,6 +664,14 @@ fn robots_refusal(failure: &CollectRunError) -> Option<RobotsRefusal> {
             serde_json::json!({"host": host, "pinned": pinned, "why": why.to_string()}),
             false,
         )),
+        CollectRunError::RobotsBlobAltered {
+            host,
+            pinned,
+            found,
+        } => Some(refused(
+            serde_json::json!({"host": host, "pinned": pinned, "found": found}),
+            false,
+        )),
         CollectRunError::RobotsDisallowsPath { host, path } => Some(refused(
             serde_json::json!({"host": host, "path": path}),
             false,
