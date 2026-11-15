@@ -260,6 +260,7 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     use super::{BudgetError, BudgetScope, HostKey, Pace};
+    use crate::request::SourceId;
 
     const SHOUTED: &str = "WWW.SEC.GOV";
     const SEC: &str = "www.sec.gov";
@@ -295,6 +296,29 @@ mod tests {
                 )
             ),
             "{first:?} {second:?}"
+        );
+        Ok(())
+    }
+
+    /// The per-IP arm adds the interval on its first call, so one call reaches it.
+    #[test]
+    fn a_per_ip_pace_too_long_to_add_is_refused_on_its_first_call() -> Result<(), String> {
+        let store = tempfile::tempdir().map_err(|why| why.to_string())?;
+        let pace = Pace::beside_the_store(
+            store.path(),
+            &BudgetScope::PerIp(SourceId::new("open_web_wires")),
+            AN_INTERVAL_PAST_THE_CALENDAR,
+        );
+        let first = pace.reserve(DateTime::UNIX_EPOCH);
+        assert!(
+            matches!(
+                first,
+                Err(BudgetError::Unusable {
+                    act: "advanced",
+                    ..
+                })
+            ),
+            "{first:?}"
         );
         Ok(())
     }
