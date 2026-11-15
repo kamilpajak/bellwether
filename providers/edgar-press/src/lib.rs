@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use canon::{Digest, FileDigest};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeDelta, TimeZone, Utc};
 use chrono_tz::Tz;
 use news_provider::budget::RequestBudget;
 use news_provider::provider::{
@@ -325,23 +325,28 @@ impl EdgarPress {
             }
         }
         let raw = request.listed_date.clone().unwrap_or_default();
-        let valid = match NaiveDate::parse_from_str(raw.trim(), INDEX_DATE) {
-            Ok(day) => Published::On {
+        let valid = match filed_day(request) {
+            Some(day) => Published::On {
                 day,
                 tz: self.parsed.zone,
             },
-            Err(_) => Published::Unknown,
+            None => Published::Unknown,
         };
         (valid, raw, DATE_FILED.to_owned())
     }
 
-    /// Where a backfilled item's observation goes: its own publication plus the probed lag, via
-    /// [`Visibility::from_backfill`], which is the only constructor that takes a [`MeasuredLag`].
+    /// Where a backfilled item's observation goes: its publication bounded by its index day, plus
+    /// the probed lag, via [`Visibility::from_backfill`], the only constructor taking a
+    /// [`MeasuredLag`].
     /// `Ok(None)` for a live ingest, whose observation is the fetch instant the driver holds.
     ///
     /// A DATE has no instant, so the bound is the later END of two days: the row's `Date Filed` and
     /// the index that first lists it (§3.9). Lag on top of an upper bound can only make an item
     /// less visible. Reachable `Ok(None)` arms: §8 row R11.
+    ///
+    /// An instant floored at the START of the index's day bounds a row whose readable `Date Filed`
+    /// is that day, the only rows the lag was probed on (§8 row R11); the END of the index's day
+    /// bounds any other row.
     fn backfill_observation(
         &self,
         request: &Request,
@@ -353,16 +358,23 @@ impl EdgarPress {
         let Some(lag) = self.lag.as_ref() else {
             return Ok(None);
         };
+        let listed = days_of(&request.target_window).and_then(|days| days.first().copied());
+        let Some(listed_ends) = listed.and_then(|listed| end_of_day(listed, self.parsed.zone))
+        else {
+            return Ok(None);
+        };
         let bound = match valid {
-            Published::At(instant) => instant,
-            Published::On { day, tz } => {
-                let listed = days_of(&request.target_window).and_then(|days| days.first().copied());
-                let listed_ends = listed.and_then(|listed| end_of_day(listed, self.parsed.zone));
-                match (end_of_day(day, tz), listed_ends) {
-                    (Some(filed), Some(listed)) => ValidTime::new(filed.max(listed)),
-                    _ => return Ok(None),
+            Published::At(instant) if filed_day(request) == listed => {
+                match listed.and_then(|listed| start_of_day(listed, self.parsed.zone)) {
+                    Some(listed_starts) => ValidTime::new(instant.inner().max(listed_starts)),
+                    None => return Ok(None),
                 }
             }
+            Published::At(instant) => ValidTime::new(instant.inner().max(listed_ends)),
+            Published::On { day, tz } => match end_of_day(day, tz) {
+                Some(filed) => ValidTime::new(filed.max(listed_ends)),
+                None => return Ok(None),
+            },
             Published::Unknown => return Ok(None),
         };
         Visibility::from_backfill(bound, lag).map(|visible| Some(visible.observed()))
@@ -608,6 +620,18 @@ pub fn read_listing(bytes: &[u8]) -> Result<Listing, Refusal> {
         })
         .unwrap_or_default();
     Ok(Listing::of_days(&days))
+}
+
+/// The first microsecond of `day` in `tz`: one past the end of the day before, so a gap or an
+/// ambiguous midnight resolves exactly as [`end_of_day`] resolves it.
+fn start_of_day(day: NaiveDate, tz: &str) -> Option<DateTime<Utc>> {
+    end_of_day(day.pred_opt()?, tz)?.checked_add_signed(TimeDelta::microseconds(1))
+}
+
+/// The `Date Filed` of the index row behind a follow-up; `None` when absent or not `YYYYMMDD`.
+fn filed_day(request: &Request) -> Option<NaiveDate> {
+    let raw = request.listed_date.as_deref()?;
+    NaiveDate::parse_from_str(raw.trim(), INDEX_DATE).ok()
 }
 
 fn day_of_index_name(name: &str) -> Option<NaiveDate> {

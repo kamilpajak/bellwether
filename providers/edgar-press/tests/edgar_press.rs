@@ -54,6 +54,16 @@ const MICROSOFT_PATH: &str = "edgar/data/789019/0000789019-26-000045.txt";
 /// index days the late-row tests below read it under.
 const LATE_DATE_FILED: &str = "20261102";
 const LATE_FILED_DAY: &str = "2026-11-02";
+/// 10:00:00 New York on `LATE_FILED_DAY`, which is 15:00:00Z: a week before the index lists it.
+const LATE_ACCEPTANCE_RAW: &str = "20261102100000";
+/// 16:32:15 New York on `AN_ARCHIVED_SESSION`, which is 21:32:15Z, inside that index's own day.
+const ON_TIME_ACCEPTANCE_RAW: &str = "20261109163215";
+/// `ON_TIME_ACCEPTANCE_RAW` plus the 7,200 s `probed()` stands behind.
+const ON_TIME_OBSERVED_AT: &str = "2026-11-09T23:32:15Z";
+/// 18:00:00 New York on Friday 2026-11-06, after hours, so its `Date Filed` is Monday's index day.
+const AFTER_HOURS_ACCEPTANCE_RAW: &str = "20261106180000";
+/// `AN_ARCHIVED_SESSION` starts at 05:00Z in New York; plus the same 7,200 s.
+const ARCHIVED_DAY_START_OBSERVED_AT: &str = "2026-11-09T07:00:00Z";
 /// ISO, which the real column never carries.
 const NOT_A_DATE_FILED: &str = "2026-11-02";
 /// The acceptance field as the filing header spells it, kept as `valid_raw` so a replay re-parses
@@ -849,6 +859,68 @@ fn a_rows_backfilled_observation_is_not_before_the_end_of_a_date_filed_later_tha
         (item.valid_raw.as_str(), item.observed),
         (LISTED_DATE_FILED, Some(at(LISTED_DAY_OBSERVED_AT)))
     );
+    Ok(())
+}
+
+/// The Apple filing with its acceptance field rewritten to `acceptance`, as the header spells it.
+fn filing_accepted_at(acceptance: &str) -> RawBlob {
+    let text = String::from_utf8_lossy(&fixture("filing_8k_apple.txt"))
+        .replace(APPLE_ACCEPTANCE_RAW, acceptance);
+    let bytes = text.into_bytes();
+    RawBlob {
+        digest: FileDigest::of(&bytes).hex().to_owned(),
+        bytes,
+    }
+}
+
+/// §8 row R11: a late row's acceptance instant precedes the index that first lists it by days, so
+/// its observation is bounded by the END of that index's day plus the lag, as the day arm's is.
+#[test]
+fn a_late_row_with_an_acceptance_instant_is_not_observed_before_the_end_of_its_index_day_plus_the_lag(
+) -> Outcome {
+    let provider = probed()?;
+    let request = listed_document_request(&provider, AN_ARCHIVED_SESSION, LATE_DATE_FILED)?;
+    let item = only_item(&provider.extract(&request, &filing_accepted_at(LATE_ACCEPTANCE_RAW)))?;
+    assert_eq!(
+        (precision_of(&item.valid), item.observed),
+        (ValidPrecision::Instant, Some(at(ARCHIVED_DAY_OBSERVED_AT)))
+    );
+    Ok(())
+}
+
+/// §8 row R11: a row whose `Date Filed` is its index's day is the population the lag was probed
+/// on, so it keeps acceptance plus the lag and is not moved to the end of the day.
+#[test]
+fn an_on_time_row_with_an_acceptance_instant_observes_at_its_acceptance_plus_the_lag() -> Outcome {
+    let provider = probed()?;
+    let request = listed_document_request(&provider, AN_ARCHIVED_SESSION, ARCHIVED_DATE_FILED)?;
+    let item = only_item(&provider.extract(&request, &filing_accepted_at(ON_TIME_ACCEPTANCE_RAW)))?;
+    assert_eq!(item.observed, Some(at(ON_TIME_OBSERVED_AT)));
+    Ok(())
+}
+
+/// §8 row R11: a row the index lists on its own day but accepted on an earlier one, here a Friday
+/// after hours listed on Monday, is not observed before its index's day starts plus the lag.
+#[test]
+fn an_on_time_row_accepted_before_its_index_day_is_not_observed_before_that_day_starts_plus_the_lag(
+) -> Outcome {
+    let provider = probed()?;
+    let request = listed_document_request(&provider, AN_ARCHIVED_SESSION, ARCHIVED_DATE_FILED)?;
+    let item =
+        only_item(&provider.extract(&request, &filing_accepted_at(AFTER_HOURS_ACCEPTANCE_RAW)))?;
+    assert_eq!(item.observed, Some(at(ARCHIVED_DAY_START_OBSERVED_AT)));
+    Ok(())
+}
+
+/// §8 row R11: a row with an acceptance instant and no readable `Date Filed` is not known to be
+/// on time, so it is bounded by the end of its index's day plus the lag, as a late row is.
+#[test]
+fn an_acceptance_instant_row_with_no_readable_date_filed_is_bounded_by_its_index_days_end(
+) -> Outcome {
+    let provider = probed()?;
+    let request = listed_document_request(&provider, AN_ARCHIVED_SESSION, NOT_A_DATE_FILED)?;
+    let item = only_item(&provider.extract(&request, &filing_accepted_at(LATE_ACCEPTANCE_RAW)))?;
+    assert_eq!(item.observed, Some(at(ARCHIVED_DAY_OBSERVED_AT)));
     Ok(())
 }
 
