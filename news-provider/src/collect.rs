@@ -550,7 +550,7 @@ fn attempt_once<A: Archive>(
     let closed = slot.close(archive, outcome, &answer, ObservationTime::new(clock.now()))?;
     let (status, observed) = match &answer {
         Ok(response) => (Some(response.status()), response.received_at()),
-        Err(failed) => (None, failed.failed_at()),
+        Err(failed) => (failed.status(), failed.failed_at()),
     };
     let no_items: Vec<CollectedItem> = Vec::new();
     let items = extracted.as_ref().map_or(&no_items, |one| &one.items);

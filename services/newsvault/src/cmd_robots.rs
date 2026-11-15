@@ -298,7 +298,10 @@ fn fetch(
     };
     Ok(Fetched {
         attempt_id: Some(attempt_id),
-        transport_status: answer.as_ref().ok().map(RawResponse::status),
+        transport_status: match &answer {
+            Ok(response) => Some(response.status()),
+            Err(failed) => failed.status(),
+        },
         verdict: Some(verdict),
         outcome: Some(kind),
         robots,

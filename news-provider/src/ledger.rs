@@ -406,7 +406,7 @@ impl AttemptSlot {
                     failure.attempt_id(),
                     failure.requested_at(),
                     failure.failed_at(),
-                    None,
+                    failure.status(),
                     failure.clock_nonmonotonic(),
                 ),
             };

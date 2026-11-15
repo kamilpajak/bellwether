@@ -359,16 +359,29 @@ fn a_robots_408_stays_a_permanent_failure_with_no_robots_row() -> TestResult {
     Ok(())
 }
 
-/// Section 11.2, §11.5 step 5: the refresh's open-web `Wire` refuses a robots.txt 3xx, so the
-/// target, which serves the pinned body, is never fetched. Mutations 2026-11-15, open-web following
-/// one redirect / a 3xx mapped to `Empty` or `Usable` in `verdict_of`: each red.
-#[test]
-fn a_robots_redirect_is_a_permanent_failure_with_no_robots_row_and_its_target_never_fetched(
-) -> TestResult {
+/// What one refresh left when GNW's robots url went through the real open-web `Wire` to a loopback
+/// server answering `301 Location: /elsewhere`, where `/elsewhere` serves the pinned body: robots
+/// rows, (outcome, status, verdict) per attempt, the reported row's answer and status, the exit,
+/// the urls sent and the paths the server saw.
+type Refreshed = (
+    usize,
+    Vec<(String, Option<i64>, Option<String>)>,
+    (Option<String>, Option<i64>),
+    u8,
+    Vec<String>,
+    Vec<String>,
+);
+
+fn refreshed_through_a_redirect(body_over_the_limit: bool) -> Result<Refreshed, Box<dyn Error>> {
     let root = TempDir::new()?;
-    let server = loopback::Loopback::redirecting(ROBOTS_PATH, gnw_body()?)?;
     let ask = ask(root.path(), committed_hosts());
     let feed = cmd_robots::open(&ask)?;
+    let server = if body_over_the_limit {
+        let over = usize::try_from(feed.transport().body_limit)? + 1;
+        loopback::Loopback::redirecting_with(ROBOTS_PATH, vec![b'x'; over], gnw_body()?)?
+    } else {
+        loopback::Loopback::redirecting(ROBOTS_PATH, gnw_body()?)?
+    };
     let unanswered = Robots::of(&[]);
     let exchange = loopback::Relay {
         stub: &unanswered,
@@ -388,27 +401,59 @@ fn a_robots_redirect_is_a_permanent_failure_with_no_robots_row_and_its_target_ne
         .prepare("SELECT outcome, transport_status, verdict FROM attempts")?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<Result<_, _>>()?;
-    assert_eq!(
+    let row = first_row(&answer);
+    Ok((
+        robots_rows(root.path())?.len(),
+        recorded,
         (
-            robots_rows(root.path())?.len(),
-            recorded,
-            first_row(&answer)["answer"].as_str(),
-            answer.exit.code(),
-            sent,
-            hops,
+            row["answer"].as_str().map(str::to_owned),
+            row["transport_status"].as_i64(),
         ),
+        answer.exit.code(),
+        sent,
+        hops,
+    ))
+}
+
+/// Both refusals below leave this.
+fn refused_robots_redirect() -> Refreshed {
+    (
+        0,
+        vec![(
+            "failed".to_owned(),
+            Some(i64::from(MOVED_PERMANENTLY)),
+            Some("permanent_failure".to_owned()),
+        )],
         (
-            0,
-            vec![(
-                "failed".to_owned(),
-                Some(i64::from(MOVED_PERMANENTLY)),
-                Some("permanent_failure".to_owned())
-            )],
-            Some("failed"),
-            EXIT_PARTIAL,
-            vec![GNW_ROBOTS.to_owned()],
-            vec![ROBOTS_PATH.to_owned()],
-        )
+            Some("failed".to_owned()),
+            Some(i64::from(MOVED_PERMANENTLY)),
+        ),
+        EXIT_PARTIAL,
+        vec![GNW_ROBOTS.to_owned()],
+        vec![ROBOTS_PATH.to_owned()],
+    )
+}
+
+/// Section 11.2, §11.5 step 5: the refresh's open-web `Wire` refuses a robots.txt 3xx, so the
+/// target, which serves the pinned body, is never fetched. Mutations 2026-11-15, open-web following
+/// one redirect / a 3xx mapped to `Empty` or `Usable` in `verdict_of`: each red.
+#[test]
+fn a_robots_redirect_is_a_permanent_failure_with_no_robots_row_and_its_target_never_fetched(
+) -> TestResult {
+    assert_eq!(
+        refreshed_through_a_redirect(false)?,
+        refused_robots_redirect()
+    );
+    Ok(())
+}
+
+/// A robots 301 whose body is over the profile's limit fails as `BodyOverLimit` and keeps the 301
+/// on its attempt row and in the report.
+#[test]
+fn a_robots_redirect_whose_body_is_over_the_limit_keeps_its_status() -> TestResult {
+    assert_eq!(
+        refreshed_through_a_redirect(true)?,
+        refused_robots_redirect()
     );
     Ok(())
 }

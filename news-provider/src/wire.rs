@@ -119,6 +119,8 @@ pub struct TransportError {
     failed_at: ObservationTime,
     clock_nonmonotonic: bool,
     kind: TransportKind,
+    /// The status of a head read before the body failed; `None` when no head arrived.
+    status: Option<u16>,
     detail: String,
 }
 
@@ -191,8 +193,22 @@ impl TransportError {
             failed_at,
             clock_nonmonotonic: stepped_backwards(requested_at, failed_at),
             kind: TransportKind::Conversation,
+            status: None,
             detail,
         }
+    }
+
+    /// A 3xx whose body is over `body_limit` keeps its status, so the held read's 3xx exclusion
+    /// sees it (architecture.md section 11.1).
+    #[must_use]
+    pub const fn with_status(mut self, status: u16) -> Self {
+        self.status = Some(status);
+        self
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> Option<u16> {
+        self.status
     }
 
     #[must_use]
@@ -352,9 +368,15 @@ impl Wire {
                 requested_at,
                 received_at,
             )),
-            Err((kind, detail)) => Err(SendFailure::Transport(
-                TransportError::new(attempt_id, requested_at, received_at, detail).of_kind(kind),
-            )),
+            Err(failed) => {
+                let error =
+                    TransportError::new(attempt_id, requested_at, received_at, failed.detail)
+                        .of_kind(failed.kind);
+                Err(SendFailure::Transport(match failed.status {
+                    Some(status) => error.with_status(status),
+                    None => error,
+                }))
+            }
         }
     }
 
@@ -377,33 +399,39 @@ impl Wire {
 
     /// The socket, and the only call to the agent. Between the two clock reads in [`Wire::send`],
     /// so the body is inside the measured interval.
-    fn exchange(
-        &self,
-        url: &str,
-        headers: &[(String, String)],
-    ) -> Result<(u16, Vec<u8>), (TransportKind, String)> {
+    fn exchange(&self, url: &str, headers: &[(String, String)]) -> Result<(u16, Vec<u8>), Failed> {
         let mut call = self.agent.get(url);
         for (name, value) in headers {
             call = call.header(name, value);
         }
-        let mut response = call
-            .call()
-            .map_err(|why| (TransportKind::Conversation, why.to_string()))?;
+        let mut response = call.call().map_err(|why| Failed {
+            kind: TransportKind::Conversation,
+            status: None,
+            detail: why.to_string(),
+        })?;
         let status = response.status().as_u16();
         let body = response
             .body_mut()
             .with_config()
             .limit(self.profile.body_limit)
             .read_to_vec()
-            .map_err(|why| {
-                let kind = match why {
+            .map_err(|why| Failed {
+                kind: match why {
                     ureq::Error::BodyExceedsLimit(_) => TransportKind::BodyOverLimit,
                     _ => TransportKind::Conversation,
-                };
-                (kind, why.to_string())
+                },
+                status: Some(status),
+                detail: why.to_string(),
             })?;
         Ok((status, body))
     }
+}
+
+/// What [`Wire::exchange`] knew when the conversation failed.
+struct Failed {
+    kind: TransportKind,
+    status: Option<u16>,
+    detail: String,
 }
 
 #[cfg(test)]
@@ -982,8 +1010,13 @@ mod tests {
 
     type Server = JoinHandle<std::io::Result<()>>;
 
-    /// One loopback connection answered 200, declaring `declared` bytes and writing `written`.
+    const OK_HEAD: &str = "200 OK";
+    const MOVED_HEAD: &str = "301 Moved Permanently\r\nLocation: /elsewhere";
+
+    /// One loopback connection answered with `head`, declaring `declared` bytes and writing
+    /// `written`.
     fn serve_once(
+        head: &'static str,
         declared: usize,
         written: usize,
     ) -> Result<(String, Server), Box<dyn std::error::Error>> {
@@ -997,7 +1030,7 @@ mod tests {
                 asked.extend_from_slice(&byte);
             }
             let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
+                "HTTP/1.1 {head}\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
             );
             stream.write_all(head.as_bytes())?;
             stream.write_all(&vec![b'x'; written])
@@ -1005,8 +1038,10 @@ mod tests {
         Ok((url, served))
     }
 
-    /// The body length read, or the kind of the transport failure.
-    fn sent_to(url: &str) -> Result<Result<usize, TransportKind>, Box<dyn std::error::Error>> {
+    /// The body length read, or the kind of the transport failure and the status it kept.
+    type Received = Result<usize, (TransportKind, Option<u16>)>;
+
+    fn sent_to(url: &str) -> Result<Received, Box<dyn std::error::Error>> {
         let store = tempfile::tempdir()?;
         let mut sink = Recorder::default();
         let Some(permit) = permit(&mut sink, FIRST_ATTEMPT) else {
@@ -1019,7 +1054,7 @@ mod tests {
         let clock = clock_over(&[RESERVED_AT]);
         match wire(held(), store.path(), &WaitRecorder::default()).send(permit, &asked, &clock) {
             Ok(answer) => Ok(Ok(answer.body().len())),
-            Err(SendFailure::Transport(failed)) => Ok(Err(failed.kind())),
+            Err(SendFailure::Transport(failed)) => Ok(Err((failed.kind(), failed.status()))),
             Err(other) => Err(format!("{other:?}").into()),
         }
     }
@@ -1033,11 +1068,15 @@ mod tests {
             (
                 at_limit + 1,
                 at_limit + 1,
-                Err(TransportKind::BodyOverLimit),
+                Err((TransportKind::BodyOverLimit, Some(OK_STATUS))),
             ),
-            (at_limit, 1, Err(TransportKind::Conversation)),
+            (
+                at_limit,
+                1,
+                Err((TransportKind::Conversation, Some(OK_STATUS))),
+            ),
         ] {
-            let (url, served) = serve_once(declared, written)?;
+            let (url, served) = serve_once(OK_HEAD, declared, written)?;
             let answer = sent_to(&url)?;
             assert_eq!(
                 (answer, matches!(served.join(), Ok(Ok(())))),
@@ -1045,7 +1084,21 @@ mod tests {
                 "{written} of {declared} bytes"
             );
         }
-        assert_eq!(sent_to(REFUSED)?, Err(TransportKind::Conversation));
+        assert_eq!(sent_to(REFUSED)?, Err((TransportKind::Conversation, None)));
+        Ok(())
+    }
+
+    /// Under `Refuse` a 3xx is the answer and its body is read under the same limit; the failure
+    /// keeps the 301, which the held read's 3xx exclusion keys on (architecture.md section 11.1).
+    #[test]
+    fn a_redirect_whose_body_is_over_the_limit_fails_with_the_status_its_head_carried() -> Checked {
+        let over = usize::try_from(TEST_BODY_LIMIT)? + 1;
+        let (url, served) = serve_once(MOVED_HEAD, over, over)?;
+        let answer = sent_to(&url)?;
+        assert_eq!(
+            (answer, matches!(served.join(), Ok(Ok(())))),
+            (Err((TransportKind::BodyOverLimit, Some(MOVED))), true)
+        );
         Ok(())
     }
 
