@@ -10,7 +10,8 @@ use std::process::{Command, Stdio};
 use canon::FileDigest;
 use chrono::{DateTime, Utc};
 use news_provider::{
-    Clock, Exchange, RawResponse, Request, SendFailure, SendPermit, TransportError,
+    Clock, Credentials, Exchange, Provider, RawResponse, Request, SendFailure, SendPermit,
+    TransportError, Wire,
 };
 use newsvault::cmd_collect::Registered;
 use newsvault::cmd_ledger;
@@ -20,6 +21,8 @@ use pit::ObservationTime;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use tempfile::TempDir;
+
+mod loopback;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -31,11 +34,13 @@ const RUN_ID: &str = "robots-20261115T100000Z";
 const GNW_HOST: &str = "rss.globenewswire.com";
 const GNW_ROBOTS: &str = "https://rss.globenewswire.com/robots.txt";
 const PRN_ROBOTS: &str = "https://www.prnewswire.com/robots.txt";
+const ROBOTS_PATH: &str = "/robots.txt";
 /// The committed hosts file's pin: `robots_rss_globenewswire_com.txt`'s sha256.
 const GNW_PIN: &str = "eb8bb698171dd56c139c224c9217070adf9947f6ed6cd02336eba55aa4155bfe";
 const PRN_BODY: &[u8] = b"User-agent: *\nDisallow: /search/\n";
 const CHANGED_BODY: &[u8] = b"User-agent: *\nDisallow: /\n";
 const OK: u16 = 200;
+const MOVED_PERMANENTLY: u16 = 301;
 const NOT_FOUND: u16 = 404;
 const FORBIDDEN: u16 = 403;
 const UNAVAILABLE: u16 = 503;
@@ -350,6 +355,60 @@ fn a_robots_408_stays_a_permanent_failure_with_no_robots_row() -> TestResult {
             answer.exit.code()
         ),
         (0, vec![Some("permanent_failure".to_owned())], EXIT_PARTIAL)
+    );
+    Ok(())
+}
+
+/// Section 11.2, §11.5 step 5: the refresh's open-web `Wire` refuses a robots.txt 3xx, so the
+/// target, which serves the pinned body, is never fetched. Mutations 2026-11-15, open-web following
+/// one redirect / a 3xx mapped to `Empty` or `Usable` in `verdict_of`: each red.
+#[test]
+fn a_robots_redirect_is_a_permanent_failure_with_no_robots_row_and_its_target_never_fetched(
+) -> TestResult {
+    let root = TempDir::new()?;
+    let server = loopback::Loopback::redirecting(ROBOTS_PATH, gnw_body()?)?;
+    let ask = ask(root.path(), committed_hosts());
+    let feed = cmd_robots::open(&ask)?;
+    let unanswered = Robots::of(&[]);
+    let exchange = loopback::Relay {
+        stub: &unanswered,
+        wire: Wire::new(
+            feed.transport(),
+            Credentials::default().with(open_web_feed::CONTACT_CREDENTIAL, CONTACT),
+            root.path(),
+            &feed.source(),
+        ),
+        relayed: BTreeMap::from([(GNW_ROBOTS.to_owned(), server.url(ROBOTS_PATH))]),
+        asked: RefCell::default(),
+    };
+    let answer = cmd_robots::run(&ask, &feed, &exchange, &Fixed)?;
+    let (sent, hops) = (exchange.sent(), server.seen()?);
+    server.finish()?;
+    let recorded: Vec<(String, Option<i64>, Option<String>)> = read_only(root.path())?
+        .prepare("SELECT outcome, transport_status, verdict FROM attempts")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(
+        (
+            robots_rows(root.path())?.len(),
+            recorded,
+            first_row(&answer)["answer"].as_str(),
+            answer.exit.code(),
+            sent,
+            hops,
+        ),
+        (
+            0,
+            vec![(
+                "failed".to_owned(),
+                Some(i64::from(MOVED_PERMANENTLY)),
+                Some("permanent_failure".to_owned())
+            )],
+            Some("failed"),
+            EXIT_PARTIAL,
+            vec![GNW_ROBOTS.to_owned()],
+            vec![ROBOTS_PATH.to_owned()],
+        )
     );
     Ok(())
 }
