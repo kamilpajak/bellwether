@@ -31,6 +31,15 @@ pub struct Timeouts {
     pub recv_body: Duration,
 }
 
+/// Whether ureq may follow a 3xx. No `Default`, for the reason `Timeouts` has none: ureq 3.5.2
+/// follows 10, unpaced and unledgered (architecture.md section 8 row R19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Redirects {
+    /// ureq 3.5.2 returns the 3xx itself as the answer, never `TooManyRedirects`.
+    Refuse,
+    FollowUpTo(u32),
+}
+
 /// What one vendor's conversation looks like. The transport is this crate's; the profile is the
 /// provider's.
 #[derive(Debug, Clone)]
@@ -44,6 +53,7 @@ pub struct TransportProfile {
     /// How fast this vendor may be called, so both intervals have one producer: the provider.
     /// `Wire::new` builds the per-IP pace file; `Wire::send` opens a per-host one per url host.
     pub budget: RequestBudget,
+    pub redirects: Redirects,
 }
 
 /// The only place a credential VALUE lives. A `Request` and every ledger row carry the name.
@@ -264,6 +274,10 @@ impl Wire {
             profile.budget.min_interval,
         );
         let timeouts = profile.timeouts;
+        let max_redirects = match profile.redirects {
+            Redirects::Refuse => 0,
+            Redirects::FollowUpTo(hops) => hops,
+        };
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(timeouts.global))
             .timeout_per_call(Some(timeouts.per_call))
@@ -278,6 +292,7 @@ impl Wire {
             // error: EDGAR answers a weekend, a holiday and an unpublished day with 403 and the
             // same generic S3 body (measured in `providers/edgar-press/src/lib.rs`'s header).
             .http_status_as_error(false)
+            .max_redirects(max_redirects)
             .build();
         Self {
             agent: ureq::Agent::new_with_config(config),
@@ -394,8 +409,8 @@ impl Wire {
 #[cfg(test)]
 mod tests {
     use super::{
-        Credentials, RawResponse, SendFailure, Timeouts, TransportKind, TransportProfile, Wire,
-        USER_AGENT,
+        Credentials, RawResponse, Redirects, SendFailure, Timeouts, TransportKind,
+        TransportProfile, Wire, USER_AGENT,
     };
     use crate::budget::{BudgetError, RequestBudget};
     use crate::clock::testing::{StepClock, WaitRecorder, WaitedClock};
@@ -408,11 +423,13 @@ mod tests {
         TargetWindow,
     };
     use canon::FileDigest;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::thread::{self, JoinHandle};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     type Checked = Result<(), Box<dyn std::error::Error>>;
 
@@ -497,6 +514,7 @@ mod tests {
                 min_interval: TEST_INTERVAL,
                 per_host: None,
             },
+            redirects: Redirects::Refuse,
         }
     }
 
@@ -1098,6 +1116,138 @@ mod tests {
                     held: NOT_AN_INSTANT.to_owned(),
                 })),
                 Vec::new()
+            )
+        );
+        Ok(())
+    }
+
+    const REDIRECTED: &str = "/page";
+    const REDIRECT_TARGET: &str = "/elsewhere";
+    const MOVED: u16 = 301;
+    const MOVED_BODY: &[u8] = b"moved to /elsewhere";
+    const ARRIVED_BODY: &[u8] = b"arrived";
+    /// How often the non-blocking accept loop looks again, and how long it waits in all.
+    const ACCEPT_POLL: Duration = Duration::from_millis(5);
+    const SERVER_DEADLINE: Duration = Duration::from_secs(5);
+
+    /// The request targets a loopback server saw, in order.
+    type Targets = Vec<String>;
+    type RedirectServer = JoinHandle<std::io::Result<Targets>>;
+    /// Status, body, and the targets the server saw.
+    type Redirected = (u16, Vec<u8>, Targets);
+
+    /// Answers `/page` with a 301 to `/elsewhere` and anything else with 200, one connection at a
+    /// time, until `stop` or `SERVER_DEADLINE`, so a mutation that sends nothing cannot hang it.
+    fn serve_redirects(
+        stop: Arc<AtomicBool>,
+    ) -> Result<(String, RedirectServer), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let url = format!("http://{}{REDIRECTED}", listener.local_addr()?);
+        let served = thread::spawn(move || -> std::io::Result<Targets> {
+            let deadline = Instant::now() + SERVER_DEADLINE;
+            let mut targets = Vec::new();
+            while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((stream, _peer)) => targets.push(answer_one(stream)?),
+                    Err(why) if why.kind() == ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
+                    Err(why) => return Err(why),
+                }
+            }
+            Ok(targets)
+        });
+        Ok((url, served))
+    }
+
+    /// Reads one request head and answers it; returns the request line's target.
+    fn answer_one(mut stream: TcpStream) -> std::io::Result<String> {
+        stream.set_nonblocking(false)?;
+        stream.set_read_timeout(Some(TEST_TIMEOUT))?;
+        let mut asked = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !asked.ends_with(b"\r\n\r\n") && stream.read(&mut byte)? == 1 {
+            asked.extend_from_slice(&byte);
+        }
+        let target = String::from_utf8_lossy(&asked)
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+            .to_owned();
+        let (head, body) = if target == REDIRECTED {
+            (
+                format!("301 Moved Permanently\r\nLocation: {REDIRECT_TARGET}"),
+                MOVED_BODY,
+            )
+        } else {
+            ("200 OK".to_owned(), ARRIVED_BODY)
+        };
+        let len = body.len();
+        stream.write_all(
+            format!("HTTP/1.1 {head}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )?;
+        stream.write_all(body)?;
+        Ok(target)
+    }
+
+    /// One send through a `Wire` whose profile holds `redirects`: the answer, and every request
+    /// target the loopback server saw. The pace waits go to `waits`.
+    fn send_redirected(
+        redirects: Redirects,
+        waits: &WaitRecorder,
+    ) -> Result<Redirected, Box<dyn std::error::Error>> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (url, served) = serve_redirects(Arc::clone(&stop))?;
+        let store = tempfile::tempdir()?;
+        let mut sink = Recorder::default();
+        let Some(permit) = permit(&mut sink, FIRST_ATTEMPT) else {
+            return Err("no permit".into());
+        };
+        let asked = Request { url, ..request() };
+        let wire = Wire::with_sleeper(
+            TransportProfile {
+                redirects,
+                ..profile()
+            },
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(waits.clone()),
+        );
+        let answer = wire.send(permit, &asked, &clock_over(&[RESERVED_AT]));
+        stop.store(true, Ordering::SeqCst);
+        let Ok(targets) = served.join() else {
+            return Err("the loopback server panicked".into());
+        };
+        let answer = answer?;
+        Ok((answer.status(), answer.body().to_vec(), targets?))
+    }
+
+    /// §11.4 gate (c): the 3xx is the answer and the hop it names is never sent.
+    #[test]
+    fn a_refused_redirect_is_answered_as_its_3xx_and_its_target_never_requested() -> Checked {
+        assert_eq!(
+            send_redirected(Redirects::Refuse, &WaitRecorder::default())?,
+            (MOVED, MOVED_BODY.to_vec(), vec![REDIRECTED.to_owned()])
+        );
+        Ok(())
+    }
+
+    /// The positive control for the gate above, and R19's hole for every profile that follows:
+    /// two requests reach the server and the pace is reserved once.
+    #[test]
+    fn a_followed_redirect_is_a_second_request_no_pace_file_saw() -> Checked {
+        let waits = WaitRecorder::default();
+        let answer = send_redirected(Redirects::FollowUpTo(1), &waits)?;
+        assert_eq!(
+            (answer, waits.waits()),
+            (
+                (
+                    OK_STATUS,
+                    ARRIVED_BODY.to_vec(),
+                    vec![REDIRECTED.to_owned(), REDIRECT_TARGET.to_owned()]
+                ),
+                vec![NO_WAIT]
             )
         );
         Ok(())

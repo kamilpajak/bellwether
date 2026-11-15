@@ -21,7 +21,9 @@ use news_provider::provider::{
     ValidSource,
 };
 use news_provider::request::{days_of, HeaderValue, Request, RequestPhase};
-use news_provider::wire::{RawResponse, Timeouts, TransportError, TransportKind, TransportProfile};
+use news_provider::wire::{
+    RawResponse, Redirects, Timeouts, TransportError, TransportKind, TransportProfile,
+};
 use news_provider::{CredentialRef, RequestBudget, SourceId, TargetWindow, Verdict};
 use pit::datedness::{Minute, Published};
 use pit::ObservationTime;
@@ -411,6 +413,7 @@ impl Provider for OpenWebFeed {
                 min_interval: INTERVAL,
                 per_host: Some(self.per_host_interval()),
             },
+            redirects: Redirects::Refuse,
         }
     }
 

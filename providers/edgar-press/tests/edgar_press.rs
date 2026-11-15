@@ -632,6 +632,16 @@ fn the_sec_profile_paces_both_our_address_and_the_sec_host_at_ten_a_second() -> 
     Ok(())
 }
 
+/// R19 and §10: edgar keeps ureq 3.5.2's former default, so a redirect is followed as before.
+#[test]
+fn the_sec_profile_follows_up_to_ten_redirects_as_ureq_did_before() -> Outcome {
+    assert_eq!(
+        provider()?.transport().redirects,
+        news_provider::Redirects::FollowUpTo(10)
+    );
+    Ok(())
+}
+
 /// R6. The predecessor's own roster read catches the unparseable case, logs a warning and returns
 /// an empty map, and the run then reports a quiet day.
 #[test]
