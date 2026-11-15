@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use news_provider::{
-    Archive, ArchiveError, AttemptEvent, AttemptReceipt, Clock, CollectedItem, Committed,
-    Credentials, Exchange, Exit, LedgerError, PlanRefusal, RawResponse, Request, RunId,
-    SendFailure, SendPermit, Sink, SourceId, TargetWindow, TransportError, Wire,
+    Archive, ArchiveError, AttemptEvent, AttemptReceipt, Clock, CollectedItem, Committed, Exchange,
+    Exit, LedgerError, PlanRefusal, RawResponse, Request, RunId, SendFailure, SendPermit, Sink,
+    SourceId, TargetWindow, TransportError,
 };
 use newsvault::cmd_collect::{self, Ask, CollectRunError};
 use newsvault::cmd_items::{self, PerStory};
@@ -502,19 +502,21 @@ fn an_admitted_row_without_a_ledgered_robots_fetch_is_refused() -> TestResult {
     assert_eq!(verdict(&refused), "unverified none");
     assert_eq!(exchange.asked.borrow().len(), 0);
     assert!(snapshot(empty.path()).is_empty());
-    let failed_only = TempDir::new()?;
-    seed::refresh(
-        failed_only.path(),
-        &hosts(),
-        ROBOTS_EARLIER,
-        (FORBIDDEN, b"Access Denied"),
-    )?;
-    let before = snapshot(failed_only.path());
-    assert_eq!(
-        collected(failed_only.path(), hosts(), false)?,
-        "unverified none"
-    );
-    assert_eq!(snapshot(failed_only.path()), before);
+    for failed in [
+        (FORBIDDEN, b"Access Denied".as_slice()),
+        (MOVED_PERMANENTLY, b"moved".as_slice()),
+    ] {
+        let failed_only = TempDir::new()?;
+        seed::refresh(failed_only.path(), &hosts(), ROBOTS_EARLIER, failed)?;
+        let before = snapshot(failed_only.path());
+        assert_eq!(
+            collected(failed_only.path(), hosts(), false)?,
+            "unverified none",
+            "{}",
+            failed.0
+        );
+        assert_eq!(snapshot(failed_only.path()), before);
+    }
     Ok(())
 }
 
@@ -577,14 +579,24 @@ fn an_admitted_row_pinned_absent_is_admitted_only_by_a_ledgered_404() -> TestRes
     Ok(())
 }
 
-/// A failed fetch files no robots row, so it neither admits nor un-admits a host. Mutation
-/// 2026-11-15, the reader left-joining `attempts` to `robots`: red.
+/// A failed fetch files no robots row, so it neither admits nor un-admits a host; a 3xx is one
+/// (section 11.2). Mutation 2026-11-15, the reader left-joining `attempts` to `robots`: red.
 #[test]
 fn a_failed_robots_fetch_after_a_matching_one_leaves_the_host_admitted() -> TestResult {
-    let root = TempDir::new()?;
-    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
-    seed::refresh(root.path(), &hosts(), ROBOTS_LATER, (UNAVAILABLE, b""))?;
-    assert_eq!(collected(root.path(), hosts(), true)?, "admitted");
+    for failed in [
+        (UNAVAILABLE, b"".as_slice()),
+        (MOVED_PERMANENTLY, b"moved".as_slice()),
+    ] {
+        let root = TempDir::new()?;
+        seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+        seed::refresh(root.path(), &hosts(), ROBOTS_LATER, failed)?;
+        assert_eq!(
+            collected(root.path(), hosts(), true)?,
+            "admitted",
+            "{}",
+            failed.0
+        );
+    }
     Ok(())
 }
 
@@ -1192,12 +1204,7 @@ fn polled_twice_through_a_redirect(moved_body: MovedBody) -> Result<TwoPolls, Bo
     };
     let exchange = loopback::Relay {
         stub: &gnw,
-        wire: Wire::new(
-            opened.provider.transport(),
-            Credentials::default().with(open_web_feed::CONTACT_CREDENTIAL, CONTACT),
-            root.path(),
-            &SourceId::new(SOURCE),
-        ),
+        wire: cmd_collect::wire_for(&ask, &opened),
         relayed: BTreeMap::from([(redirected.clone(), server.url(&moved))]),
         asked: RefCell::default(),
     };

@@ -10,8 +10,7 @@ use std::process::{Command, Stdio};
 use canon::FileDigest;
 use chrono::{DateTime, Utc};
 use news_provider::{
-    Clock, Credentials, Exchange, Provider, RawResponse, Request, SendFailure, SendPermit,
-    TransportError, Wire,
+    Clock, Exchange, Provider, RawResponse, Request, SendFailure, SendPermit, TransportError,
 };
 use newsvault::cmd_collect::Registered;
 use newsvault::cmd_ledger;
@@ -385,12 +384,7 @@ fn refreshed_through_a_redirect(body_over_the_limit: bool) -> Result<Refreshed, 
     let unanswered = Robots::of(&[]);
     let exchange = loopback::Relay {
         stub: &unanswered,
-        wire: Wire::new(
-            feed.transport(),
-            Credentials::default().with(open_web_feed::CONTACT_CREDENTIAL, CONTACT),
-            root.path(),
-            &feed.source(),
-        ),
+        wire: cmd_robots::wire_for(&ask, &feed),
         relayed: BTreeMap::from([(GNW_ROBOTS.to_owned(), server.url(ROBOTS_PATH))]),
         asked: RefCell::default(),
     };

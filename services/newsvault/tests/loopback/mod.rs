@@ -130,9 +130,9 @@ fn answer_one(
     } else {
         ("200 OK".to_owned(), answers.arrived.as_slice())
     };
-    if let Ok(mut recorded) = seen.lock() {
-        recorded.push(target);
-    }
+    seen.lock()
+        .map_err(|_| std::io::Error::other("the seen list is poisoned"))?
+        .push(target);
     let len = body.len();
     stream.write_all(
         format!("HTTP/1.1 {head}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n").as_bytes(),

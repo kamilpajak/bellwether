@@ -37,6 +37,7 @@ pub struct Timeouts {
 pub enum Redirects {
     /// ureq 3.5.2 returns the 3xx itself as the answer, never `TooManyRedirects`.
     Refuse,
+    /// `FollowUpTo(0)` is `Refuse`: ureq 3.5.2 errors only when `max_redirects > 0`.
     FollowUpTo(u32),
 }
 
@@ -1088,6 +1089,41 @@ mod tests {
         Ok(())
     }
 
+    /// RFC 9110's 3xx codes but 305 and 306, each with a `Location` but 304, which carries none.
+    const EVERY_REDIRECT: [(&str, u16); 7] = [
+        ("300 Multiple Choices\r\nLocation: /elsewhere", 300),
+        ("301 Moved Permanently\r\nLocation: /elsewhere", 301),
+        ("302 Found\r\nLocation: /elsewhere", 302),
+        ("303 See Other\r\nLocation: /elsewhere", 303),
+        ("304 Not Modified", 304),
+        ("307 Temporary Redirect\r\nLocation: /elsewhere", 307),
+        ("308 Permanent Redirect\r\nLocation: /elsewhere", 308),
+    ];
+
+    /// What `open_web_feed::a_redirect_is_permanent_never_transient` assumes: under `Refuse` every
+    /// 3xx above reaches `classify` as an answer, over one connection.
+    #[test]
+    fn every_redirect_is_answered_as_itself_under_refuse() -> Checked {
+        for (head, status) in EVERY_REDIRECT {
+            let (url, served) = serve_once(head, 1, 1)?;
+            let store = tempfile::tempdir()?;
+            let mut sink = Recorder::default();
+            let Some(permit) = permit(&mut sink, FIRST_ATTEMPT) else {
+                return Err("no permit".into());
+            };
+            let asked = Request { url, ..request() };
+            let clock = clock_over(&[RESERVED_AT]);
+            let answer = wire(held(), store.path(), &WaitRecorder::default())
+                .send(permit, &asked, &clock)
+                .map(|answer| answer.status());
+            assert_eq!(
+                (answer, matches!(served.join(), Ok(Ok(())))),
+                (Ok(status), true)
+            );
+        }
+        Ok(())
+    }
+
     /// Under `Refuse` a 3xx is the answer and its body is read under the same limit; the failure
     /// keeps the 301, which the held read's 3xx exclusion keys on (architecture.md section 11.1).
     #[test]
@@ -1276,12 +1312,23 @@ mod tests {
         Ok((answer.status(), answer.body().to_vec(), targets?))
     }
 
-    /// §11.4 gate (c): the 3xx is the answer and the hop it names is never sent.
+    /// §8 row R19 (redirects): the 3xx is the answer and the hop it names is never sent.
     #[test]
     fn a_refused_redirect_is_answered_as_its_3xx_and_its_target_never_requested() -> Checked {
         assert_eq!(
             send_redirected(Redirects::Refuse, &WaitRecorder::default())?,
             (MOVED, MOVED_BODY.to_vec(), vec![REDIRECTED.to_owned()])
+        );
+        Ok(())
+    }
+
+    /// ureq 3.5.2 raises `TooManyRedirects` only when `max_redirects > 0` (`config.rs`), so a
+    /// follow limit of 0 answers with the 3xx as `Refuse` does.
+    #[test]
+    fn following_up_to_zero_redirects_is_refusing_them() -> Checked {
+        assert_eq!(
+            send_redirected(Redirects::FollowUpTo(0), &WaitRecorder::default())?,
+            send_redirected(Redirects::Refuse, &WaitRecorder::default())?
         );
         Ok(())
     }

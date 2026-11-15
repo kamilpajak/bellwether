@@ -87,8 +87,9 @@ const OUTSIDE_THE_CONTAINER: [&str; 5] = [
 const FIRST_ATTEMPT: u32 = 0;
 const OK: u16 = 200;
 const REQUEST_TIMEOUT: u16 = 408;
-/// Moved permanently, found, temporary and permanent redirect.
-const REDIRECTS: [u16; 4] = [301, 302, 307, 308];
+/// RFC 9110's 3xx codes but 305 (deprecated) and 306 (unused); a `Refuse` profile hands each to
+/// `classify` as an answer.
+const REDIRECTS: [u16; 7] = [300, 301, 302, 303, 304, 307, 308];
 
 fn crate_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

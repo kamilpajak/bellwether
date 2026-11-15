@@ -15,7 +15,7 @@ use news_provider::lag_policy::{LagPolicy, LagPolicyError};
 use news_provider::provider::{Cadence, Calendar, CalendarError, Listing, PlanRefusal, Provenance};
 use news_provider::{
     stamp_of, Archive, ArchiveError, AttemptReceipt, Clock, CollectError, Collected, CollectedItem,
-    Committed, Exchange, Exit, Provider, Run, RunId, SourceId, TargetWindow,
+    Committed, Credentials, Exchange, Exit, Provider, Run, RunId, SourceId, TargetWindow, Wire,
 };
 use open_web_feed::{OpenWebFeed, RobotsPin};
 use pit::{MeasuredLag, ObservationTime};
@@ -398,6 +398,19 @@ fn required<'a>(
             flag,
             source_id: entry.source(),
         })
+}
+
+/// The one place a collect builds its `Wire`, for `main.rs` and the loopback tests alike: the
+/// provider's profile unchanged, the contact under the provider's credential name, the pace files
+/// beside the run's own store.
+#[must_use]
+pub fn wire_for(ask: &Ask, opened: &Opened) -> Wire {
+    Wire::new(
+        opened.provider.transport(),
+        Credentials::default().with(opened.registered.credential(), ask.contact.clone()),
+        &ask.store,
+        &opened.provider.source(),
+    )
 }
 
 /// Opens the one provider the sources name, after refusing every input flag its table entry and
