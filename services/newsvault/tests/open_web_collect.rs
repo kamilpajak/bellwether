@@ -1524,6 +1524,64 @@ fn two_all_held_polls_of_one_day_hold_every_vendor_row_of_both() -> TestResult {
     Ok(())
 }
 
+/// §8 R4: each poll of 2026-11-15 refetches release 0, whose listing never parses, and the ledger
+/// counts both fetches. The refetch is a vendor row nothing held or committed, so `--check` says
+/// no. Mutations in §8 row R4.
+#[test]
+fn the_ledger_counts_every_fetch_of_a_story_whose_listing_stayed_unparseable() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let mut exchange = Gnw::day()?;
+    let unparsed = an_index_whose_first_listing_does_not_parse(&exchange)?;
+    exchange.pages.insert(INDEX.to_owned(), unparsed);
+    poll(root.path(), RUN_AT, "first", &exchange)?;
+    poll(root.path(), THE_NEXT_DAY, "second", &exchange)?;
+    poll(root.path(), LATER_THE_NEXT_DAY, "third", &exchange)?;
+    let day: chrono::NaiveDate = NEXT_DAY_DATE.parse()?;
+    let report = newsvault::cmd_ledger::read(
+        root.path(),
+        &newsvault::cmd_ledger::Ask {
+            at: instant(LEDGER_AT),
+            from: day,
+            to: day,
+            source: None,
+            expected_runs: None,
+            limit: None,
+            check: true,
+        },
+    )?;
+    let counts: Vec<(i64, i64, i64, i64)> = report
+        .days
+        .iter()
+        .flat_map(|one| &one.per_source)
+        .map(|row| {
+            (
+                row.vendor_rows,
+                row.held,
+                row.listing_unusable,
+                row.rows_committed,
+            )
+        })
+        .collect();
+    let findings: Vec<(&str, &str)> = report
+        .check
+        .findings
+        .iter()
+        .map(|finding| (finding.code, finding.detail.as_str()))
+        .collect();
+    assert_eq!(
+        (counts, findings),
+        (
+            vec![(8, 4, 2, 0)],
+            vec![(
+                "rows_committed_zero_against_vendor_rows",
+                "8 vendor rows, 4 held, and no item row committed"
+            )]
+        )
+    );
+    Ok(())
+}
+
 /// Section 11.1, `attempts.held`: `matched - issued` on a live index row, 0 included, and NULL on
 /// a Document row. Mutation 2026-11-15, `record_held` made a no-op: red.
 #[test]

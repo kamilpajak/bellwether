@@ -436,6 +436,44 @@ fn the_human_ledger_states_the_held_count_of_the_json_row() -> TestResult {
     Ok(())
 }
 
+/// The human renderer carries `listing_unusable` as the JSON row does. Mutation 2026-11-15, the
+/// field dropped from `render_human`: red.
+#[test]
+fn the_human_ledger_states_the_listing_unusable_count_of_the_json_row() -> TestResult {
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    db.execute(
+        "UPDATE attempts SET listing_unusable = 7 WHERE attempt_id = 'a-0704-edgar-0'",
+        [],
+    )?;
+    drop(db);
+    let json = over(&root, ZERO_ITEM_DAY, ZERO_ITEM_DAY)?.json()?;
+    let counted = per_source(&json, ZERO_ITEM_DAY, EDGAR)
+        .and_then(|edgar| edgar.get("listing_unusable"))
+        .and_then(Value::as_i64)
+        .ok_or("the JSON row has no listing_unusable")?;
+    let human = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .arg("ledger")
+        .args(["--store", &root.path().to_string_lossy()])
+        .args(["--at", AT, "--format", "human"])
+        .args(["--from", ZERO_ITEM_DAY, "--to", ZERO_ITEM_DAY])
+        .output()?
+        .stdout;
+    let line = String::from_utf8(human)?
+        .lines()
+        .find(|line| line.trim_start().starts_with(EDGAR))
+        .map(str::to_owned)
+        .ok_or("no human line names the source")?;
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let shown = words
+        .iter()
+        .position(|word| *word == "listing_unusable")
+        .and_then(|at| words.get(at + 1))
+        .map(|word| (*word).to_owned());
+    assert_eq!((shown, counted), (Some("7".to_owned()), 7));
+    Ok(())
+}
+
 /// Section 3.2 `held`: only a row carrying `vendor_rows` adds its `held`, so an unclosed index
 /// row holding 60 cannot outweigh 59 vendor rows. Mutation 2026-11-15, the ledger summing `held`
 /// over every row again: red.
