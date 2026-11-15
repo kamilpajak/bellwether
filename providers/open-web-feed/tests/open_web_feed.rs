@@ -14,7 +14,8 @@ use news_provider::provider::{
 };
 use news_provider::request::{HeaderValue, Request, RequestPhase};
 use news_provider::{
-    AttemptSlot, CredentialRef, RawResponse, RunId, TargetWindow, TransportError, Verdict,
+    AttemptSlot, CredentialRef, RawResponse, RunId, TargetWindow, TransportError, TransportKind,
+    Verdict,
 };
 use open_web_feed::{OpenWebFeed, Refusal, CONTACT_CREDENTIAL, SOURCE};
 use pit::datedness::{Minute, Published};
@@ -350,6 +351,33 @@ fn a_lost_connection_is_transient() -> Outcome {
     assert_eq!(
         provider.classify(&request, &lost),
         Verdict::TransientFailure
+    );
+    Ok(())
+}
+
+/// `Wire` reads `BODY_LIMIT` bytes and refuses the rest, so a refetch fails the same way.
+#[test]
+fn a_body_over_the_limit_is_permanent() -> Outcome {
+    let provider = provider()?;
+    let request = index_request(&provider)?;
+    let mut sink = RecordingSink::default();
+    let slot = AttemptSlot::open(
+        &mut sink,
+        &request,
+        &RunId::new(RUN),
+        FIRST_ATTEMPT,
+        at(RUN_AT),
+    )?;
+    let too_large = Err(TransportError::new(
+        slot.attempt_id().clone(),
+        at(RUN_AT),
+        at(RUN_AT),
+        "the response body is larger than the limit".to_owned(),
+    )
+    .of_kind(TransportKind::BodyOverLimit));
+    assert_eq!(
+        provider.classify(&request, &too_large),
+        Verdict::PermanentFailure
     );
     Ok(())
 }

@@ -19,7 +19,7 @@ use news_provider::provider::{
     Provenance, Provider, RawBlob, UnusableReason, UnusableRow, ValidPrecision, ValidSource,
 };
 use news_provider::request::{days_of, HeaderValue, Request, RequestPhase};
-use news_provider::wire::{RawResponse, Timeouts, TransportError, TransportProfile};
+use news_provider::wire::{RawResponse, Timeouts, TransportError, TransportKind, TransportProfile};
 use news_provider::{CredentialRef, RequestBudget, SourceId, TargetWindow, Verdict};
 use pit::datedness::{Minute, Published};
 use pit::ObservationTime;
@@ -393,8 +393,12 @@ impl Provider for OpenWebFeed {
     /// Bot protection (403, a challenge page) is permanent and never retried in another form
     /// (section 11.1); so is every other 4xx but 429, a rate limit.
     fn classify(&self, request: &Request, answer: &Result<RawResponse, TransportError>) -> Verdict {
-        let Ok(response) = answer else {
-            return Verdict::TransientFailure;
+        let response = match answer {
+            Ok(response) => response,
+            Err(failed) if failed.kind() == TransportKind::BodyOverLimit => {
+                return Verdict::PermanentFailure
+            }
+            Err(_) => return Verdict::TransientFailure,
         };
         let Some(rule) = self.rule_for(&request.url) else {
             return Verdict::PermanentFailure;

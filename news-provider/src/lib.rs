@@ -68,7 +68,8 @@ pub use request::{
     TargetWindow,
 };
 pub use wire::{
-    Credentials, RawResponse, SendFailure, Timeouts, TransportError, TransportProfile, Wire,
+    Credentials, RawResponse, SendFailure, Timeouts, TransportError, TransportKind,
+    TransportProfile, Wire,
 };
 
 #[cfg(test)]

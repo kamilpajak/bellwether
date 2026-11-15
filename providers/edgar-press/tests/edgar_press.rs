@@ -15,7 +15,10 @@ use news_provider::provider::{
     ValidSource,
 };
 use news_provider::request::{Request, RequestPhase};
-use news_provider::{AttemptEvent, AttemptSlot, RawResponse, RunId, TargetWindow, Verdict};
+use news_provider::{
+    AttemptEvent, AttemptSlot, RawResponse, RunId, TargetWindow, TransportError, TransportKind,
+    Verdict,
+};
 use pit::datedness::Published;
 use pit::{MeasuredLag, ObservationTime};
 
@@ -470,6 +473,35 @@ fn a_shared_ip_traffic_403_closes_a_transient_failure_so_a_later_run_retries_it(
         )?,
         Verdict::TransientFailure
     );
+    Ok(())
+}
+
+/// `Wire` reads `BODY_LIMIT` bytes and refuses the rest, so only a lost connection is retried.
+#[test]
+fn a_body_over_the_limit_is_permanent_and_a_lost_connection_transient() -> Outcome {
+    let provider = provider()?;
+    let request = index_request(&provider, A_LISTED_SESSION)?;
+    for (kind, expected) in [
+        (TransportKind::Conversation, Verdict::TransientFailure),
+        (TransportKind::BodyOverLimit, Verdict::PermanentFailure),
+    ] {
+        let mut sink = RecordingSink::default();
+        let slot = AttemptSlot::open(
+            &mut sink,
+            &request,
+            &RunId::new(RUN),
+            FIRST_ATTEMPT,
+            at(RUN_AT),
+        )?;
+        let failed = Err(TransportError::new(
+            slot.attempt_id().clone(),
+            at(RUN_AT),
+            at(RUN_AT),
+            format!("{kind:?}"),
+        )
+        .of_kind(kind));
+        assert_eq!(provider.classify(&request, &failed), expected, "{kind:?}");
+    }
     Ok(())
 }
 

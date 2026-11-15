@@ -93,6 +93,14 @@ pub struct RawResponse {
     clock_nonmonotonic: bool,
 }
 
+/// What a provider's `classify` reads from a failed conversation. A body over the profile's
+/// `body_limit` fails the same way on every refetch, so it is not a transient failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportKind {
+    Conversation,
+    BodyOverLimit,
+}
+
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 #[error("{detail}")]
 pub struct TransportError {
@@ -100,6 +108,7 @@ pub struct TransportError {
     requested_at: ObservationTime,
     failed_at: ObservationTime,
     clock_nonmonotonic: bool,
+    kind: TransportKind,
     detail: String,
 }
 
@@ -171,8 +180,20 @@ impl TransportError {
             requested_at,
             failed_at,
             clock_nonmonotonic: stepped_backwards(requested_at, failed_at),
+            kind: TransportKind::Conversation,
             detail,
         }
+    }
+
+    #[must_use]
+    pub const fn of_kind(mut self, kind: TransportKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> TransportKind {
+        self.kind
     }
 
     #[must_use]
@@ -316,12 +337,9 @@ impl Wire {
                 requested_at,
                 received_at,
             )),
-            Err(detail) => Err(SendFailure::Transport(TransportError::new(
-                attempt_id,
-                requested_at,
-                received_at,
-                detail,
-            ))),
+            Err((kind, detail)) => Err(SendFailure::Transport(
+                TransportError::new(attempt_id, requested_at, received_at, detail).of_kind(kind),
+            )),
         }
     }
 
@@ -344,19 +362,31 @@ impl Wire {
 
     /// The socket, and the only call to the agent. Between the two clock reads in [`Wire::send`],
     /// so the body is inside the measured interval.
-    fn exchange(&self, url: &str, headers: &[(String, String)]) -> Result<(u16, Vec<u8>), String> {
+    fn exchange(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<(u16, Vec<u8>), (TransportKind, String)> {
         let mut call = self.agent.get(url);
         for (name, value) in headers {
             call = call.header(name, value);
         }
-        let mut response = call.call().map_err(|why| why.to_string())?;
+        let mut response = call
+            .call()
+            .map_err(|why| (TransportKind::Conversation, why.to_string()))?;
         let status = response.status().as_u16();
         let body = response
             .body_mut()
             .with_config()
             .limit(self.profile.body_limit)
             .read_to_vec()
-            .map_err(|why| why.to_string())?;
+            .map_err(|why| {
+                let kind = match why {
+                    ureq::Error::BodyExceedsLimit(_) => TransportKind::BodyOverLimit,
+                    _ => TransportKind::Conversation,
+                };
+                (kind, why.to_string())
+            })?;
         Ok((status, body))
     }
 }
@@ -364,7 +394,8 @@ impl Wire {
 #[cfg(test)]
 mod tests {
     use super::{
-        Credentials, RawResponse, SendFailure, Timeouts, TransportProfile, Wire, USER_AGENT,
+        Credentials, RawResponse, SendFailure, Timeouts, TransportKind, TransportProfile, Wire,
+        USER_AGENT,
     };
     use crate::budget::{BudgetError, RequestBudget};
     use crate::clock::testing::{StepClock, WaitRecorder, WaitedClock};
@@ -377,7 +408,10 @@ mod tests {
         TargetWindow,
     };
     use canon::FileDigest;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::Path;
+    use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
     type Checked = Result<(), Box<dyn std::error::Error>>;
@@ -925,6 +959,75 @@ mod tests {
                 Vec::new()
             )
         );
+        Ok(())
+    }
+
+    type Server = JoinHandle<std::io::Result<()>>;
+
+    /// One loopback connection answered 200, declaring `declared` bytes and writing `written`.
+    fn serve_once(
+        declared: usize,
+        written: usize,
+    ) -> Result<(String, Server), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let url = format!("http://{}/page", listener.local_addr()?);
+        let served = thread::spawn(move || -> std::io::Result<()> {
+            let (mut stream, _peer) = listener.accept()?;
+            let mut asked = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !asked.ends_with(b"\r\n\r\n") && stream.read(&mut byte)? == 1 {
+                asked.extend_from_slice(&byte);
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(head.as_bytes())?;
+            stream.write_all(&vec![b'x'; written])
+        });
+        Ok((url, served))
+    }
+
+    /// The body length read, or the kind of the transport failure.
+    fn sent_to(url: &str) -> Result<Result<usize, TransportKind>, Box<dyn std::error::Error>> {
+        let store = tempfile::tempdir()?;
+        let mut sink = Recorder::default();
+        let Some(permit) = permit(&mut sink, FIRST_ATTEMPT) else {
+            return Err("no permit".into());
+        };
+        let asked = Request {
+            url: url.to_owned(),
+            ..request()
+        };
+        let clock = clock_over(&[RESERVED_AT]);
+        match wire(held(), store.path(), &WaitRecorder::default()).send(permit, &asked, &clock) {
+            Ok(answer) => Ok(Ok(answer.body().len())),
+            Err(SendFailure::Transport(failed)) => Ok(Err(failed.kind())),
+            Err(other) => Err(format!("{other:?}").into()),
+        }
+    }
+
+    /// ureq 3.5.2 reads `body_limit` bytes, then probes one more; only a byte past it fails.
+    #[test]
+    fn a_body_over_the_limit_fails_as_its_own_kind_and_one_at_the_limit_is_read() -> Checked {
+        let at_limit = usize::try_from(TEST_BODY_LIMIT)?;
+        for (declared, written, expected) in [
+            (at_limit, at_limit, Ok(at_limit)),
+            (
+                at_limit + 1,
+                at_limit + 1,
+                Err(TransportKind::BodyOverLimit),
+            ),
+            (at_limit, 1, Err(TransportKind::Conversation)),
+        ] {
+            let (url, served) = serve_once(declared, written)?;
+            let answer = sent_to(&url)?;
+            assert_eq!(
+                (answer, matches!(served.join(), Ok(Ok(())))),
+                (expected, true),
+                "{written} of {declared} bytes"
+            );
+        }
+        assert_eq!(sent_to(REFUSED)?, Err(TransportKind::Conversation));
         Ok(())
     }
 
