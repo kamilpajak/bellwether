@@ -1749,7 +1749,52 @@ mod tests {
         Ok(())
     }
 
-    /// A v0 store holding one attempt and one item, written with the frozen DDL and no migration.
+    /// Every column the user_version 0 `items` table holds, which the rebuild must carry unchanged.
+    const V0_ITEM_COLUMNS: [&str; 15] = [
+        "seq",
+        "item_id",
+        "story_id",
+        "doc_id",
+        "attempt_id",
+        "valid_at",
+        "valid_day",
+        "valid_tz",
+        "valid_refused",
+        "observed_at",
+        "valid_disputed",
+        "earliest_valid_at",
+        "raw_blob",
+        "body_blob",
+        "committed_at",
+    ];
+    const V0_ROWS: usize = 3;
+
+    /// Each `items` row's v0 columns as one SQL-quoted text, so a NULL and an empty string differ.
+    fn v0_items(db: &Connection) -> Result<Vec<String>, rusqlite::Error> {
+        let quoted = V0_ITEM_COLUMNS.map(|column| format!("quote({column})"));
+        let mut statement = db.prepare(&format!(
+            "SELECT {} FROM items WHERE seq IN (7, 8, 9) ORDER BY seq",
+            quoted.join(" || '|' || ")
+        ))?;
+        let rows = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>();
+        rows
+    }
+
+    fn item_indexes(db: &Connection) -> Result<Vec<String>, rusqlite::Error> {
+        let mut statement = db.prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'items'
+               AND sql IS NOT NULL ORDER BY name",
+        )?;
+        let names = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>();
+        names
+    }
+
+    /// A v0 store holding one attempt and one item of each v0 precision (instant, day, refused),
+    /// every nullable column set and no `seq` at 1, written with the frozen DDL and no migration.
     fn a_store_at_user_version_zero(temp: &TempDir) -> TestResult {
         let db = Connection::open(temp.path().join(COMMIT_LOG))?;
         db.execute_batch(SCHEMA_V0)?;
@@ -1759,11 +1804,24 @@ mod tests {
              VALUES ('a v0 attempt', 'a v0 run', 'edgar_press', '2026-11-10', 'f', 'u',
                  '1970-01-01T00:00:01.000000Z');
              INSERT INTO blobs (digest, bytes, first_indexed_at)
-             VALUES ('a v0 blob', 1, '1970-01-01T00:00:01.000000Z');
-             INSERT INTO items (seq, item_id, story_id, attempt_id, valid_at, observed_at,
-                 valid_disputed, raw_blob, committed_at)
-             VALUES (1, 'a v0 item', 'a v0 story', 'a v0 attempt', '1970-01-01T00:00:01.000000Z',
-                 '1970-01-01T00:00:01.000000Z', 0, 'a v0 blob', '1970-01-01T00:00:01.000000Z');",
+             VALUES ('a v0 blob', 1, '1970-01-01T00:00:01.000000Z'),
+                    ('a v0 body', 1, '1970-01-01T00:00:01.000000Z');
+             INSERT INTO items (seq, item_id, story_id, doc_id, attempt_id, valid_at, valid_day,
+                 valid_tz, valid_refused, observed_at, valid_disputed, earliest_valid_at,
+                 raw_blob, body_blob, committed_at)
+             VALUES
+                 (7, 'a v0 instant', 'a v0 story', 'a v0 doc', 'a v0 attempt',
+                  '1970-01-01T00:00:01.000000Z', NULL, NULL, NULL, '1970-01-01T00:00:02.000000Z',
+                  1, '1970-01-01T00:00:00.500000Z', 'a v0 blob', 'a v0 body',
+                  '1970-01-01T00:00:03.000000Z'),
+                 (8, 'a v0 day', 'a v0 story', 'a v0 doc', 'a v0 attempt', NULL, '2026-11-10',
+                  'America/New_York', NULL, '2026-11-11T05:00:00.000000Z', 1,
+                  '1970-01-01T00:00:00.500000Z', 'a v0 blob', 'a v0 body',
+                  '2026-11-11T05:00:01.000000Z'),
+                 (9, 'a v0 refused', 'a v0 other story', 'a v0 doc', 'a v0 attempt', NULL, NULL,
+                  NULL, '2026-11-12T00:00:00.000000Z', '2026-11-11T00:00:00.000000Z', 1,
+                  '1970-01-01T00:00:00.500000Z', 'a v0 blob', 'a v0 body',
+                  '2026-11-11T00:00:01.000000Z');",
         )?;
         Ok(())
     }
@@ -1792,15 +1850,35 @@ mod tests {
             (user_version(&store.db)?, stored),
             (
                 SCHEMA_VERSION,
-                vec![
-                    (None, None),
-                    (
+                [
+                    vec![(None, None); V0_ROWS],
+                    vec![(
                         Some(VALID_RAW.to_owned()),
                         Some(stamped(A_PUBLICATION_MINUTE))
-                    )
+                    )]
                 ]
+                .concat()
             )
         );
+        Ok(())
+    }
+
+    /// §8 row M1, the carried half. Mutations 2026-11-15: `seq`, `doc_id`, `earliest_valid_at`
+    /// and `body_blob` dropped from the copy, and both `CREATE INDEX` lines dropped, were green.
+    #[test]
+    fn a_migrated_v0_store_keeps_every_v0_column_of_every_row_and_both_indexes() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_zero(&temp)?;
+        let v0 = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let before = (v0_items(&v0)?, item_indexes(&v0)?);
+        drop(v0);
+        let store = open(&temp)?;
+        assert_eq!(before.0.len(), V0_ROWS);
+        assert_eq!(
+            before.1,
+            vec!["items_by_doc".to_owned(), "items_by_story".to_owned()]
+        );
+        assert_eq!((v0_items(&store.db)?, item_indexes(&store.db)?), before);
         Ok(())
     }
 
@@ -1817,7 +1895,7 @@ mod tests {
         assert!(
             matches!(
                 &refused,
-                Err(StoreError::MigrationFoundADanglingReference { table, rowid: 1 })
+                Err(StoreError::MigrationFoundADanglingReference { table, rowid: 7 })
                     if table == "items"
             ),
             "{refused:?}"
