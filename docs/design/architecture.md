@@ -148,8 +148,18 @@
   joined from `attempts`; `requested_at` and `received_at` live on `attempts`, reached through
   `attempt_id`.
 - Schema versioning (§11.1), since 2026-11-15:
-  - every store, new or old, is created from `SCHEMA_V0` and migrated in one transaction by
-    `Committer::open`; a user_version above 1 is refused (`StoreError::SchemaVersion`):
+  - a store is brought to user_version 1 in one transaction by `Committer::open`: `SCHEMA_V0`
+    (`CREATE TABLE IF NOT EXISTS`) creates each v0 table the store lacks, then `MIGRATIONS[0]`.
+  - a v0 table the store already holds is compared first with `SCHEMA_V0`'s columns (`PRAGMA
+    table_info`: name, type, NOT NULL, default, primary key); a difference is refused with
+    `StoreError::V0ShapeDiffers` naming each `table.column`, exit 2, store left at user_version 0,
+    no repair step: §8 row M1.
+  - a migration step SQLite refuses is `StoreError::MigrationFailed { from, step, cause }`, exit
+    2, store left at user_version `from`; `cause` is SQLite's message without the SQL batch
+    (review 2026-11-15 measured 2,040 bytes of stderr, most of it the batch, before):
+    `a_failed_migration_step_is_named_without_its_sql_and_leaves_user_version_zero` (mutations
+    2026-11-15, the step's error left unwrapped / the SQL kept in `cause`: each red).
+  - a user_version above 1 is refused (`StoreError::SchemaVersion`):
     `a_store_at_an_unknown_higher_user_version_is_refused` (mutation 2026-11-15, refusal removed:
     red).
   - `collect` refuses that store before its policy copy, run envelope and lease, so the store
@@ -619,7 +629,7 @@ Draw voting:
 | `input_absent` | a required input file is missing (row 1). `vault`, `panel-contract`. In `collect`, exit 4: an absent hosts file or `open-web-feed` rules file, and a hosts file admitting no host, which would plan zero requests (`an_open_web_run_with_an_absent_or_empty_hosts_file_or_an_absent_rules_file_exits_four`; mutations 2026-11-15, the arm removed: red; its `RulesAbsent` alternative removed: red, green before the rules case). An absent `edgar-press` rules file exits 2 |
 | `day_absent` | narrower: the store is there, the day is not in it (row 1), kept apart for the reason the coverage ledger exists. `vault`. Measured 2026-11-12, two states reach it through one `LakeError::MissingDay`: an absent partition directory, and one holding no run file |
 | `input_unparseable` | the file is present and is not what the contract says. `vault`, `panel-contract` |
-| `input_schema_mismatch` | a required column is absent or has an unusable type; or the commit log's `user_version` is above the writer's, or is not the one `items` and `ledger` read (`StoreError::SchemaVersion`, §3.1). `vault` |
+| `input_schema_mismatch` | a required column is absent or has an unusable type; or the commit log's `user_version` is above the writer's, or is not the one `items` and `ledger` read (`StoreError::SchemaVersion`, §3.1); or a user_version 0 store whose columns differ from `SCHEMA_V0` (`StoreError::V0ShapeDiffers`) or whose migration step SQLite refused (`StoreError::MigrationFailed`), both leaving the store at its old user_version (§3.1). `vault` |
 | `io_failed` | a read or write the filesystem refused for another reason. Every CLI |
 | `roster_absent` | the in-universe roster is missing or names no CIK. `vault`'s `collect`, before the first request |
 | `credential_contact_missing` | the User-Agent carries no contact address, read from the chosen source's own variable (§11.2). A startup refusal, never a vendor event in the coverage ledger |
@@ -788,7 +798,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | U1 | **the panel names the roster it was built from** | collection side: `news_provider::Request.universe_version` inside `filter_params`; `attempts.universe_version` is `NOT NULL`; `news_provider::request::tests::two_runs_whose_rosters_differ_have_two_filter_params_digests`, `newsvault::store::tests::the_opened_row_carries_the_roster_digest_the_request_was_built_from`<br>absent, unparseable or empty roster: `edgar-press::Refusal` (§9)<br>panel side: nothing | **no enforcement point yet**: the panel side has none; the collection side has only a producer, a column and the two tests in the enforced-by cell<br>unguarded: `panel-contract schema` lists 13 manifest fields, none a roster or `relation_map_version` (measured 2026-11-12), so §2 names five `panel_id` inputs where the gate requires three<br>making them required rewrites seven fixtures and R8: a decision, not an omission |
 | E1 | an error code is never renamed, and no code reaches stderr from outside the table | §5.1 stderr codes: nothing; design: workspace member `error-codes/` with `const CODES`, `codes.snapshot`, a snapshot test, and a constructor taking `&'static Code`<br>`panel-contract`'s 15 stdout `Finding` codes: renaming any one turns a named test red (`cargo test -p panel-contract --lib`, measured 2026-11-12) | **no enforcement point yet** for §5.1's codes<br>renaming the 15 `Finding` codes: **enforced**<br>unguarded: a new code needs no table entry and no review<br>unguarded: repurposing a code is not checkable |
 | H1 | every difference between `derive`'s picks and the predecessor's has a named cause (memo §5.1, build step 6) | nothing: no cause list, diff artefact or test exists | **no enforcement point yet** |
-| M1 | a store at the previous `user_version` opens, migrates and takes a row of every precision the current one stores (§11.1) | `Committer::open` → `migrate`: `newsvault::store::tests::a_store_at_the_previous_user_version_opens_migrates_and_takes_a_minute_row`; carried: `a_migrated_v0_store_keeps_every_v0_column_of_every_row_and_both_indexes` (v0 fixture: one instant, one day+tz and one refused row, `seq` 7..9, every nullable v0 column set, `valid_disputed` 1; all 15 v0 columns compared by `quote()` before and after, and the `items_by_story`/`items_by_doc` index names) | **enforced** from user_version 0 to 1: mutations 2026-11-15, the `items` rebuild replaced by the three `ADD COLUMN`s / every migration step skipped: red<br>carried columns and indexes **enforced** since 2026-11-15: mutations that day, the copy reduced to 11 columns without `seq`, `doc_id`, `earliest_valid_at`, `body_blob` / `doc_id` and `earliest_valid_at` dropped / both `CREATE INDEX` lines dropped: each green before the carried test, red after<br>unguarded: no store older than this build's own `SCHEMA_V0` text is tested; a v0 store written by an older binary is assumed byte-equal to it |
+| M1 | a store at the previous `user_version` opens, migrates and takes a row of every precision the current one stores (§11.1) | `Committer::open` → `migrate`: `newsvault::store::tests::a_store_at_the_previous_user_version_opens_migrates_and_takes_a_minute_row`; carried: `a_migrated_v0_store_keeps_every_v0_column_of_every_row_and_both_indexes` (v0 fixture: one instant, one day+tz and one refused row, `seq` 7..9, every nullable v0 column set, `valid_disputed` 1; all 15 v0 columns compared by `quote()` before and after, and the `items_by_story`/`items_by_doc` index names) | **enforced** from user_version 0 to 1: mutations 2026-11-15, the `items` rebuild replaced by the three `ADD COLUMN`s / every migration step skipped: red<br>carried columns and indexes **enforced** since 2026-11-15: mutations that day, the copy reduced to 11 columns without `seq`, `doc_id`, `earliest_valid_at`, `body_blob` / `doc_id` and `earliest_valid_at` dropped / both `CREATE INDEX` lines dropped: each green before the carried test, red after<br>a v0 store written by an older binary: **enforced** for a missing column since 2026-11-15: `a_v0_store_whose_attempts_predate_matched_is_refused_and_left_at_user_version_zero` (fixture: `attempts` as written before 067a0bd, 2026-11-13, 22 columns, no `matched`); mutation that day, the shape check skipped: red. Before it, review 2026-11-15 measured a scratch store of that shape (1,006 attempt rows) migrate to user_version 1 without `matched`, then `ledger` exit 2 on `no such column: a.matched`. Refused, not repaired: only scratch stores have that shape (R11 search, 2026-11-15)<br>unguarded: a column whose name matches and whose type, NOT NULL, default or key differs is compared and untested (mutation 2026-11-15, names compared alone: green); CHECK clauses and indexes are not compared |
 
 ---
 
@@ -1144,6 +1154,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | envelope `hosts_version` null | `the_run_envelope_names_the_hosts_file_it_was_allowed_to_use`, `an_open_web_run_collects_a_globenewswire_day_end_to_end` |
 | the other 44, as named in §3.1, §3.2, §8 rows R3, R4, R7, R13, R15, R17, R19, R21, M1 and §11.1, §11.2 | each its own named test |
 | review round 2026-11-15: 18 mutations, each run once its new test was written, as named beside those tests in §2, §3.1, §5.1, §8 rows R3, R13, R17, R19, M1 and §11.1, §11.2 | each its own named test |
+| second review round 2026-11-15, migration: 4 mutations, each run once, as named in §3.1 and §8 row M1 | 3 red, each its own named test; 1 green, stated as unguarded in M1 |
 
    - Holes step 2 leaves open:
      - GNW's admission rests on the 2026-11-14 robots fetch made outside the ledger until step 3 (§11.1).
