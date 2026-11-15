@@ -47,6 +47,7 @@ const EXIT_NOT_FOUND: i32 = 4;
 const NOT_FOUND: u16 = 404;
 const FORBIDDEN: u16 = 403;
 const UNAVAILABLE: u16 = 503;
+const REQUEST_TIMEOUT: u16 = 408;
 /// Two robots fetches before `RUN_AT`, the second the newer.
 const ROBOTS_EARLIER: &str = "2026-11-14T17:00:00Z";
 const ROBOTS_LATER: &str = "2026-11-14T18:00:00Z";
@@ -1142,6 +1143,27 @@ fn a_transiently_failed_document_is_fetched_again_by_the_next_poll() -> TestResu
     assert_eq!(
         (times(&first), second, exit),
         (tries, vec![INDEX.to_owned(), failing.clone()], Exit::Ok)
+    );
+    Ok(())
+}
+
+/// Owner decision of 2026-11-15 (§10): a 408 is retried in-run and never held, so the next poll asks
+/// again.
+#[test]
+fn a_document_answered_408_is_fetched_again_by_the_next_poll() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let timing_out = release_url(0)?;
+    let tries = 1 + news_provider::MAX_TRANSIENT_RETRIES as usize;
+    let exchange = Gnw::day()?.answering(&timing_out, &vec![REQUEST_TIMEOUT; tries]);
+    poll(root.path(), RUN_AT, "first", &exchange)?;
+    let (first, _) = exchange.sent();
+    let exit = poll(root.path(), LATER_THE_SAME_DAY, "second", &exchange)?;
+    let (second, _) = exchange.sent();
+    let times = |sent: &[String]| sent.iter().filter(|url| **url == timing_out).count();
+    assert_eq!(
+        (times(&first), second, exit),
+        (tries, vec![INDEX.to_owned(), timing_out.clone()], Exit::Ok)
     );
     Ok(())
 }

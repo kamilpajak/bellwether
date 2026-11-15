@@ -92,6 +92,7 @@ const COMMITTED_FILINGS: usize = 2;
 const FIRST_ATTEMPT: u32 = 0;
 const SERVER_ERROR: u16 = 503;
 const TOO_MANY: u16 = 429;
+const REQUEST_TIMEOUT: u16 = 408;
 const FORBIDDEN: u16 = 403;
 const OK: u16 = 200;
 /// Every sink type this crate may not hold, asserted over its own source. The clock half of this
@@ -516,6 +517,24 @@ fn a_429_and_a_5xx_both_close_transient_failures() -> Outcome {
             verdict(&provider, &request, status, b"")?,
             Verdict::TransientFailure,
             "{status}"
+        );
+    }
+    Ok(())
+}
+
+/// Owner decision of 2026-11-15 (§10): a 408 is retried in-run and never held.
+#[test]
+fn a_408_request_timeout_closes_a_transient_failure() -> Outcome {
+    let provider = provider()?;
+    for request in [
+        index_request(&provider, A_LISTED_SESSION)?,
+        document_request(&provider, A_LISTED_SESSION)?,
+    ] {
+        assert_eq!(
+            verdict(&provider, &request, REQUEST_TIMEOUT, b"")?,
+            Verdict::TransientFailure,
+            "{:?}",
+            request.phase
         );
     }
     Ok(())

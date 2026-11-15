@@ -36,6 +36,7 @@ pub const SOURCE: &str = "open_web_wires";
 pub const CONTACT_CREDENTIAL: &str = "open_web_contact";
 
 const OK: u16 = 200;
+const REQUEST_TIMEOUT: u16 = 408;
 const TOO_MANY_REQUESTS: u16 = 429;
 const SERVER_ERRORS: std::ops::RangeInclusive<u16> = 500..=599;
 const SCHEMES: [&str; 2] = ["https://", "http://"];
@@ -463,7 +464,7 @@ impl Provider for OpenWebFeed {
     }
 
     /// Bot protection (403, a challenge page) is permanent and never retried in another form
-    /// (section 11.1); so is every other 4xx but 429, a rate limit.
+    /// (section 11.1); so is every other 4xx but 408 and 429.
     fn classify(&self, request: &Request, answer: &Result<RawResponse, TransportError>) -> Verdict {
         let response = match answer {
             Ok(response) => response,
@@ -484,7 +485,7 @@ impl Provider for OpenWebFeed {
                 },
                 RequestPhase::Document => Verdict::Usable,
             },
-            TOO_MANY_REQUESTS => Verdict::TransientFailure,
+            TOO_MANY_REQUESTS | REQUEST_TIMEOUT => Verdict::TransientFailure,
             status if SERVER_ERRORS.contains(&status) => Verdict::TransientFailure,
             _ => Verdict::PermanentFailure,
         }

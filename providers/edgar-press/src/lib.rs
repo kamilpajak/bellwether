@@ -59,6 +59,7 @@ const KNOWN_ZONES: [&str; 1] = ["America/New_York"];
 const RULES_SCHEMA: &str = "edgar-press.rules/1";
 const HEADER_END: &str = "</SEC-HEADER>";
 const ACCESS_DENIED: &str = "<Code>AccessDenied</Code>";
+const REQUEST_TIMEOUT: u16 = 408;
 const TOO_MANY_REQUESTS: u16 = 429;
 const SERVER_ERRORS: std::ops::RangeInclusive<u16> = 500..=599;
 const OK: u16 = 200;
@@ -557,7 +558,7 @@ impl Provider for EdgarPress {
                 }
             },
             FORBIDDEN if body.contains(ACCESS_DENIED) => Verdict::PermanentFailure,
-            FORBIDDEN | TOO_MANY_REQUESTS => Verdict::TransientFailure,
+            FORBIDDEN | TOO_MANY_REQUESTS | REQUEST_TIMEOUT => Verdict::TransientFailure,
             status if SERVER_ERRORS.contains(&status) => Verdict::TransientFailure,
             _ => Verdict::PermanentFailure,
         }

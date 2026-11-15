@@ -86,6 +86,7 @@ const OUTSIDE_THE_CONTAINER: [&str; 5] = [
 ];
 const FIRST_ATTEMPT: u32 = 0;
 const OK: u16 = 200;
+const REQUEST_TIMEOUT: u16 = 408;
 
 fn crate_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -354,6 +355,19 @@ fn every_other_client_error_is_permanent_and_a_rate_limit_or_server_error_is_tra
             verdict(&provider, &request, status, b"")?,
             expected,
             "{status}"
+        );
+    }
+    Ok(())
+}
+
+/// Owner decision of 2026-11-15 (§10): a 408 is retried in-run and never held.
+#[test]
+fn a_408_request_timeout_is_transient() -> Outcome {
+    let provider = provider()?;
+    for request in [index_request(&provider)?, article_request(&provider)?] {
+        assert_eq!(
+            verdict(&provider, &request, REQUEST_TIMEOUT, b"")?,
+            Verdict::TransientFailure
         );
     }
     Ok(())
