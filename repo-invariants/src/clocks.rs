@@ -177,7 +177,11 @@ mod tests {
         let members = resolve_members(&root_manifest()).unwrap();
         assert_eq!(
             scanned(&members),
-            vec!["news-provider", "providers/edgar-press"]
+            vec![
+                "news-provider",
+                "providers/edgar-press",
+                "providers/open-web-feed"
+            ]
         );
     }
 

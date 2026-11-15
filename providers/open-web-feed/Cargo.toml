@@ -1,0 +1,13 @@
+[package]
+name = "open-web-feed"
+version = "0.1.0"
+edition = "2021"
+description = "Our own forward news feed over public wire and outlet pages: architecture.md section 11."
+publish = false
+
+# No HTTP client and no clock (section 11.1), so row R4's one-crate allowlist and clock scan cover
+# it as they cover edgar-press.
+[dependencies]
+
+[lints]
+workspace = true
