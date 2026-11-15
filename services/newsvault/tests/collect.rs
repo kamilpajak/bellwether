@@ -1898,13 +1898,7 @@ fn a_run_against_a_store_at_a_newer_user_version_leaves_the_store_unchanged() ->
     let db = Connection::open(root.path().join(COMMIT_LOG))?;
     db.pragma_update(None, "user_version", A_NEWER_USER_VERSION)?;
     drop(db);
-    let digests = |root: &Path| -> Vec<(String, String)> {
-        tree(root)
-            .into_iter()
-            .map(|(name, bytes)| (name, canon::FileDigest::of(&bytes).hex().to_owned()))
-            .collect()
-    };
-    let before = digests(root.path());
+    let before = tree_digests(root.path());
     let refused = collected(root.path(), A_LISTED_SESSION, &Payloads::a_good_day()?);
     let said = refused
         .err()
@@ -1914,8 +1908,34 @@ fn a_run_against_a_store_at_a_newer_user_version_leaves_the_store_unchanged() ->
         said.contains(&format!("user_version {A_NEWER_USER_VERSION}")),
         "{said}"
     );
-    assert_eq!(digests(root.path()), before);
+    assert_eq!(tree_digests(root.path()), before);
     Ok(())
+}
+
+/// The v0 sibling of the test above: a v0 `attempts` that `SCHEMA_V0` does not match. Review
+/// 2026-11-15 measured `LOCK` and a `runs/` file left behind by `Committer::open`'s refusal.
+#[test]
+fn a_run_against_a_v0_store_of_another_shape_leaves_the_store_unchanged() -> TestResult {
+    let root = TempDir::new()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    db.execute_batch("CREATE TABLE attempts (attempt_id TEXT PRIMARY KEY, run_id TEXT NOT NULL);")?;
+    drop(db);
+    let before = tree_digests(root.path());
+    let refused = collected(root.path(), A_LISTED_SESSION, &Payloads::a_good_day()?);
+    let said = refused
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+    assert!(said.contains("differs from SCHEMA_V0"), "{said}");
+    assert_eq!(tree_digests(root.path()), before);
+    Ok(())
+}
+
+fn tree_digests(root: &Path) -> Vec<(String, String)> {
+    tree(root)
+        .into_iter()
+        .map(|(name, bytes)| (name, canon::FileDigest::of(&bytes).hex().to_owned()))
+        .collect()
 }
 
 /// A usage error is reported before any input file is read, so an absent file beside it cannot

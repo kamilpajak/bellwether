@@ -496,8 +496,8 @@ pub fn run(
         });
     }
     let run = RunId::new(run_id.clone());
-    // Before the policy copy, the envelope and the lease: a store this build cannot read is left
-    // as it was found, with no run record pointing at a commit log nothing wrote.
+    // Before the policy copy, the envelope and the lease: a store at a newer user_version or of
+    // another v0 shape is left as found. A v0 step SQLite refuses still leaves a run record.
     crate::store::refuse_an_unreadable_version(&ask.store)?;
     // Before the plan, because the plan is where a lag dates a window: a run that refuses after
     // dating nothing still leaves the policy it would have dated by.

@@ -159,8 +159,7 @@ CREATE INDEX items_by_story ON items(story_id);
 CREATE INDEX items_by_doc ON items(doc_id);
 "];
 
-/// The frozen user_version 0 DDL: it creates each table a store lacks, and a table the store holds
-/// must already match it (`v0_columns_that_differ`) before any migration runs.
+/// The frozen user_version 0 DDL; how a store reaches user_version 1: architecture.md §3.1.
 ///
 /// `seq` is `INTEGER PRIMARY KEY AUTOINCREMENT` so the column never reuses a value after a delete,
 /// and the value itself comes from a committed `seq_reservations` row: measured 2026-11-13 on
@@ -335,18 +334,34 @@ pub enum StoreError {
     V0ShapeDiffers { columns: Vec<String> },
     /// `cause` is SQLite's message alone: the error rusqlite returns carries the whole batch.
     #[error(
-        "migrating the commit log from user_version {from} failed at the step to user_version \
-         {step}: {cause}; the store is left at user_version {from}"
+        "migrating the commit log from user_version {from} failed {step}: {cause}; the store is \
+         left at user_version {from}"
     )]
     MigrationFailed {
         from: usize,
-        step: usize,
+        step: MigrationStep,
         cause: String,
     },
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+/// Where a migration stopped: `SCHEMA_V0` is not a step to a version, so it is named on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationStep {
+    CreatingTheV0Tables,
+    ToUserVersion(usize),
+}
+
+impl std::fmt::Display for MigrationStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreatingTheV0Tables => f.write_str("creating the v0 tables the store lacks"),
+            Self::ToUserVersion(version) => write!(f, "at the step to user_version {version}"),
+        }
+    }
 }
 
 /// One item as the store takes it. The extraction evidence (title, url, lang, the vendor's own
@@ -509,8 +524,8 @@ pub fn require_current_version(db: &Connection) -> Result<(), StoreError> {
 }
 
 /// A writer's check before it writes anything into `root`, the lease and a run record included:
-/// [`migrate`] refuses the same version only after `Committer::open` has taken the lease. An
-/// absent commit log is a new store, which `Committer::open` creates.
+/// [`migrate`] refuses the same version and v0 shape only after `Committer::open` has taken the
+/// lease. An absent commit log is a new store, which `Committer::open` creates.
 pub fn refuse_an_unreadable_version(root: &Path) -> Result<(), StoreError> {
     let log = root.join(COMMIT_LOG);
     if !log.exists() {
@@ -518,14 +533,19 @@ pub fn refuse_an_unreadable_version(root: &Path) -> Result<(), StoreError> {
     }
     let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let found = user_version(&db)?;
-    if (0..=SCHEMA_VERSION).contains(&found) {
-        Ok(())
-    } else {
-        Err(StoreError::SchemaVersion {
+    if !(0..=SCHEMA_VERSION).contains(&found) {
+        return Err(StoreError::SchemaVersion {
             found,
             expected: SCHEMA_VERSION,
-        })
+        });
     }
+    if found == 0 {
+        let columns = v0_columns_that_differ(&db)?;
+        if !columns.is_empty() {
+            return Err(StoreError::V0ShapeDiffers { columns });
+        }
+    }
+    Ok(())
 }
 
 /// Brings a store from the version it holds to [`SCHEMA_VERSION`] in one transaction, so a crash
@@ -560,12 +580,12 @@ fn migrate_from(db: &mut Connection, from: usize) -> Result<(), StoreError> {
         }
         transaction
             .execute_batch(SCHEMA_V0)
-            .map_err(step_failed(from, 0))?;
+            .map_err(step_failed(from, MigrationStep::CreatingTheV0Tables))?;
     }
     for (index, step) in MIGRATIONS.iter().enumerate().skip(from) {
         transaction
             .execute_batch(step)
-            .map_err(step_failed(from, index + 1))?;
+            .map_err(step_failed(from, MigrationStep::ToUserVersion(index + 1)))?;
     }
     let dangling: Option<(String, i64)> = transaction
         .query_row("PRAGMA foreign_key_check", [], |row| {
@@ -580,7 +600,7 @@ fn migrate_from(db: &mut Connection, from: usize) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn step_failed(from: usize, step: usize) -> impl FnOnce(rusqlite::Error) -> StoreError {
+fn step_failed(from: usize, step: MigrationStep) -> impl FnOnce(rusqlite::Error) -> StoreError {
     move |failure| StoreError::MigrationFailed {
         from,
         step,
@@ -1394,8 +1414,8 @@ mod tests {
 
     use super::{
         first_observed, fs, newest_visible_publication, params, stamp, user_version, Committer,
-        ItemRow, LedgerError, ObservationTime, RunId, Sink, StoreError, COMMIT_LOG, SCHEMA_V0,
-        SCHEMA_VERSION,
+        ItemRow, LedgerError, MigrationStep, ObservationTime, RunId, Sink, StoreError, COMMIT_LOG,
+        SCHEMA_V0, SCHEMA_VERSION,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -2047,6 +2067,53 @@ mod tests {
         Ok(())
     }
 
+    /// §8 row M1: every part of a column's shape is compared, not its name alone. Each fixture is
+    /// `SCHEMA_V0` with one column's type, NOT NULL, default or primary key changed.
+    #[test]
+    fn a_v0_store_whose_column_differs_in_type_not_null_default_or_key_is_refused() -> TestResult {
+        let fixtures = [
+            (
+                "slots                 INTEGER,",
+                "slots TEXT,",
+                "attempts.slots",
+            ),
+            (
+                "run_id                TEXT NOT NULL,",
+                "run_id TEXT,",
+                "attempts.run_id",
+            ),
+            (
+                "outcome               TEXT,",
+                "outcome TEXT DEFAULT 'x',",
+                "attempts.outcome",
+            ),
+            (
+                "attempt_id            TEXT PRIMARY KEY,",
+                "attempt_id TEXT UNIQUE,",
+                "attempts.attempt_id",
+            ),
+        ];
+        let mut named = Vec::new();
+        for (declared, written, _) in fixtures {
+            assert_eq!(SCHEMA_V0.matches(declared).count(), 1, "{declared}");
+            let temp = TempDir::new()?;
+            let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+            db.execute_batch(&SCHEMA_V0.replacen(declared, written, 1))?;
+            drop(db);
+            let refused = match open(&temp) {
+                Err(StoreError::V0ShapeDiffers { columns }) => columns,
+                other => vec![format!("{other:?}")],
+            };
+            let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+            named.push((refused, user_version(&db)?));
+        }
+        assert_eq!(
+            named,
+            fixtures.map(|(_, _, column)| (vec![column.to_owned()], 0))
+        );
+        Ok(())
+    }
+
     /// A step that fails names the versions and SQLite's message, never the 2 KB batch rusqlite
     /// puts in its error (review 2026-11-15, `items_v1` left in place).
     #[test]
@@ -2061,13 +2128,33 @@ mod tests {
         assert!(
             matches!(
                 &refused,
-                Err(StoreError::MigrationFailed { from: 0, step: 1, cause })
+                Err(StoreError::MigrationFailed { from: 0, step: MigrationStep::ToUserVersion(1), cause })
                     if cause == "table items_v1 already exists"
             ),
             "{refused:?}"
         );
         let db = Connection::open(temp.path().join(COMMIT_LOG))?;
         assert_eq!(user_version(&db)?, 0);
+        Ok(())
+    }
+
+    /// A failure inside `SCHEMA_V0` is not named as a step to user_version 0 (review 2026-11-15:
+    /// "failed at the step to user_version 0", read as a no-op step).
+    #[test]
+    fn a_failure_creating_the_v0_tables_is_named_as_that_step() -> TestResult {
+        let temp = TempDir::new()?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch("CREATE TABLE t (x); CREATE INDEX published ON t(x);")?;
+        drop(db);
+        let said = open(&temp).err().map(|error| error.to_string());
+        assert_eq!(
+            said.as_deref(),
+            Some(
+                "migrating the commit log from user_version 0 failed creating the v0 tables the \
+                 store lacks: there is already an index named published; the store is left at \
+                 user_version 0"
+            )
+        );
         Ok(())
     }
 
