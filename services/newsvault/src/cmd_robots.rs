@@ -264,7 +264,7 @@ fn fetch(
     request: &Request,
 ) -> Result<Fetched, RobotsError> {
     let opened_at = ObservationTime::new(clock.now());
-    let mut slot = AttemptSlot::open(store, request, run, ordinal, opened_at)?;
+    let mut slot = AttemptSlot::open(store, request, None, run, ordinal, opened_at)?;
     let attempt_id = slot.attempt_id().hex().to_owned();
     let permit = slot.take_permit()?;
     let answer = match exchange.send(permit, request, clock) {

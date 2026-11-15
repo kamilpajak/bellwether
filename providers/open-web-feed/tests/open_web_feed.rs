@@ -183,6 +183,7 @@ fn verdict(
     let slot = AttemptSlot::open(
         &mut sink,
         request,
+        None,
         &RunId::new(RUN),
         FIRST_ATTEMPT,
         at(RUN_AT),
@@ -366,6 +367,7 @@ fn a_lost_connection_is_transient() -> Outcome {
     let slot = AttemptSlot::open(
         &mut sink,
         &request,
+        None,
         &RunId::new(RUN),
         FIRST_ATTEMPT,
         at(RUN_AT),
@@ -392,6 +394,7 @@ fn a_body_over_the_limit_is_permanent() -> Outcome {
     let slot = AttemptSlot::open(
         &mut sink,
         &request,
+        None,
         &RunId::new(RUN),
         FIRST_ATTEMPT,
         at(RUN_AT),

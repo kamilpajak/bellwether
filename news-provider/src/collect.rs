@@ -100,6 +100,14 @@ pub trait Archive: Sink {
         target_window: &TargetWindow,
     ) -> Result<std::collections::BTreeSet<String>, ArchiveError>;
 
+    /// The story ids this archive holds under `source` across EVERY target window: a committed
+    /// item, or a closed Document attempt whose verdict was usable, empty or permanent. A transient
+    /// failure, a swept attempt and one in flight hold nothing (architecture.md section 11.1).
+    fn held_story_ids(
+        &self,
+        source: &SourceId,
+    ) -> Result<std::collections::BTreeSet<String>, ArchiveError>;
+
     /// Records how many in-universe follow-ups an index attempt named: the denominator the coverage
     /// reader compares the committed rows against. Written whatever the count, so a window that
     /// matched nothing is distinguishable from one no index ever read.
@@ -474,9 +482,14 @@ fn attempt_once<A: Archive>(
         run,
         baseline,
     } = *driving;
+    // Document only: open-web's `item_key` can key an index url, which would hold a story.
+    let story = (request.phase == RequestPhase::Document)
+        .then(|| provider.story_of(request))
+        .flatten();
     let mut slot = AttemptSlot::open(
         archive,
         request,
+        story.as_ref(),
         run,
         ordinal,
         ObservationTime::new(clock.now()),

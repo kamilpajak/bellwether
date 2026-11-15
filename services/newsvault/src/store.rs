@@ -43,7 +43,7 @@
 //! };
 //! let at = ObservationTime::new(DateTime::UNIX_EPOCH);
 //! let raw = committer.put_blob(b"{}")?;
-//! let mut slot = AttemptSlot::open(&mut committer, &request, &run, 0, at)?;
+//! let mut slot = AttemptSlot::open(&mut committer, &request, None, &run, 0, at)?;
 //! let answer = RawResponse::new(slot.attempt_id().clone(), 200, b"{}".to_vec(), at, at);
 //! let outcome = Outcome::decide(&Verdict::Usable, 1, &Baseline::from_trailing_ok(&[1]));
 //! let closed = slot.close(&mut committer, outcome, &Ok(answer), at)?;
@@ -176,6 +176,9 @@ CREATE TABLE robots (
 -- and for every row closed before user_version 3, because a backfill from `failed` is a guess.
 ALTER TABLE attempts ADD COLUMN verdict TEXT
     CHECK (verdict IN ('usable', 'empty', 'permanent_failure', 'transient_failure'));
+-- The story a Document attempt fetched, from `Provider::story_of` at open: section 11.1's held
+-- key. NULL for an index or robots attempt and for every row opened before user_version 3.
+ALTER TABLE attempts ADD COLUMN story_id TEXT;
 ",
 ];
 
@@ -1000,6 +1003,33 @@ impl Committer {
         Ok(covered)
     }
 
+    /// Section 11.1's held set: keyed on (source, story) over every target window, so a story
+    /// held under yesterday's window is held today. No cutoff, for the reason
+    /// [`Committer::covered_story_ids`] gives.
+    pub fn held_story_ids(&self, source: &SourceId) -> Result<BTreeSet<String>, StoreError> {
+        let mut statement = self.db.prepare(
+            "SELECT i.story_id FROM items i
+             JOIN attempts a ON a.attempt_id = i.attempt_id
+             WHERE a.source = ?1
+             UNION
+             SELECT story_id FROM attempts
+             WHERE source = ?1 AND story_id IS NOT NULL AND closed_at IS NOT NULL
+               AND verdict IN (?2, ?3, ?4)",
+        )?;
+        let held = statement
+            .query_map(
+                params![
+                    source.as_str(),
+                    Verdict::Usable.name(),
+                    Verdict::Empty.name(),
+                    Verdict::PermanentFailure.name()
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<BTreeSet<String>, _>>()?;
+        Ok(held)
+    }
+
     /// Records how many in-universe follow-ups an index attempt named. One count per index
     /// attempt, stable across runs, so the coverage reader takes the MAX. A plain annotation
     /// column and not an item-row invariant, so it is its own `UPDATE` rather than part of the
@@ -1327,14 +1357,15 @@ impl Committer {
             filter_params,
             universe_version,
             hosts_version,
+            story_id,
             opened_at,
         } = event
         {
             self.db.execute(
                 "INSERT INTO attempts
                      (attempt_id, run_id, source, target_window, filter_params, universe_version,
-                      opened_at, hosts_version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(attempt_id) DO NOTHING",
+                      opened_at, hosts_version, story_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(attempt_id) DO NOTHING",
                 params![
                     attempt_id.hex(),
                     run.as_str(),
@@ -1343,7 +1374,8 @@ impl Committer {
                     filter_params.hex(),
                     universe_version.hex(),
                     stamp(opened_at.inner()),
-                    hosts_version.as_ref().map(FileDigest::hex)
+                    hosts_version.as_ref().map(FileDigest::hex),
+                    story_id.as_ref().map(Digest::hex)
                 ],
             )?;
         }
@@ -1956,6 +1988,7 @@ mod tests {
         let slot = AttemptSlot::open(
             store,
             &request_from(source),
+            None,
             &RunId::new(RUN),
             ordinal,
             at(1),
@@ -1989,6 +2022,7 @@ mod tests {
         let slot = AttemptSlot::open(
             store,
             &request_from(SOURCE),
+            None,
             &RunId::new(RUN),
             ordinal,
             at(1),
@@ -2107,7 +2141,7 @@ mod tests {
         let temp = TempDir::new()?;
         let mut store = open(&temp)?;
         let request = request();
-        let slot = AttemptSlot::open(&mut store, &request, &RunId::new(RUN), 0, at(1))?;
+        let slot = AttemptSlot::open(&mut store, &request, None, &RunId::new(RUN), 0, at(1))?;
         let stored: String = store.db.query_row(
             "SELECT universe_version FROM attempts WHERE attempt_id = ?1",
             params![slot.attempt_id().hex()],
@@ -2126,7 +2160,7 @@ mod tests {
             hosts_version: Some(FileDigest::of(HOSTS)),
             ..request()
         };
-        let slot = AttemptSlot::open(&mut store, &request, &RunId::new(RUN), 0, at(1))?;
+        let slot = AttemptSlot::open(&mut store, &request, None, &RunId::new(RUN), 0, at(1))?;
         let stored: Option<String> = store.db.query_row(
             "SELECT hosts_version FROM attempts WHERE attempt_id = ?1",
             params![slot.attempt_id().hex()],
@@ -2515,7 +2549,7 @@ mod tests {
             target_window: TargetWindow::new(ROBOTS_HOST),
             ..request()
         };
-        let slot = AttemptSlot::open(store, &request, &RunId::new(RUN), 0, at(1))?;
+        let slot = AttemptSlot::open(store, &request, None, &RunId::new(RUN), 0, at(1))?;
         let answer = RawResponse::new(
             slot.attempt_id().clone(),
             STATUS_OK,
@@ -2652,25 +2686,44 @@ mod tests {
         )?)
     }
 
-    /// §8 row M1 from user_version 2: the step to 3 adds `attempts.verdict`, and a closed
-    /// attempt's verdict lands in it. Mutation 2026-11-15, `MIGRATIONS[2]` emptied: red.
+    /// §8 row M1 from user_version 2: the step to 3 adds `attempts.verdict` and
+    /// `attempts.story_id`, and a Document attempt's verdict and story land in them. Mutations
+    /// 2026-11-15, `MIGRATIONS[2]` emptied and its `story_id` line alone removed: red.
     #[test]
     fn a_store_at_user_version_two_opens_migrates_to_three_and_takes_a_verdict() -> TestResult {
         let temp = TempDir::new()?;
         a_store_at_user_version_two(&temp)?;
         let mut store = open(&temp)?;
-        let closed = closed_attempt(&mut store, 0, Verdict::PermanentFailure)?;
-        let attempt = closed.attempt_id().hex().to_owned();
-        store.record(closed, &[], at(5))?;
+        a_document_closed(
+            &mut store,
+            (SOURCE, WINDOW),
+            STORY,
+            0,
+            Verdict::PermanentFailure,
+        )?;
+        let attempt: String = store.db.query_row(
+            "SELECT attempt_id FROM attempts WHERE story_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
         assert_eq!(
-            (user_version(&store.db)?, verdict_of(&store, &attempt)?),
-            (3, Some("permanent_failure".to_owned()))
+            (
+                user_version(&store.db)?,
+                verdict_of(&store, &attempt)?,
+                story_of_row(&store, &attempt)?
+            ),
+            (
+                3,
+                Some("permanent_failure".to_owned()),
+                Some(story_hex(SOURCE, STORY))
+            )
         );
         Ok(())
     }
 
     /// §8 row M1, the carried half from user_version 2: every column of every row of every v2
-    /// table, compared by `quote()`; the v2 attempt gains a NULL verdict and nothing else.
+    /// table, compared by `quote()`; the v2 attempt gains a NULL verdict and story and nothing
+    /// else, because neither is backfilled.
     #[test]
     fn a_v2_store_keeps_every_v2_column_of_every_row() -> TestResult {
         let temp = TempDir::new()?;
@@ -2681,7 +2734,11 @@ mod tests {
         let store = open(&temp)?;
         let after = quoted_rows(&store.db, 2, &V2_TABLES)?;
         assert_eq!(before.len(), V2_TABLES.len() + 1);
-        assert_eq!((after, verdict_of(&store, "a v1 attempt")?), (before, None));
+        let added = (
+            verdict_of(&store, "a v1 attempt")?,
+            story_of_row(&store, "a v1 attempt")?,
+        );
+        assert_eq!((after, added), (before, (None, None)));
         Ok(())
     }
 
@@ -2744,6 +2801,7 @@ mod tests {
         let slot = AttemptSlot::open(
             &mut store,
             &request(),
+            None,
             &RunId::new(RUN),
             u32::try_from(EVERY_VERDICT.len())?,
             at(1),
@@ -2773,7 +2831,7 @@ mod tests {
     fn every_verdict_name_is_one_the_verdict_check_admits() -> TestResult {
         let temp = TempDir::new()?;
         let mut store = open(&temp)?;
-        let slot = AttemptSlot::open(&mut store, &request(), &RunId::new(RUN), 0, at(1))?;
+        let slot = AttemptSlot::open(&mut store, &request(), None, &RunId::new(RUN), 0, at(1))?;
         let attempt = slot.attempt_id().hex().to_owned();
         drop(slot);
         let admitted = |name: &str| {
@@ -3132,6 +3190,179 @@ mod tests {
         assert_eq!(
             covered,
             std::collections::BTreeSet::from([story_hex(SOURCE, STORY)])
+        );
+        Ok(())
+    }
+
+    const YESTERDAY: &str = "2026-11-09";
+
+    fn document_request(source: &str, window: &str) -> Request {
+        Request {
+            target_window: TargetWindow::new(window),
+            phase: RequestPhase::Document,
+            ..request_from(source)
+        }
+    }
+
+    /// A Document attempt opened under the story `source_item_id` names, the way the driver
+    /// opens one; the caller closes it, abandons it or leaves it in flight.
+    fn document_slot(
+        store: &mut Committer,
+        (source, window): (&str, &str),
+        source_item_id: &str,
+        ordinal: u32,
+    ) -> Result<AttemptSlot, Box<dyn std::error::Error>> {
+        let story = story_id(source, source_item_id).map_err(|failure| failure.to_string())?;
+        Ok(AttemptSlot::open(
+            store,
+            &document_request(source, window),
+            Some(&story),
+            &RunId::new(RUN),
+            ordinal,
+            at(1),
+        )?)
+    }
+
+    /// A Document attempt closed under `verdict` and recorded with no item.
+    fn a_document_closed(
+        store: &mut Committer,
+        at_window: (&str, &str),
+        source_item_id: &str,
+        ordinal: u32,
+        verdict: Verdict,
+    ) -> TestResult {
+        let slot = document_slot(store, at_window, source_item_id, ordinal)?;
+        let answer = RawResponse::new(
+            slot.attempt_id().clone(),
+            STATUS_OK,
+            PAYLOAD.to_vec(),
+            at(2),
+            at(3),
+        );
+        let outcome = Outcome::decide(&verdict, 0, &Baseline::from_trailing_ok(&TRAILING_OK));
+        let closed = slot.close(store, outcome, &Ok(answer), at(4))?;
+        store.record(closed, &[], at(5))?;
+        Ok(())
+    }
+
+    fn story_of_row(store: &Committer, attempt: &str) -> Result<Option<String>, StoreError> {
+        Ok(store.db.query_row(
+            "SELECT story_id FROM attempts WHERE attempt_id = ?1",
+            params![attempt],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Section 11.1, `attempts.story_id`: written at open from the story the driver named.
+    /// Mutation 2026-11-15, `commit_opened` binding NULL for it: red.
+    #[test]
+    fn the_opened_row_carries_the_story_the_driver_named_and_an_index_row_none() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let document = document_slot(&mut store, (SOURCE, WINDOW), STORY, 0)?;
+        let index = AttemptSlot::open(&mut store, &request(), None, &RunId::new(RUN), 1, at(1))?;
+        let named = (
+            story_of_row(&store, document.attempt_id().hex())?,
+            story_of_row(&store, index.attempt_id().hex())?,
+        );
+        drop((document, index));
+        assert_eq!(named, (Some(story_hex(SOURCE, STORY)), None));
+        Ok(())
+    }
+
+    /// One row per state of section 11.1's held table; only the first four are held. The item's
+    /// attempt names no story, so the items arm alone holds it. Mutations 2026-11-15: the verdict
+    /// arm dropped, red; `transient_failure` admitted, red.
+    #[test]
+    fn held_story_ids_names_each_state_the_held_table_holds_and_no_other() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let here = (SOURCE, WINDOW);
+        let committed = closed_attempt(&mut store, 0, Verdict::Usable)?;
+        store.record(committed, &[row(&store, &spec(STORY))?], at(5))?;
+        a_document_closed(&mut store, here, "usable, no item", 1, Verdict::Usable)?;
+        a_document_closed(&mut store, here, "empty", 2, Verdict::Empty)?;
+        a_document_closed(&mut store, here, "permanent", 3, Verdict::PermanentFailure)?;
+        a_document_closed(&mut store, here, "transient", 4, Verdict::TransientFailure)?;
+        let swept = document_slot(&mut store, here, "swept", 5)?;
+        let swept_id = swept.attempt_id().clone();
+        drop(swept);
+        let closed = abandon(&mut store, swept_id, at(9), &RunId::new(SWEEPING_RUN))?;
+        store.record(closed, &[], at(10))?;
+        let in_flight = document_slot(&mut store, here, "in flight", 6)?;
+        drop(in_flight);
+        let held = store.held_story_ids(&SourceId::new(SOURCE))?;
+        assert_eq!(
+            held,
+            [STORY, "usable, no item", "empty", "permanent"]
+                .map(|story| story_hex(SOURCE, story))
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        Ok(())
+    }
+
+    /// An index attempt under (source, window), naming no story, that commits `spec`'s item: the
+    /// items arm of the held read is then the only one that can hold it.
+    fn an_item_committed_under(
+        store: &mut Committer,
+        (source, window): (&str, &str),
+        ordinal: u32,
+        spec: &Spec,
+    ) -> TestResult {
+        let request = Request {
+            target_window: TargetWindow::new(window),
+            ..request_from(source)
+        };
+        let slot = AttemptSlot::open(store, &request, None, &RunId::new(RUN), ordinal, at(1))?;
+        let answer = RawResponse::new(
+            slot.attempt_id().clone(),
+            STATUS_OK,
+            PAYLOAD.to_vec(),
+            at(2),
+            at(3),
+        );
+        let outcome = Outcome::decide(
+            &Verdict::Usable,
+            VENDOR_ROWS,
+            &Baseline::from_trailing_ok(&TRAILING_OK),
+        );
+        let closed = slot.close(store, outcome, &Ok(answer), at(4))?;
+        store.record(closed, &[row(store, spec)?], at(5))?;
+        Ok(())
+    }
+
+    /// Held is keyed on (source, story) over every target window, never the run's window alone:
+    /// each arm holds one story under yesterday only, and today is the latest window. Mutations
+    /// 2026-11-15: either arm filtered to the latest window, red; either arm's source dropped, red.
+    #[test]
+    fn held_story_ids_spans_every_target_window_and_one_source_only() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let (yesterday, today) = ((SOURCE, YESTERDAY), (SOURCE, WINDOW));
+        an_item_committed_under(&mut store, yesterday, 0, &spec(STORY))?;
+        let failed = Verdict::PermanentFailure;
+        a_document_closed(&mut store, yesterday, "yesterday", 1, failed)?;
+        a_document_closed(&mut store, today, "today", 2, failed)?;
+        let elsewhere = Spec {
+            source: OTHER_SOURCE,
+            ..spec("elsewhere, committed")
+        };
+        an_item_committed_under(&mut store, (OTHER_SOURCE, YESTERDAY), 3, &elsewhere)?;
+        a_document_closed(
+            &mut store,
+            (OTHER_SOURCE, YESTERDAY),
+            "elsewhere",
+            4,
+            failed,
+        )?;
+        let held = store.held_story_ids(&SourceId::new(SOURCE))?;
+        assert_eq!(
+            held,
+            [STORY, "yesterday", "today"]
+                .map(|story| story_hex(SOURCE, story))
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
         );
         Ok(())
     }
@@ -3695,7 +3926,7 @@ mod tests {
     ) -> TestResult {
         let temp = TempDir::new()?;
         let mut store = open(&temp)?;
-        let slot = AttemptSlot::open(&mut store, &request(), &RunId::new(RUN), 0, at(1))?;
+        let slot = AttemptSlot::open(&mut store, &request(), None, &RunId::new(RUN), 0, at(1))?;
         let answer = RawResponse::new(
             slot.attempt_id().clone(),
             STATUS_OK,
@@ -3741,7 +3972,7 @@ mod tests {
     fn an_abandoned_attempt_records_its_interrupted_outcome_and_no_items() -> TestResult {
         let temp = TempDir::new()?;
         let mut store = open(&temp)?;
-        let slot = AttemptSlot::open(&mut store, &request(), &RunId::new(RUN), 0, at(1))?;
+        let slot = AttemptSlot::open(&mut store, &request(), None, &RunId::new(RUN), 0, at(1))?;
         let in_flight = slot.attempt_id().clone();
         drop(slot);
         let closed = abandon(&mut store, in_flight, at(9), &RunId::new(SWEEPING_RUN))?;
@@ -3760,7 +3991,7 @@ mod tests {
     fn an_abandoned_attempt_may_not_carry_items_even_though_it_was_closed() -> TestResult {
         let temp = TempDir::new()?;
         let mut store = open(&temp)?;
-        let slot = AttemptSlot::open(&mut store, &request(), &RunId::new(RUN), 0, at(1))?;
+        let slot = AttemptSlot::open(&mut store, &request(), None, &RunId::new(RUN), 0, at(1))?;
         let in_flight = slot.attempt_id().clone();
         drop(slot);
         let closed = abandon(&mut store, in_flight, at(9), &RunId::new(SWEEPING_RUN))?;
@@ -3780,7 +4011,7 @@ mod tests {
         store
             .db
             .execute_batch("DROP TABLE items; DROP TABLE attempts;")?;
-        let refused = AttemptSlot::open(&mut store, &request(), &RunId::new(RUN), 0, at(1));
+        let refused = AttemptSlot::open(&mut store, &request(), None, &RunId::new(RUN), 0, at(1));
         assert!(
             matches!(
                 refused,

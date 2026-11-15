@@ -1071,6 +1071,13 @@ impl Archive for Committer {
             .map_err(|why| refused("read the covered set", &why))
     }
 
+    fn held_story_ids(
+        &self,
+        source: &SourceId,
+    ) -> Result<std::collections::BTreeSet<String>, ArchiveError> {
+        Committer::held_story_ids(self, source).map_err(|why| refused("read the held set", &why))
+    }
+
     fn record_planned_coverage(
         &mut self,
         attempt_id: &str,
@@ -1331,7 +1338,7 @@ mod tests {
             hosts_version: None,
         };
         let at = ObservationTime::new(instant(FETCHED_AT));
-        let slot = AttemptSlot::open(&mut store, &request, &RunId::new(RUN), 0, at)?;
+        let slot = AttemptSlot::open(&mut store, &request, None, &RunId::new(RUN), 0, at)?;
         let answer = RawResponse::new(slot.attempt_id().clone(), 200, b"payload".to_vec(), at, at);
         let outcome = Outcome::decide(&Verdict::Usable, 1, &Baseline::from_trailing_ok(&[1]));
         let closed = slot.close(&mut store, outcome, &Ok(answer), at)?;

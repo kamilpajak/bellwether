@@ -304,6 +304,13 @@ impl Archive for Refusing {
         Archive::covered_story_ids(&self.store, source, target_window)
     }
 
+    fn held_story_ids(
+        &self,
+        source: &SourceId,
+    ) -> Result<std::collections::BTreeSet<String>, ArchiveError> {
+        Archive::held_story_ids(&self.store, source)
+    }
+
     fn record_planned_coverage(
         &mut self,
         attempt_id: &str,
@@ -662,6 +669,13 @@ impl Archive for Untouched {
         Err(self.touched("covered_story_ids"))
     }
 
+    fn held_story_ids(
+        &self,
+        _source: &SourceId,
+    ) -> Result<std::collections::BTreeSet<String>, ArchiveError> {
+        Err(self.touched("held_story_ids"))
+    }
+
     fn record_planned_coverage(
         &mut self,
         _attempt_id: &str,
@@ -863,6 +877,33 @@ fn a_literal_contact_shaped_header_value_turns_a_named_test_red() -> TestResult 
     Ok(())
 }
 
+/// Section 11.1, `attempts.story_id`: the driver names a Document attempt's story from
+/// `Provider::story_of` and an index attempt's not at all. Mutation 2026-11-15, the driver
+/// passing None: red.
+#[test]
+fn a_document_attempt_opens_under_the_story_its_provider_names() -> TestResult {
+    let root = TempDir::new()?;
+    collected(root.path(), A_LISTED_SESSION, &Payloads::a_good_day()?)?;
+    let db = Connection::open_with_flags(
+        root.path().join(COMMIT_LOG),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let mut statement = db.prepare("SELECT story_id FROM attempts ORDER BY story_id")?;
+    let stories = statement
+        .query_map([], |row| row.get::<_, Option<String>>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut expected = vec![None];
+    for url in [APPLE_URL, MICROSOFT_URL] {
+        let accession = url.rsplit('/').next().unwrap_or_default();
+        let story = canon::digest::story_id(SOURCE, accession.trim_end_matches(".txt"))
+            .map_err(|failure| failure.to_string())?;
+        expected.push(Some(story.hex().to_owned()));
+    }
+    expected.sort();
+    assert_eq!(stories, expected);
+    Ok(())
+}
+
 #[test]
 fn the_index_attempt_counts_the_vendors_rows_and_our_own_filtering_separately() -> TestResult {
     let root = TempDir::new()?;
@@ -905,7 +946,14 @@ fn an_attempt_a_dead_run_left_open_is_closed_interrupted_by_the_next_run() -> Te
         listed_date: None,
         hosts_version: None,
     };
-    let orphan = AttemptSlot::open(&mut store, &abandoned, &dead, 0, ObservationTime::new(at()))?;
+    let orphan = AttemptSlot::open(
+        &mut store,
+        &abandoned,
+        None,
+        &dead,
+        0,
+        ObservationTime::new(at()),
+    )?;
     let orphaned = orphan.attempt_id().hex().to_owned();
     drop(orphan);
     drop(store);

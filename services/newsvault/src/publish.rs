@@ -581,7 +581,7 @@ pub(crate) mod tests {
             listed_date: None,
             hosts_version: None,
         };
-        let slot = AttemptSlot::open(store, &request, &run, 0, at(observed))?;
+        let slot = AttemptSlot::open(store, &request, None, &run, 0, at(observed))?;
         let answer = RawResponse::new(
             slot.attempt_id().clone(),
             STATUS_OK,

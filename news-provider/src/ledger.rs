@@ -71,6 +71,9 @@ pub enum AttemptEvent {
         universe_version: FileDigest,
         /// Read off the request for the same reason; never inside `filter_params`.
         hosts_version: Option<FileDigest>,
+        /// The story a Document request fetches, named before the socket so a swept attempt still
+        /// says what it was fetching; None for an index or robots request (section 11.1).
+        story_id: Option<Digest>,
         opened_at: ObservationTime,
     },
     Answered {
@@ -336,6 +339,7 @@ impl AttemptSlot {
     pub fn open(
         sink: &mut dyn Sink,
         request: &Request,
+        story: Option<&Digest>,
         run: &RunId,
         ordinal: u32,
         at: ObservationTime,
@@ -358,6 +362,7 @@ impl AttemptSlot {
             filter_params: request.filter_params()?,
             universe_version: request.universe_version.clone(),
             hosts_version: request.hosts_version.clone(),
+            story_id: story.cloned(),
             opened_at: at,
         })?;
         Ok(Self {
@@ -585,7 +590,14 @@ pub(crate) mod tests {
     }
 
     fn slot(sink: &mut dyn Sink, ordinal: u32) -> Result<AttemptSlot, LedgerError> {
-        AttemptSlot::open(sink, &request(), &RunId::new(RUN), ordinal, at(OPENED_AT))
+        AttemptSlot::open(
+            sink,
+            &request(),
+            None,
+            &RunId::new(RUN),
+            ordinal,
+            at(OPENED_AT),
+        )
     }
 
     fn answer(slot: &AttemptSlot) -> RawResponse {
