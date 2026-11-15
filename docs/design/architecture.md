@@ -1204,7 +1204,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | story state | held? |
 |---|---|
 | has a committed item | yes |
-| `Document` attempt closed `Usable`, `Empty`, `PermanentFailure`, or with only unusable rows | yes (an `Empty` or unusable page: re-fetching returns the same page; the raw blob, §3.9, allows re-extraction) |
+| `Document` attempt closed `Usable`, `Empty`, `PermanentFailure`, or with only unusable rows | yes (an `Empty` or unusable page: re-fetching returns the same page; the raw blob, §3.9, allows re-extraction). Unguarded: an unusable reason taken from the index row rather than the page (`NoParseableValidTime` from `listed_date`, `BlankSourceItemId`) is held the same way, though neither reason holds for it: the valid time is not in the page blob and `listed_date` is stored nowhere, so a later listing or a changed pubDate rule never reaches the story again (review 2026-11-15, two-poll driver test; owner decision pending) |
 | `TransientFailure`, interrupted by the startup sweep, in flight | no |
 
 - `Usable`, `Empty`, `PermanentFailure`, `TransientFailure` are `news_provider::ledger::Verdict` arms; §3.2's `OutcomeKind` maps both failures to `failed` (`Outcome::decide`, `news-provider/src/ledger.rs`). `Finalised` carries the `Verdict` inside `Outcome` (`Outcome::verdict`, None from `Outcome::abandoned`), stored as `attempts.verdict` (§3.2), since 2026-11-15.
