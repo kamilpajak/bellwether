@@ -40,9 +40,11 @@ const NOT_FOUND: u16 = 404;
 const FORBIDDEN: u16 = 403;
 const UNAVAILABLE: u16 = 503;
 const TOO_MANY_REQUESTS: u16 = 429;
+const REQUEST_TIMEOUT: u16 = 408;
 const EXIT_OK: i32 = 0;
 const EXIT_USAGE: i32 = 2;
 const EXIT_NOT_FOUND: i32 = 4;
+const EXIT_PARTIAL: u8 = 8;
 const RUNS_BELOW_EXPECTED: &str = "runs_below_expected";
 const HOLDS_A_FAILURE: &str = "holds_a_failure";
 
@@ -326,6 +328,28 @@ fn a_robots_403_5xx_or_transport_error_is_a_failed_attempt_with_no_robots_row() 
             (failed.0, failed.1.clone(), failed.2.clone(), 7, false),
             (failed.0, failed.1, failed.2, 7, false),
         ]
+    );
+    Ok(())
+}
+
+/// Section 10, robots 408: the owner's 408 rule names the providers only, so robots keeps it
+/// permanent. Mutation 2026-11-15, 408 mapped to a transient failure in `verdict_of`: red.
+#[test]
+fn a_robots_408_stays_a_permanent_failure_with_no_robots_row() -> TestResult {
+    let root = TempDir::new()?;
+    let exchange = Robots::of(&[(GNW_ROBOTS, REQUEST_TIMEOUT, &b""[..])]);
+    let answer = refreshed(root.path(), committed_hosts(), &exchange)?;
+    let verdicts: Vec<Option<String>> = read_only(root.path())?
+        .prepare("SELECT verdict FROM attempts")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(
+        (
+            robots_rows(root.path())?.len(),
+            verdicts,
+            answer.exit.code()
+        ),
+        (0, vec![Some("permanent_failure".to_owned())], EXIT_PARTIAL)
     );
     Ok(())
 }

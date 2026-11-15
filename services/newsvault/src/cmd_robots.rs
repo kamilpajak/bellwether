@@ -306,7 +306,7 @@ fn fetch(
 }
 
 /// 200 is present, 404 is absent (section 11.1); 429, a 5xx and a transport error are transient;
-/// every other status, 403 and 410 included, and a body over the limit are permanent.
+/// every other status, 403, 408 and 410 included, and a body over the limit are permanent.
 fn verdict_of(answer: &Result<RawResponse, TransportError>) -> Verdict {
     match answer {
         Ok(response) => match response.status() {
