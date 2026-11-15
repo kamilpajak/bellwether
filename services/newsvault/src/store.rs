@@ -2307,6 +2307,7 @@ mod tests {
         let v0 = Connection::open(temp.path().join(COMMIT_LOG))?;
         let before = (v0_items(&v0)?, item_indexes(&v0)?);
         drop(v0);
+        assert!(super::refuse_an_unreadable_version(temp.path()).is_ok());
         let store = open(&temp)?;
         assert_eq!(before.0.len(), V0_ROWS);
         assert_eq!(
@@ -2646,19 +2647,22 @@ mod tests {
             let db = Connection::open(temp.path().join(COMMIT_LOG))?;
             db.execute_batch(edit)?;
             drop(db);
-            let read_only = super::refuse_an_unreadable_version(temp.path());
+            let read_only = match super::refuse_an_unreadable_version(temp.path()) {
+                Err(StoreError::ShapeDiffers { found: 1, columns }) => columns,
+                other => vec![format!("{other:?}")],
+            };
             let refused = match open(&temp) {
                 Err(StoreError::ShapeDiffers { found: 1, columns }) => columns,
                 other => vec![format!("{other:?}")],
             };
             let db = Connection::open(temp.path().join(COMMIT_LOG))?;
-            named.push((refused, read_only.is_err(), user_version(&db)?));
+            named.push((refused, read_only, user_version(&db)?));
         }
         assert_eq!(
             named,
             fixtures
                 .into_iter()
-                .map(|(_, columns)| (columns, true, 1))
+                .map(|(_, columns)| (columns.clone(), columns, 1))
                 .collect::<Vec<_>>()
         );
         Ok(())
@@ -2673,6 +2677,7 @@ mod tests {
         let v1 = Connection::open(temp.path().join(COMMIT_LOG))?;
         let before = quoted_rows(&v1, 1, &V1_TABLES)?;
         drop(v1);
+        assert!(super::refuse_an_unreadable_version(temp.path()).is_ok());
         let store = open(&temp)?;
         assert_eq!(before.len(), V1_TABLES.len() + 1);
         assert_eq!(quoted_rows(&store.db, 1, &V1_TABLES)?, before);
@@ -2755,6 +2760,7 @@ mod tests {
         let v2 = Connection::open(temp.path().join(COMMIT_LOG))?;
         let before = quoted_rows(&v2, 2, &V2_TABLES)?;
         drop(v2);
+        assert!(super::refuse_an_unreadable_version(temp.path()).is_ok());
         let store = open(&temp)?;
         let after = quoted_rows(&store.db, 2, &V2_TABLES)?;
         assert_eq!(before.len(), V2_TABLES.len() + 1);
@@ -2796,19 +2802,22 @@ mod tests {
             let db = Connection::open(temp.path().join(COMMIT_LOG))?;
             db.execute_batch(edit)?;
             drop(db);
-            let read_only = super::refuse_an_unreadable_version(temp.path());
+            let read_only = match super::refuse_an_unreadable_version(temp.path()) {
+                Err(StoreError::ShapeDiffers { found: 2, columns }) => columns,
+                other => vec![format!("{other:?}")],
+            };
             let refused = match open(&temp) {
                 Err(StoreError::ShapeDiffers { found: 2, columns }) => columns,
                 other => vec![format!("{other:?}")],
             };
             let db = Connection::open(temp.path().join(COMMIT_LOG))?;
-            named.push((refused, read_only.is_err(), user_version(&db)?));
+            named.push((refused, read_only, user_version(&db)?));
         }
         assert_eq!(
             named,
             fixtures
                 .into_iter()
-                .map(|(_, columns)| (columns, true, 2))
+                .map(|(_, columns)| (columns.clone(), columns, 2))
                 .collect::<Vec<_>>()
         );
         Ok(())
