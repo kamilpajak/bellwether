@@ -1,6 +1,6 @@
-//! The seven digests, each a field list over the form in `lib.rs`. Each field list is stated by
-//! its function or struct below; `docs/design/architecture.md` section 2's `canon::Domain` table
-//! points at them and states only `item_id`'s order itself.
+//! The seven digests, each a field list over the form in `lib.rs`. `docs/design/architecture.md`
+//! section 2's rows state the order of `item_id`, `story_id` and `snapshot_id`, section 3.2's that
+//! of `filter_params` and `result_digest`; only the code below states `doc_id` and `attempt_id`.
 
 use crate::{sha256_canon, CanonError, Digest, Domain, Field, Stamp};
 use chrono::{DateTime, Utc};
@@ -103,9 +103,8 @@ pub fn result_digest(ids: &[&str]) -> Result<Digest, CanonError> {
     sha256_canon(Domain::ResultDigest, &[Field::List(&set)])
 }
 
-/// A snapshot is a set under a cutoff: a date range is not reproducible because the archive grows
-/// under it. The ids keep their ascending `seq` order, which is the only ordering authority, so
-/// they are not re-sorted here.
+/// architecture.md section 2 row `snapshot_id`. The ids are taken in the caller's ascending `seq`
+/// order and not re-sorted.
 pub fn snapshot_id(
     cutoff: DateTime<Utc>,
     item_ids_in_seq_order: &[&str],
