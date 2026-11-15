@@ -9,8 +9,8 @@ use canon::FileDigest;
 use chrono::{DateTime, Utc};
 use news_provider::conformance::{breaches, RecordingSink, Subject};
 use news_provider::provider::{
-    precision_of, Cadence, CollectedItem, Extracted, PlanRefusal, Provenance, Provider, RawBlob,
-    UnusableReason, UnusableRow, ValidPrecision, ValidSource,
+    precision_of, Cadence, Calendar, CollectedItem, Extracted, Listing, PlanRefusal, Provenance,
+    Provider, RawBlob, UnusableReason, UnusableRow, ValidPrecision, ValidSource,
 };
 use news_provider::request::{HeaderValue, Request, RequestPhase};
 use news_provider::{
@@ -222,6 +222,32 @@ fn a_target_other_than_the_run_day_is_refused_before_any_request() -> Outcome {
     let plan = provider.plan(&TargetWindow::new(RUN_DAY), None, None, at(RUN_AT))?;
     assert_eq!(plan.requests.len(), 1);
     assert_eq!(plan.not_planned, Vec::new());
+    Ok(())
+}
+
+/// Every driver refuses the mismatch first, so only this test reaches the check in `plan`
+/// (review 2026-11-15: that line removed, the whole suite stayed green).
+#[test]
+fn a_calendar_or_a_listing_handed_to_plan_is_refused() -> Outcome {
+    let provider = provider()?;
+    let calendar = Calendar::read(br#"{"schema":"calendar/1","sessions":["2026-11-14"]}"#)?;
+    let listing = Listing::of_days(&[RUN_DAY.parse()?]);
+    for (calendar, listing, why) in [
+        (Some(&calendar), None, "was handed a calendar"),
+        (None, Some(&listing), "was handed a listing"),
+    ] {
+        assert_eq!(
+            provider
+                .plan(&TargetWindow::new(RUN_DAY), calendar, listing, at(RUN_AT))
+                .err(),
+            Some(PlanRefusal::InputsDoNotMatchCadence {
+                source_id: SOURCE.to_owned(),
+                cadence: Cadence::EveryUtcDay.name(),
+                why,
+            }),
+            "{why}"
+        );
+    }
     Ok(())
 }
 

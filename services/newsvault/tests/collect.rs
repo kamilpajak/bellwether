@@ -339,6 +339,7 @@ fn a_collected_store(runs: usize) -> Result<TempDir, Box<dyn Error>> {
 struct Answered {
     code: i32,
     stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 /// Runs the binary with stdin closed, which is the shape a scheduler gives it.
@@ -372,6 +373,7 @@ fn binary_env(args: &[&str], env: &[(&str, &str)]) -> Result<Answered, Box<dyn E
     Ok(Answered {
         code: output.status.code().unwrap_or(-1),
         stdout: output.stdout,
+        stderr: output.stderr,
     })
 }
 
@@ -1946,6 +1948,90 @@ fn a_flag_error_beside_an_absent_input_file_is_still_a_usage_error() -> TestResu
     args[at + 1] = path(&absent);
     let answered = binary(&args.iter().map(String::as_str).collect::<Vec<&str>>())?;
     assert_eq!((answered.code, answered.stdout.len()), (EXIT_USAGE, 0));
+    Ok(())
+}
+
+/// `today` is a UTC date and edgar plans New York session days: before this refusal a run at
+/// 2026-11-11T02:00Z planned 2026-11-11 (review 2026-11-15).
+#[test]
+fn an_edgar_run_refuses_window_today() -> TestResult {
+    let root = TempDir::new()?;
+    let today = Ask {
+        dry_run: true,
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let refused = cmd_collect::open_provider(&today).err();
+    assert!(
+        matches!(
+            refused,
+            Some(cmd_collect::CollectRunError::TodayRefused { source_id: SOURCE })
+        ),
+        "{refused:?}"
+    );
+    Ok(())
+}
+
+/// Section 5.1's `invalid_argument` row: every `collect` usage check writes the prefix
+/// `usage_exit` writes, one row per check.
+#[test]
+fn every_collect_usage_error_is_written_as_a_usage_error() -> TestResult {
+    let root = TempDir::new()?;
+    let without_flag = |args: Vec<String>, flag: &str| -> Vec<String> {
+        let at = args
+            .iter()
+            .position(|arg| arg == flag)
+            .unwrap_or(args.len());
+        args.into_iter()
+            .enumerate()
+            .filter(|(index, _)| *index != at && *index != at + 1)
+            .map(|(_, arg)| arg)
+            .collect()
+    };
+    let with_source = |args: Vec<String>, source: &str| -> Vec<String> {
+        let mut args = args;
+        args.extend(["--source".to_owned(), source.to_owned()]);
+        args
+    };
+    let mut unknown = open_web_args(root.path(), &[]);
+    unknown[2] = "no_such_source".to_owned();
+    let off_the_clock_day: Vec<String> = open_web_args(root.path(), &[])
+        .into_iter()
+        .filter(|arg| arg != "--dry-run")
+        .collect();
+    let calendar = path(&fixture("calendar.json"));
+    let rows = [
+        (
+            "flag required",
+            without_flag(
+                collect_args(root.path(), A_LISTED_SESSION, &[]),
+                "--calendar",
+            ),
+        ),
+        (
+            "flag refused",
+            open_web_args(root.path(), &["--calendar", &calendar]),
+        ),
+        (
+            "second source",
+            with_source(open_web_args(root.path(), &[]), SOURCE),
+        ),
+        ("unknown source", unknown),
+        ("at off the clock day", off_the_clock_day),
+        (
+            "today for edgar",
+            collect_args(root.path(), cmd_collect::TODAY, &["--dry-run"]),
+        ),
+    ];
+    for (row, args) in rows {
+        let answered = binary(&args.iter().map(String::as_str).collect::<Vec<&str>>())?;
+        let said = String::from_utf8_lossy(&answered.stderr).into_owned();
+        assert_eq!(
+            (answered.code, answered.stdout.len()),
+            (EXIT_USAGE, 0),
+            "{row}: {said}"
+        );
+        assert!(said.starts_with("usage error: "), "{row}: {said}");
+    }
     Ok(())
 }
 

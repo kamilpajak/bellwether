@@ -102,7 +102,8 @@ enum Command {
         /// refused: one source per invocation.
         #[arg(long = "source", required = true)]
         sources: Vec<String>,
-        /// A day as YYYY-MM-DD, a FROM..TO range of days, or `today`: the UTC date of `--at`.
+        /// A day as YYYY-MM-DD, a FROM..TO range of days, or `today`: the UTC date of `--at`,
+        /// refused for edgar_press, which plans session days.
         #[arg(long)]
         window: String,
         /// The schedule slot this run belongs to, which keys its run id.
@@ -218,9 +219,21 @@ fn main() -> ExitCode {
                 clippy::let_underscore_must_use,
                 reason = "reporting an error must not fail on a closed stderr; the exit code is the verdict"
             )]
-            let _ = writeln!(std::io::stderr(), "error: {e:#}");
+            let _ = writeln!(std::io::stderr(), "{}: {e:#}", prefix_of(&e));
             ExitCode::from(code)
         }
+    }
+}
+
+/// `usage error` for the caller's own mistake, as `usage_exit` writes it; `error` otherwise.
+fn prefix_of(failure: &anyhow::Error) -> &'static str {
+    if failure
+        .downcast_ref::<CollectRunError>()
+        .is_some_and(CollectRunError::is_usage)
+    {
+        "usage error"
+    } else {
+        "error"
     }
 }
 
@@ -716,7 +729,7 @@ fn print_schema(format: Format) {
                      "doc": "one source per invocation: a second distinct source is invalid_argument"},
                     {"name": "window", "type": "string", "required": true,
                      "doc": "a day as YYYY-MM-DD, a FROM..TO range of days, or today: the UTC date \
-                             of at; the envelope's window is the resolved day"},
+                             of at, refused for edgar_press; the envelope's window is the resolved day"},
                     {"name": "schedule", "type": "string"},
                     {"name": "expected_runs", "type": "integer", "default": 1},
                     {"name": "store", "type": "path"},
