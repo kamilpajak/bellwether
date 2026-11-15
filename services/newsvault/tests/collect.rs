@@ -1297,12 +1297,9 @@ fn index_held(root: &Path) -> Result<Vec<Option<i64>>, Box<dyn Error>> {
     Ok(held)
 }
 
-/// §8 row R20, the whole point of this change. A backfill re-run of one window re-fetches only the
-/// accessions the store does not already hold a committed item for: run 1 leaves Microsoft
-/// uncovered, and run 2 asks for the index and Microsoft alone, never Apple again. Mutation
-/// 2026-11-13: making `EdgarPress::follow_ups_to_issue` return its input unfiltered turns this red
-/// (run 2 asks for Apple too). Section 11.1: `held` is the live arm's, so both archive index rows
-/// keep it NULL. Mutation 2026-11-15, the driver writing `held` on the archive arm too: red.
+/// §8 row R20: run 2 re-fetches only Microsoft, which run 1 left uncovered; `held` stays NULL
+/// (§3.2). Mutations: 2026-11-13, `EdgarPress::follow_ups_to_issue` unfiltered: red (Apple asked
+/// again); 2026-11-15, the driver writing `held` on the archive arm too: red.
 #[test]
 fn a_vendor_archive_rerun_fetches_only_the_uncovered_accession() -> TestResult {
     let root = TempDir::new()?;
@@ -1328,10 +1325,9 @@ fn a_vendor_archive_rerun_fetches_only_the_uncovered_accession() -> TestResult {
     Ok(())
 }
 
-/// §8 row R16. A live ingest polls every matched row, so a live re-run fetches BOTH documents even
-/// though run 1 committed them: coverage skips the archive arm alone. Mutation 2026-11-13:
-/// dropping the `provenance != VendorArchive` guard in `follow_ups_to_issue` turns this red (run 2
-/// asks for the index alone). Edgar live issues every follow-up, so each index row holds 0.
+/// §8 row R16: a live re-run fetches BOTH documents run 1 committed; each index row holds 0.
+/// Mutation 2026-11-13, the `provenance != VendorArchive` guard in `follow_ups_to_issue` dropped:
+/// red (run 2 asks for the index alone).
 #[test]
 fn a_live_rerun_still_polls_every_matched_row_even_when_the_story_is_covered() -> TestResult {
     let root = TempDir::new()?;
