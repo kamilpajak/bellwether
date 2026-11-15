@@ -101,8 +101,10 @@ do not prove: `probes/newsvault_parity/PREREGISTRATION.md`.
 
 `collect` is the only command that writes to the archive. Every input it reads is a file whose
 digest the run envelope names, so a second reader can reproduce what the run filtered by.
-`BELLWETHER_SEC_CONTACT` carries the contact address SEC requires in the User-Agent; it is
-substituted inside the one HTTP client and reaches no plan and no ledger row.
+`BELLWETHER_SEC_CONTACT` (edgar_press) and `BELLWETHER_FEED_CONTACT` (open_web_wires) carry the
+contact address the User-Agent sends; each is substituted inside the one HTTP client and reaches
+no plan and no ledger row. One source per invocation; which files each source takes is
+`newsvault schema --format=json`.
 
 ```
 export BELLWETHER_SEC_CONTACT='bellwether <your address>'
@@ -110,6 +112,10 @@ cargo run -p newsvault -- collect --source edgar_press --window 2026-11-10 \
   --calendar <calendar.json> --listing <quarter index.json> \
   --roster <cik roster.json> --rules providers/edgar-press/rules/edgar-press.rules.json \
   --dry-run --format json
+export BELLWETHER_FEED_CONTACT='bellwether-feed <your address>'
+cargo run -p newsvault -- collect --source open_web_wires --window today \
+  --hosts providers/open-web-feed/hosts/open_web_wires.hosts.json \
+  --rules providers/open-web-feed/rules/open-web-feed.rules.json --dry-run --format json
 ```
 
 `unwrap`, `expect` and `panic!` are denied by lint and `unsafe` is forbidden. The table is

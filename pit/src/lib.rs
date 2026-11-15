@@ -171,6 +171,8 @@ pub enum PitError {
     NegativeLag(i64),
     #[error("valid time {valid} plus a lag of {seconds} s is past the last instant chrono holds")]
     LagOutOfRange { valid: DateTime<Utc>, seconds: i64 },
+    #[error("{0} is not a whole minute: a minute value carries no seconds and none are dropped")]
+    MinuteWithSeconds(DateTime<Utc>),
 }
 
 /// The pair of instants that decides whether an item may enter an analysis.

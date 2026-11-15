@@ -16,9 +16,9 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeDelta, TimeZone, Utc};
 use chrono_tz::Tz;
 use news_provider::budget::RequestBudget;
 use news_provider::provider::{
-    precision_of, probed_lag, Calendar, CollectedItem, Extracted, ExtractedBody, Listing,
-    NotPlanned, Plan, PlanRefusal, Provenance, Provider, RawBlob, UnusableReason, UnusableRow,
-    ValidPrecision, ValidSource,
+    listed_sessions, precision_of, probed_lag, Cadence, Calendar, CollectedItem, Extracted,
+    ExtractedBody, Listing, NotPlanned, Plan, PlanRefusal, Provenance, Provider, RawBlob,
+    UnusableReason, UnusableRow, ValidPrecision, ValidSource,
 };
 use news_provider::request::{days_of, HeaderValue, Request, RequestPhase};
 use news_provider::wire::{RawResponse, Timeouts, TransportError, TransportProfile};
@@ -210,6 +210,7 @@ impl EdgarPress {
             params: Vec::new(),
             universe_version: self.roster.version.clone(),
             listed_date: None,
+            hosts_version: None,
         }
     }
 
@@ -226,6 +227,7 @@ impl EdgarPress {
             params: Vec::new(),
             universe_version: self.roster.version.clone(),
             listed_date: Some(row.filed.clone()),
+            hosts_version: None,
         }
     }
 
@@ -375,7 +377,8 @@ impl EdgarPress {
                 Some(filed) => ValidTime::new(filed.max(listed_ends)),
                 None => return Ok(None),
             },
-            Published::Unknown => return Ok(None),
+            // `publication` never states a minute: EDGAR's acceptance field carries seconds.
+            Published::AtMinute(_) | Published::Unknown => return Ok(None),
         };
         Visibility::from_backfill(bound, lag).map(|visible| Some(visible.observed()))
     }
@@ -478,13 +481,19 @@ impl Provider for EdgarPress {
         self.roster.version.clone()
     }
 
+    /// EDGAR answers a closed day and an unpublished one with the same 403 (this file's header).
+    fn cadence(&self) -> Cadence {
+        Cadence::SessionBound
+    }
+
     fn plan(
         &self,
         target: &TargetWindow,
-        calendar: &Calendar,
-        listing: &Listing,
+        calendar: Option<&Calendar>,
+        listing: Option<&Listing>,
         at: pit::ObservationTime,
     ) -> Result<Plan, PlanRefusal> {
+        let (calendar, listing) = listed_sessions(&self.source(), calendar, listing)?;
         let Some(days) = days_of(target) else {
             return Err(PlanRefusal::TargetWindowUnreadable(
                 target.as_str().to_owned(),
@@ -577,22 +586,21 @@ impl Provider for EdgarPress {
                 if follow_up.provenance != Provenance::VendorArchive {
                     return true;
                 }
-                match story_of(follow_up) {
+                match self.story_of(follow_up) {
                     Some(story) => !covered.contains(story.hex()),
                     None => true,
                 }
             })
             .collect()
     }
-}
 
-/// The story a follow-up document request belongs to, taken over the accession its url carries.
-/// `story_id` is `canon` over the vendor row identity, which for EDGAR is the accession, so the
-/// covered set is matched by computing the digest from the index-derived url rather than by
-/// storing it. `None` when the url carries no accession.
-fn story_of(follow_up: &Request) -> Option<Digest> {
-    let accession = accession_of(&follow_up.url)?;
-    canon::digest::story_id(SOURCE, &accession).ok()
+    /// `story_id` is `canon` over the vendor row identity, which for EDGAR is the accession, so
+    /// the covered set is matched by computing the digest from the index-derived url rather than
+    /// by storing it. `None` when the url carries no accession.
+    fn story_of(&self, follow_up: &Request) -> Option<Digest> {
+        let accession = accession_of(&follow_up.url)?;
+        canon::digest::story_id(SOURCE, &accession).ok()
+    }
 }
 
 /// The accession an EDGAR document url ends in:

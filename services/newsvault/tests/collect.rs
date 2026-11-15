@@ -9,12 +9,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use chrono::{DateTime, NaiveDate, Utc};
-use news_provider::provider::Provider;
 use news_provider::{
     Archive, ArchiveError, AttemptEvent, AttemptReceipt, AttemptSlot, Clock, CollectedItem,
-    Committed, Exchange, Exit, HeaderValue, LedgerError, Provenance, RawResponse, Request,
-    RequestPhase, RunId, SendFailure, SendPermit, Sink, SourceId, TargetWindow,
+    Committed, CredentialRef, Exchange, Exit, HeaderValue, LedgerError, Provenance, RawResponse,
+    Request, RequestPhase, RunId, SendFailure, SendPermit, Sink, SourceId, TargetWindow,
 };
+use news_provider::{CollectError, PlanRefusal, Run};
 use newsvault::cmd_collect::{self, Ask};
 use newsvault::cmd_items::{self, PerStory};
 use newsvault::cmd_ledger;
@@ -60,8 +60,11 @@ const SERVICE_UNAVAILABLE: u16 = 503;
 
 const EXIT_OK: i32 = 0;
 const EXIT_USAGE: i32 = 2;
+const EXIT_NOT_FOUND: i32 = 4;
 const EXIT_LEASE_HELD: i32 = 7;
 const EXIT_INCOMPLETE: i32 = 8;
+/// One above `store::SCHEMA_VERSION`, which this build must refuse rather than write into.
+const A_NEWER_USER_VERSION: i32 = newsvault::store::SCHEMA_VERSION + 1;
 
 /// The index names four filings, two of them in universe under an in-list form type.
 const VENDOR_ROWS_IN_THE_INDEX: u32 = 4;
@@ -96,9 +99,10 @@ fn ask(store: &Path, window: &str) -> Ask {
         schedule: Some(SCHEDULE.to_owned()),
         expected_runs: EXPECTED_RUNS,
         store: store.to_path_buf(),
-        calendar: fixture("calendar.json"),
-        listing: fixture("quarter_index.json"),
-        roster: fixture("roster.json"),
+        calendar: Some(fixture("calendar.json")),
+        listing: Some(fixture("quarter_index.json")),
+        roster: Some(fixture("roster.json")),
+        hosts: None,
         rules: rules(),
         lag_policy: None,
         contact: CONTACT.to_owned(),
@@ -339,9 +343,26 @@ struct Answered {
 
 /// Runs the binary with stdin closed, which is the shape a scheduler gives it.
 fn binary(args: &[&str]) -> Result<Answered, Box<dyn Error>> {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+    binary_env(
+        args,
+        &[
+            ("BELLWETHER_SEC_CONTACT", CONTACT),
+            ("BELLWETHER_FEED_CONTACT", CONTACT),
+        ],
+    )
+}
+
+/// `binary` with exactly the contact variables named, and any other variable a test sets.
+fn binary_env(args: &[&str], env: &[(&str, &str)]) -> Result<Answered, Box<dyn Error>> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_newsvault"));
+    command
+        .env_remove("BELLWETHER_SEC_CONTACT")
+        .env_remove("BELLWETHER_FEED_CONTACT");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let mut child = command
         .args(args)
-        .env("BELLWETHER_SEC_CONTACT", CONTACT)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -565,7 +586,7 @@ fn a_commit_the_store_refused_exits_eight_and_names_the_attempt() -> TestResult 
     let run = RunId::new("refusing");
     let driven = cmd_collect::drive(
         &ask,
-        &provider.provider,
+        provider.provider.as_ref(),
         &mut archive,
         &Payloads::a_good_day()?,
         &Fixed,
@@ -580,6 +601,109 @@ fn a_commit_the_store_refused_exits_eight_and_names_the_attempt() -> TestResult 
     assert_eq!(collected.exit(), Exit::CommitFailed);
     assert_eq!(named.len(), 1, "{:?}", collected.attempts);
     assert!(named[0].contains("refused attempt"), "{named:?}");
+    Ok(())
+}
+
+/// An archive that records every call made to it, so "refused before anything" is a count.
+#[derive(Default)]
+struct Untouched {
+    calls: RefCell<Vec<&'static str>>,
+}
+
+impl Untouched {
+    fn touched(&self, call: &'static str) -> ArchiveError {
+        self.calls.borrow_mut().push(call);
+        ArchiveError {
+            act: call,
+            detail: "this archive was not to be touched".to_owned(),
+        }
+    }
+}
+
+impl Sink for Untouched {
+    fn write(&mut self, _event: &AttemptEvent) -> Result<(), LedgerError> {
+        self.calls.borrow_mut().push("write");
+        Ok(())
+    }
+}
+
+impl Archive for Untouched {
+    fn put_blob(&self, _payload: &[u8]) -> Result<String, ArchiveError> {
+        Err(self.touched("put_blob"))
+    }
+
+    fn commit(
+        &mut self,
+        _closed: AttemptReceipt,
+        _items: &[CollectedItem],
+        _raw_blob: Option<&str>,
+        _observed: ObservationTime,
+    ) -> Result<Committed, ArchiveError> {
+        Err(self.touched("commit"))
+    }
+
+    fn ok_vendor_rows(&self, _source: &SourceId) -> Result<Vec<u32>, ArchiveError> {
+        Err(self.touched("ok_vendor_rows"))
+    }
+
+    fn attempts_in_flight(&self) -> Result<Vec<String>, ArchiveError> {
+        Err(self.touched("attempts_in_flight"))
+    }
+
+    fn covered_story_ids(
+        &self,
+        _source: &SourceId,
+        _target_window: &TargetWindow,
+    ) -> Result<std::collections::BTreeSet<String>, ArchiveError> {
+        Err(self.touched("covered_story_ids"))
+    }
+
+    fn record_planned_coverage(
+        &mut self,
+        _attempt_id: &str,
+        _matched: u32,
+    ) -> Result<(), ArchiveError> {
+        Err(self.touched("record_planned_coverage"))
+    }
+}
+
+/// Architecture.md section 11.2: a run whose inputs do not match the provider's declaration is
+/// refused by the driver before the startup sweep reads the archive and before any send.
+#[test]
+fn a_session_bound_run_with_no_calendar_is_refused_before_any_request() -> TestResult {
+    let root = TempDir::new()?;
+    let ask = ask(root.path(), A_LISTED_SESSION);
+    let opened = cmd_collect::open_provider(&ask)?;
+    let listing = edgar_press::read_listing(&std::fs::read(
+        ask.listing
+            .as_deref()
+            .ok_or("an edgar ask names a listing")?,
+    )?)?;
+    let exchange = Payloads::a_good_day()?;
+    let mut archive = Untouched::default();
+    let refused = news_provider::collect(
+        opened.provider.as_ref(),
+        &mut archive,
+        &exchange,
+        &Fixed,
+        &Run {
+            run: &RunId::new("run-no-calendar"),
+            target: &TargetWindow::new(A_LISTED_SESSION),
+            calendar: None,
+            listing: Some(&listing),
+            at: ObservationTime::new(at()),
+        },
+    );
+    let named = matches!(
+        refused,
+        Err(CollectError::Planning(PlanRefusal::InputsDoNotMatchCadence { why, .. }))
+            if why == "has no calendar"
+    );
+    assert!(named, "{refused:?}");
+    assert_eq!(
+        (exchange.sends(), archive.calls.borrow().clone()),
+        (0, Vec::<&str>::new())
+    );
     Ok(())
 }
 
@@ -775,6 +899,7 @@ fn an_attempt_a_dead_run_left_open_is_closed_interrupted_by_the_next_run() -> Te
         params: Vec::new(),
         universe_version: provider.provider.universe_version(),
         listed_date: None,
+        hosts_version: None,
     };
     let orphan = AttemptSlot::open(&mut store, &abandoned, &dead, 0, ObservationTime::new(at()))?;
     let orphaned = orphan.attempt_id().hex().to_owned();
@@ -1380,6 +1505,507 @@ fn a_request_that_fails_transiently_every_time_is_bounded_to_n_plus_one_attempts
     assert_eq!(
         outcomes_for(&answer, MICROSOFT_URL),
         vec!["failed".to_owned(); microsoft_attempts]
+    );
+    Ok(())
+}
+
+const OPEN_WEB: &str = "open_web_wires";
+/// Inside Saturday 2026-11-14, the day the GNW probes ran (architecture.md section 11.6).
+const SATURDAY_AT: &str = "2026-11-14T19:30:00Z";
+const SATURDAY: &str = "2026-11-14";
+/// Thirty minutes before UTC midnight: already 2026-11-15 in any zone east of UTC+00:30.
+const LATE_SATURDAY_AT: &str = "2026-11-14T23:30:00Z";
+/// UTC+14, the zone furthest ahead of UTC, so its local date is the next day for most of UTC's.
+const A_ZONE_AHEAD_OF_UTC: &str = "Pacific/Kiritimati";
+const GNW_INDEX: &str = "https://rss.globenewswire.com/rssfeed/";
+/// `synthetic_index_one_release.xml`'s one `www.` link, rewritten to `rss.` as the rules say.
+const GNW_RELEASE: &str =
+    "https://rss.globenewswire.com/news-release/2026/11/14/9999999/0/en/synthetic-release.html";
+/// The committed hosts file admits one host, so a plan holds one index request.
+const ADMITTED_HOSTS: u64 = 1;
+
+fn open_web_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../providers/open-web-feed")
+}
+
+/// The production hosts and rules files, as `rules()` is edgar's.
+fn open_web_hosts() -> PathBuf {
+    open_web_dir().join("hosts/open_web_wires.hosts.json")
+}
+
+fn open_web_rules() -> PathBuf {
+    open_web_dir().join("rules/open-web-feed.rules.json")
+}
+
+fn gnw(name: &str) -> PathBuf {
+    open_web_dir().join("tests/fixtures/gnw").join(name)
+}
+
+fn instant(text: &str) -> DateTime<Utc> {
+    text.parse().unwrap_or(DateTime::UNIX_EPOCH)
+}
+
+fn open_web_ask(store: &Path, at: &str) -> Ask {
+    Ask {
+        sources: vec![OPEN_WEB.to_owned()],
+        window: cmd_collect::TODAY.to_owned(),
+        schedule: Some(SCHEDULE.to_owned()),
+        expected_runs: EXPECTED_RUNS,
+        store: store.to_path_buf(),
+        calendar: None,
+        listing: None,
+        roster: None,
+        hosts: Some(open_web_hosts()),
+        rules: open_web_rules(),
+        lag_policy: None,
+        contact: CONTACT.to_owned(),
+        at: instant(at),
+        dry_run: false,
+    }
+}
+
+/// A clock standing at one named instant.
+struct At(DateTime<Utc>);
+
+impl Clock for At {
+    fn now(&self) -> DateTime<Utc> {
+        self.0
+    }
+}
+
+fn gnw_payloads(answers: &[(&str, u16, &str)]) -> Result<Payloads, Box<dyn Error>> {
+    let mut held = BTreeMap::new();
+    for (url, status, name) in answers {
+        held.insert((*url).to_owned(), (*status, std::fs::read(gnw(name))?));
+    }
+    Ok(Payloads {
+        answers: held,
+        asked: RefCell::new(Vec::new()),
+    })
+}
+
+fn open_web_args(store: &Path, extra: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "collect",
+        "--source",
+        OPEN_WEB,
+        "--window",
+        cmd_collect::TODAY,
+        "--store",
+        &path(store),
+        "--hosts",
+        &path(&open_web_hosts()),
+        "--rules",
+        &path(&open_web_rules()),
+        "--at",
+        SATURDAY_AT,
+        "--format",
+        "json",
+        "--dry-run",
+    ]
+    .iter()
+    .map(|arg| (*arg).to_owned())
+    .collect();
+    args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+    args
+}
+
+fn refused_flag(refused: Result<cmd_collect::Opened, cmd_collect::CollectRunError>) -> String {
+    match refused {
+        Err(cmd_collect::CollectRunError::FlagRefused { flag, .. }) => format!("refused {flag}"),
+        Err(cmd_collect::CollectRunError::FlagRequired { flag, .. }) => format!("required {flag}"),
+        Err(other) => format!("another refusal: {other}"),
+        Ok(opened) => format!("opened {opened:?}"),
+    }
+}
+
+/// Section 11.2: the open-web run takes neither a calendar nor a listing, and no file of edgar's;
+/// a flag it does not read is refused, never ignored. Mutation 2026-11-15: dropping the cadence
+/// check in `open_provider` turns this red.
+#[test]
+fn an_open_web_run_refuses_a_calendar_or_listing_flag() -> TestResult {
+    let root = TempDir::new()?;
+    let given = open_web_ask(root.path(), SATURDAY_AT);
+    let mut said = Vec::new();
+    for flag in ["calendar", "listing", "roster", "lag-policy"] {
+        let mut ask = given.clone();
+        match flag {
+            "calendar" => ask.calendar = Some(fixture("calendar.json")),
+            "listing" => ask.listing = Some(fixture("quarter_index.json")),
+            "roster" => ask.roster = Some(fixture("roster.json")),
+            _ => ask.lag_policy = Some(lag_policy()),
+        }
+        said.push(refused_flag(cmd_collect::open_provider(&ask)));
+    }
+    assert_eq!(
+        said,
+        vec![
+            "refused calendar",
+            "refused listing",
+            "refused roster",
+            "refused lag-policy"
+        ]
+    );
+    let calendar = path(&fixture("calendar.json"));
+    let args = open_web_args(root.path(), &["--calendar", &calendar]);
+    let answered = binary(&args.iter().map(String::as_str).collect::<Vec<&str>>())?;
+    assert_eq!((answered.code, answered.stdout.len()), (EXIT_USAGE, 0));
+    assert!(tree(root.path()).is_empty());
+    Ok(())
+}
+
+/// The other side of the table: edgar needs its calendar, and takes no hosts file. Refused before
+/// the store is touched. Mutation 2026-11-15: dropping the cadence check in `open_provider`
+/// turns this red (the binary writes a run envelope, then `collect` refuses).
+#[test]
+fn an_edgar_run_without_a_calendar_is_a_usage_error() -> TestResult {
+    let root = TempDir::new()?;
+    let without = Ask {
+        calendar: None,
+        ..ask(root.path(), A_LISTED_SESSION)
+    };
+    let with_hosts = Ask {
+        hosts: Some(open_web_hosts()),
+        ..ask(root.path(), A_LISTED_SESSION)
+    };
+    assert_eq!(
+        (
+            refused_flag(cmd_collect::open_provider(&without)),
+            refused_flag(cmd_collect::open_provider(&with_hosts)),
+            refused_flag(cmd_collect::open_provider(&Ask {
+                hosts: None,
+                ..open_web_ask(root.path(), SATURDAY_AT)
+            })),
+        ),
+        (
+            "required calendar".to_owned(),
+            "refused hosts".to_owned(),
+            "required hosts".to_owned()
+        )
+    );
+    let args: Vec<String> = collect_args(root.path(), A_LISTED_SESSION, &[])
+        .into_iter()
+        .collect();
+    let at = args
+        .iter()
+        .position(|arg| arg == "--calendar")
+        .ok_or("the edgar arguments name a calendar")?;
+    let without: Vec<&str> = args
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != at && *index != at + 1)
+        .map(|(_, arg)| arg.as_str())
+        .collect();
+    let answered = binary(&without)?;
+    assert_eq!((answered.code, answered.stdout.len()), (EXIT_USAGE, 0));
+    assert!(
+        tree(root.path()).is_empty(),
+        "{:?}",
+        tree(root.path()).keys()
+    );
+    Ok(())
+}
+
+/// `--window today` is the UTC date of `--at`, never the machine's local date: run under a zone
+/// where 23:30Z is already the next day. Mutation 2026-11-15: resolving from `chrono::Local`
+/// turns this red (the plan is refused as not the run's day).
+#[test]
+fn window_today_resolves_to_the_utc_date_of_at() -> TestResult {
+    let root = TempDir::new()?;
+    let mut args = open_web_args(root.path(), &[]);
+    let at = args
+        .iter()
+        .position(|arg| arg == SATURDAY_AT)
+        .ok_or("the arguments name --at")?;
+    LATE_SATURDAY_AT.clone_into(&mut args[at]);
+    let answered = binary_env(
+        &args.iter().map(String::as_str).collect::<Vec<&str>>(),
+        &[
+            ("BELLWETHER_FEED_CONTACT", CONTACT),
+            ("TZ", A_ZONE_AHEAD_OF_UTC),
+        ],
+    )?;
+    assert_eq!(answered.code, EXIT_OK);
+    let envelope: Value = serde_json::from_slice(&answered.stdout)?;
+    assert_eq!(
+        (
+            envelope["window"].as_str(),
+            envelope["plan"]["requests"].as_u64()
+        ),
+        (Some(SATURDAY), Some(ADMITTED_HOSTS))
+    );
+    Ok(())
+}
+
+/// Section 11.1: the hosts file's digest is in the run envelope and in every attempt row; edgar's
+/// envelope names none and a calendar. Mutation 2026-11-15: `"hosts_version": null` in
+/// `envelope_of` turns this red.
+#[test]
+fn the_run_envelope_names_the_hosts_file_it_was_allowed_to_use() -> TestResult {
+    let root = TempDir::new()?;
+    let ask = open_web_ask(root.path(), SATURDAY_AT);
+    let opened = cmd_collect::open_provider(&ask)?;
+    let exchange = gnw_payloads(&[
+        (GNW_INDEX, OK, "synthetic_index_one_release.xml"),
+        (GNW_RELEASE, OK, "synthetic_canonical_differs.html"),
+    ])?;
+    let answer = cmd_collect::run(&ask, &opened, &exchange, &At(instant(SATURDAY_AT)))?;
+    let digest = canon::FileDigest::of(&std::fs::read(open_web_hosts())?);
+    assert_eq!(
+        (
+            answer.exit,
+            answer.envelope["hosts_version"].as_str(),
+            answer.envelope["calendar_version"].is_null(),
+            answer.envelope["source"].as_str(),
+            answer.envelope["items_committed"].as_u64(),
+        ),
+        (Exit::Ok, Some(digest.hex()), true, Some(OPEN_WEB), Some(1)),
+        "{:#}",
+        answer.envelope
+    );
+    let db = Connection::open_with_flags(
+        root.path().join(COMMIT_LOG),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let mut rows = db.prepare("SELECT hosts_version FROM attempts")?;
+    let stored: Vec<Option<String>> = rows
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<Option<String>>, _>>()?;
+    assert_eq!(stored, vec![Some(digest.hex().to_owned()); 2]);
+    let edgar = collected(
+        &root.path().join("edgar"),
+        A_LISTED_SESSION,
+        &Payloads::a_good_day()?,
+    )?;
+    assert_eq!(
+        (
+            edgar.envelope["hosts_version"].is_null(),
+            edgar.envelope["calendar_version"].is_string()
+        ),
+        (true, true)
+    );
+    Ok(())
+}
+
+/// Section 11.2: a second SourceId in one invocation needs a run envelope listing one
+/// `hosts_version` per source, which is not built. Mutation 2026-11-15: `chosen` returning the
+/// first source instead of refusing turns this red.
+#[test]
+fn two_sources_in_one_invocation_are_refused() -> TestResult {
+    let both = [SOURCE.to_owned(), OPEN_WEB.to_owned()];
+    let twice = [SOURCE.to_owned(), SOURCE.to_owned()];
+    assert!(matches!(
+        cmd_collect::Registered::chosen(&both),
+        Err(cmd_collect::CollectRunError::MoreThanOneSource(_))
+    ));
+    assert!(matches!(
+        cmd_collect::Registered::chosen(&twice),
+        Ok(cmd_collect::Registered::EdgarPress)
+    ));
+    let root = TempDir::new()?;
+    let answered = run_collect(root.path(), A_LISTED_SESSION, &["--source", OPEN_WEB])?;
+    assert_eq!((answered.code, answered.stdout.len()), (EXIT_USAGE, 0));
+    assert!(tree(root.path()).is_empty());
+    Ok(())
+}
+
+#[test]
+fn an_open_web_dry_run_plans_one_index_request_per_admitted_host_and_writes_nothing() -> TestResult
+{
+    let root = TempDir::new()?;
+    let dry = Ask {
+        dry_run: true,
+        ..open_web_ask(root.path(), SATURDAY_AT)
+    };
+    let opened = cmd_collect::open_provider(&dry)?;
+    let exchange = gnw_payloads(&[])?;
+    let answer = cmd_collect::run(&dry, &opened, &exchange, &At(instant(SATURDAY_AT)))?;
+    assert_eq!(
+        (
+            exchange.sends(),
+            answer.exit,
+            answer.envelope["plan"]["requests"].as_u64(),
+            answer.envelope["changed"].as_bool(),
+        ),
+        (0, Exit::Ok, Some(ADMITTED_HOSTS), Some(false)),
+        "{:#}",
+        answer.envelope
+    );
+    assert!(tree(root.path()).is_empty());
+    Ok(())
+}
+
+/// An every-day provider collects the clock's own UTC day; an `--at` on another day would label
+/// today's fetch with that day. Mutation 2026-11-15: removing the check in `cmd_collect::run`
+/// turns this red (the run writes its envelope and asks the index).
+#[test]
+fn an_open_web_run_whose_at_is_not_the_clocks_day_is_refused_before_anything_is_written(
+) -> TestResult {
+    let root = TempDir::new()?;
+    let ask = open_web_ask(root.path(), SATURDAY_AT);
+    let opened = cmd_collect::open_provider(&ask)?;
+    let exchange = gnw_payloads(&[(GNW_INDEX, OK, "synthetic_index_one_release.xml")])?;
+    let refused = cmd_collect::run(&ask, &opened, &exchange, &Fixed);
+    assert!(
+        matches!(
+            refused,
+            Err(cmd_collect::CollectRunError::AtIsNotTheClockDay { .. })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(exchange.sends(), 0);
+    assert!(tree(root.path()).is_empty());
+    Ok(())
+}
+
+/// Section 5.1: an absent hosts file, one admitting no host and an absent rules file are
+/// `input_absent`, exit 4, as an absent or empty roster is. Mutations 2026-11-15: removing the
+/// `OpenWebRefused` arm in `exit_code` turns this red (all exit 2); removing only its
+/// `RulesAbsent` arm was green before the rules case was added.
+#[test]
+fn an_open_web_run_with_an_absent_or_empty_hosts_file_or_an_absent_rules_file_exits_four(
+) -> TestResult {
+    let root = TempDir::new()?;
+    let absent = path(&root.path().join("no-such-hosts.json"));
+    let none_admitted = path(&open_web_dir().join("tests/fixtures/hosts/none_admitted.json"));
+    let no_rules = path(&root.path().join("no-such-rules.json"));
+    let mut exits = Vec::new();
+    for (flag, given) in [
+        ("--hosts", absent),
+        ("--hosts", none_admitted),
+        ("--rules", no_rules),
+    ] {
+        let mut args = open_web_args(root.path(), &[]);
+        let at = args
+            .iter()
+            .position(|arg| arg == flag)
+            .ok_or("the arguments name the flag")?;
+        args[at + 1] = given;
+        let answered = binary(&args.iter().map(String::as_str).collect::<Vec<&str>>())?;
+        exits.push((answered.code, answered.stdout.len()));
+    }
+    assert_eq!(exits, vec![(EXIT_NOT_FOUND, 0); 3]);
+    Ok(())
+}
+
+/// A store at a version above this build's is refused before the run writes its envelope or
+/// anything else into it. Review 2026-11-15 measured a `runs/` file left behind by the refusal.
+#[test]
+fn a_run_against_a_store_at_a_newer_user_version_leaves_the_store_unchanged() -> TestResult {
+    let root = TempDir::new()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    db.pragma_update(None, "user_version", A_NEWER_USER_VERSION)?;
+    drop(db);
+    let digests = |root: &Path| -> Vec<(String, String)> {
+        tree(root)
+            .into_iter()
+            .map(|(name, bytes)| (name, canon::FileDigest::of(&bytes).hex().to_owned()))
+            .collect()
+    };
+    let before = digests(root.path());
+    let refused = collected(root.path(), A_LISTED_SESSION, &Payloads::a_good_day()?);
+    let said = refused
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+    assert!(
+        said.contains(&format!("user_version {A_NEWER_USER_VERSION}")),
+        "{said}"
+    );
+    assert_eq!(digests(root.path()), before);
+    Ok(())
+}
+
+/// A usage error is reported before any input file is read, so an absent file beside it cannot
+/// turn exit 2 into exit 4. Mutation 2026-11-15: the calendar and listing checks moved back after
+/// the provider's `open` turns this red (both report the absent file).
+#[test]
+fn a_flag_error_beside_an_absent_input_file_is_still_a_usage_error() -> TestResult {
+    let root = TempDir::new()?;
+    let absent = root.path().join("absent.json");
+    let edgar = Ask {
+        calendar: None,
+        roster: Some(absent.clone()),
+        ..ask(root.path(), A_LISTED_SESSION)
+    };
+    let open_web = Ask {
+        calendar: Some(fixture("calendar.json")),
+        hosts: Some(absent.clone()),
+        ..open_web_ask(root.path(), SATURDAY_AT)
+    };
+    assert_eq!(
+        [edgar, open_web].map(|ask| refused_flag(cmd_collect::open_provider(&ask))),
+        ["required calendar", "refused calendar"]
+    );
+    let calendar = path(&fixture("calendar.json"));
+    let mut args = open_web_args(root.path(), &["--calendar", &calendar]);
+    let at = args
+        .iter()
+        .position(|arg| arg == "--hosts")
+        .ok_or("the arguments name --hosts")?;
+    args[at + 1] = path(&absent);
+    let answered = binary(&args.iter().map(String::as_str).collect::<Vec<&str>>())?;
+    assert_eq!((answered.code, answered.stdout.len()), (EXIT_USAGE, 0));
+    Ok(())
+}
+
+/// `Registered::cadence` decides the calendar and listing flags before the provider is opened, so
+/// it must be what each provider declares once open.
+#[test]
+fn every_registered_cadence_is_the_one_its_provider_declares() -> TestResult {
+    let root = TempDir::new()?;
+    let mut declared = Vec::new();
+    for ask in [
+        ask(root.path(), A_LISTED_SESSION),
+        open_web_ask(root.path(), SATURDAY_AT),
+    ] {
+        let opened = cmd_collect::open_provider(&ask)?;
+        declared.push((opened.provider.cadence(), opened.registered.cadence()));
+    }
+    assert_eq!(declared.len(), cmd_collect::Registered::ALL.len());
+    for (opened, registered) in declared {
+        assert_eq!(opened, registered);
+    }
+    Ok(())
+}
+
+/// The table's credential name is the one the provider's own User-Agent asks `Wire` for; a
+/// mismatch stores the contact where `Wire::send` never reads it. Mutation 2026-11-15: the
+/// open-web entry naming edgar's credential was green before this.
+#[test]
+fn every_registered_credential_is_the_one_its_providers_user_agent_names() -> TestResult {
+    let root = TempDir::new()?;
+    let mut named = Vec::new();
+    for ask in [
+        ask(root.path(), A_LISTED_SESSION),
+        open_web_ask(root.path(), SATURDAY_AT),
+    ] {
+        let opened = cmd_collect::open_provider(&ask)?;
+        named.push((
+            opened.provider.transport().user_agent,
+            HeaderValue::FromCredential(CredentialRef::new(opened.registered.credential())),
+        ));
+    }
+    assert_eq!(named.len(), cmd_collect::Registered::ALL.len());
+    for (asked_for, held_under) in named {
+        assert_eq!(asked_for, held_under);
+    }
+    Ok(())
+}
+
+/// Each provider's contact comes from its own variable: SEC's address set alone leaves the
+/// open-web User-Agent with none, refused at startup. Mutation 2026-11-15: `contact_variable`
+/// naming `BELLWETHER_SEC_CONTACT` for both turns this red (exit 0).
+#[test]
+fn an_open_web_run_reads_its_contact_from_its_own_variable() -> TestResult {
+    let root = TempDir::new()?;
+    let args = open_web_args(root.path(), &[]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let sec_only = binary_env(&args, &[("BELLWETHER_SEC_CONTACT", CONTACT)])?;
+    let own = binary_env(&args, &[("BELLWETHER_FEED_CONTACT", CONTACT)])?;
+    assert_eq!(
+        (sec_only.code, sec_only.stdout.len(), own.code),
+        (EXIT_USAGE, 0, EXIT_OK)
     );
     Ok(())
 }

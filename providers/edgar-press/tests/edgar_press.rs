@@ -10,8 +10,9 @@ use chrono::{DateTime, Utc};
 use edgar_press::{read_listing, EdgarPress, Refusal, CONTACT_CREDENTIAL, SOURCE};
 use news_provider::conformance::{breaches, RecordingSink, Subject};
 use news_provider::provider::{
-    precision_of, stamp_of, BodyState, Calendar, CollectedItem, Extracted, Listing, NotPlanned,
-    Plan, PlanRefusal, Provenance, Provider, RawBlob, UnusableReason, ValidPrecision, ValidSource,
+    precision_of, stamp_of, BodyState, Cadence, Calendar, CollectedItem, Extracted, Listing,
+    NotPlanned, Plan, PlanRefusal, Provenance, Provider, RawBlob, UnusableReason, ValidPrecision,
+    ValidSource,
 };
 use news_provider::request::{Request, RequestPhase};
 use news_provider::{AttemptEvent, AttemptSlot, RawResponse, RunId, TargetWindow, Verdict};
@@ -149,8 +150,8 @@ fn listing() -> Result<Listing, Refusal> {
 fn plan_over(window: &str, provider: &EdgarPress) -> Result<Plan, Box<dyn std::error::Error>> {
     Ok(provider.plan(
         &TargetWindow::new(window),
-        &calendar()?,
-        &listing()?,
+        Some(&calendar()?),
+        Some(&listing()?),
         at(RUN_AT),
     )?)
 }
@@ -330,8 +331,8 @@ fn a_window_that_is_not_a_day_or_a_range_is_refused_rather_than_planned_as_nothi
     let provider = provider()?;
     let refused = provider.plan(
         &TargetWindow::new(NOT_A_WINDOW),
-        &calendar()?,
-        &listing()?,
+        Some(&calendar()?),
+        Some(&listing()?),
         at(RUN_AT),
     );
     assert_eq!(
@@ -422,8 +423,8 @@ fn a_vendor_archive_window_is_refused_until_a_probed_lag_stands_behind_it() -> O
         provider
             .plan(
                 &TargetWindow::new(AN_ARCHIVED_SESSION),
-                &calendar()?,
-                &listing()?,
+                Some(&calendar()?),
+                Some(&listing()?),
                 at(RUN_AT)
             )
             .err(),
@@ -1178,12 +1179,39 @@ fn the_conformance_harness_finds_no_breach_in_this_provider() -> Outcome {
     ];
     let subject = Subject {
         target: TargetWindow::new(A_WINDOW_SPANNING_ALL_FOUR),
-        calendar: &calendar,
-        listing: &listing,
+        calendar: Some(&calendar),
+        listing: Some(&listing),
         at: at(RUN_AT),
         payloads: &payloads,
     };
     assert_eq!(breaches(&provider, &subject), Vec::new());
+    Ok(())
+}
+
+/// Architecture.md section 11.2: the declaration is what keeps the harness's listed-session check
+/// on this provider, which an `EveryUtcDay` here would switch off.
+#[test]
+fn edgar_press_declares_itself_session_bound() -> Outcome {
+    assert_eq!(provider()?.cadence(), Cadence::SessionBound);
+    Ok(())
+}
+
+#[test]
+fn a_plan_with_no_calendar_is_refused_and_names_what_is_missing() -> Outcome {
+    let refused = provider()?.plan(
+        &TargetWindow::new(A_LISTED_SESSION),
+        None,
+        Some(&listing()?),
+        at(RUN_AT),
+    );
+    assert_eq!(
+        refused.err(),
+        Some(PlanRefusal::InputsDoNotMatchCadence {
+            source_id: SOURCE.to_owned(),
+            cadence: "session_bound",
+            why: "has no calendar",
+        })
+    );
     Ok(())
 }
 

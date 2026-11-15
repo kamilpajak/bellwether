@@ -124,6 +124,10 @@ fn published_text(published: Published) -> String {
             .inner()
             .to_rfc3339_opts(SecondsFormat::Micros, true)
             .to_string(),
+        Published::AtMinute(minute) => format!(
+            "minute {}",
+            minute.start().to_rfc3339_opts(SecondsFormat::Micros, true)
+        ),
         Published::On { day, tz } => format!("day {day} {tz}"),
         Published::Unknown => "unknown".to_owned(),
     }

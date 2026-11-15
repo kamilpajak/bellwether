@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Synthetic: one GNW-shaped item whose page (synthetic_canonical_differs.html) names another canonical link. -->
+<rss version="2.0">
+  <channel>
+    <title>GlobeNewswire RSS Feed</title>
+    <link>https://rss.globenewswire.com/rssfeed/</link>
+    <item>
+      <link>https://www.globenewswire.com/news-release/2026/11/14/9999999/0/en/synthetic-release.html</link>
+      <title>Synthetic Release</title>
+      <pubDate>Sat, 14 Nov 2026 19:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>

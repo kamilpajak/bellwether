@@ -1,0 +1,14 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "item_id",
+  "note": "A minute-precision publication value carries its first microsecond beside the minute tag. Same value string as item_id_midnight_instant.json, different tag, different digest. Python 3 hashlib reproduced it on 2026-11-15.",
+  "input": {
+    "source": "edgar_press",
+    "source_item_id": "0000320193-26-000071",
+    "url": "https://www.sec.gov/Archives/edgar/data/320193/000032019326000071/ex991.htm",
+    "valid": { "minute": "2026-07-01T00:00:00.000000Z" },
+    "title": "Schäfer Holdings reports",
+    "body_ref": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "sha256": "88a9c6c73eed59fd11c00c581301f0e683904781af37e704ec5645357267d988"
+}

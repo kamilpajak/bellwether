@@ -142,7 +142,7 @@ mod tests {
     const MIDNIGHT_MICROS: i64 = 1_782_864_000_000_000;
     /// Every file in `vectors/` is read by the loop below; the count is here so that deleting one
     /// is a failure rather than a smaller pass.
-    const VECTOR_COUNT: usize = 15;
+    const VECTOR_COUNT: usize = 16;
 
     fn at(micros: i64) -> DateTime<Utc> {
         DateTime::UNIX_EPOCH + TimeDelta::microseconds(micros)
@@ -214,6 +214,13 @@ mod tests {
         assert_ne!(hex(item_id(&dated)), hex(item_id(&stamped)));
     }
 
+    #[test]
+    fn a_minute_and_the_instant_at_its_first_microsecond_digest_differently() {
+        let minute = item(TITLE, Stamp::Minute(at(MIDNIGHT_MICROS)), Some(BODY_REF));
+        let stamped = item(TITLE, Stamp::Instant(at(MIDNIGHT_MICROS)), Some(BODY_REF));
+        assert_ne!(hex(item_id(&minute)), hex(item_id(&stamped)));
+    }
+
     /// Before the form named its digest, these two calls produced one sha256: both rendered as
     /// the same two text fields. Verified by mutation 2026-11-13 - dropping the domain field
     /// turns this assertion red.
@@ -280,10 +287,13 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// Exactly one of the three keys, or the vector is unreadable.
     fn stamp(value: &Value) -> Option<Stamp> {
-        match (value["instant"].as_str(), value["day"].as_str()) {
-            (Some(instant), None) => instant.parse().ok().map(Stamp::Instant),
-            (None, Some(date)) => date.parse().ok().map(Stamp::Day),
+        let keys = ["instant", "minute", "day"].map(|key| value[key].as_str());
+        match keys {
+            [Some(instant), None, None] => instant.parse().ok().map(Stamp::Instant),
+            [None, Some(minute), None] => minute.parse().ok().map(Stamp::Minute),
+            [None, None, Some(date)] => date.parse().ok().map(Stamp::Day),
             _ => None,
         }
     }

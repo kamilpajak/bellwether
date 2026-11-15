@@ -6,8 +6,22 @@ description = "Our own forward news feed over public wire and outlet pages: arch
 publish = false
 
 # No HTTP client and no clock (section 11.1), so row R4's one-crate allowlist and clock scan cover
-# it as they cover edgar-press.
+# it as they cover edgar-press. Cost, measured 2026-11-15 by
+# `cargo tree -e normal,build --workspace --prefix none | sed 's/ (\*)$//' | sort -u | wc -l`:
+# 161 before the two parsers, 192 after. roxmltree adds itself and nothing; scraper adds 30
+# (html5ever, selectors, cssparser, string_cache, parking_lot and their kin). `default-features =
+# false` drops scraper's `main` binary and its getopts: 194 with the defaults.
 [dependencies]
+canon = { path = "../../canon" }
+chrono = "0.4.45"
+news-provider = { path = "../../news-provider" }
+pit = { path = "../../pit" }
+# RSS through an XML parser: an HTML5 parser treats `<link>` as void and loses the url.
+roxmltree = "0.21.2"
+# Pages through html5ever, the WHATWG tree builder, so `<script>` text never reads as a paragraph.
+scraper = { version = "0.29.0", default-features = false }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
 
 [lints]
 workspace = true

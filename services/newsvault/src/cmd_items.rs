@@ -10,18 +10,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDate, Utc};
-use pit::datedness::end_of_day;
+use pit::datedness::{end_of_day, Datedness, Minute};
 use pit::{Cutoff, ObservationTime, ValidTime, Visibility};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Map, Value};
 
-use crate::store::COMMIT_LOG;
+use crate::store::{require_current_version, StoreError, COMMIT_LOG, VALID_DATE};
 
 pub const SCHEMA: &str = "newsvault.items/1";
 
 /// Every field an item row can be reported under, which is also what `--fields` may name. One
 /// list, so the SQL, the envelope and the help cannot drift apart.
-pub const FIELDS: [&str; 15] = [
+pub const FIELDS: [&str; 16] = [
     "seq",
     "item_id",
     "story_id",
@@ -31,6 +31,7 @@ pub const FIELDS: [&str; 15] = [
     "valid_at",
     "valid_day",
     "valid_tz",
+    "valid_minute",
     "valid_refused",
     "valid_precision",
     "observed_at",
@@ -49,6 +50,8 @@ pub enum ItemsError {
     UnknownField(String),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Store(#[from] StoreError),
 }
 
 /// Which rows of one story a read returns.
@@ -107,6 +110,7 @@ struct Row {
     valid_at: Option<String>,
     valid_day: Option<String>,
     valid_tz: Option<String>,
+    valid_minute: Option<String>,
     valid_refused: Option<String>,
     observed_at: String,
     valid_disputed: bool,
@@ -126,6 +130,7 @@ pub fn read(root: &Path, ask: &Ask) -> Result<Report, ItemsError> {
         return Err(ItemsError::StoreAbsent(log));
     }
     let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    require_current_version(&db)?;
     let cutoff = Cutoff::new(ask.at);
     let mut visible: Vec<Row> = rows(&db)?
         .into_iter()
@@ -176,14 +181,13 @@ fn chosen(asked: Option<&[String]>) -> Result<Vec<&'static str>, ItemsError> {
 /// Ordered by `seq` and by nothing else, which is the only ordering authority
 /// (architecture.md section 2).
 fn rows(db: &Connection) -> Result<Vec<Row>, ItemsError> {
-    let mut statement = db.prepare(
+    let mut statement = db.prepare(&format!(
         "SELECT i.seq, i.item_id, i.story_id, i.doc_id, i.attempt_id, a.source, i.valid_at,
-                i.valid_day, i.valid_tz, i.valid_refused, i.observed_at, i.valid_disputed,
-                i.earliest_valid_at,
-                substr(COALESCE(i.valid_at, i.valid_day, i.valid_refused), 1, 10)
+                i.valid_day, i.valid_tz, i.valid_minute, i.valid_refused, i.observed_at,
+                i.valid_disputed, i.earliest_valid_at, {VALID_DATE}
          FROM items i JOIN attempts a ON a.attempt_id = i.attempt_id
-         ORDER BY i.seq",
-    )?;
+         ORDER BY i.seq"
+    ))?;
     let read = statement
         .query_map([], |row| {
             Ok(Row {
@@ -196,11 +200,12 @@ fn rows(db: &Connection) -> Result<Vec<Row>, ItemsError> {
                 valid_at: row.get(6)?,
                 valid_day: row.get(7)?,
                 valid_tz: row.get(8)?,
-                valid_refused: row.get(9)?,
-                observed_at: row.get(10)?,
-                valid_disputed: row.get(11)?,
-                earliest_valid_at: row.get(12)?,
-                valid_date: row.get(13)?,
+                valid_minute: row.get(9)?,
+                valid_refused: row.get(10)?,
+                observed_at: row.get(11)?,
+                valid_disputed: row.get(12)?,
+                earliest_valid_at: row.get(13)?,
+                valid_date: row.get(14)?,
             })
         })?
         .collect::<Result<Vec<Row>, _>>()?;
@@ -219,12 +224,21 @@ fn in_range(row: &Row, ask: &Ask) -> bool {
     after && before && sourced
 }
 
-/// Both predicates come from `pit`: an instant row through `Visibility`, a day row through the end
-/// of that day in its OWN calendar. A day bounded by UTC midnight is 19:00 in New York and admits
+/// Every predicate comes from `pit`: an instant row through `Visibility`, a minute row through
+/// `Datedness::of_minute`, a day row through the end of that day in its OWN calendar. A day bounded by UTC midnight is 19:00 in New York and admits
 /// the afternoon, which is the 13 h of lookahead the two day columns exist to remove. The zone is
 /// a stored string rather than the `&'static str` `Datedness::DayDated` carries, so this reaches
 /// `end_of_day` directly instead of rebuilding that value.
 fn visible_at(row: &Row, cutoff: Cutoff) -> bool {
+    if let Some(minute) = &row.valid_minute {
+        let (Some(minute), Some(observed)) = (
+            instant(minute).and_then(|starts| Minute::new(starts).ok()),
+            instant(&row.observed_at),
+        ) else {
+            return false;
+        };
+        return Datedness::of_minute(minute, ObservationTime::new(observed)).visible_at(cutoff);
+    }
     if let (Some(day), Some(zone)) = (&row.valid_day, &row.valid_tz) {
         let (Ok(day), Some(observed)) = (day.parse::<NaiveDate>(), instant(&row.observed_at))
         else {
@@ -272,10 +286,11 @@ fn latest_per_story(rows: Vec<Row>) -> Vec<Row> {
 /// The precision the stored columns state, derived from which column holds the value rather than
 /// carried beside it, so the two cannot disagree.
 fn precision(row: &Row) -> &'static str {
-    match (&row.valid_at, &row.valid_day) {
-        (Some(_), _) => "instant",
-        (None, Some(_)) => "day",
-        (None, None) => "unknown",
+    match (&row.valid_at, &row.valid_minute, &row.valid_day) {
+        (Some(_), _, _) => "instant",
+        (None, Some(_), _) => "minute",
+        (None, None, Some(_)) => "day",
+        (None, None, None) => "unknown",
     }
 }
 
@@ -290,6 +305,7 @@ fn reported(row: &Row, fields: &[&'static str]) -> Value {
     whole.insert("valid_at".to_owned(), json!(row.valid_at));
     whole.insert("valid_day".to_owned(), json!(row.valid_day));
     whole.insert("valid_tz".to_owned(), json!(row.valid_tz));
+    whole.insert("valid_minute".to_owned(), json!(row.valid_minute));
     whole.insert("valid_refused".to_owned(), json!(row.valid_refused));
     whole.insert("valid_precision".to_owned(), json!(precision(row)));
     whole.insert("observed_at".to_owned(), json!(row.observed_at));
@@ -317,6 +333,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
             item["valid_precision"].as_str().unwrap_or_default(),
             item["valid_at"]
                 .as_str()
+                .or_else(|| item["valid_minute"].as_str())
                 .or_else(|| item["valid_day"].as_str())
                 .unwrap_or("-"),
             item["item_id"].as_str().unwrap_or_default(),
@@ -330,4 +347,94 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
         report.matched, report.returned, report.truncated
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use canon::Stamp;
+    use chrono::{DateTime, Utc};
+    use pit::datedness::{Minute, Published};
+    use tempfile::TempDir;
+
+    use super::{read, Ask, PerStory};
+    use crate::publish::tests::{commit_valued, open};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    const RUN: &str = "2026-11-14T19:05:00Z";
+    /// GNW's RSS `pubDate` of 2026-11-14, `Sat, 14 Nov 2026 19:00 GMT`, read inside that minute.
+    const A_PUBLICATION_MINUTE: &str = "2026-11-14T19:00:00Z";
+    const READ_INSIDE_IT: &str = "2026-11-14T19:00:30Z";
+    const ONE_MICROSECOND_BEFORE_IT_CLOSES: &str = "2026-11-14T19:00:59.999998Z";
+    const THE_LAST_MICROSECOND_OF_IT: &str = "2026-11-14T19:00:59.999999Z";
+    const AFTER_THE_MINUTE_BEFORE_THE_FETCH: &str = "2026-11-14T19:02:00Z";
+
+    fn ask(at: &str) -> Result<Ask, chrono::ParseError> {
+        Ok(Ask {
+            at: at.parse()?,
+            from: None,
+            to: None,
+            source: None,
+            limit: None,
+            fields: None,
+            per_story: PerStory::All,
+        })
+    }
+
+    #[test]
+    fn a_minute_dated_item_is_invisible_until_its_minute_has_closed() -> TestResult {
+        let root = TempDir::new()?;
+        let mut store = open(&root, RUN)?;
+        let minute = Minute::new(A_PUBLICATION_MINUTE.parse::<DateTime<Utc>>()?)?;
+        commit_valued(
+            &mut store,
+            "3403075",
+            Published::AtMinute(minute),
+            Stamp::Minute(minute.start()),
+            READ_INSIDE_IT,
+        )?;
+        drop(store);
+        let mut precisions = Vec::new();
+        for cutoff in [
+            READ_INSIDE_IT,
+            ONE_MICROSECOND_BEFORE_IT_CLOSES,
+            THE_LAST_MICROSECOND_OF_IT,
+        ] {
+            let report = read(root.path(), &ask(cutoff)?)?;
+            precisions.push(
+                report
+                    .items
+                    .iter()
+                    .filter_map(|item| item["valid_precision"].as_str().map(str::to_owned))
+                    .collect::<Vec<String>>(),
+            );
+        }
+        assert_eq!(
+            precisions,
+            vec![Vec::new(), Vec::new(), vec!["minute".to_owned()]]
+        );
+        Ok(())
+    }
+
+    /// The observation half through the stored row; mutation 2026-11-15 in `pit`'s minute arm.
+    #[test]
+    fn a_minute_dated_item_fetched_after_its_minute_is_invisible_until_the_fetch() -> TestResult {
+        let root = TempDir::new()?;
+        let mut store = open(&root, RUN)?;
+        let minute = Minute::new(A_PUBLICATION_MINUTE.parse::<DateTime<Utc>>()?)?;
+        commit_valued(
+            &mut store,
+            "3403075",
+            Published::AtMinute(minute),
+            Stamp::Minute(minute.start()),
+            RUN,
+        )?;
+        drop(store);
+        let mut seen = Vec::new();
+        for cutoff in [AFTER_THE_MINUTE_BEFORE_THE_FETCH, RUN] {
+            seen.push(read(root.path(), &ask(cutoff)?)?.items.len());
+        }
+        assert_eq!(seen, vec![0, 1]);
+        Ok(())
+    }
 }

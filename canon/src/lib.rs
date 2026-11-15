@@ -5,7 +5,7 @@
 //! "Everything else" - every digest in section 2 is taken over it, and section 8 row R7 is the
 //! row it moves. `canon/vectors/` is what this crate owes a reader in another language.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Timelike, Utc};
 use sha2::{Digest as _, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
@@ -25,6 +25,7 @@ const SEPARATORS: [char; 3] = [FIELD, LIST, TAG];
 const INSTANT_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6fZ";
 const DAY_FORMAT: &str = "%Y-%m-%d";
 const INSTANT_TAG: &str = "instant";
+const MINUTE_TAG: &str = "minute";
 const DAY_TAG: &str = "day";
 const CREDENTIAL_TAG: &str = "credential";
 /// chrono carries a leap second's extra second in the nanosecond field rather than in `second`.
@@ -40,6 +41,9 @@ pub enum CanonError {
     /// `23:59:60.000000Z`, and its own microsecond round trip returns `2026-07-02T00:00:00Z`
     /// (not equal), while Python's `fromisoformat` raises `second must be in 0..59, not 60`.
     SixtiethSecond,
+    /// A `minute` stamp whose seconds or sub-seconds are not zero: `pit::datedness::Minute`
+    /// refuses one, and the form must not depend on every caller having gone through it.
+    MinuteWithSeconds,
 }
 
 impl std::fmt::Display for CanonError {
@@ -47,6 +51,7 @@ impl std::fmt::Display for CanonError {
         match self {
             Self::SeparatorInValue => write!(f, "a value holding a canonical-form separator"),
             Self::SixtiethSecond => write!(f, "an instant whose seconds field is 60"),
+            Self::MinuteWithSeconds => write!(f, "a minute stamp carrying seconds"),
         }
     }
 }
@@ -86,6 +91,8 @@ impl Domain {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stamp {
     Instant(DateTime<Utc>),
+    /// A minute as its first microsecond: it differs from that instant only by its tag.
+    Minute(DateTime<Utc>),
     /// The date as published, never a fabricated instant inside it.
     Day(NaiveDate),
 }
@@ -160,18 +167,29 @@ fn render(field: &Field, out: &mut String) -> Result<(), CanonError> {
                 write_value(member, out)?;
             }
         }
-        Field::Stamp(Stamp::Instant(at)) => {
-            if at.timestamp_subsec_nanos() >= LEAP_SECOND_NANOS {
-                return Err(CanonError::SixtiethSecond);
-            }
-            tagged(INSTANT_TAG, &at.format(INSTANT_FORMAT).to_string(), out)?;
-        }
+        Field::Stamp(Stamp::Instant(at)) => tagged(INSTANT_TAG, &instant_text(at)?, out)?,
+        Field::Stamp(Stamp::Minute(starts)) => tagged(MINUTE_TAG, &minute_text(starts)?, out)?,
         Field::Stamp(Stamp::Day(day)) => {
             tagged(DAY_TAG, &day.format(DAY_FORMAT).to_string(), out)?;
         }
         Field::Credential(name) => tagged(CREDENTIAL_TAG, name, out)?,
     }
     Ok(())
+}
+
+fn instant_text(at: DateTime<Utc>) -> Result<String, CanonError> {
+    if at.timestamp_subsec_nanos() >= LEAP_SECOND_NANOS {
+        return Err(CanonError::SixtiethSecond);
+    }
+    Ok(at.format(INSTANT_FORMAT).to_string())
+}
+
+fn minute_text(starts: DateTime<Utc>) -> Result<String, CanonError> {
+    let text = instant_text(starts)?;
+    if starts.second() != 0 || starts.nanosecond() != 0 {
+        return Err(CanonError::MinuteWithSeconds);
+    }
+    Ok(text)
 }
 
 /// A tag and the value it qualifies, in that order. Section 2 says the precision tag travels
@@ -210,6 +228,9 @@ mod tests {
     /// 1,500 ns past a whole microsecond, which `%.6f` truncates rather than rounds.
     const NANOSECOND_BEARING: &str = "2026-07-01T12:00:00.000001500Z";
     const SIXTIETH_SECOND: &str = "2026-07-01T23:59:60Z";
+    const A_MINUTE: &str = "2026-11-14T19:00:00Z";
+    const THIRTY_SECONDS_INTO_IT: &str = "2026-11-14T19:00:30Z";
+    const A_MICROSECOND_INTO_IT: &str = "2026-11-14T19:00:00.000001Z";
     const CREDENTIAL_NAME: &str = "sec_contact";
     const HEADER_NAME: &str = "User-Agent";
     /// German phonebook collation puts `ä` with `ae` and therefore before `z`; raw UTF-8 bytes
@@ -278,6 +299,24 @@ mod tests {
         assert_eq!(
             canon_of_instant(SIXTIETH_SECOND),
             format!("refused: {}", CanonError::SixtiethSecond)
+        );
+    }
+
+    /// Review 2026-11-15: before this refusal `Stamp::Minute` of 19:00:30 digested as a minute.
+    #[test]
+    fn a_minute_stamp_carrying_seconds_is_refused_and_a_whole_minute_is_not() {
+        let refused = [A_MINUTE, THIRTY_SECONDS_INTO_IT, A_MICROSECOND_INTO_IT].map(|text| {
+            text.parse::<DateTime<Utc>>()
+                .ok()
+                .map(|at| canon(ANY, &[Field::Stamp(Stamp::Minute(at))]).err())
+        });
+        assert_eq!(
+            refused,
+            [
+                Some(None),
+                Some(Some(CanonError::MinuteWithSeconds)),
+                Some(Some(CanonError::MinuteWithSeconds))
+            ]
         );
     }
 }

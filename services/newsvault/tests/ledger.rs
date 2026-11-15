@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use news_provider::RunId;
-use newsvault::store::{Committer, COMMIT_LOG, RUNS_DIR};
+use newsvault::store::{Committer, COMMIT_LOG, RUNS_DIR, SCHEMA_VERSION};
 use rusqlite::Connection;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -513,5 +513,40 @@ fn a_ledger_without_at_is_a_usage_error() -> TestResult {
         .output()?;
     assert_eq!(output.status.code(), Some(EXIT_USAGE));
     assert!(output.stdout.is_empty());
+    Ok(())
+}
+
+/// A read-only reader cannot migrate, so a store at the previous version or an unknown later one
+/// is refused by name (exit 2, `input_schema_mismatch`) instead of failing on a missing column.
+#[test]
+fn a_reader_refuses_a_store_at_another_user_version() -> TestResult {
+    let mut answers = Vec::new();
+    for version in [SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
+        let root = fixture()?;
+        let db = Connection::open(root.path().join(COMMIT_LOG))?;
+        db.pragma_update(None, "user_version", version)?;
+        drop(db);
+        for command in ["ledger", "items"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+                .arg(command)
+                .args(["--store", &root.path().to_string_lossy()])
+                .args(["--at", AT])
+                .args(["--from", FIRST_DAY, "--to", FIRST_DAY])
+                .output()?;
+            let named = String::from_utf8_lossy(&output.stderr).contains("user_version");
+            answers.push((
+                command,
+                version,
+                output.status.code(),
+                output.stdout.len(),
+                named,
+            ));
+        }
+    }
+    let refused: Vec<_> = answers
+        .iter()
+        .map(|(command, version, ..)| (*command, *version, Some(EXIT_USAGE), 0, true))
+        .collect();
+    assert_eq!(answers, refused);
     Ok(())
 }
