@@ -507,10 +507,9 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 &feed.source(),
             );
             let answer = cmd_robots::run(&ask, &feed, &wire, &SystemClock)?;
-            if answer.exit.carries_the_result_on_stdout() {
-                emit_robots(&answer.report, format)?;
-            } else {
-                emit_robots_error(&answer, format)?;
+            match answer.emitted(std::env::args().collect()) {
+                cmd_robots::Emitted::Stdout(report) => emit_robots(&report, format)?,
+                cmd_robots::Emitted::Stderr(error) => emit_robots_error(&error, format)?,
             }
             Ok(match answer.exit.code() {
                 0 => Verdict::Ok,
@@ -652,13 +651,14 @@ fn robots_refusal(failure: &CollectRunError) -> Option<RobotsRefusal> {
             details: serde_json::json!({"host": host, "pinned": pinned, "fetched": fetched}),
             refresh_helps: true,
         }),
+        // A refresh records the changed digest again; a person editing the hosts file is the fix.
         CollectRunError::RobotsRefused {
             host,
             pinned,
             fetched,
         } => Some(refused(
             serde_json::json!({"host": host, "pinned": pinned, "fetched": fetched}),
-            true,
+            false,
         )),
         CollectRunError::RobotsUnreadable { host, pinned, why } => Some(refused(
             serde_json::json!({"host": host, "pinned": pinned, "why": why.to_string()}),
@@ -745,15 +745,7 @@ fn emit_robots(report: &serde_json::Value, format: Format) -> anyhow::Result<()>
 }
 
 /// Exit 7, every row failed transiently: the report rides the error object, never stdout.
-fn emit_robots_error(answer: &cmd_robots::Answer, format: Format) -> anyhow::Result<()> {
-    let object = serde_json::json!({
-        "schema": "newsvault.error/1",
-        "code": answer.exit.error_code(),
-        "message": "no robots.txt answered",
-        "retryable": answer.exit.retryable(),
-        "details": answer.report,
-        "suggestions": [std::env::args().collect::<Vec<String>>()],
-    });
+fn emit_robots_error(object: &serde_json::Value, format: Format) -> anyhow::Result<()> {
     let err = std::io::stderr();
     let mut err = err.lock();
     match format {
@@ -761,8 +753,8 @@ fn emit_robots_error(answer: &cmd_robots::Answer, format: Format) -> anyhow::Res
         Format::Human => writeln!(
             err,
             "error: {} (retryable {})",
-            answer.exit.error_code().unwrap_or_default(),
-            answer.exit.retryable()
+            object["code"].as_str().unwrap_or_default(),
+            object["retryable"]
         )?,
     }
     Ok(())
@@ -1051,12 +1043,19 @@ fn print_schema(format: Format) {
                     {"name": "format", "type": "enum", "values": ["human", "json"]}
                 ],
                 "env": [{"name": "BELLWETHER_FEED_CONTACT", "source": "open_web_wires",
-                         "doc": "the contact address the open-web User-Agent carries"}],
+                         "doc": "the contact address the open-web User-Agent carries"},
+                        {"name": "BELLWETHER_VAULT",
+                         "doc": "the store when --store is not given, then ~/.bellwether/vault"}],
                 "output": cmd_robots::SCHEMA,
                 "exits": {
                     "0": "every row answered and every admitted pin matches",
                     "1": "every row answered and an admitted pin differs",
-                    "7": "every row failed transiently",
+                    "2": "invalid_argument (a source with no hosts file), an unparseable hosts or \
+                          rules file, credential_contact_missing, a store of another version or \
+                          shape, io",
+                    "4": "an absent hosts or rules file, or a hosts file admitting no host",
+                    "7": "every row failed transiently (vendor_unreachable), or another run holds \
+                          the lease (lease_held)",
                     "8": "a row failed"
                 },
                 "mutates": true

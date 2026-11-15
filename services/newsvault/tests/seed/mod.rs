@@ -1,6 +1,7 @@
 //! A ledgered robots fetch, through `cmd_robots::run` over a stub, so an open-web collect passes
-//! §8 row R4(b). One url is answered; every other url fails in transport.
+//! §8 row R4(b). The urls named are answered; every other url fails in transport.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
@@ -11,7 +12,7 @@ use news_provider::{
 use newsvault::cmd_robots::{self, Ask};
 use pit::ObservationTime;
 
-const GNW_ROBOTS: &str = "https://rss.globenewswire.com/robots.txt";
+pub const GNW_ROBOTS: &str = "https://rss.globenewswire.com/robots.txt";
 const CONTACT: &str = "bellwether collector contact@example.test";
 
 fn provider_dir() -> PathBuf {
@@ -31,12 +32,9 @@ impl Clock for At {
     }
 }
 
-struct Gnw {
-    status: u16,
-    body: Vec<u8>,
-}
+struct Answers(BTreeMap<String, (u16, Vec<u8>)>);
 
-impl Exchange for Gnw {
+impl Exchange for Answers {
     fn send(
         &self,
         permit: SendPermit,
@@ -45,21 +43,14 @@ impl Exchange for Gnw {
     ) -> Result<RawResponse, SendFailure> {
         let attempt = permit.attempt_id().clone();
         let at = ObservationTime::new(clock.now());
-        if request.url == GNW_ROBOTS {
-            Ok(RawResponse::new(
-                attempt,
-                self.status,
-                self.body.clone(),
-                at,
-                at,
-            ))
-        } else {
-            Err(SendFailure::Transport(TransportError::new(
+        match self.0.get(&request.url) {
+            Some((status, body)) => Ok(RawResponse::new(attempt, *status, body.clone(), at, at)),
+            None => Err(SendFailure::Transport(TransportError::new(
                 attempt,
                 at,
                 at,
                 format!("no stub answers {}", request.url),
-            )))
+            ))),
         }
     }
 }
@@ -71,6 +62,16 @@ pub fn refresh(
     at: &str,
     answer: (u16, &[u8]),
 ) -> Result<cmd_robots::Answer, Box<dyn Error>> {
+    refresh_answering(store, hosts, at, &[(GNW_ROBOTS, answer.0, answer.1)])
+}
+
+/// One `robots refresh` of `hosts` into `store` at `at`, each `(url, status, body)` answered.
+pub fn refresh_answering(
+    store: &Path,
+    hosts: &Path,
+    at: &str,
+    answers: &[(&str, u16, &[u8])],
+) -> Result<cmd_robots::Answer, Box<dyn Error>> {
     let ask = Ask {
         source: open_web_feed::SOURCE.to_owned(),
         hosts: hosts.to_path_buf(),
@@ -80,9 +81,11 @@ pub fn refresh(
         dry_run: false,
     };
     let feed = cmd_robots::open(&ask)?;
-    let exchange = Gnw {
-        status: answer.0,
-        body: answer.1.to_vec(),
-    };
+    let exchange = Answers(
+        answers
+            .iter()
+            .map(|(url, status, body)| ((*url).to_owned(), (*status, body.to_vec())))
+            .collect(),
+    );
     Ok(cmd_robots::run(&ask, &feed, &exchange, &At(at.parse()?))?)
 }

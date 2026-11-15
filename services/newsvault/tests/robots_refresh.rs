@@ -14,7 +14,7 @@ use news_provider::{
 };
 use newsvault::cmd_collect::Registered;
 use newsvault::cmd_ledger;
-use newsvault::cmd_robots::{self, Ask, RobotsError, RobotsExit, ROBOTS_SOURCE};
+use newsvault::cmd_robots::{self, Ask, Emitted, RobotsError, RobotsExit, ROBOTS_SOURCE};
 use newsvault::store::{StoreError, COMMIT_LOG, RUNS_DIR};
 use pit::ObservationTime;
 use rusqlite::{Connection, OpenFlags};
@@ -39,7 +39,10 @@ const OK: u16 = 200;
 const NOT_FOUND: u16 = 404;
 const FORBIDDEN: u16 = 403;
 const UNAVAILABLE: u16 = 503;
+const TOO_MANY_REQUESTS: u16 = 429;
 const EXIT_OK: i32 = 0;
+const EXIT_USAGE: i32 = 2;
+const EXIT_NOT_FOUND: i32 = 4;
 const RUNS_BELOW_EXPECTED: &str = "runs_below_expected";
 const HOLDS_A_FAILURE: &str = "holds_a_failure";
 
@@ -284,14 +287,15 @@ fn a_robots_404_is_recorded_as_absent_and_pins_no_digest() -> TestResult {
 }
 
 /// Section 11.1: bot protection is permanent and a 4xx is not "allow all"; a rate limit, a 5xx
-/// and a lost connection are transient. None files a robots row. Mutation 2026-11-15, 403 mapped
-/// to absent: red.
+/// and a lost connection are transient. None files a robots row. Mutations 2026-11-15, 403 mapped
+/// to absent / 429 mapped to a permanent failure: each red.
 #[test]
 fn a_robots_403_5xx_or_transport_error_is_a_failed_attempt_with_no_robots_row() -> TestResult {
     let mut seen = Vec::new();
     for (answers, exit) in [
         (vec![(GNW_ROBOTS, FORBIDDEN, &b"Access Denied"[..])], 8),
         (vec![(GNW_ROBOTS, UNAVAILABLE, &b""[..])], 7),
+        (vec![(GNW_ROBOTS, TOO_MANY_REQUESTS, &b""[..])], 7),
         (Vec::new(), 7),
     ] {
         let root = TempDir::new()?;
@@ -318,6 +322,7 @@ fn a_robots_403_5xx_or_transport_error_is_a_failed_attempt_with_no_robots_row() 
         seen,
         vec![
             (failed.0, failed.1.clone(), failed.2.clone(), 8, true),
+            (failed.0, failed.1.clone(), failed.2.clone(), 7, false),
             (failed.0, failed.1.clone(), failed.2.clone(), 7, false),
             (failed.0, failed.1, failed.2, 7, false),
         ]
@@ -352,6 +357,127 @@ fn a_fetched_robots_digest_other_than_the_pin_exits_one_and_names_both() -> Test
             Some(false),
             true,
         )
+    );
+    Ok(())
+}
+
+/// Exit 1 is for an admitted row: a candidate is never collected, so its changed robots.txt is
+/// reported and answers nothing. Mutation 2026-11-15, `row.admitted` dropped from `exit_of`: red.
+#[test]
+fn a_candidate_whose_fetch_differs_from_its_pin_exits_zero() -> TestResult {
+    let root = TempDir::new()?;
+    let hosts = root.path().join("hosts.json");
+    let file = serde_json::json!({
+        "schema": "open-web-feed.hosts/2",
+        "hosts": [
+            {"host": GNW_HOST, "status": "admitted", "index_url": "https://rss.globenewswire.com/rssfeed/",
+             "rule": "gnw", "robots": GNW_PIN},
+            {"host": "www.prnewswire.com", "status": "candidate",
+             "index_url": "https://www.prnewswire.com/rss/news-releases-list.rss", "rule": "gnw",
+             "robots": FileDigest::of(CHANGED_BODY).hex()},
+        ],
+    });
+    std::fs::write(&hosts, serde_json::to_vec(&file)?)?;
+    let body = gnw_body()?;
+    let exchange = Robots::of(&[(GNW_ROBOTS, OK, &body), (PRN_ROBOTS, OK, PRN_BODY)]);
+    let answer = refreshed(&root.path().join("vault"), hosts, &exchange)?;
+    assert_eq!(
+        (
+            answer.exit,
+            answer.report["rows"][1]["matches_pin"].as_bool()
+        ),
+        (RobotsExit::Ok, Some(false))
+    );
+    Ok(())
+}
+
+/// Section 5.1's iff rule for a refresh: the report on stdout for exits 0, 1 and 8, an error object
+/// on stderr for 7. Mutation 2026-11-15, `Answer::emitted` always choosing stdout: red.
+#[test]
+fn a_refresh_writes_its_report_on_stdout_for_exits_zero_one_and_eight_only() -> TestResult {
+    let body = gnw_body()?;
+    let mut seen = Vec::new();
+    for (status, answered) in [
+        (OK, body.as_slice()),
+        (OK, CHANGED_BODY),
+        (FORBIDDEN, &b"Access Denied"[..]),
+        (UNAVAILABLE, &b""[..]),
+    ] {
+        let root = TempDir::new()?;
+        let exchange = Robots::of(&[(GNW_ROBOTS, status, answered)]);
+        let answer = refreshed(root.path(), committed_hosts(), &exchange)?;
+        seen.push(match answer.emitted(vec![RUN_ID.to_owned()]) {
+            Emitted::Stdout(report) => (answer.exit.code(), "stdout", report["schema"].clone()),
+            Emitted::Stderr(error) => (answer.exit.code(), "stderr", error["code"].clone()),
+        });
+    }
+    let report = Value::from(cmd_robots::SCHEMA);
+    assert_eq!(
+        seen,
+        vec![
+            (0, "stdout", report.clone()),
+            (1, "stdout", report.clone()),
+            (8, "stdout", report),
+            (7, "stderr", Value::from("vendor_unreachable")),
+        ]
+    );
+    Ok(())
+}
+
+/// The binary's failures before any fetch: a source with no hosts file is a `usage error:` exiting
+/// 2, an absent hosts file exits 4, stdout empty in both, and each exit is one the schema lists.
+/// Mutations 2026-11-15, `NoHostsFile` not a usage error / `robots refresh`'s absent-input arm in
+/// `exit_code` mapped to 2 / exit 4 dropped from the schema: each red.
+#[test]
+fn a_refresh_refused_before_any_fetch_exits_two_or_four_with_an_empty_stdout() -> TestResult {
+    let root = TempDir::new()?;
+    let rules = provider_dir().join("rules/open-web-feed.rules.json");
+    let binary = |source: &str, hosts: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_newsvault"))
+            .args(["robots", "refresh", "--source", source, "--dry-run"])
+            .arg("--hosts")
+            .arg(hosts)
+            .arg("--rules")
+            .arg(&rules)
+            .arg("--store")
+            .arg(root.path())
+            .env("BELLWETHER_FEED_CONTACT", CONTACT)
+            .stdin(Stdio::null())
+            .output()
+    };
+    let schema: Value = serde_json::from_slice(
+        &Command::new(env!("CARGO_BIN_EXE_newsvault"))
+            .args(["schema", "--format", "json"])
+            .output()?
+            .stdout,
+    )?;
+    let exits = schema["commands"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|command| command["path"] == serde_json::json!(["robots", "refresh"]))
+        .map(|command| command["exits"].clone())
+        .unwrap_or_default();
+    let mut seen = Vec::new();
+    for output in [
+        binary("edgar_press", &committed_hosts())?,
+        binary(SOURCE, &root.path().join("absent.json"))?,
+    ] {
+        let code = output.status.code();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        seen.push((
+            code,
+            output.stdout.len(),
+            stderr.split(':').next().map(str::to_owned),
+            code.is_some_and(|code| exits.get(code.to_string()).is_some()),
+        ));
+    }
+    assert_eq!(
+        seen,
+        vec![
+            (Some(EXIT_USAGE), 0, Some("usage error".to_owned()), true),
+            (Some(EXIT_NOT_FOUND), 0, Some("error".to_owned()), true),
+        ]
     );
     Ok(())
 }

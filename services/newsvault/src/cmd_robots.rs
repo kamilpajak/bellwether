@@ -130,6 +130,33 @@ pub struct Answer {
     pub exit: RobotsExit,
 }
 
+/// Which stream a refresh writes, and what: section 5.1's iff rule, decided here so a test can
+/// reach the exits a stub produces and the binary cannot without the network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Emitted {
+    /// The report, for exits 0, 1 and 8.
+    Stdout(Value),
+    /// A `newsvault.error/1` object carrying the report; `argv` is the suggested rerun.
+    Stderr(Value),
+}
+
+impl Answer {
+    #[must_use]
+    pub fn emitted(&self, argv: Vec<String>) -> Emitted {
+        if self.exit.carries_the_result_on_stdout() {
+            return Emitted::Stdout(self.report.clone());
+        }
+        Emitted::Stderr(json!({
+            "schema": "newsvault.error/1",
+            "code": self.exit.error_code(),
+            "message": "no robots.txt answered",
+            "retryable": self.exit.retryable(),
+            "details": self.report,
+            "suggestions": [argv],
+        }))
+    }
+}
+
 /// The one source a refresh reads the hosts file of; `edgar_press` has none.
 pub fn registered(source: &str) -> Result<Registered, RobotsError> {
     match Registered::chosen(&[source.to_owned()])? {

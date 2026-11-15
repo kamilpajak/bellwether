@@ -660,6 +660,55 @@ fn an_open_web_collect_against_a_newer_store_is_a_version_refusal() -> TestResul
     Ok(())
 }
 
+const PRN_ROBOTS: &str = "https://www.prnewswire.com/robots.txt";
+
+/// A hosts file in `dir` admitting GNW and PRN, both pinned to the committed GNW body, and a store
+/// whose one refresh answered each url in `answered` with that body: what a dry-run collect says.
+fn collected_over_two_admitted_hosts(
+    dir: &Path,
+    answered: &[&str],
+) -> Result<String, Box<dyn Error>> {
+    let hosts = dir.join("hosts.json");
+    let store = dir.join("store");
+    let row = |host: &str, index: &str| {
+        serde_json::json!({"host": host, "status": "admitted", "index_url": index,
+                           "rule": "gnw", "robots": GNW_PIN})
+    };
+    let file = serde_json::json!({
+        "schema": "open-web-feed.hosts/2",
+        "hosts": [row("rss.globenewswire.com", INDEX),
+                  row("www.prnewswire.com", "https://www.prnewswire.com/rss/news-releases-list.rss")],
+    });
+    std::fs::write(&hosts, serde_json::to_vec(&file)?)?;
+    let body = seed::gnw_robots()?;
+    let answers: Vec<(&str, u16, &[u8])> = answered
+        .iter()
+        .map(|url| (*url, OK, body.as_slice()))
+        .collect();
+    seed::refresh_answering(&store, &hosts, ROBOTS_EARLIER, &answers)?;
+    collected(&store, hosts, true)
+}
+
+/// §8 row R4: every admitted row is checked, not the first. Mutation 2026-11-15, the loop in
+/// `refuse_an_unverified_robots` cut to its first row: red.
+#[test]
+fn a_second_admitted_host_without_a_ledgered_fetch_is_refused() -> TestResult {
+    let dir = TempDir::new()?;
+    let said = collected_over_two_admitted_hosts(dir.path(), &[seed::GNW_ROBOTS])?;
+    assert_eq!(said, "unverified none");
+    Ok(())
+}
+
+/// §8 row R4: the lookup is keyed by host, so another host's fetch of the same bytes admits
+/// nothing. Mutation 2026-11-15, `newest_robots`' host condition replaced by `?2 IS NOT NULL`: red.
+#[test]
+fn another_hosts_fetch_matching_the_pin_does_not_admit_a_host() -> TestResult {
+    let dir = TempDir::new()?;
+    let said = collected_over_two_admitted_hosts(dir.path(), &[PRN_ROBOTS])?;
+    assert_eq!(said, "unverified none");
+    Ok(())
+}
+
 /// A dry run validates everything, robots included, and still writes nothing. Mutation
 /// 2026-11-15, the call in `planned` removed: red.
 #[test]
@@ -671,8 +720,10 @@ fn a_dry_run_refuses_an_unverified_host_too() -> TestResult {
 }
 
 /// Section 5.1: `robots_unverified` exits 4 and `robots_refused` 2, each a `newsvault.error/1`
-/// object on stderr whose suggestion is the refresh as an argv array; stdout stays empty.
-/// Mutation 2026-11-15, the refusal written as plain `error:` text: red.
+/// object on stderr; stdout stays empty. The unverified one suggests the refresh as an argv array;
+/// a changed pin suggests nothing, because a refresh records the same change again. Mutations
+/// 2026-11-15, the refusal written as plain `error:` text / the changed pin suggesting the
+/// refresh: each red.
 #[test]
 fn a_robots_refusal_names_the_refresh_command_as_an_argv_suggestion() -> TestResult {
     let unverified = TempDir::new()?;
@@ -720,10 +771,12 @@ fn a_robots_refusal_names_the_refresh_command_as_an_argv_suggestion() -> TestRes
             &shown(store),
         ]
         .map(Value::from);
-        assert_eq!(
-            error["suggestions"],
-            Value::from(vec![Value::from(refresh.to_vec())])
-        );
+        let suggested = if store == unverified.path() {
+            vec![Value::from(refresh.to_vec())]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(error["suggestions"], Value::from(suggested));
         seen.push((
             output.status.code(),
             output.stdout.len(),
