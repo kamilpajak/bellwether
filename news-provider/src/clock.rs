@@ -1,7 +1,6 @@
 //! The one clock this seam reads, injected, and the one wait it takes. `Utc::now` is called here
 //! and nowhere else in the crate: `Wire::send` is handed a `&dyn Clock` and no other method takes
-//! one, so a provider cannot read an instant even by accident. Why the trait is its own module
-//! rather than an exemption written into a grep: `docs/design/design.md` section 2.2.
+//! one, so a provider cannot read an instant even by accident.
 
 use std::time::Duration;
 

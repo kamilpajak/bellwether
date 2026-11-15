@@ -226,7 +226,7 @@ ordinary word — and no word list resolves it; only corroboration in context do
 | R1 | The archive is complete and append-only. Any cap is a derived **view**, computable from the archive; the reverse is not required to work. | §1.1 |
 | R2 | Valid time and observation time are **distinct types** that cannot be compared with each other. The single visibility query requires both; the half-predicates are not reachable from outside their module. | §1.2 |
 | R3 | When several runs carry one item, observation time is the **earliest**. | §1.3 |
-| R4 | Every store carries a **coverage ledger**: one row per (source, target date, attempt) with filter parameters, status, item count, cost, fetch time and a hash of the result. | §1.1, §1.4 |
+| R4 | Every store carries a **coverage ledger**: one row per (source, target date, attempt) with filter parameters, status, item count, `slots` (the only cost as built; a money arm comes with the first metered vendor, owner 2026-11-15, `architecture.md` §3.2), fetch time and a hash of the result. | §1.1, §1.4 |
 | R5 | A failed network operation must be handled for the program to compile. Dropped records are counted and reported, never silent. | §1.5 |
 | R6 | A missing input aborts with an error. An empty fallback is forbidden. | §1.6 |
 | R7 | Units are types; artefact identity is a content hash, never a per-process function. | §1.7 |

@@ -3,8 +3,7 @@
 //! slot, so one HTTP call needs one written row. Which field each event carries and why:
 //! `docs/design/architecture.md` section 3.2.
 //!
-//! A provider never holds a `Sink`: the driver opens and closes every slot. Why that is stronger
-//! than letting `fetch` do it is `docs/design/design.md` section 2.2.
+//! A provider never holds a `Sink`: the driver opens and closes every slot.
 
 use canon::digest::attempt_id;
 use canon::{CanonError, Digest, FileDigest};
@@ -110,7 +109,7 @@ impl AttemptEvent {
 }
 
 /// What the vendor's answer was, read from the body as well as the status. There is no `Premature`
-/// arm and that is a resolution rather than an omission: `docs/design/design.md` section 2.4.
+/// arm and that is a resolution rather than an omission: `edgar-press`'s crate header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     Usable,
@@ -531,6 +530,7 @@ pub(crate) mod tests {
             provenance: Provenance::LiveIngest,
             url: URL.to_owned(),
             universe_version: FileDigest::of(ROSTER),
+            listed_date: None,
             headers: vec![(
                 HeaderName::new("Accept"),
                 HeaderValue::Literal("text/plain".to_owned()),

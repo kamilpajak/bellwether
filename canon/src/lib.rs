@@ -1,6 +1,6 @@
 //! The digest rules of `docs/design/architecture.md` section 2: the canonical form, whose six
-//! rules live in that section's "Canonical form" paragraph and are not restated here, and
-//! [`FileDigest`] for the three rows of that section whose input is a file's bytes. Why
+//! rules live in that section's "Canonical form" bullet and are not restated here, and
+//! [`FileDigest`] for the rows whose input is a file's bytes, named by that same bullet. Why
 //! the form is a crate of its own rather than code inside the first producer: `CONTRIBUTING.md`,
 //! "Everything else" - every digest in section 2 is taken over it, and section 8 row R7 is the
 //! row it moves. `canon/vectors/` is what this crate owes a reader in another language.
@@ -63,7 +63,7 @@ pub enum Domain {
     AttemptId,
     FilterParams,
     ResultDigest,
-    SelectionId,
+    SnapshotId,
 }
 
 impl Domain {
@@ -76,7 +76,7 @@ impl Domain {
             Self::AttemptId => "attempt_id",
             Self::FilterParams => "filter_params",
             Self::ResultDigest => "result_digest",
-            Self::SelectionId => "selection_id",
+            Self::SnapshotId => "snapshot_id",
         }
     }
 }
@@ -108,9 +108,9 @@ pub enum Field<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Digest(String);
 
-/// A sha256 over a hashed FILE's bytes as committed: architecture.md section 2's `rule_version`,
-/// `calendar_version` and `universe_version` rows, which take no canonical form. Its own type so
-/// that "a [`Digest`] was taken over the form" keeps holding.
+/// A sha256 over a hashed FILE's bytes as committed, for the rows architecture.md section 2's
+/// "Canonical form" bullet names. Its own type so that "a [`Digest`] was taken over the form" keeps
+/// holding.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FileDigest(String);
 

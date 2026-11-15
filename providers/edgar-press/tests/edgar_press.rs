@@ -37,12 +37,25 @@ const APPLE_ACCEPTED_AT: &str = "2026-11-10T21:32:15Z";
 const APPLE_OBSERVED_AT: &str = "2026-11-10T23:32:15Z";
 /// `AN_ARCHIVED_SESSION` ends at 05:00Z less one microsecond in New York; plus the same 7,200 s.
 const ARCHIVED_DAY_OBSERVED_AT: &str = "2026-11-10T06:59:59.999999Z";
+/// `AN_ARCHIVED_SESSION` as the `Date Filed` column spells it.
+const ARCHIVED_DATE_FILED: &str = "20261109";
+/// `A_LISTED_SESSION` as the column spells it: a `Date Filed` later than `AN_ARCHIVED_SESSION`.
+const LISTED_DATE_FILED: &str = "20261110";
+/// `A_LISTED_SESSION` ends at 05:00Z on 2026-11-11 less one microsecond; plus the same 7,200 s.
+const LISTED_DAY_OBSERVED_AT: &str = "2026-11-11T06:59:59.999999Z";
 /// Fits a `TimeDelta`, which holds `i64::MAX` milliseconds, and carries 2026 past year 262,143.
 const SECONDS_PAST_THE_LAST_INSTANT: i64 = 1_000_000_000_000_000;
 const APPLE_ACCESSION: &str = "0000320193-26-000071";
 /// The second in-universe filing of the fixture index, which is the uncovered one in the
 /// convergence tests below.
 const MICROSOFT_ACCESSION: &str = "0000789019-26-000045";
+const MICROSOFT_PATH: &str = "edgar/data/789019/0000789019-26-000045.txt";
+/// One of the four `Date Filed` values §3.9 measured in the 2026-11-10 index, earlier than both
+/// index days the late-row tests below read it under.
+const LATE_DATE_FILED: &str = "20261102";
+const LATE_FILED_DAY: &str = "2026-11-02";
+/// ISO, which the real column never carries.
+const NOT_A_DATE_FILED: &str = "2026-11-02";
 /// The acceptance field as the filing header spells it, kept as `valid_raw` so a replay re-parses
 /// the value rather than trusting the stored instant.
 const APPLE_ACCEPTANCE_RAW: &str = "20261110163215";
@@ -331,15 +344,24 @@ fn a_backfilled_item_observes_at_its_publication_plus_the_probed_lag_and_not_at_
     Ok(())
 }
 
-/// §8 row R11, the day arm: the END of the archived day in New York plus the lag.
+/// §8 row R11, the day arm: a row filed on the day its index lists it observes at the END of that
+/// day in New York plus the lag.
 #[test]
 fn a_backfilled_day_dated_item_observes_at_the_end_of_its_own_day_plus_the_probed_lag() -> Outcome {
     let provider = probed()?;
-    let request = archived_document_request(&provider)?;
+    let request = listed_document_request(&provider, AN_ARCHIVED_SESSION, ARCHIVED_DATE_FILED)?;
     let item =
         only_item(&provider.extract(&request, &blob("filing_8k_microsoft_no_acceptance.txt")))?;
-    assert_eq!(precision_of(&item.valid), ValidPrecision::Day);
-    assert_eq!(item.observed, Some(at(ARCHIVED_DAY_OBSERVED_AT)));
+    assert_eq!(
+        (item.valid, item.observed),
+        (
+            Published::On {
+                day: AN_ARCHIVED_SESSION.parse()?,
+                tz: "America/New_York"
+            },
+            Some(at(ARCHIVED_DAY_OBSERVED_AT))
+        )
+    );
     Ok(())
 }
 
@@ -695,25 +717,137 @@ fn a_blank_source_item_id_lands_as_an_unusable_row_carrying_its_whole_item() -> 
     Ok(())
 }
 
-/// The other unusable arm: a document whose acceptance instant does not parse AND whose window
-/// names no day has no publication value at all, so there is no `item_id` to take over it.
+/// The other unusable arm: a document whose acceptance instant does not parse AND whose index row
+/// carries no readable `Date Filed` has no publication value at all, so there is no `item_id` to
+/// take over it - and the index's own day is never substituted for the missing one.
 #[test]
-fn a_filing_with_no_acceptance_instant_and_no_readable_day_is_unusable_rather_than_undated(
+fn a_filing_with_no_acceptance_instant_and_no_readable_date_filed_is_unusable_rather_than_undated(
 ) -> Outcome {
     let provider = provider()?;
-    let mut request = document_request(&provider, A_LISTED_SESSION)?;
-    request.target_window = TargetWindow::new(NOT_A_WINDOW);
+    for listed in [None, Some(NOT_A_DATE_FILED.to_owned())] {
+        let mut request = document_request(&provider, A_LISTED_SESSION)?;
+        request.listed_date = listed.clone();
+        let extracted = provider.extract(&request, &blob("filing_8k_microsoft_no_acceptance.txt"));
+        let row = extracted.unusable.first().ok_or_else(|| {
+            format!("expected one unusable row for {listed:?}, got {extracted:?}")
+        })?;
+        assert_eq!(
+            (
+                row.reason,
+                precision_of(&row.item.valid),
+                row.item.valid_raw.clone()
+            ),
+            (
+                UnusableReason::NoParseableValidTime,
+                ValidPrecision::Unknown,
+                listed.unwrap_or_default()
+            )
+        );
+    }
+    Ok(())
+}
+
+/// §8 row R11: an archived row with no publication value has nothing to add the lag to, so its
+/// unusable row places no observation rather than one taken from the index's day.
+#[test]
+fn an_archived_filing_with_no_readable_date_filed_places_no_observation() -> Outcome {
+    let provider = probed()?;
+    let request = listed_document_request(&provider, AN_ARCHIVED_SESSION, NOT_A_DATE_FILED)?;
     let extracted = provider.extract(&request, &blob("filing_8k_microsoft_no_acceptance.txt"));
-    assert_eq!(
-        extracted.unusable.first().map(|row| row.reason),
-        Some(UnusableReason::NoParseableValidTime)
-    );
     assert_eq!(
         extracted
             .unusable
-            .first()
-            .map(|row| precision_of(&row.item.valid)),
-        Some(ValidPrecision::Unknown)
+            .iter()
+            .map(|row| (row.reason, row.item.observed))
+            .collect::<Vec<_>>(),
+        vec![(UnusableReason::NoParseableValidTime, None)]
+    );
+    Ok(())
+}
+
+/// One index row in the vendor's layout carrying `date_filed`, whatever day's index lists it.
+fn one_row_index(date_filed: &str) -> RawBlob {
+    let bytes = format!(
+        "Form Type   Company Name           CIK         Date Filed  File Name\n\
+         ---------------------------------------------------------------------\n\
+         8-K         Microsoft Corporation  789019      {date_filed}    {MICROSOFT_PATH}\n"
+    )
+    .into_bytes();
+    RawBlob {
+        digest: FileDigest::of(&bytes).hex().to_owned(),
+        bytes,
+    }
+}
+
+fn listed_document_request(
+    provider: &EdgarPress,
+    index_day: &str,
+    date_filed: &str,
+) -> Result<Request, Box<dyn std::error::Error>> {
+    let index = index_request(provider, index_day)?;
+    provider
+        .extract(&index, &one_row_index(date_filed))
+        .follow_ups
+        .first()
+        .cloned()
+        .ok_or_else(|| "the one-row index yielded no follow-up".to_string().into())
+}
+
+/// §3.9: the 2026-11-10 index carries `Date Filed` 20261102, 20261103, 20261105 and 20261110. A
+/// late row's day fallback is its own `Date Filed`, as the column reads, never the index's day.
+#[test]
+fn a_late_row_with_no_acceptance_instant_lands_on_its_own_date_filed_and_not_the_index_day(
+) -> Outcome {
+    let provider = provider()?;
+    let request = listed_document_request(&provider, A_LISTED_SESSION, LATE_DATE_FILED)?;
+    let item =
+        only_item(&provider.extract(&request, &blob("filing_8k_microsoft_no_acceptance.txt")))?;
+    assert_eq!(
+        (
+            item.valid,
+            item.valid_raw.as_str(),
+            item.valid_field.as_str()
+        ),
+        (
+            Published::On {
+                day: LATE_FILED_DAY.parse()?,
+                tz: "America/New_York"
+            },
+            LATE_DATE_FILED,
+            "Date Filed"
+        )
+    );
+    Ok(())
+}
+
+/// §8 row R11: a late row was first listed on its index's day, so the backfill bound is the end of
+/// THAT day and not of its earlier `Date Filed`.
+#[test]
+fn a_late_rows_backfilled_observation_is_dated_by_its_index_day_and_not_its_date_filed() -> Outcome
+{
+    let provider = probed()?;
+    let request = listed_document_request(&provider, AN_ARCHIVED_SESSION, LATE_DATE_FILED)?;
+    let item =
+        only_item(&provider.extract(&request, &blob("filing_8k_microsoft_no_acceptance.txt")))?;
+    assert_eq!(
+        (precision_of(&item.valid), item.observed),
+        (ValidPrecision::Day, Some(at(ARCHIVED_DAY_OBSERVED_AT)))
+    );
+    Ok(())
+}
+
+/// §8 row R11: a `Date Filed` later than the index listing it still bounds the observation, so an
+/// item is never observed before its own publication day has closed.
+#[test]
+fn a_rows_backfilled_observation_is_not_before_the_end_of_a_date_filed_later_than_its_index_day(
+) -> Outcome {
+    let provider = probed()?;
+    let request = listed_document_request(&provider, AN_ARCHIVED_SESSION, LISTED_DATE_FILED)?;
+    let item =
+        only_item(&provider.extract(&request, &blob("filing_8k_microsoft_no_acceptance.txt")))?;
+    assert_eq!(
+        (item.valid_raw.as_str(), item.observed),
+        (LISTED_DATE_FILED, Some(at(LISTED_DAY_OBSERVED_AT)))
     );
     Ok(())
 }

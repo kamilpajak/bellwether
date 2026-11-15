@@ -68,7 +68,7 @@ impl Credentials {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SendFailure {
     /// Before the socket: a header names a credential this process does not hold. A startup
-    /// refusal, never a vendor event in the coverage ledger (design.md section 3).
+    /// refusal, never a vendor event in the coverage ledger (architecture.md section 5.1).
     #[error("no credential named {0} is held")]
     CredentialMissing(String),
     /// Also before the socket: the pace file could not be read or reserved. A local refusal, so
@@ -255,7 +255,7 @@ impl Wire {
             .timeout_recv_body(Some(timeouts.recv_body))
             // A 403 carrying the vendor's own body is an ANSWER the classifier reads, not an
             // error: EDGAR answers a weekend, a holiday and an unpublished day with 403 and the
-            // same generic S3 body, measured on six dates 2026-11-12 (design.md section 2.4).
+            // same generic S3 body (measured in `providers/edgar-press/src/lib.rs`'s header).
             .http_status_as_error(false)
             .build();
         Self {
@@ -484,6 +484,7 @@ mod tests {
             provenance: Provenance::LiveIngest,
             url: REFUSED.to_owned(),
             universe_version: FileDigest::of(ROSTER),
+            listed_date: None,
             headers: vec![(
                 HeaderName::new(ACCEPT),
                 HeaderValue::Literal(PLAIN_TEXT.to_owned()),

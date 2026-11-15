@@ -1,6 +1,6 @@
 //! The driver. `fetch` is not on [`Provider`], so this is what opens a slot, spends its permit,
 //! classifies the answer, stores the payload, extracts it and closes the attempt - one HTTP call
-//! per written ledger row. Why the provider does not do it: `docs/design/design.md` section 2.2.
+//! per written ledger row.
 //!
 //! Two seams, so a run is drivable over stored payloads with no network and over a real archive
 //! with no provider: [`Exchange`] is the socket, whose only implementation that opens one is
@@ -70,7 +70,7 @@ pub struct Committed {
 /// The store side of the driver, in the terms this crate can name: a `CollectedItem` is a
 /// provider's row and the archive's own row type is the archive's business.
 pub trait Archive: Sink {
-    /// Stores a payload under its own digest, BEFORE anything parses it (design.md section 6).
+    /// Stores a payload under its own digest, BEFORE anything parses it (architecture.md section 3.1, `raw_blob_ref`).
     fn put_blob(&self, payload: &[u8]) -> Result<String, ArchiveError>;
 
     /// The one door. `raw_blob` is absent exactly when the attempt brought nothing back, which is
@@ -120,7 +120,8 @@ pub enum CollectError {
     Ledger(#[from] LedgerError),
     #[error(transparent)]
     Archive(#[from] ArchiveError),
-    /// A startup refusal and never a vendor event in the coverage ledger (design.md section 3).
+    /// A startup refusal and never a vendor event in the coverage ledger (architecture.md
+    /// section 5.1, `credential_contact_missing`).
     #[error("no credential named {0} is held")]
     Credential(String),
     /// The same kind of refusal, raised before the socket: the vendor's pace could not be read.
@@ -180,7 +181,7 @@ impl Exit {
         match self {
             Self::Ok => 0,
             // 8 and not 7 for a total refusal: 7 is the retryable class and a permanent refusal
-            // must not invite a timer to hammer it (design.md section 4).
+            // must not invite a timer to hammer it.
             Self::PartialCollect | Self::VendorRefusedAll | Self::CommitFailed => 8,
             Self::VendorUnreachable => 7,
         }
@@ -222,7 +223,7 @@ impl Tally {
     }
 
     /// The exit table as a TOTAL function over the counts, not a chain of ifs that falls through:
-    /// design.md section 4's table, one arm per bucket.
+    /// architecture.md section 5.1's table, one arm per bucket.
     #[must_use]
     pub fn exit(&self) -> Exit {
         let incomplete = self.incomplete();
@@ -653,7 +654,8 @@ mod tests {
     use super::{Exit, Tally, EXITS};
     use std::collections::BTreeSet;
 
-    /// One row per bucket of design.md section 4's table, each stating the counts that reach it.
+    /// One row per bucket of architecture.md section 5.1's table, each stating the counts that reach
+    /// it.
     const TABLE: [(&str, Tally, Exit); 7] = [
         (
             "every target ok or empty",

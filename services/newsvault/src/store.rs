@@ -1,5 +1,6 @@
-//! The commit log, the `seq` assigner and the one door an item enters by. The on-disk layout is
-//! design.md section 5 and the ledger row is architecture.md section 3.2; neither is restated.
+//! The commit log, the `seq` assigner and the one door an item enters by. The blob layout is
+//! architecture.md section 3.9, the partition key section 10 D3 and the ledger row section 3.2;
+//! none is restated.
 //!
 //! An item with no closed attempt:
 //!
@@ -37,6 +38,7 @@
 //!     headers: Vec::new(),
 //!     params: Vec::new(),
 //!     universe_version: canon::FileDigest::of(b"{}"),
+//!     listed_date: None,
 //! };
 //! let at = ObservationTime::new(DateTime::UNIX_EPOCH);
 //! let raw = committer.put_blob(b"{}")?;
@@ -84,8 +86,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::blobs::{BlobDigest, BlobStore};
 
 const LOCK_FILE: &str = "LOCK";
-/// The layout, in one place because a reader and the writer may not disagree about it
-/// (design.md section 6, the archive row).
+/// The layout, in one place because a reader and the writer may not disagree about it.
 pub const COMMIT_LOG: &str = "commit.sqlite3";
 pub const RUNS_DIR: &str = "runs";
 pub const ITEMS_DIR: &str = "items";
@@ -180,7 +181,7 @@ CREATE TABLE IF NOT EXISTS seq_reservations (
     reserved_at  TEXT NOT NULL
 );
 -- One row per exported segment, committed only once the file is at its final name. The grain is
--- (run, publication day) and not the attempt: design.md section 5.
+-- (run, publication day) and not the attempt, as the `publish` module header states.
 CREATE TABLE IF NOT EXISTS published (
     segment_digest TEXT PRIMARY KEY,
     run_id         TEXT NOT NULL,
@@ -541,7 +542,7 @@ impl Committer {
 
     /// The counts `news_provider::Outcome::decide` is asked against, oldest first. How many of
     /// them make a baseline is the caller's: `Baseline::from_trailing_ok` states the attempt
-    /// count it used, and no floor fires in this slice (design.md section 2.4).
+    /// count it used, and no floor fires in this slice (architecture.md section 3.2, `collapsed`).
     pub fn ok_vendor_rows(&self, source: &SourceId) -> Result<Vec<u32>, StoreError> {
         let mut statement = self.db.prepare(
             "SELECT vendor_rows FROM attempts
@@ -1134,7 +1135,7 @@ mod tests {
     const SENTINEL: &[u8] = b"a staged file a crash left behind";
     const STATUS_OK: u16 = 200;
     /// Distinct values, so a swap of the two columns is visible. 59 is the day the collapse
-    /// outcome exists for (design.md section 2.4).
+    /// outcome exists for (`news_provider::ledger`'s `TRAILING_MEDIAN` comment).
     const VENDOR_ROWS: u32 = 59;
     /// A permanent failure brought nothing back, so the two verdicts carry different counts and a
     /// swap of their outcome labels is visible in what the baseline reader returns.
@@ -1210,6 +1211,7 @@ mod tests {
             headers: Vec::new(),
             params: Vec::new(),
             universe_version: FileDigest::of(ROSTER),
+            listed_date: None,
         }
     }
 
