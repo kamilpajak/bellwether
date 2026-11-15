@@ -1,7 +1,6 @@
-//! The seven digests, each a field list over the form in `lib.rs`. Five field lists are stated in
-//! `docs/design/architecture.md` (section 2 for `item_id`, `story_id` and `doc_id`, section 3.2
-//! for `filter_params` and `result_digest`); `attempt_id` and `selection_id` are named by the
-//! build order with no field list anywhere, so theirs are stated on the functions below.
+//! The seven digests, each a field list over the form in `lib.rs`. Each field list is stated by
+//! its function or struct below; `docs/design/architecture.md` section 2's `canon::Domain` table
+//! points at them and states only `item_id`'s order itself.
 
 use crate::{sha256_canon, CanonError, Digest, Domain, Field, Stamp};
 use chrono::{DateTime, Utc};
@@ -104,15 +103,15 @@ pub fn result_digest(ids: &[&str]) -> Result<Digest, CanonError> {
     sha256_canon(Domain::ResultDigest, &[Field::List(&set)])
 }
 
-/// A selection is a set under a cutoff, like section 2's `snapshot_id`: a date range is not
-/// reproducible because the archive grows under it. The ids keep their ascending `seq` order,
-/// which is the only ordering authority, so they are not re-sorted here.
-pub fn selection_id(
+/// A snapshot is a set under a cutoff: a date range is not reproducible because the archive grows
+/// under it. The ids keep their ascending `seq` order, which is the only ordering authority, so
+/// they are not re-sorted here.
+pub fn snapshot_id(
     cutoff: DateTime<Utc>,
     item_ids_in_seq_order: &[&str],
 ) -> Result<Digest, CanonError> {
     sha256_canon(
-        Domain::SelectionId,
+        Domain::SnapshotId,
         &[
             Field::Stamp(Stamp::Instant(cutoff)),
             Field::List(item_ids_in_seq_order),
@@ -123,7 +122,7 @@ pub fn selection_id(
 #[cfg(test)]
 mod tests {
     use super::{
-        attempt_id, doc_id, filter_params, item_id, result_digest, selection_id, story_id,
+        attempt_id, doc_id, filter_params, item_id, result_digest, snapshot_id, story_id,
         ItemFields, Param, ParamValue,
     };
     use crate::{CanonError, Digest, Stamp};
@@ -343,11 +342,11 @@ mod tests {
                 filter_params(&params)
             }
             "result_digest" => result_digest(&strings(input, "ids")),
-            "selection_id" => {
+            "snapshot_id" => {
                 let Ok(cutoff) = text(input, "cutoff").parse::<DateTime<Utc>>() else {
                     return "unreadable: cutoff".to_string();
                 };
-                selection_id(cutoff, &strings(input, "item_ids"))
+                snapshot_id(cutoff, &strings(input, "item_ids"))
             }
             other => return format!("unreadable: digest {other}"),
         };

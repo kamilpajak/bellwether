@@ -1,5 +1,5 @@
 //! The digest rules of `docs/design/architecture.md` section 2: the canonical form, whose six
-//! rules live in that section's "Canonical form" paragraph and are not restated here, and
+//! rules live in that section's "Canonical form" bullet and are not restated here, and
 //! [`FileDigest`] for the three rows of that section whose input is a file's bytes. Why
 //! the form is a crate of its own rather than code inside the first producer: `CONTRIBUTING.md`,
 //! "Everything else" - every digest in section 2 is taken over it, and section 8 row R7 is the
@@ -63,7 +63,7 @@ pub enum Domain {
     AttemptId,
     FilterParams,
     ResultDigest,
-    SelectionId,
+    SnapshotId,
 }
 
 impl Domain {
@@ -76,7 +76,7 @@ impl Domain {
             Self::AttemptId => "attempt_id",
             Self::FilterParams => "filter_params",
             Self::ResultDigest => "result_digest",
-            Self::SelectionId => "selection_id",
+            Self::SnapshotId => "snapshot_id",
         }
     }
 }
