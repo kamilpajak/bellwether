@@ -51,6 +51,8 @@ const DASH: char = '-';
 /// Where the day-precision fallback's value comes from: the one index column carrying a date and
 /// no hour. Taken from [`COLUMNS`] so the heading has one home.
 const DATE_FILED: &str = COLUMNS[3];
+/// `Date Filed` and the index file name both read `YYYYMMDD`, measured on the real file 2026-11-13.
+const INDEX_DATE: &str = "%Y%m%d";
 /// The one zone name this binary knows, because `Published::On` carries a `&'static str` and a
 /// zone read out of a file is not static. EDGAR files in Eastern time.
 const KNOWN_ZONES: [&str; 1] = ["America/New_York"];
@@ -202,26 +204,28 @@ impl EdgarPress {
                 "{ARCHIVES}{DAILY_INDEX}/{}/QTR{}/form.{}.idx",
                 day.format("%Y"),
                 quarter(day),
-                day.format("%Y%m%d")
+                day.format(INDEX_DATE)
             ),
             headers: Vec::new(),
             params: Vec::new(),
             universe_version: self.roster.version.clone(),
+            listed_date: None,
         }
     }
 
     /// A follow-up inherits its index request's provenance: the two read the same window under the
     /// same retrieval model, and R10's rule is that two retrieval models are two populations.
-    fn document_request(&self, request: &Request, path: &str) -> Request {
+    fn document_request(&self, request: &Request, row: &IndexRow) -> Request {
         Request {
             source: SourceId::new(SOURCE),
             target_window: request.target_window.clone(),
             phase: RequestPhase::Document,
             provenance: request.provenance,
-            url: format!("{ARCHIVES}{path}"),
+            url: format!("{ARCHIVES}{}", row.path),
             headers: Vec::new(),
             params: Vec::new(),
             universe_version: self.roster.version.clone(),
+            listed_date: Some(row.filed.clone()),
         }
     }
 
@@ -239,7 +243,7 @@ impl EdgarPress {
                 .parse()
                 .is_ok_and(|cik| self.roster.ciks.contains(&cik));
             if in_form && in_universe {
-                follow_ups.push(self.document_request(request, &row.path));
+                follow_ups.push(self.document_request(request, row));
             } else {
                 filtered_out += 1;
             }
@@ -259,9 +263,9 @@ impl EdgarPress {
         let accession = labelled(&text, &self.parsed.accession_field).unwrap_or_default();
         let company = labelled(&text, &self.parsed.company_field).unwrap_or_default();
         let form = labelled(&text, &self.parsed.form_field).unwrap_or_default();
-        let (valid, valid_raw, valid_field) = self.publication(&text, &request.target_window);
+        let (valid, valid_raw, valid_field) = self.publication(&text, request);
         let url = request.url.clone();
-        let observation = self.backfill_observation(request.provenance, valid);
+        let observation = self.backfill_observation(request, valid);
         let item = CollectedItem {
             source: SourceId::new(SOURCE),
             source_item_id: accession.clone(),
@@ -307,10 +311,10 @@ impl EdgarPress {
         }
     }
 
-    /// The acceptance instant when it parses, and the index's own `Date Filed` DAY when it does
-    /// not - never a fabricated midnight, which is what carried 13 h of lookahead through the
-    /// predecessor's lake (architecture.md section 3.1's `valid_precision` row).
-    fn publication(&self, text: &str, window: &TargetWindow) -> (Published, String, String) {
+    /// The acceptance instant when it parses, else the `Date Filed` DAY of the index row behind the
+    /// follow-up, never the index's own day: they differ on a late submission (§3.9). Never a
+    /// fabricated midnight, which carried 13 h of lookahead through the predecessor's lake (§3.1).
+    fn publication(&self, text: &str, request: &Request) -> (Published, String, String) {
         if let Some(raw) = tagged(text, &self.parsed.acceptance_field) {
             if let Some(at) = self.instant(&raw) {
                 return (
@@ -320,36 +324,30 @@ impl EdgarPress {
                 );
             }
         }
-        match days_of(window).and_then(|days| days.first().copied()) {
-            Some(day) => (
-                Published::On {
-                    day,
-                    tz: self.parsed.zone,
-                },
-                day.to_string(),
-                DATE_FILED.to_owned(),
-            ),
-            None => (
-                Published::Unknown,
-                window.as_str().to_owned(),
-                DATE_FILED.to_owned(),
-            ),
-        }
+        let raw = request.listed_date.clone().unwrap_or_default();
+        let valid = match NaiveDate::parse_from_str(raw.trim(), INDEX_DATE) {
+            Ok(day) => Published::On {
+                day,
+                tz: self.parsed.zone,
+            },
+            Err(_) => Published::Unknown,
+        };
+        (valid, raw, DATE_FILED.to_owned())
     }
 
     /// Where a backfilled item's observation goes: its own publication plus the probed lag, via
     /// [`Visibility::from_backfill`], which is the only constructor that takes a [`MeasuredLag`].
     /// `Ok(None)` for a live ingest, whose observation is the fetch instant the driver holds.
     ///
-    /// A DATE has no instant, so its publication bound is the END of that day in its own calendar
-    /// and the lag is added to that: an upper bound on top of an upper bound, which can only make
-    /// an item less visible. Which `Ok(None)` arms an archive item can reach: section 8 row R11.
+    /// A DATE has no instant, so the bound is the END of the INDEX's day in the rules' zone, not
+    /// of the row's `Date Filed`: a late row is first listed on the index's day (§3.9). Lag on top
+    /// of an upper bound can only make an item less visible. Reachable `Ok(None)` arms: §8 row R11.
     fn backfill_observation(
         &self,
-        provenance: Provenance,
+        request: &Request,
         valid: Published,
     ) -> Result<Option<ObservationTime>, PitError> {
-        if provenance != Provenance::VendorArchive {
+        if request.provenance != Provenance::VendorArchive {
             return Ok(None);
         }
         let Some(lag) = self.lag.as_ref() else {
@@ -357,11 +355,13 @@ impl EdgarPress {
         };
         let bound = match valid {
             Published::At(instant) => instant,
-            Published::On { day, tz } => match end_of_day(day, tz) {
-                Some(ends) => ValidTime::new(ends),
-                None => return Ok(None),
-            },
-            Published::Unknown => return Ok(None),
+            Published::On { .. } | Published::Unknown => {
+                let listed = days_of(&request.target_window).and_then(|days| days.first().copied());
+                match listed.and_then(|day| end_of_day(day, self.parsed.zone)) {
+                    Some(ends) => ValidTime::new(ends),
+                    None => return Ok(None),
+                }
+            }
         };
         Visibility::from_backfill(bound, lag).map(|visible| Some(visible.observed()))
     }
@@ -610,7 +610,7 @@ pub fn read_listing(bytes: &[u8]) -> Result<Listing, Refusal> {
 
 fn day_of_index_name(name: &str) -> Option<NaiveDate> {
     let digits = name.strip_prefix("form.")?.strip_suffix(".idx")?;
-    NaiveDate::parse_from_str(digits, "%Y%m%d").ok()
+    NaiveDate::parse_from_str(digits, INDEX_DATE).ok()
 }
 
 /// SEC asks for a name and an address. Checked at startup and never stored, so a run with no
@@ -710,8 +710,8 @@ fn strings(value: &serde_json::Value) -> Vec<String> {
 struct IndexRow {
     form: String,
     cik: String,
-    /// The index's own `Date Filed`, which is `YYYYMMDD` and not ISO - measured on the real file
-    /// 2026-11-13, where the hand-written fixture had `2026-11-10`.
+    /// The row's own `Date Filed`, which is `YYYYMMDD` and not ISO - measured on the real file
+    /// 2026-11-13, where the hand-written fixture had `2026-11-10` until 2026-11-15.
     filed: String,
     path: String,
 }

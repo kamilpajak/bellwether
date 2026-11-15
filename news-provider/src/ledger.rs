@@ -531,6 +531,7 @@ pub(crate) mod tests {
             provenance: Provenance::LiveIngest,
             url: URL.to_owned(),
             universe_version: FileDigest::of(ROSTER),
+            listed_date: None,
             headers: vec![(
                 HeaderName::new("Accept"),
                 HeaderValue::Literal("text/plain".to_owned()),

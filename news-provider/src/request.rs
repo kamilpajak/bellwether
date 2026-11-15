@@ -108,6 +108,9 @@ pub struct Request {
     /// collection time how many of a payload's rows enter the archive: architecture.md section 2's
     /// `universe_version` row, and section 9's "a derive-side input" amended there on 2026-11-13.
     pub universe_version: FileDigest,
+    /// The date the listing row behind a `Document` follow-up carries, as its column reads. Never
+    /// sent and outside `filter_params`; `None` on an `Index` request.
+    pub listed_date: Option<String>,
 }
 
 impl Request {
@@ -195,6 +198,7 @@ mod tests {
                 value: HeaderValue::Literal("getcompany".to_owned()),
             }],
             universe_version: FileDigest::of(universe_version),
+            listed_date: None,
         }
     }
 

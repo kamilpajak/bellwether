@@ -484,6 +484,7 @@ mod tests {
             provenance: Provenance::LiveIngest,
             url: REFUSED.to_owned(),
             universe_version: FileDigest::of(ROSTER),
+            listed_date: None,
             headers: vec![(
                 HeaderName::new(ACCEPT),
                 HeaderValue::Literal(PLAIN_TEXT.to_owned()),

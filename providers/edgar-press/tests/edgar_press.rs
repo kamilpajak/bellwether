@@ -43,6 +43,13 @@ const APPLE_ACCESSION: &str = "0000320193-26-000071";
 /// The second in-universe filing of the fixture index, which is the uncovered one in the
 /// convergence tests below.
 const MICROSOFT_ACCESSION: &str = "0000789019-26-000045";
+const MICROSOFT_PATH: &str = "edgar/data/789019/0000789019-26-000045.txt";
+/// One of the four `Date Filed` values §3.9 measured in the 2026-11-10 index, earlier than both
+/// index days the late-row tests below read it under.
+const LATE_DATE_FILED: &str = "20261102";
+const LATE_FILED_DAY: &str = "2026-11-02";
+/// ISO, which the real column never carries.
+const NOT_A_DATE_FILED: &str = "2026-11-02";
 /// The acceptance field as the filing header spells it, kept as `valid_raw` so a replay re-parses
 /// the value rather than trusting the stored instant.
 const APPLE_ACCEPTANCE_RAW: &str = "20261110163215";
@@ -695,25 +702,102 @@ fn a_blank_source_item_id_lands_as_an_unusable_row_carrying_its_whole_item() -> 
     Ok(())
 }
 
-/// The other unusable arm: a document whose acceptance instant does not parse AND whose window
-/// names no day has no publication value at all, so there is no `item_id` to take over it.
+/// The other unusable arm: a document whose acceptance instant does not parse AND whose index row
+/// carries no readable `Date Filed` has no publication value at all, so there is no `item_id` to
+/// take over it - and the index's own day is never substituted for the missing one.
 #[test]
-fn a_filing_with_no_acceptance_instant_and_no_readable_day_is_unusable_rather_than_undated(
+fn a_filing_with_no_acceptance_instant_and_no_readable_date_filed_is_unusable_rather_than_undated(
 ) -> Outcome {
     let provider = provider()?;
-    let mut request = document_request(&provider, A_LISTED_SESSION)?;
-    request.target_window = TargetWindow::new(NOT_A_WINDOW);
-    let extracted = provider.extract(&request, &blob("filing_8k_microsoft_no_acceptance.txt"));
+    for listed in [None, Some(NOT_A_DATE_FILED.to_owned())] {
+        let mut request = document_request(&provider, A_LISTED_SESSION)?;
+        request.listed_date = listed.clone();
+        let extracted = provider.extract(&request, &blob("filing_8k_microsoft_no_acceptance.txt"));
+        let row = extracted.unusable.first().ok_or_else(|| {
+            format!("expected one unusable row for {listed:?}, got {extracted:?}")
+        })?;
+        assert_eq!(
+            (
+                row.reason,
+                precision_of(&row.item.valid),
+                row.item.valid_raw.clone()
+            ),
+            (
+                UnusableReason::NoParseableValidTime,
+                ValidPrecision::Unknown,
+                listed.unwrap_or_default()
+            )
+        );
+    }
+    Ok(())
+}
+
+/// One index row in the vendor's layout, listed in a later day's index than its own `Date Filed`.
+fn late_index(date_filed: &str) -> RawBlob {
+    let bytes = format!(
+        "Form Type   Company Name           CIK         Date Filed  File Name\n\
+         ---------------------------------------------------------------------\n\
+         8-K         Microsoft Corporation  789019      {date_filed}    {MICROSOFT_PATH}\n"
+    )
+    .into_bytes();
+    RawBlob {
+        digest: FileDigest::of(&bytes).hex().to_owned(),
+        bytes,
+    }
+}
+
+fn late_document_request(
+    provider: &EdgarPress,
+    index_day: &str,
+) -> Result<Request, Box<dyn std::error::Error>> {
+    let index = index_request(provider, index_day)?;
+    provider
+        .extract(&index, &late_index(LATE_DATE_FILED))
+        .follow_ups
+        .first()
+        .cloned()
+        .ok_or_else(|| "the late index yielded no follow-up".to_string().into())
+}
+
+/// §3.9: the 2026-11-10 index carries `Date Filed` 20261102, 20261103, 20261105 and 20261110. A
+/// late row's day fallback is its own `Date Filed`, as the column reads, never the index's day.
+#[test]
+fn a_late_row_with_no_acceptance_instant_lands_on_its_own_date_filed_and_not_the_index_day(
+) -> Outcome {
+    let provider = provider()?;
+    let request = late_document_request(&provider, A_LISTED_SESSION)?;
+    let item =
+        only_item(&provider.extract(&request, &blob("filing_8k_microsoft_no_acceptance.txt")))?;
     assert_eq!(
-        extracted.unusable.first().map(|row| row.reason),
-        Some(UnusableReason::NoParseableValidTime)
+        (
+            item.valid,
+            item.valid_raw.as_str(),
+            item.valid_field.as_str()
+        ),
+        (
+            Published::On {
+                day: LATE_FILED_DAY.parse()?,
+                tz: "America/New_York"
+            },
+            LATE_DATE_FILED,
+            "Date Filed"
+        )
     );
+    Ok(())
+}
+
+/// §8 row R11: the row's `Date Filed` moves the publication but never the observation. A late row
+/// was first listed on its index's day, so the backfill bound stays the end of THAT day.
+#[test]
+fn a_late_rows_backfilled_observation_is_dated_by_its_index_day_and_not_its_date_filed() -> Outcome
+{
+    let provider = probed()?;
+    let request = late_document_request(&provider, AN_ARCHIVED_SESSION)?;
+    let item =
+        only_item(&provider.extract(&request, &blob("filing_8k_microsoft_no_acceptance.txt")))?;
     assert_eq!(
-        extracted
-            .unusable
-            .first()
-            .map(|row| precision_of(&row.item.valid)),
-        Some(ValidPrecision::Unknown)
+        (precision_of(&item.valid), item.observed),
+        (ValidPrecision::Day, Some(at(ARCHIVED_DAY_OBSERVED_AT)))
     );
     Ok(())
 }

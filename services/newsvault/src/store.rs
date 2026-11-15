@@ -37,6 +37,7 @@
 //!     headers: Vec::new(),
 //!     params: Vec::new(),
 //!     universe_version: canon::FileDigest::of(b"{}"),
+//!     listed_date: None,
 //! };
 //! let at = ObservationTime::new(DateTime::UNIX_EPOCH);
 //! let raw = committer.put_blob(b"{}")?;
@@ -1210,6 +1211,7 @@ mod tests {
             headers: Vec::new(),
             params: Vec::new(),
             universe_version: FileDigest::of(ROSTER),
+            listed_date: None,
         }
     }
 

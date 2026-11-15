@@ -243,6 +243,7 @@ mod tests {
                 headers: Vec::new(),
                 params: Vec::new(),
                 universe_version: FileDigest::of(ROSTER),
+                listed_date: None,
             }
         }
 
