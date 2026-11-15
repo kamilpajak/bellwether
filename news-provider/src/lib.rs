@@ -30,7 +30,7 @@
 //! # fn legal(wire: &Wire, request: &Request, clock: &dyn Clock, run: &RunId,
 //! #          at: ObservationTime) -> Result<(), LedgerError> {
 //! let mut sink = Nowhere;
-//! let mut slot = AttemptSlot::open(&mut sink, request, run, 0, at)?;
+//! let mut slot = AttemptSlot::open(&mut sink, request, None, run, 0, at)?;
 //! let permit = slot.take_permit()?;
 //! let _answer = wire.send(permit, request, clock);
 //! # Ok(())

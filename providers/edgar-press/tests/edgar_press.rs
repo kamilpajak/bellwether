@@ -193,6 +193,7 @@ fn verdict(
     let slot = AttemptSlot::open(
         &mut sink,
         request,
+        None,
         &RunId::new(RUN),
         FIRST_ATTEMPT,
         at(RUN_AT),
@@ -489,6 +490,7 @@ fn a_body_over_the_limit_is_permanent_and_a_lost_connection_transient() -> Outco
         let slot = AttemptSlot::open(
             &mut sink,
             &request,
+            None,
             &RunId::new(RUN),
             FIRST_ATTEMPT,
             at(RUN_AT),
@@ -545,6 +547,7 @@ fn an_empty_daily_index_closes_empty_and_writes_its_row() -> Outcome {
     let slot = AttemptSlot::open(
         &mut sink,
         &request,
+        None,
         &RunId::new(RUN),
         FIRST_ATTEMPT,
         at(RUN_AT),

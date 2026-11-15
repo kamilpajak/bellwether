@@ -183,6 +183,7 @@ fn verdict(
     let slot = AttemptSlot::open(
         &mut sink,
         request,
+        None,
         &RunId::new(RUN),
         FIRST_ATTEMPT,
         at(RUN_AT),
@@ -366,6 +367,7 @@ fn a_lost_connection_is_transient() -> Outcome {
     let slot = AttemptSlot::open(
         &mut sink,
         &request,
+        None,
         &RunId::new(RUN),
         FIRST_ATTEMPT,
         at(RUN_AT),
@@ -392,6 +394,7 @@ fn a_body_over_the_limit_is_permanent() -> Outcome {
     let slot = AttemptSlot::open(
         &mut sink,
         &request,
+        None,
         &RunId::new(RUN),
         FIRST_ATTEMPT,
         at(RUN_AT),
@@ -603,6 +606,30 @@ fn a_url_with_a_port_or_a_userinfo_has_no_item_key() -> Outcome {
     ] {
         assert_eq!(provider.item_key(&url), None, "{url}");
     }
+    Ok(())
+}
+
+/// Section 11.1: a follow-up with no `story_of` is issued even beside a held one, built by hand
+/// because `index_rows_of` emits none. Mutation 2026-11-15, `is_none_or` made `is_some_and`: red.
+#[test]
+fn a_follow_up_with_no_story_is_issued_and_a_held_one_dropped() -> Outcome {
+    let provider = provider()?;
+    let held_one = article_request(&provider)?;
+    let storyless = Request {
+        url: held_one
+            .url
+            .replacen(GNW_HOST, &format!("{GNW_HOST}:443"), 1),
+        ..held_one.clone()
+    };
+    let story = provider
+        .story_of(&held_one)
+        .ok_or("the article has no story")?;
+    let held = BTreeSet::from([story.hex().to_owned()]);
+    let issued = provider.follow_ups_to_issue(vec![held_one, storyless.clone()], &held);
+    assert_eq!(
+        (provider.story_of(&storyless), issued),
+        (None, vec![storyless])
+    );
     Ok(())
 }
 
@@ -883,18 +910,22 @@ fn a_page_with_no_article_container_is_unusable_as_no_article_body() -> Outcome 
     Ok(())
 }
 
-/// Section 11.5 step 4 builds the held filter; until then every live follow-up is issued.
+/// Section 11.1: a live follow-up whose story is held is dropped. Mutation 2026-11-15, the filter
+/// removed: red.
 #[test]
-fn every_live_follow_up_is_issued_even_when_its_story_is_covered() -> Outcome {
+fn a_live_follow_up_whose_story_is_held_is_dropped_and_an_unheld_one_kept() -> Outcome {
     let provider = provider()?;
     let all = follow_ups(&provider, &gnw(REAL_INDEX))?.follow_ups;
-    let covered: BTreeSet<String> = all
-        .iter()
-        .filter_map(|request| provider.story_of(request))
+    let Some((first, rest)) = all.split_first() else {
+        return Err("the real index names no follow-up".into());
+    };
+    let held: BTreeSet<String> = provider
+        .story_of(first)
         .map(|story| story.hex().to_owned())
+        .into_iter()
         .collect();
-    assert_eq!(covered.len(), all.len());
-    assert_eq!(provider.follow_ups_to_issue(all.clone(), &covered), all);
+    assert_eq!(held.len(), 1);
+    assert_eq!(provider.follow_ups_to_issue(all.clone(), &held), rest);
     Ok(())
 }
 

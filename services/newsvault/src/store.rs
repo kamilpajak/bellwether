@@ -43,7 +43,7 @@
 //! };
 //! let at = ObservationTime::new(DateTime::UNIX_EPOCH);
 //! let raw = committer.put_blob(b"{}")?;
-//! let mut slot = AttemptSlot::open(&mut committer, &request, &run, 0, at)?;
+//! let mut slot = AttemptSlot::open(&mut committer, &request, None, &run, 0, at)?;
 //! let answer = RawResponse::new(slot.attempt_id().clone(), 200, b"{}".to_vec(), at, at);
 //! let outcome = Outcome::decide(&Verdict::Usable, 1, &Baseline::from_trailing_ok(&[1]));
 //! let closed = slot.close(&mut committer, outcome, &Ok(answer), at)?;
@@ -81,7 +81,7 @@ use canon::{Digest, FileDigest};
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use news_provider::{
     AttemptEvent, AttemptReceipt, Cost, LedgerError, OutcomeKind, RunId, Sink, SourceId,
-    TargetWindow, ValidSource,
+    TargetWindow, ValidSource, Verdict,
 };
 use pit::datedness::{Datedness, Published};
 use pit::{ObservationTime, Visibility};
@@ -110,11 +110,11 @@ PRAGMA synchronous = FULL;
 ";
 
 /// The `PRAGMA user_version` this build writes, and the only one a read-only reader accepts.
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// Version `i + 1` is reached from version `i` by `MIGRATIONS[i]`, run by [`migrate`] with
 /// foreign keys off, as SQLite's twelve-step table rebuild (lang_altertable.html) requires.
-const MIGRATIONS: [&str; 2] = [
+const MIGRATIONS: [&str; 3] = [
     "
 -- The hosts file a run was admitted under: architecture.md section 2's `hosts_version` row. NULL
 -- for a provider that reads no hosts file.
@@ -169,6 +169,19 @@ CREATE TABLE robots (
     answer     TEXT NOT NULL CHECK (answer IN ('present', 'absent')),
     blob       TEXT REFERENCES blobs(digest)
 );
+",
+    "
+-- `news_provider::Verdict::name`, which tells a permanent failure from a transient one where
+-- `outcome` says `failed` for both: architecture.md section 11.1. NULL for an abandoned attempt
+-- and for every row closed before user_version 3, because a backfill from `failed` is a guess.
+ALTER TABLE attempts ADD COLUMN verdict TEXT
+    CHECK (verdict IN ('usable', 'empty', 'permanent_failure', 'transient_failure'));
+-- The story a Document attempt fetched, from `Provider::story_of` at open: section 11.1's held
+-- key. NULL for an index or robots attempt and for every row opened before user_version 3.
+ALTER TABLE attempts ADD COLUMN story_id TEXT;
+-- Section 11.1's `held`: follow-ups a LIVE index attempt did not issue because the store already
+-- held them, `matched - issued`. NULL on every other row and on every row before user_version 3.
+ALTER TABLE attempts ADD COLUMN held INTEGER;
 ",
 ];
 
@@ -993,6 +1006,33 @@ impl Committer {
         Ok(covered)
     }
 
+    /// Section 11.1's held set: keyed on (source, story) over every target window, so a story
+    /// held under yesterday's window is held today. No cutoff, for the reason
+    /// [`Committer::covered_story_ids`] gives.
+    pub fn held_story_ids(&self, source: &SourceId) -> Result<BTreeSet<String>, StoreError> {
+        let mut statement = self.db.prepare(
+            "SELECT i.story_id FROM items i
+             JOIN attempts a ON a.attempt_id = i.attempt_id
+             WHERE a.source = ?1
+             UNION
+             SELECT story_id FROM attempts
+             WHERE source = ?1 AND story_id IS NOT NULL AND closed_at IS NOT NULL
+               AND verdict IN (?2, ?3, ?4)",
+        )?;
+        let held = statement
+            .query_map(
+                params![
+                    source.as_str(),
+                    Verdict::Usable.name(),
+                    Verdict::Empty.name(),
+                    Verdict::PermanentFailure.name()
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<BTreeSet<String>, _>>()?;
+        Ok(held)
+    }
+
     /// Records how many in-universe follow-ups an index attempt named. One count per index
     /// attempt, stable across runs, so the coverage reader takes the MAX. A plain annotation
     /// column and not an item-row invariant, so it is its own `UPDATE` rather than part of the
@@ -1005,6 +1045,17 @@ impl Committer {
         self.db.execute(
             "UPDATE attempts SET matched = ?2 WHERE attempt_id = ?1",
             params![attempt_id, matched],
+        )?;
+        Ok(())
+    }
+
+    /// Records how many follow-ups a live index attempt left unissued because the store held them:
+    /// section 11.1's `held`, the number `ledger --check` subtracts. Same shape as
+    /// [`Committer::record_planned_coverage`]: its own `UPDATE` after the commit.
+    pub fn record_held(&mut self, attempt_id: &str, held: u32) -> Result<(), StoreError> {
+        self.db.execute(
+            "UPDATE attempts SET held = ?2 WHERE attempt_id = ?1",
+            params![attempt_id, held],
         )?;
         Ok(())
     }
@@ -1320,14 +1371,15 @@ impl Committer {
             filter_params,
             universe_version,
             hosts_version,
+            story_id,
             opened_at,
         } = event
         {
             self.db.execute(
                 "INSERT INTO attempts
                      (attempt_id, run_id, source, target_window, filter_params, universe_version,
-                      opened_at, hosts_version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(attempt_id) DO NOTHING",
+                      opened_at, hosts_version, story_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(attempt_id) DO NOTHING",
                 params![
                     attempt_id.hex(),
                     run.as_str(),
@@ -1336,7 +1388,8 @@ impl Committer {
                     filter_params.hex(),
                     universe_version.hex(),
                     stamp(opened_at.inner()),
-                    hosts_version.as_ref().map(FileDigest::hex)
+                    hosts_version.as_ref().map(FileDigest::hex),
+                    story_id.as_ref().map(Digest::hex)
                 ],
             )?;
         }
@@ -1618,7 +1671,7 @@ fn apply(db: &Connection, event: &AttemptEvent) -> Result<(), StoreError> {
             db.execute(
                 "UPDATE attempts SET outcome = ?2, vendor_rows = ?3,
                      baseline_count = ?4, baseline_window = ?5, baseline_construction = ?6,
-                     baseline_ratio = ?7, slots = ?8, closed_at = ?9
+                     baseline_ratio = ?7, slots = ?8, closed_at = ?9, verdict = ?10
                  WHERE attempt_id = ?1",
                 params![
                     attempt_id.hex(),
@@ -1629,7 +1682,8 @@ fn apply(db: &Connection, event: &AttemptEvent) -> Result<(), StoreError> {
                     baseline.map(|baseline| baseline.construction),
                     baseline.and_then(|baseline| baseline.ratio),
                     cost.map(|Cost::Slots(slots)| slots),
-                    stamp(closed_at.inner())
+                    stamp(closed_at.inner()),
+                    outcome.verdict().map(Verdict::name)
                 ],
             )?;
             Ok(())
@@ -1948,6 +2002,7 @@ mod tests {
         let slot = AttemptSlot::open(
             store,
             &request_from(source),
+            None,
             &RunId::new(RUN),
             ordinal,
             at(1),
@@ -1981,6 +2036,7 @@ mod tests {
         let slot = AttemptSlot::open(
             store,
             &request_from(SOURCE),
+            None,
             &RunId::new(RUN),
             ordinal,
             at(1),
@@ -2099,7 +2155,7 @@ mod tests {
         let temp = TempDir::new()?;
         let mut store = open(&temp)?;
         let request = request();
-        let slot = AttemptSlot::open(&mut store, &request, &RunId::new(RUN), 0, at(1))?;
+        let slot = AttemptSlot::open(&mut store, &request, None, &RunId::new(RUN), 0, at(1))?;
         let stored: String = store.db.query_row(
             "SELECT universe_version FROM attempts WHERE attempt_id = ?1",
             params![slot.attempt_id().hex()],
@@ -2118,7 +2174,7 @@ mod tests {
             hosts_version: Some(FileDigest::of(HOSTS)),
             ..request()
         };
-        let slot = AttemptSlot::open(&mut store, &request, &RunId::new(RUN), 0, at(1))?;
+        let slot = AttemptSlot::open(&mut store, &request, None, &RunId::new(RUN), 0, at(1))?;
         let stored: Option<String> = store.db.query_row(
             "SELECT hosts_version FROM attempts WHERE attempt_id = ?1",
             params![slot.attempt_id().hex()],
@@ -2251,6 +2307,7 @@ mod tests {
         let v0 = Connection::open(temp.path().join(COMMIT_LOG))?;
         let before = (v0_items(&v0)?, item_indexes(&v0)?);
         drop(v0);
+        assert!(super::refuse_an_unreadable_version(temp.path()).is_ok());
         let store = open(&temp)?;
         assert_eq!(before.0.len(), V0_ROWS);
         assert_eq!(
@@ -2422,6 +2479,21 @@ mod tests {
         "published",
     ];
     const ROBOTS_HOST: &str = "rss.globenewswire.com";
+    /// Every table a user_version 2 store holds: the v1 five plus `robots`.
+    const V2_TABLES: [&str; 6] = [
+        "attempts",
+        "blobs",
+        "items",
+        "seq_reservations",
+        "published",
+        "robots",
+    ];
+    const EVERY_VERDICT: [Verdict; 4] = [
+        Verdict::Usable,
+        Verdict::Empty,
+        Verdict::PermanentFailure,
+        Verdict::TransientFailure,
+    ];
 
     /// A v1 store written with the frozen DDL replayed to user_version 1 and no later step: one
     /// row in every table, every nullable column set, a minute item and a hosts version.
@@ -2451,11 +2523,21 @@ mod tests {
         Ok(())
     }
 
-    /// Each row of each v1 table as one SQL-quoted text over every column, in rowid order.
-    fn v1_rows(db: &Connection) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    /// Each row of each of `tables` as one SQL-quoted text over every column a store at
+    /// `version` declares, in rowid order, so a column a later step adds is not compared.
+    fn quoted_rows(
+        db: &Connection,
+        version: usize,
+        tables: &[&str],
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let declared = Connection::open_in_memory()?;
+        declared.execute_batch(SCHEMA_V0)?;
+        for step in MIGRATIONS.iter().take(version) {
+            declared.execute_batch(step)?;
+        }
         let mut rows = Vec::new();
-        for table in V1_TABLES {
-            let columns = super::columns_of(db, table)?;
+        for &table in tables {
+            let columns = super::columns_of(&declared, table)?;
             let quoted: Vec<String> = columns
                 .keys()
                 .map(|column| format!("quote({column})"))
@@ -2482,7 +2564,7 @@ mod tests {
             target_window: TargetWindow::new(ROBOTS_HOST),
             ..request()
         };
-        let slot = AttemptSlot::open(store, &request, &RunId::new(RUN), 0, at(1))?;
+        let slot = AttemptSlot::open(store, &request, None, &RunId::new(RUN), 0, at(1))?;
         let answer = RawResponse::new(
             slot.attempt_id().clone(),
             STATUS_OK,
@@ -2521,7 +2603,7 @@ mod tests {
         assert_eq!(
             (user_version(&store.db)?, robots_rows(&store)?),
             (
-                2,
+                SCHEMA_VERSION,
                 vec![(
                     ROBOTS_HOST.to_owned(),
                     "present".to_owned(),
@@ -2565,19 +2647,22 @@ mod tests {
             let db = Connection::open(temp.path().join(COMMIT_LOG))?;
             db.execute_batch(edit)?;
             drop(db);
-            let read_only = super::refuse_an_unreadable_version(temp.path());
+            let read_only = match super::refuse_an_unreadable_version(temp.path()) {
+                Err(StoreError::ShapeDiffers { found: 1, columns }) => columns,
+                other => vec![format!("{other:?}")],
+            };
             let refused = match open(&temp) {
                 Err(StoreError::ShapeDiffers { found: 1, columns }) => columns,
                 other => vec![format!("{other:?}")],
             };
             let db = Connection::open(temp.path().join(COMMIT_LOG))?;
-            named.push((refused, read_only.is_err(), user_version(&db)?));
+            named.push((refused, read_only, user_version(&db)?));
         }
         assert_eq!(
             named,
             fixtures
                 .into_iter()
-                .map(|(_, columns)| (columns, true, 1))
+                .map(|(_, columns)| (columns.clone(), columns, 1))
                 .collect::<Vec<_>>()
         );
         Ok(())
@@ -2590,11 +2675,221 @@ mod tests {
         let temp = TempDir::new()?;
         a_store_at_user_version_one(&temp)?;
         let v1 = Connection::open(temp.path().join(COMMIT_LOG))?;
-        let before = v1_rows(&v1)?;
+        let before = quoted_rows(&v1, 1, &V1_TABLES)?;
         drop(v1);
+        assert!(super::refuse_an_unreadable_version(temp.path()).is_ok());
         let store = open(&temp)?;
         assert_eq!(before.len(), V1_TABLES.len() + 1);
-        assert_eq!(v1_rows(&store.db)?, before);
+        assert_eq!(quoted_rows(&store.db, 1, &V1_TABLES)?, before);
+        Ok(())
+    }
+
+    /// A v2 store: the v1 fixture, `MIGRATIONS[1]` and no later step, plus one robots row.
+    fn a_store_at_user_version_two(temp: &TempDir) -> TestResult {
+        a_store_at_user_version_one(temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch(MIGRATIONS[1])?;
+        db.pragma_update(None, "user_version", 2)?;
+        db.execute_batch(
+            "INSERT INTO robots VALUES ('a v1 attempt', 'rss.globenewswire.com', 'present',
+                 'a v1 blob');",
+        )?;
+        Ok(())
+    }
+
+    fn verdict_of(store: &Committer, attempt: &str) -> Result<Option<String>, StoreError> {
+        Ok(store.db.query_row(
+            "SELECT verdict FROM attempts WHERE attempt_id = ?1",
+            params![attempt],
+            |row| row.get(0),
+        )?)
+    }
+
+    const HELD: u32 = 2;
+
+    /// §8 row M1 from user_version 2: the step to 3 adds `attempts.verdict`, `attempts.story_id`
+    /// and `attempts.held`, and a verdict, a story and a held count land in them. Mutations
+    /// 2026-11-15, `MIGRATIONS[2]` emptied and its `story_id` or `held` line alone removed: red.
+    #[test]
+    fn a_store_at_user_version_two_opens_migrates_to_three_and_takes_a_verdict() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_two(&temp)?;
+        let mut store = open(&temp)?;
+        a_document_closed(
+            &mut store,
+            (SOURCE, WINDOW),
+            STORY,
+            0,
+            Verdict::PermanentFailure,
+        )?;
+        let attempt: String = store.db.query_row(
+            "SELECT attempt_id FROM attempts WHERE story_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        store.record_held(&attempt, HELD)?;
+        let held: Option<u32> = store.db.query_row(
+            "SELECT held FROM attempts WHERE attempt_id = ?1",
+            params![attempt],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            (
+                user_version(&store.db)?,
+                verdict_of(&store, &attempt)?,
+                story_of_row(&store, &attempt)?,
+                held
+            ),
+            (
+                3,
+                Some("permanent_failure".to_owned()),
+                Some(story_hex(SOURCE, STORY)),
+                Some(HELD)
+            )
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the carried half from user_version 2: every column of every row of every v2
+    /// table, compared by `quote()`; the v2 attempt gains a NULL verdict, story and held and
+    /// nothing else, because none is backfilled.
+    #[test]
+    fn a_v2_store_keeps_every_v2_column_of_every_row() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_two(&temp)?;
+        let v2 = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let before = quoted_rows(&v2, 2, &V2_TABLES)?;
+        drop(v2);
+        assert!(super::refuse_an_unreadable_version(temp.path()).is_ok());
+        let store = open(&temp)?;
+        let after = quoted_rows(&store.db, 2, &V2_TABLES)?;
+        assert_eq!(before.len(), V2_TABLES.len() + 1);
+        let held: Option<i64> = store.db.query_row(
+            "SELECT held FROM attempts WHERE attempt_id = 'a v1 attempt'",
+            [],
+            |row| row.get(0),
+        )?;
+        let added = (
+            verdict_of(&store, "a v1 attempt")?,
+            story_of_row(&store, "a v1 attempt")?,
+            held,
+        );
+        assert_eq!((after, added), (before, (None, None, None)));
+        Ok(())
+    }
+
+    /// §8 row M1, the per-version shape check at user_version 2: a robots column of another type
+    /// and a missing `robots` table are each named, and the store stays at 2.
+    #[test]
+    fn a_v2_store_whose_columns_differ_is_refused_and_left_at_user_version_two() -> TestResult {
+        let fixtures = [
+            (
+                "ALTER TABLE robots DROP COLUMN host;
+                 ALTER TABLE robots ADD COLUMN host INTEGER;",
+                vec!["robots.host".to_owned()],
+            ),
+            (
+                "DROP TABLE robots;",
+                ["answer", "attempt_id", "blob", "host"]
+                    .map(|column| format!("robots.{column}"))
+                    .to_vec(),
+            ),
+        ];
+        let mut named = Vec::new();
+        for (edit, _) in &fixtures {
+            let temp = TempDir::new()?;
+            a_store_at_user_version_two(&temp)?;
+            let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+            db.execute_batch(edit)?;
+            drop(db);
+            let read_only = match super::refuse_an_unreadable_version(temp.path()) {
+                Err(StoreError::ShapeDiffers { found: 2, columns }) => columns,
+                other => vec![format!("{other:?}")],
+            };
+            let refused = match open(&temp) {
+                Err(StoreError::ShapeDiffers { found: 2, columns }) => columns,
+                other => vec![format!("{other:?}")],
+            };
+            let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+            named.push((refused, read_only, user_version(&db)?));
+        }
+        assert_eq!(
+            named,
+            fixtures
+                .into_iter()
+                .map(|(_, columns)| (columns.clone(), columns, 2))
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    /// §11.1's held table needs permanence apart from `failed`, and nothing for an attempt nobody
+    /// answered. Mutation 2026-11-15, `apply` writing NULL for the verdict: red.
+    #[test]
+    fn every_verdict_reaches_the_verdict_column_by_its_own_name_and_an_abandoned_attempt_none(
+    ) -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let mut stored = Vec::new();
+        for (ordinal, verdict) in EVERY_VERDICT.into_iter().enumerate() {
+            let closed = closed_attempt(&mut store, u32::try_from(ordinal)?, verdict)?;
+            let attempt = closed.attempt_id().hex().to_owned();
+            store.record(closed, &[], at(5))?;
+            stored.push(verdict_of(&store, &attempt)?);
+        }
+        let slot = AttemptSlot::open(
+            &mut store,
+            &request(),
+            None,
+            &RunId::new(RUN),
+            u32::try_from(EVERY_VERDICT.len())?,
+            at(1),
+        )?;
+        let in_flight = slot.attempt_id().clone();
+        drop(slot);
+        let closed = abandon(&mut store, in_flight, at(9), &RunId::new(SWEEPING_RUN))?;
+        let attempt = closed.attempt_id().hex().to_owned();
+        store.record(closed, &[], at(10))?;
+        stored.push(verdict_of(&store, &attempt)?);
+        assert_eq!(
+            stored,
+            vec![
+                Some("usable".to_owned()),
+                Some("empty".to_owned()),
+                Some("permanent_failure".to_owned()),
+                Some("transient_failure".to_owned()),
+                None
+            ]
+        );
+        Ok(())
+    }
+
+    /// The CHECK and `Verdict::name` are two spellings of one vocabulary; `failed` is the
+    /// control that the CHECK refuses anything. Mutation 2026-11-15, one name removed: red.
+    #[test]
+    fn every_verdict_name_is_one_the_verdict_check_admits() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let slot = AttemptSlot::open(&mut store, &request(), None, &RunId::new(RUN), 0, at(1))?;
+        let attempt = slot.attempt_id().hex().to_owned();
+        drop(slot);
+        let admitted = |name: &str| {
+            store
+                .db
+                .execute(
+                    "UPDATE attempts SET verdict = ?2 WHERE attempt_id = ?1",
+                    params![attempt, name],
+                )
+                .is_ok()
+        };
+        let names: Vec<bool> = EVERY_VERDICT
+            .into_iter()
+            .map(|verdict| admitted(verdict.name()))
+            .collect();
+        assert_eq!(
+            (names, admitted("failed")),
+            (vec![true; EVERY_VERDICT.len()], false)
+        );
         Ok(())
     }
 
@@ -2934,6 +3229,179 @@ mod tests {
         assert_eq!(
             covered,
             std::collections::BTreeSet::from([story_hex(SOURCE, STORY)])
+        );
+        Ok(())
+    }
+
+    const YESTERDAY: &str = "2026-11-09";
+
+    fn document_request(source: &str, window: &str) -> Request {
+        Request {
+            target_window: TargetWindow::new(window),
+            phase: RequestPhase::Document,
+            ..request_from(source)
+        }
+    }
+
+    /// A Document attempt opened under the story `source_item_id` names, the way the driver
+    /// opens one; the caller closes it, abandons it or leaves it in flight.
+    fn document_slot(
+        store: &mut Committer,
+        (source, window): (&str, &str),
+        source_item_id: &str,
+        ordinal: u32,
+    ) -> Result<AttemptSlot, Box<dyn std::error::Error>> {
+        let story = story_id(source, source_item_id).map_err(|failure| failure.to_string())?;
+        Ok(AttemptSlot::open(
+            store,
+            &document_request(source, window),
+            Some(&story),
+            &RunId::new(RUN),
+            ordinal,
+            at(1),
+        )?)
+    }
+
+    /// A Document attempt closed under `verdict` and recorded with no item.
+    fn a_document_closed(
+        store: &mut Committer,
+        at_window: (&str, &str),
+        source_item_id: &str,
+        ordinal: u32,
+        verdict: Verdict,
+    ) -> TestResult {
+        let slot = document_slot(store, at_window, source_item_id, ordinal)?;
+        let answer = RawResponse::new(
+            slot.attempt_id().clone(),
+            STATUS_OK,
+            PAYLOAD.to_vec(),
+            at(2),
+            at(3),
+        );
+        let outcome = Outcome::decide(&verdict, 0, &Baseline::from_trailing_ok(&TRAILING_OK));
+        let closed = slot.close(store, outcome, &Ok(answer), at(4))?;
+        store.record(closed, &[], at(5))?;
+        Ok(())
+    }
+
+    fn story_of_row(store: &Committer, attempt: &str) -> Result<Option<String>, StoreError> {
+        Ok(store.db.query_row(
+            "SELECT story_id FROM attempts WHERE attempt_id = ?1",
+            params![attempt],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Section 11.1, `attempts.story_id`: written at open from the story the driver named.
+    /// Mutation 2026-11-15, `commit_opened` binding NULL for it: red.
+    #[test]
+    fn the_opened_row_carries_the_story_the_driver_named_and_an_index_row_none() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let document = document_slot(&mut store, (SOURCE, WINDOW), STORY, 0)?;
+        let index = AttemptSlot::open(&mut store, &request(), None, &RunId::new(RUN), 1, at(1))?;
+        let named = (
+            story_of_row(&store, document.attempt_id().hex())?,
+            story_of_row(&store, index.attempt_id().hex())?,
+        );
+        drop((document, index));
+        assert_eq!(named, (Some(story_hex(SOURCE, STORY)), None));
+        Ok(())
+    }
+
+    /// One row per state of section 11.1's held table; only the first four are held. The item's
+    /// attempt names no story, so the items arm alone holds it. Mutations 2026-11-15: the verdict
+    /// arm dropped, red; `transient_failure` admitted, red.
+    #[test]
+    fn held_story_ids_names_each_state_the_held_table_holds_and_no_other() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let here = (SOURCE, WINDOW);
+        let committed = closed_attempt(&mut store, 0, Verdict::Usable)?;
+        store.record(committed, &[row(&store, &spec(STORY))?], at(5))?;
+        a_document_closed(&mut store, here, "usable, no item", 1, Verdict::Usable)?;
+        a_document_closed(&mut store, here, "empty", 2, Verdict::Empty)?;
+        a_document_closed(&mut store, here, "permanent", 3, Verdict::PermanentFailure)?;
+        a_document_closed(&mut store, here, "transient", 4, Verdict::TransientFailure)?;
+        let swept = document_slot(&mut store, here, "swept", 5)?;
+        let swept_id = swept.attempt_id().clone();
+        drop(swept);
+        let closed = abandon(&mut store, swept_id, at(9), &RunId::new(SWEEPING_RUN))?;
+        store.record(closed, &[], at(10))?;
+        let in_flight = document_slot(&mut store, here, "in flight", 6)?;
+        drop(in_flight);
+        let held = store.held_story_ids(&SourceId::new(SOURCE))?;
+        assert_eq!(
+            held,
+            [STORY, "usable, no item", "empty", "permanent"]
+                .map(|story| story_hex(SOURCE, story))
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        Ok(())
+    }
+
+    /// An index attempt under (source, window), naming no story, that commits `spec`'s item: the
+    /// items arm of the held read is then the only one that can hold it.
+    fn an_item_committed_under(
+        store: &mut Committer,
+        (source, window): (&str, &str),
+        ordinal: u32,
+        spec: &Spec,
+    ) -> TestResult {
+        let request = Request {
+            target_window: TargetWindow::new(window),
+            ..request_from(source)
+        };
+        let slot = AttemptSlot::open(store, &request, None, &RunId::new(RUN), ordinal, at(1))?;
+        let answer = RawResponse::new(
+            slot.attempt_id().clone(),
+            STATUS_OK,
+            PAYLOAD.to_vec(),
+            at(2),
+            at(3),
+        );
+        let outcome = Outcome::decide(
+            &Verdict::Usable,
+            VENDOR_ROWS,
+            &Baseline::from_trailing_ok(&TRAILING_OK),
+        );
+        let closed = slot.close(store, outcome, &Ok(answer), at(4))?;
+        store.record(closed, &[row(store, spec)?], at(5))?;
+        Ok(())
+    }
+
+    /// Held is keyed on (source, story) over every target window, never the run's window alone:
+    /// each arm holds one story under yesterday only, and today is the latest window. Mutations
+    /// 2026-11-15: either arm filtered to the latest window, red; either arm's source dropped, red.
+    #[test]
+    fn held_story_ids_spans_every_target_window_and_one_source_only() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let (yesterday, today) = ((SOURCE, YESTERDAY), (SOURCE, WINDOW));
+        an_item_committed_under(&mut store, yesterday, 0, &spec(STORY))?;
+        let failed = Verdict::PermanentFailure;
+        a_document_closed(&mut store, yesterday, "yesterday", 1, failed)?;
+        a_document_closed(&mut store, today, "today", 2, failed)?;
+        let elsewhere = Spec {
+            source: OTHER_SOURCE,
+            ..spec("elsewhere, committed")
+        };
+        an_item_committed_under(&mut store, (OTHER_SOURCE, YESTERDAY), 3, &elsewhere)?;
+        a_document_closed(
+            &mut store,
+            (OTHER_SOURCE, YESTERDAY),
+            "elsewhere",
+            4,
+            failed,
+        )?;
+        let held = store.held_story_ids(&SourceId::new(SOURCE))?;
+        assert_eq!(
+            held,
+            [STORY, "yesterday", "today"]
+                .map(|story| story_hex(SOURCE, story))
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
         );
         Ok(())
     }
@@ -3497,7 +3965,7 @@ mod tests {
     ) -> TestResult {
         let temp = TempDir::new()?;
         let mut store = open(&temp)?;
-        let slot = AttemptSlot::open(&mut store, &request(), &RunId::new(RUN), 0, at(1))?;
+        let slot = AttemptSlot::open(&mut store, &request(), None, &RunId::new(RUN), 0, at(1))?;
         let answer = RawResponse::new(
             slot.attempt_id().clone(),
             STATUS_OK,
@@ -3543,7 +4011,7 @@ mod tests {
     fn an_abandoned_attempt_records_its_interrupted_outcome_and_no_items() -> TestResult {
         let temp = TempDir::new()?;
         let mut store = open(&temp)?;
-        let slot = AttemptSlot::open(&mut store, &request(), &RunId::new(RUN), 0, at(1))?;
+        let slot = AttemptSlot::open(&mut store, &request(), None, &RunId::new(RUN), 0, at(1))?;
         let in_flight = slot.attempt_id().clone();
         drop(slot);
         let closed = abandon(&mut store, in_flight, at(9), &RunId::new(SWEEPING_RUN))?;
@@ -3562,7 +4030,7 @@ mod tests {
     fn an_abandoned_attempt_may_not_carry_items_even_though_it_was_closed() -> TestResult {
         let temp = TempDir::new()?;
         let mut store = open(&temp)?;
-        let slot = AttemptSlot::open(&mut store, &request(), &RunId::new(RUN), 0, at(1))?;
+        let slot = AttemptSlot::open(&mut store, &request(), None, &RunId::new(RUN), 0, at(1))?;
         let in_flight = slot.attempt_id().clone();
         drop(slot);
         let closed = abandon(&mut store, in_flight, at(9), &RunId::new(SWEEPING_RUN))?;
@@ -3582,7 +4050,7 @@ mod tests {
         store
             .db
             .execute_batch("DROP TABLE items; DROP TABLE attempts;")?;
-        let refused = AttemptSlot::open(&mut store, &request(), &RunId::new(RUN), 0, at(1));
+        let refused = AttemptSlot::open(&mut store, &request(), None, &RunId::new(RUN), 0, at(1));
         assert!(
             matches!(
                 refused,

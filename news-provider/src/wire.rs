@@ -627,7 +627,7 @@ mod tests {
 
     fn slot_at(sink: &mut Recorder, ordinal: u32) -> Option<AttemptSlot> {
         let run = RunId::new(RUN);
-        AttemptSlot::open(sink, &request(), &run, ordinal, at(OPENED_AT)).ok()
+        AttemptSlot::open(sink, &request(), None, &run, ordinal, at(OPENED_AT)).ok()
     }
 
     fn permit(sink: &mut Recorder, ordinal: u32) -> Option<SendPermit> {

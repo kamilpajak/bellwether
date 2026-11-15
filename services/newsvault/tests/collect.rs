@@ -304,12 +304,23 @@ impl Archive for Refusing {
         Archive::covered_story_ids(&self.store, source, target_window)
     }
 
+    fn held_story_ids(
+        &self,
+        source: &SourceId,
+    ) -> Result<std::collections::BTreeSet<String>, ArchiveError> {
+        Archive::held_story_ids(&self.store, source)
+    }
+
     fn record_planned_coverage(
         &mut self,
         attempt_id: &str,
         matched: u32,
     ) -> Result<(), ArchiveError> {
         Archive::record_planned_coverage(&mut self.store, attempt_id, matched)
+    }
+
+    fn record_held(&mut self, attempt_id: &str, held: u32) -> Result<(), ArchiveError> {
+        Archive::record_held(&mut self.store, attempt_id, held)
     }
 }
 
@@ -662,12 +673,23 @@ impl Archive for Untouched {
         Err(self.touched("covered_story_ids"))
     }
 
+    fn held_story_ids(
+        &self,
+        _source: &SourceId,
+    ) -> Result<std::collections::BTreeSet<String>, ArchiveError> {
+        Err(self.touched("held_story_ids"))
+    }
+
     fn record_planned_coverage(
         &mut self,
         _attempt_id: &str,
         _matched: u32,
     ) -> Result<(), ArchiveError> {
         Err(self.touched("record_planned_coverage"))
+    }
+
+    fn record_held(&mut self, _attempt_id: &str, _held: u32) -> Result<(), ArchiveError> {
+        Err(self.touched("record_held"))
     }
 }
 
@@ -863,6 +885,33 @@ fn a_literal_contact_shaped_header_value_turns_a_named_test_red() -> TestResult 
     Ok(())
 }
 
+/// Section 11.1, `attempts.story_id`: the driver names a Document attempt's story from
+/// `Provider::story_of` and an index attempt's not at all. Mutation 2026-11-15, the driver
+/// passing None: red.
+#[test]
+fn a_document_attempt_opens_under_the_story_its_provider_names() -> TestResult {
+    let root = TempDir::new()?;
+    collected(root.path(), A_LISTED_SESSION, &Payloads::a_good_day()?)?;
+    let db = Connection::open_with_flags(
+        root.path().join(COMMIT_LOG),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let mut statement = db.prepare("SELECT story_id FROM attempts ORDER BY story_id")?;
+    let stories = statement
+        .query_map([], |row| row.get::<_, Option<String>>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut expected = vec![None];
+    for url in [APPLE_URL, MICROSOFT_URL] {
+        let accession = url.rsplit('/').next().unwrap_or_default();
+        let story = canon::digest::story_id(SOURCE, accession.trim_end_matches(".txt"))
+            .map_err(|failure| failure.to_string())?;
+        expected.push(Some(story.hex().to_owned()));
+    }
+    expected.sort();
+    assert_eq!(stories, expected);
+    Ok(())
+}
+
 #[test]
 fn the_index_attempt_counts_the_vendors_rows_and_our_own_filtering_separately() -> TestResult {
     let root = TempDir::new()?;
@@ -905,7 +954,14 @@ fn an_attempt_a_dead_run_left_open_is_closed_interrupted_by_the_next_run() -> Te
         listed_date: None,
         hosts_version: None,
     };
-    let orphan = AttemptSlot::open(&mut store, &abandoned, &dead, 0, ObservationTime::new(at()))?;
+    let orphan = AttemptSlot::open(
+        &mut store,
+        &abandoned,
+        None,
+        &dead,
+        0,
+        ObservationTime::new(at()),
+    )?;
     let orphaned = orphan.attempt_id().hex().to_owned();
     drop(orphan);
     drop(store);
@@ -1231,11 +1287,19 @@ fn asked(exchange: &Payloads) -> Vec<String> {
     exchange.asked.borrow().clone()
 }
 
-/// §8 row R20, the whole point of this change. A backfill re-run of one window re-fetches only the
-/// accessions the store does not already hold a committed item for: run 1 leaves Microsoft
-/// uncovered, and run 2 asks for the index and Microsoft alone, never Apple again. Mutation
-/// 2026-11-13: making `EdgarPress::follow_ups_to_issue` return its input unfiltered turns this red
-/// (run 2 asks for Apple too).
+/// `attempts.held` of every index row (no story, and edgar fetches no robots), oldest first.
+fn index_held(root: &Path) -> Result<Vec<Option<i64>>, Box<dyn Error>> {
+    let db = Connection::open_with_flags(root.join(COMMIT_LOG), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let held = db
+        .prepare("SELECT held FROM attempts WHERE story_id IS NULL ORDER BY opened_at, attempt_id")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<Option<i64>>, _>>()?;
+    Ok(held)
+}
+
+/// §8 row R20: run 2 re-fetches only Microsoft, which run 1 left uncovered; `held` stays NULL
+/// (§3.2). Mutations: 2026-11-13, `EdgarPress::follow_ups_to_issue` unfiltered: red (Apple asked
+/// again); 2026-11-15, the driver writing `held` on the archive arm too: red.
 #[test]
 fn a_vendor_archive_rerun_fetches_only_the_uncovered_accession() -> TestResult {
     let root = TempDir::new()?;
@@ -1252,16 +1316,18 @@ fn a_vendor_archive_rerun_fetches_only_the_uncovered_accession() -> TestResult {
     let answer = cmd_collect::run(&second, &opened, &good, &Fixed)?;
     assert_eq!(answer.exit, Exit::Ok, "{:#}", answer.envelope);
     assert_eq!(
-        asked(&good),
-        vec![INDEX_URL.to_owned(), MICROSOFT_URL.to_owned()]
+        (asked(&good), index_held(root.path())?),
+        (
+            vec![INDEX_URL.to_owned(), MICROSOFT_URL.to_owned()],
+            vec![None, None]
+        )
     );
     Ok(())
 }
 
-/// §8 row R16. A live ingest polls every matched row, so a live re-run fetches BOTH documents even
-/// though run 1 committed them: coverage skips the archive arm alone. Mutation 2026-11-13:
-/// dropping the `provenance != VendorArchive` guard in `follow_ups_to_issue` turns this red (run 2
-/// asks for the index alone).
+/// §8 row R16: a live re-run fetches BOTH documents run 1 committed; each index row holds 0.
+/// Mutation 2026-11-13, the `provenance != VendorArchive` guard in `follow_ups_to_issue` dropped:
+/// red (run 2 asks for the index alone).
 #[test]
 fn a_live_rerun_still_polls_every_matched_row_even_when_the_story_is_covered() -> TestResult {
     let root = TempDir::new()?;
@@ -1275,12 +1341,15 @@ fn a_live_rerun_still_polls_every_matched_row_even_when_the_story_is_covered() -
     let good = Payloads::a_good_day()?;
     cmd_collect::run(&second, &opened, &good, &Fixed)?;
     assert_eq!(
-        asked(&good),
-        vec![
-            INDEX_URL.to_owned(),
-            APPLE_URL.to_owned(),
-            MICROSOFT_URL.to_owned()
-        ]
+        (asked(&good), index_held(root.path())?),
+        (
+            vec![
+                INDEX_URL.to_owned(),
+                APPLE_URL.to_owned(),
+                MICROSOFT_URL.to_owned()
+            ],
+            vec![Some(0), Some(0)]
+        )
     );
     Ok(())
 }

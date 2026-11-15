@@ -100,6 +100,14 @@ pub trait Archive: Sink {
         target_window: &TargetWindow,
     ) -> Result<std::collections::BTreeSet<String>, ArchiveError>;
 
+    /// The story ids this archive holds under `source` across EVERY target window: a committed
+    /// item, or a closed Document attempt whose verdict was usable, empty or permanent. A transient
+    /// failure, a swept attempt and one in flight hold nothing (architecture.md section 11.1).
+    fn held_story_ids(
+        &self,
+        source: &SourceId,
+    ) -> Result<std::collections::BTreeSet<String>, ArchiveError>;
+
     /// Records how many in-universe follow-ups an index attempt named: the denominator the coverage
     /// reader compares the committed rows against. Written whatever the count, so a window that
     /// matched nothing is distinguishable from one no index ever read.
@@ -108,6 +116,11 @@ pub trait Archive: Sink {
         attempt_id: &str,
         matched: u32,
     ) -> Result<(), ArchiveError>;
+
+    /// Records how many of a live index attempt's follow-ups were not issued because
+    /// [`Archive::held_story_ids`] held their story: section 11.1's `held`, which `ledger --check`
+    /// subtracts from `vendor_rows`. Written whatever the count, 0 included.
+    fn record_held(&mut self, attempt_id: &str, held: u32) -> Result<(), ArchiveError>;
 }
 
 /// Why a run could not be driven at all. A vendor's own answer is never one of these: it is a
@@ -474,9 +487,14 @@ fn attempt_once<A: Archive>(
         run,
         baseline,
     } = *driving;
+    // Document only: open-web's `item_key` can key an index url, which would hold a story.
+    let story = (request.phase == RequestPhase::Document)
+        .then(|| provider.story_of(request))
+        .flatten();
     let mut slot = AttemptSlot::open(
         archive,
         request,
+        story.as_ref(),
         run,
         ordinal,
         ObservationTime::new(clock.now()),
@@ -529,22 +547,28 @@ fn attempt_once<A: Archive>(
         Ok(committed) => (committed, None),
         Err(refused) => (Committed::default(), Some(refused.detail)),
     };
-    // Follow-ups are an index attempt's business, and coverage is the vendor_archive arm's alone:
-    // a live index records no `matched` and excludes nothing, re-polling every row (R20, R16).
+    // A vendor_archive index records `matched` and hands over one window's covered set (R20); a
+    // live index records `held` and hands over the held set of every window (§11.1, R16).
     let follow_ups = match extracted {
         Some(extracted) if request.phase == RequestPhase::Index => {
             let matched = count(extracted.follow_ups.len());
-            let covered = if request.provenance == Provenance::VendorArchive {
+            let archived = request.provenance == Provenance::VendorArchive;
+            let stories = if archived {
                 archive.record_planned_coverage(&attempt_id, matched)?;
                 archive.covered_story_ids(&request.source, &request.target_window)?
             } else {
-                std::collections::BTreeSet::new()
+                archive.held_story_ids(&request.source)?
             };
-            if matched == 0 {
+            let issued = if matched == 0 {
                 Vec::new()
             } else {
-                provider.follow_ups_to_issue(extracted.follow_ups, &covered)
+                provider.follow_ups_to_issue(extracted.follow_ups, &stories)
+            };
+            if !archived && refusal.is_none() {
+                let held = matched.saturating_sub(count(issued.len()));
+                archive.record_held(&attempt_id, held)?;
             }
+            issued
         }
         _ => Vec::new(),
     };

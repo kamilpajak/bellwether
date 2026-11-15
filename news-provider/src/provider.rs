@@ -530,13 +530,14 @@ pub trait Provider: Send + Sync {
 
     fn extract_rules_version(&self) -> FileDigest;
 
-    /// Which follow-ups of an index attempt to issue, given the stories (by
-    /// [`Provider::story_of`]) committed under that window: a covered `vendor_archive` one is
-    /// dropped, a `live_ingest` one always issued (architecture.md section 8 rows R16, R20).
+    /// Which follow-ups of an index attempt to issue, given a set of stories (by
+    /// [`Provider::story_of`]): for a `vendor_archive` index the stories COVERED by a committed
+    /// item under that one window, for a `live_ingest` index the stories HELD over every window
+    /// (architecture.md section 11.1). Each provider decides what it drops (section 8 R16, R20).
     fn follow_ups_to_issue(
         &self,
         follow_ups: Vec<Request>,
-        covered: &BTreeSet<String>,
+        stories: &BTreeSet<String>,
     ) -> Vec<Request>;
 
     /// The `story_id` a follow-up's item will carry, from the request alone and so before any

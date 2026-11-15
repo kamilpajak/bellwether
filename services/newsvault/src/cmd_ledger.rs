@@ -122,6 +122,9 @@ pub struct SourceRow {
     /// arrives with the `Finalised` event, so in this state the store holds none.
     pub answered_without_finalised: Vec<String>,
     pub vendor_rows: i64,
+    /// Section 11.1's `held`: vendor rows a live index left unfetched because the store already
+    /// held their story. Subtracted from `vendor_rows` before the zero-rows finding.
+    pub held: i64,
     pub items_new: i64,
     pub rows_committed: i64,
 }
@@ -238,6 +241,7 @@ struct Grouped {
     state: String,
     attempts: u32,
     vendor_rows: i64,
+    held: i64,
     items_new: i64,
 }
 
@@ -397,7 +401,8 @@ fn code_of(failure: &serde_json::Error) -> &'static str {
 fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerReadError> {
     let mut statement = db.prepare(&format!(
         "SELECT run_id, source, COALESCE(outcome, '{IN_FLIGHT}') AS state, COUNT(*),
-                SUM(COALESCE(vendor_rows, 0)), SUM(COALESCE(items_new, 0))
+                SUM(COALESCE(vendor_rows, 0)), SUM(COALESCE(items_new, 0)),
+                SUM(CASE WHEN vendor_rows IS NOT NULL THEN COALESCE(held, 0) ELSE 0 END)
          FROM attempts WHERE opened_at <= ?1
          GROUP BY run_id, source, state
          ORDER BY run_id, source, state"
@@ -411,6 +416,7 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
                 attempts: row.get(3)?,
                 vendor_rows: row.get(4)?,
                 items_new: row.get(5)?,
+                held: row.get(6)?,
             })
         })?
         .collect::<Result<Vec<Grouped>, _>>()?;
@@ -579,6 +585,7 @@ fn day_row(
             .or_insert_with(|| SourceRow::named(&entry.source));
         row.attempts += entry.attempts;
         row.vendor_rows += entry.vendor_rows;
+        row.held += entry.held;
         row.items_new += entry.items_new;
         match entry.state.as_str() {
             OUTCOME_OK => row.ok += entry.attempts,
@@ -644,6 +651,7 @@ impl SourceRow {
             opened_without_answered: Vec::new(),
             answered_without_finalised: Vec::new(),
             vendor_rows: 0,
+            held: 0,
             items_new: 0,
             rows_committed: 0,
         }
@@ -672,12 +680,15 @@ fn findings_for(day: &DayRow) -> Vec<Finding> {
                 detail: format!("{} failed, {} interrupted", row.failed, row.interrupted),
             });
         }
-        if row.rows_committed == 0 && row.vendor_rows > 0 {
+        if row.rows_committed == 0 && row.vendor_rows - row.held > 0 {
             findings.push(Finding {
                 code: ROWS_ZERO_AGAINST_VENDOR_ROWS,
                 run_date: day.run_date.clone(),
                 source: Some(row.source.clone()),
-                detail: format!("{} vendor rows and no item row committed", row.vendor_rows),
+                detail: format!(
+                    "{} vendor rows, {} held, and no item row committed",
+                    row.vendor_rows, row.held
+                ),
             });
         }
     }
@@ -741,7 +752,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
             writeln!(
                 out,
                 "  {:<14} ok {} empty {} failed {} interrupted {} in-flight {} \
-                 vendor_rows {} items_new {} rows {}",
+                 vendor_rows {} held {} items_new {} rows {}",
                 row.source,
                 row.ok,
                 row.empty,
@@ -749,6 +760,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 row.interrupted,
                 row.in_flight,
                 row.vendor_rows,
+                row.held,
                 row.items_new,
                 row.rows_committed
             )?;
