@@ -501,13 +501,20 @@ impl Provider for OpenWebFeed {
         self.rules_version.clone()
     }
 
-    /// Every follow-up is live and issued; the held filter is section 11.5 step 4.
+    /// Every follow-up is live, and one whose story is in the held set is dropped (section 11.1).
+    /// A follow-up with no `story_of` is always issued: a skip we cannot justify is a hole.
     fn follow_ups_to_issue(
         &self,
         follow_ups: Vec<Request>,
-        _covered: &BTreeSet<String>,
+        held: &BTreeSet<String>,
     ) -> Vec<Request> {
         follow_ups
+            .into_iter()
+            .filter(|follow_up| {
+                self.story_of(follow_up)
+                    .is_none_or(|story| !held.contains(story.hex()))
+            })
+            .collect()
     }
 
     fn story_of(&self, follow_up: &Request) -> Option<Digest> {

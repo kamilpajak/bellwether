@@ -886,18 +886,22 @@ fn a_page_with_no_article_container_is_unusable_as_no_article_body() -> Outcome 
     Ok(())
 }
 
-/// Section 11.5 step 4 builds the held filter; until then every live follow-up is issued.
+/// Section 11.1: a live follow-up whose story is held is dropped. Mutation 2026-11-15, the filter
+/// removed: red.
 #[test]
-fn every_live_follow_up_is_issued_even_when_its_story_is_covered() -> Outcome {
+fn a_live_follow_up_whose_story_is_held_is_dropped_and_an_unheld_one_kept() -> Outcome {
     let provider = provider()?;
     let all = follow_ups(&provider, &gnw(REAL_INDEX))?.follow_ups;
-    let covered: BTreeSet<String> = all
-        .iter()
-        .filter_map(|request| provider.story_of(request))
+    let Some((first, rest)) = all.split_first() else {
+        return Err("the real index names no follow-up".into());
+    };
+    let held: BTreeSet<String> = provider
+        .story_of(first)
         .map(|story| story.hex().to_owned())
+        .into_iter()
         .collect();
-    assert_eq!(covered.len(), all.len());
-    assert_eq!(provider.follow_ups_to_issue(all.clone(), &covered), all);
+    assert_eq!(held.len(), 1);
+    assert_eq!(provider.follow_ups_to_issue(all.clone(), &held), rest);
     Ok(())
 }
 

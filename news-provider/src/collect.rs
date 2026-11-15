@@ -542,21 +542,21 @@ fn attempt_once<A: Archive>(
         Ok(committed) => (committed, None),
         Err(refused) => (Committed::default(), Some(refused.detail)),
     };
-    // Follow-ups are an index attempt's business, and coverage is the vendor_archive arm's alone:
-    // a live index records no `matched` and excludes nothing, re-polling every row (R20, R16).
+    // A vendor_archive index records `matched` and hands over one window's covered set (R20); a
+    // live index records no `matched` and hands over the held set of every window (§11.1, R16).
     let follow_ups = match extracted {
         Some(extracted) if request.phase == RequestPhase::Index => {
             let matched = count(extracted.follow_ups.len());
-            let covered = if request.provenance == Provenance::VendorArchive {
+            let stories = if request.provenance == Provenance::VendorArchive {
                 archive.record_planned_coverage(&attempt_id, matched)?;
                 archive.covered_story_ids(&request.source, &request.target_window)?
             } else {
-                std::collections::BTreeSet::new()
+                archive.held_story_ids(&request.source)?
             };
             if matched == 0 {
                 Vec::new()
             } else {
-                provider.follow_ups_to_issue(extracted.follow_ups, &covered)
+                provider.follow_ups_to_issue(extracted.follow_ups, &stories)
             }
         }
         _ => Vec::new(),

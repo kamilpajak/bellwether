@@ -133,6 +133,8 @@ impl Clock for Fixed {
 struct Gnw {
     pages: BTreeMap<String, Vec<u8>>,
     asked: RefCell<Vec<String>>,
+    /// Statuses a url answers with, front first and with an empty body, before its page.
+    scripted: RefCell<BTreeMap<String, Vec<u16>>>,
 }
 
 impl Gnw {
@@ -146,7 +148,22 @@ impl Gnw {
         Ok(Self {
             pages,
             asked: RefCell::new(Vec::new()),
+            scripted: RefCell::new(BTreeMap::new()),
         })
+    }
+
+    fn answering(self, url: &str, statuses: &[u16]) -> Self {
+        self.scripted
+            .borrow_mut()
+            .insert(url.to_owned(), statuses.to_vec());
+        self
+    }
+
+    /// The urls sent since the last call, and the count of them that were not the index.
+    fn sent(&self) -> (Vec<String>, usize) {
+        let sent = self.asked.take();
+        let documents = sent.iter().filter(|url| url.as_str() != INDEX).count();
+        (sent, documents)
     }
 }
 
@@ -163,6 +180,18 @@ impl Exchange for Gnw {
         let sent = ObservationTime::new(clock.now() - TimeDelta::seconds(SENT_BEFORE_THE_CLOCK));
         let received =
             ObservationTime::new(clock.now() - TimeDelta::seconds(RECEIVED_BEFORE_THE_CLOCK));
+        if let Some(statuses) = self.scripted.borrow_mut().get_mut(&request.url) {
+            if !statuses.is_empty() {
+                let status = statuses.remove(0);
+                return Ok(RawResponse::new(
+                    attempt,
+                    status,
+                    Vec::new(),
+                    sent,
+                    received,
+                ));
+            }
+        }
         match self.pages.get(&request.url) {
             Some(body) => Ok(RawResponse::new(attempt, OK, body.clone(), sent, received)),
             None => Err(SendFailure::Transport(TransportError::new(
@@ -1000,6 +1029,151 @@ fn a_path_or_unreadable_robots_refusal_names_its_fact_and_suggests_no_refresh() 
                 Value::Array(Vec::new())
             ),
         ]
+    );
+    Ok(())
+}
+
+// ---- section 11.1: the held filter ----
+
+/// A second poll of the same day, and the first poll of the next day.
+const LATER_THE_SAME_DAY: &str = "2026-11-14T19:05:00Z";
+const THE_NEXT_DAY: &str = "2026-11-15T09:00:00Z";
+/// `RELEASES` index of the page answered with `synthetic_no_article_container.html`.
+const NO_ARTICLE: usize = 2;
+
+struct At(DateTime<Utc>);
+
+impl Clock for At {
+    fn now(&self) -> DateTime<Utc> {
+        self.0
+    }
+}
+
+/// One live collect of the clock's own day at `at`, keyed by `schedule` so two polls of one store
+/// never share a run id.
+fn poll(store: &Path, at: &str, schedule: &str, exchange: &Gnw) -> Result<Exit, Box<dyn Error>> {
+    let ask = Ask {
+        at: instant(at),
+        schedule: Some(schedule.to_owned()),
+        ..ask(store, cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    Ok(cmd_collect::run(&ask, &opened, exchange, &At(instant(at)))?.exit)
+}
+
+fn release_url(index: usize) -> Result<String, Box<dyn Error>> {
+    let (key, _, _, _) = RELEASES.get(index).ok_or("no such release")?;
+    Ok(format!("https://{key}"))
+}
+
+/// Section 11.4 (a), §8 R16: every story the first poll answered is held, so the second sends the
+/// index alone. An all-held run commits nothing and exits ok. Mutation 2026-11-15, collect.rs
+/// passing an empty set for the live arm again: red.
+#[test]
+fn a_second_live_poll_of_one_day_fetches_no_held_document() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let exchange = Gnw::day()?;
+    poll(root.path(), RUN_AT, "first", &exchange)?;
+    let (_, first) = exchange.sent();
+    let exit = poll(root.path(), LATER_THE_SAME_DAY, "second", &exchange)?;
+    let (second, documents) = exchange.sent();
+    assert_eq!(
+        (first, second, documents, exit),
+        (RELEASES.len(), vec![INDEX.to_owned()], 0, Exit::Ok)
+    );
+    Ok(())
+}
+
+/// Section 11.4 (b), §8 R20: held is keyed on (source, story) over every window. Mutation
+/// 2026-11-15, `AND a.target_window = ?2` added to both arms of the held read: red.
+#[test]
+fn a_story_held_under_yesterdays_window_is_not_fetched_today() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let exchange = Gnw::day()?;
+    poll(root.path(), RUN_AT, "first", &exchange)?;
+    let (_, first) = exchange.sent();
+    let exit = poll(root.path(), THE_NEXT_DAY, "second", &exchange)?;
+    let (second, documents) = exchange.sent();
+    assert_eq!(
+        (first, second, documents, exit),
+        (RELEASES.len(), vec![INDEX.to_owned()], 0, Exit::Ok)
+    );
+    Ok(())
+}
+
+/// Section 11.4, §8 R16: a 404 is a permanent verdict, which holds the story with no item.
+/// Mutation 2026-11-15, the held read keeping its items arm only: red.
+#[test]
+fn a_permanently_failed_document_is_not_fetched_again() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let failed = release_url(0)?;
+    let exchange = Gnw::day()?.answering(&failed, &[NOT_FOUND]);
+    poll(root.path(), RUN_AT, "first", &exchange)?;
+    let (first, _) = exchange.sent();
+    poll(root.path(), LATER_THE_SAME_DAY, "second", &exchange)?;
+    let (second, _) = exchange.sent();
+    assert_eq!(
+        (first.contains(&failed), second.contains(&failed)),
+        (true, false)
+    );
+    Ok(())
+}
+
+/// Section 11.4, §8 R21: a transient failure holds nothing, so after the run's own retries run out
+/// the next poll asks again. Mutation 2026-11-15, `transient_failure` added to the held verdicts:
+/// red.
+#[test]
+fn a_transiently_failed_document_is_fetched_again_by_the_next_poll() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let failing = release_url(0)?;
+    let tries = 1 + news_provider::MAX_TRANSIENT_RETRIES as usize;
+    let exchange = Gnw::day()?.answering(&failing, &vec![UNAVAILABLE; tries]);
+    poll(root.path(), RUN_AT, "first", &exchange)?;
+    let (first, _) = exchange.sent();
+    let exit = poll(root.path(), LATER_THE_SAME_DAY, "second", &exchange)?;
+    let (second, _) = exchange.sent();
+    let times = |sent: &[String]| sent.iter().filter(|url| **url == failing).count();
+    assert_eq!(
+        (times(&first), second, exit),
+        (tries, vec![INDEX.to_owned(), failing.clone()], Exit::Ok)
+    );
+    Ok(())
+}
+
+/// Section 11.1: a page that yielded only unusable rows is a usable verdict with no item, and is
+/// held. Mutation 2026-11-15, the held read keeping its items arm only: red.
+#[test]
+fn a_document_that_yielded_only_unusable_rows_is_not_fetched_again() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let no_article = release_url(NO_ARTICLE)?;
+    let exchange = Gnw::day()?;
+    poll(root.path(), RUN_AT, "first", &exchange)?;
+    let (first, _) = exchange.sent();
+    poll(root.path(), LATER_THE_SAME_DAY, "second", &exchange)?;
+    let (second, _) = exchange.sent();
+    let db = Connection::open_with_flags(
+        root.path().join(COMMIT_LOG),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let (key, _, _, _) = RELEASES[NO_ARTICLE];
+    let story = digest(canon::digest::story_id(SOURCE, key)).ok_or("story id")?;
+    let items: i64 = db.query_row(
+        "SELECT COUNT(*) FROM items WHERE story_id = ?1",
+        [&story],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        (
+            first.contains(&no_article),
+            items,
+            second.contains(&no_article)
+        ),
+        (true, 0, false)
     );
     Ok(())
 }
