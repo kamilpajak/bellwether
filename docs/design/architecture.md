@@ -86,6 +86,9 @@
   - A `minute` value is its first microsecond in that same format beside the tag `minute`
     (`canon::Stamp::Minute`), so it cannot collide with the instant at :00
     (`canon/vectors/item_id_minute_precision.json` against `item_id_midnight_instant.json`).
+  - A `minute` value with non-zero seconds or sub-seconds is refused, `CanonError::MinuteWithSeconds`:
+    `a_minute_stamp_carrying_seconds_is_refused_and_a_whole_minute_is_not` (mutation 2026-11-15,
+    the check removed: red). No producer passes one: each goes through `pit::datedness::Minute`.
   - An absent optional field contributes an empty string.
   - Every string ordering is over raw UTF-8 bytes, never a locale's collation.
 - **The seven `canon::Domain` digests.** The variant's name is the form's first field
