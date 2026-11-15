@@ -165,6 +165,9 @@ impl OutcomeKind {
 pub struct Counts {
     /// Rows the payload held, before any filtering of ours.
     pub vendor_rows: u32,
+    /// Unusable rows whose reason the index row decided ([`crate::DecidedBy::IndexRow`]): a
+    /// usable Document attempt with any is not held (architecture.md section 11.1).
+    pub listing_unusable: u32,
 }
 
 /// What one attempt cost. There is no metered arm until a metered vendor arrives.
@@ -227,7 +230,7 @@ impl Outcome {
     /// and the store's own `items_new` is not: a replay of a stored window has `items_new` zero
     /// and is `ok`.
     #[must_use]
-    pub fn decide(verdict: &Verdict, vendor_rows: u32, baseline: &Baseline) -> Self {
+    pub fn decide(verdict: &Verdict, counts: Counts, baseline: &Baseline) -> Self {
         let kind = match verdict {
             Verdict::Usable => OutcomeKind::Ok,
             Verdict::Empty => OutcomeKind::Empty,
@@ -236,8 +239,8 @@ impl Outcome {
         Self {
             kind,
             verdict: Some(*verdict),
-            counts: Some(Counts { vendor_rows }),
-            baseline: Some(baseline.against(vendor_rows)),
+            counts: Some(counts),
+            baseline: Some(baseline.against(counts.vendor_rows)),
         }
     }
 
@@ -467,8 +470,8 @@ pub fn abandon(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        abandon, AttemptEvent, AttemptSlot, Baseline, Cost, LedgerError, Outcome, OutcomeKind,
-        Sink, Verdict,
+        abandon, AttemptEvent, AttemptSlot, Baseline, Cost, Counts, LedgerError, Outcome,
+        OutcomeKind, Sink, Verdict,
     };
     use crate::provider::Provenance;
     use crate::request::{
@@ -586,7 +589,14 @@ pub(crate) mod tests {
     }
 
     fn usable() -> Outcome {
-        Outcome::decide(&Verdict::Usable, VENDOR_ROWS, &baseline())
+        Outcome::decide(
+            &Verdict::Usable,
+            Counts {
+                vendor_rows: VENDOR_ROWS,
+                listing_unusable: 0,
+            },
+            &baseline(),
+        )
     }
 
     fn slot(sink: &mut dyn Sink, ordinal: u32) -> Result<AttemptSlot, LedgerError> {
@@ -752,7 +762,14 @@ pub(crate) mod tests {
                 Verdict::PermanentFailure => (OutcomeKind::Failed, "permanent_failure"),
                 Verdict::TransientFailure => (OutcomeKind::Failed, "transient_failure"),
             };
-            let decided = Outcome::decide(&verdict, VENDOR_ROWS, &baseline());
+            let decided = Outcome::decide(
+                &verdict,
+                Counts {
+                    vendor_rows: VENDOR_ROWS,
+                    listing_unusable: 0,
+                },
+                &baseline(),
+            );
             assert_eq!(
                 (named, (decided.kind(), verdict.name())),
                 ((expected, label), (expected, label))
@@ -764,7 +781,17 @@ pub(crate) mod tests {
     fn a_finalised_outcome_carries_its_verdict_and_an_abandoned_one_none() {
         let decided: Vec<Option<Verdict>> = EVERY_VERDICT
             .iter()
-            .map(|(verdict, _, _)| Outcome::decide(verdict, VENDOR_ROWS, &baseline()).verdict())
+            .map(|(verdict, _, _)| {
+                Outcome::decide(
+                    verdict,
+                    Counts {
+                        vendor_rows: VENDOR_ROWS,
+                        listing_unusable: 0,
+                    },
+                    &baseline(),
+                )
+                .verdict()
+            })
             .collect();
         let expected: Vec<Option<Verdict>> = EVERY_VERDICT
             .iter()
@@ -777,7 +804,14 @@ pub(crate) mod tests {
     /// attempt so it can be picked from a quantile of real runs, with its date.
     #[test]
     fn decide_cannot_return_collapsed_until_a_floor_with_our_own_construction_exists() {
-        let decided = Outcome::decide(&Verdict::Usable, COLLAPSE_SHAPED_ROWS, &baseline());
+        let decided = Outcome::decide(
+            &Verdict::Usable,
+            Counts {
+                vendor_rows: COLLAPSE_SHAPED_ROWS,
+                listing_unusable: 0,
+            },
+            &baseline(),
+        );
         assert_eq!(decided.kind(), OutcomeKind::Ok);
         assert_eq!(
             decided.baseline().and_then(|b| b.ratio),
@@ -796,7 +830,10 @@ pub(crate) mod tests {
     fn a_baseline_with_no_prior_attempts_has_no_ratio_rather_than_a_division_by_zero() {
         let first_ever = Outcome::decide(
             &Verdict::Usable,
-            VENDOR_ROWS,
+            Counts {
+                vendor_rows: VENDOR_ROWS,
+                listing_unusable: 0,
+            },
             &Baseline::from_trailing_ok(&[]),
         );
         assert_eq!(first_ever.baseline().and_then(|b| b.ratio), None);

@@ -22,7 +22,7 @@
 //! # use canon::digest::{item_id, story_id, ItemFields};
 //! # use canon::Stamp;
 //! # use chrono::DateTime;
-//! # use news_provider::{AttemptSlot, Baseline, Outcome, Provenance, RawResponse, Request,
+//! # use news_provider::{AttemptSlot, Baseline, Counts, Outcome, Provenance, RawResponse, Request,
 //! #                     RequestPhase, RunId, SourceId, TargetWindow, ValidSource, Verdict};
 //! # use pit::datedness::Published;
 //! # use pit::{ObservationTime, ValidTime};
@@ -45,7 +45,8 @@
 //! let raw = committer.put_blob(b"{}")?;
 //! let mut slot = AttemptSlot::open(&mut committer, &request, None, &run, 0, at)?;
 //! let answer = RawResponse::new(slot.attempt_id().clone(), 200, b"{}".to_vec(), at, at);
-//! let outcome = Outcome::decide(&Verdict::Usable, 1, &Baseline::from_trailing_ok(&[1]));
+//! let counts = Counts { vendor_rows: 1, listing_unusable: 0 };
+//! let outcome = Outcome::decide(&Verdict::Usable, counts, &Baseline::from_trailing_ok(&[1]));
 //! let closed = slot.close(&mut committer, outcome, &Ok(answer), at)?;
 //! let rows = [ItemRow {
 //!     item_id: item_id(&ItemFields {
@@ -102,6 +103,8 @@ const BLOB_DIR: &str = "blobs";
 const BLOB_SPACE: &str = "sha256";
 /// One constant for the label `record` writes and `ok_vendor_rows` reads, so the two cannot drift.
 const OUTCOME_OK: &str = "ok";
+/// Statuses a permanent failure is not held under: owner decision of 2026-11-15 (§10).
+const REDIRECTS: std::ops::RangeInclusive<u16> = 300..=399;
 
 /// Per connection, so set on every open and never part of a schema version.
 const CONNECTION: &str = "
@@ -110,11 +113,11 @@ PRAGMA synchronous = FULL;
 ";
 
 /// The `PRAGMA user_version` this build writes, and the only one a read-only reader accepts.
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// Version `i + 1` is reached from version `i` by `MIGRATIONS[i]`, run by [`migrate`] with
 /// foreign keys off, as SQLite's twelve-step table rebuild (lang_altertable.html) requires.
-const MIGRATIONS: [&str; 3] = [
+const MIGRATIONS: [&str; 4] = [
     "
 -- The hosts file a run was admitted under: architecture.md section 2's `hosts_version` row. NULL
 -- for a provider that reads no hosts file.
@@ -182,6 +185,11 @@ ALTER TABLE attempts ADD COLUMN story_id TEXT;
 -- Section 11.1's `held`: follow-ups a LIVE index attempt did not issue because the store already
 -- held them, `matched - issued`. NULL on every other row and on every row before user_version 3.
 ALTER TABLE attempts ADD COLUMN held INTEGER;
+",
+    "
+-- `news_provider::Counts::listing_unusable`: unusable rows the index row decided (section 11.1).
+-- NULL for an abandoned attempt and for every row closed before user_version 4, not backfilled.
+ALTER TABLE attempts ADD COLUMN listing_unusable INTEGER;
 ",
 ];
 
@@ -1006,9 +1014,8 @@ impl Committer {
         Ok(covered)
     }
 
-    /// Section 11.1's held set: keyed on (source, story) over every target window, so a story
-    /// held under yesterday's window is held today. No cutoff, for the reason
-    /// [`Committer::covered_story_ids`] gives.
+    /// Section 11.1's held read. A NULL status or count is held through the `COALESCE`s: without
+    /// them SQLite evaluates the `NOT (...)` to NULL and drops the row.
     pub fn held_story_ids(&self, source: &SourceId) -> Result<BTreeSet<String>, StoreError> {
         let mut statement = self.db.prepare(
             "SELECT i.story_id FROM items i
@@ -1017,7 +1024,9 @@ impl Committer {
              UNION
              SELECT story_id FROM attempts
              WHERE source = ?1 AND story_id IS NOT NULL AND closed_at IS NOT NULL
-               AND verdict IN (?2, ?3, ?4)",
+               AND verdict IN (?2, ?3, ?4)
+               AND NOT (verdict = ?4 AND COALESCE(transport_status, 0) BETWEEN ?5 AND ?6)
+               AND NOT (verdict = ?2 AND COALESCE(listing_unusable, 0) > 0)",
         )?;
         let held = statement
             .query_map(
@@ -1025,7 +1034,9 @@ impl Committer {
                     source.as_str(),
                     Verdict::Usable.name(),
                     Verdict::Empty.name(),
-                    Verdict::PermanentFailure.name()
+                    Verdict::PermanentFailure.name(),
+                    REDIRECTS.start(),
+                    REDIRECTS.end()
                 ],
                 |row| row.get::<_, String>(0),
             )?
@@ -1671,7 +1682,8 @@ fn apply(db: &Connection, event: &AttemptEvent) -> Result<(), StoreError> {
             db.execute(
                 "UPDATE attempts SET outcome = ?2, vendor_rows = ?3,
                      baseline_count = ?4, baseline_window = ?5, baseline_construction = ?6,
-                     baseline_ratio = ?7, slots = ?8, closed_at = ?9, verdict = ?10
+                     baseline_ratio = ?7, slots = ?8, closed_at = ?9, verdict = ?10,
+                     listing_unusable = ?11
                  WHERE attempt_id = ?1",
                 params![
                     attempt_id.hex(),
@@ -1683,7 +1695,8 @@ fn apply(db: &Connection, event: &AttemptEvent) -> Result<(), StoreError> {
                     baseline.and_then(|baseline| baseline.ratio),
                     cost.map(|Cost::Slots(slots)| slots),
                     stamp(closed_at.inner()),
-                    outcome.verdict().map(Verdict::name)
+                    outcome.verdict().map(Verdict::name),
+                    counts.map(|counts| counts.listing_unusable)
                 ],
             )?;
             Ok(())
@@ -1710,8 +1723,8 @@ mod tests {
     use canon::{FileDigest, Stamp};
     use chrono::{DateTime, TimeDelta, Utc};
     use news_provider::{
-        abandon, AttemptEvent, AttemptSlot, Baseline, Outcome, Provenance, RawResponse, Request,
-        RequestPhase, SourceId, TargetWindow, ValidSource, Verdict,
+        abandon, AttemptEvent, AttemptSlot, Baseline, Counts, Outcome, Provenance, RawResponse,
+        Request, RequestPhase, SourceId, TargetWindow, TransportError, ValidSource, Verdict,
     };
     use pit::datedness::{Minute, Published};
     use pit::ValidTime;
@@ -2020,7 +2033,10 @@ mod tests {
         };
         let outcome = Outcome::decide(
             &verdict,
-            vendor_rows,
+            Counts {
+                vendor_rows,
+                listing_unusable: 0,
+            },
             &Baseline::from_trailing_ok(&TRAILING_OK),
         );
         Ok(slot.close(store, outcome, &Ok(answer), at(4))?)
@@ -2050,7 +2066,10 @@ mod tests {
         );
         let outcome = Outcome::decide(
             &Verdict::Usable,
-            vendor_rows,
+            Counts {
+                vendor_rows,
+                listing_unusable: 0,
+            },
             &Baseline::from_trailing_ok(&TRAILING_OK),
         );
         Ok(slot.close(store, outcome, &Ok(answer), at(4 + i64::from(ordinal)))?)
@@ -2572,7 +2591,14 @@ mod tests {
             at(2),
             at(3),
         );
-        let outcome = Outcome::decide(&Verdict::Usable, 0, &Baseline::from_trailing_ok(&[]));
+        let outcome = Outcome::decide(
+            &Verdict::Usable,
+            Counts {
+                vendor_rows: 0,
+                listing_unusable: 0,
+            },
+            &Baseline::from_trailing_ok(&[]),
+        );
         Ok(slot.close(store, outcome, &Ok(answer), at(4))?)
     }
 
@@ -2741,7 +2767,7 @@ mod tests {
                 held
             ),
             (
-                3,
+                SCHEMA_VERSION,
                 Some("permanent_failure".to_owned()),
                 Some(story_hex(SOURCE, STORY)),
                 Some(HELD)
@@ -2823,6 +2849,108 @@ mod tests {
         Ok(())
     }
 
+    /// A v3 store: the v2 fixture, `MIGRATIONS[2]` and no later step, with the v1 attempt given a
+    /// verdict, a story and a held count.
+    fn a_store_at_user_version_three(temp: &TempDir) -> TestResult {
+        a_store_at_user_version_two(temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch(MIGRATIONS[2])?;
+        db.pragma_update(None, "user_version", 3)?;
+        db.execute_batch(
+            "UPDATE attempts SET verdict = 'usable', story_id = 'a v3 story', held = 2
+              WHERE attempt_id = 'a v1 attempt';",
+        )?;
+        Ok(())
+    }
+
+    /// §8 row M1 from user_version 3: the step to 4 adds `attempts.listing_unusable`, and a
+    /// document's count lands in it.
+    #[test]
+    fn a_store_at_user_version_three_opens_migrates_to_four_and_takes_a_listing_count() -> TestResult
+    {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_three(&temp)?;
+        let mut store = open(&temp)?;
+        let usable = (Verdict::Usable, Some(STATUS_OK));
+        a_document_counted(&mut store, (SOURCE, WINDOW), (STORY, 0), usable, 1)?;
+        let attempt: String = store.db.query_row(
+            "SELECT attempt_id FROM attempts WHERE story_id = ?1",
+            params![story_hex(SOURCE, STORY)],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            (
+                user_version(&store.db)?,
+                listing_unusable_of(&store, &attempt)?
+            ),
+            (SCHEMA_VERSION, Some(1))
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the carried half from user_version 3: every column of every row of every v3
+    /// table, compared by `quote()`; the v3 attempt gains a NULL `listing_unusable`, not backfilled.
+    #[test]
+    fn a_v3_store_keeps_every_v3_column_of_every_row() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_three(&temp)?;
+        let v3 = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let before = quoted_rows(&v3, 3, &V2_TABLES)?;
+        drop(v3);
+        assert!(super::refuse_an_unreadable_version(temp.path()).is_ok());
+        let store = open(&temp)?;
+        let after = quoted_rows(&store.db, 3, &V2_TABLES)?;
+        assert_eq!(before.len(), V2_TABLES.len() + 1);
+        assert_eq!(
+            (after, listing_unusable_of(&store, "a v1 attempt")?),
+            (before, None)
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the per-version shape check at user_version 3: an attempts column of another
+    /// type and a missing one are each named, and the store stays at 3.
+    #[test]
+    fn a_v3_store_whose_columns_differ_is_refused_and_left_at_user_version_three() -> TestResult {
+        let fixtures = [
+            (
+                "ALTER TABLE attempts DROP COLUMN held;
+                 ALTER TABLE attempts ADD COLUMN held TEXT;",
+                vec!["attempts.held".to_owned()],
+            ),
+            (
+                "ALTER TABLE attempts DROP COLUMN story_id;",
+                vec!["attempts.story_id".to_owned()],
+            ),
+        ];
+        let mut named = Vec::new();
+        for (edit, _) in &fixtures {
+            let temp = TempDir::new()?;
+            a_store_at_user_version_three(&temp)?;
+            let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+            db.execute_batch(edit)?;
+            drop(db);
+            let read_only = match super::refuse_an_unreadable_version(temp.path()) {
+                Err(StoreError::ShapeDiffers { found: 3, columns }) => columns,
+                other => vec![format!("{other:?}")],
+            };
+            let refused = match open(&temp) {
+                Err(StoreError::ShapeDiffers { found: 3, columns }) => columns,
+                other => vec![format!("{other:?}")],
+            };
+            let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+            named.push((refused, read_only, user_version(&db)?));
+        }
+        assert_eq!(
+            named,
+            fixtures
+                .into_iter()
+                .map(|(_, columns)| (columns.clone(), columns, 3))
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
     /// §11.1's held table needs permanence apart from `failed`, and nothing for an attempt nobody
     /// answered. Mutation 2026-11-15, `apply` writing NULL for the verdict: red.
     #[test]
@@ -2861,6 +2989,52 @@ mod tests {
                 None
             ]
         );
+        Ok(())
+    }
+
+    fn listing_unusable_of(store: &Committer, attempt: &str) -> Result<Option<u32>, StoreError> {
+        Ok(store.db.query_row(
+            "SELECT listing_unusable FROM attempts WHERE attempt_id = ?1",
+            params![attempt],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Section 11.1's held read needs the count on the row `verdict` is on, and none for an
+    /// attempt nobody answered. Mutation 2026-11-15, `apply` binding NULL for it: red.
+    #[test]
+    fn every_listing_unusable_count_reaches_its_column_and_an_abandoned_attempt_none() -> TestResult
+    {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let here = (SOURCE, WINDOW);
+        let usable = (Verdict::Usable, Some(STATUS_OK));
+        let counts = [0, 1, VENDOR_ROWS];
+        for (listing_unusable, ordinal) in counts.into_iter().zip(0..) {
+            let story = (format!("counted {ordinal}"), ordinal);
+            a_document_counted(
+                &mut store,
+                here,
+                (&story.0, story.1),
+                usable,
+                listing_unusable,
+            )?;
+        }
+        let in_flight = document_slot(&mut store, here, "swept", 3)?;
+        let swept = in_flight.attempt_id().clone();
+        drop(in_flight);
+        let closed = abandon(&mut store, swept, at(9), &RunId::new(SWEEPING_RUN))?;
+        store.record(closed, &[], at(10))?;
+        let mut stored = Vec::new();
+        for story in ["counted 0", "counted 1", "counted 2", "swept"] {
+            let attempt: String = store.db.query_row(
+                "SELECT attempt_id FROM attempts WHERE story_id = ?1",
+                params![story_hex(SOURCE, story)],
+                |row| row.get(0),
+            )?;
+            stored.push(listing_unusable_of(&store, &attempt)?);
+        }
+        assert_eq!(stored, vec![Some(0), Some(1), Some(VENDOR_ROWS), None]);
         Ok(())
     }
 
@@ -3270,16 +3444,50 @@ mod tests {
         ordinal: u32,
         verdict: Verdict,
     ) -> TestResult {
+        let story = (source_item_id, ordinal);
+        a_document_answered(store, at_window, story, verdict, Some(STATUS_OK))
+    }
+
+    /// As [`a_document_closed`], answered with `status`, or with a transport error for `None`.
+    fn a_document_answered(
+        store: &mut Committer,
+        at_window: (&str, &str),
+        story: (&str, u32),
+        verdict: Verdict,
+        status: Option<u16>,
+    ) -> TestResult {
+        a_document_counted(store, at_window, story, (verdict, status), 0)
+    }
+
+    /// As [`a_document_answered`], decided with `listing_unusable` unusable rows of the index row.
+    fn a_document_counted(
+        store: &mut Committer,
+        at_window: (&str, &str),
+        (source_item_id, ordinal): (&str, u32),
+        (verdict, status): (Verdict, Option<u16>),
+        listing_unusable: u32,
+    ) -> TestResult {
         let slot = document_slot(store, at_window, source_item_id, ordinal)?;
-        let answer = RawResponse::new(
-            slot.attempt_id().clone(),
-            STATUS_OK,
-            PAYLOAD.to_vec(),
-            at(2),
-            at(3),
+        let attempt = slot.attempt_id().clone();
+        let answer = match status {
+            Some(status) => Ok(RawResponse::new(
+                attempt,
+                status,
+                PAYLOAD.to_vec(),
+                at(2),
+                at(3),
+            )),
+            None => Err(TransportError::new(attempt, at(2), at(3), String::new())),
+        };
+        let outcome = Outcome::decide(
+            &verdict,
+            Counts {
+                vendor_rows: 0,
+                listing_unusable,
+            },
+            &Baseline::from_trailing_ok(&TRAILING_OK),
         );
-        let outcome = Outcome::decide(&verdict, 0, &Baseline::from_trailing_ok(&TRAILING_OK));
-        let closed = slot.close(store, outcome, &Ok(answer), at(4))?;
+        let closed = slot.close(store, outcome, &answer, at(4))?;
         store.record(closed, &[], at(5))?;
         Ok(())
     }
@@ -3341,6 +3549,72 @@ mod tests {
         Ok(())
     }
 
+    /// Section 11.1, owner decision of 2026-11-15: a permanent failure answered with a 3xx holds
+    /// nothing, any other status or none at all holds. Mutations 2026-11-15: the 3xx exclusion
+    /// dropped, red; its `COALESCE` dropped, red; either bound moved in by one, red.
+    #[test]
+    fn a_permanent_document_answered_with_a_redirect_holds_nothing_and_one_with_no_status_holds(
+    ) -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let here = (SOURCE, WINDOW);
+        let answers = [
+            ("300", Some(300)),
+            ("301", Some(301)),
+            ("399", Some(399)),
+            ("400", Some(400)),
+            ("404", Some(404)),
+            ("no status", None),
+        ];
+        for ((story, status), ordinal) in answers.into_iter().zip(0..) {
+            let failed = Verdict::PermanentFailure;
+            a_document_answered(&mut store, here, (story, ordinal), failed, status)?;
+        }
+        a_document_closed(&mut store, here, "usable", 6, Verdict::Usable)?;
+        let held = store.held_story_ids(&SourceId::new(SOURCE))?;
+        assert_eq!(
+            held,
+            ["400", "404", "no status", "usable"]
+                .map(|story| story_hex(SOURCE, story))
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        Ok(())
+    }
+
+    /// Section 11.1, owner decision of 2026-11-15: a usable document with an unusable row the
+    /// index row decided holds nothing; a page-decided one (count 0) and a row closed before
+    /// user_version 4 (count NULL) hold. Mutations 2026-11-15 are in §11.1 (the held read).
+    #[test]
+    fn a_usable_document_with_a_listing_unusable_row_holds_nothing_and_a_v3_or_page_one_holds(
+    ) -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let here = (SOURCE, WINDOW);
+        let usable = (Verdict::Usable, Some(STATUS_OK));
+        let counted = [
+            ("usable, listing unusable", 1),
+            ("usable, listing count NULL", 1),
+            ("usable, page unusable", 0),
+        ];
+        for ((story, listing_unusable), ordinal) in counted.into_iter().zip(0..) {
+            a_document_counted(&mut store, here, (story, ordinal), usable, listing_unusable)?;
+        }
+        store.db.execute(
+            "UPDATE attempts SET listing_unusable = NULL WHERE story_id = ?1",
+            params![story_hex(SOURCE, "usable, listing count NULL")],
+        )?;
+        let held = store.held_story_ids(&SourceId::new(SOURCE))?;
+        assert_eq!(
+            held,
+            ["usable, listing count NULL", "usable, page unusable"]
+                .map(|story| story_hex(SOURCE, story))
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        Ok(())
+    }
+
     /// An index attempt under (source, window), naming no story, that commits `spec`'s item: the
     /// items arm of the held read is then the only one that can hold it.
     fn an_item_committed_under(
@@ -3363,7 +3637,10 @@ mod tests {
         );
         let outcome = Outcome::decide(
             &Verdict::Usable,
-            VENDOR_ROWS,
+            Counts {
+                vendor_rows: VENDOR_ROWS,
+                listing_unusable: 0,
+            },
             &Baseline::from_trailing_ok(&TRAILING_OK),
         );
         let closed = slot.close(store, outcome, &Ok(answer), at(4))?;
@@ -3975,7 +4252,10 @@ mod tests {
         );
         let outcome = Outcome::decide(
             &Verdict::Usable,
-            VENDOR_ROWS,
+            Counts {
+                vendor_rows: VENDOR_ROWS,
+                listing_unusable: 0,
+            },
             &Baseline::from_trailing_ok(&TRAILING_OK),
         );
         let closed = slot.close(&mut Elsewhere, outcome, &Ok(answer), at(4))?;

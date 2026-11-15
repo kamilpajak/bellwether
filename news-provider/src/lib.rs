@@ -60,8 +60,9 @@ pub use ledger::{
 };
 pub use provider::{
     listed_sessions, precision_of, probed_lag, stamp_of, BodyState, Cadence, Calendar,
-    CalendarError, CollectedItem, Extracted, ExtractedBody, Listing, NotPlanned, Plan, PlanRefusal,
-    Provenance, Provider, RawBlob, UnusableReason, UnusableRow, ValidPrecision, ValidSource,
+    CalendarError, CollectedItem, DecidedBy, Extracted, ExtractedBody, Listing, NotPlanned, Plan,
+    PlanRefusal, Provenance, Provider, RawBlob, UnusableReason, UnusableRow, ValidPrecision,
+    ValidSource,
 };
 pub use request::{
     days_of, CredentialRef, HeaderName, HeaderValue, Param, Request, RequestPhase, RunId, SourceId,

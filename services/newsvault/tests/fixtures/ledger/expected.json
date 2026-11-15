@@ -33,6 +33,7 @@
           ],
           "vendor_rows": 120,
           "held": 0,
+          "listing_unusable": 0,
           "items_new": 3,
           "rows_committed": 3
         },
@@ -48,6 +49,7 @@
           "answered_without_finalised": [],
           "vendor_rows": 12,
           "held": 0,
+          "listing_unusable": 0,
           "items_new": 1,
           "rows_committed": 1
         }
@@ -73,6 +75,7 @@
           "answered_without_finalised": [],
           "vendor_rows": 0,
           "held": 0,
+          "listing_unusable": 0,
           "items_new": 0,
           "rows_committed": 0
         },
@@ -88,6 +91,7 @@
           "answered_without_finalised": [],
           "vendor_rows": 0,
           "held": 0,
+          "listing_unusable": 0,
           "items_new": 0,
           "rows_committed": 0
         }
@@ -113,6 +117,7 @@
           "answered_without_finalised": [],
           "vendor_rows": 0,
           "held": 0,
+          "listing_unusable": 0,
           "items_new": 0,
           "rows_committed": 0
         },
@@ -128,6 +133,7 @@
           "answered_without_finalised": [],
           "vendor_rows": 0,
           "held": 0,
+          "listing_unusable": 0,
           "items_new": 0,
           "rows_committed": 0
         }
@@ -153,6 +159,7 @@
           "answered_without_finalised": [],
           "vendor_rows": 59,
           "held": 0,
+          "listing_unusable": 0,
           "items_new": 0,
           "rows_committed": 0
         }
@@ -178,6 +185,7 @@
           "answered_without_finalised": [],
           "vendor_rows": 5,
           "held": 0,
+          "listing_unusable": 0,
           "items_new": 1,
           "rows_committed": 1
         }

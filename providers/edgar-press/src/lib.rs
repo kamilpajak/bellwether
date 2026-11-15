@@ -16,9 +16,9 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeDelta, TimeZone, Utc};
 use chrono_tz::Tz;
 use news_provider::budget::RequestBudget;
 use news_provider::provider::{
-    listed_sessions, precision_of, probed_lag, Cadence, Calendar, CollectedItem, Extracted,
-    ExtractedBody, Listing, NotPlanned, Plan, PlanRefusal, Provenance, Provider, RawBlob,
-    UnusableReason, UnusableRow, ValidPrecision, ValidSource,
+    listed_sessions, precision_of, probed_lag, Cadence, Calendar, CollectedItem, DecidedBy,
+    Extracted, ExtractedBody, Listing, NotPlanned, Plan, PlanRefusal, Provenance, Provider,
+    RawBlob, UnusableReason, UnusableRow, ValidPrecision, ValidSource,
 };
 use news_provider::request::{days_of, HeaderValue, Request, RequestPhase};
 use news_provider::wire::{RawResponse, Timeouts, TransportError, TransportKind, TransportProfile};
@@ -59,6 +59,7 @@ const KNOWN_ZONES: [&str; 1] = ["America/New_York"];
 const RULES_SCHEMA: &str = "edgar-press.rules/1";
 const HEADER_END: &str = "</SEC-HEADER>";
 const ACCESS_DENIED: &str = "<Code>AccessDenied</Code>";
+const REQUEST_TIMEOUT: u16 = 408;
 const TOO_MANY_REQUESTS: u16 = 429;
 const SERVER_ERRORS: std::ops::RangeInclusive<u16> = 500..=599;
 const OK: u16 = 200;
@@ -297,6 +298,8 @@ impl EdgarPress {
                 follow_ups: Vec::new(),
                 unusable: vec![UnusableRow {
                     reason,
+                    // Page for every reason: edgar's live ingest ignores the held set (§10).
+                    decided_by: DecidedBy::Page,
                     item,
                     raw_blob: raw.digest.clone(),
                 }],
@@ -557,7 +560,7 @@ impl Provider for EdgarPress {
                 }
             },
             FORBIDDEN if body.contains(ACCESS_DENIED) => Verdict::PermanentFailure,
-            FORBIDDEN | TOO_MANY_REQUESTS => Verdict::TransientFailure,
+            FORBIDDEN | TOO_MANY_REQUESTS | REQUEST_TIMEOUT => Verdict::TransientFailure,
             status if SERVER_ERRORS.contains(&status) => Verdict::TransientFailure,
             _ => Verdict::PermanentFailure,
         }

@@ -125,6 +125,10 @@ pub struct SourceRow {
     /// Section 11.1's `held`: vendor rows a live index left unfetched because the store already
     /// held their story. Subtracted from `vendor_rows` before the zero-rows finding.
     pub held: i64,
+    /// Section 11.1: unusable rows the index row decided. Such a story is fetched again by every
+    /// poll, so this counts one per fetch of such a story, the first fetch included. Not
+    /// subtracted before the zero-rows finding.
+    pub listing_unusable: i64,
     pub items_new: i64,
     pub rows_committed: i64,
 }
@@ -242,6 +246,7 @@ struct Grouped {
     attempts: u32,
     vendor_rows: i64,
     held: i64,
+    listing_unusable: i64,
     items_new: i64,
 }
 
@@ -402,7 +407,8 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
     let mut statement = db.prepare(&format!(
         "SELECT run_id, source, COALESCE(outcome, '{IN_FLIGHT}') AS state, COUNT(*),
                 SUM(COALESCE(vendor_rows, 0)), SUM(COALESCE(items_new, 0)),
-                SUM(CASE WHEN vendor_rows IS NOT NULL THEN COALESCE(held, 0) ELSE 0 END)
+                SUM(CASE WHEN vendor_rows IS NOT NULL THEN COALESCE(held, 0) ELSE 0 END),
+                SUM(CASE WHEN vendor_rows IS NOT NULL THEN COALESCE(listing_unusable, 0) ELSE 0 END)
          FROM attempts WHERE opened_at <= ?1
          GROUP BY run_id, source, state
          ORDER BY run_id, source, state"
@@ -417,6 +423,7 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
                 vendor_rows: row.get(4)?,
                 items_new: row.get(5)?,
                 held: row.get(6)?,
+                listing_unusable: row.get(7)?,
             })
         })?
         .collect::<Result<Vec<Grouped>, _>>()?;
@@ -586,6 +593,7 @@ fn day_row(
         row.attempts += entry.attempts;
         row.vendor_rows += entry.vendor_rows;
         row.held += entry.held;
+        row.listing_unusable += entry.listing_unusable;
         row.items_new += entry.items_new;
         match entry.state.as_str() {
             OUTCOME_OK => row.ok += entry.attempts,
@@ -652,6 +660,7 @@ impl SourceRow {
             answered_without_finalised: Vec::new(),
             vendor_rows: 0,
             held: 0,
+            listing_unusable: 0,
             items_new: 0,
             rows_committed: 0,
         }
@@ -752,7 +761,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
             writeln!(
                 out,
                 "  {:<14} ok {} empty {} failed {} interrupted {} in-flight {} \
-                 vendor_rows {} held {} items_new {} rows {}",
+                 vendor_rows {} held {} listing_unusable {} items_new {} rows {}",
                 row.source,
                 row.ok,
                 row.empty,
@@ -761,6 +770,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 row.in_flight,
                 row.vendor_rows,
                 row.held,
+                row.listing_unusable,
                 row.items_new,
                 row.rows_committed
             )?;
