@@ -7,7 +7,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use news_provider::{
     Clock, CollectError, Exchange, Exit, PlanRefusal, RawResponse, Request, SendFailure,
     SendPermit, TransportError,
@@ -32,6 +32,10 @@ const BEFORE_THE_MINUTE_CLOSED: &str = "2026-11-14T19:00:45Z";
 const AFTER_THE_MINUTE_CLOSED: &str = "2026-11-14T19:01:00Z";
 const INDEX: &str = "https://rss.globenewswire.com/rssfeed/";
 const OK: u16 = 200;
+const SENT_BEFORE_THE_CLOCK: i64 = 2;
+const RECEIVED_BEFORE_THE_CLOCK: i64 = 1;
+/// The stub's `received_at` for every page: `RUN_AT` less `RECEIVED_BEFORE_THE_CLOCK`.
+const RECEIVED_AT: &str = "2026-11-14T19:00:29.000000Z";
 const EXIT_USAGE: i32 = 2;
 
 /// The three `rssfeed_3_items.xml` links after the www -> rss rewrite, the page each is answered
@@ -97,7 +101,8 @@ impl Clock for Fixed {
     }
 }
 
-/// Answers each url out of a committed fixture, received at the clock's instant.
+/// Answers each url out of a committed fixture, sent two seconds and received one second before
+/// the clock's instant, so the three instants differ and the stored observation names one of them.
 struct Gnw {
     pages: BTreeMap<String, Vec<u8>>,
     asked: RefCell<Vec<String>>,
@@ -128,8 +133,11 @@ impl Exchange for Gnw {
         self.asked.borrow_mut().push(request.url.clone());
         let attempt = permit.attempt_id().clone();
         let at = ObservationTime::new(clock.now());
+        let sent = ObservationTime::new(clock.now() - TimeDelta::seconds(SENT_BEFORE_THE_CLOCK));
+        let received =
+            ObservationTime::new(clock.now() - TimeDelta::seconds(RECEIVED_BEFORE_THE_CLOCK));
         match self.pages.get(&request.url) {
-            Some(body) => Ok(RawResponse::new(attempt, OK, body.clone(), at, at)),
+            Some(body) => Ok(RawResponse::new(attempt, OK, body.clone(), sent, received)),
             None => Err(SendFailure::Transport(TransportError::new(
                 attempt,
                 at,
@@ -265,12 +273,27 @@ fn an_open_web_run_collects_a_globenewswire_day_end_to_end() -> TestResult {
                     Some((*raw).to_owned()),
                     Some("pubDate".to_owned()),
                     Some("vendor_published".to_owned()),
-                    "2026-11-14T19:00:30.000000Z".to_owned(),
+                    RECEIVED_AT.to_owned(),
                 ),
             ))
         })
         .collect();
     assert_eq!(stored_items(&db)?, expected);
+    // Mutation 2026-11-15: `collect` observing at `requested_at` instead of `received_at` was
+    // green before the stub told the two apart.
+    let mut clocks = db.prepare(
+        "SELECT i.observed_at, a.requested_at, a.received_at
+           FROM items i JOIN attempts a ON a.attempt_id = i.attempt_id",
+    )?;
+    let clocks = clocks
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)? == row.get::<_, String>(2)?,
+                row.get::<_, String>(0)? == row.get::<_, String>(1)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(clocks, vec![(true, false); expected.len()]);
     // The 19:00 minute is still open at 19:00:45: only the 18:45 release is visible.
     assert_eq!(
         (
