@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use news_provider::{Clock, Credentials, Provider, RunId, SystemClock, Wire};
+use news_provider::{Clock, Credentials, RunId, SystemClock, Wire};
 use newsvault::cmd_collect::{self, CollectRunError};
 use newsvault::cmd_items;
 use newsvault::cmd_ledger::{self, Ask, LedgerReadError, Report};
@@ -98,10 +98,11 @@ enum Command {
     },
     /// Collects one window from one source into the archive. The only command that writes.
     Collect {
-        /// Source id, repeatable.
+        /// Source id: edgar_press or open_web_wires. Repeatable, but a second distinct source is
+        /// refused: one source per invocation.
         #[arg(long = "source", required = true)]
         sources: Vec<String>,
-        /// A day as YYYY-MM-DD, or a FROM..TO range of days.
+        /// A day as YYYY-MM-DD, a FROM..TO range of days, or `today`: the UTC date of `--at`.
         #[arg(long)]
         window: String,
         /// The schedule slot this run belongs to, which keys its run id.
@@ -112,17 +113,23 @@ enum Command {
         expected_runs: u32,
         #[arg(long)]
         store: Option<PathBuf>,
-        /// The session calendar, hashed: a non-session day is zero requests.
+        /// The session calendar, hashed: a non-session day is zero requests. Required for
+        /// edgar_press, refused for open_web_wires.
         #[arg(long)]
-        calendar: PathBuf,
+        calendar: Option<PathBuf>,
         /// The vendor's own quarter listing, hashed: an unpublished day is zero requests.
+        /// Required for edgar_press, refused for open_web_wires.
         #[arg(long)]
-        listing: PathBuf,
+        listing: Option<PathBuf>,
         /// The in-universe CIK roster. Absent, unparseable or empty is a refusal, never an empty
-        /// universe.
+        /// universe. Required for edgar_press, refused for open_web_wires.
         #[arg(long)]
-        roster: PathBuf,
-        /// The hashed extraction rules.
+        roster: Option<PathBuf>,
+        /// The hosts file, hashed: only its admitted rows are asked. Required for
+        /// open_web_wires, refused for edgar_press.
+        #[arg(long)]
+        hosts: Option<PathBuf>,
+        /// The chosen provider's hashed extraction rules.
         #[arg(long)]
         rules: PathBuf,
         /// The measured observation lag per source and provenance, hashed. Without it a window
@@ -246,6 +253,13 @@ fn exit_code(failure: &anyhow::Error) -> u8 {
             CollectRunError::Refused(
                 edgar_press::Refusal::RosterAbsent(_) | edgar_press::Refusal::RosterEmpty(_),
             ) => EXIT_NOT_FOUND,
+            // input_absent: an absent hosts or rules file, and a hosts file admitting no host,
+            // which would plan zero requests and read as a quiet day (R6).
+            CollectRunError::OpenWebRefused(
+                open_web_feed::Refusal::HostsAbsent(_)
+                | open_web_feed::Refusal::RulesAbsent(_)
+                | open_web_feed::Refusal::NoHostAdmitted(_),
+            ) => EXIT_NOT_FOUND,
             CollectRunError::Store(StoreError::LeaseHeld(_)) => EXIT_LEASE_HELD,
             // invalid_argument, input_unparseable, credential_contact_missing and io_failed.
             _ => EXIT_USAGE,
@@ -342,6 +356,7 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
             calendar,
             listing,
             roster,
+            hosts,
             rules,
             lag_policy,
             at,
@@ -350,6 +365,7 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
             format,
         } => {
             let clock = SystemClock;
+            let registered = cmd_collect::Registered::chosen(&sources)?;
             let ask = cmd_collect::Ask {
                 sources,
                 window,
@@ -359,9 +375,10 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 calendar,
                 listing,
                 roster,
+                hosts,
                 rules,
                 lag_policy,
-                contact: contact(),
+                contact: contact(registered),
                 at: match at {
                     Some(raw) => instant(&raw, "--at"),
                     None => clock.now(),
@@ -373,7 +390,7 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
             // address is substituted inside `Wire::send` and reaches no plan and no ledger row.
             let wire = Wire::new(
                 opened.provider.transport(),
-                Credentials::default().with(edgar_press::CONTACT_CREDENTIAL, ask.contact.clone()),
+                Credentials::default().with(opened.registered.credential(), ask.contact.clone()),
                 // The pace file goes beside this run's own store, and the production sleeper is
                 // the only thing in the tree that really waits.
                 &ask.store,
@@ -453,10 +470,11 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
     }
 }
 
-/// SEC requires a contact address in the User-Agent. It comes from the environment and never
-/// from a flag, so it is not in a process listing, and it is checked at startup by the provider.
-fn contact() -> String {
-    std::env::var("BELLWETHER_SEC_CONTACT").unwrap_or_default()
+/// The User-Agent's contact address, from the chosen provider's own variable. It comes from the
+/// environment and never from a flag, so it is not in a process listing; an unset variable reads
+/// as empty and the provider refuses it at startup as `credential_contact_missing`.
+fn contact(registered: cmd_collect::Registered) -> String {
+    std::env::var(registered.contact_variable()).unwrap_or_default()
 }
 
 fn emit_collect(envelope: &serde_json::Value, format: Format) -> anyhow::Result<()> {
@@ -693,29 +711,41 @@ fn print_schema(format: Format) {
                 "path": ["collect"],
                 "summary": "Collects one window from one source into the archive.",
                 "options": [
-                    {"name": "source", "type": "string", "required": true, "repeatable": true},
+                    {"name": "source", "type": "enum", "required": true, "repeatable": true,
+                     "values": cmd_collect::Registered::ALL.map(cmd_collect::Registered::source),
+                     "doc": "one source per invocation: a second distinct source is invalid_argument"},
                     {"name": "window", "type": "string", "required": true,
-                     "doc": "a day as YYYY-MM-DD, or a FROM..TO range of days"},
+                     "doc": "a day as YYYY-MM-DD, a FROM..TO range of days, or today: the UTC date \
+                             of at; the envelope's window is the resolved day"},
                     {"name": "schedule", "type": "string"},
                     {"name": "expected_runs", "type": "integer", "default": 1},
                     {"name": "store", "type": "path"},
-                    {"name": "calendar", "type": "path", "required": true},
-                    {"name": "listing", "type": "path", "required": true},
-                    {"name": "roster", "type": "path", "required": true},
-                    {"name": "rules", "type": "path", "required": true},
-                    {"name": "lag_policy", "type": "path",
+                    {"name": "calendar", "type": "path", "required_for": ["edgar_press"],
+                     "refused_for": ["open_web_wires"]},
+                    {"name": "listing", "type": "path", "required_for": ["edgar_press"],
+                     "refused_for": ["open_web_wires"]},
+                    {"name": "roster", "type": "path", "required_for": ["edgar_press"],
+                     "refused_for": ["open_web_wires"]},
+                    {"name": "hosts", "type": "path", "required_for": ["open_web_wires"],
+                     "refused_for": ["edgar_press"]},
+                    {"name": "rules", "type": "path", "required": true,
+                     "doc": "the chosen source's own rules file"},
+                    {"name": "lag_policy", "type": "path", "refused_for": ["open_web_wires"],
                      "doc": "the measured observation lag per source and provenance; without it a \
                              window earlier than the run's own date is refused unplanned (R11)"},
                     {"name": "at", "type": "rfc3339",
-                     "doc": "the run's observation instant; defaults to now"},
+                     "doc": "the instant the run plans against; defaults to now; for open_web_wires \
+                             a run (not a dry run) whose at is not the clock's UTC day is refused"},
                     {"name": "dry_run", "type": "flag",
                      "doc": "plans and resolves every target and mutates nothing"},
                     {"name": "non_interactive", "type": "flag",
                      "doc": "accepted and does nothing: no command here prompts or reads stdin"},
                     {"name": "format", "type": "enum", "values": ["human", "json"]}
                 ],
-                "env": [{"name": "BELLWETHER_SEC_CONTACT",
-                         "doc": "the contact address SEC requires in the User-Agent"}],
+                "env": [{"name": "BELLWETHER_SEC_CONTACT", "source": "edgar_press",
+                         "doc": "the contact address SEC requires in the User-Agent"},
+                        {"name": "BELLWETHER_FEED_CONTACT", "source": "open_web_wires",
+                         "doc": "the contact address the open-web User-Agent carries"}],
                 "output": cmd_collect::SCHEMA,
                 "mutates": true
             },

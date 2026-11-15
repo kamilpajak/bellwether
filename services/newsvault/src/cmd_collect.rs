@@ -11,26 +11,32 @@ use canon::digest::{doc_id, item_id, story_id, ItemFields};
 use chrono::{DateTime, NaiveDate, Utc};
 use edgar_press::EdgarPress;
 use news_provider::lag_policy::{LagPolicy, LagPolicyError};
-use news_provider::provider::{Calendar, CalendarError, Listing, PlanRefusal, Provenance};
+use news_provider::provider::{Cadence, Calendar, CalendarError, Listing, PlanRefusal, Provenance};
 use news_provider::{
     stamp_of, Archive, ArchiveError, AttemptReceipt, Clock, CollectError, Collected, CollectedItem,
     Committed, Exchange, Exit, Provider, Run, RunId, SourceId, TargetWindow,
 };
-use pit::ObservationTime;
+use open_web_feed::OpenWebFeed;
+use pit::{MeasuredLag, ObservationTime};
 use serde_json::{json, Value};
 
 use crate::cmd_ledger::{Envelope, RUN_ENVELOPE_SCHEMA};
 use crate::store::{Committer, ItemRow, StoreError, POLICY_DIR, RUNS_DIR};
 
-pub const SCHEMA: &str = "newsvault.collect/1";
+/// `/2` since 2026-11-15: `calendar_version` became nullable, a type change, and `window`,
+/// `source` and `hosts_version` were added.
+pub const SCHEMA: &str = "newsvault.collect/2";
 /// What a run with no schedule slot is keyed by, so an ad-hoc run still has a run id and a
 /// partition key (accepted attack A1.7).
 const ADHOC: &str = "adhoc";
 const RUN_ID_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 const STAGING_PREFIX: &str = ".tmp-";
+/// The one window spelling that is not a day: the UTC date of the run's own `at`.
+pub const TODAY: &str = "today";
 
 /// What a caller asked `collect` for. `calendar` and `listing` are files for the same reason the
-/// rules file is one: a hashed input a second reader can reproduce.
+/// rules file is one: a hashed input a second reader can reproduce. Which of the four optional
+/// files a source takes is `Registered`'s table and its provider's `Cadence`.
 #[derive(Debug, Clone)]
 pub struct Ask {
     pub sources: Vec<String>,
@@ -38,13 +44,13 @@ pub struct Ask {
     pub schedule: Option<String>,
     pub expected_runs: u32,
     pub store: PathBuf,
-    pub calendar: PathBuf,
-    pub listing: PathBuf,
-    /// `edgar_press`'s own inputs. A second provider makes this a policy file; with one, a policy
-    /// file would be a shape nothing reads.
-    pub roster: PathBuf,
+    pub calendar: Option<PathBuf>,
+    pub listing: Option<PathBuf>,
+    pub roster: Option<PathBuf>,
+    pub hosts: Option<PathBuf>,
+    /// The chosen provider's own rules file.
     pub rules: PathBuf,
-    /// The measured observation lag per (source, provenance), hashed like the three files above.
+    /// The measured observation lag per (source, provenance), hashed like the files above.
     /// Absent is not "no lag of zero": a `vendor_archive` window then has nothing behind it and
     /// `probed_lag` refuses it before the first request (decision D5).
     pub lag_policy: Option<PathBuf>,
@@ -57,6 +63,29 @@ pub struct Ask {
 pub enum CollectRunError {
     #[error("no provider is registered under {0}")]
     UnknownSource(String),
+    /// A second SourceId needs a run envelope listing one `hosts_version` per source
+    /// (architecture.md section 11.2), which is not built.
+    #[error("one source per invocation; asked for {0:?}")]
+    MoreThanOneSource(Vec<String>),
+    #[error("{source_id} needs --{flag}")]
+    FlagRequired {
+        flag: &'static str,
+        source_id: &'static str,
+    },
+    /// Refused, never ignored: a file a run does not read would still read as an input of it.
+    #[error("{source_id} takes no --{flag}")]
+    FlagRefused {
+        flag: &'static str,
+        source_id: &'static str,
+    },
+    /// An every-day provider's window is the run's UTC day, so an `at` on another day than the
+    /// clock's would label today's fetch with that day.
+    #[error("--at names {at}, and {source_id} collects only the clock's own UTC day, {today}")]
+    AtIsNotTheClockDay {
+        source_id: &'static str,
+        at: NaiveDate,
+        today: NaiveDate,
+    },
     #[error("no {what} at {path}")]
     InputAbsent { what: &'static str, path: PathBuf },
     #[error("the calendar at {path} is unusable: {why}")]
@@ -69,6 +98,8 @@ pub enum CollectRunError {
     PlanRefused(#[from] PlanRefusal),
     #[error(transparent)]
     Refused(#[from] edgar_press::Refusal),
+    #[error(transparent)]
+    OpenWebRefused(#[from] open_web_feed::Refusal),
     /// Registry code `input_unparseable`, exit 2. A policy nothing can read is not a run with no
     /// lag: that would refuse the window with R11's message and hide the unreadable file.
     #[error("the observation-lag policy is unusable: {0}")]
@@ -95,16 +126,87 @@ pub struct Answer {
 #[derive(Debug)]
 pub struct Driven {
     pub collected: Collected,
-    pub calendar_version: String,
+    /// `None` when the provider's cadence takes no calendar and none was read.
+    pub calendar_version: Option<String>,
+}
+
+/// The table of registered providers: per source, its credential and the files it takes beside
+/// the calendar and listing its `Cadence` decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registered {
+    EdgarPress,
+    OpenWebWires,
+}
+
+impl Registered {
+    pub const ALL: [Self; 2] = [Self::EdgarPress, Self::OpenWebWires];
+
+    /// The one source an invocation collects; the same id given twice is one source.
+    pub fn chosen(sources: &[String]) -> Result<Self, CollectRunError> {
+        let mut distinct: Vec<String> = sources.to_vec();
+        distinct.sort();
+        distinct.dedup();
+        let [only] = distinct.as_slice() else {
+            return Err(CollectRunError::MoreThanOneSource(distinct));
+        };
+        Self::ALL
+            .into_iter()
+            .find(|entry| entry.source() == only)
+            .ok_or_else(|| CollectRunError::UnknownSource(only.clone()))
+    }
+
+    #[must_use]
+    pub const fn source(self) -> &'static str {
+        match self {
+            Self::EdgarPress => edgar_press::SOURCE,
+            Self::OpenWebWires => open_web_feed::SOURCE,
+        }
+    }
+
+    /// The name the User-Agent's contact travels under inside `Wire::send`.
+    #[must_use]
+    pub const fn credential(self) -> &'static str {
+        match self {
+            Self::EdgarPress => edgar_press::CONTACT_CREDENTIAL,
+            Self::OpenWebWires => open_web_feed::CONTACT_CREDENTIAL,
+        }
+    }
+
+    /// Each provider's contact from a variable of its own, never another vendor's.
+    #[must_use]
+    pub const fn contact_variable(self) -> &'static str {
+        match self {
+            Self::EdgarPress => "BELLWETHER_SEC_CONTACT",
+            Self::OpenWebWires => "BELLWETHER_FEED_CONTACT",
+        }
+    }
+
+    /// (flag, taken): `roster` is `edgar-press`'s universe, `hosts` is `open-web-feed`'s.
+    const fn own_files(self) -> [(&'static str, bool); 2] {
+        let edgar = matches!(self, Self::EdgarPress);
+        [("roster", edgar), ("hosts", !edgar)]
+    }
 }
 
 /// The provider and the policy that dated it. One struct, because the digest the envelope reports
 /// and the lag `plan` was handed have to come from ONE read of one file: two reads of a path a
 /// caller names are two different files when the second read lands after an edit.
-#[derive(Debug)]
 pub struct Opened {
-    pub provider: EdgarPress,
+    pub registered: Registered,
+    pub provider: Box<dyn Provider>,
+    /// sha256 of the hosts file the provider was opened on; `None` for a provider with none.
+    pub hosts_version: Option<String>,
     pub lag: Option<AppliedLag>,
+}
+
+impl std::fmt::Debug for Opened {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Opened")
+            .field("registered", &self.registered)
+            .field("hosts_version", &self.hosts_version)
+            .field("lag", &self.lag)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The lag a `vendor_archive` window of this run is dated through, as read.
@@ -117,40 +219,109 @@ pub struct AppliedLag {
     bytes: Vec<u8>,
 }
 
-/// The one provider registered here. A second one makes this a table.
-pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
-    for source in &ask.sources {
-        if source != edgar_press::SOURCE {
-            return Err(CollectRunError::UnknownSource(source.clone()));
-        }
+fn given(
+    path: Option<&PathBuf>,
+    flag: &'static str,
+    entry: Registered,
+    taken: bool,
+) -> Result<(), CollectRunError> {
+    match (path.is_some(), taken) {
+        (false, true) => Err(CollectRunError::FlagRequired {
+            flag,
+            source_id: entry.source(),
+        }),
+        (true, false) => Err(CollectRunError::FlagRefused {
+            flag,
+            source_id: entry.source(),
+        }),
+        _ => Ok(()),
     }
-    let provider = EdgarPress::open(&ask.roster, &ask.rules, &ask.contact)?;
+}
+
+fn required<'a>(
+    path: Option<&'a PathBuf>,
+    flag: &'static str,
+    entry: Registered,
+) -> Result<&'a Path, CollectRunError> {
+    path.map(PathBuf::as_path)
+        .ok_or(CollectRunError::FlagRequired {
+            flag,
+            source_id: entry.source(),
+        })
+}
+
+/// Opens the one provider the sources name, after refusing every input flag its table entry and
+/// its cadence do not take, so a refused run has read no store and written nothing.
+pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
+    let registered = Registered::chosen(&ask.sources)?;
+    let [roster, hosts] = registered.own_files();
+    given(ask.roster.as_ref(), roster.0, registered, roster.1)?;
+    given(ask.hosts.as_ref(), hosts.0, registered, hosts.1)?;
+    let (provider, hosts_version, lag): (Box<dyn Provider>, _, _) = match registered {
+        Registered::EdgarPress => {
+            let roster = required(ask.roster.as_ref(), roster.0, registered)?;
+            let provider = EdgarPress::open(roster, &ask.rules, &ask.contact)?;
+            match lag_of(ask, registered)? {
+                Some((applied, measured)) => (
+                    Box::new(provider.with_observation_lag(measured)),
+                    None,
+                    Some(applied),
+                ),
+                None => (Box::new(provider), None, None),
+            }
+        }
+        Registered::OpenWebWires => {
+            // Live only (section 11.1): no window of it is dated by a lag, so a policy is refused.
+            if ask.lag_policy.is_some() {
+                return Err(CollectRunError::FlagRefused {
+                    flag: "lag-policy",
+                    source_id: registered.source(),
+                });
+            }
+            let hosts = required(ask.hosts.as_ref(), hosts.0, registered)?;
+            let provider = OpenWebFeed::open(hosts, &ask.rules, &ask.contact)?;
+            let version = provider.hosts_version().hex().to_owned();
+            (Box::new(provider), Some(version), None)
+        }
+    };
+    let session_bound = provider.cadence() == Cadence::SessionBound;
+    given(ask.calendar.as_ref(), "calendar", registered, session_bound)?;
+    given(ask.listing.as_ref(), "listing", registered, session_bound)?;
+    Ok(Opened {
+        registered,
+        provider,
+        hosts_version,
+        lag,
+    })
+}
+
+/// The policy's entry for this source's archive arm, read once per call from the caller's file.
+fn lag_of(
+    ask: &Ask,
+    registered: Registered,
+) -> Result<Option<(AppliedLag, MeasuredLag)>, CollectRunError> {
     let Some(path) = ask.lag_policy.as_deref() else {
-        return Ok(Opened {
-            provider,
-            lag: None,
-        });
+        return Ok(None);
     };
     let bytes = read_input("observation-lag policy", path)?;
     let policy = LagPolicy::read(&bytes)?;
     // Per (source, provenance), because the same adapter reading today's index and an earlier one
     // are two populations (R10) and one measured lag does not describe both.
-    let Some(lag) = policy.lag(&provider.source(), Provenance::VendorArchive) else {
-        return Ok(Opened {
-            provider,
-            lag: None,
-        });
+    let Some(lag) = policy.lag(
+        &SourceId::new(registered.source()),
+        Provenance::VendorArchive,
+    ) else {
+        return Ok(None);
     };
-    let applied = AppliedLag {
-        version: policy.version().hex().to_owned(),
-        probe_id: lag.probe_id.clone(),
-        seconds: lag.seconds,
-        bytes,
-    };
-    Ok(Opened {
-        provider: provider.with_observation_lag(lag.clone()),
-        lag: Some(applied),
-    })
+    Ok(Some((
+        AppliedLag {
+            version: policy.version().hex().to_owned(),
+            probe_id: lag.probe_id.clone(),
+            seconds: lag.seconds,
+            bytes,
+        },
+        lag.clone(),
+    )))
 }
 
 /// The policy as a file in the archive, named by its own digest, on first use. A run that dated
@@ -185,15 +356,38 @@ fn read_input(what: &'static str, path: &Path) -> Result<Vec<u8>, CollectRunErro
     })
 }
 
-fn inputs(ask: &Ask) -> Result<(Calendar, Listing), CollectRunError> {
-    let calendar = Calendar::read(&read_input("calendar", &ask.calendar)?).map_err(|why| {
-        CollectRunError::UnusableCalendar {
-            path: ask.calendar.clone(),
-            why,
-        }
-    })?;
-    let listing = edgar_press::read_listing(&read_input("quarter listing", &ask.listing)?)?;
+/// The calendar and listing the caller named, each read only when given; `open_provider` already
+/// refused a flag the provider's cadence does not take and a missing one it needs.
+fn inputs(ask: &Ask) -> Result<(Option<Calendar>, Option<Listing>), CollectRunError> {
+    let calendar = match ask.calendar.as_deref() {
+        Some(path) => Some(
+            Calendar::read(&read_input("calendar", path)?).map_err(|why| {
+                CollectRunError::UnusableCalendar {
+                    path: path.to_path_buf(),
+                    why,
+                }
+            })?,
+        ),
+        None => None,
+    };
+    let listing = match ask.listing.as_deref() {
+        Some(path) => Some(edgar_press::read_listing(&read_input(
+            "quarter listing",
+            path,
+        )?)?),
+        None => None,
+    };
     Ok((calendar, listing))
+}
+
+/// The window as planned: `today` is the UTC date of the run's own `at`, never the local one.
+#[must_use]
+pub fn target_of(ask: &Ask) -> TargetWindow {
+    if ask.window == TODAY {
+        TargetWindow::new(ask.at.date_naive().to_string())
+    } else {
+        TargetWindow::new(&ask.window)
+    }
 }
 
 /// Drives one run against an archive the caller holds. `run` takes the lease and calls this; a
@@ -208,7 +402,7 @@ pub fn drive<A: Archive>(
     run: &RunId,
 ) -> Result<Driven, CollectRunError> {
     let (calendar, listing) = inputs(ask)?;
-    let target = TargetWindow::new(&ask.window);
+    let target = target_of(ask);
     let collected = news_provider::collect(
         provider,
         archive,
@@ -217,15 +411,19 @@ pub fn drive<A: Archive>(
         &Run {
             run,
             target: &target,
-            calendar: Some(&calendar),
-            listing: Some(&listing),
+            calendar: calendar.as_ref(),
+            listing: listing.as_ref(),
             at: ObservationTime::new(ask.at),
         },
     )?;
     Ok(Driven {
         collected,
-        calendar_version: calendar.version().hex().to_owned(),
+        calendar_version: version_of(calendar.as_ref()),
     })
+}
+
+fn version_of(calendar: Option<&Calendar>) -> Option<String> {
+    calendar.map(|calendar| calendar.version().hex().to_owned())
 }
 
 /// Plans and collects one window. A dry run stops after the plan: it takes no lease, writes no
@@ -236,11 +434,20 @@ pub fn run(
     exchange: &dyn Exchange,
     clock: &dyn Clock,
 ) -> Result<Answer, CollectRunError> {
-    let provider = &opened.provider;
+    let provider = opened.provider.as_ref();
     let run_id = run_id(ask);
     let run_date = ask.at.date_naive();
     if ask.dry_run {
         return planned(ask, opened, &run_id, run_date);
+    }
+    // A dry run may name another day, which tests and plans need; a fetch may not.
+    let today = clock.now().date_naive();
+    if provider.cadence() == Cadence::EveryUtcDay && run_date != today {
+        return Err(CollectRunError::AtIsNotTheClockDay {
+            source_id: opened.registered.source(),
+            at: run_date,
+            today,
+        });
     }
     let run = RunId::new(run_id.clone());
     // Before the plan, because the plan is where a lag dates a window: a run that refuses after
@@ -278,10 +485,10 @@ fn planned(
     run_id: &str,
     run_date: NaiveDate,
 ) -> Result<Answer, CollectRunError> {
-    let provider = &opened.provider;
+    let provider = opened.provider.as_ref();
     let (calendar, listing) = inputs(ask)?;
-    let target = TargetWindow::new(&ask.window);
-    let (calendar_in, listing_in) = (Some(&calendar), Some(&listing));
+    let target = target_of(ask);
+    let (calendar_in, listing_in) = (calendar.as_ref(), listing.as_ref());
     // The same refusal `news_provider::collect` gives first, so a dry run cannot plan what a run
     // would refuse.
     provider
@@ -297,7 +504,7 @@ fn planned(
         .map_err(CollectRunError::PlanRefused)?;
     let driven = Driven {
         collected: Collected::of_plan(&plan, &provider.source()),
-        calendar_version: calendar.version().hex().to_owned(),
+        calendar_version: version_of(calendar_in),
     };
     Ok(Answer {
         // A dry run answers the plan question and nothing else, so its exit is the plan's.
@@ -342,18 +549,24 @@ fn envelope_of(
     driven: &Driven,
     changed: bool,
 ) -> Value {
-    let provider = &opened.provider;
+    let provider = opened.provider.as_ref();
     let collected = &driven.collected;
     let exit = collected.exit();
     json!({
         "schema": SCHEMA,
         "run_id": run_id,
         "run_date": run_date.to_string(),
+        "source": opened.registered.source(),
+        // As planned: `today` is reported as the day it resolved to.
+        "window": target_of(ask).as_str(),
         "schedule_id": ask.schedule,
         "collector_version": env!("CARGO_PKG_VERSION"),
         "calendar_version": driven.calendar_version,
         "universe_version": provider.universe_version().hex(),
         "extract_rules_version": provider.extract_rules_version().hex(),
+        // Which hosts and paces this run was allowed to use (section 11.1); null for a provider
+        // that reads no hosts file.
+        "hosts_version": opened.hosts_version,
         // What dated this run's archive windows, or null. Three fields and not one: the digest
         // names the file, the probe id names the measurement inside it, and the seconds are the
         // quantity every backfilled observation in this run is publication plus.

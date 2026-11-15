@@ -1153,6 +1153,7 @@ dependencies = [
  "const-hex",
  "edgar-press",
  "news-provider",
+ "open-web-feed",
  "parquet",
  "pit",
  "rusqlite",
