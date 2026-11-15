@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use news_provider::{
-    Archive, ArchiveError, AttemptEvent, AttemptReceipt, Clock, CollectedItem, Committed, Exchange,
-    Exit, LedgerError, PlanRefusal, RawResponse, Request, RunId, SendFailure, SendPermit, Sink,
-    SourceId, TargetWindow, TransportError,
+    Archive, ArchiveError, AttemptEvent, AttemptReceipt, Clock, CollectedItem, Committed,
+    Credentials, Exchange, Exit, LedgerError, PlanRefusal, RawResponse, Request, RunId,
+    SendFailure, SendPermit, Sink, SourceId, TargetWindow, TransportError, Wire,
 };
 use newsvault::cmd_collect::{self, Ask, CollectRunError};
 use newsvault::cmd_items::{self, PerStory};
@@ -23,6 +23,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use tempfile::TempDir;
 
+mod loopback;
 mod seed;
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -1055,7 +1056,12 @@ impl Clock for At {
 
 /// One live collect of the clock's own day at `at`, keyed by `schedule` so two polls of one store
 /// never share a run id.
-fn poll(store: &Path, at: &str, schedule: &str, exchange: &Gnw) -> Result<Exit, Box<dyn Error>> {
+fn poll(
+    store: &Path,
+    at: &str,
+    schedule: &str,
+    exchange: &dyn Exchange,
+) -> Result<Exit, Box<dyn Error>> {
     let ask = Ask {
         at: instant(at),
         schedule: Some(schedule.to_owned()),
@@ -1126,23 +1132,75 @@ fn a_permanently_failed_document_is_not_fetched_again() -> TestResult {
     Ok(())
 }
 
-/// Section 11.1, owner decision of 2026-11-15 (§10): a 3xx is a permanent verdict, so it is not
-/// retried in-run, and it holds nothing, so the next poll asks again. Mutation 2026-11-15, the
-/// held read's 3xx exclusion dropped: red.
+/// A release's first attempt row: its `transport_status` and `verdict`.
+fn first_attempt_of(root: &Path, release: usize) -> Result<(Option<i64>, String), Box<dyn Error>> {
+    let db = Connection::open_with_flags(root.join(COMMIT_LOG), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let (key, _, _, _) = RELEASES.get(release).ok_or("no such release")?;
+    let story = digest(canon::digest::story_id(SOURCE, key)).ok_or("story id")?;
+    Ok(db.query_row(
+        "SELECT transport_status, verdict FROM attempts WHERE story_id = ?1
+         ORDER BY opened_at, attempt_id LIMIT 1",
+        [&story],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?)
+}
+
+/// Section 11.1, owner decision of 2026-11-15 (§10), §11.5 step 5: release 0 is sent through the
+/// real open-web `Wire` to a loopback server answering `301 Location: /elsewhere`. The 3xx is the
+/// answer, a permanent verdict that holds nothing, so the next poll asks again and the hop is never
+/// sent. Mutations 2026-11-15: open-web following one redirect, or the held read's 3xx exclusion
+/// dropped: red.
 #[test]
 fn a_document_answered_with_a_redirect_is_fetched_again_by_the_next_poll() -> TestResult {
     let root = TempDir::new()?;
     seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
     let redirected = release_url(0)?;
-    let exchange = Gnw::day()?.answering(&redirected, &[MOVED_PERMANENTLY]);
+    let gnw = Gnw::day()?;
+    let (_, path) = RELEASES[0]
+        .0
+        .split_once('/')
+        .ok_or("release 0 has no path")?;
+    let moved = format!("/{path}");
+    let server = loopback::Loopback::redirecting(
+        &moved,
+        gnw.pages.get(&redirected).ok_or("no page")?.clone(),
+    )?;
+    let opened = cmd_collect::open_provider(&ask(root.path(), cmd_collect::TODAY))?;
+    let exchange = loopback::Relay {
+        stub: &gnw,
+        wire: Wire::new(
+            opened.provider.transport(),
+            Credentials::default().with(open_web_feed::CONTACT_CREDENTIAL, CONTACT),
+            root.path(),
+            &SourceId::new(SOURCE),
+        ),
+        relayed: BTreeMap::from([(redirected.clone(), server.url(&moved))]),
+        asked: RefCell::default(),
+    };
     poll(root.path(), RUN_AT, "first", &exchange)?;
-    let (first, _) = exchange.sent();
+    let (first, first_hops) = (exchange.sent(), server.seen()?);
     poll(root.path(), LATER_THE_SAME_DAY, "second", &exchange)?;
-    let (second, _) = exchange.sent();
+    let (second, second_hops) = (exchange.sent(), server.seen()?);
+    server.finish()?;
     let times = first.iter().filter(|url| **url == redirected).count();
     assert_eq!(
-        (times, second),
-        (1, vec![INDEX.to_owned(), redirected.clone()])
+        (
+            times,
+            second,
+            first_hops,
+            second_hops,
+            first_attempt_of(root.path(), 0)?
+        ),
+        (
+            1,
+            vec![INDEX.to_owned(), redirected.clone()],
+            vec![moved.clone()],
+            vec![moved.clone()],
+            (
+                Some(i64::from(MOVED_PERMANENTLY)),
+                "permanent_failure".to_owned()
+            )
+        )
     );
     Ok(())
 }
