@@ -245,6 +245,8 @@ mod tests {
     const ONE_MICROSECOND_BEFORE_IT_CLOSES: &str = "2026-11-14T19:00:59.999998Z";
     const THE_LAST_MICROSECOND_OF_THAT_MINUTE: &str = "2026-11-14T19:00:59.999999Z";
     const BEFORE_THAT_MINUTE_STARTS: &str = "2026-11-14T18:59:59.999999Z";
+    const AFTER_THE_MINUTE_BEFORE_THE_FETCH: &str = "2026-11-14T19:02:00Z";
+    const FETCHED_AFTER_THAT_MINUTE: &str = "2026-11-14T19:05:00Z";
     const A_SECOND_INTO_THE_MINUTE: &str = "2026-11-14T19:00:01Z";
     const A_MICROSECOND_INTO_THE_MINUTE: &str = "2026-11-14T19:00:00.000001Z";
     const EVERY_CUTOFF: [&str; 3] = [
@@ -404,6 +406,16 @@ mod tests {
         ]
         .map(|cutoff| item.visible_at(Cutoff::new(at(cutoff))));
         assert_eq!(visible, [false, false, true]);
+    }
+
+    /// The observation half: mutation 2026-11-15 dropped `admits_observation` from the minute arm
+    /// and nothing was red, because every other minute test observes inside the minute.
+    #[test]
+    fn a_minute_fetched_after_it_closed_is_invisible_until_we_had_fetched_it() {
+        let item = minute_dated_observed_at(FETCHED_AFTER_THAT_MINUTE);
+        let visible = [AFTER_THE_MINUTE_BEFORE_THE_FETCH, FETCHED_AFTER_THAT_MINUTE]
+            .map(|cutoff| item.visible_at(Cutoff::new(at(cutoff))));
+        assert_eq!(visible, [false, true]);
     }
 
     #[test]

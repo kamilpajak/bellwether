@@ -367,6 +367,7 @@ mod tests {
     const READ_INSIDE_IT: &str = "2026-11-14T19:00:30Z";
     const ONE_MICROSECOND_BEFORE_IT_CLOSES: &str = "2026-11-14T19:00:59.999998Z";
     const THE_LAST_MICROSECOND_OF_IT: &str = "2026-11-14T19:00:59.999999Z";
+    const AFTER_THE_MINUTE_BEFORE_THE_FETCH: &str = "2026-11-14T19:02:00Z";
 
     fn ask(at: &str) -> Result<Ask, chrono::ParseError> {
         Ok(Ask {
@@ -412,6 +413,28 @@ mod tests {
             precisions,
             vec![Vec::new(), Vec::new(), vec!["minute".to_owned()]]
         );
+        Ok(())
+    }
+
+    /// The observation half through the stored row; mutation 2026-11-15 in `pit`'s minute arm.
+    #[test]
+    fn a_minute_dated_item_fetched_after_its_minute_is_invisible_until_the_fetch() -> TestResult {
+        let root = TempDir::new()?;
+        let mut store = open(&root, RUN)?;
+        let minute = Minute::new(A_PUBLICATION_MINUTE.parse::<DateTime<Utc>>()?)?;
+        commit_valued(
+            &mut store,
+            "3403075",
+            Published::AtMinute(minute),
+            Stamp::Minute(minute.start()),
+            RUN,
+        )?;
+        drop(store);
+        let mut seen = Vec::new();
+        for cutoff in [AFTER_THE_MINUTE_BEFORE_THE_FETCH, RUN] {
+            seen.push(read(root.path(), &ask(cutoff)?)?.items.len());
+        }
+        assert_eq!(seen, vec![0, 1]);
         Ok(())
     }
 }

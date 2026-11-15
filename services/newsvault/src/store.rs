@@ -2606,6 +2606,29 @@ mod tests {
         Ok(())
     }
 
+    /// The observation half: mutation 2026-11-15 dropped `AND observed_at <= ?1` from the minute
+    /// branch and nothing was red, because the test above observes at the minute's start.
+    #[test]
+    fn a_minute_fetched_after_it_closed_is_not_the_newest_publication_before_the_fetch(
+    ) -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let closed = closed_attempt(&mut store, 0, Verdict::Usable)?;
+        let read_later = Spec {
+            observed: OBSERVED_LATER,
+            ..minute_spec()
+        };
+        store.record(closed, &[minute_row(&store, &read_later)?], at(400))?;
+        assert_eq!(
+            (
+                newest_visible_publication(&store.db, THAT_MINUTE_CLOSES)?,
+                newest_visible_publication(&store.db, &stamped(OBSERVED_LATER))?
+            ),
+            (None, Some(stamped(A_PUBLICATION_MINUTE)))
+        );
+        Ok(())
+    }
+
     /// A1.12: the stored column and the digested value must be the same number, or two
     /// implementations of the canonical form disagree over a row neither can be wrong about.
     #[test]

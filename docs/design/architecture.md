@@ -204,6 +204,10 @@
   - `pit::datedness::tests::a_minute_value_is_invisible_until_its_minute_has_closed`;
     `newsvault::cmd_items::tests::a_minute_dated_item_is_invisible_until_its_minute_has_closed`
     (mutations 2026-11-15, visible from the minute's start in `pit` / in `cmd_items`: red).
+  - the observation half: `a_minute_fetched_after_it_closed_is_invisible_until_we_had_fetched_it`,
+    `a_minute_dated_item_fetched_after_its_minute_is_invisible_until_the_fetch` (minute 19:00
+    observed 19:05: invisible at 19:02, visible at 19:05; mutation 2026-11-15,
+    `admits_observation` dropped from the minute arm: both red, nothing red before them).
   - stored `Undated` (`valid_refused`) only when the observation precedes the minute's START; a
     page read inside its own minute is not refused:
     `an_observation_inside_its_own_minute_is_not_refused` (mutation 2026-11-15, compared against
@@ -211,7 +215,9 @@
   - the ledger's publication clock counts a minute once its last microsecond has passed and
     reports the stored minute: `newsvault::store::newest_visible_publication`,
     `a_minute_is_not_the_newest_publication_until_its_minute_has_closed` (mutation 2026-11-15,
-    the minute's start compared: red).
+    the minute's start compared: red); its observation half:
+    `a_minute_fetched_after_it_closed_is_not_the_newest_publication_before_the_fetch` (mutation
+    2026-11-15, `AND observed_at <= ?1` dropped from the minute branch: red, nothing red before it).
   - producer: `open-web-feed`'s document extraction, from GNW's `pubDate` under the rules file's
     exact minute format (`a_globenewswire_pubdate_is_a_minute_and_never_an_instant`), driven by
     `newsvault collect --source open_web_wires` since 2026-11-15; through the real store and
