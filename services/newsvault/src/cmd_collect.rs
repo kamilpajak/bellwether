@@ -100,6 +100,9 @@ pub enum CollectRunError {
     /// agent reads.
     #[error(transparent)]
     PlanRefused(#[from] PlanRefusal),
+    /// The caller's `--window`: unreadable, or not the run's UTC day for a live-only source.
+    #[error(transparent)]
+    WindowRefused(PlanRefusal),
     #[error(transparent)]
     Refused(#[from] edgar_press::Refusal),
     #[error(transparent)]
@@ -128,7 +131,8 @@ impl CollectRunError {
             | Self::FlagRequired { .. }
             | Self::FlagRefused { .. }
             | Self::AtIsNotTheClockDay { .. }
-            | Self::TodayRefused { .. } => true,
+            | Self::TodayRefused { .. }
+            | Self::WindowRefused(_) => true,
             Self::InputAbsent { .. }
             | Self::UnusableCalendar { .. }
             | Self::PlanRefused(_)
@@ -139,6 +143,22 @@ impl CollectRunError {
             | Self::Driver(_)
             | Self::Io(_)
             | Self::Serde(_) => false,
+        }
+    }
+
+    fn of_plan(refusal: PlanRefusal) -> Self {
+        match refusal {
+            PlanRefusal::TargetWindowUnreadable(_) | PlanRefusal::NotTheRunDay { .. } => {
+                Self::WindowRefused(refusal)
+            }
+            other => Self::PlanRefused(other),
+        }
+    }
+
+    fn of_driver(failure: CollectError) -> Self {
+        match failure {
+            CollectError::Planning(refusal) => Self::of_plan(refusal),
+            other => Self::Driver(other),
         }
     }
 }
@@ -461,7 +481,8 @@ pub fn drive<A: Archive>(
             listing: listing.as_ref(),
             at: ObservationTime::new(ask.at),
         },
-    )?;
+    )
+    .map_err(CollectRunError::of_driver)?;
     Ok(Driven {
         collected,
         calendar_version: version_of(calendar.as_ref()),
@@ -550,7 +571,7 @@ fn planned(
             listing_in,
             ObservationTime::new(ask.at),
         )
-        .map_err(CollectRunError::PlanRefused)?;
+        .map_err(CollectRunError::of_plan)?;
     let driven = Driven {
         collected: Collected::of_plan(&plan, &provider.source()),
         calendar_version: version_of(calendar_in),

@@ -2128,8 +2128,11 @@ mod tests {
         assert!(
             matches!(
                 &refused,
-                Err(StoreError::MigrationFailed { from: 0, step: MigrationStep::ToUserVersion(1), cause })
-                    if cause == "table items_v1 already exists"
+                Err(StoreError::MigrationFailed {
+                    from: 0,
+                    step: MigrationStep::ToUserVersion(1),
+                    cause,
+                }) if cause == "table items_v1 already exists"
             ),
             "{refused:?}"
         );

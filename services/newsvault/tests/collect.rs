@@ -2018,8 +2018,15 @@ fn every_collect_usage_error_is_written_as_a_usage_error() -> TestResult {
         .into_iter()
         .filter(|arg| arg != "--dry-run")
         .collect();
+    let with_window = |window: &str| -> Vec<String> {
+        let mut args = open_web_args(root.path(), &[]);
+        args[4] = window.to_owned();
+        args
+    };
     let calendar = path(&fixture("calendar.json"));
     let rows = [
+        ("window unreadable", with_window("garbage")),
+        ("window not the run day", with_window("2026-11-13")),
         (
             "flag required",
             without_flag(

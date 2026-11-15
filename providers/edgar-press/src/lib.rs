@@ -529,9 +529,9 @@ impl Provider for EdgarPress {
         })
     }
 
-    /// From the BODY as well as the status. The shared-IP traffic 403 is TRANSIENT because the
-    /// predecessor measured it clearing by waiting (its issues #379, #382, #383); only the generic
-    /// S3 `AccessDenied` is permanent, and only because `plan` asked for a day the listing named.
+    /// From the BODY as well as the status. The shared-IP traffic 403 is TRANSIENT: it cleared by
+    /// waiting (predecessor issues #379, #382, #383). Permanent: the S3 403 `AccessDenied`, as
+    /// `plan` asked for a listed day, and a body over `body_limit` whatever its status (§8 R21).
     fn classify(&self, request: &Request, answer: &Result<RawResponse, TransportError>) -> Verdict {
         let response = match answer {
             Ok(response) => response,

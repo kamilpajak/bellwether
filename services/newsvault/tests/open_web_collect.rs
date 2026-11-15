@@ -9,8 +9,8 @@ use std::process::{Command, Stdio};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use news_provider::{
-    Clock, CollectError, Exchange, Exit, PlanRefusal, RawResponse, Request, SendFailure,
-    SendPermit, TransportError,
+    Clock, Exchange, Exit, PlanRefusal, RawResponse, Request, SendFailure, SendPermit,
+    TransportError,
 };
 use newsvault::cmd_collect::{self, Ask, CollectRunError};
 use newsvault::cmd_items::{self, PerStory};
@@ -317,9 +317,9 @@ fn an_open_web_run_for_yesterday_sends_nothing() -> TestResult {
     assert!(
         matches!(
             refused,
-            Err(CollectRunError::Driver(CollectError::Planning(
+            Err(CollectRunError::WindowRefused(
                 PlanRefusal::NotTheRunDay { .. }
-            )))
+            ))
         ),
         "{refused:?}"
     );
