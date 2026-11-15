@@ -64,10 +64,10 @@
 | name | derivation | why not something simpler |
 |---|---|---|
 | `item_id` | sha256 over `source`, `source_item_id`, `url`, `valid_at` (with its precision), `title`, `body_ref`, in that order (`canon::digest::item_id`) | A per-process hash is not an identity: the predecessor named typed artefacts with Python's `hash()`, randomised per process, so a resumed run could not recognise its own prior output and would have rewritten 5,756 records. The **content** witness and nothing else: a re-stamped time or an edited title is a new `item_id` under one `story_id`, which is how "the bytes changed" is visible at all. |
-| `story_id` | `canon::digest::story_id`: (`source`, `source_item_id`), the vendor's own identity and the one part of a row a re-stamp does not touch | **The dedup key (§5 row 5) and R15's join key.** `item_id` cannot be either: it hashes the publication value and `title`, the two fields under dispute, so a re-stamp would mint a fresh item instead of a disputed twin and R15 would have nothing to attach to. Measured 2026-11-12 over the lake §10 describes: all 501 ids appearing in more than one partition keep one url throughout, and every one of their 1,225 repeat appearances carries a publication time that id did not have before; median span between an id's first and last stamp 4 days 15:16, worst 159 days. |
+| `story_id` | sha256 over (`source`, `source_item_id`) (`canon::digest::story_id`), the vendor's own identity and the one part of a row a re-stamp does not touch | **The dedup key (§5 row 5) and R15's join key.** `item_id` cannot be either: it hashes the publication value and `title`, the two fields under dispute, so a re-stamp would mint a fresh item instead of a disputed twin and R15 would have nothing to attach to. Measured 2026-11-12 over the lake §10 describes: all 501 ids appearing in more than one partition keep one url throughout, and every one of their 1,225 repeat appearances carries a publication time that id did not have before; median span between an id's first and last stamp 4 days 15:16, worst 159 days. |
 | `seq` | monotonic integer assigned by the store on commit, since 2026-11-13 from a committed `seq_reservations` row | **The only ordering authority.** Wall clocks are evidence, never order: a fetch issued at 10:00 that commits at 10:01:10 carries data through 10:00, while one issued at 10:01 has already committed data through 10:01, so ordering by commit time returns the older data as current. Read by `publish::read_day` through one helper keyed on `seq` across every segment of a partition (§8 row R13); mutation 2026-11-13: keying it on `committed_at` turns `the_ordering_helper_sorts_on_seq_and_leaves_no_row_behind` red. `newsvault day` reads the predecessor's lake, which has no `seq`, and sorts by (publication time, id): presentation only, so no consumer may read that order as commit order. |
-| `snapshot_id` | `canon::digest::selection_id`: the cutoff, then the list of `item_id` in scope in ascending `seq`. No production caller (§8 row R7) | A date range is not reproducible: the archive grows under it. A snapshot is a set. The list and the cutoff are also manifest fields (§3.0), because neither can be read back out of a digest. |
-| `rule_version` | sha256 of the rules file's bytes (§3.3) | §3.3. |
+| `snapshot_id` | sha256 over the cutoff, then the list of `item_id` in scope in ascending `seq` (`canon::digest::selection_id`). No production caller (§8 row R7) | A date range is not reproducible: the archive grows under it. A snapshot is a set. The list and the cutoff are also manifest fields (§3.0), because neither can be read back out of a digest. |
+| `rule_version` | sha256 of the rules file's bytes (§3.3) | Rules as constants in code cannot be diffed or tested: when a hand-written gazetteer wrongly removed a real company, there was no version, no test and no record (§3.3). |
 | `calendar_version` | sha256 of the session calendar file, half-days and DST included | A half-day close is a fact that changes results and is easy to get silently wrong. Its own file, not a group inside the rules file (§3.3): a calendar edit and a rule edit are then two diffs, which R18 needs. |
 | `hosts_version` | sha256 of one SourceId's hosts file (§11.1, no code) | Names which hosts and paces a run was allowed to use. Kept apart from `universe_version`, the ticker roster. |
 | `universe_version` | sha256 of the roster the panel's tickers are drawn from, as of the snapshot's cutoff, with delisted names either included or named as absent | **Survivorship, measured by the predecessor in both directions:** 18 tickers added retrospectively on 2026-04-19 contributed about 0.3 of an OOS α t, and a PIT-95 sub-universe moved that t from 1.70 to 1.36; including delisted M&A targets flipped a train α t from +0.80 to −0.86 (`docs/inherited/paradigm_failures_postmortem.md:64` and `:67`). Without the roster as a named input a panel is reproducible and survivorship-biased at once, and `panel_id` hashes it happily. Enforcement: §8 row U1. |
@@ -103,8 +103,8 @@
     - `item_id`, `story_id`, `doc_id`: `Committer::rows_of`, called by `impl Archive for Committer`
       (`services/newsvault/src/cmd_collect.rs`); `story_id` also `edgar-press`'s `story_of`.
     - `attempt_id`, `filter_params`: `news-provider`'s `AttemptSlot::open`.
-    - `result_digest`: `newsvault ledger`, over each closed attempt's returned id set
-      (`drift` in `services/newsvault/src/cmd_ledger.rs`).
+    - `result_digest`: `newsvault ledger`, over the `item_id`s each closed attempt committed
+      (§3.2; `drift` in `services/newsvault/src/cmd_ledger.rs`).
   - Each of the seven has a committed vector under `canon/vectors/`, which is what makes two
     implementations disagree loudly.
 - **Content-addressed blobs** (§3.9).
@@ -182,8 +182,10 @@
 - The `day` arm has two producers:
   - the lake reader (`newsvault::lake::datedness`) reads a value stamped exactly at midnight as a
     date, because the predecessor's lake has no precision column;
-  - `edgar-press` (`publication` in `providers/edgar-press/src/lib.rs`) falls back to the index's
-    `Date Filed` day when the acceptance instant is missing or does not parse.
+  - `edgar-press` (`publication` in `providers/edgar-press/src/lib.rs`) falls back to the day of the
+    daily index the follow-up came from (its target window), not the row's own `Date Filed`, when
+    the acceptance instant is missing or does not parse; for a late submission that day is later
+    than the filing date (§3.9, "One row of a daily index is not dated by that index").
 - Measured 2026-11-13 over the lake's 779 run files and 243,226 rows: **7,767 rows (3.19%)** are
   stamped `00:00:00.000000`; for source `perplexity`, **7,141 of 7,141**. Read as instants they were
   visible from 00:00Z of their own day, so `newsvault day --at` returned them up to a day early.
@@ -448,7 +450,7 @@ Draw voting:
 #### 3.10.2 `newsvault.stream/1` — the private item stream
 
 - One JSON object per WebSocket text frame, never an array.
-- Each frame carries `type` (`item` or `heartbeat`) and `schema` = `newsvault.stream/1`, on every frame and not only at connect, so a reconnecting consumer sees it; the key is spelled as `newsvault.day/1` (`services/newsvault/src/main.rs`) and `panel.manifest/1` (`panel_contract::SCHEMA`) spell it.
+- Each frame carries `type` (`item` or `heartbeat`) and `schema` = `newsvault.stream/1`, on every frame and not only at connect, so a reconnecting consumer sees it. The key is `schema`, as `newsvault.day/1` (`services/newsvault/src/main.rs`) and `panel.manifest/1` (`panel_contract::SCHEMA`) use it.
 - An item frame carries §3.7's field list and nothing of its own, instants being RFC 3339 UTC `Z`.
 - A heartbeat carries `at`, `items_since` on this connection, `heartbeat_seconds`, and `seq`, the last the store committed.
 - **What never changes:** `seq` is the commit order, strictly increasing, never re-used or re-ordered, with gaps allowed because memo D-7 promises no delivery — a gap is closed by the HTTP read, never read as an ordering.
@@ -701,7 +703,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | alternative | why not |
 |---|---|
 | eleven services, one per bounded context | each deployable is another deploy, log, contract version and place something goes quiet; the predecessor has a recorded case where a boundary between components *removed* a standing alert instead of raising one. The eleven contexts are drawn so the seams exist later. |
-| Kafka for the event bus | solves throughput we do not have (a few hundred items a day is one event every few minutes) and adds infrastructure a one-person system must operate. The `commit.sqlite3` outbox (§6) is already durable and is the replay log. |
+| Kafka for the event bus | solves throughput we do not have (a few hundred items a day is one event every few minutes) and adds infrastructure a one-person system must operate. The planned `commit.sqlite3` outbox (§6, no code yet) is durable by construction, because it commits in the archive's own transaction, and it is the replay log. |
 | a Postgres outbox with `LISTEN`/`NOTIFY` | rule 2 (§6) holds only inside one engine, so an outbox next to `commit.sqlite3` is a dual write, and keeping it atomic means moving the whole archive. The Postgres that "already runs in production" is the predecessor's container: no host port, holds `auth_user`, no automated backup, allowed to stop at memo step 7. `NOTIFY` is not queued for a disconnected listener, so a consumer polls by cursor anyway. Rejected 2026-11-14. |
 | Common Crawl's CC-NEWS as the archive | probed and rejected: 7 of our own 287 items for one test day, 2 of our 17 publishers crawled at all, zero tier-1 US financial outlets in 72,000 records, 4.19 TB for ten months, and no index, so no URL lookup and no aimed range request. |
 | **collecting the news ourselves** (publisher RSS, EDGAR, or crawling the open web) instead of buying it | **Chosen by the owner 2026-11-14 for the forward feed** (§11); history stays a one-time vendor purchase (`probes/vendor_probe/PREREGISTRATION.md`). Body-length evidence below. |
