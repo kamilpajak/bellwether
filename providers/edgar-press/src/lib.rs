@@ -335,8 +335,9 @@ impl EdgarPress {
         (valid, raw, DATE_FILED.to_owned())
     }
 
-    /// Where a backfilled item's observation goes: its own publication plus the probed lag, via
-    /// [`Visibility::from_backfill`], which is the only constructor that takes a [`MeasuredLag`].
+    /// Where a backfilled item's observation goes: its publication bounded by its index day, plus
+    /// the probed lag, via [`Visibility::from_backfill`], the only constructor taking a
+    /// [`MeasuredLag`].
     /// `Ok(None)` for a live ingest, whose observation is the fetch instant the driver holds.
     ///
     /// A DATE has no instant, so the bound is the later END of two days: the row's `Date Filed` and
@@ -621,13 +622,13 @@ pub fn read_listing(bytes: &[u8]) -> Result<Listing, Refusal> {
     Ok(Listing::of_days(&days))
 }
 
-/// The `Date Filed` of the index row behind a follow-up; `None` when absent or not `YYYYMMDD`.
 /// The first microsecond of `day` in `tz`: one past the end of the day before, so a gap or an
 /// ambiguous midnight resolves exactly as [`end_of_day`] resolves it.
 fn start_of_day(day: NaiveDate, tz: &str) -> Option<DateTime<Utc>> {
     end_of_day(day.pred_opt()?, tz)?.checked_add_signed(TimeDelta::microseconds(1))
 }
 
+/// The `Date Filed` of the index row behind a follow-up; `None` when absent or not `YYYYMMDD`.
 fn filed_day(request: &Request) -> Option<NaiveDate> {
     let raw = request.listed_date.as_deref()?;
     NaiveDate::parse_from_str(raw.trim(), INDEX_DATE).ok()
