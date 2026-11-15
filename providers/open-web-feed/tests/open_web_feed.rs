@@ -45,7 +45,13 @@ const REAL_PUB_DATES: [&str; 3] = [
     "Sat, 14 Nov 2026 18:38 GMT",
 ];
 const ARTICLE_MINUTE: &str = "2026-11-14T19:00:00Z";
-const A_SECONDS_PUB_DATE: &str = "Sat, 14 Nov 2026 19:00:05 GMT";
+/// Each read by the rule's format into a value that is not a minute of the release.
+const NOT_A_MINUTE_PUB_DATES: [&str; 3] = [
+    "Sat, 14 Nov 2026 19:00:05 GMT",
+    // chrono's `%Y` reads it as the year 26; review 2026-11-15.
+    "Sat, 14 Nov 26 19:00 GMT",
+    "Sat, 14 Nov 2026 9:05 GMT",
+];
 const SYNTHETIC_INDEX: &str = "synthetic_index_one_release.xml";
 const SYNTHETIC_PAGE: &str = "synthetic_canonical_differs.html";
 const SYNTHETIC_CANONICAL: &str =
@@ -59,6 +65,11 @@ const RESOLVED_CANONICAL: &str =
 const EMPTY_PARAGRAPHS_PAGE: &str = "synthetic_empty_paragraphs.html";
 const NO_CONTAINER_PAGE: &str = "synthetic_no_article_container.html";
 const BOT_PROTECTION_PAGE: &str = "akamai_403_access_denied.html";
+const PROSE_PAGE: &str = "synthetic_script_and_symbol_paragraphs.html";
+const TWO_CONTAINERS_PAGE: &str = "synthetic_two_containers.html";
+/// `parse::DEEPEST_PAGE`, and the `html`, `body`, container and `<p>` around the nested divs.
+const DEEPEST_PAGE: usize = 112;
+const PAGE_DEPTH_AROUND_THE_WRAPPERS: usize = 4;
 const ARTICLE_PARAGRAPHS: usize = 3;
 const ARTICLE_OPENS: &str = "ORLANDO, FLORIDA, Nov. 14, 2026 (GLOBE NEWSWIRE) -- USTA Florida";
 /// Text the trimmed page holds OUTSIDE its article container: a `<p>` (the source line), two
@@ -428,11 +439,12 @@ fn a_link_off_the_path_filter_off_the_host_or_absent_is_filtered_out_and_counted
         format!("<item><link>{link}</link><pubDate>Sat, 14 Nov 2026 19:00 GMT</pubDate></item>")
     };
     let index = format!(
-        "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel>{}{}{}{}</channel></rss>",
+        "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel>{}{}{}{}{}</channel></rss>",
         item(ARTICLE_WWW_URL),
         item("https://www.globenewswire.com/en/search/tag/tennis"),
         item("https://www.prnewswire.com/news-release/2026/11/14/1/a.html"),
         "<item><pubDate>Sat, 14 Nov 2026 19:00 GMT</pubDate></item>",
+        item("https://rss.globenewswire.com/news-release/../rssfeed/"),
     );
     let extracted = follow_ups(&provider()?, index.as_bytes())?;
     assert_eq!(
@@ -441,7 +453,62 @@ fn a_link_off_the_path_filter_off_the_host_or_absent_is_filtered_out_and_counted
             extracted.follow_ups.len(),
             extracted.filtered_out
         ),
-        (4, 1, 3)
+        (5, 1, 4)
+    );
+    Ok(())
+}
+
+/// Two follow-ups for one story would be two paced requests and two `listed_date` values.
+#[test]
+fn a_story_listed_twice_in_one_index_is_followed_up_once_and_the_repeat_counted() -> Outcome {
+    let item = |link: &str, pub_date: &str| {
+        format!("<item><link>{link}</link><pubDate>{pub_date}</pubDate></item>")
+    };
+    let index = format!(
+        "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel>{}{}{}</channel></rss>",
+        item(ARTICLE_URL, REAL_PUB_DATES[0]),
+        item(ARTICLE_URL, REAL_PUB_DATES[1]),
+        item(ARTICLE_WWW_URL, REAL_PUB_DATES[2]),
+    );
+    let extracted = follow_ups(&provider()?, index.as_bytes())?;
+    let kept: Vec<(&str, Option<&str>)> = extracted
+        .follow_ups
+        .iter()
+        .map(|request| (request.url.as_str(), request.listed_date.as_deref()))
+        .collect();
+    assert_eq!(
+        (kept, extracted.vendor_rows, extracted.filtered_out),
+        (vec![(ARTICLE_URL, Some(REAL_PUB_DATES[0]))], 3, 2)
+    );
+    Ok(())
+}
+
+/// RSS 2.0 elements have no namespace; a namespaced element of the same local name placed first
+/// was read instead of the item's own `pubDate` or `link` (review 2026-11-15).
+#[test]
+fn a_namespaced_element_named_like_an_rss_field_is_never_read_as_that_field() -> Outcome {
+    let other_release = ARTICLE_URL.replace("3403075", "3403076");
+    let index = format!(
+        "<?xml version=\"1.0\"?><rss version=\"2.0\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" \
+         xmlns:atom=\"http://www.w3.org/2005/Atom\"><channel>\
+         <item><dc:pubDate>Fri, 13 Nov 2026 01:00 GMT</dc:pubDate><link>{ARTICLE_URL}</link>\
+         <pubDate>{}</pubDate></item>\
+         <item><atom:link>https://www.prnewswire.com/news-release/a.html</atom:link>\
+         <link>{other_release}</link><pubDate>{}</pubDate></item></channel></rss>",
+        REAL_PUB_DATES[0], REAL_PUB_DATES[1],
+    );
+    let extracted = follow_ups(&provider()?, index.as_bytes())?;
+    let kept: Vec<(&str, Option<&str>)> = extracted
+        .follow_ups
+        .iter()
+        .map(|request| (request.url.as_str(), request.listed_date.as_deref()))
+        .collect();
+    assert_eq!(
+        kept,
+        vec![
+            (ARTICLE_URL, Some(REAL_PUB_DATES[0])),
+            (other_release.as_str(), Some(REAL_PUB_DATES[1])),
+        ]
     );
     Ok(())
 }
@@ -506,19 +573,21 @@ fn a_globenewswire_pubdate_is_a_minute_and_never_an_instant() -> Outcome {
             ValidSource::VendorPublished,
         )
     );
-    let seconds = Request {
-        listed_date: Some(A_SECONDS_PUB_DATE.to_owned()),
-        ..request
-    };
-    let row = only_unusable(&provider.extract(&seconds, &blob(gnw(REAL_ARTICLE))))?;
-    assert_eq!(
-        (row.reason, &row.item.valid, row.item.valid_raw.as_str()),
-        (
-            UnusableReason::NoParseableValidTime,
-            &Published::Unknown,
-            A_SECONDS_PUB_DATE
-        )
-    );
+    for raw in NOT_A_MINUTE_PUB_DATES {
+        let unread = Request {
+            listed_date: Some(raw.to_owned()),
+            ..request.clone()
+        };
+        let row = only_unusable(&provider.extract(&unread, &blob(gnw(REAL_ARTICLE))))?;
+        assert_eq!(
+            (row.reason, &row.item.valid, row.item.valid_raw.as_str()),
+            (
+                UnusableReason::NoParseableValidTime,
+                &Published::Unknown,
+                raw
+            )
+        );
+    }
     Ok(())
 }
 
@@ -645,6 +714,74 @@ fn a_container_holding_only_empty_paragraphs_is_unusable_as_no_article_body() ->
         (row.reason, row.item.body.as_ref()),
         (UnusableReason::NoArticleBody, None)
     );
+    Ok(())
+}
+
+/// Review 2026-11-15: a `<script>` or `<style>` inside a container `<p>` read as body text, and
+/// a paragraph of U+200B only passed the emptiness filter.
+#[test]
+fn paragraph_text_skips_script_style_and_noscript_and_needs_a_letter_or_a_digit() -> Outcome {
+    let provider = provider()?;
+    let page = blob(gnw(PROSE_PAGE));
+    let item = only_item(&provider.extract(&article_request(&provider)?, &page))?;
+    assert_eq!(
+        item.body.map(|body| body.text).as_deref(),
+        Some("First paragraph.\nSecond paragraph.")
+    );
+    Ok(())
+}
+
+/// A lossy decode would store U+FFFD in place of the byte; the page is evidence, not text.
+#[test]
+fn a_page_that_is_not_utf8_is_unusable_and_never_decoded_lossily() -> Outcome {
+    let provider = provider()?;
+    let mut bytes = gnw(REAL_ARTICLE);
+    bytes.extend_from_slice(&[0xFF, 0xFE]);
+    let row = only_unusable(&provider.extract(&article_request(&provider)?, &blob(bytes)))?;
+    assert_eq!(
+        (row.reason, row.item.body.as_ref()),
+        (UnusableReason::PageNotUtf8, None)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_page_holding_the_article_container_twice_is_unusable_as_ambiguous() -> Outcome {
+    let provider = provider()?;
+    let page = blob(gnw(TWO_CONTAINERS_PAGE));
+    let row = only_unusable(&provider.extract(&article_request(&provider)?, &page))?;
+    assert_eq!(
+        (row.reason, row.item.body.as_ref()),
+        (UnusableReason::ArticleContainerAmbiguous, None)
+    );
+    Ok(())
+}
+
+/// html5ever is superlinear in nesting depth (section 11.1), so the bound is read before parsing.
+#[test]
+fn a_page_nested_past_the_bound_is_unusable_and_one_at_the_bound_is_read() -> Outcome {
+    let provider = provider()?;
+    let request = article_request(&provider)?;
+    let nested = |depth: usize| {
+        let wrappers = depth - PAGE_DEPTH_AROUND_THE_WRAPPERS;
+        blob(
+            format!(
+                "<html><body>{}<div class=\"main-body-container\"><p>Text.</p></div></body></html>",
+                "<div>".repeat(wrappers)
+            )
+            .into_bytes(),
+        )
+    };
+    let at_the_bound = provider.extract(&request, &nested(DEEPEST_PAGE));
+    assert_eq!(
+        only_item(&at_the_bound)?
+            .body
+            .map(|body| body.text)
+            .as_deref(),
+        Some("Text.")
+    );
+    let past = only_unusable(&provider.extract(&request, &nested(DEEPEST_PAGE + 1)))?;
+    assert_eq!(past.reason, UnusableReason::PageTooDeep);
     Ok(())
 }
 
@@ -823,6 +960,81 @@ fn a_host_two_rules_rewrite_to_two_hosts_is_refused() {
         Some(Refusal::RulesUnparseable {
             path,
             why: "www.globenewswire.com is rewritten to two hosts".to_owned()
+        })
+    );
+}
+
+/// `serde_json::Value` keeps the last of two values, so a reader of the file sees the first.
+#[test]
+fn a_key_named_twice_in_one_object_of_either_file_is_refused() {
+    let hosts = hosts_fixture("duplicate_key.json");
+    assert_eq!(
+        refusal_of(&hosts, &rules_path(), CONTACT),
+        Some(Refusal::DuplicateKey {
+            path: hosts,
+            key: "status".to_owned()
+        })
+    );
+    let rules = rules_fixture("rules_duplicate_key.json");
+    assert_eq!(
+        refusal_of(&hosts_path(), &rules, CONTACT),
+        Some(Refusal::DuplicateKey {
+            path: rules,
+            key: "path_prefix".to_owned()
+        })
+    );
+}
+
+#[test]
+fn a_rewrite_to_a_host_no_url_can_name_is_refused() {
+    let path = rules_fixture("rules_rewrite_not_a_host.json");
+    assert_eq!(
+        refusal_of(&hosts_path(), &path, CONTACT),
+        Some(Refusal::RewriteNotAHost {
+            path,
+            rule: "gnw".to_owned(),
+            host: "rss.globenewswire.com/".to_owned()
+        })
+    );
+}
+
+/// Both spellings lowercase to one key, and the map kept whichever came last.
+#[test]
+fn a_host_one_rule_rewrites_twice_in_two_cases_is_refused() {
+    let path = rules_fixture("rules_rewrite_named_twice.json");
+    assert_eq!(
+        refusal_of(&hosts_path(), &path, CONTACT),
+        Some(Refusal::RewriteNamedTwice {
+            path,
+            rule: "gnw".to_owned(),
+            host: "www.globenewswire.com".to_owned()
+        })
+    );
+}
+
+#[test]
+fn a_path_filter_not_starting_with_a_slash_is_refused() {
+    let path = rules_fixture("rules_path_prefix_unrooted.json");
+    assert_eq!(
+        refusal_of(&hosts_path(), &path, CONTACT),
+        Some(Refusal::PathPrefixNotRooted {
+            path,
+            rule: "gnw".to_owned(),
+            prefix: "news-release/".to_owned()
+        })
+    );
+}
+
+/// A format printing seconds reads only GNW values at second 0; every real one would be unusable.
+#[test]
+fn a_valid_format_that_does_not_read_back_a_minute_is_refused() {
+    let path = rules_fixture("rules_format_prints_seconds.json");
+    assert_eq!(
+        refusal_of(&hosts_path(), &path, CONTACT),
+        Some(Refusal::FormatReadsNoMinute {
+            path,
+            rule: "gnw".to_owned(),
+            format: "%a, %d %b %Y %H:%M:%S GMT".to_owned()
         })
     );
 }

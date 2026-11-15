@@ -2,9 +2,18 @@
 //! parser for both was rejected: HTML treats `<link>` as a void element, so an RSS link's text is
 //! lost.
 
-use scraper::{ElementRef, Html};
+use news_provider::provider::UnusableReason;
+use scraper::{ElementRef, Html, Node};
 
+use crate::depth::nesting_depth;
 use crate::rules::{Pick, Rule};
+
+/// The deepest page `page` parses. 7 is the depth `depth::nesting_depth` measured on
+/// `article_3403075.html` (2026-11-15, trimmed); 16 times that is the margin for the untrimmed page,
+/// whose depth was not kept.
+pub(crate) const DEEPEST_PAGE: usize = 7 * 16;
+/// Elements whose text is never prose.
+const NOT_PROSE: [&str; 4] = ["script", "style", "noscript", "template"];
 
 /// One RSS `<item>`, its two fields as the payload spells them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,20 +28,20 @@ pub(crate) fn index_rows(payload: &[u8], rule: &Rule) -> Option<Vec<IndexRow>> {
     let text = std::str::from_utf8(payload).ok()?;
     let document = roxmltree::Document::parse(text).ok()?;
     let root = document.root_element();
-    if !root.has_tag_name("rss") {
+    if !is_rss(root, "rss") {
         return None;
     }
-    let channel = root.children().find(|node| node.has_tag_name("channel"))?;
+    let channel = root.children().find(|node| is_rss(*node, "channel"))?;
     let child_text = |item: roxmltree::Node, name: &str| {
         item.children()
-            .find(|node| node.has_tag_name(name))
+            .find(|node| is_rss(*node, name))
             .and_then(|node| node.text())
             .map(|text| text.trim().to_owned())
     };
     Some(
         channel
             .children()
-            .filter(|node| node.has_tag_name("item"))
+            .filter(|node| is_rss(*node, "item"))
             .map(|item| IndexRow {
                 link: child_text(item, "link"),
                 valid_raw: child_text(item, rule.valid_field.as_str()),
@@ -41,30 +50,52 @@ pub(crate) fn index_rows(payload: &[u8], rule: &Rule) -> Option<Vec<IndexRow>> {
     )
 }
 
+/// RSS 2.0 elements carry no namespace; `has_tag_name(&str)` compares the local name alone, so
+/// it also matched `atom:link` and `dc:pubDate` (review 2026-11-15).
+fn is_rss(node: roxmltree::Node, name: &str) -> bool {
+    let tag = node.tag_name();
+    node.is_element() && tag.namespace().is_none() && tag.name() == name
+}
+
 /// What one article page yields under its rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Page {
     pub(crate) title: Option<String>,
     pub(crate) canonical: Option<String>,
-    /// Whitespace-collapsed paragraph text, one line per non-empty paragraph; empty when the
-    /// container is absent or holds no paragraph text.
-    pub(crate) body: String,
+    /// Whitespace-collapsed paragraph text, one line per paragraph holding a letter or a digit.
+    pub(crate) body: Result<String, UnusableReason>,
 }
 
 pub(crate) fn page(payload: &[u8], rule: &Rule) -> Page {
-    let html = Html::parse_document(&String::from_utf8_lossy(payload));
-    let body = html
-        .select(&rule.container)
-        .next()
-        .map(|container| {
-            container
+    let unread = |reason| Page {
+        title: None,
+        canonical: None,
+        body: Err(reason),
+    };
+    let Ok(text) = std::str::from_utf8(payload) else {
+        return unread(UnusableReason::PageNotUtf8);
+    };
+    if nesting_depth(text) > DEEPEST_PAGE {
+        return unread(UnusableReason::PageTooDeep);
+    }
+    let html = Html::parse_document(text);
+    let mut containers = html.select(&rule.container);
+    let body = match (containers.next(), containers.next()) {
+        (None, _) => Err(UnusableReason::NoArticleBody),
+        (Some(_), Some(_)) => Err(UnusableReason::ArticleContainerAmbiguous),
+        (Some(container), None) => {
+            let paragraphs: Vec<String> = container
                 .select(&rule.paragraph)
                 .map(collapsed)
-                .filter(|paragraph| !paragraph.is_empty())
-                .collect::<Vec<String>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
+                .filter(|paragraph| paragraph.chars().any(char::is_alphanumeric))
+                .collect();
+            if paragraphs.is_empty() {
+                Err(UnusableReason::NoArticleBody)
+            } else {
+                Ok(paragraphs.join("\n"))
+            }
+        }
+    };
     Page {
         title: picked(&html, &rule.title),
         canonical: picked(&html, &rule.canonical),
@@ -80,10 +111,22 @@ fn picked(html: &Html, pick: &Pick) -> Option<String> {
 }
 
 fn collapsed(element: ElementRef) -> String {
-    element
-        .text()
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<&str>>()
-        .join(" ")
+    let mut text = String::new();
+    prose(element, &mut text);
+    text.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+fn prose(element: ElementRef, into: &mut String) {
+    for child in element.children() {
+        match child.value() {
+            Node::Text(text) => into.push_str(text),
+            Node::Element(inner) if NOT_PROSE.contains(&inner.name()) => {}
+            Node::Element(_) => {
+                if let Some(inner) = ElementRef::wrap(child) {
+                    prose(inner, into);
+                }
+            }
+            _ => {}
+        }
+    }
 }

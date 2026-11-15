@@ -171,6 +171,12 @@ pub enum UnusableReason {
     /// A page whose article container is absent or yields zero paragraph text. The rule is fixed
     /// before its first measurement, as architecture.md section 11.3 requires of its threshold.
     NoArticleBody,
+    /// A page whose bytes are not UTF-8; a lossy decode would store replacement characters.
+    PageNotUtf8,
+    /// A page nested deeper than its provider parses (architecture.md section 11.1).
+    PageTooDeep,
+    /// A page holding the article container more than once, so which one is the article is unknown.
+    ArticleContainerAmbiguous,
 }
 
 /// An unusable row carries the WHOLE item and the payload it came out of, so the evidence is in

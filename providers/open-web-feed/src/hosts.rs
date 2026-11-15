@@ -10,7 +10,7 @@ use news_provider::HostKey;
 use serde_json::Value;
 
 use crate::rules::Rule;
-use crate::{host_and_path, known_fields, Refusal};
+use crate::{host_and_path, known_fields, strict, Refusal};
 
 pub(crate) const HOSTS_SCHEMA: &str = "open-web-feed.hosts/1";
 const TOP: [&str; 2] = ["schema", "hosts"];
@@ -55,7 +55,7 @@ pub(crate) fn read_hosts(path: &Path, rules: &BTreeMap<String, Rule>) -> Result<
         path: path.to_path_buf(),
         why,
     };
-    let read: Value = serde_json::from_slice(&bytes).map_err(|why| unparseable(why.to_string()))?;
+    let read = strict::read(&bytes, path, unparseable)?;
     let top = read
         .as_object()
         .ok_or_else(|| unparseable("not an object".to_owned()))?;

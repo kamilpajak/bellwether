@@ -8,7 +8,10 @@ use std::path::Path;
 use scraper::Selector;
 use serde_json::{Map, Value};
 
-use crate::{known_fields, Refusal};
+use chrono::{NaiveDate, NaiveDateTime};
+use news_provider::HostKey;
+
+use crate::{known_fields, minute_of, strict, Refusal};
 
 pub(crate) const RULES_SCHEMA: &str = "open-web-feed.rules/1";
 const TOP: [&str; 2] = ["schema", "rules"];
@@ -23,6 +26,10 @@ const RULE: [&str; 7] = [
 ];
 const PICK: [&str; 2] = ["selector", "attribute"];
 const BODY: [&str; 2] = ["container", "paragraph"];
+/// The minute every `valid_format` must print and read back, 2026-11-14T19:07Z, and a second
+/// inside it that the format must not print.
+const PROBE_MINUTE: (i32, u32, u32, u32, u32) = (2026, 11, 14, 19, 7);
+const PROBE_SECOND: u32 = 31;
 
 /// One element's attribute, picked by a CSS selector.
 #[derive(Debug, Clone)]
@@ -53,7 +60,7 @@ pub(crate) fn parse_rules(bytes: &[u8], path: &Path) -> Result<BTreeMap<String, 
         path: path.to_path_buf(),
         why,
     };
-    let read: Value = serde_json::from_slice(bytes).map_err(|why| unparseable(why.to_string()))?;
+    let read = strict::read(bytes, path, unparseable)?;
     let top = read
         .as_object()
         .ok_or_else(|| unparseable("not an object".to_owned()))?;
@@ -97,25 +104,81 @@ fn parse_rule(name: &str, rule: &Map<String, Value>, path: &Path) -> Result<Rule
             .and_then(Value::as_object)
             .ok_or_else(|| unparseable(format!("no {key} object")))
     };
+    let not_a_host = |host: &str| Refusal::RewriteNotAHost {
+        path: path.to_path_buf(),
+        rule: name.to_owned(),
+        host: host.to_owned(),
+    };
     let mut rewrite_hosts = BTreeMap::new();
     for (from, to) in object("rewrite_hosts")? {
-        let to = to
-            .as_str()
-            .ok_or_else(|| unparseable(format!("rewrite of {from} is not a host")))?;
-        rewrite_hosts.insert(from.to_ascii_lowercase(), to.to_ascii_lowercase());
+        let to = to.as_str().ok_or_else(|| not_a_host(from))?;
+        for host in [from.as_str(), to] {
+            HostKey::new(host).map_err(|_| not_a_host(host))?;
+        }
+        let from = from.to_ascii_lowercase();
+        if rewrite_hosts.contains_key(&from) {
+            return Err(Refusal::RewriteNamedTwice {
+                path: path.to_path_buf(),
+                rule: name.to_owned(),
+                host: from,
+            });
+        }
+        rewrite_hosts.insert(from, to.to_ascii_lowercase());
+    }
+    let path_prefix = text("path_prefix")?;
+    if !path_prefix.starts_with('/') {
+        return Err(Refusal::PathPrefixNotRooted {
+            path: path.to_path_buf(),
+            rule: name.to_owned(),
+            prefix: path_prefix,
+        });
+    }
+    let valid_format = text("valid_format")?;
+    if !reads_a_minute(&valid_format) {
+        return Err(Refusal::FormatReadsNoMinute {
+            path: path.to_path_buf(),
+            rule: name.to_owned(),
+            format: valid_format,
+        });
     }
     let body = object("body")?;
     known_fields(body, &BODY, path)?;
     Ok(Rule {
         valid_field: text("valid_field")?,
-        valid_format: text("valid_format")?,
-        path_prefix: text("path_prefix")?,
+        valid_format,
+        path_prefix,
         rewrite_hosts,
         title: pick(object("title")?, path, &unparseable)?,
         canonical: pick(object("canonical")?, path, &unparseable)?,
         container: selector(body.get("container"), &unparseable)?,
         paragraph: selector(body.get("paragraph"), &unparseable)?,
     })
+}
+
+/// `format` prints `PROBE_MINUTE` as text that `minute_of` reads back as that minute, and prints
+/// no second: a `%S` format reads only values at second 0 and refuses every other one.
+fn reads_a_minute(format: &str) -> bool {
+    let (year, month, day, hour, minute) = PROBE_MINUTE;
+    let at = |second| {
+        NaiveDate::from_ymd_opt(year, month, day)
+            .and_then(|date| date.and_hms_opt(hour, minute, second))
+    };
+    let (Some(probe), Some(inside)) = (at(0), at(PROBE_SECOND)) else {
+        return false;
+    };
+    match (printed(probe, format), printed(inside, format)) {
+        (Some(minute_text), Some(second_text)) if minute_text == second_text => {
+            minute_of(&minute_text, format).is_some_and(|read| read.start() == probe.and_utc())
+        }
+        _ => false,
+    }
+}
+
+fn printed(at: NaiveDateTime, format: &str) -> Option<String> {
+    use std::fmt::Write;
+    let mut text = String::new();
+    write!(text, "{}", at.format(format)).ok()?;
+    Some(text)
 }
 
 fn pick(

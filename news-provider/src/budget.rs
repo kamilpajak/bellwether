@@ -32,7 +32,7 @@ pub enum BudgetScope {
 }
 
 /// A remote host as a pace-file name: lowercased, then only `[a-z0-9.-]`, not empty, no leading
-/// dot and no empty label. The field is private, so no caller can name a file outside `pace/`.
+/// or trailing dot and no empty label: `host.` and `host` are one host and would be two keys. The field is private, so no caller can name a file outside `pace/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostKey(String);
 
@@ -42,7 +42,11 @@ impl HostKey {
         let key = host.to_ascii_lowercase();
         let allowed =
             |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b".-".contains(&byte);
-        if key.is_empty() || key.starts_with('.') || key.contains("..") || !key.bytes().all(allowed)
+        if key.is_empty()
+            || key.starts_with('.')
+            || key.ends_with('.')
+            || key.contains("..")
+            || !key.bytes().all(allowed)
         {
             return Err(BudgetError::NotAHostKey {
                 host: host.to_owned(),
@@ -250,7 +254,8 @@ mod tests {
     const SEC: &str = "www.sec.gov";
     const TRAVERSAL: &str = "../../x";
     /// Each breaks exactly one rule, so deleting any one rule lets its row through.
-    const ONE_RULE_BROKEN_EACH: [&str; 4] = ["", ".sec.gov", "www..sec.gov", "[::1]"];
+    const ONE_RULE_BROKEN_EACH: [&str; 5] =
+        ["", ".sec.gov", "www.sec.gov.", "www..sec.gov", "[::1]"];
 
     #[test]
     fn a_host_key_in_upper_case_is_normalised_to_one_lowercase_bucket() {

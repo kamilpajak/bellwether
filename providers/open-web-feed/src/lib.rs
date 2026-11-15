@@ -3,9 +3,11 @@
 //! one admitted host (section 11.5 step 2). It declares no HTTP dependency and holds no clock and
 //! no `Sink`.
 
+mod depth;
 mod hosts;
 mod parse;
 mod rules;
+mod strict;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -82,6 +84,38 @@ pub enum Refusal {
     RulesUnparseable { path: PathBuf, why: String },
     #[error("the {CONTACT_CREDENTIAL} credential carries no contact address")]
     ContactMissing,
+    /// Either file: `serde_json` keeps the last of two values, a reader sees the first.
+    #[error("{path} names the key {key} twice in one object")]
+    DuplicateKey { path: PathBuf, key: String },
+    #[error(
+        "the rules at {path} rewrite under rule {rule} from or to {host}, which is not a host"
+    )]
+    RewriteNotAHost {
+        path: PathBuf,
+        rule: String,
+        host: String,
+    },
+    #[error("the rules at {path} rewrite {host} twice under rule {rule}")]
+    RewriteNamedTwice {
+        path: PathBuf,
+        rule: String,
+        host: String,
+    },
+    /// A url path starts with `/`, so any other prefix filters out every link.
+    #[error("the rules at {path} filter rule {rule} on {prefix}, which does not start with /")]
+    PathPrefixNotRooted {
+        path: PathBuf,
+        rule: String,
+        prefix: String,
+    },
+    #[error(
+        "the rules at {path} read rule {rule}'s valid time as {format}, which reads no minute"
+    )]
+    FormatReadsNoMinute {
+        path: PathBuf,
+        rule: String,
+        format: String,
+    },
 }
 
 #[derive(Debug)]
@@ -167,8 +201,9 @@ impl OpenWebFeed {
         }
     }
 
-    /// Each RSS item whose rewritten link stays on the index's own host and passes the path
-    /// filter is one follow-up; the raw publication value rides `listed_date`, never sent.
+    /// Each RSS item whose rewritten link stays on the index's own host, passes the path filter
+    /// and keys a story no earlier row of this index keyed is one follow-up; the raw publication
+    /// value rides `listed_date`, never sent.
     fn index_rows_of(&self, request: &Request, raw: &RawBlob) -> Extracted {
         let (Some(rule), Some((host, _))) =
             (self.rule_for(&request.url), host_and_path(&request.url))
@@ -179,11 +214,16 @@ impl OpenWebFeed {
         let rows = parse::index_rows(&raw.bytes, rule).unwrap_or_default();
         let mut follow_ups = Vec::new();
         let mut filtered_out = 0;
+        let mut keyed = BTreeSet::new();
         for row in &rows {
             let kept = row.link.as_deref().and_then(|link| {
                 let (at, path) = self.rewritten(link)?;
-                (at == host && path.starts_with(&rule.path_prefix))
-                    .then(|| format!("https://{at}{path}"))
+                let walks = path.split('/').any(|segment| matches!(segment, "." | ".."));
+                (at == host
+                    && path.starts_with(&rule.path_prefix)
+                    && !walks
+                    && keyed.insert(format!("{at}{path}")))
+                .then(|| format!("https://{at}{path}"))
             });
             match kept {
                 Some(url) => follow_ups.push(Request {
@@ -220,7 +260,11 @@ impl OpenWebFeed {
         let valid_raw = request.listed_date.clone().unwrap_or_default();
         let valid = minute_of(&valid_raw, &rule.valid_format)
             .map_or(Published::Unknown, Published::AtMinute);
-        let body = (!page.body.is_empty()).then(|| ExtractedBody::of(page.body.clone()));
+        let body = page
+            .body
+            .as_ref()
+            .ok()
+            .map(|text| ExtractedBody::of(text.clone()));
         let item = CollectedItem {
             source: SourceId::new(SOURCE),
             source_item_id,
@@ -243,10 +287,8 @@ impl OpenWebFeed {
             Some(UnusableReason::BlankSourceItemId)
         } else if item.valid == Published::Unknown {
             Some(UnusableReason::NoParseableValidTime)
-        } else if item.body.is_none() {
-            Some(UnusableReason::NoArticleBody)
         } else {
-            None
+            page.body.err()
         };
         let (items, unusable) = match unusable {
             Some(reason) => (
@@ -435,9 +477,16 @@ fn absolute(href: &str, base: &str) -> Option<String> {
         .then(|| format!("https://{host}{href}"))
 }
 
-/// The exact minute form the rule names; a value with seconds is refused by `Minute::new`.
-fn minute_of(raw: &str, format: &str) -> Option<Minute> {
-    let naive = NaiveDateTime::parse_from_str(raw.trim(), format).ok()?;
+/// The exact minute form the rule names: the value must print back byte for byte, because
+/// chrono's `%Y` reads `26` as the year 26 and `%H` reads `9` (review 2026-11-15). A value with
+/// seconds is refused by `Minute::new`.
+pub(crate) fn minute_of(raw: &str, format: &str) -> Option<Minute> {
+    use std::fmt::Write;
+    let raw = raw.trim();
+    let naive = NaiveDateTime::parse_from_str(raw, format).ok()?;
+    let mut printed = String::new();
+    write!(printed, "{}", naive.format(format)).ok()?;
+    (printed == raw).then_some(())?;
     Minute::new(naive.and_utc()).ok()
 }
 

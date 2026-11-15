@@ -1224,6 +1224,7 @@ dependencies = [
  "pit",
  "roxmltree",
  "scraper",
+ "serde",
  "serde_json",
  "thiserror",
 ]
