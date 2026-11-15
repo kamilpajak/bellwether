@@ -1,0 +1,7 @@
+﻿User-agent: *
+Disallow: /rssfeed/
+Crawl-delay: 60
+
+User-agent: bingbot
+Disallow: /x
+# Synthetic, 2026-11-15: a UTF-8 byte order mark before the first user-agent line.

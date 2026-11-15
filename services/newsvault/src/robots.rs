@@ -13,6 +13,9 @@ const EVERY_AGENT: &str = "*";
 const WILDCARD: char = '*';
 const END_ANCHOR: char = '$';
 const COMMENT: char = '#';
+const BYTE_ORDER_MARK: char = '\u{feff}';
+/// RFC 9309 section 2.2's EOL is CR, LF or CRLF; `str::lines` splits on LF alone.
+const LINE_ENDS: [char; 2] = ['\r', '\n'];
 const NANOS_DIGITS: usize = 9;
 
 /// Why a pinned robots body cannot be read; each refuses the run as `robots_refused` (section 5.1).
@@ -45,12 +48,13 @@ impl Robots {
     /// the run; a rule before any `user-agent` line belongs to no group. Unknown lines are ignored.
     pub fn parse(body: &[u8]) -> Result<Self, RobotsError> {
         let text = std::str::from_utf8(body).map_err(|_| RobotsError::NotUtf8)?;
+        let text = text.strip_prefix(BYTE_ORDER_MARK).unwrap_or(text);
         let mut robots = Self {
             rules: Vec::new(),
             crawl_delay: None,
         };
         let (mut named_an_agent, mut in_agent_run, mut every_agent) = (false, false, false);
-        for line in text.lines() {
+        for line in text.split(LINE_ENDS) {
             let line = line.split(COMMENT).next().unwrap_or("");
             let Some((key, value)) = line.split_once(':') else {
                 continue;
@@ -299,6 +303,57 @@ mod tests {
         assert_eq!(
             Robots::parse(&[b'U', 0xff, b'\n']),
             Err(RobotsError::NotUtf8)
+        );
+        Ok(())
+    }
+
+    /// Read with `str::lines` and no BOM strip, each body parsed Ok with no `*` rule and no delay.
+    /// Mutations 2026-11-15, `lines()` restored / the strip removed: each red.
+    #[test]
+    fn a_cr_only_or_bom_led_body_keeps_its_star_rules_and_crawl_delay() -> TestResult {
+        let mut read = Vec::new();
+        for name in ["synthetic_cr_line_ends.txt", "synthetic_bom_led.txt"] {
+            let robots = Robots::parse(&fixture(name)?)?;
+            read.push((name, robots.allows("/rssfeed/"), robots.crawl_delay()));
+        }
+        let held = Some(Duration::from_secs(60));
+        assert_eq!(
+            read,
+            [
+                ("synthetic_cr_line_ends.txt", false, held),
+                ("synthetic_bom_led.txt", false, held)
+            ]
+        );
+        Ok(())
+    }
+
+    /// A named group after `*` resets the run, so bingbot's tying `Allow` is not a `*` rule.
+    /// Mutation 2026-11-15, the `every_agent = false` reset deleted: red.
+    #[test]
+    fn a_named_group_after_the_star_group_adds_no_star_rule() -> TestResult {
+        let robots = Robots::parse(&fixture("synthetic_named_after_star.txt")?)?;
+        assert!(!robots.allows("/rssfeed/"));
+        Ok(())
+    }
+
+    /// Mutation 2026-11-15, the comment cut removed: red (the delay `5 # seconds` is refused).
+    #[test]
+    fn a_trailing_comment_is_cut_from_a_rule_and_a_crawl_delay() -> TestResult {
+        let robots = Robots::parse(&fixture("synthetic_inline_comment.txt")?)?;
+        assert_eq!(
+            (robots.allows("/rssfeed/"), robots.crawl_delay()),
+            (false, Some(Duration::from_secs(5)))
+        );
+        Ok(())
+    }
+
+    /// Mutation 2026-11-15, the empty-value skip removed: red (`/news` disallowed).
+    #[test]
+    fn an_empty_disallow_disallows_nothing() -> TestResult {
+        let robots = Robots::parse(&fixture("synthetic_empty_disallow.txt")?)?;
+        assert_eq!(
+            (robots.allows("/news"), robots.allows("/private/x")),
+            (true, false)
         );
         Ok(())
     }
