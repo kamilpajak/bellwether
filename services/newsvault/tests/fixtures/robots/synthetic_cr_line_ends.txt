@@ -1,0 +1,1 @@
+User-agent: bingbotDisallow: /xUser-agent: *Disallow: /rssfeed/Crawl-delay: 60# Synthetic, 2026-11-15: CR-only line ends, the comment last so a body read as one line still names an agent.

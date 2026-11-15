@@ -11,6 +11,7 @@ mod strict;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use canon::{Digest, FileDigest};
 use chrono::NaiveDateTime;
@@ -25,7 +26,8 @@ use pit::datedness::{Minute, Published};
 use pit::ObservationTime;
 use serde_json::{Map, Value};
 
-use crate::hosts::{read_hosts, HostRow, Hosts, HOSTS_SCHEMA};
+pub use crate::hosts::RobotsPin;
+use crate::hosts::{read_hosts, HostRow, Hosts, Status, HOSTS_SCHEMA};
 use crate::rules::{parse_rules, Rule, RULES_SCHEMA};
 
 pub const SOURCE: &str = "open_web_wires";
@@ -38,13 +40,13 @@ const TOO_MANY_REQUESTS: u16 = 429;
 const SERVER_ERRORS: std::ops::RangeInclusive<u16> = 500..=599;
 const SCHEMES: [&str; 2] = ["https://", "http://"];
 /// An ASSUMPTION taken by default, as edgar-press's is: nothing here has timed a GNW response.
-const VENDOR_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+const VENDOR_PATIENCE: Duration = Duration::from_secs(30);
 /// The largest page of the 2026-11-14 probes was 979,950 B (cnbc.com), the GNW article 71,657 B
 /// and the GNW RSS 36,687 B, all as decompressed by curl (§11.6's method).
 const BODY_LIMIT: u64 = 2 * 1_024 * 1_024;
-/// Section 11.1's floor and section 11.2's one interval for every host; per IP the same, because
-/// no measurement places a smaller one.
-const INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// Section 11.1's floor; per IP the same, because no measurement places a smaller one. A host's
+/// robots Crawl-delay raises `per_host` above it (`with_crawl_delays`), never below.
+const INTERVAL: Duration = Duration::from_secs(10);
 
 /// Why no request may be made at all, each raised by `open` before the first request.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -118,6 +120,22 @@ pub enum Refusal {
     },
 }
 
+/// One hosts row as `OpenWebFeed::host_pins` hands it out. `host` is lowercased.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPin {
+    pub host: String,
+    pub admitted: bool,
+    pub robots: Option<RobotsPin>,
+}
+
+/// A path an admitted row asks of its host, which that host's robots.txt must allow: the index
+/// url's path with its query, and the rule's `path_prefix`. `host` is lowercased.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedPath {
+    pub host: String,
+    pub path: String,
+}
+
 #[derive(Debug)]
 pub struct OpenWebFeed {
     hosts: Hosts,
@@ -125,6 +143,8 @@ pub struct OpenWebFeed {
     rules_version: FileDigest,
     /// Every rule's host rewrite, which `item_key` applies whatever host a url names.
     rewrites: BTreeMap<String, String>,
+    /// Per host, the Crawl-delay `newsvault` read from the pinned robots.txt (section 11.2).
+    crawl_delays: BTreeMap<String, Duration>,
 }
 
 impl OpenWebFeed {
@@ -154,7 +174,59 @@ impl OpenWebFeed {
             rules: parsed,
             rules_version: FileDigest::of(&rules_bytes),
             rewrites,
+            crawl_delays: BTreeMap::new(),
         })
+    }
+
+    /// The Crawl-delay per host, read by `newsvault` from each pinned robots.txt. `transport()`
+    /// paces at the largest an ADMITTED host states when it is above 10 s; one `per_host` serves
+    /// every host (§8 row R19 hole 7), so one slow host slows them all.
+    #[must_use]
+    pub fn with_crawl_delays(self, crawl_delays: BTreeMap<String, Duration>) -> Self {
+        Self {
+            crawl_delays,
+            ..self
+        }
+    }
+
+    /// Every path an admitted row asks of its host (section 11.2), in hosts-file order.
+    #[must_use]
+    pub fn admitted_paths(&self) -> Vec<AdmittedPath> {
+        self.hosts
+            .admitted()
+            .flat_map(|row| {
+                let prefix = self.rules.get(&row.rule).map(|rule| &rule.path_prefix);
+                std::iter::once(&row.index_target)
+                    .chain(prefix)
+                    .map(|path| AdmittedPath {
+                        host: row.host.clone(),
+                        path: path.clone(),
+                    })
+            })
+            .collect()
+    }
+
+    /// The one per-host interval: 10 s, or the largest admitted host's Crawl-delay above it.
+    fn per_host_interval(&self) -> Duration {
+        self.hosts
+            .admitted()
+            .filter_map(|row| self.crawl_delays.get(&row.host))
+            .fold(INTERVAL, |slowest, delay| slowest.max(*delay))
+    }
+
+    /// Every row of the hosts file, admitted and candidate, with its robots pin: what `newsvault
+    /// robots refresh` asks and compares (section 11.2).
+    #[must_use]
+    pub fn host_pins(&self) -> Vec<HostPin> {
+        self.hosts
+            .rows
+            .iter()
+            .map(|row| HostPin {
+                host: row.host.clone(),
+                admitted: row.status == Status::Admitted,
+                robots: row.robots.clone(),
+            })
+            .collect()
     }
 
     /// `hosts_version`: the sha256 of the hosts file as read.
@@ -333,7 +405,7 @@ impl Provider for OpenWebFeed {
             body_limit: BODY_LIMIT,
             budget: RequestBudget {
                 min_interval: INTERVAL,
-                per_host: Some(INTERVAL),
+                per_host: Some(self.per_host_interval()),
             },
         }
     }
@@ -446,11 +518,22 @@ impl Provider for OpenWebFeed {
 /// A url's lowercased host and its path (`/` when empty), without scheme, port, query or
 /// fragment. `None` for another scheme, a userinfo or port, or a host `HostKey` refuses.
 pub(crate) fn host_and_path(url: &str) -> Option<(String, String)> {
+    let (host, target) = host_and_target(url)?;
+    let path = target.split('?').next().unwrap_or("/");
+    Some((host, path.to_owned()))
+}
+
+/// `host_and_path` with the query kept: the path robots.txt rules are matched against.
+pub(crate) fn host_and_target(url: &str) -> Option<(String, String)> {
     let (authority, tail) = authority_and_tail(url)?;
     news_provider::HostKey::new(authority).ok()?;
-    let path = tail.split(['?', '#']).next().unwrap_or("");
-    let path = if path.is_empty() { "/" } else { path };
-    Some((authority.to_ascii_lowercase(), path.to_owned()))
+    let target = tail.split('#').next().unwrap_or("");
+    let target = if target.starts_with('/') {
+        target.to_owned()
+    } else {
+        format!("/{target}")
+    };
+    Some((authority.to_ascii_lowercase(), target))
 }
 
 /// The text after an http(s) scheme, split where the authority ends; `None` for another scheme.

@@ -1,6 +1,5 @@
 //! The hosts file: one hashed file per SourceId, whose digest is `hosts_version` (architecture.md
-//! sections 2 and 11.1). In step 2 a row holds host, status, index url and rule only; Crawl-delay
-//! and the robots digest arrive with their reader in section 11.5 step 3.
+//! sections 2 and 11.1). A row holds host, status, index url, rule and the robots pin.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -10,13 +9,46 @@ use news_provider::HostKey;
 use serde_json::Value;
 
 use crate::rules::Rule;
-use crate::{host_and_path, known_fields, strict, Refusal};
+use crate::{host_and_target, known_fields, strict, Refusal};
 
-pub(crate) const HOSTS_SCHEMA: &str = "open-web-feed.hosts/1";
+pub(crate) const HOSTS_SCHEMA: &str = "open-web-feed.hosts/2";
 const TOP: [&str; 2] = ["schema", "hosts"];
-const ROW: [&str; 4] = ["host", "status", "index_url", "rule"];
+const ROW: [&str; 5] = ["host", "status", "index_url", "rule", "robots"];
 const ADMITTED: &str = "admitted";
 const CANDIDATE: &str = "candidate";
+/// A robots.txt 404 is "no robots" and pins no digest (section 11.1).
+const ABSENT: &str = "absent";
+const SHA256_HEX: usize = 64;
+
+/// What a hosts row pins its robots.txt to: the sha256 of the body as received after content
+/// decoding, or a 404. One field, so a state and a digest cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RobotsPin {
+    Sha256(String),
+    Absent,
+}
+
+impl RobotsPin {
+    fn read(text: &str) -> Option<Self> {
+        if text == ABSENT {
+            return Some(Self::Absent);
+        }
+        let hex = text.len() == SHA256_HEX
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        hex.then(|| Self::Sha256(text.to_owned()))
+    }
+
+    /// The pin as the hosts file spells it.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Sha256(hex) => hex,
+            Self::Absent => ABSENT,
+        }
+    }
+}
 
 /// Section 11's **Admitted** term. Only `Admitted` rows are planned (§8 row R19).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,7 +64,11 @@ pub(crate) struct HostRow {
     pub(crate) host: String,
     pub(crate) status: Status,
     pub(crate) index_url: String,
+    /// The index url's path with its query, which robots.txt must allow (section 11.2).
+    pub(crate) index_target: String,
     pub(crate) rule: String,
+    /// Required on an admitted row, optional on a candidate one.
+    pub(crate) robots: Option<RobotsPin>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,18 +148,36 @@ pub(crate) fn read_hosts(path: &Path, rules: &BTreeMap<String, Rule>) -> Result<
                 rule,
             });
         }
-        if host_and_path(&index_url).map(|(at, _)| at) != Some(host.clone()) {
-            return Err(Refusal::IndexOffHost {
-                path: path.to_path_buf(),
-                host,
-                url: index_url,
-            });
+        let index_target = match host_and_target(&index_url) {
+            Some((at, target)) if at == host => target,
+            _ => {
+                return Err(Refusal::IndexOffHost {
+                    path: path.to_path_buf(),
+                    host,
+                    url: index_url,
+                })
+            }
+        };
+        let robots = match row.get("robots") {
+            None => None,
+            Some(pin) => Some(pin.as_str().and_then(RobotsPin::read).ok_or_else(|| {
+                unparseable(format!(
+                    "{host} pins robots to {pin}, neither 64 lowercase hex nor {ABSENT}"
+                ))
+            })?),
+        };
+        if status == Status::Admitted && robots.is_none() {
+            return Err(unparseable(format!(
+                "{host} is admitted and pins no robots"
+            )));
         }
         rows.push(HostRow {
             host,
             status,
             index_url,
+            index_target,
             rule,
+            robots,
         });
     }
     let hosts = Hosts {

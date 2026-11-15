@@ -6,6 +6,8 @@ pub mod blobs;
 pub mod cmd_collect;
 pub mod cmd_items;
 pub mod cmd_ledger;
+pub mod cmd_robots;
 pub mod lake;
 pub mod publish;
+pub mod robots;
 pub mod store;

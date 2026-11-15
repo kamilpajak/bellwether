@@ -6,6 +6,7 @@
 //! that dies holding nothing still left a record that it started (accepted attack A3.13).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use canon::digest::{doc_id, item_id, story_id, ItemFields};
 use chrono::{DateTime, NaiveDate, Utc};
@@ -16,11 +17,12 @@ use news_provider::{
     stamp_of, Archive, ArchiveError, AttemptReceipt, Clock, CollectError, Collected, CollectedItem,
     Committed, Exchange, Exit, Provider, Run, RunId, SourceId, TargetWindow,
 };
-use open_web_feed::OpenWebFeed;
+use open_web_feed::{OpenWebFeed, RobotsPin};
 use pit::{MeasuredLag, ObservationTime};
 use serde_json::{json, Value};
 
-use crate::cmd_ledger::{Envelope, RUN_ENVELOPE_SCHEMA};
+use crate::cmd_ledger::{Envelope, RunKind, RUN_ENVELOPE_SCHEMA};
+use crate::robots::{Robots, RobotsError};
 use crate::store::{Committer, ItemRow, StoreError, POLICY_DIR, RUNS_DIR};
 
 /// `/2` since 2026-11-15: `calendar_version` became nullable, a type change, and `window`,
@@ -29,10 +31,13 @@ pub const SCHEMA: &str = "newsvault.collect/2";
 /// What a run with no schedule slot is keyed by, so an ad-hoc run still has a run id and a
 /// partition key (accepted attack A1.7).
 const ADHOC: &str = "adhoc";
-const RUN_ID_FORMAT: &str = "%Y%m%dT%H%M%SZ";
+pub(crate) const RUN_ID_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 const STAGING_PREFIX: &str = ".tmp-";
 /// The one window spelling that is not a day: the UTC date of the run's own `at`.
 pub const TODAY: &str = "today";
+/// Section 11.1's 10 s, held apart from `open-web-feed`'s own interval so the floor check does not
+/// move when the profile it checks does.
+const PACE_FLOOR: Duration = Duration::from_secs(10);
 
 /// What a caller asked `collect` for. `calendar` and `listing` are files for the same reason the
 /// rules file is one: a hashed input a second reader can reproduce. Which of the four optional
@@ -111,6 +116,60 @@ pub enum CollectRunError {
     /// lag: that would refuse the window with R11's message and hide the unreadable file.
     #[error("the observation-lag policy is unusable: {0}")]
     UnusableLagPolicy(#[from] LagPolicyError),
+    /// Code `robots_unverified`, exit 4: `fetched` is `None` when no answered robots fetch of the
+    /// host is ledgered, and names the digest whose blob is absent from disk otherwise.
+    #[error(
+        "admitted host {host} pins robots {pinned}, and {}; run `newsvault robots refresh`",
+        match .fetched {
+            Some(digest) => format!("the newest ledgered fetch's blob {digest} is not on disk"),
+            None => "the store ledgers no answered robots.txt fetch of it".to_owned(),
+        }
+    )]
+    RobotsUnverified {
+        host: String,
+        pinned: String,
+        fetched: Option<String>,
+    },
+    /// Code `robots_refused`, exit 2: the newest answered fetch is not the pin.
+    #[error(
+        "admitted host {host} pins robots {pinned}, and its newest ledgered fetch is {fetched}; \
+         edit the hosts file once the change is read"
+    )]
+    RobotsRefused {
+        host: String,
+        pinned: String,
+        fetched: String,
+    },
+    /// Code `robots_refused`, exit 2: the pinned robots body is no robots.txt this reader takes.
+    #[error("admitted host {host} pins robots {pinned}, which cannot be read: {why}")]
+    RobotsUnreadable {
+        host: String,
+        pinned: String,
+        why: RobotsError,
+    },
+    /// Code `robots_refused`, exit 2: the pinned blob's bytes on disk hash to `found`, not the pin.
+    #[error(
+        "admitted host {host} pins robots {pinned}, and its stored blob now hashes to {found}"
+    )]
+    RobotsBlobAltered {
+        host: String,
+        pinned: String,
+        found: String,
+    },
+    /// Code `robots_refused`, exit 2: the pinned robots.txt disallows a path the row asks.
+    #[error("the pinned robots.txt of admitted host {host} disallows {path}, which its row asks")]
+    RobotsDisallowsPath { host: String, path: String },
+    /// Code `robots_refused`, exit 2: section 11.1's `max(Crawl-delay, 10 s)` is above the
+    /// per-host interval the provider's profile paces at (`None`: no per-host pace at all).
+    #[error(
+        "admitted host {host} would be paced every {per_host:?}, below its floor {floor:?}, \
+         the larger of its robots Crawl-delay and 10 s"
+    )]
+    PaceBelowFloor {
+        host: String,
+        per_host: Option<Duration>,
+        floor: Duration,
+    },
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -139,6 +198,12 @@ impl CollectRunError {
             | Self::Refused(_)
             | Self::OpenWebRefused(_)
             | Self::UnusableLagPolicy(_)
+            | Self::RobotsUnverified { .. }
+            | Self::RobotsRefused { .. }
+            | Self::RobotsUnreadable { .. }
+            | Self::RobotsBlobAltered { .. }
+            | Self::RobotsDisallowsPath { .. }
+            | Self::PaceBelowFloor { .. }
             | Self::Store(_)
             | Self::Driver(_)
             | Self::Io(_)
@@ -256,7 +321,31 @@ pub struct Opened {
     pub provider: Box<dyn Provider>,
     /// sha256 of the hosts file the provider was opened on; `None` for a provider with none.
     pub hosts_version: Option<String>,
+    /// Every admitted hosts-file row as `collect` checks it; empty for a provider with none.
+    pub admitted_robots: Vec<AdmittedRobots>,
     pub lag: Option<AppliedLag>,
+}
+
+/// One admitted hosts row (section 11.2): its pin, its pinned robots body as read when the
+/// provider was opened, and the paths the row asks of its host.
+#[derive(Debug, Clone)]
+pub struct AdmittedRobots {
+    pub host: String,
+    pub pin: Option<RobotsPin>,
+    pub robots: PinnedRobots,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinnedRobots {
+    /// Pinned `absent`, a 404: no Crawl-delay and no path disallowed.
+    NoRobots,
+    Read(Robots),
+    /// No blob of the pinned digest was in the store when the provider was opened.
+    BlobMissing,
+    /// The pinned blob's bytes hash to this digest instead of the pin.
+    Altered(String),
+    Unreadable(RobotsError),
 }
 
 impl std::fmt::Debug for Opened {
@@ -264,6 +353,7 @@ impl std::fmt::Debug for Opened {
         f.debug_struct("Opened")
             .field("registered", &self.registered)
             .field("hosts_version", &self.hosts_version)
+            .field("admitted_robots", &self.admitted_robots)
             .field("lag", &self.lag)
             .finish_non_exhaustive()
     }
@@ -325,39 +415,91 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
             source_id: registered.source(),
         });
     }
-    let (provider, hosts_version, lag): (Box<dyn Provider>, _, _) = match registered {
-        Registered::EdgarPress => {
-            let roster = required(ask.roster.as_ref(), roster.0, registered)?;
-            let provider = EdgarPress::open(roster, &ask.rules, &ask.contact)?;
-            match lag_of(ask, registered)? {
-                Some((applied, measured)) => (
-                    Box::new(provider.with_observation_lag(measured)),
+    let (provider, hosts_version, admitted_robots, lag): (Box<dyn Provider>, _, _, _) =
+        match registered {
+            Registered::EdgarPress => {
+                let roster = required(ask.roster.as_ref(), roster.0, registered)?;
+                let provider = EdgarPress::open(roster, &ask.rules, &ask.contact)?;
+                match lag_of(ask, registered)? {
+                    Some((applied, measured)) => (
+                        Box::new(provider.with_observation_lag(measured)),
+                        None,
+                        Vec::new(),
+                        Some(applied),
+                    ),
+                    None => (Box::new(provider), None, Vec::new(), None),
+                }
+            }
+            Registered::OpenWebWires => {
+                // Live only (section 11.1): no window of it is dated by a lag, so a policy is refused.
+                if ask.lag_policy.is_some() {
+                    return Err(CollectRunError::FlagRefused {
+                        flag: "lag-policy",
+                        source_id: registered.source(),
+                    });
+                }
+                let hosts = required(ask.hosts.as_ref(), hosts.0, registered)?;
+                let provider = OpenWebFeed::open(hosts, &ask.rules, &ask.contact)?;
+                let version = provider.hosts_version().hex().to_owned();
+                let admitted = admitted_robots(&ask.store, &provider)?;
+                let delays = admitted
+                    .iter()
+                    .filter_map(|row| match &row.robots {
+                        PinnedRobots::Read(robots) => {
+                            Some((row.host.clone(), robots.crawl_delay()?))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                (
+                    Box::new(provider.with_crawl_delays(delays)),
+                    Some(version),
+                    admitted,
                     None,
-                    Some(applied),
-                ),
-                None => (Box::new(provider), None, None),
+                )
             }
-        }
-        Registered::OpenWebWires => {
-            // Live only (section 11.1): no window of it is dated by a lag, so a policy is refused.
-            if ask.lag_policy.is_some() {
-                return Err(CollectRunError::FlagRefused {
-                    flag: "lag-policy",
-                    source_id: registered.source(),
-                });
-            }
-            let hosts = required(ask.hosts.as_ref(), hosts.0, registered)?;
-            let provider = OpenWebFeed::open(hosts, &ask.rules, &ask.contact)?;
-            let version = provider.hosts_version().hex().to_owned();
-            (Box::new(provider), Some(version), None)
-        }
-    };
+        };
     Ok(Opened {
         registered,
         provider,
         hosts_version,
+        admitted_robots,
         lag,
     })
+}
+
+/// Each admitted row's pinned robots body, read from the store's blobs by digest before the
+/// provider is boxed, so the Crawl-delay `transport()` paces at is the one `collect` checks.
+fn admitted_robots(
+    store: &Path,
+    feed: &OpenWebFeed,
+) -> Result<Vec<AdmittedRobots>, CollectRunError> {
+    let paths = feed.admitted_paths();
+    let mut admitted = Vec::new();
+    for row in feed.host_pins().into_iter().filter(|row| row.admitted) {
+        let robots = match &row.robots {
+            Some(RobotsPin::Sha256(hex)) => match crate::store::blob_bytes(store, hex) {
+                Ok(Some(body)) => {
+                    Robots::parse(&body).map_or_else(PinnedRobots::Unreadable, PinnedRobots::Read)
+                }
+                Ok(None) => PinnedRobots::BlobMissing,
+                Err(StoreError::BlobAltered { found, .. }) => PinnedRobots::Altered(found),
+                Err(other) => return Err(other.into()),
+            },
+            Some(RobotsPin::Absent) | None => PinnedRobots::NoRobots,
+        };
+        admitted.push(AdmittedRobots {
+            paths: paths
+                .iter()
+                .filter(|used| used.host == row.host)
+                .map(|used| used.path.clone())
+                .collect(),
+            host: row.host,
+            pin: row.robots,
+            robots,
+        });
+    }
+    Ok(admitted)
 }
 
 /// The policy's entry for this source's archive arm, read once per call from the caller's file.
@@ -516,6 +658,8 @@ pub fn run(
             today,
         });
     }
+    refuse_the_window(ask, provider)?;
+    refuse_an_unverified_robots(ask, opened)?;
     let run = RunId::new(run_id.clone());
     // Before the policy copy, the envelope and the lease: a store at a newer user_version or of
     // another v0 shape is left as found. A v0 step SQLite refuses still leaves a run record.
@@ -532,6 +676,7 @@ pub fn run(
         expected_runs: ask.expected_runs,
         started_at: ask.at,
         finished_at: None,
+        kind: RunKind::Collect,
     };
     // Before the lease, so a run that never gets one is a record rather than a hole.
     write_envelope(&ask.store, &envelope)?;
@@ -546,6 +691,130 @@ pub fn run(
         exit: driven.collected.exit(),
         envelope: envelope_of(ask, opened, &run_id, run_date, &driven, true),
     })
+}
+
+/// A driven run's window refusal before the store, the lock or an envelope exists (section 5.1).
+/// Only `WindowRefused`: edgar's no-lag `PlanRefused` keeps its policy copy and envelope (D5),
+/// and an unreadable input is still reported by `drive`, after the envelope, as before.
+fn refuse_the_window(ask: &Ask, provider: &dyn Provider) -> Result<(), CollectRunError> {
+    let Ok((calendar, listing)) = inputs(ask) else {
+        return Ok(());
+    };
+    let at = ObservationTime::new(ask.at);
+    match provider.plan(&target_of(ask), calendar.as_ref(), listing.as_ref(), at) {
+        Err(refusal) => match CollectRunError::of_plan(refusal) {
+            refused @ CollectRunError::WindowRefused(_) => Err(refused),
+            _ => Ok(()),
+        },
+        Ok(_) => Ok(()),
+    }
+}
+
+/// Section 8 rows R4(b) and R19(b): every admitted row's newest answered robots fetch in the
+/// store is its pin, and the pinned robots allows the row's paths and its pace. Read before the
+/// lease; a refresh running alongside can only add a newer answer.
+fn refuse_an_unverified_robots(ask: &Ask, opened: &Opened) -> Result<(), CollectRunError> {
+    if opened.admitted_robots.is_empty() {
+        return Ok(());
+    }
+    let ledger = crate::store::RobotsLedger::open(&ask.store)?;
+    let per_host = opened.provider.transport().budget.per_host;
+    for row in &opened.admitted_robots {
+        let pinned = row
+            .pin
+            .as_ref()
+            .map_or_else(String::new, |pin| pin.text().to_owned());
+        let newest = match ledger.newest_robots(&row.host) {
+            Ok(newest) => newest,
+            Err(StoreError::BlobAbsent { digest }) => {
+                return Err(CollectRunError::RobotsUnverified {
+                    host: row.host.clone(),
+                    pinned,
+                    fetched: Some(digest),
+                })
+            }
+            Err(other) => return Err(other.into()),
+        };
+        let Some(answer) = newest else {
+            return Err(CollectRunError::RobotsUnverified {
+                host: row.host.clone(),
+                pinned,
+                fetched: None,
+            });
+        };
+        let fetched = crate::cmd_robots::fetched_pin(&answer);
+        if fetched != pinned {
+            return Err(CollectRunError::RobotsRefused {
+                host: row.host.clone(),
+                pinned,
+                fetched,
+            });
+        }
+        refuse_what_the_pinned_robots_forbids(row, pinned, per_host)?;
+    }
+    Ok(())
+}
+
+/// Section 11.2's path and floor checks on one row whose newest fetch is its pin.
+fn refuse_what_the_pinned_robots_forbids(
+    row: &AdmittedRobots,
+    pinned: String,
+    per_host: Option<Duration>,
+) -> Result<(), CollectRunError> {
+    let robots = match &row.robots {
+        PinnedRobots::NoRobots => None,
+        PinnedRobots::Read(robots) => Some(robots),
+        // A refresh that wrote the blob after `open_provider` read the store.
+        PinnedRobots::BlobMissing => {
+            return Err(CollectRunError::RobotsUnverified {
+                host: row.host.clone(),
+                fetched: Some(pinned.clone()),
+                pinned,
+            })
+        }
+        PinnedRobots::Altered(found) => {
+            return Err(CollectRunError::RobotsBlobAltered {
+                host: row.host.clone(),
+                pinned,
+                found: found.clone(),
+            })
+        }
+        PinnedRobots::Unreadable(why) => {
+            return Err(CollectRunError::RobotsUnreadable {
+                host: row.host.clone(),
+                pinned,
+                why: why.clone(),
+            })
+        }
+    };
+    let disallowed = row
+        .paths
+        .iter()
+        .find(|path| robots.is_some_and(|robots| !robots.allows(path)));
+    if let Some(path) = disallowed {
+        return Err(CollectRunError::RobotsDisallowsPath {
+            host: row.host.clone(),
+            path: path.clone(),
+        });
+    }
+    refuse_a_pace_below_the_floor(&row.host, per_host, robots.and_then(Robots::crawl_delay))
+}
+
+/// Section 8 row R19(b): `per_host` must be at least `max(crawl_delay, 10 s)`; `None` is refused.
+pub fn refuse_a_pace_below_the_floor(
+    host: &str,
+    per_host: Option<Duration>,
+    crawl_delay: Option<Duration>,
+) -> Result<(), CollectRunError> {
+    let floor = crawl_delay.map_or(PACE_FLOOR, |delay| delay.max(PACE_FLOOR));
+    match per_host {
+        Some(interval) if interval >= floor => Ok(()),
+        _ => Err(CollectRunError::PaceBelowFloor {
+            host: host.to_owned(),
+            per_host,
+            floor,
+        }),
+    }
 }
 
 /// The plan alone, which is what `--dry-run` returns: everything except the mutation.
@@ -572,6 +841,7 @@ fn planned(
             ObservationTime::new(ask.at),
         )
         .map_err(CollectRunError::of_plan)?;
+    refuse_an_unverified_robots(ask, opened)?;
     let driven = Driven {
         collected: Collected::of_plan(&plan, &provider.source()),
         calendar_version: version_of(calendar_in),
@@ -593,7 +863,7 @@ fn run_id(ask: &Ask) -> String {
 
 /// tmp + rename, like every other file in the layout: a run killed while its envelope is rewritten
 /// otherwise leaves unparseable JSON and disables the command whose job is to report the kill.
-fn write_envelope(root: &Path, envelope: &Envelope) -> Result<(), CollectRunError> {
+pub(crate) fn write_envelope(root: &Path, envelope: &Envelope) -> Result<(), CollectRunError> {
     let runs = root.join(RUNS_DIR);
     std::fs::create_dir_all(&runs)?;
     let staging = runs.join(format!("{STAGING_PREFIX}{}.json", envelope.run_id));

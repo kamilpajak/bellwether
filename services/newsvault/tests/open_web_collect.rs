@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use news_provider::{
@@ -14,10 +15,14 @@ use news_provider::{
 };
 use newsvault::cmd_collect::{self, Ask, CollectRunError};
 use newsvault::cmd_items::{self, PerStory};
-use newsvault::store::COMMIT_LOG;
+use newsvault::store::{StoreError, COMMIT_LOG};
+use open_web_feed::OpenWebFeed;
 use pit::ObservationTime;
 use rusqlite::{Connection, OpenFlags};
+use serde_json::Value;
 use tempfile::TempDir;
+
+mod seed;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -37,6 +42,17 @@ const RECEIVED_BEFORE_THE_CLOCK: i64 = 1;
 /// The stub's `received_at` for every page: `RUN_AT` less `RECEIVED_BEFORE_THE_CLOCK`.
 const RECEIVED_AT: &str = "2026-11-14T19:00:29.000000Z";
 const EXIT_USAGE: i32 = 2;
+const EXIT_NOT_FOUND: i32 = 4;
+const NOT_FOUND: u16 = 404;
+const FORBIDDEN: u16 = 403;
+const UNAVAILABLE: u16 = 503;
+/// Two robots fetches before `RUN_AT`, the second the newer.
+const ROBOTS_EARLIER: &str = "2026-11-14T17:00:00Z";
+const ROBOTS_LATER: &str = "2026-11-14T18:00:00Z";
+/// The committed hosts file's GNW pin, `robots_rss_globenewswire_com.txt`'s sha256.
+const GNW_PIN: &str = "eb8bb698171dd56c139c224c9217070adf9947f6ed6cd02336eba55aa4155bfe";
+const CHANGED_ROBOTS: &[u8] = b"User-agent: *\nDisallow: /\n";
+const NEWER_STORE: i32 = 3;
 
 /// The three `rssfeed_3_items.xml` links after the www -> rss rewrite, the page each is answered
 /// with, its pubDate text, and the canonical link that page names (`None`: not committed).
@@ -68,6 +84,16 @@ fn provider_dir() -> PathBuf {
 
 fn hosts() -> PathBuf {
     provider_dir().join("hosts/open_web_wires.hosts.json")
+}
+
+fn hosts_fixture(name: &str) -> PathBuf {
+    provider_dir().join("tests/fixtures/hosts").join(name)
+}
+
+/// The committed GNW row's robots fetch at `at`, answered with the committed body.
+fn seed_gnw(store: &Path, hosts: &Path, at: &str) -> TestResult {
+    seed::refresh(store, hosts, at, (OK, &seed::gnw_robots()?))?;
+    Ok(())
 }
 
 fn instant(text: &str) -> DateTime<Utc> {
@@ -208,6 +234,7 @@ fn visible(store: &Path, at: &str) -> Result<usize, Box<dyn Error>> {
 #[test]
 fn an_open_web_run_collects_a_globenewswire_day_end_to_end() -> TestResult {
     let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
     let ask = ask(root.path(), cmd_collect::TODAY);
     let opened = cmd_collect::open_provider(&ask)?;
     let exchange = Gnw::day()?;
@@ -250,9 +277,9 @@ fn an_open_web_run_collects_a_globenewswire_day_end_to_end() -> TestResult {
         root.path().join(COMMIT_LOG),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
-    let mut versions = db.prepare("SELECT hosts_version FROM attempts")?;
+    let mut versions = db.prepare("SELECT hosts_version FROM attempts WHERE source = ?1")?;
     let versions = versions
-        .query_map([], |row| row.get::<_, Option<String>>(0))?
+        .query_map([SOURCE], |row| row.get::<_, Option<String>>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     assert_eq!(versions, vec![Some(hosts_version.hex().to_owned()); 4]);
     let expected: BTreeMap<String, Row> = RELEASES
@@ -305,6 +332,27 @@ fn an_open_web_run_collects_a_globenewswire_day_end_to_end() -> TestResult {
     Ok(())
 }
 
+/// Section 5.1 `invalid_argument`: the driven path refuses the window before `commit.sqlite3`, the
+/// lock or a run envelope exist. Mutation 2026-11-15, `refuse_the_window` removed: red.
+#[test]
+fn a_driven_collect_refuses_an_unreadable_or_off_day_window_before_writing_anything() -> TestResult
+{
+    for window in ["garbage", YESTERDAY] {
+        let root = TempDir::new()?;
+        let ask = ask(root.path(), window);
+        let opened = cmd_collect::open_provider(&ask)?;
+        let exchange = Gnw::day()?;
+        let refused = cmd_collect::run(&ask, &opened, &exchange, &Fixed);
+        assert!(
+            matches!(refused, Err(CollectRunError::WindowRefused(_))),
+            "{window}: {refused:?}"
+        );
+        let left = [COMMIT_LOG, "LOCK", "runs"].map(|name| root.path().join(name).exists());
+        assert_eq!(left, [false; 3], "{window}");
+    }
+    Ok(())
+}
+
 /// Section 8 row R10, the driver half: a window that is not the run's UTC day sends nothing, and
 /// the binary exits 2. Mutation 2026-11-15: removing the run-day check in `plan` turns this red.
 #[test]
@@ -351,6 +399,606 @@ fn an_open_web_run_for_yesterday_sends_nothing() -> TestResult {
     assert_eq!(
         (output.status.code(), output.stdout.len()),
         (Some(EXIT_USAGE), 0)
+    );
+    Ok(())
+}
+
+/// Every file under `root` with its bytes, so a refusal can be shown to have written nothing.
+fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.insert(path.clone(), std::fs::read(&path).unwrap_or_default());
+            }
+        }
+    }
+    files
+}
+
+/// `collect` over `hosts` into `store`, as a dry run when `dry_run`: the robots check runs in both.
+/// An error is the test's own setup failing; the string is `verdict` of what `collect` answered.
+fn collected(store: &Path, hosts: PathBuf, dry_run: bool) -> Result<String, Box<dyn Error>> {
+    let ask = Ask {
+        hosts: Some(hosts),
+        dry_run,
+        ..ask(store, cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    Ok(verdict(&cmd_collect::run(
+        &ask,
+        &opened,
+        &Gnw::day()?,
+        &Fixed,
+    )))
+}
+
+/// What the robots check said: `admitted`, or the refusal's variant with its fetched digest.
+fn verdict(answered: &Result<cmd_collect::Answer, CollectRunError>) -> String {
+    match answered {
+        Ok(_) => "admitted".to_owned(),
+        Err(CollectRunError::RobotsUnverified { fetched, .. }) => {
+            format!("unverified {}", fetched.as_deref().unwrap_or("none"))
+        }
+        Err(CollectRunError::RobotsRefused { fetched, .. }) => format!("refused {fetched}"),
+        Err(CollectRunError::RobotsUnreadable { why, .. }) => format!("unreadable: {why}"),
+        Err(CollectRunError::RobotsBlobAltered { found, .. }) => format!("altered {found}"),
+        Err(CollectRunError::RobotsDisallowsPath { path, .. }) => format!("disallows {path}"),
+        Err(CollectRunError::PaceBelowFloor {
+            per_host, floor, ..
+        }) => format!("paced {per_host:?} below {floor:?}"),
+        Err(other) => format!("another refusal: {other}"),
+    }
+}
+
+/// §8 row R4(b), section 11.4: no answered robots fetch of an admitted host, in a store with no
+/// commit log or one holding only a failed fetch, refuses before the envelope, the lock or a send.
+/// Mutation 2026-11-15, the lookup in `refuse_an_unverified_robots` removed: red.
+#[test]
+fn an_admitted_row_without_a_ledgered_robots_fetch_is_refused() -> TestResult {
+    let empty = TempDir::new()?;
+    let exchange = Gnw::day()?;
+    let ask = ask(empty.path(), cmd_collect::TODAY);
+    let opened = cmd_collect::open_provider(&ask)?;
+    let refused = cmd_collect::run(&ask, &opened, &exchange, &Fixed);
+    assert_eq!(verdict(&refused), "unverified none");
+    assert_eq!(exchange.asked.borrow().len(), 0);
+    assert!(snapshot(empty.path()).is_empty());
+    let failed_only = TempDir::new()?;
+    seed::refresh(
+        failed_only.path(),
+        &hosts(),
+        ROBOTS_EARLIER,
+        (FORBIDDEN, b"Access Denied"),
+    )?;
+    let before = snapshot(failed_only.path());
+    assert_eq!(
+        collected(failed_only.path(), hosts(), false)?,
+        "unverified none"
+    );
+    assert_eq!(snapshot(failed_only.path()), before);
+    Ok(())
+}
+
+/// Only the NEWEST answered fetch is compared, both ways round. Mutation 2026-11-15, the reader
+/// ordered oldest first: red.
+#[test]
+fn an_admitted_row_whose_newest_robots_fetch_differs_from_its_pin_is_refused() -> TestResult {
+    let changed = canon::FileDigest::of(CHANGED_ROBOTS);
+    let changed_last = TempDir::new()?;
+    seed_gnw(changed_last.path(), &hosts(), ROBOTS_EARLIER)?;
+    seed::refresh(
+        changed_last.path(),
+        &hosts(),
+        ROBOTS_LATER,
+        (OK, CHANGED_ROBOTS),
+    )?;
+    let pinned_last = TempDir::new()?;
+    seed::refresh(
+        pinned_last.path(),
+        &hosts(),
+        ROBOTS_EARLIER,
+        (OK, CHANGED_ROBOTS),
+    )?;
+    seed_gnw(pinned_last.path(), &hosts(), ROBOTS_LATER)?;
+    assert_eq!(
+        (
+            collected(changed_last.path(), hosts(), true)?,
+            collected(pinned_last.path(), hosts(), true)?,
+        ),
+        (format!("refused {}", changed.hex()), "admitted".to_owned())
+    );
+    Ok(())
+}
+
+/// A pin of `absent` is a 404 the store ledgers, never a host nobody asked. Mutation 2026-11-15,
+/// an absent pin accepted without the lookup: red.
+#[test]
+fn an_admitted_row_pinned_absent_is_admitted_only_by_a_ledgered_404() -> TestResult {
+    let pinned_absent = hosts_fixture("robots_pin_absent.json");
+    let mut said = Vec::new();
+    for answer in [
+        None,
+        Some((OK, seed::gnw_robots()?)),
+        Some((NOT_FOUND, b"not here".to_vec())),
+    ] {
+        let root = TempDir::new()?;
+        if let Some((status, body)) = &answer {
+            seed::refresh(root.path(), &pinned_absent, ROBOTS_EARLIER, (*status, body))?;
+        }
+        said.push(collected(root.path(), pinned_absent.clone(), true)?);
+    }
+    assert_eq!(
+        said,
+        vec![
+            "unverified none".to_owned(),
+            format!("refused {GNW_PIN}"),
+            "admitted".to_owned()
+        ]
+    );
+    Ok(())
+}
+
+/// A failed fetch files no robots row, so it neither admits nor un-admits a host. Mutation
+/// 2026-11-15, the reader left-joining `attempts` to `robots`: red.
+#[test]
+fn a_failed_robots_fetch_after_a_matching_one_leaves_the_host_admitted() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    seed::refresh(root.path(), &hosts(), ROBOTS_LATER, (UNAVAILABLE, b""))?;
+    assert_eq!(collected(root.path(), hosts(), true)?, "admitted");
+    Ok(())
+}
+
+/// A candidate is never planned, so it needs no fetch: here its own fetch failed in transport.
+#[test]
+fn a_candidate_row_needs_no_robots_fetch() -> TestResult {
+    let root = TempDir::new()?;
+    let two_rows = hosts_fixture("one_admitted_one_candidate.json");
+    seed_gnw(root.path(), &two_rows, ROBOTS_EARLIER)?;
+    assert_eq!(collected(root.path(), two_rows, true)?, "admitted");
+    Ok(())
+}
+
+/// The pin names bytes the store must still hold, not only a row that once named them. Mutation
+/// 2026-11-15, `BlobAbsent` skipped: red.
+#[test]
+fn a_pinned_robots_blob_missing_on_disk_is_unverified() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    std::fs::remove_file(gnw_blob(root.path()))?;
+    assert_eq!(
+        collected(root.path(), hosts(), false)?,
+        format!("unverified {GNW_PIN}")
+    );
+    Ok(())
+}
+
+fn gnw_blob(store: &Path) -> PathBuf {
+    store
+        .join("blobs/sha256")
+        .join(&GNW_PIN[..2])
+        .join(&GNW_PIN[2..4])
+        .join(GNW_PIN)
+}
+
+/// The pinned blob is re-hashed when read: bytes changed on disk are not the pin, and a later
+/// refresh keeps the changed file, so it repairs nothing and no refresh is suggested. Mutation
+/// 2026-11-15, the hash comparison in `BlobStore::read_verified` removed: red.
+#[test]
+fn a_pinned_robots_blob_changed_on_disk_is_refused_and_suggests_no_refresh() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    std::fs::write(gnw_blob(root.path()), CHANGED_ROBOTS)?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_LATER)?;
+    let found = canon::FileDigest::of(CHANGED_ROBOTS).hex().to_owned();
+    let output = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .args([
+            "collect",
+            "--source",
+            SOURCE,
+            "--window",
+            cmd_collect::TODAY,
+        ])
+        .args(["--at", RUN_AT, "--format", "json", "--dry-run"])
+        .arg("--store")
+        .arg(root.path())
+        .arg("--hosts")
+        .arg(hosts())
+        .arg("--rules")
+        .arg(provider_dir().join("rules/open-web-feed.rules.json"))
+        .env("BELLWETHER_FEED_CONTACT", CONTACT)
+        .stdin(Stdio::null())
+        .output()?;
+    let error: Value = serde_json::from_slice(&output.stderr)?;
+    assert_eq!(
+        (
+            collected(root.path(), hosts(), true)?,
+            output.status.code(),
+            error["code"].clone(),
+            error["details"]["found"].clone(),
+            error["suggestions"].clone(),
+        ),
+        (
+            format!("altered {found}"),
+            Some(EXIT_USAGE),
+            Value::from("robots_refused"),
+            Value::from(found.as_str()),
+            Value::Array(Vec::new()),
+        )
+    );
+    Ok(())
+}
+
+/// The robots check reads the store before the version check, and a store above this build's
+/// user_version is a version refusal there, not `robots_unverified`. Mutation 2026-11-15, the
+/// version check in `RobotsLedger::open` removed: red.
+#[test]
+fn an_open_web_collect_against_a_newer_store_is_a_version_refusal() -> TestResult {
+    let root = TempDir::new()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    db.pragma_update(None, "user_version", NEWER_STORE)?;
+    drop(db);
+    let ask = ask(root.path(), cmd_collect::TODAY);
+    let opened = cmd_collect::open_provider(&ask)?;
+    let refused = cmd_collect::run(&ask, &opened, &Gnw::day()?, &Fixed);
+    assert!(
+        matches!(
+            refused,
+            Err(CollectRunError::Store(StoreError::SchemaVersion {
+                found: NEWER_STORE,
+                ..
+            }))
+        ),
+        "{}",
+        verdict(&refused)
+    );
+    Ok(())
+}
+
+const PRN_ROBOTS: &str = "https://www.prnewswire.com/robots.txt";
+
+/// A hosts file in `dir` admitting GNW and PRN, both pinned to the committed GNW body, and a store
+/// whose one refresh answered each url in `answered` with that body: what a dry-run collect says.
+fn collected_over_two_admitted_hosts(
+    dir: &Path,
+    answered: &[&str],
+) -> Result<String, Box<dyn Error>> {
+    let hosts = dir.join("hosts.json");
+    let store = dir.join("store");
+    let row = |host: &str, index: &str| {
+        serde_json::json!({"host": host, "status": "admitted", "index_url": index,
+                           "rule": "gnw", "robots": GNW_PIN})
+    };
+    let file = serde_json::json!({
+        "schema": "open-web-feed.hosts/2",
+        "hosts": [row("rss.globenewswire.com", INDEX),
+                  row("www.prnewswire.com", "https://www.prnewswire.com/rss/news-releases-list.rss")],
+    });
+    std::fs::write(&hosts, serde_json::to_vec(&file)?)?;
+    let body = seed::gnw_robots()?;
+    let answers: Vec<(&str, u16, &[u8])> = answered
+        .iter()
+        .map(|url| (*url, OK, body.as_slice()))
+        .collect();
+    seed::refresh_answering(&store, &hosts, ROBOTS_EARLIER, &answers)?;
+    collected(&store, hosts, true)
+}
+
+/// §8 row R4: every admitted row is checked, not the first. Mutation 2026-11-15, the loop in
+/// `refuse_an_unverified_robots` cut to its first row: red.
+#[test]
+fn a_second_admitted_host_without_a_ledgered_fetch_is_refused() -> TestResult {
+    let dir = TempDir::new()?;
+    let said = collected_over_two_admitted_hosts(dir.path(), &[seed::GNW_ROBOTS])?;
+    assert_eq!(said, "unverified none");
+    Ok(())
+}
+
+/// §8 row R4: the lookup is keyed by host, so another host's fetch of the same bytes admits
+/// nothing. Mutation 2026-11-15, `newest_robots`' host condition replaced by `?2 IS NOT NULL`: red.
+#[test]
+fn another_hosts_fetch_matching_the_pin_does_not_admit_a_host() -> TestResult {
+    let dir = TempDir::new()?;
+    let said = collected_over_two_admitted_hosts(dir.path(), &[PRN_ROBOTS])?;
+    assert_eq!(said, "unverified none");
+    Ok(())
+}
+
+/// A dry run validates everything, robots included, and still writes nothing. Mutation
+/// 2026-11-15, the call in `planned` removed: red.
+#[test]
+fn a_dry_run_refuses_an_unverified_host_too() -> TestResult {
+    let root = TempDir::new()?;
+    assert_eq!(collected(root.path(), hosts(), true)?, "unverified none");
+    assert!(snapshot(root.path()).is_empty());
+    Ok(())
+}
+
+/// Section 5.1: `robots_unverified` exits 4 and `robots_refused` 2, each a `newsvault.error/1`
+/// object on stderr; stdout stays empty. The unverified one suggests the refresh as an argv array;
+/// a changed pin suggests nothing, because a refresh records the same change again. Mutations
+/// 2026-11-15, the refusal written as plain `error:` text / the changed pin suggesting the
+/// refresh: each red.
+#[test]
+fn a_robots_refusal_names_the_refresh_command_as_an_argv_suggestion() -> TestResult {
+    let unverified = TempDir::new()?;
+    let refused = TempDir::new()?;
+    seed::refresh(
+        refused.path(),
+        &hosts(),
+        ROBOTS_EARLIER,
+        (OK, CHANGED_ROBOTS),
+    )?;
+    let rules = provider_dir().join("rules/open-web-feed.rules.json");
+    let mut seen = Vec::new();
+    for store in [unverified.path(), refused.path()] {
+        let output = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+            .args([
+                "collect",
+                "--source",
+                SOURCE,
+                "--window",
+                cmd_collect::TODAY,
+            ])
+            .args(["--at", RUN_AT, "--format", "json", "--dry-run"])
+            .arg("--store")
+            .arg(store)
+            .arg("--hosts")
+            .arg(hosts())
+            .arg("--rules")
+            .arg(&rules)
+            .env("BELLWETHER_FEED_CONTACT", CONTACT)
+            .stdin(Stdio::null())
+            .output()?;
+        let error: Value = serde_json::from_slice(&output.stderr)?;
+        let shown = |path: &Path| path.display().to_string();
+        let refresh = [
+            "newsvault",
+            "robots",
+            "refresh",
+            "--source",
+            SOURCE,
+            "--hosts",
+            &shown(&hosts()),
+            "--rules",
+            &shown(&rules),
+            "--store",
+            &shown(store),
+        ]
+        .map(Value::from);
+        let suggested = if store == unverified.path() {
+            vec![Value::from(refresh.to_vec())]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(error["suggestions"], Value::from(suggested));
+        seen.push((
+            output.status.code(),
+            output.stdout.len(),
+            error["schema"].as_str().map(str::to_owned),
+            error["code"].as_str().map(str::to_owned),
+            error["details"]["host"].as_str().map(str::to_owned),
+        ));
+    }
+    let gnw = Some("rss.globenewswire.com".to_owned());
+    let schema = Some("newsvault.error/1".to_owned());
+    assert_eq!(
+        seen,
+        vec![
+            (
+                Some(EXIT_NOT_FOUND),
+                0,
+                schema.clone(),
+                Some("robots_unverified".to_owned()),
+                gnw.clone()
+            ),
+            (
+                Some(EXIT_USAGE),
+                0,
+                schema,
+                Some("robots_refused".to_owned()),
+                gnw
+            ),
+        ]
+    );
+    Ok(())
+}
+
+/// A hosts file in `dir` whose one GNW row pins `body`, and a store in `dir` whose newest robots
+/// fetch of GNW answered `body`: what `collect` then says.
+fn collected_under_robots(
+    dir: &Path,
+    body: &[u8],
+    dry_run: bool,
+) -> Result<String, Box<dyn Error>> {
+    let (store, hosts) = pinned_to(dir, body)?;
+    collected(&store, hosts, dry_run)
+}
+
+/// The store and the hosts file of `collected_under_robots`, before any collect.
+fn pinned_to(dir: &Path, body: &[u8]) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let hosts = dir.join("hosts.json");
+    let store = dir.join("store");
+    let pin = canon::FileDigest::of(body);
+    let file = serde_json::json!({
+        "schema": "open-web-feed.hosts/2",
+        "hosts": [{"host": "rss.globenewswire.com", "status": "admitted", "index_url": INDEX,
+                   "rule": "gnw", "robots": pin.hex()}],
+    });
+    std::fs::write(&hosts, serde_json::to_vec(&file)?)?;
+    seed::refresh(&store, &hosts, ROBOTS_EARLIER, (OK, body))?;
+    Ok((store, hosts))
+}
+
+fn robots_fixture(name: &str) -> Result<Vec<u8>, std::io::Error> {
+    std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/robots")
+            .join(name),
+    )
+}
+
+/// Section 11.2: the index path with its query and the rule's `path_prefix` must both be allowed.
+/// A narrower Disallow under the prefix passes: documents are not checked per request. Mutation
+/// 2026-11-15, the path check removed: red.
+#[test]
+fn an_admitted_row_whose_index_or_path_prefix_robots_disallows_is_refused() -> TestResult {
+    let mut said = Vec::new();
+    for body in [
+        "User-agent: *\nDisallow: /rssfeed/\n",
+        "User-agent: *\nDisallow: /news-release/\n",
+        "User-agent: *\nDisallow: /news-release/2026/\n",
+    ] {
+        let dir = TempDir::new()?;
+        said.push(collected_under_robots(dir.path(), body.as_bytes(), true)?);
+    }
+    assert_eq!(
+        said,
+        [
+            "disallows /rssfeed/",
+            "disallows /news-release/",
+            "admitted"
+        ]
+    );
+    Ok(())
+}
+
+/// A pinned body this reader refuses is `robots_refused`, never a robots.txt with no rule.
+/// Mutation 2026-11-15, `Unreadable` read as no robots: red.
+#[test]
+fn a_pinned_robots_body_that_does_not_parse_is_refused() -> TestResult {
+    let dir = TempDir::new()?;
+    let said = collected_under_robots(
+        dir.path(),
+        &robots_fixture("synthetic_html_page.txt")?,
+        true,
+    )?;
+    assert_eq!(said, "unreadable: the body names no user-agent");
+    Ok(())
+}
+
+/// `open_provider` reads the pinned body before the ledger check; a refresh that writes it in
+/// between is unverified, not read as no robots. Mutation 2026-11-15, `BlobMissing` read as no
+/// robots: red.
+#[test]
+fn a_robots_blob_written_after_the_provider_opened_is_unverified() -> TestResult {
+    let root = TempDir::new()?;
+    let ask = Ask {
+        dry_run: true,
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let answered = cmd_collect::run(&ask, &opened, &Gnw::day()?, &Fixed);
+    assert_eq!(verdict(&answered), format!("unverified {GNW_PIN}"));
+    Ok(())
+}
+
+/// §8 row R19(b): nasdaq's 30 s is admitted once handed to the provider, refused without it.
+/// Mutations 2026-11-15, the floor check removed / `max(cd, 10 s)` as `cd` / `>=` as `>` / the
+/// hand-off removed: each red.
+#[test]
+fn a_hosts_row_faster_than_its_robots_crawl_delay_is_refused() -> TestResult {
+    let secs = |n: u64| Some(Duration::from_secs(n));
+    let dir = TempDir::new()?;
+    let (store, hosts) = pinned_to(dir.path(), &robots_fixture("www.nasdaq.com.txt")?)?;
+    let ask = Ask {
+        hosts: Some(hosts.clone()),
+        dry_run: true,
+        ..ask(&store, cmd_collect::TODAY)
+    };
+    let mut opened = cmd_collect::open_provider(&ask)?;
+    let slowed = opened.provider.transport().budget.per_host;
+    let admitted = verdict(&cmd_collect::run(&ask, &opened, &Gnw::day()?, &Fixed));
+    opened.provider = Box::new(OpenWebFeed::open(&hosts, &ask.rules, CONTACT)?);
+    let unslowed = verdict(&cmd_collect::run(&ask, &opened, &Gnw::day()?, &Fixed));
+    assert_eq!(
+        (slowed, admitted.as_str(), unslowed.as_str()),
+        (secs(30), "admitted", "paced Some(10s) below 30s")
+    );
+    // (per_host, Crawl-delay, admitted): the floor is 10 s with no delay or a smaller one.
+    let cases = [
+        (secs(10), secs(30), false),
+        (secs(30), secs(30), true),
+        (secs(10), secs(5), true),
+        (secs(10), None, true),
+        (secs(5), secs(5), false),
+        (secs(5), None, false),
+        (None, None, false),
+    ];
+    for (per_host, crawl_delay, ok) in cases {
+        let checked = cmd_collect::refuse_a_pace_below_the_floor(INDEX, per_host, crawl_delay);
+        assert_eq!(checked.is_ok(), ok, "{per_host:?} {crawl_delay:?}");
+    }
+    Ok(())
+}
+
+/// Section 5.1: a disallowed path and an unreadable pinned body are `robots_refused`, exit 2, with
+/// the path or the reason in `details` and no suggestion, because a refresh cannot change a pinned
+/// body. Mutation 2026-11-15, the path arm dropped from `robots_refusal`: red.
+#[test]
+fn a_path_or_unreadable_robots_refusal_names_its_fact_and_suggests_no_refresh() -> TestResult {
+    let mut seen = Vec::new();
+    for body in [
+        b"User-agent: *\nDisallow: /rssfeed/\n".to_vec(),
+        robots_fixture("synthetic_html_page.txt")?,
+    ] {
+        let dir = TempDir::new()?;
+        let (store, hosts) = pinned_to(dir.path(), &body)?;
+        let output = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+            .args([
+                "collect",
+                "--source",
+                SOURCE,
+                "--window",
+                cmd_collect::TODAY,
+            ])
+            .args(["--at", RUN_AT, "--format", "json", "--dry-run"])
+            .arg("--store")
+            .arg(&store)
+            .arg("--hosts")
+            .arg(&hosts)
+            .arg("--rules")
+            .arg(provider_dir().join("rules/open-web-feed.rules.json"))
+            .env("BELLWETHER_FEED_CONTACT", CONTACT)
+            .stdin(Stdio::null())
+            .output()?;
+        let error: Value = serde_json::from_slice(&output.stderr)?;
+        seen.push((
+            output.status.code(),
+            output.stdout.len(),
+            error["code"].clone(),
+            error["details"]["path"].clone(),
+            error["details"]["why"].clone(),
+            error["suggestions"].clone(),
+        ));
+    }
+    let refused = Value::from("robots_refused");
+    assert_eq!(
+        seen,
+        vec![
+            (
+                Some(EXIT_USAGE),
+                0,
+                refused.clone(),
+                Value::from("/rssfeed/"),
+                Value::Null,
+                Value::Array(Vec::new())
+            ),
+            (
+                Some(EXIT_USAGE),
+                0,
+                refused,
+                Value::Null,
+                Value::from("the body names no user-agent"),
+                Value::Array(Vec::new())
+            ),
+        ]
     );
     Ok(())
 }

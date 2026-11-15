@@ -10,10 +10,11 @@ use std::process::ExitCode;
 use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use news_provider::{Clock, Credentials, RunId, SystemClock, Wire};
+use news_provider::{Clock, Credentials, Provider, RunId, SystemClock, Wire};
 use newsvault::cmd_collect::{self, CollectRunError};
 use newsvault::cmd_items;
 use newsvault::cmd_ledger::{self, Ask, LedgerReadError, Report};
+use newsvault::cmd_robots::{self, RobotsError};
 use newsvault::lake::{Day, LakeError, LakeReader};
 use newsvault::publish::{publish_run, Fsync, PublishError};
 use newsvault::store::{Committer, StoreError};
@@ -178,9 +179,41 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
+    /// robots.txt of every hosts-file row, fetched under the ledger.
+    Robots {
+        #[command(subcommand)]
+        action: RobotsAction,
+    },
     /// Machine-readable description of this tool.
     Schema {
         #[arg(long, value_enum, default_value_t = Format::Json)]
+        format: Format,
+    },
+}
+
+#[derive(Subcommand)]
+enum RobotsAction {
+    /// Fetches each hosts-file row's robots.txt once, admitted and candidate, under an attempt
+    /// row, and compares it with the row's pin. Never writes the hosts file.
+    Refresh {
+        /// Source id whose hosts file is read: open_web_wires.
+        #[arg(long)]
+        source: String,
+        /// The hosts file, hashed; every row is asked.
+        #[arg(long)]
+        hosts: PathBuf,
+        /// The open-web-feed rules file the hosts rows name.
+        #[arg(long)]
+        rules: PathBuf,
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Plans one url per row and mutates nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Accepted and does nothing: no command here prompts or reads stdin.
+        #[arg(long)]
+        non_interactive: bool,
+        #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
 }
@@ -230,6 +263,9 @@ fn prefix_of(failure: &anyhow::Error) -> &'static str {
     if failure
         .downcast_ref::<CollectRunError>()
         .is_some_and(CollectRunError::is_usage)
+        || failure
+            .downcast_ref::<RobotsError>()
+            .is_some_and(RobotsError::is_usage)
     {
         "usage error"
     } else {
@@ -275,6 +311,17 @@ fn exit_code(failure: &anyhow::Error) -> u8 {
             ) => EXIT_NOT_FOUND,
             CollectRunError::Store(StoreError::LeaseHeld(_)) => EXIT_LEASE_HELD,
             // invalid_argument, input_unparseable, credential_contact_missing and io_failed.
+            _ => EXIT_USAGE,
+        };
+    }
+    if let Some(robots) = failure.downcast_ref::<RobotsError>() {
+        return match robots {
+            RobotsError::OpenWebRefused(
+                open_web_feed::Refusal::HostsAbsent(_)
+                | open_web_feed::Refusal::RulesAbsent(_)
+                | open_web_feed::Refusal::NoHostAdmitted(_),
+            ) => EXIT_NOT_FOUND,
+            RobotsError::Store(StoreError::LeaseHeld(_)) => EXIT_LEASE_HELD,
             _ => EXIT_USAGE,
         };
     }
@@ -409,11 +456,60 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 &ask.store,
                 &opened.provider.source(),
             );
-            let answer = cmd_collect::run(&ask, &opened, &wire, &clock)?;
+            let answer = match cmd_collect::run(&ask, &opened, &wire, &clock) {
+                Ok(answer) => answer,
+                Err(refused) => {
+                    let Some(facts) = robots_refusal(&refused) else {
+                        return Err(refused.into());
+                    };
+                    emit_robots_refusal(&refused, &facts, &ask, format)?;
+                    return Ok(Verdict::No(facts.exit));
+                }
+            };
             if answer.exit.carries_the_result_on_stdout() {
                 emit_collect(&answer.envelope, format)?;
             } else {
                 emit_collect_error(&answer, format)?;
+            }
+            Ok(match answer.exit.code() {
+                0 => Verdict::Ok,
+                code => Verdict::No(code),
+            })
+        }
+        Command::Robots {
+            action:
+                RobotsAction::Refresh {
+                    source,
+                    hosts,
+                    rules,
+                    store,
+                    dry_run,
+                    non_interactive: _,
+                    format,
+                },
+        } => {
+            let registered = cmd_robots::registered(&source)?;
+            let ask = cmd_robots::Ask {
+                source,
+                hosts,
+                rules,
+                store: vault_root(store),
+                contact: contact(registered),
+                dry_run,
+            };
+            let feed = cmd_robots::open(&ask)?;
+            // The collector's profile, credential and pace files: a robots fetch waits for the
+            // same per-IP and per-host slots a collect run does.
+            let wire = Wire::new(
+                feed.transport(),
+                Credentials::default().with(registered.credential(), ask.contact.clone()),
+                &ask.store,
+                &feed.source(),
+            );
+            let answer = cmd_robots::run(&ask, &feed, &wire, &SystemClock)?;
+            match answer.emitted(std::env::args().collect()) {
+                cmd_robots::Emitted::Stdout(report) => emit_robots(&report, format)?,
+                cmd_robots::Emitted::Stderr(error) => emit_robots_error(&error, format)?,
             }
             Ok(match answer.exit.code() {
                 0 => Verdict::Ok,
@@ -523,6 +619,142 @@ fn emit_collect_error(answer: &cmd_collect::Answer, format: Format) -> anyhow::R
             "error: {} (retryable {})",
             answer.exit.error_code().unwrap_or_default(),
             answer.exit.retryable()
+        )?,
+    }
+    Ok(())
+}
+
+/// A collect refused by the robots check: section 5.1's code, its exit, the facts behind it, and
+/// whether a `robots refresh` can change the answer (it cannot for a pinned body's own content).
+struct RobotsRefusal {
+    code: &'static str,
+    exit: u8,
+    details: serde_json::Value,
+    refresh_helps: bool,
+}
+
+fn robots_refusal(failure: &CollectRunError) -> Option<RobotsRefusal> {
+    let refused = |details, refresh_helps| RobotsRefusal {
+        code: "robots_refused",
+        exit: EXIT_USAGE,
+        details,
+        refresh_helps,
+    };
+    match failure {
+        CollectRunError::RobotsUnverified {
+            host,
+            pinned,
+            fetched,
+        } => Some(RobotsRefusal {
+            code: "robots_unverified",
+            exit: EXIT_NOT_FOUND,
+            details: serde_json::json!({"host": host, "pinned": pinned, "fetched": fetched}),
+            refresh_helps: true,
+        }),
+        // A refresh records the changed digest again; a person editing the hosts file is the fix.
+        CollectRunError::RobotsRefused {
+            host,
+            pinned,
+            fetched,
+        } => Some(refused(
+            serde_json::json!({"host": host, "pinned": pinned, "fetched": fetched}),
+            false,
+        )),
+        CollectRunError::RobotsUnreadable { host, pinned, why } => Some(refused(
+            serde_json::json!({"host": host, "pinned": pinned, "why": why.to_string()}),
+            false,
+        )),
+        CollectRunError::RobotsBlobAltered {
+            host,
+            pinned,
+            found,
+        } => Some(refused(
+            serde_json::json!({"host": host, "pinned": pinned, "found": found}),
+            false,
+        )),
+        CollectRunError::RobotsDisallowsPath { host, path } => Some(refused(
+            serde_json::json!({"host": host, "path": path}),
+            false,
+        )),
+        CollectRunError::PaceBelowFloor {
+            host,
+            per_host,
+            floor,
+        } => Some(refused(
+            serde_json::json!({
+                "host": host,
+                "per_host_seconds": per_host.map(|interval| interval.as_secs_f64()),
+                "floor_seconds": floor.as_secs_f64(),
+            }),
+            false,
+        )),
+        _ => None,
+    }
+}
+
+/// The refusal as an error object; its suggestion, when a refresh can change the answer, is the
+/// refresh that would ledger the fetch.
+fn emit_robots_refusal(
+    refused: &CollectRunError,
+    facts: &RobotsRefusal,
+    ask: &cmd_collect::Ask,
+    format: Format,
+) -> anyhow::Result<()> {
+    let shown = |path: &std::path::Path| path.display().to_string();
+    let refresh = serde_json::json!([
+        "newsvault",
+        "robots",
+        "refresh",
+        "--source",
+        open_web_feed::SOURCE,
+        "--hosts",
+        ask.hosts.as_deref().map(shown).unwrap_or_default(),
+        "--rules",
+        shown(&ask.rules),
+        "--store",
+        shown(&ask.store),
+    ]);
+    let object = serde_json::json!({
+        "schema": "newsvault.error/1",
+        "code": facts.code,
+        "message": refused.to_string(),
+        "retryable": false,
+        "details": facts.details,
+        "suggestions": if facts.refresh_helps { vec![refresh] } else { Vec::new() },
+    });
+    let err = std::io::stderr();
+    let mut err = err.lock();
+    match format {
+        Format::Json => writeln!(err, "{object}")?,
+        Format::Human => writeln!(err, "error: {refused}")?,
+    }
+    Ok(())
+}
+
+fn emit_robots(report: &serde_json::Value, format: Format) -> anyhow::Result<()> {
+    let out = std::io::stdout();
+    let mut out = out.lock();
+    match format {
+        Format::Json => {
+            serde_json::to_writer_pretty(&mut out, report)?;
+            writeln!(out)?;
+        }
+        Format::Human => cmd_robots::render_human(report, &mut out)?,
+    }
+    Ok(())
+}
+
+/// Exit 7, every row failed transiently: the report rides the error object, never stdout.
+fn emit_robots_error(object: &serde_json::Value, format: Format) -> anyhow::Result<()> {
+    let err = std::io::stderr();
+    let mut err = err.lock();
+    match format {
+        Format::Json => writeln!(err, "{object}")?,
+        Format::Human => writeln!(
+            err,
+            "error: {} (retryable {})",
+            object["code"].as_str().unwrap_or_default(),
+            object["retryable"]
         )?,
     }
     Ok(())
@@ -793,6 +1025,41 @@ fn print_schema(format: Format) {
                 "output": "newsvault.publish/1",
                 "mutates": true
             },
+            {
+                "path": ["robots", "refresh"],
+                "summary": "Fetches each hosts-file row's robots.txt under an attempt row and compares it with the row's pin.",
+                "options": [
+                    {"name": "source", "type": "enum", "required": true,
+                     "values": [open_web_feed::SOURCE],
+                     "doc": "edgar_press reads no hosts file and is invalid_argument"},
+                    {"name": "hosts", "type": "path", "required": true,
+                     "doc": "every row, admitted and candidate, is asked once; the file is never written"},
+                    {"name": "rules", "type": "path", "required": true},
+                    {"name": "store", "type": "path"},
+                    {"name": "dry_run", "type": "flag",
+                     "doc": "plans one url per row and mutates nothing"},
+                    {"name": "non_interactive", "type": "flag",
+                     "doc": "accepted and does nothing: no command here prompts or reads stdin"},
+                    {"name": "format", "type": "enum", "values": ["human", "json"]}
+                ],
+                "env": [{"name": "BELLWETHER_FEED_CONTACT", "source": "open_web_wires",
+                         "doc": "the contact address the open-web User-Agent carries"},
+                        {"name": "BELLWETHER_VAULT",
+                         "doc": "the store when --store is not given, then ~/.bellwether/vault"}],
+                "output": cmd_robots::SCHEMA,
+                "exits": {
+                    "0": "every row answered and every admitted pin matches",
+                    "1": "every row answered and an admitted pin differs",
+                    "2": "invalid_argument (a source with no hosts file), an unparseable hosts or \
+                          rules file, credential_contact_missing, a store of another version or \
+                          shape, io",
+                    "4": "an absent hosts or rules file, or a hosts file admitting no host",
+                    "7": "every row failed transiently (vendor_unreachable), or another run holds \
+                          the lease (lease_held)",
+                    "8": "a row failed"
+                },
+                "mutates": true
+            },
             {"path": ["schema"], "summary": "This document.", "mutates": false}
         ],
         // Decision D1: `1` is the answer and never a failure. What each code means and which
@@ -818,7 +1085,9 @@ fn print_schema(format: Format) {
             {"code": "vendor_unreachable", "exit": 7, "retryable": true},
             {"code": "partial_collect", "exit": 8, "retryable": false},
             {"code": "vendor_refused_all", "exit": 8, "retryable": false},
-            {"code": "commit_failed", "exit": 8, "retryable": false}
+            {"code": "commit_failed", "exit": 8, "retryable": false},
+            {"code": "robots_unverified", "exit": 4, "retryable": false},
+            {"code": "robots_refused", "exit": 2, "retryable": false}
         ],
         // Decision D1's companion rule, which `news_provider::Exit` holds as one function.
         "stdout_carries_the_result_for_exits": [0, 1, 8]

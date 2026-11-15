@@ -1,0 +1,19 @@
+
+User-agent: *
+
+
+Disallow: /admin/
+Disallow: /users/
+Disallow: /manage/
+Disallow: /account
+Disallow: /api
+Disallow: /lists
+Disallow: /cron
+Disallow: /admin
+Disallow: /users
+Disallow: /rss
+Disallow: /rss2
+
+Crawl-delay: 5
+
+Sitemap: https://www.accessnewswire.com/public/sitemap/index.xml

@@ -24,6 +24,8 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use tempfile::TempDir;
 
+mod seed;
+
 type TestResult = Result<(), Box<dyn Error>>;
 
 /// Inside the day the fixtures name, so every window the tests ask for is a live ingest and no
@@ -1525,6 +1527,19 @@ const GNW_RELEASE: &str =
     "https://rss.globenewswire.com/news-release/2026/11/14/9999999/0/en/synthetic-release.html";
 /// The committed hosts file admits one host, so a plan holds one index request.
 const ADMITTED_HOSTS: u64 = 1;
+/// Before `SATURDAY_AT`: when the seeded robots fetch of the committed GNW row was ledgered.
+const ROBOTS_FETCHED_AT: &str = "2026-11-14T18:00:00Z";
+
+/// §8 row R4(b): the committed GNW row's robots fetch, ledgered so an open-web collect may run.
+fn seed_robots(store: &Path) -> TestResult {
+    seed::refresh(
+        store,
+        &open_web_hosts(),
+        ROBOTS_FETCHED_AT,
+        (OK, &seed::gnw_robots()?),
+    )?;
+    Ok(())
+}
 
 fn open_web_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../providers/open-web-feed")
@@ -1714,6 +1729,7 @@ fn an_edgar_run_without_a_calendar_is_a_usage_error() -> TestResult {
 #[test]
 fn window_today_resolves_to_the_utc_date_of_at() -> TestResult {
     let root = TempDir::new()?;
+    seed_robots(root.path())?;
     let mut args = open_web_args(root.path(), &[]);
     let at = args
         .iter()
@@ -1745,6 +1761,7 @@ fn window_today_resolves_to_the_utc_date_of_at() -> TestResult {
 #[test]
 fn the_run_envelope_names_the_hosts_file_it_was_allowed_to_use() -> TestResult {
     let root = TempDir::new()?;
+    seed_robots(root.path())?;
     let ask = open_web_ask(root.path(), SATURDAY_AT);
     let opened = cmd_collect::open_provider(&ask)?;
     let exchange = gnw_payloads(&[
@@ -1769,9 +1786,9 @@ fn the_run_envelope_names_the_hosts_file_it_was_allowed_to_use() -> TestResult {
         root.path().join(COMMIT_LOG),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
-    let mut rows = db.prepare("SELECT hosts_version FROM attempts")?;
+    let mut rows = db.prepare("SELECT hosts_version FROM attempts WHERE source = ?1")?;
     let stored: Vec<Option<String>> = rows
-        .query_map([], |row| row.get(0))?
+        .query_map([OPEN_WEB], |row| row.get(0))?
         .collect::<Result<Vec<Option<String>>, _>>()?;
     assert_eq!(stored, vec![Some(digest.hex().to_owned()); 2]);
     let edgar = collected(
@@ -1815,6 +1832,8 @@ fn two_sources_in_one_invocation_are_refused() -> TestResult {
 fn an_open_web_dry_run_plans_one_index_request_per_admitted_host_and_writes_nothing() -> TestResult
 {
     let root = TempDir::new()?;
+    seed_robots(root.path())?;
+    let before = tree_digests(root.path());
     let dry = Ask {
         dry_run: true,
         ..open_web_ask(root.path(), SATURDAY_AT)
@@ -1833,7 +1852,7 @@ fn an_open_web_dry_run_plans_one_index_request_per_admitted_host_and_writes_noth
         "{:#}",
         answer.envelope
     );
-    assert!(tree(root.path()).is_empty());
+    assert_eq!(tree_digests(root.path()), before);
     Ok(())
 }
 
@@ -2112,6 +2131,7 @@ fn every_registered_credential_is_the_one_its_providers_user_agent_names() -> Te
 #[test]
 fn an_open_web_run_reads_its_contact_from_its_own_variable() -> TestResult {
     let root = TempDir::new()?;
+    seed_robots(root.path())?;
     let args = open_web_args(root.path(), &[]);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let sec_only = binary_env(&args, &[("BELLWETHER_SEC_CONTACT", CONTACT)])?;

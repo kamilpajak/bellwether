@@ -1,0 +1,5 @@
+# Synthetic, 2026-11-15: a wildcard and an end anchor.
+User-agent: *
+Disallow: /*.php$
+Disallow: /*/private
+Disallow: /exact$

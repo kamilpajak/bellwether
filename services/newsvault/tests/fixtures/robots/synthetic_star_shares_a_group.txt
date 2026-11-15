@@ -1,0 +1,11 @@
+# Synthetic, 2026-11-15: a group shared by bingbot and *, a later * group merged into it.
+User-agent: bingbot
+User-agent: *
+Crawl-delay: 20
+
+User-agent: googlebot
+Crawl-delay: 1
+Disallow: /
+
+User-agent: *
+Crawl-delay: 15

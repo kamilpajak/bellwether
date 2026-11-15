@@ -199,13 +199,13 @@ impl Pace {
             .map_err(|why| self.unusable("read", &why))?;
         let next_allowed = match (self.prior(&held)?, self.held) {
             (Some(prior), Held::NextAllowed) => Some(prior),
-            (Some(granted), Held::LastGranted) => Some(granted + interval),
+            (Some(granted), Held::LastGranted) => Some(self.advanced(granted, interval)?),
             (None, _) => None,
         };
         // A reservation already in the past is owed nothing: nobody used that slot.
         let go_at = next_allowed.map_or(now, |next| next.max(now));
         let written = match self.held {
-            Held::NextAllowed => go_at + interval,
+            Held::NextAllowed => self.advanced(go_at, interval)?,
             Held::LastGranted => go_at,
         };
         file.set_len(0)
@@ -231,6 +231,12 @@ impl Pace {
             })
     }
 
+    /// A robots Crawl-delay of 9,000,000,000,000 s panicked here before 2026-11-15 (PR #23 review).
+    fn advanced(&self, at: DateTime<Utc>, by: TimeDelta) -> Result<DateTime<Utc>, BudgetError> {
+        at.checked_add_signed(by)
+            .ok_or_else(|| self.unusable("advanced", &"past the last representable instant"))
+    }
+
     fn unusable(&self, act: &'static str, why: &impl std::fmt::Display) -> BudgetError {
         BudgetError::Unusable {
             path: self.path.clone(),
@@ -249,7 +255,12 @@ fn stamp(at: DateTime<Utc>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BudgetError, HostKey};
+    use std::time::Duration;
+
+    use chrono::{DateTime, Utc};
+
+    use super::{BudgetError, BudgetScope, HostKey, Pace};
+    use crate::request::SourceId;
 
     const SHOUTED: &str = "WWW.SEC.GOV";
     const SEC: &str = "www.sec.gov";
@@ -257,6 +268,60 @@ mod tests {
     /// Each breaks exactly one rule, so deleting any one rule lets its row through.
     const ONE_RULE_BROKEN_EACH: [&str; 5] =
         ["", ".sec.gov", "www.sec.gov.", "www..sec.gov", "[::1]"];
+
+    /// A parseable robots Crawl-delay that `DateTime` cannot add (review of PR #23, 2026-11-15).
+    const AN_INTERVAL_PAST_THE_CALENDAR: Duration = Duration::from_secs(9_000_000_000_000);
+
+    #[test]
+    fn a_pace_too_long_to_add_is_refused_rather_than_panicking() -> Result<(), String> {
+        let store = tempfile::tempdir().map_err(|why| why.to_string())?;
+        let host = HostKey::new(SEC).map_err(|why| why.to_string())?;
+        let pace = Pace::beside_the_store(
+            store.path(),
+            &BudgetScope::PerHost(host),
+            AN_INTERVAL_PAST_THE_CALENDAR,
+        );
+        let now: DateTime<Utc> = DateTime::UNIX_EPOCH;
+        let first = pace.reserve(now);
+        let second = pace.reserve(now);
+        assert!(
+            matches!(
+                (&first, &second),
+                (
+                    Ok(_),
+                    Err(BudgetError::Unusable {
+                        act: "advanced",
+                        ..
+                    })
+                )
+            ),
+            "{first:?} {second:?}"
+        );
+        Ok(())
+    }
+
+    /// The per-IP arm adds the interval on its first call, so one call reaches it.
+    #[test]
+    fn a_per_ip_pace_too_long_to_add_is_refused_on_its_first_call() -> Result<(), String> {
+        let store = tempfile::tempdir().map_err(|why| why.to_string())?;
+        let pace = Pace::beside_the_store(
+            store.path(),
+            &BudgetScope::PerIp(SourceId::new("open_web_wires")),
+            AN_INTERVAL_PAST_THE_CALENDAR,
+        );
+        let first = pace.reserve(DateTime::UNIX_EPOCH);
+        assert!(
+            matches!(
+                first,
+                Err(BudgetError::Unusable {
+                    act: "advanced",
+                    ..
+                })
+            ),
+            "{first:?}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn a_host_key_in_upper_case_is_normalised_to_one_lowercase_bucket() {

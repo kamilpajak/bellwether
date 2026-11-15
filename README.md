@@ -99,8 +99,15 @@ do not prove: `probes/newsvault_parity/PREREGISTRATION.md`.
 
 ## Running a collection
 
-`collect` is the only command that writes to the archive. Every input it reads is a file whose
-digest the run envelope names, so a second reader can reproduce what the run filtered by.
+Two commands fetch from a vendor and write what came back to the store:
+
+- `collect`: items, attempt rows, blobs and a run envelope. Every input it reads is a file whose
+  digest the run envelope names, so a second reader can reproduce what the run filtered by.
+- `robots refresh`: attempt rows, `robots` rows, blobs, a run envelope and pace files; never the
+  hosts file.
+- An open-web `collect`, dry run included, is refused `robots_unverified` (exit 4) until a
+  `robots refresh` without `--dry-run` has ledgered a fetch of each admitted host matching its pin.
+
 `BELLWETHER_SEC_CONTACT` (edgar_press) and `BELLWETHER_FEED_CONTACT` (open_web_wires) carry the
 contact address the User-Agent sends; each is substituted inside the one HTTP client and reaches
 no plan and no ledger row. One source per invocation; which files each source takes is
@@ -113,10 +120,16 @@ cargo run -p newsvault -- collect --source edgar_press --window 2026-11-10 \
   --roster <cik roster.json> --rules providers/edgar-press/rules/edgar-press.rules.json \
   --dry-run --format json
 export BELLWETHER_FEED_CONTACT='bellwether-feed <your address>'
+cargo run -p newsvault -- robots refresh --source open_web_wires \
+  --hosts providers/open-web-feed/hosts/open_web_wires.hosts.json \
+  --rules providers/open-web-feed/rules/open-web-feed.rules.json --format json
 cargo run -p newsvault -- collect --source open_web_wires --window today \
   --hosts providers/open-web-feed/hosts/open_web_wires.hosts.json \
   --rules providers/open-web-feed/rules/open-web-feed.rules.json --dry-run --format json
 ```
+
+`robots refresh` fetches each hosts-file row's robots.txt under the ledger and compares it with the
+row's `robots` pin; it never writes the hosts file. Exit 1 means a pin differs.
 
 `unwrap`, `expect` and `panic!` are denied by lint and `unsafe` is forbidden. The table is
 `[workspace.lints]` in the root `Cargo.toml`, and each crate opts in with

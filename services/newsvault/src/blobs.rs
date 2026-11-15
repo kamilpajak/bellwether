@@ -81,6 +81,20 @@ impl BlobStore {
         self.path_of(&digest).exists().then_some(digest)
     }
 
+    /// The bytes stored under `digest`, re-hashed: a file changed on disk is `BlobAltered`.
+    pub fn read_verified(&self, digest: &BlobDigest) -> Result<Vec<u8>, StoreError> {
+        let bytes = fs::read(self.path_of(digest))?;
+        let found = const_hex::encode(Sha256::digest(&bytes));
+        if found == digest.hex() {
+            Ok(bytes)
+        } else {
+            Err(StoreError::BlobAltered {
+                digest: digest.hex().to_owned(),
+                found,
+            })
+        }
+    }
+
     /// The stored length, and the check that no index row is written about a missing file.
     pub fn len_of(&self, digest: &BlobDigest) -> Result<u64, StoreError> {
         fs::metadata(self.path_of(digest))

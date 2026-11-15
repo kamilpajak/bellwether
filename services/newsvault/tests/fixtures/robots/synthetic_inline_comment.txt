@@ -1,0 +1,4 @@
+# Synthetic, 2026-11-15: a rule and a Crawl-delay each with a trailing comment.
+User-agent: *
+Disallow: /rssfeed/ # the index
+Crawl-delay: 5 # seconds

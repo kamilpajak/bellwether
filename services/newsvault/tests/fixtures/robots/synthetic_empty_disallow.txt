@@ -1,0 +1,4 @@
+# Synthetic, 2026-11-15: an empty Disallow, which disallows nothing.
+User-agent: *
+Disallow:
+Disallow: /private/

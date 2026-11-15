@@ -17,7 +17,9 @@ use news_provider::{
     AttemptSlot, CredentialRef, RawResponse, RunId, TargetWindow, TransportError, TransportKind,
     Verdict,
 };
-use open_web_feed::{OpenWebFeed, Refusal, CONTACT_CREDENTIAL, SOURCE};
+use open_web_feed::{
+    AdmittedPath, HostPin, OpenWebFeed, Refusal, RobotsPin, CONTACT_CREDENTIAL, SOURCE,
+};
 use pit::datedness::{Minute, Published};
 use pit::ObservationTime;
 
@@ -913,6 +915,57 @@ fn the_profile_paces_every_host_and_our_address_at_one_request_per_ten_seconds()
     Ok(())
 }
 
+/// Section 11.2: `per_host` is max(10 s, the largest ADMITTED host's Crawl-delay), one value for
+/// every host (§8 row R19 hole 7); per IP stays 10 s. Mutations 2026-11-15, the delays ignored /
+/// `min` for `max` / a candidate's delay counted: each red.
+#[test]
+fn a_crawl_delay_above_ten_seconds_slows_every_host_and_one_below_speeds_none_up() -> Outcome {
+    let secs = std::time::Duration::from_secs;
+    let two_rows = || {
+        OpenWebFeed::open(
+            &hosts_fixture("one_admitted_one_candidate.json"),
+            &rules_path(),
+            CONTACT,
+        )
+    };
+    let cases = [
+        (vec![(GNW_HOST, 30)], 30),
+        (vec![(GNW_HOST, 5)], 10),
+        (vec![("www.prnewswire.com", 60)], 10),
+        (vec![], 10),
+    ];
+    for (delays, expected) in cases {
+        let delays = delays
+            .iter()
+            .map(|(host, delay)| ((*host).to_owned(), secs(*delay)))
+            .collect();
+        let profile = two_rows()?.with_crawl_delays(delays).transport();
+        assert_eq!(
+            (profile.budget.min_interval, profile.budget.per_host),
+            (secs(10), Some(secs(expected)))
+        );
+    }
+    Ok(())
+}
+
+/// Section 11.2: the index url's path with its query, then the rule's `path_prefix`, per admitted
+/// row; a candidate row asks nothing.
+#[test]
+fn the_admitted_paths_are_each_admitted_index_with_its_query_and_its_rule_prefix() -> Outcome {
+    let paths = OpenWebFeed::open(
+        &hosts_fixture("one_admitted_one_candidate_index_query.json"),
+        &rules_path(),
+        CONTACT,
+    )?
+    .admitted_paths();
+    let expected = ["/rssfeed/?lang=en", "/news-release/"].map(|path| AdmittedPath {
+        host: GNW_HOST.to_owned(),
+        path: path.to_owned(),
+    });
+    assert_eq!(paths, expected.to_vec());
+    Ok(())
+}
+
 // ---- open: every refusal is raised before any request ----
 
 #[test]
@@ -1011,6 +1064,67 @@ fn a_hosts_file_admitting_no_host_is_refused() {
         refusal_of(&path, &rules_path(), CONTACT),
         Some(Refusal::NoHostAdmitted(path))
     );
+}
+
+/// Section 11.1: an admitted host's robots.txt is pinned, so a host nobody fetched robots for is
+/// not admitted. A candidate row may pin nothing (`only_admitted_hosts_are_planned` reads one).
+#[test]
+fn an_admitted_hosts_row_without_a_robots_pin_is_refused() {
+    let path = hosts_fixture("no_robots_pin.json");
+    assert_eq!(
+        refusal_of(&path, &rules_path(), CONTACT),
+        Some(Refusal::HostsUnparseable {
+            path,
+            why: format!("{GNW_HOST} is admitted and pins no robots")
+        })
+    );
+}
+
+#[test]
+fn a_robots_pin_that_is_neither_64_lowercase_hex_nor_absent_is_refused() -> Outcome {
+    let refused: Vec<bool> = [
+        "robots_pin_upper_case.json",
+        "robots_pin_short.json",
+        "robots_pin_null.json",
+    ]
+    .iter()
+    .map(|name| {
+        matches!(
+            refusal_of(&hosts_fixture(name), &rules_path(), CONTACT),
+            Some(Refusal::HostsUnparseable { why, .. }) if why.contains("pins robots to")
+        )
+    })
+    .collect();
+    assert_eq!(refused, [true; 3]);
+    let absent = OpenWebFeed::open(
+        &hosts_fixture("robots_pin_absent.json"),
+        &rules_path(),
+        CONTACT,
+    )?;
+    assert_eq!(
+        absent
+            .host_pins()
+            .first()
+            .and_then(|row| row.robots.clone()),
+        Some(RobotsPin::Absent)
+    );
+    Ok(())
+}
+
+/// The committed pin is the committed robots body's sha256, so a refresh answered with that body
+/// matches it (`newsvault`'s `tests/robots_refresh.rs`).
+#[test]
+fn the_committed_hosts_file_pins_the_committed_robots_body() -> Outcome {
+    let body = gnw("robots_rss_globenewswire_com.txt");
+    assert_eq!(
+        provider()?.host_pins(),
+        vec![HostPin {
+            host: GNW_HOST.to_owned(),
+            admitted: true,
+            robots: Some(RobotsPin::Sha256(FileDigest::of(&body).hex().to_owned())),
+        }]
+    );
+    Ok(())
 }
 
 #[test]

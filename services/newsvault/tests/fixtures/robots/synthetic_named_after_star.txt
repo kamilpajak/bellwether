@@ -1,0 +1,6 @@
+# Synthetic, 2026-11-15: a named group after * whose Allow ties the * Disallow.
+User-agent: *
+Disallow: /rssfeed/
+
+User-agent: bingbot
+Allow: /rssfeed/
