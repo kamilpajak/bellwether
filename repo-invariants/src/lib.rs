@@ -3,8 +3,9 @@
 //! Nothing depends on this crate; its product is a failing test whose message says what to add.
 //!
 //! Row G1 is this file, in two halves because inheriting a table says nothing about what it
-//! holds. Row R4's manifest half is [`clients`] and its clock half is [`clocks`]; the size step's
-//! own precondition is [`layout`]. Row R2's doc-test switch is [`doctests`].
+//! holds. Row R4's manifest half is [`clients`], its clock half [`clocks`] and its no-sink half
+//! [`sinks`]; the size step's own precondition is [`layout`]. Row R2's doc-test switch is
+//! [`doctests`].
 //!
 //! The member set comes from `cargo metadata`, never from `workspace.members`: measured
 //! 2026-11-12 on cargo 1.99.1, a crate reached only by a `path` dependency from inside the
@@ -20,6 +21,7 @@ pub mod clients;
 pub mod clocks;
 pub mod doctests;
 pub mod layout;
+pub mod sinks;
 
 const MANIFEST: &str = "Cargo.toml";
 /// The two lines a crate needs in its own manifest to inherit the floor, indented for a message.

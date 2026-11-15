@@ -363,6 +363,16 @@ pub enum PlanRefusal {
         cadence: &'static str,
         why: &'static str,
     },
+    /// A live-only provider asked for any window but exactly the run's own UTC day
+    /// (architecture.md section 11.1): no `vendor_archive` request can exist for it.
+    #[error(
+        "{source_id} collects only the run's UTC day {run_day}, and window {window} is not it"
+    )]
+    NotTheRunDay {
+        source_id: String,
+        window: String,
+        run_day: NaiveDate,
+    },
 }
 
 const HAS_NO_CALENDAR: &str = "has no calendar";

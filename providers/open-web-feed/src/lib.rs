@@ -1,4 +1,463 @@
 //! Our own forward news feed: dated indexes and article pages from admitted hosts, collected live
-//! for the run's UTC day only. The design is `docs/design/architecture.md` section 11; this crate
-//! is its build-order step 1 and holds nothing yet. It declares no HTTP dependency and holds no
-//! clock and no `Sink`.
+//! for the run's UTC day only. The design is `docs/design/architecture.md` section 11; GNW is the
+//! one admitted host (section 11.5 step 2). It declares no HTTP dependency and holds no clock and
+//! no `Sink`.
+
+mod hosts;
+mod parse;
+mod rules;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+use canon::{Digest, FileDigest};
+use chrono::NaiveDateTime;
+use news_provider::provider::{
+    Cadence, Calendar, CollectedItem, Extracted, ExtractedBody, Listing, Plan, PlanRefusal,
+    Provenance, Provider, RawBlob, UnusableReason, UnusableRow, ValidPrecision, ValidSource,
+};
+use news_provider::request::{days_of, HeaderValue, Request, RequestPhase};
+use news_provider::wire::{RawResponse, Timeouts, TransportError, TransportProfile};
+use news_provider::{CredentialRef, RequestBudget, SourceId, TargetWindow, Verdict};
+use pit::datedness::{Minute, Published};
+use pit::ObservationTime;
+use serde_json::{Map, Value};
+
+use crate::hosts::{read_hosts, HostRow, Hosts, HOSTS_SCHEMA};
+use crate::rules::{parse_rules, Rule, RULES_SCHEMA};
+
+pub const SOURCE: &str = "open_web_wires";
+/// The User-Agent, a product token plus a contact address, travels by NAME as SEC's does
+/// (architecture.md section 3.2's `filter_params` row); its own name, not another vendor's.
+pub const CONTACT_CREDENTIAL: &str = "open_web_contact";
+
+const OK: u16 = 200;
+const TOO_MANY_REQUESTS: u16 = 429;
+const SERVER_ERRORS: std::ops::RangeInclusive<u16> = 500..=599;
+const SCHEMES: [&str; 2] = ["https://", "http://"];
+/// An ASSUMPTION taken by default, as edgar-press's is: nothing here has timed a GNW response.
+const VENDOR_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+/// The largest page of the 2026-11-14 probes was 979,950 B (cnbc.com), the GNW article 71,657 B
+/// and the GNW RSS 36,687 B, all as decompressed by curl (§11.6's method).
+const BODY_LIMIT: u64 = 2 * 1_024 * 1_024;
+/// Section 11.1's floor and section 11.2's one interval for every host; per IP the same, because
+/// no measurement places a smaller one.
+const INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Why no request may be made at all, each raised by `open` before the first request.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum Refusal {
+    #[error("no hosts file at {0}")]
+    HostsAbsent(PathBuf),
+    #[error("the hosts file at {path} is present and is not {HOSTS_SCHEMA}: {why}")]
+    HostsUnparseable { path: PathBuf, why: String },
+    /// Either file: a field nothing reads is a setting nobody applies.
+    #[error("{path} holds the field {field}, which this reader does not know")]
+    UnknownField { path: PathBuf, field: String },
+    #[error("the hosts file at {path} names {host} twice")]
+    DuplicateHost { path: PathBuf, host: String },
+    #[error("the hosts file at {path} names {host}, which no per-host pace file can be keyed on")]
+    NotAHost { path: PathBuf, host: String },
+    #[error(
+        "the hosts file at {path} reads {host} under rule {rule}, which the rules do not hold"
+    )]
+    UnknownRule {
+        path: PathBuf,
+        host: String,
+        rule: String,
+    },
+    /// The index would be asked of a host the row did not admit.
+    #[error("the hosts file at {path} reads the index of {host} from {url}, which is elsewhere")]
+    IndexOffHost {
+        path: PathBuf,
+        host: String,
+        url: String,
+    },
+    /// R6: zero admitted rows plans zero requests, which reads as a quiet day.
+    #[error("the hosts file at {0} admits no host")]
+    NoHostAdmitted(PathBuf),
+    #[error("no extraction rules at {0}")]
+    RulesAbsent(PathBuf),
+    #[error("the rules at {path} are present and are not {RULES_SCHEMA}: {why}")]
+    RulesUnparseable { path: PathBuf, why: String },
+    #[error("the {CONTACT_CREDENTIAL} credential carries no contact address")]
+    ContactMissing,
+}
+
+#[derive(Debug)]
+pub struct OpenWebFeed {
+    hosts: Hosts,
+    rules: BTreeMap<String, Rule>,
+    rules_version: FileDigest,
+    /// Every rule's host rewrite, which `item_key` applies whatever host a url names.
+    rewrites: BTreeMap<String, String>,
+}
+
+impl OpenWebFeed {
+    /// Reads the rules, then the hosts file against them, and refuses before any request exists.
+    /// The contact is checked and not stored, as edgar-press's is.
+    pub fn open(hosts: &Path, rules: &Path, contact: &str) -> Result<Self, Refusal> {
+        usable_contact(contact)?;
+        let rules_bytes =
+            std::fs::read(rules).map_err(|_| Refusal::RulesAbsent(rules.to_path_buf()))?;
+        let parsed = parse_rules(&rules_bytes, rules)?;
+        let mut rewrites = BTreeMap::new();
+        for rule in parsed.values() {
+            for (from, to) in &rule.rewrite_hosts {
+                if rewrites
+                    .insert(from.clone(), to.clone())
+                    .is_some_and(|was| was != *to)
+                {
+                    return Err(Refusal::RulesUnparseable {
+                        path: rules.to_path_buf(),
+                        why: format!("{from} is rewritten to two hosts"),
+                    });
+                }
+            }
+        }
+        Ok(Self {
+            hosts: read_hosts(hosts, &parsed)?,
+            rules: parsed,
+            rules_version: FileDigest::of(&rules_bytes),
+            rewrites,
+        })
+    }
+
+    /// `hosts_version`: the sha256 of the hosts file as read.
+    #[must_use]
+    pub const fn hosts_version(&self) -> &FileDigest {
+        &self.hosts.version
+    }
+
+    /// The one function behind `source_item_id` and `story_of` (section 11.1): the host rewrite,
+    /// then the lowercased host plus the path, with no scheme, query or fragment. `None` for a
+    /// url with no host this crate can read. A page's canonical link never reaches it.
+    #[must_use]
+    pub fn item_key(&self, url: &str) -> Option<String> {
+        let (host, path) = self.rewritten(url)?;
+        Some(format!("{host}{path}"))
+    }
+
+    fn rewritten(&self, url: &str) -> Option<(String, String)> {
+        let (host, path) = host_and_path(url)?;
+        Some((self.rewrites.get(&host).cloned().unwrap_or(host), path))
+    }
+
+    fn admitted_row(&self, url: &str) -> Option<&HostRow> {
+        let (host, _) = host_and_path(url)?;
+        self.hosts.admitted().find(|row| row.host == host)
+    }
+
+    fn rule_for(&self, url: &str) -> Option<&Rule> {
+        self.rules.get(&self.admitted_row(url)?.rule)
+    }
+
+    fn index_request(&self, row: &HostRow, window: &TargetWindow) -> Request {
+        Request {
+            source: SourceId::new(SOURCE),
+            target_window: window.clone(),
+            phase: RequestPhase::Index,
+            provenance: Provenance::LiveIngest,
+            url: row.index_url.clone(),
+            headers: Vec::new(),
+            params: Vec::new(),
+            universe_version: empty_roster(),
+            listed_date: None,
+            hosts_version: Some(self.hosts.version.clone()),
+        }
+    }
+
+    /// Each RSS item whose rewritten link stays on the index's own host and passes the path
+    /// filter is one follow-up; the raw publication value rides `listed_date`, never sent.
+    fn index_rows_of(&self, request: &Request, raw: &RawBlob) -> Extracted {
+        let (Some(rule), Some((host, _))) =
+            (self.rule_for(&request.url), host_and_path(&request.url))
+        else {
+            return nothing();
+        };
+        // An unreadable index is `classify`'s `PermanentFailure`, so nothing extracts it.
+        let rows = parse::index_rows(&raw.bytes, rule).unwrap_or_default();
+        let mut follow_ups = Vec::new();
+        let mut filtered_out = 0;
+        for row in &rows {
+            let kept = row.link.as_deref().and_then(|link| {
+                let (at, path) = self.rewritten(link)?;
+                (at == host && path.starts_with(&rule.path_prefix))
+                    .then(|| format!("https://{at}{path}"))
+            });
+            match kept {
+                Some(url) => follow_ups.push(Request {
+                    source: SourceId::new(SOURCE),
+                    target_window: request.target_window.clone(),
+                    phase: RequestPhase::Document,
+                    provenance: request.provenance,
+                    url,
+                    headers: Vec::new(),
+                    params: Vec::new(),
+                    universe_version: empty_roster(),
+                    listed_date: row.valid_raw.clone(),
+                    hosts_version: request.hosts_version.clone(),
+                }),
+                None => filtered_out += 1,
+            }
+        }
+        Extracted {
+            items: Vec::new(),
+            follow_ups,
+            unusable: Vec::new(),
+            vendor_rows: u32::try_from(rows.len()).unwrap_or(u32::MAX),
+            filtered_out,
+        }
+    }
+
+    /// One article page, which is the one row a document payload holds.
+    fn document_of(&self, request: &Request, raw: &RawBlob) -> Extracted {
+        let Some(rule) = self.rule_for(&request.url) else {
+            return nothing();
+        };
+        let page = parse::page(&raw.bytes, rule);
+        let source_item_id = self.item_key(&request.url).unwrap_or_default();
+        let valid_raw = request.listed_date.clone().unwrap_or_default();
+        let valid = minute_of(&valid_raw, &rule.valid_format)
+            .map_or(Published::Unknown, Published::AtMinute);
+        let body = (!page.body.is_empty()).then(|| ExtractedBody::of(page.body.clone()));
+        let item = CollectedItem {
+            source: SourceId::new(SOURCE),
+            source_item_id,
+            url: request.url.clone(),
+            // `doc_id`'s input only (section 11.1). A page naming none is canonical at its url.
+            canonical_url: page.canonical.unwrap_or_else(|| request.url.clone()),
+            title: page.title.unwrap_or_default(),
+            valid,
+            valid_raw,
+            valid_field: rule.valid_field.clone(),
+            valid_source: ValidSource::VendorPublished,
+            provenance: request.provenance,
+            observed: None,
+            body,
+        };
+        let unusable = if item.source_item_id.is_empty() {
+            Some(UnusableReason::BlankSourceItemId)
+        } else if item.valid == Published::Unknown {
+            Some(UnusableReason::NoParseableValidTime)
+        } else if item.body.is_none() {
+            Some(UnusableReason::NoArticleBody)
+        } else {
+            None
+        };
+        let (items, unusable) = match unusable {
+            Some(reason) => (
+                Vec::new(),
+                vec![UnusableRow {
+                    reason,
+                    item,
+                    raw_blob: raw.digest.clone(),
+                }],
+            ),
+            None => (vec![item], Vec::new()),
+        };
+        Extracted {
+            items,
+            follow_ups: Vec::new(),
+            unusable,
+            vendor_rows: 1,
+            filtered_out: 0,
+        }
+    }
+}
+
+impl Provider for OpenWebFeed {
+    fn source(&self) -> SourceId {
+        SourceId::new(SOURCE)
+    }
+
+    fn transport(&self) -> TransportProfile {
+        TransportProfile {
+            user_agent: HeaderValue::FromCredential(CredentialRef::new(CONTACT_CREDENTIAL)),
+            timeouts: Timeouts {
+                global: VENDOR_PATIENCE,
+                per_call: VENDOR_PATIENCE,
+                resolve: VENDOR_PATIENCE,
+                connect: VENDOR_PATIENCE,
+                send_request: VENDOR_PATIENCE,
+                await_100: VENDOR_PATIENCE,
+                send_body: VENDOR_PATIENCE,
+                recv_response: VENDOR_PATIENCE,
+                recv_body: VENDOR_PATIENCE,
+            },
+            body_limit: BODY_LIMIT,
+            budget: RequestBudget {
+                min_interval: INTERVAL,
+                per_host: Some(INTERVAL),
+            },
+        }
+    }
+
+    /// `plan` refuses every window but the run's UTC day, so no other answer is reachable.
+    fn provenance(&self, _window: &TargetWindow, _at: ObservationTime) -> Provenance {
+        Provenance::LiveIngest
+    }
+
+    fn precision_ceiling(&self) -> ValidPrecision {
+        ValidPrecision::Minute
+    }
+
+    /// No roster filters this feed (section 11.1): the digest of zero bytes.
+    fn universe_version(&self) -> FileDigest {
+        empty_roster()
+    }
+
+    fn cadence(&self) -> Cadence {
+        Cadence::EveryUtcDay
+    }
+
+    /// One `Index` request per admitted host for the run's UTC day; any other window is refused
+    /// before any request (section 11.1, §8 row R10).
+    fn plan(
+        &self,
+        target: &TargetWindow,
+        calendar: Option<&Calendar>,
+        listing: Option<&Listing>,
+        at: ObservationTime,
+    ) -> Result<Plan, PlanRefusal> {
+        self.cadence().admits(&self.source(), calendar, listing)?;
+        let Some(days) = days_of(target) else {
+            return Err(PlanRefusal::TargetWindowUnreadable(
+                target.as_str().to_owned(),
+            ));
+        };
+        let run_day = at.inner().date_naive();
+        if days != [run_day] {
+            return Err(PlanRefusal::NotTheRunDay {
+                source_id: SOURCE.to_owned(),
+                window: target.as_str().to_owned(),
+                run_day,
+            });
+        }
+        let window = TargetWindow::new(run_day.to_string());
+        Ok(Plan {
+            requests: self
+                .hosts
+                .admitted()
+                .map(|row| self.index_request(row, &window))
+                .collect(),
+            not_planned: Vec::new(),
+        })
+    }
+
+    /// Bot protection (403, a challenge page) is permanent and never retried in another form
+    /// (section 11.1); so is every other 4xx but 429, a rate limit.
+    fn classify(&self, request: &Request, answer: &Result<RawResponse, TransportError>) -> Verdict {
+        let Ok(response) = answer else {
+            return Verdict::TransientFailure;
+        };
+        let Some(rule) = self.rule_for(&request.url) else {
+            return Verdict::PermanentFailure;
+        };
+        match response.status() {
+            OK => match request.phase {
+                RequestPhase::Index => match parse::index_rows(response.body(), rule) {
+                    None => Verdict::PermanentFailure,
+                    Some(rows) if rows.is_empty() => Verdict::Empty,
+                    Some(_) => Verdict::Usable,
+                },
+                RequestPhase::Document => Verdict::Usable,
+            },
+            TOO_MANY_REQUESTS => Verdict::TransientFailure,
+            status if SERVER_ERRORS.contains(&status) => Verdict::TransientFailure,
+            _ => Verdict::PermanentFailure,
+        }
+    }
+
+    fn extract(&self, request: &Request, raw: &RawBlob) -> Extracted {
+        match request.phase {
+            RequestPhase::Index => self.index_rows_of(request, raw),
+            RequestPhase::Document => self.document_of(request, raw),
+        }
+    }
+
+    fn extract_rules_version(&self) -> FileDigest {
+        self.rules_version.clone()
+    }
+
+    /// Every follow-up is live and issued; the held filter is section 11.5 step 4.
+    fn follow_ups_to_issue(
+        &self,
+        follow_ups: Vec<Request>,
+        _covered: &BTreeSet<String>,
+    ) -> Vec<Request> {
+        follow_ups
+    }
+
+    fn story_of(&self, follow_up: &Request) -> Option<Digest> {
+        canon::digest::story_id(SOURCE, &self.item_key(&follow_up.url)?).ok()
+    }
+}
+
+/// A url's lowercased host and its path (`/` when empty), without scheme, port, query or
+/// fragment. `None` for another scheme, a userinfo or port, or a host `HostKey` refuses.
+pub(crate) fn host_and_path(url: &str) -> Option<(String, String)> {
+    let rest = SCHEMES.iter().find_map(|scheme| {
+        let head = url.get(..scheme.len())?;
+        head.eq_ignore_ascii_case(scheme)
+            .then(|| url.get(scheme.len()..))
+            .flatten()
+    })?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    news_provider::HostKey::new(authority).ok()?;
+    let path = tail.split(['?', '#']).next().unwrap_or("");
+    let path = if path.is_empty() { "/" } else { path };
+    Some((authority.to_ascii_lowercase(), path.to_owned()))
+}
+
+/// The exact minute form the rule names; a value with seconds is refused by `Minute::new`.
+fn minute_of(raw: &str, format: &str) -> Option<Minute> {
+    let naive = NaiveDateTime::parse_from_str(raw.trim(), format).ok()?;
+    Minute::new(naive.and_utc()).ok()
+}
+
+fn empty_roster() -> FileDigest {
+    FileDigest::of(&[])
+}
+
+/// What a payload for a host with no admitted rule yields. `classify` closes such an answer
+/// `PermanentFailure` before anything extracts it.
+fn nothing() -> Extracted {
+    Extracted {
+        items: Vec::new(),
+        follow_ups: Vec::new(),
+        unusable: Vec::new(),
+        vendor_rows: 0,
+        filtered_out: 0,
+    }
+}
+
+/// Refuses a JSON object holding a key outside `known`.
+pub(crate) fn known_fields(
+    object: &Map<String, Value>,
+    known: &[&str],
+    path: &Path,
+) -> Result<(), Refusal> {
+    match object.keys().find(|key| !known.contains(&key.as_str())) {
+        Some(field) => Err(Refusal::UnknownField {
+            path: path.to_path_buf(),
+            field: field.clone(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// A site operator needs somebody to reach before blocking us, so an address is required.
+fn usable_contact(contact: &str) -> Result<(), Refusal> {
+    let addressed = contact.split_whitespace().any(|token| {
+        token
+            .split_once('@')
+            .is_some_and(|(local, domain)| !local.is_empty() && domain.contains('.'))
+    });
+    if addressed {
+        Ok(())
+    } else {
+        Err(Refusal::ContactMissing)
+    }
+}

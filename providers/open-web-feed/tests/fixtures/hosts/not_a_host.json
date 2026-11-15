@@ -1,0 +1,1 @@
+{"schema":"open-web-feed.hosts/1","hosts":[{"host":"[::1]","status":"admitted","index_url":"https://[::1]/rssfeed/","rule":"gnw"}]}
