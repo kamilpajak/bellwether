@@ -1886,6 +1886,59 @@ fn an_open_web_run_with_an_absent_or_empty_hosts_file_or_an_absent_rules_file_ex
     Ok(())
 }
 
+/// A usage error is reported before any input file is read, so an absent file beside it cannot
+/// turn exit 2 into exit 4. Mutation 2026-11-15: the calendar and listing checks moved back after
+/// the provider's `open` turns this red (both report the absent file).
+#[test]
+fn a_flag_error_beside_an_absent_input_file_is_still_a_usage_error() -> TestResult {
+    let root = TempDir::new()?;
+    let absent = root.path().join("absent.json");
+    let edgar = Ask {
+        calendar: None,
+        roster: Some(absent.clone()),
+        ..ask(root.path(), A_LISTED_SESSION)
+    };
+    let open_web = Ask {
+        calendar: Some(fixture("calendar.json")),
+        hosts: Some(absent.clone()),
+        ..open_web_ask(root.path(), SATURDAY_AT)
+    };
+    assert_eq!(
+        [edgar, open_web].map(|ask| refused_flag(cmd_collect::open_provider(&ask))),
+        ["required calendar", "refused calendar"]
+    );
+    let calendar = path(&fixture("calendar.json"));
+    let mut args = open_web_args(root.path(), &["--calendar", &calendar]);
+    let at = args
+        .iter()
+        .position(|arg| arg == "--hosts")
+        .ok_or("the arguments name --hosts")?;
+    args[at + 1] = path(&absent);
+    let answered = binary(&args.iter().map(String::as_str).collect::<Vec<&str>>())?;
+    assert_eq!((answered.code, answered.stdout.len()), (EXIT_USAGE, 0));
+    Ok(())
+}
+
+/// `Registered::cadence` decides the calendar and listing flags before the provider is opened, so
+/// it must be what each provider declares once open.
+#[test]
+fn every_registered_cadence_is_the_one_its_provider_declares() -> TestResult {
+    let root = TempDir::new()?;
+    let mut declared = Vec::new();
+    for ask in [
+        ask(root.path(), A_LISTED_SESSION),
+        open_web_ask(root.path(), SATURDAY_AT),
+    ] {
+        let opened = cmd_collect::open_provider(&ask)?;
+        declared.push((opened.provider.cadence(), opened.registered.cadence()));
+    }
+    assert_eq!(declared.len(), cmd_collect::Registered::ALL.len());
+    for (opened, registered) in declared {
+        assert_eq!(opened, registered);
+    }
+    Ok(())
+}
+
 /// The table's credential name is the one the provider's own User-Agent asks `Wire` for; a
 /// mismatch stores the contact where `Wire::send` never reads it. Mutation 2026-11-15: the
 /// open-web entry naming edgar's credential was green before this.

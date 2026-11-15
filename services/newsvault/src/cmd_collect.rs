@@ -181,6 +181,17 @@ impl Registered {
         }
     }
 
+    /// What the provider's `cadence()` returns once opened, known before any file is read so a
+    /// usage error is never hidden behind an absent input: review 2026-11-15 measured exit 4 for
+    /// a run that was missing `--calendar` and also named an absent roster.
+    #[must_use]
+    pub const fn cadence(self) -> Cadence {
+        match self {
+            Self::EdgarPress => Cadence::SessionBound,
+            Self::OpenWebWires => Cadence::EveryUtcDay,
+        }
+    }
+
     /// (flag, taken): `roster` is `edgar-press`'s universe, `hosts` is `open-web-feed`'s.
     const fn own_files(self) -> [(&'static str, bool); 2] {
         let edgar = matches!(self, Self::EdgarPress);
@@ -257,6 +268,9 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
     let [roster, hosts] = registered.own_files();
     given(ask.roster.as_ref(), roster.0, registered, roster.1)?;
     given(ask.hosts.as_ref(), hosts.0, registered, hosts.1)?;
+    let session_bound = registered.cadence() == Cadence::SessionBound;
+    given(ask.calendar.as_ref(), "calendar", registered, session_bound)?;
+    given(ask.listing.as_ref(), "listing", registered, session_bound)?;
     let (provider, hosts_version, lag): (Box<dyn Provider>, _, _) = match registered {
         Registered::EdgarPress => {
             let roster = required(ask.roster.as_ref(), roster.0, registered)?;
@@ -284,9 +298,6 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
             (Box::new(provider), Some(version), None)
         }
     };
-    let session_bound = provider.cadence() == Cadence::SessionBound;
-    given(ask.calendar.as_ref(), "calendar", registered, session_bound)?;
-    given(ask.listing.as_ref(), "listing", registered, session_bound)?;
     Ok(Opened {
         registered,
         provider,

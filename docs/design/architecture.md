@@ -1037,18 +1037,18 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
   - Built 2026-11-15: `Provider::cadence()` returns `Cadence::{SessionBound, EveryUtcDay}`; `news_provider::collect` refuses a calendar or listing the cadence does not take, and a missing one it needs, with `PlanRefusal::InputsDoNotMatchCadence` before the startup sweep reads the archive; `--dry-run` refuses the same way, untested. No CLI input reaches either refusal: `cmd_collect::open_provider` refuses the same mismatch first, from the flags, before the store is read (below).
   - Tests, each turned red by one mutation 2026-11-15: `edgar_press_declares_itself_session_bound` (declaration set to `EveryUtcDay`); `an_every_utc_day_provider_is_not_held_to_the_listed_session_check` (check run unconditionally); `a_session_bound_provider_that_asks_for_a_closed_day_is_still_named` (check never run); `a_session_bound_run_with_no_calendar_is_refused_before_any_request` (driver check removed: the archive is read first).
 - `collect` takes `--calendar` and `--listing` per provider; the open-web run takes neither. Accounting is per (day, host).
-  - Built 2026-11-15 in `cmd_collect::open_provider` over the table `cmd_collect::Registered` (source, credential name, contact variable, own files):
+  - Built 2026-11-15 in `cmd_collect::open_provider` over the table `cmd_collect::Registered` (source, credential name, contact variable, own files, cadence):
 
 | flag | `edgar_press` | `open_web_wires` | decided by |
 |---|---|---|---|
-| `--calendar`, `--listing` | required | refused | the provider's `Cadence` |
+| `--calendar`, `--listing` | required | refused | `Registered::cadence`, equal to the opened provider's `Cadence` (`every_registered_cadence_is_the_one_its_provider_declares`) |
 | `--roster` | required | refused | the table |
 | `--hosts` | refused | required | the table |
 | `--lag-policy` | optional | refused (live only) | `open_provider` |
 | `--rules` | required: the chosen provider's file | same | clap |
 | contact variable | `BELLWETHER_SEC_CONTACT` | `BELLWETHER_FEED_CONTACT` | the table |
 
-  - A missing required flag or a refused one is `invalid_argument`, exit 2, before any store read, write or send: `an_open_web_run_refuses_a_calendar_or_listing_flag`, `an_edgar_run_without_a_calendar_is_a_usage_error` (mutation 2026-11-15, the cadence check dropped: both red; the roster/hosts check dropped: the second red; the lag-policy check dropped: the first red); `an_open_web_run_reads_its_contact_from_its_own_variable` (mutation 2026-11-15, both entries on the SEC variable: red).
+  - A missing required flag or a refused one is `invalid_argument`, exit 2, before any input file, store read, write or send: `a_flag_error_beside_an_absent_input_file_is_still_a_usage_error` (mutation 2026-11-15, the calendar/listing checks after the provider's `open`: red; review 2026-11-15 measured exit 4 there before the move); `an_open_web_run_refuses_a_calendar_or_listing_flag`, `an_edgar_run_without_a_calendar_is_a_usage_error` (mutation 2026-11-15, the cadence check dropped: both red; the roster/hosts check dropped: the second red; the lag-policy check dropped: the first red); `an_open_web_run_reads_its_contact_from_its_own_variable` (mutation 2026-11-15, both entries on the SEC variable: red).
   - `--window today` is the UTC date of `--at` (`cmd_collect::target_of`); the envelope's `window` is the resolved day: `window_today_resolves_to_the_utc_date_of_at`, run under `TZ=Pacific/Kiritimati` with `--at` 23:30Z (mutation 2026-11-15, `chrono::Local`'s date: red).
   - An `EveryUtcDay` run (not a dry run) whose `--at` is not the clock's UTC day is `invalid_argument`, before the envelope is written: `an_open_web_run_whose_at_is_not_the_clocks_day_is_refused_before_anything_is_written` (mutation 2026-11-15, check removed: red). A dry run may name another day.
   - A dry run plans one index request per admitted host and writes nothing: `an_open_web_dry_run_plans_one_index_request_per_admitted_host_and_writes_nothing`.
