@@ -179,8 +179,8 @@ pub enum UnusableReason {
     ArticleContainerAmbiguous,
 }
 
-/// Which input decided an [`UnusableReason`]. Not a method on the reason: edgar reads its
-/// `BlankSourceItemId` off the page, open-web reads its own off the url the index gave.
+/// Which input decided an [`UnusableReason`]. Not a method on the reason: `NoParseableValidTime`
+/// is `IndexRow` in open-web and `Page` in edgar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecidedBy {
     /// The index row the request was planned from, which a later listing can correct: such a

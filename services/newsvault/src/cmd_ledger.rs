@@ -126,7 +126,8 @@ pub struct SourceRow {
     /// held their story. Subtracted from `vendor_rows` before the zero-rows finding.
     pub held: i64,
     /// Section 11.1: unusable rows the index row decided. Such a story is fetched again by every
-    /// poll, so this is the count of those refetches. Not subtracted before the zero-rows finding.
+    /// poll, so this counts one per fetch of such a story, the first fetch included. Not
+    /// subtracted before the zero-rows finding.
     pub listing_unusable: i64,
     pub items_new: i64,
     pub rows_committed: i64,

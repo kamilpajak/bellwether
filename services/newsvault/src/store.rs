@@ -1014,12 +1014,8 @@ impl Committer {
         Ok(covered)
     }
 
-    /// Section 11.1's held set: keyed on (source, story) over every target window, so a story
-    /// held under yesterday's window is held today. No cutoff, for the reason
-    /// [`Committer::covered_story_ids`] gives. A permanent failure answered with a 3xx holds
-    /// nothing, nor does a usable attempt with a `listing_unusable` row. A NULL status or count
-    /// (a transport error, a row closed before user_version 4) is still held through the
-    /// `COALESCE`s: without them the `NOT (...)` is NULL and drops the row.
+    /// Section 11.1's held read. A NULL status or count is held through the `COALESCE`s: without
+    /// them SQLite evaluates the `NOT (...)` to NULL and drops the row.
     pub fn held_story_ids(&self, source: &SourceId) -> Result<BTreeSet<String>, StoreError> {
         let mut statement = self.db.prepare(
             "SELECT i.story_id FROM items i
@@ -3588,7 +3584,7 @@ mod tests {
 
     /// Section 11.1, owner decision of 2026-11-15: a usable document with an unusable row the
     /// index row decided holds nothing; a page-decided one (count 0) and a row closed before
-    /// user_version 4 (count NULL) hold. Mutations 2026-11-15 are in §8 row R16.
+    /// user_version 4 (count NULL) hold. Mutations 2026-11-15 are in §11.1 (the held read).
     #[test]
     fn a_usable_document_with_a_listing_unusable_row_holds_nothing_and_a_v3_or_page_one_holds(
     ) -> TestResult {
