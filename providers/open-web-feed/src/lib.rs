@@ -226,7 +226,10 @@ impl OpenWebFeed {
             source_item_id,
             url: request.url.clone(),
             // `doc_id`'s input only (section 11.1). A page naming none is canonical at its url.
-            canonical_url: page.canonical.unwrap_or_else(|| request.url.clone()),
+            canonical_url: page
+                .canonical
+                .and_then(|href| absolute(&href, &request.url))
+                .unwrap_or_else(|| request.url.clone()),
             title: page.title.unwrap_or_default(),
             valid,
             valid_raw,
@@ -409,6 +412,22 @@ pub(crate) fn host_and_path(url: &str) -> Option<(String, String)> {
     let path = tail.split(['?', '#']).next().unwrap_or("");
     let path = if path.is_empty() { "/" } else { path };
     Some((authority.to_ascii_lowercase(), path.to_owned()))
+}
+
+/// A canonical href as an absolute url: as written when it already is one, a root- or
+/// scheme-relative one resolved against `base`, anything else `None`. Another host is kept, because
+/// `doc_id` is a cross-source identity.
+fn absolute(href: &str, base: &str) -> Option<String> {
+    if host_and_path(href).is_some() {
+        return Some(href.to_owned());
+    }
+    if let Some(rest) = href.strip_prefix("//") {
+        let resolved = format!("https://{rest}");
+        return host_and_path(&resolved).is_some().then_some(resolved);
+    }
+    let (host, _) = host_and_path(base)?;
+    href.starts_with('/')
+        .then(|| format!("https://{host}{href}"))
 }
 
 /// The exact minute form the rule names; a value with seconds is refused by `Minute::new`.

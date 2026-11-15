@@ -49,6 +49,12 @@ const SYNTHETIC_INDEX: &str = "synthetic_index_one_release.xml";
 const SYNTHETIC_PAGE: &str = "synthetic_canonical_differs.html";
 const SYNTHETIC_CANONICAL: &str =
     "https://www.globenewswire.com/en/news-release/2026/11/14/9999999/0/en/a-renamed-slug.html";
+const RELATIVE_CANONICAL_PAGE: &str = "synthetic_relative_canonical.html";
+const RELATIVE_CANONICAL: &str = "/en/news-release/2026/11/14/3403075/0/en/a-relative-slug.html";
+const SCHEME_RELATIVE_CANONICAL: &str =
+    "//rss.globenewswire.com/en/news-release/2026/11/14/3403075/0/en/a-relative-slug.html";
+const RESOLVED_CANONICAL: &str =
+    "https://rss.globenewswire.com/en/news-release/2026/11/14/3403075/0/en/a-relative-slug.html";
 const NO_CONTAINER_PAGE: &str = "synthetic_no_article_container.html";
 const BOT_PROTECTION_PAGE: &str = "akamai_403_access_denied.html";
 const ARTICLE_PARAGRAPHS: usize = 3;
@@ -547,6 +553,36 @@ fn the_follow_up_story_equals_the_item_story_on_a_page_whose_canonical_link_diff
     assert_eq!(
         provider.story_of(&follow_up),
         story_id(SOURCE, &item.source_item_id).ok()
+    );
+    Ok(())
+}
+
+/// Review 2026-11-15: a root-relative canonical href reached `doc_id` as the bare path, so two
+/// hosts serving one path shared a `doc_id`. A path-relative or non-web href is the page's url.
+#[test]
+fn a_relative_canonical_link_is_resolved_against_the_page_url_before_it_reaches_doc_id() -> Outcome
+{
+    let provider = provider()?;
+    let request = article_request(&provider)?;
+    let page = String::from_utf8(gnw(RELATIVE_CANONICAL_PAGE))?;
+    let mut canonicals = Vec::new();
+    for href in [
+        RELATIVE_CANONICAL,
+        SCHEME_RELATIVE_CANONICAL,
+        "a.html",
+        "javascript:void(0)",
+    ] {
+        let written = page.replace(RELATIVE_CANONICAL, href).into_bytes();
+        canonicals.push(only_item(&provider.extract(&request, &blob(written)))?.canonical_url);
+    }
+    assert_eq!(
+        canonicals,
+        [
+            RESOLVED_CANONICAL,
+            RESOLVED_CANONICAL,
+            ARTICLE_URL,
+            ARTICLE_URL
+        ]
     );
     Ok(())
 }
