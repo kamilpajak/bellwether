@@ -199,8 +199,8 @@ impl TransportError {
         }
     }
 
-    /// A 3xx whose body is over `body_limit` keeps its status, so the held read's 3xx exclusion
-    /// sees it (architecture.md section 11.1).
+    /// The head's status when the body read failed after it (over `body_limit` or cut short), so a
+    /// 3xx stays visible to the held read's 3xx exclusion (architecture.md section 11.1).
     #[must_use]
     pub const fn with_status(mut self, status: u16) -> Self {
         self.status = Some(status);
