@@ -69,6 +69,8 @@ pub enum AttemptEvent {
         /// Read off the request rather than passed in beside it, so the roster a run filtered by
         /// is on every `Opened` row and no caller can leave it off.
         universe_version: FileDigest,
+        /// Read off the request for the same reason; never inside `filter_params`.
+        hosts_version: Option<FileDigest>,
         opened_at: ObservationTime,
     },
     Answered {
@@ -333,6 +335,7 @@ impl AttemptSlot {
             target_window: request.target_window.clone(),
             filter_params: request.filter_params()?,
             universe_version: request.universe_version.clone(),
+            hosts_version: request.hosts_version.clone(),
             opened_at: at,
         })?;
         Ok(Self {
@@ -531,6 +534,7 @@ pub(crate) mod tests {
             url: URL.to_owned(),
             universe_version: FileDigest::of(ROSTER),
             listed_date: None,
+            hosts_version: None,
             headers: vec![(
                 HeaderName::new("Accept"),
                 HeaderValue::Literal("text/plain".to_owned()),

@@ -210,6 +210,7 @@ impl EdgarPress {
             params: Vec::new(),
             universe_version: self.roster.version.clone(),
             listed_date: None,
+            hosts_version: None,
         }
     }
 
@@ -226,6 +227,7 @@ impl EdgarPress {
             params: Vec::new(),
             universe_version: self.roster.version.clone(),
             listed_date: Some(row.filed.clone()),
+            hosts_version: None,
         }
     }
 

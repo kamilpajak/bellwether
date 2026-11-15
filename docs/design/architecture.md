@@ -69,7 +69,7 @@
 | `snapshot_id` | sha256 over the cutoff, then the list of `item_id` in scope in ascending `seq` (`canon::digest::snapshot_id`). No production caller (§8 row R7) | A date range is not reproducible: the archive grows under it. A snapshot is a set. The list and the cutoff are also manifest fields (§3.0), because neither can be read back out of a digest. |
 | `rule_version` | sha256 of the rules file's bytes (§3.3) | Rules as constants in code cannot be diffed or tested: when a hand-written gazetteer wrongly removed a real company, there was no version, no test and no record (§3.3). |
 | `calendar_version` | sha256 of the session calendar file, half-days and DST included | A half-day close is a fact that changes results and is easy to get silently wrong. Its own file, not a group inside the rules file (§3.3): a calendar edit and a rule edit are then two diffs, which R18 needs. |
-| `hosts_version` | sha256 of one SourceId's hosts file (§11.1, no code) | Names which hosts and paces a run was allowed to use. Kept apart from `universe_version`, the ticker roster. |
+| `hosts_version` | sha256 of one SourceId's hosts file (§11.1; the hosts loader has no code). Carried by `news_provider::Request.hosts_version` through `AttemptEvent::Opened` into `attempts.hosts_version`, outside `filter_params`; every request today carries `None`, so the column holds only NULL | Names which hosts and paces a run was allowed to use. Kept apart from `universe_version`, the ticker roster. Rejected: inside `filter_params`; it decides admission and pace, not what the vendor is asked, and edgar's `filter_params` and `attempt_id` digests stay byte-identical (`two_runs_whose_rosters_differ_have_two_filter_params_digests` and the `canon` vectors unchanged, 2026-11-15) |
 | `universe_version` | sha256 of the roster the panel's tickers are drawn from, as of the snapshot's cutoff, with delisted names either included or named as absent | **Survivorship, measured by the predecessor in both directions:** 18 tickers added retrospectively on 2026-04-19 contributed about 0.3 of an OOS α t, and a PIT-95 sub-universe moved that t from 1.70 to 1.36; including delisted M&A targets flipped a train α t from +0.80 to −0.86 (`docs/inherited/paradigm_failures_postmortem.md:64` and `:67`). Without the roster as a named input a panel is reproducible and survivorship-biased at once, and `panel_id` hashes it happily. Enforcement: §8 row U1. |
 | `relation_map_version` | sha256 of the relation map `derive` reads (§4) | `has_relation` is the statistics tier's control arm and a model build sets it. Without this input a flipped control arm cannot be attributed to the build that flipped it; `brief_id` already does that for prompts. |
 | `panel_id` | sha256 over (`snapshot_id`, `rule_version`, `calendar_version`, `universe_version`, `relation_map_version`, row set); the gate requires three of these (§8 row U1) | A panel that cannot name its inputs cannot be re-derived, and a number whose panel cannot be re-derived is an anecdote. The row set means §3.10.1's rows in canonical form, not the Arrow file's bytes. Measured 2026-11-12 over one four-row panel conforming to §3.10.1, two counterparties in its first row: arrow-rs 60.1.0 writes 2,578 bytes, pyarrow 24.0.0 writes 2,050, and two record batches make 2,634, so the container cannot be the digest input. Those sizes hold for that panel's own strings and metadata and no fixture is committed: a reader's own four-row panel reproduces the **disagreement**, not the sizes (pyarrow 24.0.0 over one built to this table on 2026-11-12: 2,202 in one batch, 2,786 in two). The disagreement is the claim. |
@@ -137,9 +137,22 @@
 ### 3.1 `Item` — what `vault` stores and publishes
 
 - The archive record; every consumer sees this shape, none the storage behind it.
-- Stored today: `items` in `SCHEMA` (`services/newsvault/src/store.rs`),
-  exported as `publish::SegmentRow` with `source` joined from `attempts`; `requested_at` and
-  `received_at` live on `attempts`, reached through `attempt_id`.
+- Stored today: `items` in `services/newsvault/src/store.rs` at `PRAGMA user_version` 1: the
+  frozen v0 DDL `SCHEMA_V0` plus `MIGRATIONS[0]`; exported as `publish::SegmentRow` with `source`
+  joined from `attempts`; `requested_at` and `received_at` live on `attempts`, reached through
+  `attempt_id`.
+- Schema versioning (§11.1), since 2026-11-15:
+  - every store, new or old, is created from `SCHEMA_V0` and migrated in one transaction by
+    `Committer::open`; a user_version above 1 is refused (`StoreError::SchemaVersion`):
+    `a_store_at_an_unknown_higher_user_version_is_refused` (mutation 2026-11-15, refusal removed:
+    red).
+  - a v0 store opens, migrates and takes a row: `a_store_at_the_previous_user_version_opens_and_migrates`
+    (mutation 2026-11-15, migration loop removed: red).
+  - `items` and `ledger` open read-only, cannot migrate, and refuse every user_version but 1 with
+    `StoreError::SchemaVersion`, exit 2: `a_reader_refuses_a_store_at_another_user_version`
+    (mutation 2026-11-15, the check removed from either reader: red).
+  - so a v0 store is unreadable by `items` and `ledger` until a writer (`collect`, `publish`) opens
+    it.
 - No column today: `source_item_id`, `provenance` (§8 row R10), `data_through` (§8 row R13),
   `title`, `url`, `lang`, `body_ref`'s `present` \| `expired` state,
   `vendor_tickers`, `vendor_duplicate_flag`.
@@ -157,6 +170,7 @@
 | `data_through` | instant | **R13.** The latest fact the payload covers, not when it arrived |
 | `committed_at` | instant | **R13.** |
 | `seq` | monotonic integer | **R13.** The ordering authority |
+| `valid_raw`, `valid_field`, `valid_source` | strings; `valid_source` is `vendor_published` \| `our_extraction` (`ValidSource::name`) | the evidence beside the publication value, so a replay re-parses it and a fabricated stamp has to forge evidence. Copied from `CollectedItem` by `Committer::rows_of`: `an_items_row_keeps_the_raw_publication_value_its_field_and_its_source` (mutations 2026-11-15, `rows_of` writes an empty `valid_raw` / `record` writes NULL `valid_source`: red). Nullable, NULL only on rows committed at user_version 0: `ALTER TABLE ADD COLUMN` cannot add `NOT NULL` without a default; nothing yet reads them |
 | `valid_precision` | `instant` \| `day` \| `unknown` | A publication time scraped from page metadata is often a date with no hour, which no pre-close window can take. So precision is the **shape** of `pit::datedness::Datedness`, not a column beside the value: a `day` value is a `NaiveDate` no constructor folds into an instant |
 | `valid_disputed` | bool | **R15.** Set on the ARRIVING row when another `item_id` under its `story_id` carries a **different** publication value, from another source or the same source re-stamping its own row (the archive's case: §2, 501 ids). Rejected: "materially different", a threshold no measurement places. Never set on the twin, so the stored row stays byte-identical |
 | `earliest_valid_at` | `ValidTime?` | **R15.** The earliest publication value the store holds for this `story_id`, on the disputed row only. Neither value is moved: a disputed date is an **unknown** age, never an old one |
@@ -224,7 +238,7 @@
 - One row per attempt, written **whether or not anything came back**, so "nothing happened" and "we
   did not look" differ. The predecessor could not tell them apart: one day held 59 items against a
   median of 181 and nothing recorded which it was.
-- Stored as `attempts` in `SCHEMA` (`services/newsvault/src/store.rs`), written from
+- Stored as `attempts` in `services/newsvault/src/store.rs` (user_version 1, §3.1), written from
   `news_provider::ledger::AttemptEvent`; every field below is a column there except
   `result_digest`, and the table holds more (`universe_version`, `matched`, `baseline_*`, `closed_at`).
 
@@ -232,6 +246,7 @@
 |---|---|
 | `attempt_id`, `source`, `target_window` | what was asked for |
 | `filter_params` | what the vendor was asked, not what we meant to ask: sha256, in §2's canonical form, over every sent (name, value) pair plus the roster digest `universe_version`, ordered by name over raw UTF-8 bytes, a credential by name only (`Request::filter_params`) |
+| `hosts_version` | the hosts file the request's host was admitted under (§2), from `Request.hosts_version` via `Opened`; outside `filter_params`. NULL for a provider that reads no hosts file, which is every request today: `the_opened_row_carries_the_hosts_version_the_request_was_built_from` (mutation 2026-11-15, `Opened` carries `None`: red) |
 | `requested_at`, `received_at`, `transport_status` | |
 | `outcome` | `ok` \| `empty` \| `failed` \| `interrupted` \| `collapsed`; the built four are `news_provider::ledger::OutcomeKind::name`, `collapsed` is designed and NOT built (below) |
 | `vendor_rows`, `items_new` | **R16.** Rows the payload held before our filtering; first sightings per `story_id` (§8 row R16). Written when `items_new` is zero, so poll events are recoverable, not only content changes: content-hash dedup is right for storage and destroys exactly this |
@@ -566,7 +581,7 @@ Draw voting:
 | `input_absent` | a required input file is missing (row 1). `vault`, `panel-contract` |
 | `day_absent` | narrower: the store is there, the day is not in it (row 1), kept apart for the reason the coverage ledger exists. `vault`. Measured 2026-11-12, two states reach it through one `LakeError::MissingDay`: an absent partition directory, and one holding no run file |
 | `input_unparseable` | the file is present and is not what the contract says. `vault`, `panel-contract` |
-| `input_schema_mismatch` | a required column is absent or has an unusable type. `vault` |
+| `input_schema_mismatch` | a required column is absent or has an unusable type; or the commit log's `user_version` is above the writer's, or is not the one `items` and `ledger` read (`StoreError::SchemaVersion`, §3.1). `vault` |
 | `io_failed` | a read or write the filesystem refused for another reason. Every CLI |
 | `roster_absent` | the in-universe roster is missing or names no CIK. `vault`'s `collect`, before the first request |
 | `credential_contact_missing` | the User-Agent carries no contact address. A startup refusal, never a vendor event in the coverage ledger |
@@ -896,7 +911,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
 ---
 
-## 11. `open-web-feed` — our own forward news feed (decided 2026-11-14; only the §11.5 step 1 skeleton exists)
+## 11. `open-web-feed` — our own forward news feed (decided 2026-11-14; the §11.5 step 1 skeleton and part of step 2 exist)
 
 - Every line in §11.1 and §11.2 is an owner decision of 2026-11-14, except the `ValidSource` cells of §11.1's valid-time table and the bullet below that table, both decided 2026-11-15.
 
@@ -948,7 +963,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
 - `Usable`, `Empty`, `PermanentFailure`, `TransientFailure` are `news_provider::ledger::Verdict` arms; today §3.2's `OutcomeKind` maps both failures to `failed` (`ledger.rs:216`). `Finalised` carries `Outcome`, not the `Verdict` (`news_provider::ledger::AttemptEvent::Finalised`), so permanence is not stored until §11.5 step 4.
 - New columns `attempts.story_id` and `attempts.held`; `ledger --check` subtracts `held`. First sighting is unchanged: a skip writes no item. So R15 cannot see a re-stamped time of a held story; the index value survives only in the attempt's raw blob.
-- Schema versioned with `PRAGMA user_version`, read at `Committer::open`: a lower version is migrated by explicit `ALTER TABLE` (a table rebuild for a `CHECK` change); an unknown higher version is refused.
+- Schema versioned with `PRAGMA user_version`, read at `Committer::open`: a lower version is migrated by explicit `ALTER TABLE` (a table rebuild for a `CHECK` change); an unknown higher version is refused. Built 2026-11-15 at user_version 1 (§3.1); step 2 grows that one migration rather than adding a version per commit.
 
 ### 11.2 POC
 
@@ -960,7 +975,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - The robots and floor checks run in `newsvault` (only the driver reads the store); it hands the provider the Crawl-delay parsed from the pinned robots blob.
 - Redirects refused: `TransportProfile.redirects = Refuse` sets `max_redirects(0)`; a 3xx is a `PermanentFailure`, which closes R19 hole 9 by refusal.
 - One interval for all hosts: every admitted host is at 10 s. R19 hole 7 stays open.
-- Decided: `ValidPrecision::Minute` for GNW's minute-resolution `pubDate`. It needs a `pit::datedness::Published` arm, a `canon` stamp arm with a committed vector, and a store `CHECK` change (step 2). `items` gains `valid_raw`, `valid_field`, `valid_source`.
+- Decided: `ValidPrecision::Minute` for GNW's minute-resolution `pubDate`. It needs a `pit::datedness::Published` arm, a `canon` stamp arm with a committed vector, and a store `CHECK` change (step 2), none built yet. `items.valid_raw`, `valid_field`, `valid_source` exist since 2026-11-15 (§3.1), nullable until that `CHECK` rebuild.
 
 | window (UTC) | poll every | run stops issuing requests when busy time would pass |
 |---|---|---|
@@ -1015,6 +1030,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
    - `ureq` added: `only_the_seam_crate_declares_an_http_client` and `the_seam_crate_declares_the_only_client_this_workspace_holds` (R4)
    - a `Utc::now` read added: `no_provider_and_no_part_of_the_seam_outside_wire_and_clock_reads_a_clock` (R4)
 2. GNW end to end, the largest PR (touches `pit`, `canon`, `news-provider`, `newsvault` and the new crate): hosts loader, provider table in `cmd_collect` (replacing the single `EdgarPress`); index and document parsers, `item_key`, `Provider::story_of`, `NoArticleBody`; schema versioning, `items` valid-time columns, `hosts_version` column and envelope field; `Minute` precision; conformance declaration and per-(day, host) accounting in `plan_accounts_for_every_day`; per-provider `--calendar`/`--listing`, `--window today`; an end-to-end test.
+   - Built so far (2026-11-15): schema versioning at user_version 1, `items.valid_raw`/`valid_field`/`valid_source`, `attempts.hosts_version` (§3.1, §3.2). Not yet: the envelope field, a non-`None` `Request.hosts_version`, everything else in this step.
 3. Robots refresh command; `newsvault` checks the pinned digest and the floor.
 4. Held filter: `Finalised` carries the `Verdict`, `attempts.story_id`, `attempts.held`, live covered set, ledger check. Amends R16 and R20.
 5. Redirect refusal and 3xx classification, with a loopback stub.

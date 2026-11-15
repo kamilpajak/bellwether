@@ -46,6 +46,17 @@ pub enum ValidSource {
     OurExtraction,
 }
 
+impl ValidSource {
+    /// The `items.valid_source` label, in one place.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::VendorPublished => "vendor_published",
+            Self::OurExtraction => "our_extraction",
+        }
+    }
+}
+
 /// What architecture.md section 3.1's `valid_precision` column says, derived from the value rather
 /// than carried beside it, so the two cannot disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

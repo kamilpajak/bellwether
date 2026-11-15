@@ -14,7 +14,8 @@ use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
 use crate::store::{
-    coverage_up_to, unpublished_seq_ranges, SeqRange, WindowCoverage, COMMIT_LOG, RUNS_DIR,
+    coverage_up_to, require_current_version, unpublished_seq_ranges, SeqRange, WindowCoverage,
+    COMMIT_LOG, RUNS_DIR,
 };
 
 pub const SCHEMA: &str = "newsvault.ledger/1";
@@ -230,6 +231,7 @@ pub fn read(root: &Path, ask: &Ask) -> Result<Report, LedgerReadError> {
         return Err(LedgerReadError::StoreAbsent(log));
     }
     let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    require_current_version(&db)?;
     let at = stamp(ask.at);
     let (envelopes, unreadable_runs) = read_envelopes(&root.join(RUNS_DIR), ask.at);
     let grouped = grouped_attempts(&db, &at)?;

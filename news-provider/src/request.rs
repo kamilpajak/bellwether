@@ -111,6 +111,10 @@ pub struct Request {
     /// The date the listing row behind a `Document` follow-up carries, as its column reads. Never
     /// sent and outside `filter_params`; `None` on an `Index` request.
     pub listed_date: Option<String>,
+    /// sha256 of the hosts file that admitted this request's host (architecture.md section 2).
+    /// Outside `filter_params`: it decides admission and pace, not what the vendor is asked.
+    /// `None` for a provider that reads no hosts file.
+    pub hosts_version: Option<FileDigest>,
 }
 
 impl Request {
@@ -199,6 +203,7 @@ mod tests {
             }],
             universe_version: FileDigest::of(universe_version),
             listed_date: None,
+            hosts_version: None,
         }
     }
 

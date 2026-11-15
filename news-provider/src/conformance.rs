@@ -244,6 +244,7 @@ mod tests {
                 params: Vec::new(),
                 universe_version: FileDigest::of(ROSTER),
                 listed_date: None,
+                hosts_version: None,
             }
         }
 

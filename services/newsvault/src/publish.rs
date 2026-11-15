@@ -488,7 +488,7 @@ mod tests {
     use chrono::DateTime;
     use news_provider::{
         AttemptSlot, Baseline, Outcome, Provenance, RawResponse, Request, RequestPhase, RunId,
-        SourceId, TargetWindow, Verdict,
+        SourceId, TargetWindow, ValidSource, Verdict,
     };
     use pit::datedness::Published;
     use pit::{ObservationTime, ValidTime};
@@ -508,6 +508,8 @@ mod tests {
     const WINDOW: &str = "2026-07-01";
     const URL: &str = "https://example.test/filing";
     const TITLE: &str = "A filing";
+    const VALID_RAW: &str = "20261110093000";
+    const VALID_FIELD: &str = "ACCEPTANCE-DATETIME";
     const PAYLOAD: &[u8] = b"{\"filings\": 1}";
     /// One roster value: these tests are about the segment, and `universe_version` only has to be
     /// present and stable.
@@ -571,6 +573,7 @@ mod tests {
             params: Vec::new(),
             universe_version: FileDigest::of(ROSTER),
             listed_date: None,
+            hosts_version: None,
         };
         let slot = AttemptSlot::open(store, &request, &run, 0, at(observed))?;
         let answer = RawResponse::new(
@@ -599,6 +602,9 @@ mod tests {
             story_id: story_id(SOURCE, source_item_id).map_err(|failure| failure.to_string())?,
             doc_id: None,
             valid: published,
+            valid_raw: VALID_RAW.to_owned(),
+            valid_field: VALID_FIELD.to_owned(),
+            valid_source: ValidSource::VendorPublished,
             observed: ObservationTime::new(at(observed).inner()),
             raw_blob: store.put_blob(PAYLOAD)?,
             body_blob: None,

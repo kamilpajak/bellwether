@@ -581,6 +581,9 @@ impl Committer {
                 story_id: named(item, story_id(item.source.as_str(), &item.source_item_id))?,
                 doc_id: Some(named(item, doc_id(&item.canonical_url))?),
                 valid: item.valid,
+                valid_raw: item.valid_raw.clone(),
+                valid_field: item.valid_field.clone(),
+                valid_source: item.valid_source,
                 observed,
                 raw_blob: self.blob_named(raw)?,
                 body_blob: body,
@@ -605,15 +608,24 @@ fn named(
 #[cfg(test)]
 mod tests {
     use super::{Committer, Provenance, StoreError};
+    use crate::store::COMMIT_LOG;
+    use canon::FileDigest;
     use news_provider::provider::CollectedItem;
-    use news_provider::{RunId, SourceId, ValidSource};
+    use news_provider::{
+        AttemptSlot, Baseline, Outcome, RawResponse, Request, RequestPhase, RunId, SourceId,
+        TargetWindow, ValidSource, Verdict,
+    };
     use pit::datedness::Published;
     use pit::{ObservationTime, ValidTime};
+    use rusqlite::Connection;
     use tempfile::TempDir;
 
     const RUN: &str = "a-run";
     const SOURCE: &str = "edgar_press";
+    const WINDOW: &str = "2025-11-10";
     const ITEM: &str = "0000320193-26-000071";
+    const VALID_RAW: &str = "20251110213215";
+    const VALID_FIELD: &str = "ACCEPTANCE-DATETIME";
     const PUBLISHED_AT: i64 = 1_762_810_335;
     const FETCHED_AT: i64 = 1_763_000_000;
 
@@ -720,5 +732,61 @@ mod tests {
             Ok(rows) => assert_eq!(rows.first().map(|row| row.observed), Some(placed)),
             Err(why) => assert_eq!(why.to_string(), "rows"),
         }
+    }
+
+    /// Through `rows_of` and the store's one door into the columns, so a writer dropping any of
+    /// the three on either side of the hand-over is red.
+    #[test]
+    fn an_items_row_keeps_the_raw_publication_value_its_field_and_its_source(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let mut store = Committer::open(temp.path(), &RunId::new(RUN))?;
+        let raw = Committer::put_blob(&store, b"payload")?;
+        let live = CollectedItem {
+            provenance: Provenance::LiveIngest,
+            valid_raw: VALID_RAW.to_owned(),
+            valid_field: VALID_FIELD.to_owned(),
+            valid_source: ValidSource::OurExtraction,
+            ..archived(None)
+        };
+        let rows = store.rows_of(
+            &[live],
+            Some(raw.hex()),
+            ObservationTime::new(instant(FETCHED_AT)),
+        )?;
+        let request = Request {
+            source: SourceId::new(SOURCE),
+            target_window: TargetWindow::new(WINDOW),
+            phase: RequestPhase::Document,
+            provenance: Provenance::LiveIngest,
+            url: "https://example.test/a".to_owned(),
+            headers: Vec::new(),
+            params: Vec::new(),
+            universe_version: FileDigest::of(b"{}"),
+            listed_date: None,
+            hosts_version: None,
+        };
+        let at = ObservationTime::new(instant(FETCHED_AT));
+        let slot = AttemptSlot::open(&mut store, &request, &RunId::new(RUN), 0, at)?;
+        let answer = RawResponse::new(slot.attempt_id().clone(), 200, b"payload".to_vec(), at, at);
+        let outcome = Outcome::decide(&Verdict::Usable, 1, &Baseline::from_trailing_ok(&[1]));
+        let closed = slot.close(&mut store, outcome, &Ok(answer), at)?;
+        store.record(closed, &rows, at)?;
+        drop(store);
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let stored: (String, String, String) = db.query_row(
+            "SELECT valid_raw, valid_field, valid_source FROM items",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(
+            stored,
+            (
+                VALID_RAW.to_owned(),
+                VALID_FIELD.to_owned(),
+                ValidSource::OurExtraction.name().to_owned()
+            )
+        );
+        Ok(())
     }
 }

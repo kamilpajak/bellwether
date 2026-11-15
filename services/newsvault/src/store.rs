@@ -23,7 +23,7 @@
 //! # use canon::Stamp;
 //! # use chrono::DateTime;
 //! # use news_provider::{AttemptSlot, Baseline, Outcome, Provenance, RawResponse, Request,
-//! #                     RequestPhase, RunId, SourceId, TargetWindow, Verdict};
+//! #                     RequestPhase, RunId, SourceId, TargetWindow, ValidSource, Verdict};
 //! # use pit::datedness::Published;
 //! # use pit::{ObservationTime, ValidTime};
 //! # fn legal(root: std::path::PathBuf) -> Result<(), Box<dyn std::error::Error>> {
@@ -39,6 +39,7 @@
 //!     params: Vec::new(),
 //!     universe_version: canon::FileDigest::of(b"{}"),
 //!     listed_date: None,
+//!     hosts_version: None,
 //! };
 //! let at = ObservationTime::new(DateTime::UNIX_EPOCH);
 //! let raw = committer.put_blob(b"{}")?;
@@ -60,6 +61,9 @@
 //!         .map_err(|failure| failure.to_string())?,
 //!     doc_id: None,
 //!     valid: Published::At(ValidTime::new(DateTime::UNIX_EPOCH)),
+//!     valid_raw: "19700101000000".to_owned(),
+//!     valid_field: "ACCEPTANCE-DATETIME".to_owned(),
+//!     valid_source: ValidSource::VendorPublished,
 //!     observed: at,
 //!     raw_blob: raw,
 //!     body_blob: None,
@@ -73,11 +77,11 @@ use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::PathBuf;
 
-use canon::Digest;
+use canon::{Digest, FileDigest};
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use news_provider::{
     AttemptEvent, AttemptReceipt, Cost, LedgerError, OutcomeKind, RunId, Sink, SourceId,
-    TargetWindow,
+    TargetWindow, ValidSource,
 };
 use pit::datedness::{Datedness, Published};
 use pit::{ObservationTime, Visibility};
@@ -98,13 +102,34 @@ const BLOB_SPACE: &str = "sha256";
 /// One constant for the label `record` writes and `ok_vendor_rows` reads, so the two cannot drift.
 const OUTCOME_OK: &str = "ok";
 
+/// Per connection, so set on every open and never part of a schema version.
+const CONNECTION: &str = "
+PRAGMA foreign_keys = ON;
+PRAGMA synchronous = FULL;
+";
+
+/// The `PRAGMA user_version` this build writes, and the only one a read-only reader accepts.
+pub const SCHEMA_VERSION: i32 = 1;
+
+/// Version `i + 1` is reached from version `i` by `MIGRATIONS[i]`. `ADD COLUMN` cannot add a
+/// `NOT NULL` column without a default, so the three valid-evidence columns are nullable here and
+/// NULL only on rows committed at user_version 0.
+const MIGRATIONS: [&str; 1] = ["
+ALTER TABLE items ADD COLUMN valid_raw TEXT;
+ALTER TABLE items ADD COLUMN valid_field TEXT;
+ALTER TABLE items ADD COLUMN valid_source TEXT;
+-- The hosts file a run was admitted under: architecture.md section 2's `hosts_version` row. NULL
+-- for a provider that reads no hosts file.
+ALTER TABLE attempts ADD COLUMN hosts_version TEXT;
+"];
+
+/// The frozen user_version 0 DDL; every store, new or old, is created from it and then migrated.
+///
 /// `seq` is `INTEGER PRIMARY KEY AUTOINCREMENT` so the column never reuses a value after a delete,
 /// and the value itself comes from a committed `seq_reservations` row: measured 2026-11-13 on
 /// SQLite 3.54.0, two inserts inside one transaction took 2 and 3, and after `ROLLBACK`
 /// `sqlite_sequence` was back to 1 and the next insert took 2 again.
-const SCHEMA: &str = "
-PRAGMA foreign_keys = ON;
-PRAGMA synchronous = FULL;
+const SCHEMA_V0: &str = "
 CREATE TABLE IF NOT EXISTS attempts (
     attempt_id            TEXT PRIMARY KEY,
     run_id                TEXT NOT NULL,
@@ -195,7 +220,7 @@ CREATE TABLE IF NOT EXISTS published (
 ";
 
 /// Which publication day a row is partitioned under: decision D3, taken by default
-/// (architecture.md section 10). [`SCHEMA`]'s CHECK makes exactly one of the two columns
+/// (architecture.md section 10). [`SCHEMA_V0`]'s CHECK makes exactly one of the two columns
 /// non-null, so every row has one.
 const VALID_DATE: &str = "substr(COALESCE(i.valid_at, i.valid_day, i.valid_refused), 1, 10)";
 
@@ -254,6 +279,10 @@ pub enum StoreError {
     /// field is 60, and an item whose fields cannot be put in canonical form has no identity.
     #[error("item {item} has no canonical identity: {why}")]
     ItemIdentityRefused { item: String, why: String },
+    /// A writer refuses only a version above its own; a read-only reader cannot migrate, so it
+    /// refuses every version but its own. Code `input_schema_mismatch` (architecture.md 5.1).
+    #[error("the commit log is at schema user_version {found}; this build reads {expected}")]
+    SchemaVersion { found: i32, expected: i32 },
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -274,6 +303,11 @@ pub struct ItemRow {
     /// `Published::On` reaches `items.valid_day` and `items.valid_tz` and no cutoff reads it as
     /// an instant. [`Published::Unknown`] is refused by [`Committer::record`].
     pub valid: Published,
+    /// The publication value as the payload spelled it, the field it came from and who stated
+    /// it: `news_provider::CollectedItem`'s evidence columns, stored so a replay can re-parse it.
+    pub valid_raw: String,
+    pub valid_field: String,
+    pub valid_source: ValidSource,
     pub observed: ObservationTime,
     pub raw_blob: BlobDigest,
     pub body_blob: Option<BlobDigest>,
@@ -380,7 +414,7 @@ pub fn coverage_up_to(db: &Connection, at: &str) -> Result<Vec<WindowCoverage>, 
 }
 
 /// The `seq` of every committed item no segment carries, as contiguous spans. A hole in the
-/// sequence is a range a transaction reserved and rolled back (see [`SCHEMA`]), so the spans
+/// sequence is a range a transaction reserved and rolled back (see [`SCHEMA_V0`]), so the spans
 /// break across it rather than claiming a row the store does not hold.
 pub fn unpublished_seq_ranges(db: &Connection) -> Result<Vec<SeqRange>, StoreError> {
     let mut statement = db.prepare(&format!(
@@ -391,6 +425,54 @@ pub fn unpublished_seq_ranges(db: &Connection) -> Result<Vec<SeqRange>, StoreErr
         .query_map([], |row| row.get::<_, i64>(0))?
         .collect::<Result<Vec<i64>, _>>()?;
     Ok(contiguous(&seqs))
+}
+
+const _: () = assert!(MIGRATIONS.len() == SCHEMA_VERSION as usize);
+
+fn user_version(db: &Connection) -> Result<i32, StoreError> {
+    Ok(db.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+}
+
+/// The check a read-only reader makes before its first query: a reader cannot migrate, so a store
+/// at any other version is refused by name rather than failing on a column it lacks.
+pub fn require_current_version(db: &Connection) -> Result<(), StoreError> {
+    let found = user_version(db)?;
+    if found == SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(StoreError::SchemaVersion {
+            found,
+            expected: SCHEMA_VERSION,
+        })
+    }
+}
+
+/// Brings a store from the version it holds to [`SCHEMA_VERSION`] in one transaction, so a crash
+/// mid-migration leaves the old version whole. A version above ours is refused before any write.
+fn migrate(db: &mut Connection) -> Result<(), StoreError> {
+    let found = user_version(db)?;
+    let Some(from) = usize::try_from(found)
+        .ok()
+        .filter(|from| *from <= MIGRATIONS.len())
+    else {
+        return Err(StoreError::SchemaVersion {
+            found,
+            expected: SCHEMA_VERSION,
+        });
+    };
+    if from == MIGRATIONS.len() {
+        return Ok(());
+    }
+    let transaction = db.transaction()?;
+    if from == 0 {
+        transaction.execute_batch(SCHEMA_V0)?;
+    }
+    for step in MIGRATIONS.iter().skip(from) {
+        transaction.execute_batch(step)?;
+    }
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
 }
 
 fn contiguous(seqs: &[i64]) -> Vec<SeqRange> {
@@ -438,8 +520,9 @@ impl Committer {
             Err(TryLockError::WouldBlock) => return Err(StoreError::LeaseHeld(lock_path)),
             Err(TryLockError::Error(failure)) => return Err(StoreError::Io(failure)),
         }
-        let db = Connection::open(root.join(COMMIT_LOG))?;
-        db.execute_batch(SCHEMA)?;
+        let mut db = Connection::open(root.join(COMMIT_LOG))?;
+        db.execute_batch(CONNECTION)?;
+        migrate(&mut db)?;
         Ok(Self {
             blobs: BlobStore::new(root.join(BLOB_DIR).join(BLOB_SPACE)),
             root,
@@ -683,8 +766,9 @@ impl Committer {
                     "INSERT INTO items
                          (seq, item_id, story_id, doc_id, attempt_id, valid_at, valid_day,
                           valid_tz, valid_refused, observed_at, valid_disputed, earliest_valid_at,
-                          raw_blob, body_blob, committed_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                          raw_blob, body_blob, committed_at, valid_raw, valid_field, valid_source)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                             ?16, ?17, ?18)",
                     params![
                         seq_lo + i64::try_from(offset).unwrap_or(0),
                         row.item_id.hex(),
@@ -700,7 +784,10 @@ impl Committer {
                         earliest,
                         row.raw_blob.hex(),
                         row.body_blob.as_ref().map(BlobDigest::hex),
-                        stamped
+                        stamped,
+                        row.valid_raw,
+                        row.valid_field,
+                        row.valid_source.name()
                     ],
                 )?;
             }
@@ -785,7 +872,7 @@ impl Committer {
     }
 
     /// Claims a `seq` range. Its own committed transaction, because a range the item transaction
-    /// rolls back is otherwise handed out again (see [`SCHEMA`]).
+    /// rolls back is otherwise handed out again (see [`SCHEMA_V0`]).
     fn reserve(
         &mut self,
         attempt: &str,
@@ -821,14 +908,15 @@ impl Committer {
             target_window,
             filter_params,
             universe_version,
+            hosts_version,
             opened_at,
         } = event
         {
             self.db.execute(
                 "INSERT INTO attempts
                      (attempt_id, run_id, source, target_window, filter_params, universe_version,
-                      opened_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(attempt_id) DO NOTHING",
+                      opened_at, hosts_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(attempt_id) DO NOTHING",
                 params![
                     attempt_id.hex(),
                     run.as_str(),
@@ -836,7 +924,8 @@ impl Committer {
                     target_window.as_str(),
                     filter_params.hex(),
                     universe_version.hex(),
-                    stamp(opened_at.inner())
+                    stamp(opened_at.inner()),
+                    hosts_version.as_ref().map(FileDigest::hex)
                 ],
             )?;
         }
@@ -845,7 +934,7 @@ impl Committer {
 }
 
 impl Sink for Committer {
-    /// `Opened` commits here, under the `synchronous = FULL` of [`SCHEMA`], so it is on disk
+    /// `Opened` commits here, under the `synchronous = FULL` of [`CONNECTION`], so it is on disk
     /// before the socket; the other three wait for [`Committer::record`]'s one transaction.
     fn write(&mut self, event: &AttemptEvent) -> Result<(), LedgerError> {
         match event {
@@ -1105,15 +1194,16 @@ mod tests {
     use chrono::{DateTime, TimeDelta, Utc};
     use news_provider::{
         abandon, AttemptEvent, AttemptSlot, Baseline, Outcome, Provenance, RawResponse, Request,
-        RequestPhase, SourceId, TargetWindow, Verdict,
+        RequestPhase, SourceId, TargetWindow, ValidSource, Verdict,
     };
     use pit::datedness::Published;
     use pit::ValidTime;
+    use rusqlite::Connection;
     use tempfile::TempDir;
 
     use super::{
-        first_observed, fs, params, stamp, Committer, ItemRow, LedgerError, ObservationTime, RunId,
-        Sink, StoreError,
+        first_observed, fs, params, stamp, user_version, Committer, ItemRow, LedgerError,
+        ObservationTime, RunId, Sink, StoreError, COMMIT_LOG, SCHEMA_V0, SCHEMA_VERSION,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1131,6 +1221,11 @@ mod tests {
     /// The roster bytes every test attempt names. One value, because these tests are about the
     /// store and `universe_version` only has to be present and stable.
     const ROSTER: &[u8] = b"{\"320193\": \"AAPL\"}";
+    const HOSTS: &[u8] = b"host,status\nrss.globenewswire.com,admitted\n";
+    /// The acceptance field as an EDGAR filing header spells it, and the field's own name.
+    const VALID_RAW: &str = "19700101000140";
+    const VALID_FIELD: &str = "ACCEPTANCE-DATETIME";
+    const UNKNOWN_HIGHER_VERSION: i32 = SCHEMA_VERSION + 1;
     const CORRECTED_PAYLOAD: &[u8] = b"{\"filings\": 2}";
     const SENTINEL: &[u8] = b"a staged file a crash left behind";
     const STATUS_OK: u16 = 200;
@@ -1212,6 +1307,7 @@ mod tests {
             params: Vec::new(),
             universe_version: FileDigest::of(ROSTER),
             listed_date: None,
+            hosts_version: None,
         }
     }
 
@@ -1257,6 +1353,9 @@ mod tests {
                 .map_err(|failure| failure.to_string())?,
             doc_id: Some(doc_id(URL).map_err(|failure| failure.to_string())?),
             valid: Published::At(ValidTime::new(instant(spec.valid))),
+            valid_raw: VALID_RAW.to_owned(),
+            valid_field: VALID_FIELD.to_owned(),
+            valid_source: ValidSource::VendorPublished,
             observed: ObservationTime::new(instant(spec.observed)),
             raw_blob: store.put_blob(spec.payload)?,
             body_blob: None,
@@ -1468,6 +1567,8 @@ mod tests {
                  || '|' || IFNULL(valid_refused, '') || '|' || observed_at
                  || '|' || valid_disputed || '|' || IFNULL(earliest_valid_at, '')
                  || '|' || raw_blob || '|' || IFNULL(body_blob, '') || '|' || committed_at
+                 || '|' || IFNULL(valid_raw, '') || '|' || IFNULL(valid_field, '')
+                 || '|' || IFNULL(valid_source, '')
              FROM items WHERE seq = ?1",
             params![seq],
             |row| row.get(0),
@@ -1506,6 +1607,84 @@ mod tests {
         )?;
         assert_eq!(stored, request.universe_version.hex());
         assert_eq!(stored, FileDigest::of(ROSTER).hex());
+        Ok(())
+    }
+
+    #[test]
+    fn the_opened_row_carries_the_hosts_version_the_request_was_built_from() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let request = Request {
+            hosts_version: Some(FileDigest::of(HOSTS)),
+            ..request()
+        };
+        let slot = AttemptSlot::open(&mut store, &request, &RunId::new(RUN), 0, at(1))?;
+        let stored: Option<String> = store.db.query_row(
+            "SELECT hosts_version FROM attempts WHERE attempt_id = ?1",
+            params![slot.attempt_id().hex()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(stored, Some(FileDigest::of(HOSTS).hex().to_owned()));
+        Ok(())
+    }
+
+    /// A v0 store holding one attempt and one item, written with the frozen DDL and no migration.
+    fn a_store_at_user_version_zero(temp: &TempDir) -> TestResult {
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch(SCHEMA_V0)?;
+        db.execute_batch(
+            "INSERT INTO attempts (attempt_id, run_id, source, target_window, filter_params,
+                 universe_version, opened_at)
+             VALUES ('a v0 attempt', 'a v0 run', 'edgar_press', '2026-11-10', 'f', 'u',
+                 '1970-01-01T00:00:01.000000Z');
+             INSERT INTO blobs (digest, bytes, first_indexed_at)
+             VALUES ('a v0 blob', 1, '1970-01-01T00:00:01.000000Z');
+             INSERT INTO items (seq, item_id, story_id, attempt_id, valid_at, observed_at,
+                 valid_disputed, raw_blob, committed_at)
+             VALUES (1, 'a v0 item', 'a v0 story', 'a v0 attempt', '1970-01-01T00:00:01.000000Z',
+                 '1970-01-01T00:00:01.000000Z', 0, 'a v0 blob', '1970-01-01T00:00:01.000000Z');",
+        )?;
+        Ok(())
+    }
+
+    /// The v0 row keeps NULL in the evidence columns, which is the one state they may be NULL in.
+    #[test]
+    fn a_store_at_the_previous_user_version_opens_and_migrates() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_zero(&temp)?;
+        let mut store = open(&temp)?;
+        let closed = closed_attempt(&mut store, 0, Verdict::Usable)?;
+        store.record(closed, &[row(&store, &spec(STORY))?], at(5))?;
+        let mut statement = store
+            .db
+            .prepare("SELECT valid_raw FROM items ORDER BY seq")?;
+        let raw = statement
+            .query_map([], |row| row.get::<_, Option<String>>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            (user_version(&store.db)?, raw),
+            (SCHEMA_VERSION, vec![None, Some(VALID_RAW.to_owned())])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_store_at_an_unknown_higher_user_version_is_refused() -> TestResult {
+        let temp = TempDir::new()?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.pragma_update(None, "user_version", UNKNOWN_HIGHER_VERSION)?;
+        drop(db);
+        let refused = open(&temp);
+        assert!(
+            matches!(
+                refused,
+                Err(StoreError::SchemaVersion {
+                    found: UNKNOWN_HIGHER_VERSION,
+                    expected: SCHEMA_VERSION
+                })
+            ),
+            "{refused:?}"
+        );
         Ok(())
     }
 

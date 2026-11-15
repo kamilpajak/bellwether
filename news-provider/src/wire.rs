@@ -485,6 +485,7 @@ mod tests {
             url: REFUSED.to_owned(),
             universe_version: FileDigest::of(ROSTER),
             listed_date: None,
+            hosts_version: None,
             headers: vec![(
                 HeaderName::new(ACCEPT),
                 HeaderValue::Literal(PLAIN_TEXT.to_owned()),

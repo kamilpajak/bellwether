@@ -15,7 +15,7 @@ use pit::{Cutoff, ObservationTime, ValidTime, Visibility};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Map, Value};
 
-use crate::store::COMMIT_LOG;
+use crate::store::{require_current_version, StoreError, COMMIT_LOG};
 
 pub const SCHEMA: &str = "newsvault.items/1";
 
@@ -49,6 +49,8 @@ pub enum ItemsError {
     UnknownField(String),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Store(#[from] StoreError),
 }
 
 /// Which rows of one story a read returns.
@@ -126,6 +128,7 @@ pub fn read(root: &Path, ask: &Ask) -> Result<Report, ItemsError> {
         return Err(ItemsError::StoreAbsent(log));
     }
     let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    require_current_version(&db)?;
     let cutoff = Cutoff::new(ask.at);
     let mut visible: Vec<Row> = rows(&db)?
         .into_iter()
