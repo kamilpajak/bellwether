@@ -16,7 +16,7 @@ use news_provider::{
     stamp_of, Archive, ArchiveError, AttemptReceipt, Clock, CollectError, Collected, CollectedItem,
     Committed, Exchange, Exit, Provider, Run, RunId, SourceId, TargetWindow,
 };
-use open_web_feed::OpenWebFeed;
+use open_web_feed::{HostPin, OpenWebFeed};
 use pit::{MeasuredLag, ObservationTime};
 use serde_json::{json, Value};
 
@@ -111,6 +111,30 @@ pub enum CollectRunError {
     /// lag: that would refuse the window with R11's message and hide the unreadable file.
     #[error("the observation-lag policy is unusable: {0}")]
     UnusableLagPolicy(#[from] LagPolicyError),
+    /// Code `robots_unverified`, exit 4: `fetched` is `None` when no answered robots fetch of the
+    /// host is ledgered, and names the digest whose blob is absent from disk otherwise.
+    #[error(
+        "admitted host {host} pins robots {pinned}, and {}; run `newsvault robots refresh`",
+        match .fetched {
+            Some(digest) => format!("the newest ledgered fetch's blob {digest} is not on disk"),
+            None => "the store ledgers no answered robots.txt fetch of it".to_owned(),
+        }
+    )]
+    RobotsUnverified {
+        host: String,
+        pinned: String,
+        fetched: Option<String>,
+    },
+    /// Code `robots_refused`, exit 2: the newest answered fetch is not the pin.
+    #[error(
+        "admitted host {host} pins robots {pinned}, and its newest ledgered fetch is {fetched}; \
+         edit the hosts file once the change is read"
+    )]
+    RobotsRefused {
+        host: String,
+        pinned: String,
+        fetched: String,
+    },
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -139,6 +163,8 @@ impl CollectRunError {
             | Self::Refused(_)
             | Self::OpenWebRefused(_)
             | Self::UnusableLagPolicy(_)
+            | Self::RobotsUnverified { .. }
+            | Self::RobotsRefused { .. }
             | Self::Store(_)
             | Self::Driver(_)
             | Self::Io(_)
@@ -256,6 +282,8 @@ pub struct Opened {
     pub provider: Box<dyn Provider>,
     /// sha256 of the hosts file the provider was opened on; `None` for a provider with none.
     pub hosts_version: Option<String>,
+    /// Every hosts-file row with its robots pin; empty for a provider with no hosts file.
+    pub host_pins: Vec<HostPin>,
     pub lag: Option<AppliedLag>,
 }
 
@@ -264,6 +292,7 @@ impl std::fmt::Debug for Opened {
         f.debug_struct("Opened")
             .field("registered", &self.registered)
             .field("hosts_version", &self.hosts_version)
+            .field("host_pins", &self.host_pins)
             .field("lag", &self.lag)
             .finish_non_exhaustive()
     }
@@ -325,7 +354,7 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
             source_id: registered.source(),
         });
     }
-    let (provider, hosts_version, lag): (Box<dyn Provider>, _, _) = match registered {
+    let (provider, hosts_version, host_pins, lag): (Box<dyn Provider>, _, _, _) = match registered {
         Registered::EdgarPress => {
             let roster = required(ask.roster.as_ref(), roster.0, registered)?;
             let provider = EdgarPress::open(roster, &ask.rules, &ask.contact)?;
@@ -333,9 +362,10 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
                 Some((applied, measured)) => (
                     Box::new(provider.with_observation_lag(measured)),
                     None,
+                    Vec::new(),
                     Some(applied),
                 ),
-                None => (Box::new(provider), None, None),
+                None => (Box::new(provider), None, Vec::new(), None),
             }
         }
         Registered::OpenWebWires => {
@@ -349,13 +379,15 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
             let hosts = required(ask.hosts.as_ref(), hosts.0, registered)?;
             let provider = OpenWebFeed::open(hosts, &ask.rules, &ask.contact)?;
             let version = provider.hosts_version().hex().to_owned();
-            (Box::new(provider), Some(version), None)
+            let pins = provider.host_pins();
+            (Box::new(provider), Some(version), pins, None)
         }
     };
     Ok(Opened {
         registered,
         provider,
         hosts_version,
+        host_pins,
         lag,
     })
 }
@@ -517,6 +549,7 @@ pub fn run(
         });
     }
     refuse_the_window(ask, provider)?;
+    refuse_an_unverified_robots(ask, opened)?;
     let run = RunId::new(run_id.clone());
     // Before the policy copy, the envelope and the lease: a store at a newer user_version or of
     // another v0 shape is left as found. A v0 step SQLite refuses still leaves a run record.
@@ -567,6 +600,49 @@ fn refuse_the_window(ask: &Ask, provider: &dyn Provider) -> Result<(), CollectRu
     }
 }
 
+/// Section 8 row R4(b): every admitted row's newest answered robots fetch in the store is its pin.
+/// Read before the lease; a refresh running alongside can only add a newer answer.
+fn refuse_an_unverified_robots(ask: &Ask, opened: &Opened) -> Result<(), CollectRunError> {
+    let admitted: Vec<&HostPin> = opened.host_pins.iter().filter(|row| row.admitted).collect();
+    if admitted.is_empty() {
+        return Ok(());
+    }
+    let ledger = crate::store::RobotsLedger::open(&ask.store)?;
+    for row in admitted {
+        let pinned = row
+            .robots
+            .as_ref()
+            .map_or_else(String::new, |pin| pin.text().to_owned());
+        let newest = match ledger.newest_robots(&row.host) {
+            Ok(newest) => newest,
+            Err(StoreError::BlobAbsent { digest }) => {
+                return Err(CollectRunError::RobotsUnverified {
+                    host: row.host.clone(),
+                    pinned,
+                    fetched: Some(digest),
+                })
+            }
+            Err(other) => return Err(other.into()),
+        };
+        let Some(answer) = newest else {
+            return Err(CollectRunError::RobotsUnverified {
+                host: row.host.clone(),
+                pinned,
+                fetched: None,
+            });
+        };
+        let fetched = crate::cmd_robots::fetched_pin(&answer);
+        if fetched != pinned {
+            return Err(CollectRunError::RobotsRefused {
+                host: row.host.clone(),
+                pinned,
+                fetched,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The plan alone, which is what `--dry-run` returns: everything except the mutation.
 fn planned(
     ask: &Ask,
@@ -591,6 +667,7 @@ fn planned(
             ObservationTime::new(ask.at),
         )
         .map_err(CollectRunError::of_plan)?;
+    refuse_an_unverified_robots(ask, opened)?;
     let driven = Driven {
         collected: Collected::of_plan(&plan, &provider.source()),
         calendar_version: version_of(calendar_in),

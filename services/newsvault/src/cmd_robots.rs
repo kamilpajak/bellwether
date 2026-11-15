@@ -288,7 +288,7 @@ fn verdict_of(answer: &Result<RawResponse, TransportError>) -> Verdict {
 }
 
 /// The digest the answer would be pinned by, in the hosts file's own spelling.
-fn fetched_pin(robots: &RobotsAnswer) -> String {
+pub(crate) fn fetched_pin(robots: &RobotsAnswer) -> String {
     match robots {
         RobotsAnswer::Present(digest) => digest.hex().to_owned(),
         RobotsAnswer::Absent => open_web_feed::RobotsPin::Absent.text().to_owned(),

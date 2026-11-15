@@ -88,6 +88,7 @@ use pit::{ObservationTime, Visibility};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::blobs::{BlobDigest, BlobStore};
+use crate::cmd_robots::ROBOTS_SOURCE;
 
 const LOCK_FILE: &str = "LOCK";
 /// The layout, in one place because a reader and the writer may not disagree about it.
@@ -589,6 +590,68 @@ pub fn refuse_an_unreadable_version(root: &Path) -> Result<(), StoreError> {
     match usize::try_from(found) {
         Ok(older) if older < MIGRATIONS.len() => refuse_another_shape(&db, older),
         _ => Ok(()),
+    }
+}
+
+/// The robots facts `collect` checks before its lease (architecture.md section 11.2), read-only.
+/// No commit log, and a log at a version before the `robots` table, hold no fetch.
+#[derive(Debug)]
+pub struct RobotsLedger {
+    db: Option<Connection>,
+    blobs: BlobStore,
+}
+
+impl RobotsLedger {
+    pub fn open(root: &Path) -> Result<Self, StoreError> {
+        let blobs = BlobStore::new(root.join(BLOB_DIR).join(BLOB_SPACE));
+        let log = root.join(COMMIT_LOG);
+        if !log.exists() {
+            return Ok(Self { db: None, blobs });
+        }
+        let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let found = user_version(&db)?;
+        if found > SCHEMA_VERSION {
+            return Err(StoreError::SchemaVersion {
+                found,
+                expected: SCHEMA_VERSION,
+            });
+        }
+        let has_robots: bool = db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'robots')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(Self {
+            db: has_robots.then_some(db),
+            blobs,
+        })
+    }
+
+    /// The newest ANSWERED fetch of `host`, by `closed_at` then `attempt_id`: a failed fetch files
+    /// no robots row and is skipped. A present answer whose blob is not on disk is `BlobAbsent`.
+    pub fn newest_robots(&self, host: &str) -> Result<Option<RobotsAnswer>, StoreError> {
+        let Some(db) = self.db.as_ref() else {
+            return Ok(None);
+        };
+        let row: Option<Option<String>> = db
+            .query_row(
+                "SELECT r.blob FROM robots r
+                   JOIN attempts a ON a.attempt_id = r.attempt_id
+                  WHERE a.source = ?1 AND a.target_window = ?2 AND r.host = ?2
+                  ORDER BY a.closed_at DESC, a.attempt_id DESC
+                  LIMIT 1",
+                params![ROBOTS_SOURCE, host],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match row {
+            None => Ok(None),
+            Some(None) => Ok(Some(RobotsAnswer::Absent)),
+            Some(Some(hex)) => match self.blobs.named(&hex) {
+                Some(blob) => Ok(Some(RobotsAnswer::Present(blob))),
+                None => Err(StoreError::BlobAbsent { digest: hex }),
+            },
+        }
     }
 }
 

@@ -456,7 +456,16 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 &ask.store,
                 &opened.provider.source(),
             );
-            let answer = cmd_collect::run(&ask, &opened, &wire, &clock)?;
+            let answer = match cmd_collect::run(&ask, &opened, &wire, &clock) {
+                Ok(answer) => answer,
+                Err(refused) => {
+                    let Some(facts) = robots_refusal(&refused) else {
+                        return Err(refused.into());
+                    };
+                    emit_robots_refusal(&refused, &facts, &ask, format)?;
+                    return Ok(Verdict::No(facts.exit));
+                }
+            };
             if answer.exit.carries_the_result_on_stdout() {
                 emit_collect(&answer.envelope, format)?;
             } else {
@@ -612,6 +621,77 @@ fn emit_collect_error(answer: &cmd_collect::Answer, format: Format) -> anyhow::R
             answer.exit.error_code().unwrap_or_default(),
             answer.exit.retryable()
         )?,
+    }
+    Ok(())
+}
+
+/// A collect refused by the robots check: section 5.1's code, its exit and the facts behind it.
+struct RobotsRefusal<'a> {
+    code: &'static str,
+    exit: u8,
+    host: &'a str,
+    pinned: &'a str,
+    fetched: Option<&'a str>,
+}
+
+const fn robots_refusal(failure: &CollectRunError) -> Option<RobotsRefusal<'_>> {
+    match failure {
+        CollectRunError::RobotsUnverified {
+            host,
+            pinned,
+            fetched,
+        } => Some(RobotsRefusal {
+            code: "robots_unverified",
+            exit: EXIT_NOT_FOUND,
+            host: host.as_str(),
+            pinned: pinned.as_str(),
+            fetched: match fetched {
+                Some(digest) => Some(digest.as_str()),
+                None => None,
+            },
+        }),
+        CollectRunError::RobotsRefused {
+            host,
+            pinned,
+            fetched,
+        } => Some(RobotsRefusal {
+            code: "robots_refused",
+            exit: EXIT_USAGE,
+            host: host.as_str(),
+            pinned: pinned.as_str(),
+            fetched: Some(fetched.as_str()),
+        }),
+        _ => None,
+    }
+}
+
+/// The refusal as an error object whose suggestion is the refresh that would ledger the fetch.
+fn emit_robots_refusal(
+    refused: &CollectRunError,
+    facts: &RobotsRefusal<'_>,
+    ask: &cmd_collect::Ask,
+    format: Format,
+) -> anyhow::Result<()> {
+    let shown = |path: &std::path::Path| path.display().to_string();
+    let object = serde_json::json!({
+        "schema": "newsvault.error/1",
+        "code": facts.code,
+        "message": refused.to_string(),
+        "retryable": false,
+        "details": {"host": facts.host, "pinned": facts.pinned, "fetched": facts.fetched},
+        "suggestions": [[
+            "newsvault", "robots", "refresh",
+            "--source", open_web_feed::SOURCE,
+            "--hosts", ask.hosts.as_deref().map(shown).unwrap_or_default(),
+            "--rules", shown(&ask.rules),
+            "--store", shown(&ask.store),
+        ]],
+    });
+    let err = std::io::stderr();
+    let mut err = err.lock();
+    match format {
+        Format::Json => writeln!(err, "{object}")?,
+        Format::Human => writeln!(err, "error: {refused}")?,
     }
     Ok(())
 }
@@ -971,7 +1051,9 @@ fn print_schema(format: Format) {
             {"code": "vendor_unreachable", "exit": 7, "retryable": true},
             {"code": "partial_collect", "exit": 8, "retryable": false},
             {"code": "vendor_refused_all", "exit": 8, "retryable": false},
-            {"code": "commit_failed", "exit": 8, "retryable": false}
+            {"code": "commit_failed", "exit": 8, "retryable": false},
+            {"code": "robots_unverified", "exit": 4, "retryable": false},
+            {"code": "robots_refused", "exit": 2, "retryable": false}
         ],
         // Decision D1's companion rule, which `news_provider::Exit` holds as one function.
         "stdout_carries_the_result_for_exits": [0, 1, 8]
