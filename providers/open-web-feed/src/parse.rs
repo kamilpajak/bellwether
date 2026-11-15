@@ -8,10 +8,10 @@ use scraper::{ElementRef, Html, Node};
 use crate::depth::nesting_depth;
 use crate::rules::{Pick, Rule};
 
-/// The deepest page `page` parses. 7 is the depth `depth::nesting_depth` measured on
-/// `article_3403075.html` (2026-11-15, trimmed); 16 times that is the margin for the untrimmed page,
-/// whose depth was not kept.
-pub(crate) const DEEPEST_PAGE: usize = 7 * 16;
+/// The deepest page `page` parses: 8 times 14, the untrimmed 3403075 page's depth by
+/// `depth::nesting_depth` and by html5ever (2026-11-15, from the 2026-11-14 probe body, which is
+/// not kept). The trimmed `article_3403075.html` measures 7.
+pub(crate) const DEEPEST_PAGE: usize = 14 * 8;
 /// Elements whose text is never prose.
 const NOT_PROSE: [&str; 4] = ["script", "style", "noscript", "template"];
 

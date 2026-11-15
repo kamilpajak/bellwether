@@ -70,15 +70,19 @@ pub(crate) fn nesting_depth(page: &str) -> usize {
     deepest
 }
 
+/// Pops nothing unless `name` is open below only `IMPLIED_END` elements: html5ever ignores an end
+/// tag naming no open element, so popping on it counted `<ul><li></x>` × 300 at 301, not 602.
 fn close(open: &mut Vec<(&str, usize)>, name: &str) {
-    while open
-        .last()
-        .is_some_and(|(top, _)| *top != name && IMPLIED_END.contains(top))
-    {
-        open.pop();
-    }
-    if open.last().is_some_and(|(top, _)| *top == name) {
-        open.pop();
+    let above = open
+        .iter()
+        .rev()
+        .take_while(|(top, _)| *top != name && IMPLIED_END.contains(top))
+        .count();
+    let named = (open.len() - above)
+        .checked_sub(1)
+        .filter(|index| open.get(*index).is_some_and(|(top, _)| *top == name));
+    if let Some(index) = named {
+        open.truncate(index);
     }
 }
 
@@ -137,12 +141,14 @@ mod tests {
     use super::nesting_depth;
 
     /// Each row turns on one rule of the scan; the depth is html5ever's stack, or more.
-    const ONE_RULE_EACH: [(&str, usize); 15] = [
+    const ONE_RULE_EACH: [(&str, usize); 17] = [
         ("<div><div></div><div>", 2),
         ("<DIV><div></DIV><div>", 2),
         ("<div><br><br>", 2),
         ("<div/><div/>", 2),
         ("<ul><li><li><li>", 2),
+        ("<ul><li></x><ul><li></x>", 4),
+        ("<rb><rt></x><rb><rt></x>", 4),
         ("<div><p></div><div>", 2),
         ("<span><div></span><div>", 3),
         ("<!--><div><div>", 2),

@@ -493,12 +493,13 @@ fn a_link_off_the_path_filter_off_the_host_or_absent_is_filtered_out_and_counted
         format!("<item><link>{link}</link><pubDate>Sat, 14 Nov 2026 19:00 GMT</pubDate></item>")
     };
     let index = format!(
-        "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel>{}{}{}{}{}</channel></rss>",
+        "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel>{}{}{}{}{}{}</channel></rss>",
         item(ARTICLE_WWW_URL),
         item("https://www.globenewswire.com/en/search/tag/tennis"),
         item("https://www.prnewswire.com/news-release/2026/11/14/1/a.html"),
         "<item><pubDate>Sat, 14 Nov 2026 19:00 GMT</pubDate></item>",
         item("https://rss.globenewswire.com/news-release/../rssfeed/"),
+        item("https://rss.globenewswire.com/news-release/./x.html"),
     );
     let extracted = follow_ups(&provider()?, index.as_bytes())?;
     assert_eq!(
@@ -507,7 +508,7 @@ fn a_link_off_the_path_filter_off_the_host_or_absent_is_filtered_out_and_counted
             extracted.follow_ups.len(),
             extracted.filtered_out
         ),
-        (5, 1, 4)
+        (6, 1, 5)
     );
     Ok(())
 }
@@ -642,6 +643,34 @@ fn a_globenewswire_pubdate_is_a_minute_and_never_an_instant() -> Outcome {
             )
         );
     }
+    Ok(())
+}
+
+/// Pins today's reading of days 1-9 until a real GNW `pubDate` on one is recorded (§11.1, Unknown):
+/// `%d` reads `1` as well as `01`, and only `01` prints back byte for byte.
+#[test]
+fn a_single_digit_day_is_a_minute_only_when_zero_padded() -> Outcome {
+    let provider = provider()?;
+    let request = article_request(&provider)?;
+    let read = |raw: &str| -> Result<Published, Box<dyn std::error::Error>> {
+        let dated = Request {
+            listed_date: Some(raw.to_owned()),
+            ..request.clone()
+        };
+        let extracted = provider.extract(&dated, &blob(gnw(REAL_ARTICLE)));
+        Ok(match extracted.items.first() {
+            Some(item) => item.valid,
+            None => only_unusable(&extracted)?.item.valid,
+        })
+    };
+    let first_of_november = Minute::new("2026-11-01T19:00:00Z".parse()?)?;
+    assert_eq!(
+        (
+            read("Sun, 01 Nov 2026 19:00 GMT")?,
+            read("Sun, 1 Nov 2026 19:00 GMT")?
+        ),
+        (Published::AtMinute(first_of_november), Published::Unknown)
+    );
     Ok(())
 }
 
@@ -1089,6 +1118,20 @@ fn a_valid_format_that_does_not_read_back_a_minute_is_refused() {
             path,
             rule: "gnw".to_owned(),
             format: "%a, %d %b %Y %H:%M:%S GMT".to_owned()
+        })
+    );
+}
+
+/// Prints no second, so only the read-back half refuses it: the printed minute names no year.
+#[test]
+fn a_valid_format_whose_minute_does_not_parse_back_is_refused() {
+    let path = rules_fixture("rules_format_prints_no_year.json");
+    assert_eq!(
+        refusal_of(&hosts_path(), &path, CONTACT),
+        Some(Refusal::FormatReadsNoMinute {
+            path,
+            rule: "gnw".to_owned(),
+            format: "%d %b %H:%M GMT".to_owned()
         })
     );
 }
