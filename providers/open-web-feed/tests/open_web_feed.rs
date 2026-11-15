@@ -609,6 +609,30 @@ fn a_url_with_a_port_or_a_userinfo_has_no_item_key() -> Outcome {
     Ok(())
 }
 
+/// Section 11.1: a follow-up with no `story_of` is issued even beside a held one, built by hand
+/// because `index_rows_of` emits none. Mutation 2026-11-15, `is_none_or` made `is_some_and`: red.
+#[test]
+fn a_follow_up_with_no_story_is_issued_and_a_held_one_dropped() -> Outcome {
+    let provider = provider()?;
+    let held_one = article_request(&provider)?;
+    let storyless = Request {
+        url: held_one
+            .url
+            .replacen(GNW_HOST, &format!("{GNW_HOST}:443"), 1),
+        ..held_one.clone()
+    };
+    let story = provider
+        .story_of(&held_one)
+        .ok_or("the article has no story")?;
+    let held = BTreeSet::from([story.hex().to_owned()]);
+    let issued = provider.follow_ups_to_issue(vec![held_one, storyless.clone()], &held);
+    assert_eq!(
+        (provider.story_of(&storyless), issued),
+        (None, vec![storyless])
+    );
+    Ok(())
+}
+
 // ---- document ----
 
 #[test]
