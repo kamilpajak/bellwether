@@ -184,6 +184,8 @@ mod tests {
     const DAYS_IN_THE_RANGE: usize = 4;
     const ROSTER: &[u8] = b"{\"320193\":\"AAPL\"}";
     const A_LATER_ROSTER: &[u8] = b"{\"320193\":\"AAPL\",\"789019\":\"MSFT\"}";
+    const HOSTS: &[u8] = b"{\"hosts\":[]}";
+    const A_LATER_HOSTS: &[u8] = b"{\"hosts\":[{}]}";
 
     fn day(text: &str) -> Option<NaiveDate> {
         text.parse().ok()
@@ -236,6 +238,23 @@ mod tests {
         assert_ne!(
             request(ROSTER).filter_params(),
             request(A_LATER_ROSTER).filter_params()
+        );
+    }
+
+    /// Architecture.md section 2's `hosts_version` row: admission and pace, not what the vendor
+    /// is asked. Mutation 2026-11-15, `hosts_version` folded in when `Some`: green before this.
+    #[test]
+    fn requests_that_differ_only_in_hosts_version_have_one_filter_params_digest() {
+        let with = |hosts: Option<&[u8]>| Request {
+            hosts_version: hosts.map(FileDigest::of),
+            ..request(ROSTER)
+        };
+        let digests =
+            [None, Some(HOSTS), Some(A_LATER_HOSTS)].map(|hosts| with(hosts).filter_params().ok());
+        assert!(digests[0].is_some());
+        assert_eq!(
+            digests,
+            [digests[0].clone(), digests[0].clone(), digests[0].clone()]
         );
     }
 }
