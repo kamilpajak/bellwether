@@ -75,7 +75,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use canon::{Digest, FileDigest};
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
@@ -85,7 +85,7 @@ use news_provider::{
 };
 use pit::datedness::{Datedness, Published};
 use pit::{ObservationTime, Visibility};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::blobs::{BlobDigest, BlobStore};
 
@@ -480,6 +480,26 @@ fn user_version(db: &Connection) -> Result<i32, StoreError> {
 pub fn require_current_version(db: &Connection) -> Result<(), StoreError> {
     let found = user_version(db)?;
     if found == SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(StoreError::SchemaVersion {
+            found,
+            expected: SCHEMA_VERSION,
+        })
+    }
+}
+
+/// A writer's check before it writes anything into `root`, the lease and a run record included:
+/// [`migrate`] refuses the same version only after `Committer::open` has taken the lease. An
+/// absent commit log is a new store, which `Committer::open` creates.
+pub fn refuse_an_unreadable_version(root: &Path) -> Result<(), StoreError> {
+    let log = root.join(COMMIT_LOG);
+    if !log.exists() {
+        return Ok(());
+    }
+    let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let found = user_version(&db)?;
+    if (0..=SCHEMA_VERSION).contains(&found) {
         Ok(())
     } else {
         Err(StoreError::SchemaVersion {

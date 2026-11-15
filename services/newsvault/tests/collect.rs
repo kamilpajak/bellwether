@@ -63,6 +63,8 @@ const EXIT_USAGE: i32 = 2;
 const EXIT_NOT_FOUND: i32 = 4;
 const EXIT_LEASE_HELD: i32 = 7;
 const EXIT_INCOMPLETE: i32 = 8;
+/// One above `store::SCHEMA_VERSION`, which this build must refuse rather than write into.
+const A_NEWER_USER_VERSION: i32 = newsvault::store::SCHEMA_VERSION + 1;
 
 /// The index names four filings, two of them in universe under an in-list form type.
 const VENDOR_ROWS_IN_THE_INDEX: u32 = 4;
@@ -1883,6 +1885,31 @@ fn an_open_web_run_with_an_absent_or_empty_hosts_file_or_an_absent_rules_file_ex
         exits.push((answered.code, answered.stdout.len()));
     }
     assert_eq!(exits, vec![(EXIT_NOT_FOUND, 0); 3]);
+    Ok(())
+}
+
+/// A store at a version above this build's is refused before the run writes its envelope or
+/// anything else into it. Review 2026-11-15 measured a `runs/` file left behind by the refusal.
+#[test]
+fn a_run_against_a_store_at_a_newer_user_version_leaves_the_store_unchanged() -> TestResult {
+    let root = TempDir::new()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    db.pragma_update(None, "user_version", A_NEWER_USER_VERSION)?;
+    drop(db);
+    let digests = |root: &Path| -> Vec<(String, String)> {
+        tree(root)
+            .into_iter()
+            .map(|(name, bytes)| (name, canon::FileDigest::of(&bytes).hex().to_owned()))
+            .collect()
+    };
+    let before = digests(root.path());
+    let refused = collected(root.path(), A_LISTED_SESSION, &Payloads::a_good_day()?);
+    let said = refused
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+    assert!(said.contains("user_version 2"), "{said}");
+    assert_eq!(digests(root.path()), before);
     Ok(())
 }
 

@@ -152,6 +152,11 @@
     `Committer::open`; a user_version above 1 is refused (`StoreError::SchemaVersion`):
     `a_store_at_an_unknown_higher_user_version_is_refused` (mutation 2026-11-15, refusal removed:
     red).
+  - `collect` refuses that store before its policy copy, run envelope and lease, so the store
+    is left byte-identical (`store::refuse_an_unreadable_version`):
+    `a_run_against_a_store_at_a_newer_user_version_leaves_the_store_unchanged` (mutation
+    2026-11-15, the check removed: red; review 2026-11-15 measured a `runs/` file and a `LOCK`
+    left behind before it).
   - a v0 store opens, migrates and takes a `minute` row: §8 row M1.
   - a v0 item row naming an absent attempt is refused (`StoreError::MigrationFoundADanglingReference`,
     exit 2) and the store stays at user_version 0:
