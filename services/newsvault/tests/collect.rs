@@ -1856,26 +1856,33 @@ fn an_open_web_run_whose_at_is_not_the_clocks_day_is_refused_before_anything_is_
     Ok(())
 }
 
-/// Section 5.1: an absent hosts file and one admitting no host are `input_absent`, exit 4, as an
-/// absent or empty roster is. Mutation 2026-11-15: removing the `OpenWebRefused` arm in
-/// `exit_code` turns this red (both exit 2).
+/// Section 5.1: an absent hosts file, one admitting no host and an absent rules file are
+/// `input_absent`, exit 4, as an absent or empty roster is. Mutations 2026-11-15: removing the
+/// `OpenWebRefused` arm in `exit_code` turns this red (all exit 2); removing only its
+/// `RulesAbsent` arm was green before the rules case was added.
 #[test]
-fn an_open_web_run_with_an_absent_or_empty_hosts_file_exits_four() -> TestResult {
+fn an_open_web_run_with_an_absent_or_empty_hosts_file_or_an_absent_rules_file_exits_four(
+) -> TestResult {
     let root = TempDir::new()?;
     let absent = path(&root.path().join("no-such-hosts.json"));
     let none_admitted = path(&open_web_dir().join("tests/fixtures/hosts/none_admitted.json"));
+    let no_rules = path(&root.path().join("no-such-rules.json"));
     let mut exits = Vec::new();
-    for hosts in [absent, none_admitted] {
+    for (flag, given) in [
+        ("--hosts", absent),
+        ("--hosts", none_admitted),
+        ("--rules", no_rules),
+    ] {
         let mut args = open_web_args(root.path(), &[]);
         let at = args
             .iter()
-            .position(|arg| arg == "--hosts")
-            .ok_or("the arguments name --hosts")?;
-        args[at + 1] = hosts;
+            .position(|arg| arg == flag)
+            .ok_or("the arguments name the flag")?;
+        args[at + 1] = given;
         let answered = binary(&args.iter().map(String::as_str).collect::<Vec<&str>>())?;
         exits.push((answered.code, answered.stdout.len()));
     }
-    assert_eq!(exits, vec![(EXIT_NOT_FOUND, 0), (EXIT_NOT_FOUND, 0)]);
+    assert_eq!(exits, vec![(EXIT_NOT_FOUND, 0); 3]);
     Ok(())
 }
 
