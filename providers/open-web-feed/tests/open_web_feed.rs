@@ -17,7 +17,9 @@ use news_provider::{
     AttemptSlot, CredentialRef, RawResponse, RunId, TargetWindow, TransportError, TransportKind,
     Verdict,
 };
-use open_web_feed::{HostPin, OpenWebFeed, Refusal, RobotsPin, CONTACT_CREDENTIAL, SOURCE};
+use open_web_feed::{
+    AdmittedPath, HostPin, OpenWebFeed, Refusal, RobotsPin, CONTACT_CREDENTIAL, SOURCE,
+};
 use pit::datedness::{Minute, Published};
 use pit::ObservationTime;
 
@@ -910,6 +912,57 @@ fn the_profile_paces_every_host_and_our_address_at_one_request_per_ten_seconds()
         profile.user_agent,
         HeaderValue::FromCredential(CredentialRef::new(CONTACT_CREDENTIAL))
     );
+    Ok(())
+}
+
+/// Section 11.2: `per_host` is max(10 s, the largest ADMITTED host's Crawl-delay), one value for
+/// every host (§8 row R19 hole 7); per IP stays 10 s. Mutations 2026-11-15, the delays ignored /
+/// `min` for `max` / a candidate's delay counted: each red.
+#[test]
+fn a_crawl_delay_above_ten_seconds_slows_every_host_and_one_below_speeds_none_up() -> Outcome {
+    let secs = std::time::Duration::from_secs;
+    let two_rows = || {
+        OpenWebFeed::open(
+            &hosts_fixture("one_admitted_one_candidate.json"),
+            &rules_path(),
+            CONTACT,
+        )
+    };
+    let cases = [
+        (vec![(GNW_HOST, 30)], 30),
+        (vec![(GNW_HOST, 5)], 10),
+        (vec![("www.prnewswire.com", 60)], 10),
+        (vec![], 10),
+    ];
+    for (delays, expected) in cases {
+        let delays = delays
+            .iter()
+            .map(|(host, delay)| ((*host).to_owned(), secs(*delay)))
+            .collect();
+        let profile = two_rows()?.with_crawl_delays(delays).transport();
+        assert_eq!(
+            (profile.budget.min_interval, profile.budget.per_host),
+            (secs(10), Some(secs(expected)))
+        );
+    }
+    Ok(())
+}
+
+/// Section 11.2: the index url's path with its query, then the rule's `path_prefix`, per admitted
+/// row; a candidate row asks nothing.
+#[test]
+fn the_admitted_paths_are_each_admitted_index_with_its_query_and_its_rule_prefix() -> Outcome {
+    let paths = OpenWebFeed::open(
+        &hosts_fixture("one_admitted_one_candidate_index_query.json"),
+        &rules_path(),
+        CONTACT,
+    )?
+    .admitted_paths();
+    let expected = ["/rssfeed/?lang=en", "/news-release/"].map(|path| AdmittedPath {
+        host: GNW_HOST.to_owned(),
+        path: path.to_owned(),
+    });
+    assert_eq!(paths, expected.to_vec());
     Ok(())
 }
 

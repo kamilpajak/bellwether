@@ -1,0 +1,7 @@
+# Synthetic, 2026-11-15: RFC 9309 section 2.2.2, Allow wins a tie, the longest match decides.
+User-agent: *
+Allow: /tie
+Disallow: /tie
+Allow: /a/b
+Disallow: /a/
+Disallow: /a/b/private

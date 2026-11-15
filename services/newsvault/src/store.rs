@@ -593,6 +593,16 @@ pub fn refuse_an_unreadable_version(root: &Path) -> Result<(), StoreError> {
     }
 }
 
+/// The bytes of the blob `hex` names in the store at `root`, `None` when no such file is there.
+/// Read without the commit log: the pinned robots body `collect` parses (section 11.2).
+pub fn blob_bytes(root: &Path, hex: &str) -> Result<Option<Vec<u8>>, StoreError> {
+    let blobs = BlobStore::new(root.join(BLOB_DIR).join(BLOB_SPACE));
+    match blobs.named(hex) {
+        Some(digest) => Ok(Some(std::fs::read(blobs.path_of(&digest))?)),
+        None => Ok(None),
+    }
+}
+
 /// The robots facts `collect` checks before its lease (architecture.md section 11.2), read-only.
 /// No commit log, and a log at a version before the `robots` table, hold no fetch.
 #[derive(Debug)]

@@ -9,7 +9,7 @@ use news_provider::HostKey;
 use serde_json::Value;
 
 use crate::rules::Rule;
-use crate::{host_and_path, known_fields, strict, Refusal};
+use crate::{host_and_target, known_fields, strict, Refusal};
 
 pub(crate) const HOSTS_SCHEMA: &str = "open-web-feed.hosts/2";
 const TOP: [&str; 2] = ["schema", "hosts"];
@@ -64,6 +64,8 @@ pub(crate) struct HostRow {
     pub(crate) host: String,
     pub(crate) status: Status,
     pub(crate) index_url: String,
+    /// The index url's path with its query, which robots.txt must allow (section 11.2).
+    pub(crate) index_target: String,
     pub(crate) rule: String,
     /// Required on an admitted row, optional on a candidate one.
     pub(crate) robots: Option<RobotsPin>,
@@ -146,13 +148,16 @@ pub(crate) fn read_hosts(path: &Path, rules: &BTreeMap<String, Rule>) -> Result<
                 rule,
             });
         }
-        if host_and_path(&index_url).map(|(at, _)| at) != Some(host.clone()) {
-            return Err(Refusal::IndexOffHost {
-                path: path.to_path_buf(),
-                host,
-                url: index_url,
-            });
-        }
+        let index_target = match host_and_target(&index_url) {
+            Some((at, target)) if at == host => target,
+            _ => {
+                return Err(Refusal::IndexOffHost {
+                    path: path.to_path_buf(),
+                    host,
+                    url: index_url,
+                })
+            }
+        };
         let robots = match row.get("robots") {
             None => None,
             Some(pin) => Some(pin.as_str().and_then(RobotsPin::read).ok_or_else(|| {
@@ -170,6 +175,7 @@ pub(crate) fn read_hosts(path: &Path, rules: &BTreeMap<String, Rule>) -> Result<
             host,
             status,
             index_url,
+            index_target,
             rule,
             robots,
         });

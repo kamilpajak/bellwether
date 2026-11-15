@@ -625,16 +625,22 @@ fn emit_collect_error(answer: &cmd_collect::Answer, format: Format) -> anyhow::R
     Ok(())
 }
 
-/// A collect refused by the robots check: section 5.1's code, its exit and the facts behind it.
-struct RobotsRefusal<'a> {
+/// A collect refused by the robots check: section 5.1's code, its exit, the facts behind it, and
+/// whether a `robots refresh` can change the answer (it cannot for a pinned body's own content).
+struct RobotsRefusal {
     code: &'static str,
     exit: u8,
-    host: &'a str,
-    pinned: &'a str,
-    fetched: Option<&'a str>,
+    details: serde_json::Value,
+    refresh_helps: bool,
 }
 
-const fn robots_refusal(failure: &CollectRunError) -> Option<RobotsRefusal<'_>> {
+fn robots_refusal(failure: &CollectRunError) -> Option<RobotsRefusal> {
+    let refused = |details, refresh_helps| RobotsRefusal {
+        code: "robots_refused",
+        exit: EXIT_USAGE,
+        details,
+        refresh_helps,
+    };
     match failure {
         CollectRunError::RobotsUnverified {
             host,
@@ -643,49 +649,70 @@ const fn robots_refusal(failure: &CollectRunError) -> Option<RobotsRefusal<'_>> 
         } => Some(RobotsRefusal {
             code: "robots_unverified",
             exit: EXIT_NOT_FOUND,
-            host: host.as_str(),
-            pinned: pinned.as_str(),
-            fetched: match fetched {
-                Some(digest) => Some(digest.as_str()),
-                None => None,
-            },
+            details: serde_json::json!({"host": host, "pinned": pinned, "fetched": fetched}),
+            refresh_helps: true,
         }),
         CollectRunError::RobotsRefused {
             host,
             pinned,
             fetched,
-        } => Some(RobotsRefusal {
-            code: "robots_refused",
-            exit: EXIT_USAGE,
-            host: host.as_str(),
-            pinned: pinned.as_str(),
-            fetched: Some(fetched.as_str()),
-        }),
+        } => Some(refused(
+            serde_json::json!({"host": host, "pinned": pinned, "fetched": fetched}),
+            true,
+        )),
+        CollectRunError::RobotsUnreadable { host, pinned, why } => Some(refused(
+            serde_json::json!({"host": host, "pinned": pinned, "why": why.to_string()}),
+            false,
+        )),
+        CollectRunError::RobotsDisallowsPath { host, path } => Some(refused(
+            serde_json::json!({"host": host, "path": path}),
+            false,
+        )),
+        CollectRunError::PaceBelowFloor {
+            host,
+            per_host,
+            floor,
+        } => Some(refused(
+            serde_json::json!({
+                "host": host,
+                "per_host_seconds": per_host.map(|interval| interval.as_secs_f64()),
+                "floor_seconds": floor.as_secs_f64(),
+            }),
+            false,
+        )),
         _ => None,
     }
 }
 
-/// The refusal as an error object whose suggestion is the refresh that would ledger the fetch.
+/// The refusal as an error object; its suggestion, when a refresh can change the answer, is the
+/// refresh that would ledger the fetch.
 fn emit_robots_refusal(
     refused: &CollectRunError,
-    facts: &RobotsRefusal<'_>,
+    facts: &RobotsRefusal,
     ask: &cmd_collect::Ask,
     format: Format,
 ) -> anyhow::Result<()> {
     let shown = |path: &std::path::Path| path.display().to_string();
+    let refresh = serde_json::json!([
+        "newsvault",
+        "robots",
+        "refresh",
+        "--source",
+        open_web_feed::SOURCE,
+        "--hosts",
+        ask.hosts.as_deref().map(shown).unwrap_or_default(),
+        "--rules",
+        shown(&ask.rules),
+        "--store",
+        shown(&ask.store),
+    ]);
     let object = serde_json::json!({
         "schema": "newsvault.error/1",
         "code": facts.code,
         "message": refused.to_string(),
         "retryable": false,
-        "details": {"host": facts.host, "pinned": facts.pinned, "fetched": facts.fetched},
-        "suggestions": [[
-            "newsvault", "robots", "refresh",
-            "--source", open_web_feed::SOURCE,
-            "--hosts", ask.hosts.as_deref().map(shown).unwrap_or_default(),
-            "--rules", shown(&ask.rules),
-            "--store", shown(&ask.store),
-        ]],
+        "details": facts.details,
+        "suggestions": if facts.refresh_helps { vec![refresh] } else { Vec::new() },
     });
     let err = std::io::stderr();
     let mut err = err.lock();

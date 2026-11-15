@@ -6,6 +6,7 @@
 //! that dies holding nothing still left a record that it started (accepted attack A3.13).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use canon::digest::{doc_id, item_id, story_id, ItemFields};
 use chrono::{DateTime, NaiveDate, Utc};
@@ -16,11 +17,12 @@ use news_provider::{
     stamp_of, Archive, ArchiveError, AttemptReceipt, Clock, CollectError, Collected, CollectedItem,
     Committed, Exchange, Exit, Provider, Run, RunId, SourceId, TargetWindow,
 };
-use open_web_feed::{HostPin, OpenWebFeed};
+use open_web_feed::{OpenWebFeed, RobotsPin};
 use pit::{MeasuredLag, ObservationTime};
 use serde_json::{json, Value};
 
 use crate::cmd_ledger::{Envelope, RunKind, RUN_ENVELOPE_SCHEMA};
+use crate::robots::{Robots, RobotsError};
 use crate::store::{Committer, ItemRow, StoreError, POLICY_DIR, RUNS_DIR};
 
 /// `/2` since 2026-11-15: `calendar_version` became nullable, a type change, and `window`,
@@ -33,6 +35,9 @@ pub(crate) const RUN_ID_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 const STAGING_PREFIX: &str = ".tmp-";
 /// The one window spelling that is not a day: the UTC date of the run's own `at`.
 pub const TODAY: &str = "today";
+/// Section 11.1's 10 s, held apart from `open-web-feed`'s own interval so the floor check does not
+/// move when the profile it checks does.
+const PACE_FLOOR: Duration = Duration::from_secs(10);
 
 /// What a caller asked `collect` for. `calendar` and `listing` are files for the same reason the
 /// rules file is one: a hashed input a second reader can reproduce. Which of the four optional
@@ -135,6 +140,27 @@ pub enum CollectRunError {
         pinned: String,
         fetched: String,
     },
+    /// Code `robots_refused`, exit 2: the pinned robots body is no robots.txt this reader takes.
+    #[error("admitted host {host} pins robots {pinned}, which cannot be read: {why}")]
+    RobotsUnreadable {
+        host: String,
+        pinned: String,
+        why: RobotsError,
+    },
+    /// Code `robots_refused`, exit 2: the pinned robots.txt disallows a path the row asks.
+    #[error("the pinned robots.txt of admitted host {host} disallows {path}, which its row asks")]
+    RobotsDisallowsPath { host: String, path: String },
+    /// Code `robots_refused`, exit 2: section 11.1's `max(Crawl-delay, 10 s)` is above the
+    /// per-host interval the provider's profile paces at (`None`: no per-host pace at all).
+    #[error(
+        "admitted host {host} would be paced every {per_host:?}, below its floor {floor:?}, \
+         the larger of its robots Crawl-delay and 10 s"
+    )]
+    PaceBelowFloor {
+        host: String,
+        per_host: Option<Duration>,
+        floor: Duration,
+    },
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -165,6 +191,9 @@ impl CollectRunError {
             | Self::UnusableLagPolicy(_)
             | Self::RobotsUnverified { .. }
             | Self::RobotsRefused { .. }
+            | Self::RobotsUnreadable { .. }
+            | Self::RobotsDisallowsPath { .. }
+            | Self::PaceBelowFloor { .. }
             | Self::Store(_)
             | Self::Driver(_)
             | Self::Io(_)
@@ -282,9 +311,29 @@ pub struct Opened {
     pub provider: Box<dyn Provider>,
     /// sha256 of the hosts file the provider was opened on; `None` for a provider with none.
     pub hosts_version: Option<String>,
-    /// Every hosts-file row with its robots pin; empty for a provider with no hosts file.
-    pub host_pins: Vec<HostPin>,
+    /// Every admitted hosts-file row as `collect` checks it; empty for a provider with none.
+    pub admitted_robots: Vec<AdmittedRobots>,
     pub lag: Option<AppliedLag>,
+}
+
+/// One admitted hosts row (section 11.2): its pin, its pinned robots body as read when the
+/// provider was opened, and the paths the row asks of its host.
+#[derive(Debug, Clone)]
+pub struct AdmittedRobots {
+    pub host: String,
+    pub pin: Option<RobotsPin>,
+    pub robots: PinnedRobots,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinnedRobots {
+    /// Pinned `absent`, a 404: no Crawl-delay and no path disallowed.
+    NoRobots,
+    Read(Robots),
+    /// No blob of the pinned digest was in the store when the provider was opened.
+    BlobMissing,
+    Unreadable(RobotsError),
 }
 
 impl std::fmt::Debug for Opened {
@@ -292,7 +341,7 @@ impl std::fmt::Debug for Opened {
         f.debug_struct("Opened")
             .field("registered", &self.registered)
             .field("hosts_version", &self.hosts_version)
-            .field("host_pins", &self.host_pins)
+            .field("admitted_robots", &self.admitted_robots)
             .field("lag", &self.lag)
             .finish_non_exhaustive()
     }
@@ -354,42 +403,89 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
             source_id: registered.source(),
         });
     }
-    let (provider, hosts_version, host_pins, lag): (Box<dyn Provider>, _, _, _) = match registered {
-        Registered::EdgarPress => {
-            let roster = required(ask.roster.as_ref(), roster.0, registered)?;
-            let provider = EdgarPress::open(roster, &ask.rules, &ask.contact)?;
-            match lag_of(ask, registered)? {
-                Some((applied, measured)) => (
-                    Box::new(provider.with_observation_lag(measured)),
+    let (provider, hosts_version, admitted_robots, lag): (Box<dyn Provider>, _, _, _) =
+        match registered {
+            Registered::EdgarPress => {
+                let roster = required(ask.roster.as_ref(), roster.0, registered)?;
+                let provider = EdgarPress::open(roster, &ask.rules, &ask.contact)?;
+                match lag_of(ask, registered)? {
+                    Some((applied, measured)) => (
+                        Box::new(provider.with_observation_lag(measured)),
+                        None,
+                        Vec::new(),
+                        Some(applied),
+                    ),
+                    None => (Box::new(provider), None, Vec::new(), None),
+                }
+            }
+            Registered::OpenWebWires => {
+                // Live only (section 11.1): no window of it is dated by a lag, so a policy is refused.
+                if ask.lag_policy.is_some() {
+                    return Err(CollectRunError::FlagRefused {
+                        flag: "lag-policy",
+                        source_id: registered.source(),
+                    });
+                }
+                let hosts = required(ask.hosts.as_ref(), hosts.0, registered)?;
+                let provider = OpenWebFeed::open(hosts, &ask.rules, &ask.contact)?;
+                let version = provider.hosts_version().hex().to_owned();
+                let admitted = admitted_robots(&ask.store, &provider)?;
+                let delays = admitted
+                    .iter()
+                    .filter_map(|row| match &row.robots {
+                        PinnedRobots::Read(robots) => {
+                            Some((row.host.clone(), robots.crawl_delay()?))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                (
+                    Box::new(provider.with_crawl_delays(delays)),
+                    Some(version),
+                    admitted,
                     None,
-                    Vec::new(),
-                    Some(applied),
-                ),
-                None => (Box::new(provider), None, Vec::new(), None),
+                )
             }
-        }
-        Registered::OpenWebWires => {
-            // Live only (section 11.1): no window of it is dated by a lag, so a policy is refused.
-            if ask.lag_policy.is_some() {
-                return Err(CollectRunError::FlagRefused {
-                    flag: "lag-policy",
-                    source_id: registered.source(),
-                });
-            }
-            let hosts = required(ask.hosts.as_ref(), hosts.0, registered)?;
-            let provider = OpenWebFeed::open(hosts, &ask.rules, &ask.contact)?;
-            let version = provider.hosts_version().hex().to_owned();
-            let pins = provider.host_pins();
-            (Box::new(provider), Some(version), pins, None)
-        }
-    };
+        };
     Ok(Opened {
         registered,
         provider,
         hosts_version,
-        host_pins,
+        admitted_robots,
         lag,
     })
+}
+
+/// Each admitted row's pinned robots body, read from the store's blobs by digest before the
+/// provider is boxed, so the Crawl-delay `transport()` paces at is the one `collect` checks.
+fn admitted_robots(
+    store: &Path,
+    feed: &OpenWebFeed,
+) -> Result<Vec<AdmittedRobots>, CollectRunError> {
+    let paths = feed.admitted_paths();
+    let mut admitted = Vec::new();
+    for row in feed.host_pins().into_iter().filter(|row| row.admitted) {
+        let robots = match &row.robots {
+            Some(RobotsPin::Sha256(hex)) => match crate::store::blob_bytes(store, hex)? {
+                Some(body) => {
+                    Robots::parse(&body).map_or_else(PinnedRobots::Unreadable, PinnedRobots::Read)
+                }
+                None => PinnedRobots::BlobMissing,
+            },
+            Some(RobotsPin::Absent) | None => PinnedRobots::NoRobots,
+        };
+        admitted.push(AdmittedRobots {
+            paths: paths
+                .iter()
+                .filter(|used| used.host == row.host)
+                .map(|used| used.path.clone())
+                .collect(),
+            host: row.host,
+            pin: row.robots,
+            robots,
+        });
+    }
+    Ok(admitted)
 }
 
 /// The policy's entry for this source's archive arm, read once per call from the caller's file.
@@ -600,17 +696,18 @@ fn refuse_the_window(ask: &Ask, provider: &dyn Provider) -> Result<(), CollectRu
     }
 }
 
-/// Section 8 row R4(b): every admitted row's newest answered robots fetch in the store is its pin.
-/// Read before the lease; a refresh running alongside can only add a newer answer.
+/// Section 8 rows R4(b) and R19(b): every admitted row's newest answered robots fetch in the
+/// store is its pin, and the pinned robots allows the row's paths and its pace. Read before the
+/// lease; a refresh running alongside can only add a newer answer.
 fn refuse_an_unverified_robots(ask: &Ask, opened: &Opened) -> Result<(), CollectRunError> {
-    let admitted: Vec<&HostPin> = opened.host_pins.iter().filter(|row| row.admitted).collect();
-    if admitted.is_empty() {
+    if opened.admitted_robots.is_empty() {
         return Ok(());
     }
     let ledger = crate::store::RobotsLedger::open(&ask.store)?;
-    for row in admitted {
+    let per_host = opened.provider.transport().budget.per_host;
+    for row in &opened.admitted_robots {
         let pinned = row
-            .robots
+            .pin
             .as_ref()
             .map_or_else(String::new, |pin| pin.text().to_owned());
         let newest = match ledger.newest_robots(&row.host) {
@@ -639,8 +736,64 @@ fn refuse_an_unverified_robots(ask: &Ask, opened: &Opened) -> Result<(), Collect
                 fetched,
             });
         }
+        refuse_what_the_pinned_robots_forbids(row, pinned, per_host)?;
     }
     Ok(())
+}
+
+/// Section 11.2's path and floor checks on one row whose newest fetch is its pin.
+fn refuse_what_the_pinned_robots_forbids(
+    row: &AdmittedRobots,
+    pinned: String,
+    per_host: Option<Duration>,
+) -> Result<(), CollectRunError> {
+    let robots = match &row.robots {
+        PinnedRobots::NoRobots => None,
+        PinnedRobots::Read(robots) => Some(robots),
+        // A refresh that wrote the blob after `open_provider` read the store.
+        PinnedRobots::BlobMissing => {
+            return Err(CollectRunError::RobotsUnverified {
+                host: row.host.clone(),
+                fetched: Some(pinned.clone()),
+                pinned,
+            })
+        }
+        PinnedRobots::Unreadable(why) => {
+            return Err(CollectRunError::RobotsUnreadable {
+                host: row.host.clone(),
+                pinned,
+                why: why.clone(),
+            })
+        }
+    };
+    let disallowed = row
+        .paths
+        .iter()
+        .find(|path| robots.is_some_and(|robots| !robots.allows(path)));
+    if let Some(path) = disallowed {
+        return Err(CollectRunError::RobotsDisallowsPath {
+            host: row.host.clone(),
+            path: path.clone(),
+        });
+    }
+    refuse_a_pace_below_the_floor(&row.host, per_host, robots.and_then(Robots::crawl_delay))
+}
+
+/// Section 8 row R19(b): `per_host` must be at least `max(crawl_delay, 10 s)`; `None` is refused.
+pub fn refuse_a_pace_below_the_floor(
+    host: &str,
+    per_host: Option<Duration>,
+    crawl_delay: Option<Duration>,
+) -> Result<(), CollectRunError> {
+    let floor = crawl_delay.map_or(PACE_FLOOR, |delay| delay.max(PACE_FLOOR));
+    match per_host {
+        Some(interval) if interval >= floor => Ok(()),
+        _ => Err(CollectRunError::PaceBelowFloor {
+            host: host.to_owned(),
+            per_host,
+            floor,
+        }),
+    }
 }
 
 /// The plan alone, which is what `--dry-run` returns: everything except the mutation.

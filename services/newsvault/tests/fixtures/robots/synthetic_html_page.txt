@@ -1,0 +1,4 @@
+<!doctype html>
+<!-- Synthetic, 2026-11-15: a 200 page served at the robots path. -->
+<html><head><title>Not Found</title></head>
+<body><p>Page: not here</p></body></html>
