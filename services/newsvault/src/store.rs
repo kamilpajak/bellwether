@@ -102,6 +102,8 @@ const BLOB_DIR: &str = "blobs";
 const BLOB_SPACE: &str = "sha256";
 /// One constant for the label `record` writes and `ok_vendor_rows` reads, so the two cannot drift.
 const OUTCOME_OK: &str = "ok";
+/// Statuses a permanent failure is not held under: owner decision of 2026-11-15 (§10).
+const REDIRECTS: std::ops::RangeInclusive<u16> = 300..=399;
 
 /// Per connection, so set on every open and never part of a schema version.
 const CONNECTION: &str = "
@@ -1008,7 +1010,9 @@ impl Committer {
 
     /// Section 11.1's held set: keyed on (source, story) over every target window, so a story
     /// held under yesterday's window is held today. No cutoff, for the reason
-    /// [`Committer::covered_story_ids`] gives.
+    /// [`Committer::covered_story_ids`] gives. A permanent failure answered with a 3xx holds
+    /// nothing; one with no status (a transport error) is still held, which the `COALESCE` keeps:
+    /// without it the `NOT (...)` is NULL and drops the row.
     pub fn held_story_ids(&self, source: &SourceId) -> Result<BTreeSet<String>, StoreError> {
         let mut statement = self.db.prepare(
             "SELECT i.story_id FROM items i
@@ -1017,7 +1021,8 @@ impl Committer {
              UNION
              SELECT story_id FROM attempts
              WHERE source = ?1 AND story_id IS NOT NULL AND closed_at IS NOT NULL
-               AND verdict IN (?2, ?3, ?4)",
+               AND verdict IN (?2, ?3, ?4)
+               AND NOT (verdict = ?4 AND COALESCE(transport_status, 0) BETWEEN ?5 AND ?6)",
         )?;
         let held = statement
             .query_map(
@@ -1025,7 +1030,9 @@ impl Committer {
                     source.as_str(),
                     Verdict::Usable.name(),
                     Verdict::Empty.name(),
-                    Verdict::PermanentFailure.name()
+                    Verdict::PermanentFailure.name(),
+                    REDIRECTS.start(),
+                    REDIRECTS.end()
                 ],
                 |row| row.get::<_, String>(0),
             )?
@@ -1711,7 +1718,7 @@ mod tests {
     use chrono::{DateTime, TimeDelta, Utc};
     use news_provider::{
         abandon, AttemptEvent, AttemptSlot, Baseline, Outcome, Provenance, RawResponse, Request,
-        RequestPhase, SourceId, TargetWindow, ValidSource, Verdict,
+        RequestPhase, SourceId, TargetWindow, TransportError, ValidSource, Verdict,
     };
     use pit::datedness::{Minute, Published};
     use pit::ValidTime;
@@ -3270,16 +3277,32 @@ mod tests {
         ordinal: u32,
         verdict: Verdict,
     ) -> TestResult {
+        let story = (source_item_id, ordinal);
+        a_document_answered(store, at_window, story, verdict, Some(STATUS_OK))
+    }
+
+    /// As [`a_document_closed`], answered with `status`, or with a transport error for `None`.
+    fn a_document_answered(
+        store: &mut Committer,
+        at_window: (&str, &str),
+        (source_item_id, ordinal): (&str, u32),
+        verdict: Verdict,
+        status: Option<u16>,
+    ) -> TestResult {
         let slot = document_slot(store, at_window, source_item_id, ordinal)?;
-        let answer = RawResponse::new(
-            slot.attempt_id().clone(),
-            STATUS_OK,
-            PAYLOAD.to_vec(),
-            at(2),
-            at(3),
-        );
+        let attempt = slot.attempt_id().clone();
+        let answer = match status {
+            Some(status) => Ok(RawResponse::new(
+                attempt,
+                status,
+                PAYLOAD.to_vec(),
+                at(2),
+                at(3),
+            )),
+            None => Err(TransportError::new(attempt, at(2), at(3), String::new())),
+        };
         let outcome = Outcome::decide(&verdict, 0, &Baseline::from_trailing_ok(&TRAILING_OK));
-        let closed = slot.close(store, outcome, &Ok(answer), at(4))?;
+        let closed = slot.close(store, outcome, &answer, at(4))?;
         store.record(closed, &[], at(5))?;
         Ok(())
     }
@@ -3334,6 +3357,39 @@ mod tests {
         assert_eq!(
             held,
             [STORY, "usable, no item", "empty", "permanent"]
+                .map(|story| story_hex(SOURCE, story))
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        Ok(())
+    }
+
+    /// Section 11.1, owner decision of 2026-11-15: a permanent failure answered with a 3xx holds
+    /// nothing, any other status or none at all holds. Mutations 2026-11-15: the 3xx exclusion
+    /// dropped, red; its `COALESCE` dropped, red; either bound moved in by one, red.
+    #[test]
+    fn a_permanent_document_answered_with_a_redirect_holds_nothing_and_one_with_no_status_holds(
+    ) -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let here = (SOURCE, WINDOW);
+        let answers = [
+            ("300", Some(300)),
+            ("301", Some(301)),
+            ("399", Some(399)),
+            ("400", Some(400)),
+            ("404", Some(404)),
+            ("no status", None),
+        ];
+        for ((story, status), ordinal) in answers.into_iter().zip(0..) {
+            let failed = Verdict::PermanentFailure;
+            a_document_answered(&mut store, here, (story, ordinal), failed, status)?;
+        }
+        a_document_closed(&mut store, here, "usable", 6, Verdict::Usable)?;
+        let held = store.held_story_ids(&SourceId::new(SOURCE))?;
+        assert_eq!(
+            held,
+            ["400", "404", "no status", "usable"]
                 .map(|story| story_hex(SOURCE, story))
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>()

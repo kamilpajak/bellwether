@@ -48,6 +48,7 @@ const NOT_FOUND: u16 = 404;
 const FORBIDDEN: u16 = 403;
 const UNAVAILABLE: u16 = 503;
 const REQUEST_TIMEOUT: u16 = 408;
+const MOVED_PERMANENTLY: u16 = 301;
 /// Two robots fetches before `RUN_AT`, the second the newer.
 const ROBOTS_EARLIER: &str = "2026-11-14T17:00:00Z";
 const ROBOTS_LATER: &str = "2026-11-14T18:00:00Z";
@@ -1121,6 +1122,27 @@ fn a_permanently_failed_document_is_not_fetched_again() -> TestResult {
     assert_eq!(
         (first.contains(&failed), second.contains(&failed)),
         (true, false)
+    );
+    Ok(())
+}
+
+/// Section 11.1, owner decision of 2026-11-15 (§10): a 3xx is a permanent verdict, so it is not
+/// retried in-run, and it holds nothing, so the next poll asks again. Mutation 2026-11-15, the
+/// held read's 3xx exclusion dropped: red.
+#[test]
+fn a_document_answered_with_a_redirect_is_fetched_again_by_the_next_poll() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let redirected = release_url(0)?;
+    let exchange = Gnw::day()?.answering(&redirected, &[MOVED_PERMANENTLY]);
+    poll(root.path(), RUN_AT, "first", &exchange)?;
+    let (first, _) = exchange.sent();
+    poll(root.path(), LATER_THE_SAME_DAY, "second", &exchange)?;
+    let (second, _) = exchange.sent();
+    let times = first.iter().filter(|url| **url == redirected).count();
+    assert_eq!(
+        (times, second),
+        (1, vec![INDEX.to_owned(), redirected.clone()])
     );
     Ok(())
 }

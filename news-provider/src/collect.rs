@@ -102,7 +102,8 @@ pub trait Archive: Sink {
 
     /// The story ids this archive holds under `source` across EVERY target window: a committed
     /// item, or a closed Document attempt whose verdict was usable, empty or permanent. A transient
-    /// failure, a swept attempt and one in flight hold nothing (architecture.md section 11.1).
+    /// failure, a permanent failure answered with a 3xx, a swept attempt and one in flight hold
+    /// nothing (architecture.md section 11.1).
     fn held_story_ids(
         &self,
         source: &SourceId,
