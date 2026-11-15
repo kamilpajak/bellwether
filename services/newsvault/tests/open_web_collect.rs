@@ -9,8 +9,8 @@ use std::process::{Command, Stdio};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use news_provider::{
-    Clock, CollectError, Exchange, Exit, PlanRefusal, RawResponse, Request, SendFailure,
-    SendPermit, TransportError,
+    Clock, Exchange, Exit, PlanRefusal, RawResponse, Request, SendFailure, SendPermit,
+    TransportError,
 };
 use newsvault::cmd_collect::{self, Ask, CollectRunError};
 use newsvault::cmd_items::{self, PerStory};
@@ -27,7 +27,7 @@ const CONTACT: &str = "bellwether collector contact@example.test";
 /// enough that no row is stored Undated, early enough that `items` can see that minute still open.
 const RUN_AT: &str = "2026-11-14T19:00:30Z";
 const YESTERDAY: &str = "2026-11-13";
-/// Inside the 19:00 minute and past the run's observation, then past that minute's last microsecond.
+/// Inside the 19:00 minute and past the run's observation, then the instant that minute closes.
 const BEFORE_THE_MINUTE_CLOSED: &str = "2026-11-14T19:00:45Z";
 const AFTER_THE_MINUTE_CLOSED: &str = "2026-11-14T19:01:00Z";
 const INDEX: &str = "https://rss.globenewswire.com/rssfeed/";
@@ -317,9 +317,9 @@ fn an_open_web_run_for_yesterday_sends_nothing() -> TestResult {
     assert!(
         matches!(
             refused,
-            Err(CollectRunError::Driver(CollectError::Planning(
+            Err(CollectRunError::WindowRefused(
                 PlanRefusal::NotTheRunDay { .. }
-            )))
+            ))
         ),
         "{refused:?}"
     );

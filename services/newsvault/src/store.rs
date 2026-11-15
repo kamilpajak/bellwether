@@ -73,7 +73,7 @@
 //! # }
 //! ```
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 
@@ -159,7 +159,7 @@ CREATE INDEX items_by_story ON items(story_id);
 CREATE INDEX items_by_doc ON items(doc_id);
 "];
 
-/// The frozen user_version 0 DDL; every store, new or old, is created from it and then migrated.
+/// The frozen user_version 0 DDL; how a store reaches user_version 1: architecture.md §3.1.
 ///
 /// `seq` is `INTEGER PRIMARY KEY AUTOINCREMENT` so the column never reuses a value after a delete,
 /// and the value itself comes from a committed `seq_reservations` row: measured 2026-11-13 on
@@ -324,10 +324,44 @@ pub enum StoreError {
     /// while it runs; a v0 row naming an absent parent is refused rather than carried forward.
     #[error("the migration found {table} row {rowid} naming a parent row the store does not hold")]
     MigrationFoundADanglingReference { table: String, rowid: i64 },
+    /// `SCHEMA_V0` is `CREATE TABLE IF NOT EXISTS`, so it cannot add a column to a v0 table an
+    /// older binary wrote: `attempts` before `matched` (067a0bd) migrated to 1 without it.
+    #[error(
+        "the commit log at user_version 0 differs from SCHEMA_V0 in {}; no migration repairs \
+         that, so the store is left at user_version 0",
+        .columns.join(", ")
+    )]
+    V0ShapeDiffers { columns: Vec<String> },
+    /// `cause` is SQLite's message alone: the error rusqlite returns carries the whole batch.
+    #[error(
+        "migrating the commit log from user_version {from} failed {step}: {cause}; the store is \
+         left at user_version {from}"
+    )]
+    MigrationFailed {
+        from: usize,
+        step: MigrationStep,
+        cause: String,
+    },
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+/// Where a migration stopped: `SCHEMA_V0` is not a step to a version, so it is named on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationStep {
+    CreatingTheV0Tables,
+    ToUserVersion(usize),
+}
+
+impl std::fmt::Display for MigrationStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreatingTheV0Tables => f.write_str("creating the v0 tables the store lacks"),
+            Self::ToUserVersion(version) => write!(f, "at the step to user_version {version}"),
+        }
+    }
 }
 
 /// One item as the store takes it. The extraction evidence (title, url, lang, the vendor's own
@@ -490,8 +524,8 @@ pub fn require_current_version(db: &Connection) -> Result<(), StoreError> {
 }
 
 /// A writer's check before it writes anything into `root`, the lease and a run record included:
-/// [`migrate`] refuses the same version only after `Committer::open` has taken the lease. An
-/// absent commit log is a new store, which `Committer::open` creates.
+/// [`migrate`] refuses the same version and v0 shape only after `Committer::open` has taken the
+/// lease. An absent commit log is a new store, which `Committer::open` creates.
 pub fn refuse_an_unreadable_version(root: &Path) -> Result<(), StoreError> {
     let log = root.join(COMMIT_LOG);
     if !log.exists() {
@@ -499,14 +533,19 @@ pub fn refuse_an_unreadable_version(root: &Path) -> Result<(), StoreError> {
     }
     let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let found = user_version(&db)?;
-    if (0..=SCHEMA_VERSION).contains(&found) {
-        Ok(())
-    } else {
-        Err(StoreError::SchemaVersion {
+    if !(0..=SCHEMA_VERSION).contains(&found) {
+        return Err(StoreError::SchemaVersion {
             found,
             expected: SCHEMA_VERSION,
-        })
+        });
     }
+    if found == 0 {
+        let columns = v0_columns_that_differ(&db)?;
+        if !columns.is_empty() {
+            return Err(StoreError::V0ShapeDiffers { columns });
+        }
+    }
+    Ok(())
 }
 
 /// Brings a store from the version it holds to [`SCHEMA_VERSION`] in one transaction, so a crash
@@ -535,10 +574,18 @@ fn migrate(db: &mut Connection) -> Result<(), StoreError> {
 fn migrate_from(db: &mut Connection, from: usize) -> Result<(), StoreError> {
     let transaction = db.transaction()?;
     if from == 0 {
-        transaction.execute_batch(SCHEMA_V0)?;
+        let columns = v0_columns_that_differ(&transaction)?;
+        if !columns.is_empty() {
+            return Err(StoreError::V0ShapeDiffers { columns });
+        }
+        transaction
+            .execute_batch(SCHEMA_V0)
+            .map_err(step_failed(from, MigrationStep::CreatingTheV0Tables))?;
     }
-    for step in MIGRATIONS.iter().skip(from) {
-        transaction.execute_batch(step)?;
+    for (index, step) in MIGRATIONS.iter().enumerate().skip(from) {
+        transaction
+            .execute_batch(step)
+            .map_err(step_failed(from, MigrationStep::ToUserVersion(index + 1)))?;
     }
     let dangling: Option<(String, i64)> = transaction
         .query_row("PRAGMA foreign_key_check", [], |row| {
@@ -551,6 +598,64 @@ fn migrate_from(db: &mut Connection, from: usize) -> Result<(), StoreError> {
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
+}
+
+fn step_failed(from: usize, step: MigrationStep) -> impl FnOnce(rusqlite::Error) -> StoreError {
+    move |failure| StoreError::MigrationFailed {
+        from,
+        step,
+        cause: match failure {
+            rusqlite::Error::SqlInputError { msg, .. } => msg,
+            other => other.to_string(),
+        },
+    }
+}
+
+/// A column as `PRAGMA table_info` states it: declared type, NOT NULL, default, primary key rank.
+type ColumnShape = (String, bool, Option<String>, i64);
+
+fn columns_of(db: &Connection, table: &str) -> Result<BTreeMap<String, ColumnShape>, StoreError> {
+    let mut statement =
+        db.prepare("SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?1)")?;
+    let columns = statement
+        .query_map([table], |row| {
+            Ok((
+                row.get(0)?,
+                (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?),
+            ))
+        })?
+        .collect::<Result<BTreeMap<String, ColumnShape>, _>>()?;
+    Ok(columns)
+}
+
+/// Every `table.column` of a v0 table the store holds whose shape is not the one `SCHEMA_V0`
+/// declares. A v0 table the store lacks is absent here, because `SCHEMA_V0` creates it whole.
+fn v0_columns_that_differ(db: &Connection) -> Result<Vec<String>, StoreError> {
+    let frozen = Connection::open_in_memory()?;
+    frozen.execute_batch(SCHEMA_V0)?;
+    let mut statement = frozen.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+         ORDER BY name",
+    )?;
+    let tables = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    let mut differing = Vec::new();
+    for table in tables {
+        let found = columns_of(db, &table)?;
+        if found.is_empty() {
+            continue;
+        }
+        let declared = columns_of(&frozen, &table)?;
+        let names: BTreeSet<&String> = declared.keys().chain(found.keys()).collect();
+        differing.extend(
+            names
+                .into_iter()
+                .filter(|name| declared.get(*name) != found.get(*name))
+                .map(|name| format!("{table}.{name}")),
+        );
+    }
+    Ok(differing)
 }
 
 fn contiguous(seqs: &[i64]) -> Vec<SeqRange> {
@@ -1201,15 +1306,16 @@ fn dispute(
 }
 
 /// The newest publication value visible at `at` (RFC 3339 UTC, microseconds), for the ledger's
-/// publication clock. A minute counts once its LAST microsecond has passed and is reported as the
-/// stored minute, never as an instant inside it.
+/// publication clock. A minute counts from the start of the NEXT minute, as `pit`'s minute arm
+/// counts it, and is reported as the stored minute, never as an instant inside it.
 pub fn newest_visible_publication(db: &Connection, at: &str) -> Result<Option<String>, StoreError> {
     Ok(db.query_row(
         "SELECT MAX(value) FROM (
              SELECT valid_at AS value FROM items WHERE valid_at <= ?1 AND observed_at <= ?1
              UNION ALL
              SELECT valid_minute FROM items
-              WHERE substr(valid_minute, 1, 17) || '59.999999Z' <= ?1 AND observed_at <= ?1)",
+              WHERE strftime('%Y-%m-%dT%H:%M:%S.000000Z', valid_minute, '+1 minute') <= ?1
+                AND observed_at <= ?1)",
         [at],
         |row| row.get(0),
     )?)
@@ -1308,8 +1414,8 @@ mod tests {
 
     use super::{
         first_observed, fs, newest_visible_publication, params, stamp, user_version, Committer,
-        ItemRow, LedgerError, ObservationTime, RunId, Sink, StoreError, COMMIT_LOG, SCHEMA_V0,
-        SCHEMA_VERSION,
+        ItemRow, LedgerError, MigrationStep, ObservationTime, RunId, Sink, StoreError, COMMIT_LOG,
+        SCHEMA_V0, SCHEMA_VERSION,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1363,9 +1469,10 @@ mod tests {
     /// 00:02 and 00:03 UTC on 1970-01-01, whole minutes on the same clock as `VALID_AT`.
     const A_PUBLICATION_MINUTE: i64 = 120 * SECOND;
     const A_LATER_PUBLICATION_MINUTE: i64 = 180 * SECOND;
-    /// Inside `A_PUBLICATION_MINUTE`, and its last microsecond.
+    /// Inside `A_PUBLICATION_MINUTE`, its last microsecond, and the instant it closes.
     const INSIDE_THAT_MINUTE: &str = "1970-01-01T00:02:30.000000Z";
-    const THAT_MINUTE_CLOSES: &str = "1970-01-01T00:02:59.999999Z";
+    const ONE_MICROSECOND_BEFORE_THAT_MINUTE_CLOSES: &str = "1970-01-01T00:02:59.999999Z";
+    const THAT_MINUTE_CLOSES: &str = "1970-01-01T00:03:00.000000Z";
     const INSERTED_BY_HAND: &str = "INSERT INTO items (item_id, story_id, attempt_id, valid_at,
          valid_minute, observed_at, valid_disputed, raw_blob, committed_at, valid_source)
          SELECT 'by hand', 'by hand', attempt_id, ?1, ?2, ?3, 0, raw_blob, ?3, ?4 FROM items";
@@ -1922,6 +2029,135 @@ mod tests {
         );
         let db = Connection::open(temp.path().join(COMMIT_LOG))?;
         assert_eq!(user_version(&db)?, 0);
+        Ok(())
+    }
+
+    /// `attempts` as every binary before 067a0bd (2026-11-13) wrote it: `SCHEMA_V0` less `matched`.
+    const ATTEMPTS_BEFORE_MATCHED: &str = "
+        CREATE TABLE attempts (
+            attempt_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, source TEXT NOT NULL,
+            target_window TEXT NOT NULL, filter_params TEXT NOT NULL,
+            universe_version TEXT NOT NULL, opened_at TEXT NOT NULL, requested_at TEXT,
+            received_at TEXT, transport_status INTEGER, clock_nonmonotonic INTEGER,
+            outcome TEXT, vendor_rows INTEGER, items_new INTEGER, baseline_count INTEGER,
+            baseline_window INTEGER, baseline_construction TEXT, baseline_ratio REAL,
+            slots INTEGER, closed_at TEXT, noticed_at TEXT, noticed_by TEXT
+        );";
+
+    /// §8 row M1, a v0 store an older binary wrote. Before this check it migrated to 1 with no
+    /// `matched` and `ledger` then failed on `no such column: a.matched` (review 2026-11-15).
+    #[test]
+    fn a_v0_store_whose_attempts_predate_matched_is_refused_and_left_at_user_version_zero(
+    ) -> TestResult {
+        let temp = TempDir::new()?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch(ATTEMPTS_BEFORE_MATCHED)?;
+        db.execute_batch(SCHEMA_V0)?;
+        drop(db);
+        let refused = open(&temp);
+        assert!(
+            matches!(
+                &refused,
+                Err(StoreError::V0ShapeDiffers { columns }) if columns == &["attempts.matched"]
+            ),
+            "{refused:?}"
+        );
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        assert_eq!(user_version(&db)?, 0);
+        Ok(())
+    }
+
+    /// §8 row M1: every part of a column's shape is compared, not its name alone. Each fixture is
+    /// `SCHEMA_V0` with one column's type, NOT NULL, default or primary key changed.
+    #[test]
+    fn a_v0_store_whose_column_differs_in_type_not_null_default_or_key_is_refused() -> TestResult {
+        let fixtures = [
+            (
+                "slots                 INTEGER,",
+                "slots TEXT,",
+                "attempts.slots",
+            ),
+            (
+                "run_id                TEXT NOT NULL,",
+                "run_id TEXT,",
+                "attempts.run_id",
+            ),
+            (
+                "outcome               TEXT,",
+                "outcome TEXT DEFAULT 'x',",
+                "attempts.outcome",
+            ),
+            (
+                "attempt_id            TEXT PRIMARY KEY,",
+                "attempt_id TEXT UNIQUE,",
+                "attempts.attempt_id",
+            ),
+        ];
+        let mut named = Vec::new();
+        for (declared, written, _) in fixtures {
+            assert_eq!(SCHEMA_V0.matches(declared).count(), 1, "{declared}");
+            let temp = TempDir::new()?;
+            let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+            db.execute_batch(&SCHEMA_V0.replacen(declared, written, 1))?;
+            drop(db);
+            let refused = match open(&temp) {
+                Err(StoreError::V0ShapeDiffers { columns }) => columns,
+                other => vec![format!("{other:?}")],
+            };
+            let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+            named.push((refused, user_version(&db)?));
+        }
+        assert_eq!(
+            named,
+            fixtures.map(|(_, _, column)| (vec![column.to_owned()], 0))
+        );
+        Ok(())
+    }
+
+    /// A step that fails names the versions and SQLite's message, never the 2 KB batch rusqlite
+    /// puts in its error (review 2026-11-15, `items_v1` left in place).
+    #[test]
+    fn a_failed_migration_step_is_named_without_its_sql_and_leaves_user_version_zero() -> TestResult
+    {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_zero(&temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch("CREATE TABLE items_v1 (x)")?;
+        drop(db);
+        let refused = open(&temp);
+        assert!(
+            matches!(
+                &refused,
+                Err(StoreError::MigrationFailed {
+                    from: 0,
+                    step: MigrationStep::ToUserVersion(1),
+                    cause,
+                }) if cause == "table items_v1 already exists"
+            ),
+            "{refused:?}"
+        );
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        assert_eq!(user_version(&db)?, 0);
+        Ok(())
+    }
+
+    /// A failure inside `SCHEMA_V0` is not named as a step to user_version 0 (review 2026-11-15:
+    /// "failed at the step to user_version 0", read as a no-op step).
+    #[test]
+    fn a_failure_creating_the_v0_tables_is_named_as_that_step() -> TestResult {
+        let temp = TempDir::new()?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch("CREATE TABLE t (x); CREATE INDEX published ON t(x);")?;
+        drop(db);
+        let said = open(&temp).err().map(|error| error.to_string());
+        assert_eq!(
+            said.as_deref(),
+            Some(
+                "migrating the commit log from user_version 0 failed creating the v0 tables the \
+                 store lacks: there is already an index named published; the store is left at \
+                 user_version 0"
+            )
+        );
         Ok(())
     }
 
@@ -2695,11 +2931,13 @@ mod tests {
         };
         store.record(closed, &[minute_row(&store, &read_inside)?], at(5))?;
         assert_eq!(
-            (
-                newest_visible_publication(&store.db, INSIDE_THAT_MINUTE)?,
-                newest_visible_publication(&store.db, THAT_MINUTE_CLOSES)?
-            ),
-            (None, Some(stamped(A_PUBLICATION_MINUTE)))
+            [
+                INSIDE_THAT_MINUTE,
+                ONE_MICROSECOND_BEFORE_THAT_MINUTE_CLOSES,
+                THAT_MINUTE_CLOSES
+            ]
+            .map(|at| newest_visible_publication(&store.db, at).ok().flatten()),
+            [None, None, Some(stamped(A_PUBLICATION_MINUTE))]
         );
         Ok(())
     }

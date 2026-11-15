@@ -224,11 +224,9 @@ fn in_range(row: &Row, ask: &Ask) -> bool {
     after && before && sourced
 }
 
-/// Every predicate comes from `pit`: an instant row through `Visibility`, a minute row through
-/// `Datedness::of_minute`, a day row through the end of that day in its OWN calendar. A day bounded by UTC midnight is 19:00 in New York and admits
-/// the afternoon, which is the 13 h of lookahead the two day columns exist to remove. The zone is
-/// a stored string rather than the `&'static str` `Datedness::DayDated` carries, so this reaches
-/// `end_of_day` directly instead of rebuilding that value.
+/// Every predicate comes from `pit`: instant via `Visibility`, minute via `Datedness::of_minute`,
+/// day via `end_of_day` in the row's own calendar (architecture.md section 3.1). The zone is a
+/// stored string, not the `&'static str` `Datedness::DayDated` needs, so no `DayDated` is built.
 fn visible_at(row: &Row, cutoff: Cutoff) -> bool {
     if let Some(minute) = &row.valid_minute {
         let (Some(minute), Some(observed)) = (
@@ -365,8 +363,8 @@ mod tests {
     /// GNW's RSS `pubDate` of 2026-11-14, `Sat, 14 Nov 2026 19:00 GMT`, read inside that minute.
     const A_PUBLICATION_MINUTE: &str = "2026-11-14T19:00:00Z";
     const READ_INSIDE_IT: &str = "2026-11-14T19:00:30Z";
-    const ONE_MICROSECOND_BEFORE_IT_CLOSES: &str = "2026-11-14T19:00:59.999998Z";
-    const THE_LAST_MICROSECOND_OF_IT: &str = "2026-11-14T19:00:59.999999Z";
+    const ONE_MICROSECOND_BEFORE_IT_CLOSES: &str = "2026-11-14T19:00:59.999999Z";
+    const WHEN_IT_CLOSES: &str = "2026-11-14T19:01:00Z";
     const AFTER_THE_MINUTE_BEFORE_THE_FETCH: &str = "2026-11-14T19:02:00Z";
 
     fn ask(at: &str) -> Result<Ask, chrono::ParseError> {
@@ -398,7 +396,7 @@ mod tests {
         for cutoff in [
             READ_INSIDE_IT,
             ONE_MICROSECOND_BEFORE_IT_CLOSES,
-            THE_LAST_MICROSECOND_OF_IT,
+            WHEN_IT_CLOSES,
         ] {
             let report = read(root.path(), &ask(cutoff)?)?;
             precisions.push(

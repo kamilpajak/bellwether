@@ -21,7 +21,7 @@ use news_provider::provider::{
     UnusableReason, UnusableRow, ValidPrecision, ValidSource,
 };
 use news_provider::request::{days_of, HeaderValue, Request, RequestPhase};
-use news_provider::wire::{RawResponse, Timeouts, TransportError, TransportProfile};
+use news_provider::wire::{RawResponse, Timeouts, TransportError, TransportKind, TransportProfile};
 use news_provider::{CredentialRef, SourceId, TargetWindow, Verdict};
 use pit::datedness::{end_of_day, Published};
 use pit::{MeasuredLag, ObservationTime, PitError, ValidTime, Visibility};
@@ -529,12 +529,16 @@ impl Provider for EdgarPress {
         })
     }
 
-    /// From the BODY as well as the status. The shared-IP traffic 403 is TRANSIENT because the
-    /// predecessor measured it clearing by waiting (its issues #379, #382, #383); only the generic
-    /// S3 `AccessDenied` is permanent, and only because `plan` asked for a day the listing named.
+    /// From the BODY as well as the status. The shared-IP traffic 403 is TRANSIENT: it cleared by
+    /// waiting (predecessor issues #379, #382, #383). Permanent: the S3 403 `AccessDenied`, as
+    /// `plan` asked for a listed day, and a body over `body_limit` whatever its status (§8 R21).
     fn classify(&self, request: &Request, answer: &Result<RawResponse, TransportError>) -> Verdict {
-        let Ok(response) = answer else {
-            return Verdict::TransientFailure;
+        let response = match answer {
+            Ok(response) => response,
+            Err(failed) if failed.kind() == TransportKind::BodyOverLimit => {
+                return Verdict::PermanentFailure
+            }
+            Err(_) => return Verdict::TransientFailure,
         };
         let body = String::from_utf8_lossy(response.body());
         match response.status() {

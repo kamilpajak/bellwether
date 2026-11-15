@@ -86,6 +86,10 @@ pub enum CollectRunError {
         at: NaiveDate,
         today: NaiveDate,
     },
+    /// `today` is a UTC date; a session-bound source plans New York session days, and a run at
+    /// 02:00Z planned the next UTC day (review 2026-11-15).
+    #[error("{source_id} plans session days and takes no --window today; name the day")]
+    TodayRefused { source_id: &'static str },
     #[error("no {what} at {path}")]
     InputAbsent { what: &'static str, path: PathBuf },
     #[error("the calendar at {path} is unusable: {why}")]
@@ -96,6 +100,9 @@ pub enum CollectRunError {
     /// agent reads.
     #[error(transparent)]
     PlanRefused(#[from] PlanRefusal),
+    /// The caller's `--window`: unreadable, or not the run's UTC day for a live-only source.
+    #[error(transparent)]
+    WindowRefused(PlanRefusal),
     #[error(transparent)]
     Refused(#[from] edgar_press::Refusal),
     #[error(transparent)]
@@ -112,6 +119,48 @@ pub enum CollectRunError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Serde(#[from] serde_json::Error),
+}
+
+impl CollectRunError {
+    /// `invalid_argument` (section 5.1), which `main` writes as `usage error:`.
+    #[must_use]
+    pub const fn is_usage(&self) -> bool {
+        match self {
+            Self::UnknownSource(_)
+            | Self::MoreThanOneSource(_)
+            | Self::FlagRequired { .. }
+            | Self::FlagRefused { .. }
+            | Self::AtIsNotTheClockDay { .. }
+            | Self::TodayRefused { .. }
+            | Self::WindowRefused(_) => true,
+            Self::InputAbsent { .. }
+            | Self::UnusableCalendar { .. }
+            | Self::PlanRefused(_)
+            | Self::Refused(_)
+            | Self::OpenWebRefused(_)
+            | Self::UnusableLagPolicy(_)
+            | Self::Store(_)
+            | Self::Driver(_)
+            | Self::Io(_)
+            | Self::Serde(_) => false,
+        }
+    }
+
+    fn of_plan(refusal: PlanRefusal) -> Self {
+        match refusal {
+            PlanRefusal::TargetWindowUnreadable(_) | PlanRefusal::NotTheRunDay { .. } => {
+                Self::WindowRefused(refusal)
+            }
+            other => Self::PlanRefused(other),
+        }
+    }
+
+    fn of_driver(failure: CollectError) -> Self {
+        match failure {
+            CollectError::Planning(refusal) => Self::of_plan(refusal),
+            other => Self::Driver(other),
+        }
+    }
 }
 
 /// The envelope a caller gets and the exit it takes. One object rendered two ways, so the human
@@ -271,6 +320,11 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
     let session_bound = registered.cadence() == Cadence::SessionBound;
     given(ask.calendar.as_ref(), "calendar", registered, session_bound)?;
     given(ask.listing.as_ref(), "listing", registered, session_bound)?;
+    if session_bound && ask.window == TODAY {
+        return Err(CollectRunError::TodayRefused {
+            source_id: registered.source(),
+        });
+    }
     let (provider, hosts_version, lag): (Box<dyn Provider>, _, _) = match registered {
         Registered::EdgarPress => {
             let roster = required(ask.roster.as_ref(), roster.0, registered)?;
@@ -391,7 +445,8 @@ fn inputs(ask: &Ask) -> Result<(Option<Calendar>, Option<Listing>), CollectRunEr
     Ok((calendar, listing))
 }
 
-/// The window as planned: `today` is the UTC date of the run's own `at`, never the local one.
+/// The window as planned: `today` is the UTC date of the run's own `at`, never the local one;
+/// `open_provider` refuses it for a session-bound source.
 #[must_use]
 pub fn target_of(ask: &Ask) -> TargetWindow {
     if ask.window == TODAY {
@@ -426,7 +481,8 @@ pub fn drive<A: Archive>(
             listing: listing.as_ref(),
             at: ObservationTime::new(ask.at),
         },
-    )?;
+    )
+    .map_err(CollectRunError::of_driver)?;
     Ok(Driven {
         collected,
         calendar_version: version_of(calendar.as_ref()),
@@ -461,8 +517,8 @@ pub fn run(
         });
     }
     let run = RunId::new(run_id.clone());
-    // Before the policy copy, the envelope and the lease: a store this build cannot read is left
-    // as it was found, with no run record pointing at a commit log nothing wrote.
+    // Before the policy copy, the envelope and the lease: a store at a newer user_version or of
+    // another v0 shape is left as found. A v0 step SQLite refuses still leaves a run record.
     crate::store::refuse_an_unreadable_version(&ask.store)?;
     // Before the plan, because the plan is where a lag dates a window: a run that refuses after
     // dating nothing still leaves the policy it would have dated by.
@@ -515,7 +571,7 @@ fn planned(
             listing_in,
             ObservationTime::new(ask.at),
         )
-        .map_err(CollectRunError::PlanRefused)?;
+        .map_err(CollectRunError::of_plan)?;
     let driven = Driven {
         collected: Collected::of_plan(&plan, &provider.source()),
         calendar_version: version_of(calendar_in),
