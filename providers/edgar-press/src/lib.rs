@@ -332,14 +332,7 @@ impl EdgarPress {
             }
         }
         let raw = request.listed_date.clone().unwrap_or_default();
-        let valid = match filed_day(request) {
-            Some(day) => Published::On {
-                day,
-                tz: self.parsed.zone,
-            },
-            None => Published::Unknown,
-        };
-        (valid, raw, DATE_FILED.to_owned())
+        (self.listed_publication(request), raw, DATE_FILED.to_owned())
     }
 
     /// Where a backfilled item's observation goes: its publication bounded by its index day, plus
@@ -609,6 +602,15 @@ impl Provider for EdgarPress {
     fn story_of(&self, follow_up: &Request) -> Option<Digest> {
         let accession = accession_of(&follow_up.url)?;
         canon::digest::story_id(SOURCE, &accession).ok()
+    }
+
+    /// The `Date Filed` DAY of the index row behind the follow-up, in the rules' zone: what
+    /// `publication` falls back to. Never the index's own day (section 3.9).
+    fn listed_publication(&self, follow_up: &Request) -> Published {
+        filed_day(follow_up).map_or(Published::Unknown, |day| Published::On {
+            day,
+            tz: self.parsed.zone,
+        })
     }
 }
 

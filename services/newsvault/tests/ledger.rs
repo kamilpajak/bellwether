@@ -516,6 +516,53 @@ fn a_body_stored_cut_at_the_limit_is_counted_for_its_source_and_day() -> TestRes
     Ok(())
 }
 
+/// Section 8 row R15, decision 10: a held story re-listed under another minute counts for the
+/// source and day of the index attempt it was recorded on, in the JSON row and on the human line.
+#[test]
+fn a_relisted_story_is_counted_for_the_source_and_day_of_its_index_attempt() -> TestResult {
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    db.execute(
+        "INSERT INTO relisted VALUES ('a-0703-edgar-0', 'a story', 'listed', 'b', 'a')",
+        [],
+    )?;
+    drop(db);
+    let json = over(&root, FIRST_DAY, FAILED_DAY)?.json()?;
+    let counted = |day: &str, source: &str| {
+        per_source(&json, day, source)
+            .and_then(|row| row.get("relisted_disputed"))
+            .and_then(Value::as_i64)
+    };
+    let human = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .arg("ledger")
+        .args(["--store", &root.path().to_string_lossy()])
+        .args(["--at", AT, "--format", "human"])
+        .args(["--from", FAILED_DAY, "--to", FAILED_DAY])
+        .output()?
+        .stdout;
+    let line = String::from_utf8(human)?
+        .lines()
+        .find(|line| line.trim_start().starts_with(EDGAR))
+        .map(str::to_owned)
+        .ok_or("no human line names the source")?;
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let shown = words
+        .iter()
+        .position(|word| *word == "relisted_disputed")
+        .and_then(|at| words.get(at + 1))
+        .map(|word| (*word).to_owned());
+    assert_eq!(
+        (
+            counted(FAILED_DAY, EDGAR),
+            counted(FAILED_DAY, POLYGON),
+            counted(FIRST_DAY, EDGAR),
+            shown
+        ),
+        (Some(1), Some(0), Some(0), Some("1".to_owned()))
+    );
+    Ok(())
+}
+
 /// Section 3.2 `held`: only a row carrying `vendor_rows` adds its `held`, so an unclosed index
 /// row holding 60 cannot outweigh 59 vendor rows. Mutation 2026-11-15, the ledger summing `held`
 /// over every row again: red.

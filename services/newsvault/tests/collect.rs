@@ -325,6 +325,13 @@ impl Archive for Refusing {
     fn record_held(&mut self, attempt_id: &str, held: u32) -> Result<(), ArchiveError> {
         Archive::record_held(&mut self.store, attempt_id, held)
     }
+    fn record_relisted(
+        &mut self,
+        attempt_id: &str,
+        relisted: &[news_provider::Relisted],
+    ) -> Result<(), ArchiveError> {
+        Archive::record_relisted(&mut self.store, attempt_id, relisted)
+    }
 }
 
 /// One run through the library, with the exchange the caller chose (static `Payloads` or a
@@ -693,6 +700,13 @@ impl Archive for Untouched {
 
     fn record_held(&mut self, _attempt_id: &str, _held: u32) -> Result<(), ArchiveError> {
         Err(self.touched("record_held"))
+    }
+    fn record_relisted(
+        &mut self,
+        _attempt_id: &str,
+        _relisted: &[news_provider::Relisted],
+    ) -> Result<(), ArchiveError> {
+        Err(self.touched("record_relisted"))
     }
 }
 

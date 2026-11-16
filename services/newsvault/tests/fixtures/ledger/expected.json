@@ -35,6 +35,7 @@
           "held": 0,
           "listing_unusable": 0,
           "bodies_truncated": 0,
+          "relisted_disputed": 0,
           "items_new": 3,
           "rows_committed": 3
         },
@@ -52,6 +53,7 @@
           "held": 0,
           "listing_unusable": 0,
           "bodies_truncated": 0,
+          "relisted_disputed": 0,
           "items_new": 1,
           "rows_committed": 1
         }
@@ -79,6 +81,7 @@
           "held": 0,
           "listing_unusable": 0,
           "bodies_truncated": 0,
+          "relisted_disputed": 0,
           "items_new": 0,
           "rows_committed": 0
         },
@@ -96,6 +99,7 @@
           "held": 0,
           "listing_unusable": 0,
           "bodies_truncated": 0,
+          "relisted_disputed": 0,
           "items_new": 0,
           "rows_committed": 0
         }
@@ -123,6 +127,7 @@
           "held": 0,
           "listing_unusable": 0,
           "bodies_truncated": 1,
+          "relisted_disputed": 0,
           "items_new": 0,
           "rows_committed": 0
         },
@@ -140,6 +145,7 @@
           "held": 0,
           "listing_unusable": 0,
           "bodies_truncated": 0,
+          "relisted_disputed": 0,
           "items_new": 0,
           "rows_committed": 0
         }
@@ -167,6 +173,7 @@
           "held": 0,
           "listing_unusable": 0,
           "bodies_truncated": 0,
+          "relisted_disputed": 0,
           "items_new": 0,
           "rows_committed": 0
         }
@@ -194,6 +201,7 @@
           "held": 0,
           "listing_unusable": 0,
           "bodies_truncated": 0,
+          "relisted_disputed": 0,
           "items_new": 1,
           "rows_committed": 1
         }

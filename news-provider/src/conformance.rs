@@ -480,6 +480,10 @@ mod tests {
         fn story_of(&self, _follow_up: &Request) -> Option<Digest> {
             None
         }
+
+        fn listed_publication(&self, _follow_up: &Request) -> Published {
+            Published::Unknown
+        }
     }
 
     fn found(how: Break) -> Vec<&'static str> {

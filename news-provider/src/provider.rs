@@ -556,6 +556,11 @@ pub trait Provider: Send + Sync {
     /// fetch; the provider's, because only it knows its vendor's row identity. `None` when the
     /// request does not name its story, and such a follow-up is never treated as covered.
     fn story_of(&self, follow_up: &Request) -> Option<Digest>;
+
+    /// The publication value the index listed for a follow-up, read from the request alone under
+    /// the rule `extract` dates its item by; `Unknown` when that rule reads none. The driver
+    /// compares a held story's listing with its stored item (architecture.md section 8 row R15).
+    fn listed_publication(&self, follow_up: &Request) -> Published;
 }
 
 #[cfg(test)]

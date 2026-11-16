@@ -351,8 +351,7 @@ impl OpenWebFeed {
         let page = parse::page(&raw.bytes, rule);
         let source_item_id = self.item_key(&request.url).unwrap_or_default();
         let valid_raw = request.listed_date.clone().unwrap_or_default();
-        let valid = minute_of(&valid_raw, &rule.valid_format)
-            .map_or(Published::Unknown, Published::AtMinute);
+        let valid = self.listed_publication(request);
         let body = page
             .body
             .as_ref()
@@ -542,6 +541,20 @@ impl Provider for OpenWebFeed {
 
     fn story_of(&self, follow_up: &Request) -> Option<Digest> {
         canon::digest::story_id(SOURCE, &self.item_key(&follow_up.url)?).ok()
+    }
+
+    /// The index row's publication text under its host rule's exact minute format (section 11.1),
+    /// which `document_of` dates the item by.
+    fn listed_publication(&self, follow_up: &Request) -> Published {
+        match (
+            self.rule_for(&follow_up.url),
+            follow_up.listed_date.as_deref(),
+        ) {
+            (Some(rule), Some(raw)) => {
+                minute_of(raw, &rule.valid_format).map_or(Published::Unknown, Published::AtMinute)
+            }
+            _ => Published::Unknown,
+        }
     }
 }
 
