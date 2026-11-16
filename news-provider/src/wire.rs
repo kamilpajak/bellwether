@@ -12,7 +12,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
+use chrono::{DateTime, Datelike, NaiveDateTime, TimeDelta, Utc};
 use pit::ObservationTime;
 
 use crate::budget::{host_of, BudgetError, BudgetScope, HostKey, Pace, RequestBudget};
@@ -106,13 +106,16 @@ const HTTP_DATE_FORMATS: [&str; 3] = [
 /// The answers by which a server asks a client to slow down: 429 (RFC 6585 §4) and 503 (RFC 9110
 /// §15.6.4); not SEC's 403 or another 5xx (architecture.md section 10, server back-off).
 const SLOW_DOWN: [u16; 2] = [429, 503];
+/// The last year `Pace::prior` reads back: a later instant is stamped `+YYYYY-…`, which RFC 3339
+/// cannot hold, so the host pace file it reaches is refused on every later run (row R19).
+const LAST_STAMPED_YEAR: i32 = 9999;
 
 /// What the slow-down answers of one host asked of this `Wire`, for the rest of its run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Backoff {
     /// Slow-down answers with no usable `Retry-After`; the host interval is `per_host` × 2^this.
     doublings: u32,
-    /// The latest instant a `Retry-After` named; no host slot is granted before it.
+    /// The instant the last usable `Retry-After` named; no host slot is granted before it.
     not_before: Option<DateTime<Utc>>,
 }
 
@@ -554,7 +557,7 @@ impl Wire {
         let mut held = self.backoff.borrow_mut();
         let backoff = held.entry(host).or_default();
         match retry_after(kept, received) {
-            Some(until) => backoff.not_before = backoff.not_before.max(Some(until)),
+            Some(until) => backoff.not_before = Some(until),
             None => backoff.doublings = backoff.doublings.saturating_add(1),
         }
     }
@@ -641,8 +644,12 @@ fn read_up_to(body: impl Read, limit: u64) -> Result<Vec<u8>, Unread> {
 }
 
 /// RFC 9110 §10.2.3: the instant a `Retry-After` names, never before `received`. `None` when absent,
-/// repeated or unparseable, a negative value included, or past what `DateTime` holds.
+/// repeated or unparseable, a negative value included, or past [`LAST_STAMPED_YEAR`].
 fn retry_after(headers: &Headers, received: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    named_instant(headers, received).filter(|until| until.year() <= LAST_STAMPED_YEAR)
+}
+
+fn named_instant(headers: &Headers, received: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let mut values = headers
         .pairs()
         .iter()
@@ -1788,10 +1795,16 @@ mod tests {
 
     type AnswerServer = JoinHandle<std::io::Result<usize>>;
 
-    /// Answers one connection per entry of `heads`, in order, each with an empty body, until all
-    /// are answered or `SERVER_DEADLINE` passes, so a send that never comes cannot hang the suite.
     fn serve_answers(
         heads: Vec<String>,
+    ) -> Result<(String, AnswerServer), Box<dyn std::error::Error>> {
+        serve(heads.into_iter().map(|head| (head, Vec::new())).collect())
+    }
+
+    /// Answers one connection per `(head, body)`, in order, until all are answered or
+    /// `SERVER_DEADLINE` passes, so a send that never comes cannot hang the suite.
+    fn serve(
+        answers: Vec<(String, Vec<u8>)>,
     ) -> Result<(String, AnswerServer), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
@@ -1799,7 +1812,7 @@ mod tests {
         let served = thread::spawn(move || -> std::io::Result<usize> {
             let deadline = Instant::now() + SERVER_DEADLINE;
             let mut answered = 0;
-            while answered < heads.len() && Instant::now() < deadline {
+            while answered < answers.len() && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _peer)) => {
                         stream.set_nonblocking(false)?;
@@ -1809,11 +1822,13 @@ mod tests {
                         while !asked.ends_with(b"\r\n\r\n") && stream.read(&mut byte)? == 1 {
                             asked.extend_from_slice(&byte);
                         }
-                        let head = heads.get(answered).cloned().unwrap_or_default();
+                        let (head, body) = answers.get(answered).cloned().unwrap_or_default();
+                        let length = body.len();
                         let answer = format!(
-                            "HTTP/1.1 {head}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            "HTTP/1.1 {head}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
                         );
                         stream.write_all(answer.as_bytes())?;
+                        stream.write_all(&body)?;
                         answered += 1;
                     }
                     Err(why) if why.kind() == ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
@@ -1854,9 +1869,18 @@ mod tests {
         Ok(answered?)
     }
 
-    /// The loopback answers `heads` in order, 60 ms apart; then one send to `LOCALHOST`, another
-    /// host, and one to `REFUSED`, the same host, `127.0.0.1`. Every wait, in order.
     fn waits_after(heads: &[&str]) -> Result<Vec<Duration>, Box<dyn std::error::Error>> {
+        let answers = heads.iter().map(|head| ((*head).to_owned(), Vec::new()));
+        waits_of(&[], answers.collect())
+    }
+
+    /// One send to each of `before`, then the loopback's `answers` in order, 60 ms apart; then one
+    /// send to `LOCALHOST`, another host, and one to `REFUSED`, the same host, `127.0.0.1`. Every
+    /// wait, in order.
+    fn waits_of(
+        before: &[&str],
+        answers: Vec<(String, Vec<u8>)>,
+    ) -> Result<Vec<Duration>, Box<dyn std::error::Error>> {
         let store = tempfile::tempdir()?;
         let clock = WaitedClock::at(RESERVED_AT)?;
         let wire = Wire::with_sleeper(
@@ -1866,16 +1890,22 @@ mod tests {
             &SourceId::new(SOURCE),
             Box::new(clock.clone()),
         );
-        let (url, served) = serve_answers(heads.iter().map(|head| (*head).to_owned()).collect())?;
+        let asked = answers.len();
+        let (url, served) = serve(answers)?;
         let mut ordinal = FIRST_ATTEMPT;
-        for _ in heads {
+        for other in before {
+            status_of(&wire, &clock, ordinal, other)?;
+            clock.elapse(ELAPSED);
+            ordinal += 1;
+        }
+        for _ in 0..asked {
             status_of(&wire, &clock, ordinal, &url)?;
             clock.elapse(ELAPSED);
             ordinal += 1;
         }
         status_of(&wire, &clock, ordinal, LOCALHOST)?;
         status_of(&wire, &clock, ordinal + 1, REFUSED)?;
-        if answered_by(served)? != heads.len() {
+        if answered_by(served)? != asked {
             return Err("the loopback server did not answer every send".into());
         }
         Ok(clock.waits())
@@ -1889,15 +1919,21 @@ mod tests {
     const RETRY_AFTER_PAST: &str =
         "503 Service Unavailable\r\nRetry-After: Tue, 10 Nov 2026 12:00:00 GMT";
     const NO_RETRY_AFTER: &str = "429 Too Many Requests";
-    /// Negative, a word, a fraction, delta-seconds past `u64`, and two values, which RFC 9110's
-    /// singleton field cannot hold.
-    const UNUSABLE_RETRY_AFTERS: [&str; 5] = [
+    /// Negative, a word, a fraction, delta-seconds past `u64` and past year 9999, two values, which
+    /// RFC 9110's singleton field cannot hold, and a weekday chrono 0.4.45 finds off the calendar.
+    const UNUSABLE_RETRY_AFTERS: [&str; 7] = [
         "429 Too Many Requests\r\nRetry-After: 120\r\nRetry-After: 60",
         "429 Too Many Requests\r\nRetry-After: -5",
         "429 Too Many Requests\r\nRetry-After: soon",
         "429 Too Many Requests\r\nRetry-After: 1.5",
         "429 Too Many Requests\r\nRetry-After: 99999999999999999999999",
+        PAST_YEAR_9999,
+        "429 Too Many Requests\r\nRetry-After: Mon, 10 Nov 2026 13:05:00 GMT",
     ];
+    /// About 253,500 years: an instant `DateTime` holds and the pace file's RFC 3339 cannot.
+    const PAST_YEAR_9999: &str = "429 Too Many Requests\r\nRetry-After: 8000000000000";
+    const FORBIDDEN_WITH_RETRY_AFTER: &str = "403 Forbidden\r\nRetry-After: 120";
+    const OVER_THE_LIMIT_WITH_RETRY_AFTER: &str = "503 Service Unavailable\r\nRetry-After: 120";
     const SERVER_ERROR_WITH_RETRY_AFTER: &str = "500 Internal Server Error\r\nRetry-After: 120";
     /// The send to another host 60 ms after the answer owes only the per-IP pace, `EXPECTED_WAIT`,
     /// so the next send to the answering host leaves 100 ms after it, and each wait below is less
@@ -1909,6 +1945,10 @@ mod tests {
     const DOUBLED_TWICE_LATER: Duration = Duration::from_millis(3_900);
     /// The 2 s interval less the 60 ms elapsed before the second loopback send.
     const DOUBLED_ONCE_WAIT: Duration = Duration::from_millis(1_940);
+    /// `LOCALHOST` granted at 0, the loopback's host slot at 60 ms and its 429 doubling it:
+    /// `LOCALHOST`'s own 1 s, asked at 160 ms; then the loopback's 2 s from 60 ms, asked at 1 s.
+    const OTHER_HOST_UNDOUBLED: Duration = Duration::from_millis(840);
+    const ANSWERING_HOST_DOUBLED: Duration = Duration::from_millis(1_060);
     const RETRY_AFTER_JSON: &str = "[[\"retry-after\",\"120\"]]";
 
     /// The waits of `waits_after` one answer, given the wait of the last send.
@@ -2034,6 +2074,74 @@ mod tests {
             (read, of("Sun, 06 Nov 1994 08:49:37 GMT", received)),
             (vec![Some(expected); 3], Some(received))
         );
+        Ok(())
+    }
+
+    /// The doubling binds the answering host alone: another host asked before keeps its 1 s.
+    #[test]
+    fn a_doubled_interval_slows_only_the_host_that_answered() -> Checked {
+        let answers = vec![(NO_RETRY_AFTER.to_owned(), Vec::new())];
+        assert_eq!(
+            waits_of(&[LOCALHOST], answers)?,
+            vec![
+                NO_WAIT,
+                NO_WAIT,
+                NO_WAIT,
+                EXPECTED_WAIT,
+                OTHER_HOST_UNDOUBLED,
+                NO_WAIT,
+                ANSWERING_HOST_DOUBLED,
+                NO_WAIT
+            ]
+        );
+        Ok(())
+    }
+
+    /// SEC's 403 is also its S3 `AccessDenied` for a closed day, so it never slows edgar (§10).
+    #[test]
+    fn a_403_is_no_slow_down_answer_even_with_a_retry_after() -> Checked {
+        assert_eq!(
+            waits_after(&[FORBIDDEN_WITH_RETRY_AFTER])?,
+            one_answer_then(HOST_WAIT_LATER)
+        );
+        Ok(())
+    }
+
+    /// A failure that read a head is heeded as an answer: a 503 whose body is over the limit.
+    #[test]
+    fn a_503_whose_body_is_over_the_limit_still_holds_its_host() -> Checked {
+        let over = usize::try_from(TEST_BODY_LIMIT * 2)?;
+        let answers = vec![(OVER_THE_LIMIT_WITH_RETRY_AFTER.to_owned(), vec![b'x'; over])];
+        assert_eq!(waits_of(&[], answers)?, one_answer_then(WAIT_OUT_120_S));
+        Ok(())
+    }
+
+    /// A hold past year 9999 would be stamped `+YYYYY-…` into the host pace file, which every
+    /// later run then refuses as `Unreadable`; read as absent, the next run still sends.
+    #[test]
+    fn a_retry_after_past_year_9999_leaves_the_host_pace_file_readable() -> Checked {
+        let store = tempfile::tempdir()?;
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let wire = Wire::with_sleeper(
+            polite_profile(),
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        let (url, served) = serve_answers(vec![PAST_YEAR_9999.to_owned()])?;
+        status_of(&wire, &clock, FIRST_ATTEMPT, &url)?;
+        status_of(&wire, &clock, SECOND_ATTEMPT, REFUSED)?;
+        let rerun = Wire::with_sleeper(
+            polite_profile(),
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        let again =
+            status_of(&rerun, &clock, FIRST_ATTEMPT, REFUSED).map_err(|why| why.to_string());
+        assert_eq!((answered_by(served)?, again), (1, Ok(None)));
         Ok(())
     }
 }
