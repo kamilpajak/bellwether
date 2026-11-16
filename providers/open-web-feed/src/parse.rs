@@ -315,6 +315,7 @@ mod tests {
     fn every_address_the_regex_matches_is_removed_and_nothing_around_it() {
         let cases = [
             ("E-mail: ann.example@example.com", "E-mail: "),
+            ("first_last%x@example.com and", " and"),
             ("(o'neil+ir@mail.example.co.uk).", "()."),
             ("a@b.cc@d.ee", "@d.ee"),
             ("x@y@example.com", "x@"),
@@ -330,6 +331,23 @@ mod tests {
             .iter()
             .map(|(text, kept)| (*text, (*kept).to_owned()))
             .collect();
+        assert_eq!(removed, expected);
+    }
+
+    /// The regex's own reach (section 11.1): a local part and a top label run on into letters
+    /// joined to them; results from Python's `re.sub` (run 2026-11-16).
+    #[test]
+    fn letters_joined_to_an_address_are_matched_as_part_of_it() {
+        let cases = [
+            ("Media Contactjane@example.com", "Media "),
+            ("E-mail: ir@example.comTel.: +1 555", "E-mail: .: +1 555"),
+            ("at ir@example.com. The", "at . The"),
+        ];
+        let removed: Vec<String> = cases
+            .iter()
+            .map(|(text, _)| without_addresses(text))
+            .collect();
+        let expected: Vec<&str> = cases.iter().map(|(_, kept)| *kept).collect();
         assert_eq!(removed, expected);
     }
 

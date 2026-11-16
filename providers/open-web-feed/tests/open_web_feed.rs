@@ -121,6 +121,7 @@ const PRN_NO_RELEASE_BODY_PAGE: &str = "synthetic_no_release_body.html";
 const PRN_LINE_BREAK_PAGE: &str = "synthetic_heading_line_break.html";
 const PRN_LISTS_PAGE: &str = "synthetic_lists.html";
 const PRN_ADDRESSES_PAGE: &str = "synthetic_addresses.html";
+const PRN_JOINED_ADDRESS_PAGE: &str = "synthetic_joined_address.html";
 const PRN_TABLES_PAGE: &str = "synthetic_tables.html";
 /// Release 302939742 (2026-11-16 09:42Z fetch) cut to its lead, two of its four gallery figures
 /// and one later paragraph; the two figures naming a person were left out.
@@ -1794,6 +1795,17 @@ fn a_cloudflare_placeholder_and_an_address_never_reach_the_body_and_a_mailto_nam
         prn_body(PRN_ADDRESSES_PAGE)?,
         "Media: today\nInvestors:\nPress: or , see example.com.\n\
          Contact Jane Example, +45 0000 0000, E-mail:\nDesk: daily"
+    );
+    Ok(())
+}
+
+/// Decision r's measured limit (section 11.1): inline elements join with no space, so the
+/// regex reads letters joined to an address as part of it; with spaces, the words stay.
+#[test]
+fn letters_joined_to_an_address_with_no_space_are_removed_with_it() -> Outcome {
+    assert_eq!(
+        prn_body(PRN_JOINED_ADDRESS_PAGE)?,
+        "Media\n: +1 000 000 0000\nMedia Contact Tel: +1 000 000 0000"
     );
     Ok(())
 }
