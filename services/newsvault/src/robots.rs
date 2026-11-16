@@ -1,15 +1,31 @@
 //! The robots.txt subset `collect` reads from a pinned body (architecture.md section 11.2): the
 //! `user-agent: *` groups, merged, their `Allow`/`Disallow` rules and their `Crawl-delay`. A group
 //! naming our own product token is never read: the token is `BELLWETHER_FEED_CONTACT`'s, not code's.
-//! Percent-encoding is not normalised, so `/a%2Fb` and `/a/b` are two paths here.
+//! Percent-encoding is not normalised, so `/a%2Fb` and `/a/b` are two paths here. Key spellings,
+//! the colon-less split, `*` and whitespace are read as Google's robots.cc
+//! (github.com/google/robotstxt, 50a0dac) reads them; the differences kept are in architecture.md
+//! section 10, row "key and line spellings".
 
 use std::time::Duration;
 
-const USER_AGENT: &str = "user-agent";
-const ALLOW: &str = "allow";
-const DISALLOW: &str = "disallow";
-const CRAWL_DELAY: &str = "crawl-delay";
-const EVERY_AGENT: &str = "*";
+/// robots.cc 50a0dac matches a key by case-insensitive prefix: lines 219-224 (user-agent and two
+/// typos), 230 (allow, no typo), 235-243 (disallow and five typos).
+const USER_AGENT_KEYS: [&str; 3] = ["user-agent", "useragent", "user agent"];
+const ALLOW_KEY: &str = "allow";
+const DISALLOW_KEYS: [&str; 6] = [
+    "disallow",
+    "dissallow",
+    "dissalow",
+    "disalow",
+    "diasllow",
+    "disallaw",
+];
+/// robots.cc names no Crawl-delay key, so ours is matched whole, case aside (owner decision 1).
+const CRAWL_DELAY_KEY: &str = "crawl-delay";
+/// absl's ASCII whitespace, which robots.cc line 296 strips; Rust's `is_ascii_whitespace` lacks VT.
+const ASCII_SPACE: [char; 6] = [' ', '\t', '\n', '\x0b', '\x0c', '\r'];
+/// robots.cc line 327: the blanks that may stand in for a missing colon.
+const BLANKS: [char; 2] = [' ', '\t'];
 const WILDCARD: char = '*';
 const END_ANCHOR: char = '$';
 const COMMENT: char = '#';
@@ -26,10 +42,6 @@ pub enum RobotsError {
     NotUtf8,
     #[error("the body is an HTML page: its first non-whitespace character is <")]
     HtmlPage,
-    /// Text that is not empty or comments only and has no `user-agent` line; a rule in it belongs
-    /// to no group and is ignored, so no orphan rule saves it.
-    #[error("the body names no user-agent")]
-    NoUserAgentLine,
     #[error("the * group's Crawl-delay {0:?} is not a non-negative number of seconds")]
     CrawlDelayNotANumber(String),
 }
@@ -41,7 +53,6 @@ impl RobotsError {
         match self {
             Self::NotUtf8 => "refused_not_utf8",
             Self::HtmlPage => "refused_html",
-            Self::NoUserAgentLine => "refused_no_user_agent",
             Self::CrawlDelayNotANumber(_) => "refused_crawl_delay",
         }
     }
@@ -54,6 +65,9 @@ pub enum Reading {
     Rules,
     /// Empty, or comments and blank lines only: no rule, every path allowed.
     NoRulesEmpty,
+    /// Text and no `user-agent` line, so no group: no rule, every path allowed (RFC 9309 section
+    /// 2.2.1; recommendation #2, 2026-11-16).
+    NoRulesNoGroup,
     /// A `user-agent` line, and an `Allow`, `Disallow` or Crawl-delay before the first of them:
     /// every such line is ignored (owner decision 2026-11-16, Google's standard).
     OrphanRulesIgnored,
@@ -65,6 +79,7 @@ impl Reading {
         match self {
             Self::Rules => "rules",
             Self::NoRulesEmpty => "no_rules_empty",
+            Self::NoRulesNoGroup => "no_rules_no_group",
             Self::OrphanRulesIgnored => "orphan_rules_ignored",
         }
     }
@@ -113,36 +128,39 @@ impl Robots {
         let (mut named_an_agent, mut in_agent_run) = (false, false);
         let (mut orphan, mut content) = (false, false);
         for line in text.split(LINE_ENDS) {
-            let line = line.split(COMMENT).next().unwrap_or("");
-            content |= !line.trim().is_empty();
-            let Some((key, value)) = line.split_once(':') else {
+            let line = line
+                .split(COMMENT)
+                .next()
+                .unwrap_or("")
+                .trim_matches(ASCII_SPACE);
+            content |= !line.is_empty();
+            let Some((key, value)) = directive(line) else {
                 continue;
             };
-            let value = value.trim();
-            match key.trim().to_ascii_lowercase().as_str() {
-                USER_AGENT => {
+            match Key::of(key) {
+                Key::UserAgent => {
                     if !in_agent_run {
                         robots.end(&std::mem::take(&mut group))?;
                         in_agent_run = true;
                     }
                     named_an_agent = true;
-                    group.every_agent |= value == EVERY_AGENT;
+                    group.every_agent |= names_every_agent(value);
                 }
-                rule @ (ALLOW | DISALLOW) => {
+                rule @ (Key::Allow | Key::Disallow) => {
                     in_agent_run = false;
                     orphan |= !named_an_agent && !value.is_empty();
                     if group.every_agent && !value.is_empty() {
                         robots.rules.push(PathRule {
-                            allow: rule == ALLOW,
+                            allow: rule == Key::Allow,
                             pattern: value.to_owned(),
                         });
                     }
                 }
-                CRAWL_DELAY => {
+                Key::CrawlDelay => {
                     orphan |= !named_an_agent && !value.is_empty();
                     group.delays.push(value.to_owned());
                 }
-                _ => {}
+                Key::Other => {}
             }
         }
         robots.end(&group)?;
@@ -150,7 +168,7 @@ impl Robots {
             (true, true, _) => Reading::OrphanRulesIgnored,
             (true, false, _) => Reading::Rules,
             (false, _, false) => Reading::NoRulesEmpty,
-            (false, _, true) => return Err(RobotsError::NoUserAgentLine),
+            (false, _, true) => Reading::NoRulesNoGroup,
         };
         Ok(robots)
     }
@@ -193,6 +211,62 @@ impl Robots {
             })
             .is_none_or(|rule| rule.allow)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Key {
+    UserAgent,
+    Allow,
+    Disallow,
+    CrawlDelay,
+    Other,
+}
+
+impl Key {
+    /// robots.cc 50a0dac lines 488-500 try user-agent, then allow, then disallow.
+    fn of(key: &str) -> Self {
+        let starts = |prefix: &&str| {
+            key.as_bytes()
+                .get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+        };
+        if USER_AGENT_KEYS.iter().any(starts) {
+            Self::UserAgent
+        } else if starts(&ALLOW_KEY) {
+            Self::Allow
+        } else if DISALLOW_KEYS.iter().any(starts) {
+            Self::Disallow
+        } else if key.eq_ignore_ascii_case(CRAWL_DELAY_KEY) {
+            Self::CrawlDelay
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// robots.cc 50a0dac lines 323-345 over a stripped line with its comment cut: the first colon
+/// splits it; with none, one run of blanks does when exactly two words remain. No key, no line.
+fn directive(line: &str) -> Option<(&str, &str)> {
+    let (key, value) = match line.split_once(':') {
+        Some(split) => split,
+        None => {
+            let (key, value) = line.split_once(BLANKS)?;
+            let value = value.trim_start_matches(BLANKS);
+            if value.contains(BLANKS) {
+                return None;
+            }
+            (key, value)
+        }
+    };
+    let key = key.trim_matches(ASCII_SPACE);
+    (!key.is_empty()).then(|| (key, value.trim_matches(ASCII_SPACE)))
+}
+
+/// robots.cc 50a0dac line 625: `*` alone, or followed by whitespace and more, names every agent.
+fn names_every_agent(value: &str) -> bool {
+    value
+        .strip_prefix(WILDCARD)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(ASCII_SPACE))
 }
 
 /// A pattern matches a path prefix; `*` matches any run of characters, a final `$` the end.
@@ -406,18 +480,16 @@ mod tests {
     }
 
     /// Owner decision 3b: a body whose first non-whitespace character is `<`, a BOM before it
-    /// included (the Fed's 404 page of 2026-11-16 starts so). Text with no group and no rule
-    /// stays refused. Mutation 2026-11-16, the `<` check removed: red.
+    /// included (the Fed's 404 page of 2026-11-16 starts so). Google's parser would read such a
+    /// page for rules instead. Mutation 2026-11-16, the `<` check removed: red.
     #[test]
-    fn an_html_body_is_refused_and_text_with_no_group_or_rule_too() -> TestResult {
+    fn an_html_body_is_refused() -> TestResult {
         let refused = [
             fixture("synthetic_html_page.txt")?,
             "\u{feff} \n\t<!doctype html>\n<html></html>"
                 .as_bytes()
                 .to_vec(),
             " \u{feff}<html></html>".as_bytes().to_vec(),
-            b"Sitemap: https://example.test/s.xml\n".to_vec(),
-            b"Service unavailable\n".to_vec(),
             vec![b'U', 0xff, b'\n'],
         ]
         .iter()
@@ -429,8 +501,6 @@ mod tests {
                 Err(RobotsError::HtmlPage),
                 Err(RobotsError::HtmlPage),
                 Err(RobotsError::HtmlPage),
-                Err(RobotsError::NoUserAgentLine),
-                Err(RobotsError::NoUserAgentLine),
                 Err(RobotsError::NotUtf8),
             ]
         );
@@ -438,7 +508,7 @@ mod tests {
     }
 
     /// Owner decision 3a: an empty or comment-only 200 is no rules, every path allowed, no delay.
-    /// Mutation 2026-11-16, the empty arm made `NoUserAgentLine`: red.
+    /// Mutation 2026-11-16, the empty arm made `NoRulesNoGroup`: red.
     #[test]
     fn an_empty_or_comment_only_body_reads_as_no_rules() -> TestResult {
         for body in [
@@ -522,20 +592,187 @@ mod tests {
         Ok(())
     }
 
-    /// No `user-agent` line means no group, so orphan lines alone are refused like a `Sitemap:`-only
-    /// body (decision 3b), not read as RFC 9309 section 2.2.1's "no rules apply".
+    /// Recommendation #2 (2026-11-16): RFC 9309 section 2.2.1, "or no groups are present at all, no
+    /// rules apply", and Google's robots.cc 50a0dac, whose matcher drops every rule before an agent.
+    /// Each body gives the reading, `/`, `/orphan/x`, the delay.
     #[test]
-    fn orphan_rules_with_no_user_agent_line_are_refused() {
-        for body in [
-            &b"Disallow: /orphan/\n"[..],
+    fn text_with_no_user_agent_line_reads_as_no_rules() -> TestResult {
+        let read = [
+            &b"Sitemap: https://example.test/s.xml\n"[..],
+            b"Service unavailable\n",
+            b"Disallow: /orphan/\n",
             b"# no group at all\nCrawl-delay: 12\nAllow: /\n",
-        ] {
+            b"Crawl-delay: soon\nDisallow: /\n",
+            b"user_agent: *\nDisallow: /orphan/\n",
+        ]
+        .iter()
+        .map(|body| {
+            Robots::parse(body).map(|robots| {
+                (
+                    robots.reading(),
+                    robots.allows("/"),
+                    robots.allows("/orphan/x"),
+                    robots.crawl_delay(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(
+            read,
+            vec![Ok((Reading::NoRulesNoGroup, true, true, None)); 6]
+        );
+        Ok(())
+    }
+
+    /// The `*` group's `Disallow: /x` under each key spelling; true when `/x` stays allowed.
+    fn star_disallows_x(user_agent: &str, disallow: &str) -> Result<bool, RobotsError> {
+        let body = format!("{user_agent}: *\n{disallow}: /x\n");
+        Robots::parse(body.as_bytes()).map(|robots| robots.allows("/x"))
+    }
+
+    /// Recommendation #1: Google's robots.cc 50a0dac matches a key by its case-insensitive prefix.
+    /// Lines 219-220 and 224: `user-agent`, `useragent`, `user agent`; line 230: `allow`, no typo;
+    /// lines 235-239 and 243: `disallow` and five typos.
+    #[test]
+    fn every_key_spelling_google_accepts_is_read() -> TestResult {
+        let user_agents = [
+            "User-agent",
+            "USER-AGENT",
+            "useragent",
+            "UserAgent",
+            "user agent",
+            "User-agents",
+        ];
+        let disallows = [
+            "Disallow",
+            "DISALLOW",
+            "dissallow",
+            "dissalow",
+            "disalow",
+            "diasllow",
+            "disallaw",
+            "Disallowed",
+        ];
+        for user_agent in user_agents {
             assert_eq!(
-                Robots::parse(body),
-                Err(RobotsError::NoUserAgentLine),
-                "{body:?}"
+                star_disallows_x(user_agent, "Disallow"),
+                Ok(false),
+                "{user_agent}"
             );
         }
+        for disallow in disallows {
+            assert_eq!(
+                star_disallows_x("User-agent", disallow),
+                Ok(false),
+                "{disallow}"
+            );
+        }
+        for allow in ["Allow", "ALLOW", "Allowed"] {
+            let body = format!("User-agent: *\nDisallow: /\n{allow}: /x\n");
+            assert!(Robots::parse(body.as_bytes())?.allows("/x"), "{allow}");
+        }
+        Ok(())
+    }
+
+    /// The controls: a key no line of robots.cc 217-243 names is an unknown line.
+    #[test]
+    fn a_key_spelling_google_does_not_accept_is_not_read() -> TestResult {
+        for user_agent in ["user_agent", "agent", "user-agnet"] {
+            let robots = Robots::parse(format!("{user_agent}: *\nDisallow: /x\n").as_bytes())?;
+            assert_eq!(robots.reading(), Reading::NoRulesNoGroup, "{user_agent}");
+        }
+        for disallow in ["disalw", "dis-allow", "nodisallow"] {
+            assert_eq!(
+                star_disallows_x("User-agent", disallow),
+                Ok(true),
+                "{disallow}"
+            );
+        }
+        for allow in ["alow", "allw", "a llow"] {
+            let body = format!("User-agent: *\nDisallow: /\n{allow}: /x\n");
+            assert!(!Robots::parse(body.as_bytes())?.allows("/x"), "{allow}");
+        }
+        Ok(())
+    }
+
+    /// robots.cc 50a0dac lines 323-340: with no colon, a run of spaces or tabs separates the key
+    /// when the line holds exactly two words; three words are no line. Line 625: `*` followed by
+    /// whitespace and more still names every agent.
+    #[test]
+    fn a_key_and_value_split_by_whitespace_alone_is_read() -> TestResult {
+        let read = [
+            &b"User-agent *\nDisallow /x\n"[..],
+            b"useragent\t*\nDisallow \t /x\n",
+            b"User-agent * bot\nDisallow: /x\n",
+            b"User-agent: * and more\nDisallow: /x\n",
+            b"User-agent: *bot\nDisallow: /x\n",
+            b"User-agent: *\tbot\nDisallow: /x\n",
+            b"User-agent: *\x0bbot\nDisallow: /x\n",
+        ]
+        .iter()
+        .map(|body| Robots::parse(body).map(|robots| robots.allows("/x")))
+        .collect::<Vec<_>>();
+        assert_eq!(
+            read,
+            [
+                Ok(false),
+                Ok(false),
+                Ok(true),
+                Ok(false),
+                Ok(true),
+                Ok(false),
+                Ok(false)
+            ]
+        );
+        Ok(())
+    }
+
+    /// robots.cc 50a0dac line 296 strips absl's ASCII whitespace, vertical tab included, and no
+    /// other: a trailing VT leaves `/x`, and `*` with a no-break space is no `*`.
+    #[test]
+    fn only_ascii_whitespace_is_stripped() -> TestResult {
+        let read = [
+            &b"User-agent: *\nDisallow: /x\x0b\n"[..],
+            "User-agent: *\u{a0}\nDisallow: /x\n".as_bytes(),
+        ]
+        .iter()
+        .map(|body| Robots::parse(body).map(|robots| robots.allows("/x")))
+        .collect::<Vec<_>>();
+        assert_eq!(read, [Ok(false), Ok(true)]);
+        Ok(())
+    }
+
+    /// Google defines no Crawl-delay key (robots.cc 217-252 names none), so ours is matched whole,
+    /// case aside; the colon-less split is the line's, so `Crawl-delay 20` reads.
+    #[test]
+    fn only_the_crawl_delay_key_itself_is_read() -> TestResult {
+        let read = [
+            "Crawl-delay: 20",
+            "CRAWL-DELAY: 20",
+            "Crawl-delay 20",
+            "crawl delay: 20",
+            "crawldelay: 20",
+            "Crawl-delays: 20",
+        ]
+        .iter()
+        .map(|line| {
+            Robots::parse(format!("User-agent: *\n{line}\n").as_bytes())
+                .map(|robots| robots.crawl_delay())
+        })
+        .collect::<Vec<_>>();
+        let twenty = Ok(Some(Duration::from_secs(20)));
+        assert_eq!(
+            read,
+            [
+                twenty.clone(),
+                twenty.clone(),
+                twenty,
+                Ok(None),
+                Ok(None),
+                Ok(None)
+            ]
+        );
+        Ok(())
     }
 
     /// Owner decision 2 (B2): a Crawl-delay line does not end a `user-agent` run, as RFC 9309
@@ -576,10 +813,10 @@ mod tests {
         let names = [
             RobotsError::NotUtf8.verdict(),
             RobotsError::HtmlPage.verdict(),
-            RobotsError::NoUserAgentLine.verdict(),
             RobotsError::CrawlDelayNotANumber(String::new()).verdict(),
             Reading::Rules.name(),
             Reading::NoRulesEmpty.name(),
+            Reading::NoRulesNoGroup.name(),
             Reading::OrphanRulesIgnored.name(),
         ];
         assert_eq!(
@@ -587,10 +824,10 @@ mod tests {
             [
                 "refused_not_utf8",
                 "refused_html",
-                "refused_no_user_agent",
                 "refused_crawl_delay",
                 "rules",
                 "no_rules_empty",
+                "no_rules_no_group",
                 "orphan_rules_ignored"
             ]
         );

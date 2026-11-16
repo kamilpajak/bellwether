@@ -1181,8 +1181,8 @@ fn an_admitted_row_whose_index_or_path_prefix_robots_disallows_is_refused() -> T
 }
 
 /// A pinned body this reader refuses is `robots_refused`, never a robots.txt with no rule; an
-/// empty or comment-only body is no rule (owner decision 3a) and admits the host.
-/// Mutation 2026-11-15, `Unreadable` read as no robots: red.
+/// empty or comment-only body (owner decision 3a) and text with no group (recommendation #2) are
+/// no rule and admit the host. Mutation 2026-11-15, `Unreadable` read as no robots: red.
 #[test]
 fn a_pinned_robots_body_that_does_not_parse_is_refused() -> TestResult {
     let mut said = Vec::new();
@@ -1198,7 +1198,7 @@ fn a_pinned_robots_body_that_does_not_parse_is_refused() -> TestResult {
         said,
         [
             "unreadable: the body is an HTML page: its first non-whitespace character is <",
-            "unreadable: the body names no user-agent",
+            "admitted",
             "admitted",
         ]
     );
