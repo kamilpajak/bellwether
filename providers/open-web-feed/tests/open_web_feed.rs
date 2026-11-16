@@ -117,6 +117,7 @@ const PRN_SECOND_ARTICLE: &str = "article_302938569.html";
 const PRN_SECOND_ARTICLE_URL: &str = "https://www.prnewswire.com/news-releases/lilly-to-present-new-data-across-zepbound-foundayo-eloratzp-and-retatrutide-at-obesityweek-2026-moving-obesity-care-beyond-the-scale-302938569.html";
 const PRN_SECOND_ARTICLE_TITLE: &str = "Lilly to present new data across Zepbound, Foundayo, EloraTZP and retatrutide at ObesityWeek 2026, moving obesity care beyond the scale";
 const PRN_NO_RELEASE_BODY_PAGE: &str = "synthetic_no_release_body.html";
+const PRN_LINE_BREAK_PAGE: &str = "synthetic_heading_line_break.html";
 const PRN_ARTICLE_OPENS: &str =
     "PLAINSBORO, N.J. and BAGSVÆRD, Denmark, Nov. 14, 2026 /PRNewswire/ -- Today, Novo Nordisk";
 /// Text the trimmed page holds outside `section.release-body`: the dateline `<p>`, the share
@@ -1181,6 +1182,20 @@ fn the_extracted_body_is_article_text_and_never_page_html_on_a_pr_newswire_page(
             "{outside} reached the body: {body}"
         );
     }
+    Ok(())
+}
+
+/// `body_ref` is an `item_id` input, so fused words would fix every affected id. Mutation
+/// 2026-11-16, the `br` arm removed: red ("About SIGNALSIGNAL is").
+#[test]
+fn a_line_break_inside_a_paragraph_is_read_as_a_space() -> Outcome {
+    let provider = provider()?;
+    let page = blob(prn(PRN_LINE_BREAK_PAGE));
+    let item = only_item(&provider.extract(&prn_article_request(&provider)?, &page))?;
+    assert_eq!(
+        item.body.map(|body| body.text).as_deref(),
+        Some("About SIGNAL SIGNAL is a retrospective cohort study.\nLine one line two.")
+    );
     Ok(())
 }
 

@@ -14,6 +14,9 @@ use crate::rules::{Pick, Rule};
 pub(crate) const DEEPEST_PAGE: usize = 14 * 8;
 /// Elements whose text is never prose.
 const NOT_PROSE: [&str; 4] = ["script", "style", "noscript", "template"];
+/// Read as a space: PRN's `<b>About SIGNAL<br /></b>SIGNAL is` otherwise fused to `SIGNALSIGNAL`
+/// (302939553, 2026-11-14 probe page).
+const LINE_BREAK: &str = "br";
 
 /// One RSS `<item>`, its two fields as the payload spells them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +124,7 @@ fn prose(element: ElementRef, into: &mut String) {
         match child.value() {
             Node::Text(text) => into.push_str(text),
             Node::Element(inner) if NOT_PROSE.contains(&inner.name()) => {}
+            Node::Element(inner) if inner.name() == LINE_BREAK => into.push(' '),
             Node::Element(_) => {
                 if let Some(inner) = ElementRef::wrap(child) {
                     prose(inner, into);
