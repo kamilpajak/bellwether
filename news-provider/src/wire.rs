@@ -1889,8 +1889,10 @@ mod tests {
     const RETRY_AFTER_PAST: &str =
         "503 Service Unavailable\r\nRetry-After: Tue, 10 Nov 2026 12:00:00 GMT";
     const NO_RETRY_AFTER: &str = "429 Too Many Requests";
-    /// Negative, a word, a fraction, and delta-seconds past `u64`.
-    const UNUSABLE_RETRY_AFTERS: [&str; 4] = [
+    /// Negative, a word, a fraction, delta-seconds past `u64`, and two values, which RFC 9110's
+    /// singleton field cannot hold.
+    const UNUSABLE_RETRY_AFTERS: [&str; 5] = [
+        "429 Too Many Requests\r\nRetry-After: 120\r\nRetry-After: 60",
         "429 Too Many Requests\r\nRetry-After: -5",
         "429 Too Many Requests\r\nRetry-After: soon",
         "429 Too Many Requests\r\nRetry-After: 1.5",
