@@ -162,9 +162,30 @@ type AttemptRow = (String, String, String);
 
 fn robots_rows(store: &Path) -> Result<Vec<RobotsRow>, Box<dyn Error>> {
     let db = read_only(store)?;
-    let mut statement = db.prepare("SELECT host, answer, blob FROM robots ORDER BY host")?;
+    // From user_version 6 a robots body is named by its `payloads` row and `robots.blob` is NULL;
+    // a 404's body is linked too, and pins nothing.
+    let mut statement = db.prepare(
+        "SELECT r.host, r.answer,
+                CASE r.answer WHEN 'present' THEN COALESCE(r.blob, p.raw_blob) END
+           FROM robots r LEFT JOIN payloads p ON p.attempt_id = r.attempt_id ORDER BY r.host",
+    )?;
     let rows = statement
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// `(url, raw_blob, truncated, headers)` of every `payloads` row, by url.
+type PayloadRow = (String, String, bool, String);
+
+fn payload_rows(store: &Path) -> Result<Vec<PayloadRow>, Box<dyn Error>> {
+    let db = read_only(store)?;
+    let mut statement =
+        db.prepare("SELECT url, raw_blob, truncated, headers FROM payloads ORDER BY url")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -295,12 +316,19 @@ fn a_robots_404_is_recorded_as_absent_and_pins_no_digest() -> TestResult {
     assert_eq!(
         (
             robots_rows(root.path())?,
+            payload_rows(root.path())?,
             attempts(root.path())?,
             row["answer"].as_str(),
             row["fetched_sha256"].clone(),
         ),
         (
             vec![(GNW_HOST.to_owned(), "absent".to_owned(), None)],
+            vec![(
+                GNW_ROBOTS.to_owned(),
+                FileDigest::of(b"not here").hex().to_owned(),
+                false,
+                "[]".to_owned()
+            )],
             vec![(
                 ROBOTS_SOURCE.to_owned(),
                 GNW_HOST.to_owned(),
@@ -329,6 +357,7 @@ fn a_robots_403_5xx_or_transport_error_is_a_failed_attempt_with_no_robots_row() 
         let answer = refreshed(root.path(), gnw_hosts(), &Robots::of(&answers))?;
         seen.push((
             robots_rows(root.path())?.len(),
+            payload_rows(root.path())?.len(),
             attempts(root.path())?,
             first_row(&answer)["answer"].as_str().map(str::to_owned),
             answer.exit.code(),
@@ -348,10 +377,10 @@ fn a_robots_403_5xx_or_transport_error_is_a_failed_attempt_with_no_robots_row() 
     assert_eq!(
         seen,
         vec![
-            (failed.0, failed.1.clone(), failed.2.clone(), 8, true),
-            (failed.0, failed.1.clone(), failed.2.clone(), 7, false),
-            (failed.0, failed.1.clone(), failed.2.clone(), 7, false),
-            (failed.0, failed.1, failed.2, 7, false),
+            (failed.0, 1, failed.1.clone(), failed.2.clone(), 8, true),
+            (failed.0, 1, failed.1.clone(), failed.2.clone(), 7, false),
+            (failed.0, 1, failed.1.clone(), failed.2.clone(), 7, false),
+            (failed.0, 0, failed.1, failed.2, 7, false),
         ]
     );
     Ok(())
@@ -382,7 +411,7 @@ fn a_robots_408_stays_a_permanent_failure_with_no_robots_row() -> TestResult {
 /// What one refresh left when GNW's robots url went through the real open-web `Wire` to a loopback
 /// server answering `301 Location: /elsewhere`, where `/elsewhere` serves the pinned body: robots
 /// rows, (outcome, status, verdict) per attempt, the reported row's answer and status, the exit,
-/// the urls sent and the paths the server saw.
+/// the urls sent, the paths the server saw, and the payload rows as (truncated, bytes, headers).
 type Refreshed = (
     usize,
     Vec<(String, Option<i64>, Option<String>)>,
@@ -390,6 +419,7 @@ type Refreshed = (
     u8,
     Vec<String>,
     Vec<String>,
+    Vec<(bool, i64, String)>,
 );
 
 fn refreshed_through_a_redirect(body_over_the_limit: bool) -> Result<Refreshed, Box<dyn Error>> {
@@ -416,6 +446,13 @@ fn refreshed_through_a_redirect(body_over_the_limit: bool) -> Result<Refreshed, 
         .prepare("SELECT outcome, transport_status, verdict FROM attempts")?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<Result<_, _>>()?;
+    let linked: Vec<(bool, i64, String)> = read_only(root.path())?
+        .prepare(
+            "SELECT p.truncated, b.bytes, p.headers FROM payloads p
+               JOIN blobs b ON b.digest = p.raw_blob",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<_, _>>()?;
     let row = first_row(&answer);
     Ok((
         robots_rows(root.path())?.len(),
@@ -427,11 +464,13 @@ fn refreshed_through_a_redirect(body_over_the_limit: bool) -> Result<Refreshed, 
         answer.exit.code(),
         sent,
         hops,
+        linked,
     ))
 }
 
-/// Both refusals below leave this.
-fn refused_robots_redirect() -> Refreshed {
+/// Both refusals below leave this, beside the one payload row each links: the loopback 301's
+/// `Content-Type` is kept, whole body or cut, and its `Location` is not (section 11.2).
+fn refused_robots_redirect(truncated: bool, bytes: i64) -> Refreshed {
     (
         0,
         vec![(
@@ -446,8 +485,18 @@ fn refused_robots_redirect() -> Refreshed {
         EXIT_PARTIAL,
         vec![GNW_ROBOTS.to_owned()],
         vec![ROBOTS_PATH.to_owned()],
+        vec![(
+            truncated,
+            bytes,
+            format!(r#"[["content-type","{}"]]"#, loopback::MOVED_CONTENT_TYPE),
+        )],
     )
 }
+
+/// The loopback 301's body, `b"moved"` in `tests/loopback/mod.rs`.
+const MOVED_BODY_BYTES: i64 = 5;
+/// open-web's `BODY_LIMIT` (2 MiB, `providers/open-web-feed/src/lib.rs`), private to that crate.
+const OPEN_WEB_BODY_LIMIT: i64 = 2 * 1_024 * 1_024;
 
 /// Section 11.2, §11.5 step 5: the refresh's open-web `Wire` refuses a robots.txt 3xx, so the
 /// target, which serves the pinned body, is never fetched. Mutations 2026-11-15, open-web following
@@ -457,18 +506,18 @@ fn a_robots_redirect_is_a_permanent_failure_with_no_robots_row_and_its_target_ne
 ) -> TestResult {
     assert_eq!(
         refreshed_through_a_redirect(false)?,
-        refused_robots_redirect()
+        refused_robots_redirect(false, MOVED_BODY_BYTES)
     );
     Ok(())
 }
 
 /// A robots 301 whose body is over the profile's limit fails as `BodyOverLimit` and keeps the 301
-/// on its attempt row and in the report.
+/// on its attempt row and in the report; its body is stored cut at the limit (P10, section 3.9).
 #[test]
 fn a_robots_redirect_whose_body_is_over_the_limit_keeps_its_status() -> TestResult {
     assert_eq!(
         refreshed_through_a_redirect(true)?,
-        refused_robots_redirect()
+        refused_robots_redirect(true, OPEN_WEB_BODY_LIMIT)
     );
     Ok(())
 }

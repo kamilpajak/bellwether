@@ -6,6 +6,7 @@
 //! else can know when an answer arrived. The pace wait is read from the same clock, before the
 //! socket, because `send` is the one place every vendor call passes through.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -91,6 +92,63 @@ pub enum SendFailure {
     Transport(#[from] TransportError),
 }
 
+/// The response headers P9 keeps beside the raw blob (architecture.md section 3.9), lowercase.
+pub const KEPT_HEADERS: [&str; 7] = [
+    "content-type",
+    "last-modified",
+    "etag",
+    "date",
+    "cache-control",
+    "vary",
+    "content-encoding",
+];
+
+/// The one `Content-Encoding` value ureq 3.5.2's `gzip` feature decodes (`ContentEncoding::from`
+/// matches it exactly, case included), so the body stored here is the one ureq would have stored.
+const GZIP: &str = "gzip";
+
+/// The [`KEPT_HEADERS`] of one answer, as `(name, value)` pairs in the order `http` 1.x's
+/// `HeaderMap` yields them: names by first appearance, each name's values in the order received.
+/// A value is its bytes read as ISO-8859-1, so every byte round-trips.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Headers(Vec<(String, String)>);
+
+impl Headers {
+    #[must_use]
+    pub const fn new(pairs: Vec<(String, String)>) -> Self {
+        Self(pairs)
+    }
+
+    fn kept_from(map: &ureq::http::HeaderMap) -> Self {
+        Self(
+            map.iter()
+                .filter(|(name, _)| KEPT_HEADERS.contains(&name.as_str()))
+                .map(|(name, value)| {
+                    let latin1 = value.as_bytes().iter().copied().map(char::from).collect();
+                    (name.as_str().to_owned(), latin1)
+                })
+                .collect(),
+        )
+    }
+
+    #[must_use]
+    pub fn pairs(&self) -> &[(String, String)] {
+        &self.0
+    }
+
+    /// The stored form: a JSON array of `[name, value]` arrays in [`Headers`] order, no whitespace.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        serde_json::Value::Array(
+            self.0
+                .iter()
+                .map(|(name, value)| serde_json::json!([name, value]))
+                .collect(),
+        )
+        .to_string()
+    }
+}
+
 /// A payload as received, with both instants as measured. `new` is the only constructor, so a
 /// backwards clock step is flagged rather than repaired: storing a repaired instant would store a
 /// time nothing measured.
@@ -98,6 +156,7 @@ pub enum SendFailure {
 pub struct RawResponse {
     attempt_id: AttemptId,
     status: u16,
+    headers: Headers,
     body: Vec<u8>,
     requested_at: ObservationTime,
     received_at: ObservationTime,
@@ -122,7 +181,17 @@ pub struct TransportError {
     kind: TransportKind,
     /// The status of a head read before the body failed; `None` when no head arrived.
     status: Option<u16>,
+    /// Boxed: inline, `SendFailure` fails clippy's `result_large_err` bound of 128 bytes.
+    head: Box<HeadRead>,
     detail: String,
+}
+
+/// What a failed conversation read before it failed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HeadRead {
+    headers: Headers,
+    /// The first `body_limit` bytes of a body over the limit, which `collect` stores truncated.
+    cut_body: Option<Vec<u8>>,
 }
 
 /// True when the second read of the clock precedes the first.
@@ -142,11 +211,23 @@ impl RawResponse {
         Self {
             attempt_id,
             status,
+            headers: Headers::default(),
             body,
             requested_at,
             received_at,
             clock_nonmonotonic: stepped_backwards(requested_at, received_at),
         }
+    }
+
+    #[must_use]
+    pub fn with_headers(mut self, headers: Headers) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    #[must_use]
+    pub const fn headers(&self) -> &Headers {
+        &self.headers
     }
 
     #[must_use]
@@ -195,8 +276,32 @@ impl TransportError {
             clock_nonmonotonic: stepped_backwards(requested_at, failed_at),
             kind: TransportKind::Conversation,
             status: None,
+            head: Box::default(),
             detail,
         }
+    }
+
+    #[must_use]
+    pub fn with_headers(mut self, headers: Headers) -> Self {
+        self.head.headers = headers;
+        self
+    }
+
+    #[must_use]
+    pub fn headers(&self) -> &Headers {
+        &self.head.headers
+    }
+
+    /// A body over `body_limit`, cut at the limit: P10's truncated payload (section 3.9).
+    #[must_use]
+    pub fn with_cut_body(mut self, body: Vec<u8>) -> Self {
+        self.head.cut_body = Some(body);
+        self
+    }
+
+    #[must_use]
+    pub fn cut_body(&self) -> Option<&[u8]> {
+        self.head.cut_body.as_deref()
     }
 
     /// The head's status when the body read failed after it (over `body_limit` or cut short), so a
@@ -310,6 +415,9 @@ impl Wire {
             // same generic S3 body (measured in `providers/edgar-press/src/lib.rs`'s header).
             .http_status_as_error(false)
             .max_redirects(max_redirects)
+            // ureq 3.5.2 sends `accept-encoding: gzip` only with its `gzip` feature, which is off
+            // (Cargo.toml); stated here so the request head stays byte for byte what it was.
+            .accept_encoding(GZIP)
             .build();
         Self {
             agent: ureq::Agent::new_with_config(config),
@@ -362,21 +470,24 @@ impl Wire {
         let answered = self.exchange(&request.url, &headers);
         let received_at = ObservationTime::new(clock.now());
         match answered {
-            Ok((status, body)) => Ok(RawResponse::new(
-                attempt_id,
-                status,
-                body,
-                requested_at,
-                received_at,
-            )),
+            Ok((status, headers, body)) => {
+                Ok(
+                    RawResponse::new(attempt_id, status, body, requested_at, received_at)
+                        .with_headers(headers),
+                )
+            }
             Err(failed) => {
-                let error =
+                let mut error =
                     TransportError::new(attempt_id, requested_at, received_at, failed.detail)
-                        .of_kind(failed.kind);
-                Err(SendFailure::Transport(match failed.status {
-                    Some(status) => error.with_status(status),
-                    None => error,
-                }))
+                        .of_kind(failed.kind)
+                        .with_headers(failed.headers);
+                if let Some(status) = failed.status {
+                    error = error.with_status(status);
+                }
+                if let Some(cut) = failed.cut {
+                    error = error.with_cut_body(cut);
+                }
+                Err(SendFailure::Transport(error))
             }
         }
     }
@@ -400,7 +511,11 @@ impl Wire {
 
     /// The socket, and the only call to the agent. Between the two clock reads in [`Wire::send`],
     /// so the body is inside the measured interval.
-    fn exchange(&self, url: &str, headers: &[(String, String)]) -> Result<(u16, Vec<u8>), Failed> {
+    fn exchange(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<(u16, Headers, Vec<u8>), Failed> {
         let mut call = self.agent.get(url);
         for (name, value) in headers {
             call = call.header(name, value);
@@ -408,23 +523,70 @@ impl Wire {
         let mut response = call.call().map_err(|why| Failed {
             kind: TransportKind::Conversation,
             status: None,
+            headers: Headers::default(),
+            cut: None,
             detail: why.to_string(),
         })?;
         let status = response.status().as_u16();
-        let body = response
-            .body_mut()
-            .with_config()
-            .limit(self.profile.body_limit)
-            .read_to_vec()
-            .map_err(|why| Failed {
-                kind: match why {
-                    ureq::Error::BodyExceedsLimit(_) => TransportKind::BodyOverLimit,
-                    _ => TransportKind::Conversation,
-                },
+        let kept = Headers::kept_from(response.headers());
+        let gzip = response
+            .headers()
+            .get(ureq::http::header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            == Some(GZIP);
+        // Unbounded here because `body_limit` counts DECODED bytes, as ureq 3.5.2's limit did.
+        let raw = response.body_mut().with_config().limit(u64::MAX).reader();
+        let decoded: Box<dyn Read + '_> = if gzip {
+            Box::new(flate2::read::MultiGzDecoder::new(raw))
+        } else {
+            Box::new(raw)
+        };
+        match read_up_to(decoded, self.profile.body_limit) {
+            Ok(body) => Ok((status, kept, body)),
+            Err(Unread::OverLimit(cut)) => Err(Failed {
+                kind: TransportKind::BodyOverLimit,
                 status: Some(status),
+                headers: kept,
+                cut: Some(cut),
+                detail: format!(
+                    "the body is over the limit of {} bytes",
+                    self.profile.body_limit
+                ),
+            }),
+            Err(Unread::Failed(why)) => Err(Failed {
+                kind: TransportKind::Conversation,
+                status: Some(status),
+                headers: kept,
+                cut: None,
                 detail: why.to_string(),
-            })?;
-        Ok((status, body))
+            }),
+        }
+    }
+}
+
+/// Why a body read stopped before its end.
+enum Unread {
+    /// The first `limit` bytes; at least one more followed.
+    OverLimit(Vec<u8>),
+    Failed(std::io::Error),
+}
+
+/// ureq 3.5.2's `LimitReader` rule: `limit` bytes are read, then one more is probed, and only a
+/// byte past the limit fails, so a body exactly `limit` long is read whole.
+fn read_up_to(body: impl Read, limit: u64) -> Result<Vec<u8>, Unread> {
+    let mut read = Vec::new();
+    let mut taken = body.take(limit);
+    taken.read_to_end(&mut read).map_err(Unread::Failed)?;
+    let mut probe = Vec::new();
+    taken
+        .into_inner()
+        .take(1)
+        .read_to_end(&mut probe)
+        .map_err(Unread::Failed)?;
+    if probe.is_empty() {
+        Ok(read)
+    } else {
+        Err(Unread::OverLimit(read))
     }
 }
 
@@ -432,14 +594,16 @@ impl Wire {
 struct Failed {
     kind: TransportKind,
     status: Option<u16>,
+    headers: Headers,
+    cut: Option<Vec<u8>>,
     detail: String,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Credentials, RawResponse, Redirects, SendFailure, Timeouts, TransportKind,
-        TransportProfile, Wire, USER_AGENT,
+        Credentials, Headers, RawResponse, Redirects, SendFailure, Timeouts, TransportError,
+        TransportKind, TransportProfile, Wire, USER_AGENT,
     };
     use crate::budget::{BudgetError, RequestBudget};
     use crate::clock::testing::{StepClock, WaitRecorder, WaitedClock};
@@ -1349,6 +1513,234 @@ mod tests {
                     vec![REDIRECTED.to_owned(), REDIRECT_TARGET.to_owned()]
                 ),
                 vec![NO_WAIT]
+            )
+        );
+        Ok(())
+    }
+
+    type HeadServer = JoinHandle<std::io::Result<String>>;
+
+    /// One loopback answer: status 200, `head`'s lines, then `body`. Hands back the request head.
+    fn serve_bytes(
+        head: Vec<u8>,
+        body: Vec<u8>,
+    ) -> Result<(String, HeadServer), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let url = format!("http://{}{REDIRECTED}", listener.local_addr()?);
+        let served = thread::spawn(move || -> std::io::Result<String> {
+            let (mut stream, _peer) = listener.accept()?;
+            let mut asked = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !asked.ends_with(b"\r\n\r\n") && stream.read(&mut byte)? == 1 {
+                asked.extend_from_slice(&byte);
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\n")?;
+            stream.write_all(&head)?;
+            let len = body.len();
+            stream.write_all(
+                format!("Content-Length: {len}\r\nConnection: close\r\n\r\n").as_bytes(),
+            )?;
+            stream.write_all(&body)?;
+            Ok(String::from_utf8_lossy(&asked).into_owned())
+        });
+        Ok((url, served))
+    }
+
+    type Answered = Result<RawResponse, TransportError>;
+
+    /// The answer to one send to `url`, and the request head the server read.
+    fn exchanged(
+        url: String,
+        served: HeadServer,
+    ) -> Result<(Answered, String), Box<dyn std::error::Error>> {
+        let store = tempfile::tempdir()?;
+        let mut sink = Recorder::default();
+        let Some(permit) = permit(&mut sink, FIRST_ATTEMPT) else {
+            return Err("no permit".into());
+        };
+        let asked = Request { url, ..request() };
+        let clock = clock_over(&[RESERVED_AT]);
+        let answer = match wire(held(), store.path(), &WaitRecorder::default())
+            .send(permit, &asked, &clock)
+        {
+            Ok(answer) => Ok(answer),
+            Err(SendFailure::Transport(failed)) => Err(failed),
+            Err(other) => return Err(format!("{other:?}").into()),
+        };
+        let Ok(head) = served.join() else {
+            return Err("the loopback server panicked".into());
+        };
+        Ok((answer, head?))
+    }
+
+    fn pairs(of: &[(&str, &str)]) -> Vec<(String, String)> {
+        of.iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    /// `PLAIN_PAGE` compressed by Python 3.14.7 `gzip.compress(page, compresslevel=9, mtime=0)`.
+    const GZIPPED_PAGE: [u8; 104] = [
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x2d, 0xcc, 0xd1, 0x09, 0x80,
+        0x20, 0x14, 0x05, 0xd0, 0xff, 0xa6, 0x78, 0x03, 0x54, 0x2e, 0xf0, 0x10, 0x5a, 0x20, 0xa2,
+        0x0d, 0x2c, 0x2f, 0x26, 0x58, 0x8a, 0x4f, 0x92, 0x9a, 0x3e, 0xa8, 0xfe, 0x0f, 0x87, 0xb7,
+        0xb2, 0x07, 0xcd, 0x4b, 0xb4, 0x97, 0xe6, 0xa4, 0x07, 0xca, 0x08, 0x30, 0x02, 0x12, 0xe4,
+        0x13, 0x96, 0xdc, 0xed, 0x53, 0x87, 0x63, 0x8d, 0x16, 0xb6, 0x25, 0x23, 0x34, 0xcd, 0x34,
+        0xa2, 0x4a, 0xf5, 0xf9, 0x37, 0x42, 0xbe, 0x08, 0x25, 0xe3, 0x20, 0x3d, 0xab, 0xa4, 0x59,
+        0x7d, 0x99, 0x7a, 0xe7, 0xe6, 0x01, 0x80, 0x77, 0x54, 0x23, 0x61, 0x00, 0x00, 0x00,
+    ];
+    const PLAIN_PAGE: &[u8] =
+        b"<html><body><p>A release served gzip-encoded, as PR Newswire serves its pages.</p></body></html>\n";
+    /// Measured 2026-11-16 at e2ed6d4 (ureq 3.5.2, `gzip` feature on, before this change) by a
+    /// temporary test sending `GZIPPED_PAGE` through this server: the body's sha256 and request head.
+    const MAIN_BODY_SHA256: &str =
+        "a2c552e149680b1c8865bd10a97b38c37541513f0bf8d4287361c996fbf0f096";
+    const MAIN_REQUEST_HEAD: &str = "GET /page HTTP/1.1\r\naccept-encoding: gzip\r\nhost: HOST\r\n\
+        user-agent: bellwether contact@example.test\r\naccept: text/plain\r\n\r\n";
+    const GZIP_HEAD: &[u8] = b"Content-Type: text/html\r\nContent-Encoding: gzip\r\n";
+
+    /// P9 keeps `Content-Encoding`, which ureq's `gzip` feature deletes, and the blob stays the body
+    /// ureq decoded before this change, asked for with the same request head.
+    #[test]
+    fn a_gzip_body_is_decoded_to_the_digest_ureq_gave_it_and_keeps_its_content_encoding() -> Checked
+    {
+        let (url, served) = serve_bytes(GZIP_HEAD.to_vec(), GZIPPED_PAGE.to_vec())?;
+        let host = url
+            .trim_start_matches("http://")
+            .trim_end_matches(REDIRECTED)
+            .to_owned();
+        let (answer, head) = exchanged(url, served)?;
+        let answer = answer.map_err(|failed| format!("{failed:?}"))?;
+        assert_eq!(
+            (
+                answer.body(),
+                FileDigest::of(answer.body()).hex(),
+                answer.headers().pairs(),
+                head
+            ),
+            (
+                PLAIN_PAGE,
+                MAIN_BODY_SHA256,
+                pairs(&[("content-type", "text/html"), ("content-encoding", "gzip")]).as_slice(),
+                MAIN_REQUEST_HEAD.replace("HOST", &host)
+            )
+        );
+        Ok(())
+    }
+
+    /// ureq 3.5.2 decodes with `MultiGzDecoder` (`body/gzip.rs`), which reads every member of the
+    /// stream; `GzDecoder` would stop after the first.
+    #[test]
+    fn a_gzip_body_of_two_members_is_decoded_to_both() -> Checked {
+        let (url, served) = serve_bytes(GZIP_HEAD.to_vec(), [GZIPPED_PAGE; 2].concat())?;
+        let (answer, _head) = exchanged(url, served)?;
+        let answer = answer.map_err(|failed| format!("{failed:?}"))?;
+        assert_eq!(answer.body(), [PLAIN_PAGE; 2].concat().as_slice());
+        Ok(())
+    }
+
+    /// ureq 3.5.2 decodes `gzip` alone, matched exactly; any other coding is stored as received.
+    #[test]
+    fn a_coding_ureq_did_not_decode_is_stored_as_received() -> Checked {
+        let (url, served) = serve_bytes(
+            b"Content-Encoding: GZIP\r\n".to_vec(),
+            GZIPPED_PAGE.to_vec(),
+        )?;
+        let (answer, _head) = exchanged(url, served)?;
+        let answer = answer.map_err(|failed| format!("{failed:?}"))?;
+        assert_eq!(
+            (answer.body(), answer.headers().pairs()),
+            (
+                GZIPPED_PAGE.as_slice(),
+                pairs(&[("content-encoding", "GZIP")]).as_slice()
+            )
+        );
+        Ok(())
+    }
+
+    /// `Server`, `Set-Cookie`, `Location` and `X-Other` are not kept; a repeated `Vary` is.
+    const MIXED_HEAD: &[u8] = b"Date: Mon, 16 Nov 2026 09:42:00 GMT\r\nServer: nginx\r\n\
+        Content-Type: text/html; charset=utf-8\r\nSet-Cookie: a=b\r\nVary: Accept-Encoding\r\n\
+        ETag: \"caf\xe9\"\r\nVARY: User-Agent\r\nLast-Modified: Sun, 15 Nov 2026 10:00:00 GMT\r\n\
+        Cache-Control: max-age=60\r\nLocation: /elsewhere\r\nX-Other: 1\r\n";
+
+    #[test]
+    fn only_the_allowlisted_headers_are_kept_lowercase_with_every_repeat() -> Checked {
+        let (url, served) = serve_bytes(MIXED_HEAD.to_vec(), b"page".to_vec())?;
+        let (answer, _head) = exchanged(url, served)?;
+        let answer = answer.map_err(|failed| format!("{failed:?}"))?;
+        assert_eq!(
+            answer.headers().pairs(),
+            pairs(&[
+                ("date", "Mon, 16 Nov 2026 09:42:00 GMT"),
+                ("content-type", "text/html; charset=utf-8"),
+                ("vary", "Accept-Encoding"),
+                ("vary", "User-Agent"),
+                ("etag", "\"caf\u{e9}\""),
+                ("last-modified", "Sun, 15 Nov 2026 10:00:00 GMT"),
+                ("cache-control", "max-age=60"),
+            ])
+            .as_slice()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_stored_headers_are_one_json_array_of_name_value_pairs() {
+        let headers = Headers::new(pairs(&[("etag", "\"caf\u{e9}\""), ("vary", "a")]));
+        assert_eq!(
+            headers.to_json(),
+            "[[\"etag\",\"\\\"caf\u{e9}\\\"\"],[\"vary\",\"a\"]]"
+        );
+    }
+
+    /// P10's over-limit rule: the first `body_limit` bytes and the head stay with the failure.
+    #[test]
+    fn a_body_over_the_limit_keeps_its_first_limit_bytes_and_its_headers() -> Checked {
+        let limit = usize::try_from(TEST_BODY_LIMIT)?;
+        let mut body = vec![b'a'; limit];
+        body.push(b'z');
+        let (url, served) = serve_bytes(b"Content-Type: text/html\r\n".to_vec(), body)?;
+        let (answer, _head) = exchanged(url, served)?;
+        let Err(failed) = answer else {
+            return Err("a body over the limit was read whole".into());
+        };
+        assert_eq!(
+            (
+                failed.kind(),
+                failed.status(),
+                failed.cut_body(),
+                failed.headers().pairs()
+            ),
+            (
+                TransportKind::BodyOverLimit,
+                Some(OK_STATUS),
+                Some(vec![b'a'; limit].as_slice()),
+                pairs(&[("content-type", "text/html")]).as_slice()
+            )
+        );
+        Ok(())
+    }
+
+    /// ureq 3.5.2's `BodyReader::new` puts its `LimitReader` after the decoder, so the limit
+    /// counts decoded bytes; a small gzip stream over the limit once decoded is cut decoded.
+    #[test]
+    fn a_gzip_body_over_the_limit_once_decoded_is_cut_at_the_limit_decoded() -> Checked {
+        let limit = usize::try_from(TEST_BODY_LIMIT)?;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&vec![b'x'; limit * 2])?;
+        let gzipped = encoder.finish()?;
+        let (url, served) = serve_bytes(GZIP_HEAD.to_vec(), gzipped.clone())?;
+        let (answer, _head) = exchanged(url, served)?;
+        let Err(failed) = answer else {
+            return Err("a body over the limit was read whole".into());
+        };
+        assert_eq!(
+            (gzipped.len() < limit, failed.kind(), failed.cut_body()),
+            (
+                true,
+                TransportKind::BodyOverLimit,
+                Some(vec![b'x'; limit].as_slice())
             )
         );
         Ok(())

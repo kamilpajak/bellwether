@@ -619,7 +619,7 @@ pub(crate) mod tests {
             raw_blob: store.put_blob(PAYLOAD)?,
             body_blob: None,
         };
-        let committed = store.record(closed, &[row], at(observed))?;
+        let committed = store.record(closed, None, &[row], at(observed))?;
         assert_eq!(committed.items_committed, 1);
         Ok(())
     }

@@ -73,9 +73,10 @@ const VENDOR_ROWS_IN_THE_INDEX: u32 = 4;
 const IN_UNIVERSE_FILINGS: u32 = 2;
 /// One index attempt plus one attempt per follow-up.
 const ATTEMPTS_PER_RUN: usize = 3;
-/// The two filings' raw payloads and the two bodies extracted out of them. The index payload is
-/// stored and NOT indexed: no item row references it.
-const BLOBS_INDEXED_PER_GOOD_DAY: u64 = 4;
+/// The index payload, linked by its `payloads` row (P10), the two filings' raw payloads and the
+/// two bodies extracted out of them. 4 before user_version 6, when the index payload was an
+/// orphan no row named.
+const BLOBS_INDEXED_PER_GOOD_DAY: u64 = 5;
 
 fn provider_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../providers/edgar-press")
@@ -274,7 +275,7 @@ impl Archive for Refusing {
         &mut self,
         closed: AttemptReceipt,
         items: &[CollectedItem],
-        raw_blob: Option<&str>,
+        payload: Option<&news_provider::Payload>,
         observed: ObservationTime,
     ) -> Result<Committed, ArchiveError> {
         let nth = *self.commits.borrow();
@@ -285,7 +286,7 @@ impl Archive for Refusing {
                 detail: format!("refused attempt {}", closed.attempt_id().hex()),
             });
         }
-        Archive::commit(&mut self.store, closed, items, raw_blob, observed)
+        Archive::commit(&mut self.store, closed, items, payload, observed)
     }
 
     fn ok_vendor_rows(&self, source: &SourceId) -> Result<Vec<u32>, ArchiveError> {
@@ -651,7 +652,7 @@ impl Archive for Untouched {
         &mut self,
         _closed: AttemptReceipt,
         _items: &[CollectedItem],
-        _raw_blob: Option<&str>,
+        _payload: Option<&news_provider::Payload>,
         _observed: ObservationTime,
     ) -> Result<Committed, ArchiveError> {
         Err(self.touched("commit"))
@@ -782,6 +783,56 @@ fn per_source_carries_an_entry_for_every_planned_source_including_zeros() -> Tes
             per_source["not_planned"].as_u64()
         ),
         (EXIT_OK, Some(SOURCE), Some(0), Some(0), Some(1))
+    );
+    Ok(())
+}
+
+/// P10 (section 3.9), edgar through the generic path: the daily index payload, which no item row
+/// names, is indexed and linked, and every blob file has a `blobs` row. The edgar index answers with
+/// no allowlisted header in `Payloads`, so each link stores `[]`.
+#[test]
+fn every_body_an_edgar_run_stores_is_indexed_and_linked_to_its_attempt() -> TestResult {
+    let root = TempDir::new()?;
+    let ask = ask(root.path(), A_LISTED_SESSION);
+    let provider = cmd_collect::open_provider(&ask)?;
+    cmd_collect::run(&ask, &provider, &Payloads::a_good_day()?, &Fixed)?;
+    let db = Connection::open_with_flags(
+        root.path().join(COMMIT_LOG),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let indexed: std::collections::BTreeSet<String> = db
+        .prepare("SELECT digest FROM blobs")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    let mut on_disk = std::collections::BTreeSet::new();
+    for first in std::fs::read_dir(root.path().join("blobs/sha256"))? {
+        for second in std::fs::read_dir(first?.path())? {
+            for file in std::fs::read_dir(second?.path())? {
+                on_disk.insert(file?.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    let linked: Vec<(String, bool, bool, String)> = db
+        .prepare(
+            "SELECT p.phase, p.listed_date IS NOT NULL, p.truncated, p.headers
+               FROM attempts a JOIN payloads p ON p.attempt_id = a.attempt_id
+              ORDER BY p.phase DESC, a.attempt_id",
+        )?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    let document = ("document".to_owned(), true, false, "[]".to_owned());
+    assert_eq!(
+        (on_disk, linked),
+        (
+            indexed,
+            vec![
+                ("index".to_owned(), false, false, "[]".to_owned()),
+                document.clone(),
+                document
+            ]
+        )
     );
     Ok(())
 }

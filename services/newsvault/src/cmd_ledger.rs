@@ -129,6 +129,10 @@ pub struct SourceRow {
     /// poll, so this counts one per fetch of such a story, the first fetch included. Not
     /// subtracted before the zero-rows finding.
     pub listing_unusable: i64,
+    /// P10 (section 3.9): attempts whose body is stored cut at `body_limit`, from
+    /// `payloads.truncated`. 0 for an attempt closed before user_version 6, which stored no
+    /// over-limit body, so 0 there does not mean none was over.
+    pub bodies_truncated: i64,
     pub items_new: i64,
     pub rows_committed: i64,
 }
@@ -247,6 +251,7 @@ struct Grouped {
     vendor_rows: i64,
     held: i64,
     listing_unusable: i64,
+    bodies_truncated: i64,
     items_new: i64,
 }
 
@@ -408,7 +413,9 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
         "SELECT run_id, source, COALESCE(outcome, '{IN_FLIGHT}') AS state, COUNT(*),
                 SUM(COALESCE(vendor_rows, 0)), SUM(COALESCE(items_new, 0)),
                 SUM(CASE WHEN vendor_rows IS NOT NULL THEN COALESCE(held, 0) ELSE 0 END),
-                SUM(CASE WHEN vendor_rows IS NOT NULL THEN COALESCE(listing_unusable, 0) ELSE 0 END)
+                SUM(CASE WHEN vendor_rows IS NOT NULL THEN COALESCE(listing_unusable, 0) ELSE 0 END),
+                SUM(COALESCE((SELECT p.truncated FROM payloads p
+                               WHERE p.attempt_id = attempts.attempt_id), 0))
          FROM attempts WHERE opened_at <= ?1
          GROUP BY run_id, source, state
          ORDER BY run_id, source, state"
@@ -424,6 +431,7 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
                 items_new: row.get(5)?,
                 held: row.get(6)?,
                 listing_unusable: row.get(7)?,
+                bodies_truncated: row.get(8)?,
             })
         })?
         .collect::<Result<Vec<Grouped>, _>>()?;
@@ -594,6 +602,7 @@ fn day_row(
         row.vendor_rows += entry.vendor_rows;
         row.held += entry.held;
         row.listing_unusable += entry.listing_unusable;
+        row.bodies_truncated += entry.bodies_truncated;
         row.items_new += entry.items_new;
         match entry.state.as_str() {
             OUTCOME_OK => row.ok += entry.attempts,
@@ -661,6 +670,7 @@ impl SourceRow {
             vendor_rows: 0,
             held: 0,
             listing_unusable: 0,
+            bodies_truncated: 0,
             items_new: 0,
             rows_committed: 0,
         }
@@ -761,7 +771,8 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
             writeln!(
                 out,
                 "  {:<14} ok {} empty {} failed {} interrupted {} in-flight {} \
-                 vendor_rows {} held {} listing_unusable {} items_new {} rows {}",
+                 vendor_rows {} held {} listing_unusable {} bodies_truncated {} items_new {} \
+                 rows {}",
                 row.source,
                 row.ok,
                 row.empty,
@@ -771,6 +782,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 row.vendor_rows,
                 row.held,
                 row.listing_unusable,
+                row.bodies_truncated,
                 row.items_new,
                 row.rows_committed
             )?;
