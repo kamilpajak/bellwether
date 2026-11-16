@@ -15,8 +15,8 @@ use news_provider::lag_policy::{LagPolicy, LagPolicyError};
 use news_provider::provider::{Cadence, Calendar, CalendarError, Listing, PlanRefusal, Provenance};
 use news_provider::{
     stamp_of, Archive, ArchiveError, AttemptReceipt, Clock, CollectError, Collected, CollectedItem,
-    Committed, Credentials, Exchange, Exit, Payload, Provider, Run, RunId, SourceId, TargetWindow,
-    Wire,
+    Committed, Credentials, Exchange, Exit, Payload, Provider, Relisted, Run, RunId, SourceId,
+    TargetWindow, Wire,
 };
 use open_web_feed::{OpenWebFeed, RobotsPin};
 use pit::{MeasuredLag, ObservationTime};
@@ -1114,6 +1114,15 @@ impl Archive for Committer {
     fn record_held(&mut self, attempt_id: &str, held: u32) -> Result<(), ArchiveError> {
         Committer::record_held(self, attempt_id, held)
             .map_err(|why| refused("record the held count", &why))
+    }
+
+    fn record_relisted(
+        &mut self,
+        attempt_id: &str,
+        relisted: &[Relisted],
+    ) -> Result<(), ArchiveError> {
+        Committer::record_relisted(self, attempt_id, relisted)
+            .map_err(|why| refused("record the re-listed stories", &why))
     }
 }
 

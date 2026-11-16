@@ -51,7 +51,7 @@ pub use budget::{BudgetError, BudgetScope, HostKey, Pace, RequestBudget};
 pub use clock::{Clock, Sleeper, SystemClock, ThreadSleeper};
 pub use collect::{
     collect, Archive, ArchiveError, AttemptRow, CollectError, Collected, Committed, Exchange, Exit,
-    NotPlannedRow, Payload, Run, SourceTally, Tally, EXITS, MAX_TRANSIENT_RETRIES,
+    NotPlannedRow, Payload, Relisted, Run, SourceTally, Tally, EXITS, MAX_TRANSIENT_RETRIES,
 };
 pub use lag_policy::{LagPolicy, LagPolicyError, LAG_POLICY_SCHEMA};
 pub use ledger::{
@@ -69,8 +69,8 @@ pub use request::{
     TargetWindow,
 };
 pub use wire::{
-    Credentials, Headers, RawResponse, Redirects, SendFailure, Timeouts, TransportError,
-    TransportKind, TransportProfile, Wire,
+    Credentials, Headers, RawResponse, SendFailure, Timeouts, TransportError, TransportKind,
+    TransportProfile, Wire,
 };
 
 #[cfg(test)]

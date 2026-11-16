@@ -8,6 +8,7 @@
 
 use std::collections::VecDeque;
 
+use pit::datedness::Published;
 use pit::ObservationTime;
 
 use crate::clock::Clock;
@@ -81,6 +82,18 @@ pub struct Payload {
     pub truncated: bool,
 }
 
+/// A follow-up a live index attempt did not issue because the archive held its story, with the
+/// publication value the index listed for it: the arriving observation section 8 row R15 compares
+/// with the stored item, without fetching the page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Relisted {
+    pub story_id: String,
+    /// [`Provider::listed_publication`] of the follow-up.
+    pub listed: Published,
+    /// The follow-up's `listed_date`, the value as the index wrote it.
+    pub listed_raw: Option<String>,
+}
+
 /// The store side of the driver, in the terms this crate can name: a `CollectedItem` is a
 /// provider's row and the archive's own row type is the archive's business.
 pub trait Archive: Sink {
@@ -136,6 +149,14 @@ pub trait Archive: Sink {
     /// [`Archive::held_story_ids`] held their story: section 11.1's `held`, which `ledger --check`
     /// subtracts from `vendor_rows`. Written whatever the count, 0 included.
     fn record_held(&mut self, attempt_id: &str, held: u32) -> Result<(), ArchiveError>;
+
+    /// Records, beside a live index attempt, each held story whose listed publication value
+    /// differs from its stored item's (section 8 row R15). No stored row is updated.
+    fn record_relisted(
+        &mut self,
+        attempt_id: &str,
+        relisted: &[Relisted],
+    ) -> Result<(), ArchiveError>;
 }
 
 /// Why a run could not be driven at all. A vendor's own answer is never one of these: it is a
@@ -582,6 +603,7 @@ fn attempt_once<A: Archive>(
             } else {
                 archive.held_story_ids(&request.source)?
             };
+            let listed = extracted.follow_ups.clone();
             let issued = if matched == 0 {
                 Vec::new()
             } else {
@@ -590,6 +612,7 @@ fn attempt_once<A: Archive>(
             if !archived && refusal.is_none() {
                 let held = matched.saturating_sub(count(issued.len()));
                 archive.record_held(&attempt_id, held)?;
+                archive.record_relisted(&attempt_id, &relisted_of(provider, listed, &issued))?;
             }
             issued
         }
@@ -623,6 +646,21 @@ fn attempt_once<A: Archive>(
         blob_written: payload.is_some(),
         committed,
     })
+}
+
+/// The follow-ups `listed` holds and `issued` does not, each with its story and listed value.
+fn relisted_of(provider: &dyn Provider, listed: Vec<Request>, issued: &[Request]) -> Vec<Relisted> {
+    listed
+        .into_iter()
+        .filter(|follow_up| !issued.contains(follow_up))
+        .filter_map(|follow_up| {
+            Some(Relisted {
+                story_id: provider.story_of(&follow_up)?.hex().to_owned(),
+                listed: provider.listed_publication(&follow_up),
+                listed_raw: follow_up.listed_date,
+            })
+        })
+        .collect()
 }
 
 impl Payload {

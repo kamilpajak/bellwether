@@ -82,8 +82,8 @@ use std::path::{Path, PathBuf};
 use canon::{Digest, FileDigest};
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use news_provider::{
-    AttemptEvent, AttemptReceipt, Cost, LedgerError, OutcomeKind, Payload, RunId, Sink, SourceId,
-    TargetWindow, ValidSource, Verdict,
+    AttemptEvent, AttemptReceipt, Cost, LedgerError, OutcomeKind, Payload, Relisted, RunId, Sink,
+    SourceId, TargetWindow, ValidSource, Verdict,
 };
 use pit::datedness::{Datedness, Published};
 use pit::{ObservationTime, Visibility};
@@ -114,11 +114,11 @@ PRAGMA synchronous = FULL;
 ";
 
 /// The `PRAGMA user_version` this build writes, and the only one a read-only reader accepts.
-pub const SCHEMA_VERSION: i32 = 6;
+pub const SCHEMA_VERSION: i32 = 7;
 
 /// Version `i + 1` is reached from version `i` by `MIGRATIONS[i]`, run by [`migrate`] with
 /// foreign keys off, as SQLite's twelve-step table rebuild (lang_altertable.html) requires.
-const MIGRATIONS: [&str; 6] = [
+const MIGRATIONS: [&str; 7] = [
     "
 -- The hosts file a run was admitted under: architecture.md section 2's `hosts_version` row. NULL
 -- for a provider that reads no hosts file.
@@ -210,6 +210,20 @@ CREATE TABLE payloads (
     raw_blob    TEXT NOT NULL REFERENCES blobs(digest),
     headers     TEXT NOT NULL,
     truncated   INTEGER NOT NULL CHECK (truncated IN (0, 1))
+);
+",
+    "
+-- Section 8 row R15's re-listed case (decision 10): a live index attempt listed a held story
+-- under another minute than the item first sighting kept. Written beside the arriving index
+-- attempt; the item row is never updated.
+CREATE TABLE relisted (
+    attempt_id    TEXT NOT NULL REFERENCES attempts(attempt_id),
+    story_id      TEXT NOT NULL,
+    listed_raw    TEXT NOT NULL,
+    listed_minute TEXT NOT NULL,
+    stored_minute TEXT NOT NULL,
+    PRIMARY KEY (attempt_id, story_id),
+    CHECK (listed_minute <> stored_minute)
 );
 ",
 ];
@@ -1168,6 +1182,41 @@ impl Committer {
         Ok(())
     }
 
+    /// Section 8 row R15 for a story a live index did not fetch: a listed minute that differs from
+    /// the minute of the item first sighting kept is one `relisted` row on `attempt_id`. A listing
+    /// that is not a minute, and a story with no minute-dated item, are not compared.
+    pub fn record_relisted(
+        &mut self,
+        attempt_id: &str,
+        relisted: &[Relisted],
+    ) -> Result<(), StoreError> {
+        let transaction = self.db.transaction()?;
+        for one in relisted {
+            let (Published::AtMinute(minute), Some(raw)) = (&one.listed, &one.listed_raw) else {
+                continue;
+            };
+            let listed = stamp(minute.start());
+            let kept: Option<Option<String>> = transaction
+                .query_row(
+                    "SELECT valid_minute FROM items WHERE story_id = ?1
+                      ORDER BY observed_at, seq LIMIT 1",
+                    params![one.story_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(stored) = kept.flatten().filter(|stored| *stored != listed) {
+                transaction.execute(
+                    "INSERT INTO relisted
+                         (attempt_id, story_id, listed_raw, listed_minute, stored_minute)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![attempt_id, one.story_id, raw, listed, stored],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Every attempt this store opened and never finalised, oldest first. The startup sweep's
     /// input: without it an attempt killed between `open` and `close` is in flight forever with a
     /// growing age (architecture.md section 3.2's `Abandoned` row).
@@ -1889,7 +1938,8 @@ mod tests {
     use chrono::{DateTime, TimeDelta, Utc};
     use news_provider::{
         abandon, AttemptEvent, AttemptSlot, Baseline, Counts, Outcome, Provenance, RawResponse,
-        Request, RequestPhase, SourceId, TargetWindow, TransportError, ValidSource, Verdict,
+        Relisted, Request, RequestPhase, SourceId, TargetWindow, TransportError, ValidSource,
+        Verdict,
     };
     use pit::datedness::{Minute, Published};
     use pit::ValidTime;
@@ -1951,9 +2001,10 @@ mod tests {
     const VALID_AT_PAST_THE_SECOND: i64 = VALID_AT + 123_456;
     /// A date with no hour, which is what a filing carrying no acceptance instant publishes at.
     const A_PUBLICATION_DAY: &str = "2026-11-10";
-    /// 00:02 and 00:03 UTC on 1970-01-01, whole minutes on the same clock as `VALID_AT`.
+    /// 00:02, 00:03 and 00:01 UTC on 1970-01-01, whole minutes on the same clock as `VALID_AT`.
     const A_PUBLICATION_MINUTE: i64 = 120 * SECOND;
     const A_LATER_PUBLICATION_MINUTE: i64 = 180 * SECOND;
+    const AN_EARLIER_PUBLICATION_MINUTE: i64 = 60 * SECOND;
     /// Inside `A_PUBLICATION_MINUTE`, its last microsecond, and the instant it closes.
     const INSIDE_THAT_MINUTE: &str = "1970-01-01T00:02:30.000000Z";
     const ONE_MICROSECOND_BEFORE_THAT_MINUTE_CLOSES: &str = "1970-01-01T00:02:59.999999Z";
@@ -3389,6 +3440,390 @@ mod tests {
                 .map(|(_, columns)| (columns.clone(), columns, 5))
                 .collect::<Vec<_>>()
         );
+        Ok(())
+    }
+
+    /// A v6 store: the v5 fixture, `MIGRATIONS[5]` and no later step, with the v1 attempt given a
+    /// payload row.
+    fn a_store_at_user_version_six(temp: &TempDir) -> TestResult {
+        a_store_at_user_version_five(temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch(MIGRATIONS[5])?;
+        db.pragma_update(None, "user_version", 6)?;
+        db.execute_batch(
+            "INSERT INTO payloads VALUES ('a v1 attempt', 'https://example.test/v6', 'document',
+                 'Sat, 14 Nov 2026 19:00 GMT', 'a v1 blob', '[]', 0);",
+        )?;
+        Ok(())
+    }
+
+    /// Every table a user_version 6 store holds: the v2 six plus `payloads`.
+    const V6_TABLES: [&str; 7] = [
+        "attempts",
+        "blobs",
+        "items",
+        "seq_reservations",
+        "published",
+        "robots",
+        "payloads",
+    ];
+    const LISTED_RAW: &str = "Thu, 01 Jan 1970 00:03 GMT";
+
+    fn minute_at(micros: i64) -> Result<Published, Box<dyn std::error::Error>> {
+        Ok(Published::AtMinute(
+            Minute::new(instant(micros)).map_err(|failure| failure.to_string())?,
+        ))
+    }
+
+    /// A held story as the driver hands it over, listed under `listed`.
+    fn relisted(story: &str, listed: Published) -> Relisted {
+        Relisted {
+            story_id: story.to_owned(),
+            listed,
+            listed_raw: Some(LISTED_RAW.to_owned()),
+        }
+    }
+
+    type RelistedRow = (String, String, String, String, String);
+
+    fn relisted_rows(store: &Committer) -> Result<Vec<RelistedRow>, StoreError> {
+        let mut statement = store.db.prepare(
+            "SELECT attempt_id, story_id, listed_raw, listed_minute, stored_minute FROM relisted
+              ORDER BY rowid",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// A store holding one minute-dated item for `STORY`, and a closed index attempt after it.
+    /// Returns the item's seq and the index attempt's id.
+    fn a_kept_minute_and_an_index(
+        store: &mut Committer,
+    ) -> Result<(i64, String), Box<dyn std::error::Error>> {
+        let first = closed_attempt(store, 0, Verdict::Usable)?;
+        let kept = minute_row(store, &minute_spec())?;
+        let seq = store
+            .record(first, None, &[kept], at(5))?
+            .seq_lo
+            .ok_or("no seq")?;
+        let index = closed_attempt(store, 1, Verdict::Usable)?;
+        let attempt = index.attempt_id().hex().to_owned();
+        store.record(index, None, &[], at(6))?;
+        Ok((seq, attempt))
+    }
+
+    /// §8 row M1 from user_version 6: the step to 7 adds `relisted`, and a re-listed minute lands
+    /// in it.
+    #[test]
+    fn a_store_at_user_version_six_opens_migrates_to_seven_and_takes_a_relisted_row() -> TestResult
+    {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_six(&temp)?;
+        let mut store = open(&temp)?;
+        let (_, attempt) = a_kept_minute_and_an_index(&mut store)?;
+        let story = story_hex(SOURCE, STORY);
+        store.record_relisted(
+            &attempt,
+            &[relisted(&story, minute_at(A_LATER_PUBLICATION_MINUTE)?)],
+        )?;
+        assert_eq!(
+            (user_version(&store.db)?, relisted_rows(&store)?.len()),
+            (SCHEMA_VERSION, 1)
+        );
+        // The shape check replays `MIGRATIONS[6]` against itself, so only this pins the declared
+        // shape (the same limit `MIGRATIONS[4]`'s test records).
+        let text = |pk: i64| ("TEXT".to_owned(), true, None, pk);
+        assert_eq!(
+            super::columns_of(&store.db, "relisted")?,
+            BTreeMap::from([
+                ("attempt_id".to_owned(), text(1)),
+                ("story_id".to_owned(), text(2)),
+                ("listed_raw".to_owned(), text(0)),
+                ("listed_minute".to_owned(), text(0)),
+                ("stored_minute".to_owned(), text(0)),
+            ])
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the carried half from user_version 6: every column of every row of every v6
+    /// table, compared by `quote()`; no `relisted` row is backfilled.
+    #[test]
+    fn a_v6_store_keeps_every_v6_column_of_every_row() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_six(&temp)?;
+        let v6 = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let before = quoted_rows(&v6, 6, &V6_TABLES)?;
+        drop(v6);
+        assert!(super::refuse_an_unreadable_version(temp.path()).is_ok());
+        let store = open(&temp)?;
+        let after = quoted_rows(&store.db, 6, &V6_TABLES)?;
+        assert_eq!(before.len(), V6_TABLES.len() + 1);
+        assert_eq!((after, count(&store, "relisted")?), (before, 0));
+        Ok(())
+    }
+
+    /// §8 row M1, the per-version shape check at user_version 6.
+    #[test]
+    fn a_v6_store_whose_columns_differ_is_refused_and_left_at_user_version_six() -> TestResult {
+        let every_payloads_column = [
+            "attempt_id",
+            "headers",
+            "listed_date",
+            "phase",
+            "raw_blob",
+            "truncated",
+            "url",
+        ]
+        .map(|column| format!("payloads.{column}"))
+        .to_vec();
+        let fixtures = [
+            (
+                "ALTER TABLE payloads DROP COLUMN headers;",
+                vec!["payloads.headers".to_owned()],
+            ),
+            ("DROP TABLE payloads;", every_payloads_column),
+        ];
+        let mut named = Vec::new();
+        for (edit, _) in &fixtures {
+            let temp = TempDir::new()?;
+            a_store_at_user_version_six(&temp)?;
+            let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+            db.execute_batch(edit)?;
+            drop(db);
+            let read_only = match super::refuse_an_unreadable_version(temp.path()) {
+                Err(StoreError::ShapeDiffers { found: 6, columns }) => columns,
+                other => vec![format!("{other:?}")],
+            };
+            let refused = match open(&temp) {
+                Err(StoreError::ShapeDiffers { found: 6, columns }) => columns,
+                other => vec![format!("{other:?}")],
+            };
+            let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+            named.push((refused, read_only, user_version(&db)?));
+        }
+        assert_eq!(
+            named,
+            fixtures
+                .into_iter()
+                .map(|(_, columns)| (columns.clone(), columns, 6))
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    /// §8 row R15, decision 10 (2026-11-16): a held story listed under another minute than its
+    /// kept item's is one row on the index attempt, and the stored item stays byte-identical.
+    #[test]
+    fn a_held_story_listed_under_another_minute_is_recorded_on_the_index_attempt_only() -> TestResult
+    {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let (seq, attempt) = a_kept_minute_and_an_index(&mut store)?;
+        let before = row_text(&store, seq)?;
+        let story = story_hex(SOURCE, STORY);
+        store.record_relisted(
+            &attempt,
+            &[relisted(&story, minute_at(A_LATER_PUBLICATION_MINUTE)?)],
+        )?;
+        assert_eq!(
+            (
+                relisted_rows(&store)?,
+                row_text(&store, seq)?,
+                count(&store, "items")?
+            ),
+            (
+                vec![(
+                    attempt,
+                    story,
+                    LISTED_RAW.to_owned(),
+                    stamped(A_LATER_PUBLICATION_MINUTE),
+                    stamped(A_PUBLICATION_MINUTE)
+                )],
+                before,
+                1
+            )
+        );
+        Ok(())
+    }
+
+    /// §8 row R15: the kept minute listed again, a story with no item, a listed day, and a minute
+    /// with no listed text are not compared, so none is recorded.
+    #[test]
+    fn a_listing_equal_to_the_kept_minute_or_with_nothing_to_compare_is_not_recorded() -> TestResult
+    {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let (_, attempt) = a_kept_minute_and_an_index(&mut store)?;
+        let story = story_hex(SOURCE, STORY);
+        let day = Published::On {
+            day: A_PUBLICATION_DAY.parse()?,
+            tz: NEW_YORK,
+        };
+        for listed in [
+            relisted(&story, minute_at(A_PUBLICATION_MINUTE)?),
+            relisted(
+                &story_hex(SOURCE, "never committed"),
+                minute_at(A_LATER_PUBLICATION_MINUTE)?,
+            ),
+            relisted(&story, day),
+            Relisted {
+                listed_raw: None,
+                ..relisted(&story, minute_at(A_LATER_PUBLICATION_MINUTE)?)
+            },
+        ] {
+            store.record_relisted(&attempt, &[listed])?;
+        }
+        assert_eq!(count(&store, "relisted")?, 0);
+        Ok(())
+    }
+
+    /// §8 rows R3 and R15: the listing is compared with the item first sighting kept, not with a
+    /// later twin: the twin's minute is recorded against the kept one, the kept minute is not.
+    #[test]
+    fn a_listing_is_compared_with_the_item_first_sighting_kept() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        a_kept_minute_and_an_index(&mut store)?;
+        let twin_attempt = closed_attempt(&mut store, 2, Verdict::Usable)?;
+        let twin = minute_row(
+            &store,
+            &Spec {
+                valid: A_LATER_PUBLICATION_MINUTE,
+                observed: OBSERVED_LATER,
+                ..minute_spec()
+            },
+        )?;
+        store.record(twin_attempt, None, &[twin], at(7))?;
+        let story = story_hex(SOURCE, STORY);
+        let mut indexes = Vec::new();
+        for (ordinal, listed) in [(3, A_LATER_PUBLICATION_MINUTE), (4, A_PUBLICATION_MINUTE)] {
+            let index = closed_attempt(&mut store, ordinal, Verdict::Usable)?;
+            let attempt = index.attempt_id().hex().to_owned();
+            store.record(index, None, &[], at(8))?;
+            store.record_relisted(&attempt, &[relisted(&story, minute_at(listed)?)])?;
+            indexes.push(attempt);
+        }
+        let recorded: Vec<(String, String, String)> = relisted_rows(&store)?
+            .into_iter()
+            .map(|(attempt, _, _, listed, stored)| (attempt, listed, stored))
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![(
+                indexes.first().cloned().unwrap_or_default(),
+                stamped(A_LATER_PUBLICATION_MINUTE),
+                stamped(A_PUBLICATION_MINUTE)
+            )]
+        );
+        Ok(())
+    }
+
+    /// §8 rows R3 and R15: a twin observed EARLIER but committed second is the kept item, and a
+    /// listing earlier than its minute is recorded against it, not against the first commit.
+    #[test]
+    fn an_earlier_listing_is_compared_with_an_earlier_observation_committed_later() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let commit = |store: &mut Committer, ordinal, valid, observed| -> TestResult {
+            let closed = closed_attempt(store, ordinal, Verdict::Usable)?;
+            let item = minute_row(
+                store,
+                &Spec {
+                    valid,
+                    observed,
+                    ..minute_spec()
+                },
+            )?;
+            store.record(closed, None, &[item], at(5))?;
+            Ok(())
+        };
+        commit(&mut store, 0, A_LATER_PUBLICATION_MINUTE, OBSERVED_AT)?;
+        commit(&mut store, 1, A_PUBLICATION_MINUTE, OBSERVED_EARLIER)?;
+        let index = closed_attempt(&mut store, 2, Verdict::Usable)?;
+        let attempt = index.attempt_id().hex().to_owned();
+        store.record(index, None, &[], at(6))?;
+        store.record_relisted(
+            &attempt,
+            &[relisted(
+                &story_hex(SOURCE, STORY),
+                minute_at(AN_EARLIER_PUBLICATION_MINUTE)?,
+            )],
+        )?;
+        let recorded: Vec<(String, String)> = relisted_rows(&store)?
+            .into_iter()
+            .map(|(_, _, _, listed, stored)| (listed, stored))
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![(
+                stamped(AN_EARLIER_PUBLICATION_MINUTE),
+                stamped(A_PUBLICATION_MINUTE)
+            )]
+        );
+        Ok(())
+    }
+
+    /// §8 row R15: a kept item with no `valid_minute` is not compared, even beside a later
+    /// minute-dated twin the listing disagrees with.
+    #[test]
+    fn a_listing_of_a_story_whose_kept_item_has_no_minute_is_not_recorded() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let first = closed_attempt(&mut store, 0, Verdict::Usable)?;
+        let kept = row(&store, &spec(STORY))?;
+        store.record(first, None, &[kept], at(5))?;
+        let twin_attempt = closed_attempt(&mut store, 1, Verdict::Usable)?;
+        let twin = minute_row(
+            &store,
+            &Spec {
+                valid: A_LATER_PUBLICATION_MINUTE,
+                observed: OBSERVED_LATER,
+                ..minute_spec()
+            },
+        )?;
+        store.record(twin_attempt, None, &[twin], at(6))?;
+        let index = closed_attempt(&mut store, 2, Verdict::Usable)?;
+        let attempt = index.attempt_id().hex().to_owned();
+        store.record(index, None, &[], at(7))?;
+        store.record_relisted(
+            &attempt,
+            &[relisted(
+                &story_hex(SOURCE, STORY),
+                minute_at(A_PUBLICATION_MINUTE)?,
+            )],
+        )?;
+        assert_eq!(count(&store, "relisted")?, 0);
+        Ok(())
+    }
+
+    /// The `relisted` table's own constraints: equal minutes and an unknown attempt are refused
+    /// beside a control row that is taken.
+    #[test]
+    fn a_relisted_row_breaking_a_constraint_of_its_table_is_refused() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let (_, attempt) = a_kept_minute_and_an_index(&mut store)?;
+        let insert = |attempt: &str, story: &str, listed: &str| {
+            store.db.execute(
+                "INSERT INTO relisted VALUES (?1, ?2, 'raw', ?3, 'stored')",
+                params![attempt, story, listed],
+            )
+        };
+        let taken = insert(&attempt, "control", "listed").is_ok();
+        let equal = insert(&attempt, "equal", "stored").is_err();
+        let unknown = insert("no such attempt", "unknown", "listed").is_err();
+        assert_eq!((taken, equal, unknown), (true, true, true));
         Ok(())
     }
 

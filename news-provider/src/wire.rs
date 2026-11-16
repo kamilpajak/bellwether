@@ -32,16 +32,6 @@ pub struct Timeouts {
     pub recv_body: Duration,
 }
 
-/// Whether ureq may follow a 3xx. No `Default`, for the reason `Timeouts` has none: ureq 3.5.2
-/// follows 10, unpaced and unledgered (architecture.md section 8 row R19).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Redirects {
-    /// ureq 3.5.2 returns the 3xx itself as the answer, never `TooManyRedirects`.
-    Refuse,
-    /// `FollowUpTo(0)` is `Refuse`: ureq 3.5.2 errors only when `max_redirects > 0`.
-    FollowUpTo(u32),
-}
-
 /// What one vendor's conversation looks like. The transport is this crate's; the profile is the
 /// provider's.
 #[derive(Debug, Clone)]
@@ -55,7 +45,6 @@ pub struct TransportProfile {
     /// How fast this vendor may be called, so both intervals have one producer: the provider.
     /// `Wire::new` builds the per-IP pace file; `Wire::send` opens a per-host one per url host.
     pub budget: RequestBudget,
-    pub redirects: Redirects,
 }
 
 /// The only place a credential VALUE lives. A `Request` and every ledger row carry the name.
@@ -106,6 +95,10 @@ pub const KEPT_HEADERS: [&str; 7] = [
 /// The one `Content-Encoding` value ureq 3.5.2's `gzip` feature decodes (`ContentEncoding::from`
 /// matches it exactly, case included), so the body stored here is the one ureq would have stored.
 const GZIP: &str = "gzip";
+/// No 3xx is followed: at 0 ureq 3.5.2 returns the 3xx as the answer and raises
+/// `TooManyRedirects` only above 0 (`config.rs`); its default, 10, sends each hop unpaced and
+/// unledgered (architecture.md section 8 row R19).
+const MAX_REDIRECTS: u32 = 0;
 
 /// The [`KEPT_HEADERS`] of one answer, as `(name, value)` pairs in the order `http` 1.x's
 /// `HeaderMap` yields them: names by first appearance, each name's values in the order received.
@@ -396,10 +389,6 @@ impl Wire {
             profile.budget.min_interval,
         );
         let timeouts = profile.timeouts;
-        let max_redirects = match profile.redirects {
-            Redirects::Refuse => 0,
-            Redirects::FollowUpTo(hops) => hops,
-        };
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(timeouts.global))
             .timeout_per_call(Some(timeouts.per_call))
@@ -414,7 +403,7 @@ impl Wire {
             // error: EDGAR answers a weekend, a holiday and an unpublished day with 403 and the
             // same generic S3 body (measured in `providers/edgar-press/src/lib.rs`'s header).
             .http_status_as_error(false)
-            .max_redirects(max_redirects)
+            .max_redirects(MAX_REDIRECTS)
             // ureq 3.5.2 sends `accept-encoding: gzip` only with its `gzip` feature, which is off
             // (Cargo.toml); stated here so the request head stays byte for byte what it was.
             .accept_encoding(GZIP)
@@ -602,8 +591,8 @@ struct Failed {
 #[cfg(test)]
 mod tests {
     use super::{
-        Credentials, Headers, RawResponse, Redirects, SendFailure, Timeouts, TransportError,
-        TransportKind, TransportProfile, Wire, USER_AGENT,
+        Credentials, Headers, RawResponse, SendFailure, Timeouts, TransportError, TransportKind,
+        TransportProfile, Wire, USER_AGENT,
     };
     use crate::budget::{BudgetError, RequestBudget};
     use crate::clock::testing::{StepClock, WaitRecorder, WaitedClock};
@@ -707,7 +696,6 @@ mod tests {
                 min_interval: TEST_INTERVAL,
                 per_host: None,
             },
-            redirects: Redirects::Refuse,
         }
     }
 
@@ -1265,10 +1253,10 @@ mod tests {
         ("308 Permanent Redirect\r\nLocation: /elsewhere", 308),
     ];
 
-    /// What `open_web_feed::a_redirect_is_permanent_never_transient` assumes: under `Refuse` every
-    /// 3xx above reaches `classify` as an answer, over one connection.
+    /// What both providers' `a_redirect_is_permanent_never_transient` assume: every 3xx above
+    /// reaches `classify` as an answer, over one connection.
     #[test]
-    fn every_redirect_is_answered_as_itself_under_refuse() -> Checked {
+    fn every_redirect_is_answered_as_itself() -> Checked {
         for (head, status) in EVERY_REDIRECT {
             let (url, served) = serve_once(head, 1, 1)?;
             let store = tempfile::tempdir()?;
@@ -1289,7 +1277,7 @@ mod tests {
         Ok(())
     }
 
-    /// Under `Refuse` a 3xx is the answer and its body is read under the same limit; the failure
+    /// A 3xx is the answer and its body is read under the same limit; the failure
     /// keeps the 301, which the held read's 3xx exclusion keys on (architecture.md section 11.1).
     #[test]
     fn a_redirect_whose_body_is_over_the_limit_fails_with_the_status_its_head_carried() -> Checked {
@@ -1444,12 +1432,9 @@ mod tests {
         Ok(target)
     }
 
-    /// One send through a `Wire` whose profile holds `redirects`: the answer, and every request
-    /// target the loopback server saw. The pace waits go to `waits`.
-    fn send_redirected(
-        redirects: Redirects,
-        waits: &WaitRecorder,
-    ) -> Result<Redirected, Box<dyn std::error::Error>> {
+    /// One send through a `Wire`: the answer, and every request target the loopback server saw.
+    /// The pace waits go to `waits`.
+    fn send_redirected(waits: &WaitRecorder) -> Result<Redirected, Box<dyn std::error::Error>> {
         let stop = Arc::new(AtomicBool::new(false));
         let (url, served) = serve_redirects(Arc::clone(&stop))?;
         let store = tempfile::tempdir()?;
@@ -1459,10 +1444,7 @@ mod tests {
         };
         let asked = Request { url, ..request() };
         let wire = Wire::with_sleeper(
-            TransportProfile {
-                redirects,
-                ..profile()
-            },
+            profile(),
             held(),
             store.path(),
             &SourceId::new(SOURCE),
@@ -1477,41 +1459,15 @@ mod tests {
         Ok((answer.status(), answer.body().to_vec(), targets?))
     }
 
-    /// §8 row R19 (redirects): the 3xx is the answer and the hop it names is never sent.
+    /// §8 row R19 (redirects): the 3xx is the answer, the hop it names is never sent and the pace
+    /// is reserved once. Mutation 2026-11-16, `MAX_REDIRECTS` 1: red, the server saw two targets.
     #[test]
-    fn a_refused_redirect_is_answered_as_its_3xx_and_its_target_never_requested() -> Checked {
-        assert_eq!(
-            send_redirected(Redirects::Refuse, &WaitRecorder::default())?,
-            (MOVED, MOVED_BODY.to_vec(), vec![REDIRECTED.to_owned()])
-        );
-        Ok(())
-    }
-
-    /// ureq 3.5.2 raises `TooManyRedirects` only when `max_redirects > 0` (`config.rs`), so a
-    /// follow limit of 0 answers with the 3xx as `Refuse` does.
-    #[test]
-    fn following_up_to_zero_redirects_is_refusing_them() -> Checked {
-        assert_eq!(
-            send_redirected(Redirects::FollowUpTo(0), &WaitRecorder::default())?,
-            send_redirected(Redirects::Refuse, &WaitRecorder::default())?
-        );
-        Ok(())
-    }
-
-    /// The positive control for the gate above, and R19's hole for every profile that follows:
-    /// two requests reach the server and the pace is reserved once.
-    #[test]
-    fn a_followed_redirect_is_a_second_request_no_pace_file_saw() -> Checked {
+    fn a_redirect_is_answered_as_its_3xx_and_its_target_never_requested() -> Checked {
         let waits = WaitRecorder::default();
-        let answer = send_redirected(Redirects::FollowUpTo(1), &waits)?;
         assert_eq!(
-            (answer, waits.waits()),
+            (send_redirected(&waits)?, waits.waits()),
             (
-                (
-                    OK_STATUS,
-                    ARRIVED_BODY.to_vec(),
-                    vec![REDIRECTED.to_owned(), REDIRECT_TARGET.to_owned()]
-                ),
+                (MOVED, MOVED_BODY.to_vec(), vec![REDIRECTED.to_owned()]),
                 vec![NO_WAIT]
             )
         );

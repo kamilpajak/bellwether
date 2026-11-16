@@ -1867,6 +1867,13 @@ impl Archive for RefusingTheIndex {
     fn record_held(&mut self, attempt_id: &str, held: u32) -> Result<(), ArchiveError> {
         Archive::record_held(&mut self.store, attempt_id, held)
     }
+    fn record_relisted(
+        &mut self,
+        attempt_id: &str,
+        relisted: &[news_provider::Relisted],
+    ) -> Result<(), ArchiveError> {
+        Archive::record_relisted(&mut self.store, attempt_id, relisted)
+    }
 }
 
 /// Section 3.2 `held`: an index whose commit the store refused stays open with no `vendor_rows`,
@@ -1878,26 +1885,7 @@ fn a_live_index_whose_commit_was_refused_records_no_held() -> TestResult {
     seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
     let exchange = Gnw::day()?;
     poll(root.path(), RUN_AT, "first", &exchange)?;
-    let ask = Ask {
-        at: instant(LATER_THE_SAME_DAY),
-        schedule: Some("refused".to_owned()),
-        ..ask(root.path(), cmd_collect::TODAY)
-    };
-    let opened = cmd_collect::open_provider(&ask)?;
-    let run = RunId::new("refused");
-    let mut archive = RefusingTheIndex {
-        store: Committer::open(root.path(), &run)?,
-        commits: RefCell::new(0),
-    };
-    let driven = cmd_collect::drive(
-        &ask,
-        opened.provider.as_ref(),
-        &mut archive,
-        &exchange,
-        &At(instant(LATER_THE_SAME_DAY)),
-        &run,
-    )?;
-    drop(archive);
+    let exit = polled_through_a_refused_index(root.path(), &exchange)?;
     let db = Connection::open_with_flags(
         root.path().join(COMMIT_LOG),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -1908,11 +1896,52 @@ fn a_live_index_whose_commit_was_refused_records_no_held() -> TestResult {
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    assert_eq!(
-        (driven.collected.exit(), refused),
-        (Exit::CommitFailed, (None, None))
-    );
+    assert_eq!((exit, refused), (Exit::CommitFailed, (None, None)));
     Ok(())
+}
+
+/// Section 8 row R15, decision 10: an index whose commit was refused re-lists committed release 0
+/// under another minute and records no `relisted` row on its open attempt.
+#[test]
+fn a_live_index_whose_commit_was_refused_records_no_relisted() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let mut exchange = Gnw::day()?;
+    poll(root.path(), RUN_AT, "first", &exchange)?;
+    let relisting = an_index_relisting_release_0(&exchange)?;
+    exchange.pages.insert(INDEX.to_owned(), relisting);
+    let exit = polled_through_a_refused_index(root.path(), &exchange)?;
+    let db = Connection::open_with_flags(
+        root.path().join(COMMIT_LOG),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let relisted: i64 = db.query_row("SELECT COUNT(*) FROM relisted", [], |row| row.get(0))?;
+    assert_eq!((exit, relisted), (Exit::CommitFailed, 0));
+    Ok(())
+}
+
+/// A second poll, later the same day, through a store that refuses its index commit.
+fn polled_through_a_refused_index(root: &Path, exchange: &Gnw) -> Result<Exit, Box<dyn Error>> {
+    let ask = Ask {
+        at: instant(LATER_THE_SAME_DAY),
+        schedule: Some("refused".to_owned()),
+        ..ask(root, cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let run = RunId::new("refused");
+    let mut archive = RefusingTheIndex {
+        store: Committer::open(root, &run)?,
+        commits: RefCell::new(0),
+    };
+    let driven = cmd_collect::drive(
+        &ask,
+        opened.provider.as_ref(),
+        &mut archive,
+        exchange,
+        &At(instant(LATER_THE_SAME_DAY)),
+        &run,
+    )?;
+    Ok(driven.collected.exit())
 }
 
 const EXIT_OK: i32 = 0;
@@ -2090,6 +2119,100 @@ fn an_all_held_index_attempt_records_its_held_count() -> TestResult {
     assert_eq!(
         (next_day_rows, first_index, documents),
         (vec![Some(3)], vec![Some(0)], vec![None; RELEASES.len()])
+    );
+    Ok(())
+}
+
+/// Release 0's pubDate moved five minutes later, as a re-listing under the same link states it.
+const RELISTED: &str = "<pubDate>Sat, 14 Nov 2026 19:05 GMT</pubDate>";
+
+/// The day's index with release 0 listed under `RELISTED` instead of its own pubDate.
+fn an_index_relisting_release_0(gnw: &Gnw) -> Result<Vec<u8>, Box<dyn Error>> {
+    let index = String::from_utf8(gnw.pages.get(INDEX).ok_or("no index")?.clone())?;
+    if index.matches(LISTED).count() != 1 {
+        return Err("release 0's pubDate is not in the index once".into());
+    }
+    Ok(index.replacen(LISTED, RELISTED, 1).into_bytes())
+}
+
+/// Section 8 row R15, owner decision 10 (2026-11-16): a second poll lists committed release 0
+/// under another minute, as PRN's correction 302913655 was. No fetch, the `stored_items` columns
+/// unchanged, one `relisted` row on the second index attempt, and the ledger counts it.
+#[test]
+fn a_held_story_listed_under_another_minute_is_recorded_without_a_fetch_and_counted() -> TestResult
+{
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let mut exchange = Gnw::day()?;
+    poll(root.path(), RUN_AT, "first", &exchange)?;
+    exchange.sent();
+    let db = Connection::open_with_flags(
+        root.path().join(COMMIT_LOG),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let before = stored_items(&db)?;
+    let relisting = an_index_relisting_release_0(&exchange)?;
+    exchange.pages.insert(INDEX.to_owned(), relisting);
+    poll(root.path(), LATER_THE_SAME_DAY, "second", &exchange)?;
+    let (second, _) = exchange.sent();
+    let recorded: Vec<(String, String, String, String, String, String)> = db
+        .prepare(
+            "SELECT p.url, a.run_id, r.story_id, r.listed_raw, r.listed_minute, r.stored_minute
+               FROM relisted r JOIN attempts a ON a.attempt_id = r.attempt_id
+               JOIN payloads p ON p.attempt_id = r.attempt_id",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    let second_run: String = db.query_row(
+        "SELECT run_id FROM attempts ORDER BY opened_at DESC, attempt_id LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let (key, _, _, _) = RELEASES[0];
+    let story = digest(canon::digest::story_id(SOURCE, key)).ok_or("story id")?;
+    let day: chrono::NaiveDate = "2026-11-14".parse()?;
+    let report = newsvault::cmd_ledger::read(
+        root.path(),
+        &newsvault::cmd_ledger::Ask {
+            at: instant(LEDGER_AT),
+            from: day,
+            to: day,
+            source: None,
+            expected_runs: None,
+            limit: None,
+            check: false,
+        },
+    )?;
+    let counted: Vec<i64> = report
+        .days
+        .iter()
+        .flat_map(|one| &one.per_source)
+        .map(|row| row.relisted_disputed)
+        .collect();
+    assert_eq!(
+        (second, stored_items(&db)?, recorded, counted),
+        (
+            vec![INDEX.to_owned()],
+            before,
+            vec![(
+                INDEX.to_owned(),
+                second_run,
+                story,
+                "Sat, 14 Nov 2026 19:05 GMT".to_owned(),
+                "2026-11-14T19:05:00.000000Z".to_owned(),
+                "2026-11-14T19:00:00.000000Z".to_owned()
+            )],
+            vec![1]
+        )
     );
     Ok(())
 }
