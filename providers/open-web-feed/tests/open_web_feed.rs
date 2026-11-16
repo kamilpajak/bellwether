@@ -126,15 +126,21 @@ const PRN_TABLES_PAGE: &str = "synthetic_tables.html";
 /// and one later paragraph; the two figures naming a person were left out.
 const PRN_FIGURE_PAGE: &str = "article_302939742.html";
 const GNW_ONE_PATH_PAGE: &str = "synthetic_lists_tables_and_addresses.html";
+/// Releases 3403177 and 3403225 (2026-11-16 09:42Z and 09:44Z fetches) cut to a contact block,
+/// names, phone digits and addresses replaced: the address in link text, then in plain text.
+const GNW_LINKED_ADDRESS_PAGE: &str = "article_3403177.html";
+const GNW_PLAIN_ADDRESS_PAGE: &str = "article_3403225.html";
 /// Section 11.1's P5: every page below, its committed body digest, and the extraction version
 /// that produced them. Rewritten by hand when an extraction change is meant.
 const GOLDEN_BODIES: &str = "golden_bodies.json";
-const GOLDEN_GNW_PAGES: [&str; 5] = [
+const GOLDEN_GNW_PAGES: [&str; 7] = [
     REAL_ARTICLE,
     "synthetic_canonical_differs.html",
     "synthetic_relative_canonical.html",
     PROSE_PAGE,
     GNW_ONE_PATH_PAGE,
+    GNW_LINKED_ADDRESS_PAGE,
+    GNW_PLAIN_ADDRESS_PAGE,
 ];
 const GOLDEN_PRN_PAGES: [&str; 7] = [
     PRN_ARTICLE,
@@ -1779,13 +1785,48 @@ fn a_list_item_holding_a_paragraph_or_a_nested_list_is_one_line_read_once() -> O
     Ok(())
 }
 
-/// P1 and `mailto:` (section 11.1): neither Cloudflare shape nor an address link reaches the
-/// body; a web link does. Before, each placeholder was stored as `[email protected]`.
+/// P1 and decision r (section 11.1): neither Cloudflare shape nor an address reaches the body; a
+/// `mailto:` link's name, a phone number, a label and a web link do.
 #[test]
-fn a_cloudflare_email_placeholder_and_a_mailto_link_never_reach_the_body() -> Outcome {
+fn a_cloudflare_placeholder_and_an_address_never_reach_the_body_and_a_mailto_name_does() -> Outcome
+{
     assert_eq!(
         prn_body(PRN_ADDRESSES_PAGE)?,
-        "Media: today\nInvestors:\nPress: or , see example.com.\nDesk: daily"
+        "Media: today\nInvestors:\nPress: or , see example.com.\n\
+         Contact Jane Example, +45 0000 0000, E-mail:\nDesk: daily"
+    );
+    Ok(())
+}
+
+fn gnw_body(page: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let provider = provider()?;
+    let item = only_item(&provider.extract(&article_request(&provider)?, &blob(gnw(page))))?;
+    Ok(item.body.ok_or("no body")?.text)
+}
+
+/// Decision r (section 11.1) on trimmed real GNW pages: an address as a Tracker link's text and as
+/// plain text is removed; the name, the phone number and the `E-mail:` label stay.
+#[test]
+fn an_address_in_link_text_or_plain_text_leaves_a_globenewswire_body_and_the_contact_stays(
+) -> Outcome {
+    let linked = gnw_body(GNW_LINKED_ADDRESS_PAGE)?;
+    let plain = gnw_body(GNW_PLAIN_ADDRESS_PAGE)?;
+    assert_eq!(
+        (linked.lines().nth(3), linked.lines().nth(4)),
+        (
+            Some("Ann Example Philips Global External Relations Tel.: +31 0 0000 0000 E-mail:"),
+            Some("Bo Example Philips Investor Relations Tel.: +31 00 00 00000 E-mail:")
+        ),
+        "{linked}"
+    );
+    assert_eq!(
+        plain.lines().last(),
+        Some("Niu Technologies E-mail:"),
+        "{plain}"
+    );
+    assert!(
+        !linked.contains('@') && !plain.contains('@'),
+        "{linked}\n{plain}"
     );
     Ok(())
 }
