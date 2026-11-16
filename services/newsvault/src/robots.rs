@@ -53,7 +53,8 @@ pub enum Reading {
     Rules,
     /// Empty, or comments and blank lines only: no rule, every path allowed.
     NoRulesEmpty,
-    /// An `Allow`, `Disallow` or Crawl-delay before the first `user-agent` line, read as `*`'s.
+    /// An `Allow`, `Disallow` or Crawl-delay before the first `user-agent` line: the `Disallow`
+    /// and the Crawl-delay are read as `*`'s, the `Allow` is ignored.
     OrphanRulesAppliedToStar,
 }
 
@@ -87,6 +88,8 @@ pub struct Robots {
 #[derive(Default)]
 struct Group {
     every_agent: bool,
+    /// The lines before the first `user-agent`: their delays are `*`'s, their `Allow`s nobody's.
+    orphan: bool,
     delays: Vec<String>,
 }
 
@@ -139,7 +142,7 @@ impl Robots {
                 }
                 CRAWL_DELAY => {
                     orphan |= !named_an_agent;
-                    group.every_agent |= !named_an_agent;
+                    group.orphan |= !named_an_agent;
                     group.delays.push(value.to_owned());
                 }
                 _ => {}
@@ -157,7 +160,7 @@ impl Robots {
 
     /// A group's Crawl-delays count only when it names `*`; the largest of every `*` group wins.
     fn end(&mut self, group: &Group) -> Result<(), RobotsError> {
-        if group.every_agent {
+        if group.every_agent || group.orphan {
             for value in &group.delays {
                 let delay = seconds(value)?;
                 self.crawl_delay = Some(self.crawl_delay.map_or(delay, |d| d.max(delay)));
@@ -487,19 +490,43 @@ mod tests {
             Robots::parse(b"Crawl-delay: soon\nUser-agent: *\n"),
             Err(RobotsError::CrawlDelayNotANumber("soon".to_owned()))
         );
+        // A Crawl-delay alone is an orphan rule. Mutation 2026-11-16, `orphan` not set by it: red.
+        let delay_only = Robots::parse(b"Crawl-delay: 12\nUser-agent: *\nDisallow: /x\n")?;
+        assert_eq!(
+            (delay_only.reading(), delay_only.crawl_delay()),
+            (
+                Reading::OrphanRulesAppliedToStar,
+                Some(Duration::from_secs(12))
+            )
+        );
         Ok(())
     }
 
     /// An orphan `Allow` is ignored, as RFC 9309 section 2.2.2 says: applied to `*` it would widen
-    /// what `*` may fetch, and decision 3c is the stricter reading. Review 2026-11-16, this body
-    /// allowed `/news/x` while 79a79b8 refused it.
+    /// what `*` may fetch, and decision 3c is the stricter reading. Review 2026-11-16, the first
+    /// body allowed `/news/x` at 79a79b8, the other two at 41fcbf9 (an orphan Crawl-delay before
+    /// the `Allow` made the orphan group `*`'s); mutation, that 41fcbf9 line restored: red.
     #[test]
     fn an_orphan_allow_widens_nothing() -> TestResult {
-        let robots = Robots::parse(b"Allow: /news/\nUser-agent: *\nDisallow: /\n")?;
-        assert_eq!(
-            (robots.reading(), robots.allows("/news/x")),
-            (Reading::OrphanRulesAppliedToStar, false)
-        );
+        let mut read = Vec::new();
+        for (body, path) in [
+            (
+                &b"Allow: /news/\nUser-agent: *\nDisallow: /\n"[..],
+                "/news/x",
+            ),
+            (
+                b"Crawl-delay: 5\nAllow: /news/\nUser-agent: *\nDisallow: /\n",
+                "/news/x",
+            ),
+            (
+                b"Crawl-delay: 5\nDisallow: /a\nAllow: /a/b\nUser-agent: *\nDisallow: /\n",
+                "/a/b/c",
+            ),
+        ] {
+            let robots = Robots::parse(body)?;
+            read.push((robots.reading(), robots.allows(path)));
+        }
+        assert_eq!(read, [(Reading::OrphanRulesAppliedToStar, false); 3]);
         Ok(())
     }
 
@@ -528,6 +555,11 @@ mod tests {
         // is `*`'s too; before B2 it was googlebot's alone.
         let shared = Robots::parse(&fixture("synthetic_star_shares_a_group.txt")?)?;
         assert!(!shared.allows("/news"));
+        // Nor does an unknown line. Mutation 2026-11-16, the `_` arm ending the run: red.
+        let unknown = Robots::parse(
+            b"User-agent: *\nUser-agent: bingbot\nSitemap: x\nUser-agent: googlebot\nDisallow: /g\n",
+        )?;
+        assert!(!unknown.allows("/g"));
         Ok(())
     }
 
