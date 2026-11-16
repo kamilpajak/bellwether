@@ -1594,9 +1594,11 @@ const GNW_INDEX: &str = "https://rss.globenewswire.com/rssfeed/";
 /// `synthetic_index_one_release.xml`'s one `www.` link, rewritten to `rss.` as the rules say.
 const GNW_RELEASE: &str =
     "https://rss.globenewswire.com/news-release/2026/11/14/9999999/0/en/synthetic-release.html";
-/// `open_web_hosts()` and `committed_hosts()` each admit one host, so a plan holds one index
-/// request.
+/// `open_web_hosts()` admits one host, so a plan holds one index request.
 const ADMITTED_HOSTS: u64 = 1;
+/// `committed_hosts()` admits GNW and PR Newswire.
+const COMMITTED_ADMITTED_HOSTS: u64 = 2;
+const PRN_ROBOTS: &str = "https://www.prnewswire.com/robots.txt";
 /// Before `SATURDAY_AT`: when the seeded robots fetch of the committed GNW row was ledgered.
 const ROBOTS_FETCHED_AT: &str = "2026-11-14T18:00:00Z";
 
@@ -1623,6 +1625,22 @@ fn open_web_hosts() -> PathBuf {
 /// The production hosts file.
 fn committed_hosts() -> PathBuf {
     open_web_dir().join("hosts/open_web_wires.hosts.json")
+}
+
+/// Both committed rows' robots fetches, ledgered against the production hosts file.
+fn seed_committed_robots(store: &Path) -> TestResult {
+    let prn_robots =
+        std::fs::read(open_web_dir().join("tests/fixtures/prn/robots_www_prnewswire_com.txt"))?;
+    seed::refresh_answering(
+        store,
+        &committed_hosts(),
+        ROBOTS_FETCHED_AT,
+        &[
+            (seed::GNW_ROBOTS, OK, &seed::gnw_robots()?),
+            (PRN_ROBOTS, OK, &prn_robots),
+        ],
+    )?;
+    Ok(())
 }
 
 /// The production rules file, as `rules()` is edgar's.
@@ -1908,7 +1926,7 @@ fn two_sources_in_one_invocation_are_refused() -> TestResult {
 fn an_open_web_dry_run_plans_one_index_request_per_admitted_host_and_writes_nothing() -> TestResult
 {
     let root = TempDir::new()?;
-    seed_robots(root.path())?;
+    seed_committed_robots(root.path())?;
     let before = tree_digests(root.path());
     let dry = Ask {
         dry_run: true,
@@ -1925,7 +1943,7 @@ fn an_open_web_dry_run_plans_one_index_request_per_admitted_host_and_writes_noth
             answer.envelope["plan"]["requests"].as_u64(),
             answer.envelope["changed"].as_bool(),
         ),
-        (0, Exit::Ok, Some(ADMITTED_HOSTS), Some(false)),
+        (0, Exit::Ok, Some(COMMITTED_ADMITTED_HOSTS), Some(false)),
         "{:#}",
         answer.envelope
     );
