@@ -40,6 +40,7 @@
 //!     universe_version: canon::FileDigest::of(b"{}"),
 //!     listed_date: None,
 //!     hosts_version: None,
+//!     extract_version: None,
 //! };
 //! let at = ObservationTime::new(DateTime::UNIX_EPOCH);
 //! let raw = committer.put_blob(b"{}")?;
@@ -113,11 +114,11 @@ PRAGMA synchronous = FULL;
 ";
 
 /// The `PRAGMA user_version` this build writes, and the only one a read-only reader accepts.
-pub const SCHEMA_VERSION: i32 = 4;
+pub const SCHEMA_VERSION: i32 = 5;
 
 /// Version `i + 1` is reached from version `i` by `MIGRATIONS[i]`, run by [`migrate`] with
 /// foreign keys off, as SQLite's twelve-step table rebuild (lang_altertable.html) requires.
-const MIGRATIONS: [&str; 4] = [
+const MIGRATIONS: [&str; 5] = [
     "
 -- The hosts file a run was admitted under: architecture.md section 2's `hosts_version` row. NULL
 -- for a provider that reads no hosts file.
@@ -190,6 +191,12 @@ ALTER TABLE attempts ADD COLUMN held INTEGER;
 -- `news_provider::Counts::listing_unusable`: unusable rows the index row decided (section 11.1).
 -- NULL for an abandoned attempt and for every row closed before user_version 4, not backfilled.
 ALTER TABLE attempts ADD COLUMN listing_unusable INTEGER;
+",
+    "
+-- The extraction version an answer was read under, rules plus code: architecture.md section 2's
+-- `extract_version` row. NULL for a provider that does not version its code and for every row
+-- opened before user_version 5, not backfilled.
+ALTER TABLE attempts ADD COLUMN extract_version TEXT;
 ",
 ];
 
@@ -1382,6 +1389,7 @@ impl Committer {
             filter_params,
             universe_version,
             hosts_version,
+            extract_version,
             story_id,
             opened_at,
         } = event
@@ -1389,8 +1397,8 @@ impl Committer {
             self.db.execute(
                 "INSERT INTO attempts
                      (attempt_id, run_id, source, target_window, filter_params, universe_version,
-                      opened_at, hosts_version, story_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(attempt_id) DO NOTHING",
+                      opened_at, hosts_version, story_id, extract_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(attempt_id) DO NOTHING",
                 params![
                     attempt_id.hex(),
                     run.as_str(),
@@ -1400,7 +1408,8 @@ impl Committer {
                     universe_version.hex(),
                     stamp(opened_at.inner()),
                     hosts_version.as_ref().map(FileDigest::hex),
-                    story_id.as_ref().map(Digest::hex)
+                    story_id.as_ref().map(Digest::hex),
+                    extract_version.as_ref().map(Digest::hex)
                 ],
             )?;
         }
@@ -1849,6 +1858,7 @@ mod tests {
             universe_version: FileDigest::of(ROSTER),
             listed_date: None,
             hosts_version: None,
+            extract_version: None,
         }
     }
 
@@ -2946,6 +2956,115 @@ mod tests {
             fixtures
                 .into_iter()
                 .map(|(_, columns)| (columns.clone(), columns, 3))
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    /// A v4 store: the v3 fixture, `MIGRATIONS[3]` and no later step, with the v1 attempt given a
+    /// listing count.
+    fn a_store_at_user_version_four(temp: &TempDir) -> TestResult {
+        a_store_at_user_version_three(temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch(MIGRATIONS[3])?;
+        db.pragma_update(None, "user_version", 4)?;
+        db.execute_batch(
+            "UPDATE attempts SET listing_unusable = 3 WHERE attempt_id = 'a v1 attempt';",
+        )?;
+        Ok(())
+    }
+
+    fn extract_version_of(store: &Committer, attempt: &str) -> Result<Option<String>, StoreError> {
+        Ok(store.db.query_row(
+            "SELECT extract_version FROM attempts WHERE attempt_id = ?1",
+            params![attempt],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// §8 row M1 from user_version 4: the step to 5 adds `attempts.extract_version`, and the
+    /// version a request carries lands in it.
+    #[test]
+    fn a_store_at_user_version_four_opens_migrates_to_five_and_takes_an_extract_version(
+    ) -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_four(&temp)?;
+        let mut store = open(&temp)?;
+        let version =
+            canon::digest::extract_version("rules", &[]).map_err(|error| error.to_string())?;
+        let request = Request {
+            extract_version: Some(version.clone()),
+            ..request()
+        };
+        let slot = AttemptSlot::open(&mut store, &request, None, &RunId::new(RUN), 0, at(1))?;
+        let attempt = slot.attempt_id().hex().to_owned();
+        assert_eq!(
+            (
+                user_version(&store.db)?,
+                extract_version_of(&store, &attempt)?
+            ),
+            (SCHEMA_VERSION, Some(version.hex().to_owned()))
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the carried half from user_version 4: every column of every row of every v4
+    /// table, compared by `quote()`; the v4 attempt gains a NULL `extract_version`, not backfilled.
+    #[test]
+    fn a_v4_store_keeps_every_v4_column_of_every_row() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_four(&temp)?;
+        let v4 = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let before = quoted_rows(&v4, 4, &V2_TABLES)?;
+        drop(v4);
+        assert!(super::refuse_an_unreadable_version(temp.path()).is_ok());
+        let store = open(&temp)?;
+        let after = quoted_rows(&store.db, 4, &V2_TABLES)?;
+        assert_eq!(before.len(), V2_TABLES.len() + 1);
+        assert_eq!(
+            (after, extract_version_of(&store, "a v1 attempt")?),
+            (before, None)
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the per-version shape check at user_version 4.
+    #[test]
+    fn a_v4_store_whose_columns_differ_is_refused_and_left_at_user_version_four() -> TestResult {
+        let fixtures = [
+            (
+                "ALTER TABLE attempts DROP COLUMN listing_unusable;
+                 ALTER TABLE attempts ADD COLUMN listing_unusable TEXT;",
+                vec!["attempts.listing_unusable".to_owned()],
+            ),
+            (
+                "ALTER TABLE attempts DROP COLUMN held;",
+                vec!["attempts.held".to_owned()],
+            ),
+        ];
+        let mut named = Vec::new();
+        for (edit, _) in &fixtures {
+            let temp = TempDir::new()?;
+            a_store_at_user_version_four(&temp)?;
+            let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+            db.execute_batch(edit)?;
+            drop(db);
+            let read_only = match super::refuse_an_unreadable_version(temp.path()) {
+                Err(StoreError::ShapeDiffers { found: 4, columns }) => columns,
+                other => vec![format!("{other:?}")],
+            };
+            let refused = match open(&temp) {
+                Err(StoreError::ShapeDiffers { found: 4, columns }) => columns,
+                other => vec![format!("{other:?}")],
+            };
+            let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+            named.push((refused, read_only, user_version(&db)?));
+        }
+        assert_eq!(
+            named,
+            fixtures
+                .into_iter()
+                .map(|(_, columns)| (columns.clone(), columns, 4))
                 .collect::<Vec<_>>()
         );
         Ok(())

@@ -953,6 +953,7 @@ fn an_attempt_a_dead_run_left_open_is_closed_interrupted_by_the_next_run() -> Te
         universe_version: provider.provider.universe_version(),
         listed_date: None,
         hosts_version: None,
+        extract_version: None,
     };
     let orphan = AttemptSlot::open(
         &mut store,

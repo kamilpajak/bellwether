@@ -260,6 +260,7 @@ fn request_for(row: &HostPin, hosts_version: &FileDigest) -> Request {
         universe_version: FileDigest::of(&[]),
         listed_date: None,
         hosts_version: Some(hosts_version.clone()),
+        extract_version: None,
     }
 }
 

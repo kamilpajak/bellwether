@@ -8,6 +8,7 @@ mod hosts;
 mod parse;
 mod rules;
 mod strict;
+mod version;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -145,6 +146,7 @@ pub struct OpenWebFeed {
     hosts: Hosts,
     rules: BTreeMap<String, Rule>,
     rules_version: FileDigest,
+    extract_version: Digest,
     /// Every rule's host rewrite, which `item_key` applies whatever host a url names.
     rewrites: BTreeMap<String, String>,
     /// Per host, the Crawl-delay `newsvault` read from the pinned robots.txt (section 11.2).
@@ -173,10 +175,18 @@ impl OpenWebFeed {
                 }
             }
         }
+        let rules_version = FileDigest::of(&rules_bytes);
+        let extract_version = version::extract_version(&rules_version).map_err(|error| {
+            Refusal::RulesUnparseable {
+                path: rules.to_path_buf(),
+                why: format!("the extraction version has no canonical form: {error}"),
+            }
+        })?;
         Ok(Self {
             hosts: read_hosts(hosts, &parsed)?,
             rules: parsed,
-            rules_version: FileDigest::of(&rules_bytes),
+            rules_version,
+            extract_version,
             rewrites,
             crawl_delays: BTreeMap::new(),
         })
@@ -239,6 +249,13 @@ impl OpenWebFeed {
         &self.hosts.version
     }
 
+    /// `extract_version`: the rules file's digest and this crate's extraction source together
+    /// (architecture.md section 2), carried by every request this feed builds.
+    #[must_use]
+    pub const fn extract_version(&self) -> &Digest {
+        &self.extract_version
+    }
+
     /// The one function behind `source_item_id` and `story_of` (section 11.1): the host rewrite,
     /// then the lowercased host plus the path, with no scheme, query or fragment. `None` for a
     /// url with no host this crate can read. A page's canonical link never reaches it.
@@ -274,6 +291,7 @@ impl OpenWebFeed {
             universe_version: empty_roster(),
             listed_date: None,
             hosts_version: Some(self.hosts.version.clone()),
+            extract_version: Some(self.extract_version.clone()),
         }
     }
 
@@ -313,6 +331,7 @@ impl OpenWebFeed {
                     universe_version: empty_roster(),
                     listed_date: row.valid_raw.clone(),
                     hosts_version: request.hosts_version.clone(),
+                    extract_version: request.extract_version.clone(),
                 }),
                 None => filtered_out += 1,
             }

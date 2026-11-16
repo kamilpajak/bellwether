@@ -493,6 +493,20 @@ fn an_open_web_run_collects_a_globenewswire_and_a_pr_newswire_day_end_to_end() -
         .query_map([SOURCE], |row| row.get::<_, Option<String>>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     assert_eq!(versions, vec![Some(hosts_version.hex().to_owned()); 8]);
+    // Section 2's `extract_version`, rules plus extraction code: on the envelope and on every
+    // attempt row. Mutation 2026-11-16, `commit_opened` writing NULL for it: red.
+    let extraction = OpenWebFeed::open(&seed::committed_hosts(), &ask.rules, CONTACT)?
+        .extract_version()
+        .hex()
+        .to_owned();
+    let mut extracted = db.prepare("SELECT extract_version FROM attempts WHERE source = ?1")?;
+    let extracted = extracted
+        .query_map([SOURCE], |row| row.get::<_, Option<String>>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        (envelope["extract_version"].as_str(), extracted),
+        (Some(extraction.as_str()), vec![Some(extraction.clone()); 8])
+    );
     let mut expected = gnw_items();
     expected.extend([
         prn_item(

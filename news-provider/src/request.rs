@@ -115,6 +115,10 @@ pub struct Request {
     /// Outside `filter_params`: it decides admission and pace, not what the vendor is asked.
     /// `None` for a provider that reads no hosts file.
     pub hosts_version: Option<FileDigest>,
+    /// The extraction version the answer is read under: rules file plus extraction code
+    /// (architecture.md section 2). Outside `filter_params`: it decides how an answer is read, not
+    /// what the vendor is asked. `None` for a provider that does not version its code.
+    pub extract_version: Option<Digest>,
 }
 
 impl Request {
@@ -206,6 +210,7 @@ mod tests {
             universe_version: FileDigest::of(universe_version),
             listed_date: None,
             hosts_version: None,
+            extract_version: None,
         }
     }
 
@@ -251,6 +256,23 @@ mod tests {
         };
         let digests =
             [None, Some(HOSTS), Some(A_LATER_HOSTS)].map(|hosts| with(hosts).filter_params().ok());
+        assert!(digests[0].is_some());
+        assert_eq!(
+            digests,
+            [digests[0].clone(), digests[0].clone(), digests[0].clone()]
+        );
+    }
+
+    /// Architecture.md section 2's `extract_version` row: how an answer is read, not what the
+    /// vendor is asked, so a code change does not make a new `filter_params`.
+    #[test]
+    fn requests_that_differ_only_in_extract_version_have_one_filter_params_digest() {
+        let with = |version: Option<&str>| Request {
+            extract_version: version.and_then(|text| canon::digest::doc_id(text).ok()),
+            ..request(ROSTER)
+        };
+        let digests =
+            [None, Some("a"), Some("b")].map(|version| with(version).filter_params().ok());
         assert!(digests[0].is_some());
         assert_eq!(
             digests,

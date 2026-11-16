@@ -580,6 +580,7 @@ pub(crate) mod tests {
             universe_version: FileDigest::of(ROSTER),
             listed_date: None,
             hosts_version: None,
+            extract_version: None,
         };
         let slot = AttemptSlot::open(store, &request, None, &run, 0, at(observed))?;
         let answer = RawResponse::new(

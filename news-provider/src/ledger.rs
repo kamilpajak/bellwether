@@ -71,6 +71,8 @@ pub enum AttemptEvent {
         universe_version: FileDigest,
         /// Read off the request for the same reason; never inside `filter_params`.
         hosts_version: Option<FileDigest>,
+        /// Read off the request for the same reason; never inside `filter_params`.
+        extract_version: Option<Digest>,
         /// The story a Document request fetches, named before the socket so a swept attempt still
         /// says what it was fetching; None for an index or robots request (section 11.1).
         story_id: Option<Digest>,
@@ -365,6 +367,7 @@ impl AttemptSlot {
             filter_params: request.filter_params()?,
             universe_version: request.universe_version.clone(),
             hosts_version: request.hosts_version.clone(),
+            extract_version: request.extract_version.clone(),
             story_id: story.cloned(),
             opened_at: at,
         })?;
@@ -573,6 +576,7 @@ pub(crate) mod tests {
             universe_version: FileDigest::of(ROSTER),
             listed_date: None,
             hosts_version: None,
+            extract_version: None,
             headers: vec![(
                 HeaderName::new("Accept"),
                 HeaderValue::Literal("text/plain".to_owned()),
