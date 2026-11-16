@@ -9,6 +9,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -103,9 +104,10 @@ const HTTP_DATE_FORMATS: [&str; 3] = [
     "%A, %d-%b-%y %H:%M:%S GMT",
     "%a %b %e %H:%M:%S %Y",
 ];
-/// The answers by which a server asks a client to slow down: 429 (RFC 6585 §4) and 503 (RFC 9110
-/// §15.6.4); not SEC's 403 or another 5xx (architecture.md section 10, server back-off).
-const SLOW_DOWN: [u16; 2] = [429, 503];
+/// 429 (RFC 6585 §4) and every 5xx, on which Google's crawlers slow down (owner, 2026-11-16);
+/// never SEC's 403 (architecture.md section 10, server back-off).
+const TOO_MANY_REQUESTS: u16 = 429;
+const SERVER_ERRORS: RangeInclusive<u16> = 500..=599;
 /// The last year `Pace::prior` reads back: a later instant is stamped `+YYYYY-…`, which RFC 3339
 /// cannot hold, so the host pace file it reaches is refused on every later run (row R19).
 const LAST_STAMPED_YEAR: i32 = 9999;
@@ -548,10 +550,10 @@ impl Wire {
         }
     }
 
-    /// A [`SLOW_DOWN`] answer holds its host until its `Retry-After`, or without a usable one
+    /// An answer [`asks_to_slow_down`] names holds its host until its `Retry-After`, or without a usable one
     /// doubles the host interval; either lasts for the rest of this `Wire`'s run (row R19).
     fn heed(&self, host: HostKey, status: Option<u16>, kept: &Headers, received: DateTime<Utc>) {
-        if !status.is_some_and(|status| SLOW_DOWN.contains(&status)) {
+        if !status.is_some_and(asks_to_slow_down) {
             return;
         }
         let mut held = self.backoff.borrow_mut();
@@ -641,6 +643,10 @@ fn read_up_to(body: impl Read, limit: u64) -> Result<Vec<u8>, Unread> {
     } else {
         Err(Unread::OverLimit(read))
     }
+}
+
+fn asks_to_slow_down(status: u16) -> bool {
+    status == TOO_MANY_REQUESTS || SERVER_ERRORS.contains(&status)
 }
 
 /// RFC 9110 §10.2.3: the instant a `Retry-After` names, never before `received`. `None` when absent,
@@ -1935,6 +1941,12 @@ mod tests {
     const FORBIDDEN_WITH_RETRY_AFTER: &str = "403 Forbidden\r\nRetry-After: 120";
     const OVER_THE_LIMIT_WITH_RETRY_AFTER: &str = "503 Service Unavailable\r\nRetry-After: 120";
     const SERVER_ERROR_WITH_RETRY_AFTER: &str = "500 Internal Server Error\r\nRetry-After: 120";
+    const SERVER_ERRORS_BARE: [&str; 3] = [
+        "500 Internal Server Error",
+        "502 Bad Gateway",
+        "599 Network Connect Timeout",
+    ];
+    const NEIGHBOURS_OF_5XX: [&str; 2] = ["499 Client Closed Request", "600 Unassigned"];
     /// The send to another host 60 ms after the answer owes only the per-IP pace, `EXPECTED_WAIT`,
     /// so the next send to the answering host leaves 100 ms after it, and each wait below is less
     /// those 100 ms: 120 s; 13:05:00; the 1 s interval; doubled once, 2 s; doubled twice, 4 s.
@@ -2016,12 +2028,38 @@ mod tests {
         Ok(())
     }
 
-    /// Only 429 and 503 ask for less: a 500 carrying a `Retry-After` leaves the pace alone.
+    /// Recommendation #3 (2026-11-16): every 5xx slows its host, as Google's crawlers slow on
+    /// "5xx and 429"; a 500's `Retry-After` holds the host as a 503's does.
     #[test]
-    fn a_500_is_no_slow_down_answer_even_with_a_retry_after() -> Checked {
+    fn a_500_with_a_retry_after_holds_that_host_until_then() -> Checked {
         assert_eq!(
             waits_after(&[SERVER_ERROR_WITH_RETRY_AFTER])?,
-            one_answer_then(HOST_WAIT_LATER)
+            one_answer_then(WAIT_OUT_120_S)
+        );
+        Ok(())
+    }
+
+    /// Both ends of 500..=599 double the interval with no `Retry-After`; 499 and 600 do not.
+    #[test]
+    fn every_5xx_without_retry_after_doubles_the_host_interval() -> Checked {
+        let mut waits = Vec::new();
+        for head in SERVER_ERRORS_BARE {
+            waits.push(waits_after(&[head])?);
+        }
+        for head in NEIGHBOURS_OF_5XX {
+            waits.push(waits_after(&[head])?);
+        }
+        let doubled = one_answer_then(DOUBLED_ONCE_LATER);
+        let unchanged = one_answer_then(HOST_WAIT_LATER);
+        assert_eq!(
+            waits,
+            [
+                doubled.clone(),
+                doubled.clone(),
+                doubled,
+                unchanged.clone(),
+                unchanged
+            ]
         );
         Ok(())
     }
