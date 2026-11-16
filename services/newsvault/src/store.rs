@@ -3481,9 +3481,9 @@ mod tests {
     }
 
     /// One home for a robots body (section 3.2): a row from before user_version 6 is read through
-    /// `robots.blob`, a newer one through its `payloads` row, and a present row naming neither is a
-    /// named error. Mutations 2026-11-16, `ROBOTS_BODY` read as `r.blob` alone: red (the newer
-    /// host); as `p.raw_blob` alone: red (the older host).
+    /// `robots.blob`, a newer one, whose `robots.blob` is NULL, through its `payloads` row, and a
+    /// present row naming neither is a named error. Mutations 2026-11-16, `ROBOTS_BODY` read as
+    /// `r.blob` alone: red (the newer host); as `p.raw_blob` alone: red (the older host).
     #[test]
     fn a_robots_body_is_read_from_robots_blob_before_user_version_six_and_from_payloads_after(
     ) -> TestResult {
@@ -3511,6 +3511,12 @@ mod tests {
                                        ('an unlinked attempt', 'unlinked.example', 'present', NULL);",
             older.hex()
         ))?;
+        let newer_row_blob: Option<String> = store.db.query_row(
+            "SELECT blob FROM robots WHERE host = ?1",
+            params![ROBOTS_HOST],
+            |row| row.get(0),
+        )?;
+        assert_eq!(newer_row_blob, None);
         drop(store);
         let ledger = RobotsLedger::open(temp.path())?;
         let unlinked = ledger.newest_robots("unlinked.example");
