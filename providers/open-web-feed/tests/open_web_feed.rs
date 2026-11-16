@@ -122,6 +122,9 @@ const PRN_LINE_BREAK_PAGE: &str = "synthetic_heading_line_break.html";
 const PRN_LISTS_PAGE: &str = "synthetic_lists.html";
 const PRN_ADDRESSES_PAGE: &str = "synthetic_addresses.html";
 const PRN_TABLES_PAGE: &str = "synthetic_tables.html";
+/// Release 302939742 (2026-11-16 09:42Z fetch) cut to its lead, two of its four gallery figures
+/// and one later paragraph; the two figures naming a person were left out.
+const PRN_FIGURE_PAGE: &str = "article_302939742.html";
 const GNW_ONE_PATH_PAGE: &str = "synthetic_lists_tables_and_addresses.html";
 /// Section 11.1's P5: every page below, its committed body digest, and the extraction version
 /// that produced them. Rewritten by hand when an extraction change is meant.
@@ -133,13 +136,14 @@ const GOLDEN_GNW_PAGES: [&str; 5] = [
     PROSE_PAGE,
     GNW_ONE_PATH_PAGE,
 ];
-const GOLDEN_PRN_PAGES: [&str; 6] = [
+const GOLDEN_PRN_PAGES: [&str; 7] = [
     PRN_ARTICLE,
     PRN_SECOND_ARTICLE,
     PRN_LINE_BREAK_PAGE,
     PRN_LISTS_PAGE,
     PRN_ADDRESSES_PAGE,
     PRN_TABLES_PAGE,
+    PRN_FIGURE_PAGE,
 ];
 const PRN_OFF_PREFIX_URL: &str =
     "https://www.prnewswire.com/apac/news-releases/a-release-off-the-prefix-302999998.html";
@@ -1800,8 +1804,8 @@ fn a_table_is_read_one_line_per_row_and_a_nested_table_inside_its_outer_cell() -
     Ok(())
 }
 
-/// P6 (section 11.1): GNW reads lists, tables and addresses through PRN's path; only the
-/// container differs.
+/// P6 (section 11.1): GNW reads lists, tables, addresses and a `figcaption` through PRN's path;
+/// only the container differs.
 #[test]
 fn a_globenewswire_page_reads_lists_tables_and_addresses_through_the_same_path() -> Outcome {
     let provider = provider()?;
@@ -1809,8 +1813,31 @@ fn a_globenewswire_page_reads_lists_tables_and_addresses_through_the_same_path()
     let item = only_item(&provider.extract(&article_request(&provider)?, &page))?;
     assert_eq!(
         item.body.map(|body| body.text).as_deref(),
-        Some("Opening paragraph.\nPoint one\nPoint two\nContact | or")
+        Some("Opening paragraph.\nPoint one\nPoint two\nContact | or\nA caption on GNW")
     );
+    Ok(())
+}
+
+/// `figcaption` is a paragraph on both hosts (§11.1): each caption is one line in document order,
+/// between the lead and the paragraph after the gallery; the `Continue Reading` link is not read.
+#[test]
+fn a_figure_caption_is_one_line_in_document_order_on_a_pr_newswire_page() -> Outcome {
+    let body = prn_body(PRN_FIGURE_PAGE)?;
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(
+        (lines.len(), lines.get(2..4)),
+        (
+            5,
+            Some(&["Stark Future HQ - Barcelona", "Stark VARG SM_Lineup"][..])
+        ),
+        "{body}"
+    );
+    assert!(
+        lines[1].starts_with("BARCELONA, Spain, Nov. 16, 2026"),
+        "{body}"
+    );
+    assert!(lines[4].starts_with("Founded in 2020"), "{body}");
+    assert!(!body.contains("Continue Reading"), "{body}");
     Ok(())
 }
 
