@@ -118,11 +118,19 @@ const PRN_SECOND_ARTICLE_URL: &str = "https://www.prnewswire.com/news-releases/l
 const PRN_SECOND_ARTICLE_TITLE: &str = "Lilly to present new data across Zepbound, Foundayo, EloraTZP and retatrutide at ObesityWeek 2026, moving obesity care beyond the scale";
 const PRN_NO_RELEASE_BODY_PAGE: &str = "synthetic_no_release_body.html";
 const PRN_LINE_BREAK_PAGE: &str = "synthetic_heading_line_break.html";
+const PRN_OFF_PREFIX_URL: &str =
+    "https://www.prnewswire.com/apac/news-releases/a-release-off-the-prefix-302999998.html";
 const PRN_ARTICLE_OPENS: &str =
     "PLAINSBORO, N.J. and BAGSVÆRD, Denmark, Nov. 14, 2026 /PRNewswire/ -- Today, Novo Nordisk";
 /// Text the trimmed page holds outside `section.release-body`: the dateline `<p>`, the share
-/// `<p>`, and the ld+json `<script>`. `<article>` holds the first two.
-const PRN_OUTSIDE_THE_SECTION: [&str; 3] = ["12:15 ET", "Share this article", "NewsArticle"];
+/// `<p>`, the ld+json `<script>`, and a `<p>` of `section.nav-main`, one of the 4 other
+/// `<section>` elements of the untrimmed page. `<article>` holds the first two.
+const PRN_OUTSIDE_THE_SECTION: [&str; 4] = [
+    "12:15 ET",
+    "Share this article",
+    "NewsArticle",
+    "Searching for your content",
+];
 const FIRST_ATTEMPT: u32 = 0;
 const OK: u16 = 200;
 const REQUEST_TIMEOUT: u16 = 408;
@@ -1122,6 +1130,34 @@ fn the_real_pr_newswire_index_yields_one_follow_up_per_release_with_its_raw_pub_
     Ok(())
 }
 
+/// The 40 real links of 2026-11-14 and 2026-11-16 are all under `/news-releases/`, so only a
+/// synthetic link tests the prefix from the wide side. Mutation 2026-11-16, the prefix `/`: red.
+#[test]
+fn a_pr_newswire_link_outside_news_releases_is_filtered_out_and_counted() -> Outcome {
+    let provider = provider()?;
+    let item = |link: &str| {
+        format!(
+            "<item><link>{link}</link><pubDate>Sat, 14 Nov 2026 17:15:00 +0000</pubDate></item>"
+        )
+    };
+    let index = format!(
+        "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel>{}{}</channel></rss>",
+        item(PRN_ARTICLE_URL),
+        item(PRN_OFF_PREFIX_URL),
+    );
+    let extracted = provider.extract(&prn_index_request(&provider)?, &blob(index.into_bytes()));
+    let kept: Vec<&str> = extracted
+        .follow_ups
+        .iter()
+        .map(|request| request.url.as_str())
+        .collect();
+    assert_eq!(
+        (extracted.vendor_rows, kept, extracted.filtered_out),
+        (2, vec![PRN_ARTICLE_URL], 1)
+    );
+    Ok(())
+}
+
 /// Section 11.1: every observed PRN item `pubDate` ends `:00 +0000` (40 of 40, feeds of
 /// 2026-11-14 and 2026-11-16) while the channel `pubDate` carries real seconds, so the item value
 /// is a minute. Mutations 2026-11-16: `%S` for `:00`, the loader's seconds check dropped and
@@ -1166,7 +1202,7 @@ fn a_pr_newswire_pubdate_is_a_minute_and_never_an_instant() -> Outcome {
 
 /// §8 row R17 for PR Newswire: `<p>` text inside `section.release-body`. `<article>` would add
 /// the dateline and the share line (2 of 42 `<p>` on the untrimmed page, 2026-11-14 probe).
-/// Mutations 2026-11-16, the container `body` and the container `article`: each red.
+/// Mutations 2026-11-16, the container `body`, `article` and `section`: each red.
 #[test]
 fn the_extracted_body_is_article_text_and_never_page_html_on_a_pr_newswire_page() -> Outcome {
     let provider = provider()?;
