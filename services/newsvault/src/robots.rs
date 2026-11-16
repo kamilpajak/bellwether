@@ -1,8 +1,10 @@
 //! The robots.txt subset `collect` reads from a pinned body (architecture.md section 11.2): the
 //! `user-agent: *` groups, merged, their `Allow`/`Disallow` rules and their `Crawl-delay`. A group
 //! naming our own product token is never read: the token is `BELLWETHER_FEED_CONTACT`'s, not code's.
-//! Percent-encoding is not normalised, so `/a%2Fb` and `/a/b` are two paths here. Lines and keys
-//! are read as Google's robots.cc (github.com/google/robotstxt, 50a0dac) reads them.
+//! Percent-encoding is not normalised, so `/a%2Fb` and `/a/b` are two paths here. Key spellings,
+//! the colon-less split, `*` and whitespace are read as Google's robots.cc
+//! (github.com/google/robotstxt, 50a0dac) reads them; the differences kept are in architecture.md
+//! section 10, row "key and line spellings".
 
 use std::time::Duration;
 
@@ -506,7 +508,7 @@ mod tests {
     }
 
     /// Owner decision 3a: an empty or comment-only 200 is no rules, every path allowed, no delay.
-    /// Mutation 2026-11-16, the empty arm made `NoUserAgentLine`: red.
+    /// Mutation 2026-11-16, the empty arm made `NoRulesNoGroup`: red.
     #[test]
     fn an_empty_or_comment_only_body_reads_as_no_rules() -> TestResult {
         for body in [
@@ -704,11 +706,39 @@ mod tests {
             b"User-agent * bot\nDisallow: /x\n",
             b"User-agent: * and more\nDisallow: /x\n",
             b"User-agent: *bot\nDisallow: /x\n",
+            b"User-agent: *\tbot\nDisallow: /x\n",
+            b"User-agent: *\x0bbot\nDisallow: /x\n",
         ]
         .iter()
         .map(|body| Robots::parse(body).map(|robots| robots.allows("/x")))
         .collect::<Vec<_>>();
-        assert_eq!(read, [Ok(false), Ok(false), Ok(true), Ok(false), Ok(true)]);
+        assert_eq!(
+            read,
+            [
+                Ok(false),
+                Ok(false),
+                Ok(true),
+                Ok(false),
+                Ok(true),
+                Ok(false),
+                Ok(false)
+            ]
+        );
+        Ok(())
+    }
+
+    /// robots.cc 50a0dac line 296 strips absl's ASCII whitespace, vertical tab included, and no
+    /// other: a trailing VT leaves `/x`, and `*` with a no-break space is no `*`.
+    #[test]
+    fn only_ascii_whitespace_is_stripped() -> TestResult {
+        let read = [
+            &b"User-agent: *\nDisallow: /x\x0b\n"[..],
+            "User-agent: *\u{a0}\nDisallow: /x\n".as_bytes(),
+        ]
+        .iter()
+        .map(|body| Robots::parse(body).map(|robots| robots.allows("/x")))
+        .collect::<Vec<_>>();
+        assert_eq!(read, [Ok(false), Ok(true)]);
         Ok(())
     }
 

@@ -651,6 +651,18 @@ fn a_refresh_writes_its_report_on_stdout_for_exits_zero_one_and_eight_only() -> 
     Ok(())
 }
 
+/// Major 2 since recommendation #2 removed `refused_no_user_agent`, a value major 1 released
+/// (architecture.md section 10, `parse_verdict` row).
+#[test]
+fn a_refresh_report_is_robots_schema_major_two() -> TestResult {
+    let root = TempDir::new()?;
+    let body = gnw_body()?;
+    let exchange = Robots::of(&[(GNW_ROBOTS, OK, body.as_slice())]);
+    let answer = refreshed(root.path(), gnw_hosts(), &exchange)?;
+    assert_eq!(answer.report["schema"], "newsvault.robots/2");
+    Ok(())
+}
+
 /// The binary's failures before any fetch: a source with no hosts file is a `usage error:` exiting
 /// 2, an absent hosts file exits 4, stdout empty in both, and each exit is one the schema lists.
 /// Mutations 2026-11-15, `NoHostsFile` not a usage error / `robots refresh`'s absent-input arm in
