@@ -15,7 +15,8 @@ use news_provider::lag_policy::{LagPolicy, LagPolicyError};
 use news_provider::provider::{Cadence, Calendar, CalendarError, Listing, PlanRefusal, Provenance};
 use news_provider::{
     stamp_of, Archive, ArchiveError, AttemptReceipt, Clock, CollectError, Collected, CollectedItem,
-    Committed, Credentials, Exchange, Exit, Provider, Run, RunId, SourceId, TargetWindow, Wire,
+    Committed, Credentials, Exchange, Exit, Payload, Provider, Run, RunId, SourceId, TargetWindow,
+    Wire,
 };
 use open_web_feed::{OpenWebFeed, RobotsPin};
 use pit::{MeasuredLag, ObservationTime};
@@ -1056,16 +1057,17 @@ impl Archive for Committer {
         &mut self,
         closed: AttemptReceipt,
         items: &[CollectedItem],
-        raw_blob: Option<&str>,
+        payload: Option<&Payload>,
         observed: ObservationTime,
     ) -> Result<Committed, ArchiveError> {
+        let raw_blob = payload.map(|payload| payload.raw_blob.as_str());
         let rows = self
             .rows_of(items, raw_blob, observed)
             .map_err(|why| refused("build an item row", &why))?;
         // The attempt's own close instant, so the row's `committed_at` is not a third clock.
         let at = closed.closed_at();
-        let receipt =
-            Committer::record(self, closed, &rows, at).map_err(|why| refused("commit", &why))?;
+        let receipt = Committer::record(self, closed, payload, &rows, at)
+            .map_err(|why| refused("commit", &why))?;
         Ok(Committed {
             items_committed: receipt.items_committed,
             blobs_indexed: receipt.blobs_indexed,
@@ -1377,7 +1379,7 @@ mod tests {
             &Baseline::from_trailing_ok(&[1]),
         );
         let closed = slot.close(&mut store, outcome, &Ok(answer), at)?;
-        store.record(closed, &rows, at)?;
+        store.record(closed, None, &rows, at)?;
         drop(store);
         let db = Connection::open(temp.path().join(COMMIT_LOG))?;
         let stored: (String, String, String) = db.query_row(

@@ -11,15 +11,15 @@ use std::time::Duration;
 use chrono::{DateTime, TimeDelta, Utc};
 use news_provider::{
     Archive, ArchiveError, AttemptEvent, AttemptReceipt, Clock, CollectedItem, Committed, Exchange,
-    Exit, LedgerError, PlanRefusal, RawResponse, Request, RunId, SendFailure, SendPermit, Sink,
-    SourceId, TargetWindow, TransportError,
+    Exit, Headers, LedgerError, PlanRefusal, RawResponse, Request, RunId, SendFailure, SendPermit,
+    Sink, SourceId, TargetWindow, TransportError,
 };
 use newsvault::cmd_collect::{self, Ask, CollectRunError};
 use newsvault::cmd_items::{self, PerStory};
 use newsvault::store::{Committer, StoreError, COMMIT_LOG, SCHEMA_VERSION};
 use open_web_feed::OpenWebFeed;
 use pit::ObservationTime;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -50,6 +50,14 @@ const FORBIDDEN: u16 = 403;
 const UNAVAILABLE: u16 = 503;
 const REQUEST_TIMEOUT: u16 = 408;
 const MOVED_PERMANENTLY: u16 = 301;
+/// The one header `Gnw` answers a page with, as P9 keeps it (section 3.9).
+const CONTENT_TYPE: &str = "content-type";
+const PAGE_TYPE: &str = "text/html; charset=utf-8";
+/// The loopback 301's body, `MOVED_BODY` in `tests/loopback/mod.rs`, and its length.
+const MOVED_BODY: &[u8] = b"moved";
+const MOVED_BODY_BYTES: i64 = 5;
+/// open-web's `BODY_LIMIT` (2 MiB, `providers/open-web-feed/src/lib.rs`), private to that crate.
+const OPEN_WEB_BODY_LIMIT: i64 = 2 * 1_024 * 1_024;
 /// Two robots fetches before `RUN_AT`, the second the newer.
 const ROBOTS_EARLIER: &str = "2026-11-14T17:00:00Z";
 const ROBOTS_LATER: &str = "2026-11-14T18:00:00Z";
@@ -231,7 +239,11 @@ impl Exchange for Gnw {
             }
         }
         match self.pages.get(&request.url) {
-            Some(body) => Ok(RawResponse::new(attempt, OK, body.clone(), sent, received)),
+            Some(body) => Ok(RawResponse::new(attempt, OK, body.clone(), sent, received)
+                .with_headers(Headers::new(vec![(
+                    CONTENT_TYPE.to_owned(),
+                    PAGE_TYPE.to_owned(),
+                )]))),
             None => Err(SendFailure::Transport(TransportError::new(
                 attempt,
                 at,
@@ -419,6 +431,91 @@ fn an_open_web_run_collects_a_globenewswire_day_end_to_end() -> TestResult {
             visible(root.path(), AFTER_THE_MINUTE_CLOSED)?
         ),
         (1, 2)
+    );
+    Ok(())
+}
+
+/// Every blob file under `<store>/blobs/sha256`, by the hex it is named by.
+fn blob_files(store: &Path) -> Result<std::collections::BTreeSet<String>, Box<dyn Error>> {
+    let mut names = std::collections::BTreeSet::new();
+    for first in std::fs::read_dir(store.join("blobs/sha256"))? {
+        for second in std::fs::read_dir(first?.path())? {
+            for file in std::fs::read_dir(second?.path())? {
+                names.insert(file?.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// `(url, phase, listed_date is set, truncated, headers)` of each collect attempt's link row,
+/// `None` where the attempt has none.
+type Linked = (String, Option<(String, bool, bool, String)>);
+
+/// P10 (section 3.9): every body a run and its robots seed stored is indexed by a `blobs` row, and
+/// each answered attempt names its body: the index, the unusable page and a 403 page, which no
+/// item row names. Mutations 2026-11-16, `link` a no-op, and `blobs_of` dropping the payload: red.
+#[test]
+fn every_body_an_open_web_run_stores_is_indexed_and_linked_to_its_attempt() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let ask = ask(root.path(), cmd_collect::TODAY);
+    let opened = cmd_collect::open_provider(&ask)?;
+    let forbidden = release_url(1)?;
+    let exchange = Gnw::day()?.answering(&forbidden, &[FORBIDDEN]);
+    cmd_collect::run(&ask, &opened, &exchange, &Fixed)?;
+    let db = Connection::open_with_flags(
+        root.path().join(COMMIT_LOG),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let indexed: std::collections::BTreeSet<String> = db
+        .prepare("SELECT digest FROM blobs")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    let linked: Vec<Linked> = db
+        .prepare(
+            "SELECT p.url, p.phase, p.listed_date IS NOT NULL, p.truncated, p.headers
+               FROM attempts a LEFT JOIN payloads p ON p.attempt_id = a.attempt_id
+              WHERE a.source = ?1 ORDER BY a.opened_at, a.attempt_id",
+        )?
+        .query_map([SOURCE], |row| {
+            let url: Option<String> = row.get(0)?;
+            Ok((
+                url.clone().unwrap_or_default(),
+                match url {
+                    Some(_) => Some((row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                    None => None,
+                },
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    let page = format!("[[\"{CONTENT_TYPE}\",\"{PAGE_TYPE}\"]]");
+    let document = |url: String, headers: &str| -> Linked {
+        (
+            url,
+            Some(("document".to_owned(), true, false, headers.to_owned())),
+        )
+    };
+    let mut expected = vec![(
+        INDEX.to_owned(),
+        Some(("index".to_owned(), false, false, page.clone())),
+    )];
+    for release in 0..RELEASES.len() {
+        let url = release_url(release)?;
+        let headers = if url == forbidden {
+            "[]"
+        } else {
+            page.as_str()
+        };
+        expected.push(document(url, headers));
+    }
+    let mut linked_sorted = linked.clone();
+    linked_sorted.sort();
+    expected.sort();
+    assert_eq!(
+        (blob_files(root.path())?, linked_sorted),
+        (indexed, expected),
+        "{linked:?}"
     );
     Ok(())
 }
@@ -1341,6 +1438,8 @@ struct TwoPolls {
     first_attempt: (Option<i64>, String),
     reported: Vec<Option<i64>>,
     exits: (Exit, Exit),
+    /// Release 0's first link row: truncated, the blob's stored bytes, and its digest.
+    first_payload: Option<LinkedBlob>,
 }
 
 /// The 301's body: the loopback server's own short one, or one byte over the profile's limit.
@@ -1391,7 +1490,28 @@ fn polled_twice_through_a_redirect(moved_body: MovedBody) -> Result<TwoPolls, Bo
         first_attempt: first_attempt_of(root.path(), 0)?,
         reported,
         exits: (first_answer.exit, second_exit),
+        first_payload: first_payload_of(root.path(), 0)?,
     })
+}
+
+/// A link row: truncated, the stored blob's bytes, and its digest.
+type LinkedBlob = (bool, i64, String);
+
+/// A release's first link row.
+fn first_payload_of(root: &Path, release: usize) -> Result<Option<LinkedBlob>, Box<dyn Error>> {
+    let db = Connection::open_with_flags(root.join(COMMIT_LOG), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let (key, _, _, _) = RELEASES.get(release).ok_or("no such release")?;
+    let story = digest(canon::digest::story_id(SOURCE, key)).ok_or("story id")?;
+    Ok(db
+        .query_row(
+            "SELECT p.truncated, b.bytes, p.raw_blob FROM attempts a
+               JOIN payloads p ON p.attempt_id = a.attempt_id
+               JOIN blobs b ON b.digest = p.raw_blob
+              WHERE a.story_id = ?1 ORDER BY a.opened_at, a.attempt_id LIMIT 1",
+            [&story],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?)
 }
 
 /// Release 0's path as the loopback server sees it.
@@ -1411,6 +1531,14 @@ fn release_0_path() -> Result<String, Box<dyn Error>> {
 fn a_document_answered_with_a_redirect_is_fetched_again_by_the_next_poll() -> TestResult {
     let polled = polled_twice_through_a_redirect(MovedBody::Short)?;
     let moved = release_0_path()?;
+    assert_eq!(
+        polled.first_payload,
+        Some((
+            false,
+            MOVED_BODY_BYTES,
+            canon::FileDigest::of(MOVED_BODY).hex().to_owned()
+        ))
+    );
     assert_eq!(
         (
             polled.first_times,
@@ -1437,11 +1565,21 @@ fn a_document_answered_with_a_redirect_is_fetched_again_by_the_next_poll() -> Te
 
 /// A 301 whose body is over open-web's `BODY_LIMIT` fails as `BodyOverLimit`, and the failure keeps
 /// the 301, so it is not held either (section 11.1). Before 2026-11-15 its status was NULL and the
-/// story was held for good.
+/// story was held for good. Its body is stored cut at the limit and linked `truncated` (P10,
+/// section 3.9), and the verdict stays `permanent_failure`.
 #[test]
 fn a_redirect_whose_body_is_over_the_limit_is_fetched_again_by_the_next_poll() -> TestResult {
     let polled = polled_twice_through_a_redirect(MovedBody::OverTheLimit)?;
     let moved = release_0_path()?;
+    let limit = usize::try_from(OPEN_WEB_BODY_LIMIT)?;
+    assert_eq!(
+        polled.first_payload,
+        Some((
+            true,
+            OPEN_WEB_BODY_LIMIT,
+            canon::FileDigest::of(&vec![b'x'; limit]).hex().to_owned()
+        ))
+    );
     assert_eq!(
         (
             polled.first_times,
@@ -1655,7 +1793,7 @@ impl Archive for RefusingTheIndex {
         &mut self,
         closed: AttemptReceipt,
         items: &[CollectedItem],
-        raw_blob: Option<&str>,
+        payload: Option<&news_provider::Payload>,
         observed: ObservationTime,
     ) -> Result<Committed, ArchiveError> {
         if self.commits.replace_with(|nth| *nth + 1) == 0 {
@@ -1664,7 +1802,7 @@ impl Archive for RefusingTheIndex {
                 detail: "refused the index".to_owned(),
             });
         }
-        Archive::commit(&mut self.store, closed, items, raw_blob, observed)
+        Archive::commit(&mut self.store, closed, items, payload, observed)
     }
 
     fn ok_vendor_rows(&self, source: &SourceId) -> Result<Vec<u32>, ArchiveError> {

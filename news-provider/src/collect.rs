@@ -17,7 +17,7 @@ use crate::ledger::{
 };
 use crate::provider::{CollectedItem, DecidedBy, Plan, Provenance, Provider, RawBlob};
 use crate::request::{Request, RequestPhase, RunId, SourceId, TargetWindow};
-use crate::wire::{RawResponse, SendFailure, Wire};
+use crate::wire::{Headers, RawResponse, SendFailure, TransportError, Wire};
 use crate::{Calendar, Listing, PlanRefusal};
 
 /// One vendor conversation. Behind a trait because the driver is the thing under test and a test
@@ -67,19 +67,33 @@ pub struct Committed {
     pub changed: bool,
 }
 
+/// P10's link row (architecture.md section 3.9): one per attempt that got an HTTP answer, an `Ok`
+/// response or a body cut at `body_limit`, naming the payload as received and what asked for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Payload {
+    /// The digest [`Archive::put_blob`] returned for the body, cut or whole.
+    pub raw_blob: String,
+    pub url: String,
+    pub phase: RequestPhase,
+    pub listed_date: Option<String>,
+    pub headers: Headers,
+    /// True when the body was over `body_limit` and `raw_blob` holds its first `body_limit` bytes.
+    pub truncated: bool,
+}
+
 /// The store side of the driver, in the terms this crate can name: a `CollectedItem` is a
 /// provider's row and the archive's own row type is the archive's business.
 pub trait Archive: Sink {
     /// Stores a payload under its own digest, BEFORE anything parses it (architecture.md section 3.1, `raw_blob_ref`).
     fn put_blob(&self, payload: &[u8]) -> Result<String, ArchiveError>;
 
-    /// The one door. `raw_blob` is absent exactly when the attempt brought nothing back, which is
-    /// also when `items` is empty.
+    /// The one door. `payload` is absent exactly when the attempt brought no body back, which
+    /// is also when `items` is empty; its `raw_blob` is every item's raw blob.
     fn commit(
         &mut self,
         closed: AttemptReceipt,
         items: &[CollectedItem],
-        raw_blob: Option<&str>,
+        payload: Option<&Payload>,
         observed: ObservationTime,
     ) -> Result<Committed, ArchiveError>;
 
@@ -509,18 +523,15 @@ fn attempt_once<A: Archive>(
         Err(SendFailure::Budget(why)) => return Err(CollectError::Budget(why)),
     };
     let verdict = provider.classify(request, &answer);
-    let stored = match &answer {
-        Ok(response) => Some(archive.put_blob(response.body())?),
-        Err(_) => None,
-    };
-    // Extraction only reads a payload the provider called usable, so a vendor's own error page is
-    // stored as evidence and never parsed into a row count.
+    let payload = Payload::stored(request, &answer, |body| archive.put_blob(body))?;
+    // Extraction only reads a payload the provider called usable, so a vendor's own error page and
+    // a cut body are stored as evidence and never parsed into a row count.
     let usable = matches!(verdict, Verdict::Usable);
-    let extracted = match (&answer, &stored) {
-        (Ok(response), Some(digest)) if usable => Some(provider.extract(
+    let extracted = match (&answer, &payload) {
+        (Ok(response), Some(stored)) if usable => Some(provider.extract(
             request,
             &RawBlob {
-                digest: digest.clone(),
+                digest: stored.raw_blob.clone(),
                 bytes: response.body().to_vec(),
             },
         )),
@@ -554,7 +565,7 @@ fn attempt_once<A: Archive>(
     };
     let no_items: Vec<CollectedItem> = Vec::new();
     let items = extracted.as_ref().map_or(&no_items, |one| &one.items);
-    let filed = archive.commit(closed, items, stored.as_deref(), observed);
+    let filed = archive.commit(closed, items, payload.as_ref(), observed);
     let (committed, refusal) = match filed {
         Ok(committed) => (committed, None),
         Err(refused) => (Committed::default(), Some(refused.detail)),
@@ -605,11 +616,40 @@ fn attempt_once<A: Archive>(
         permanent: matches!(verdict, Verdict::PermanentFailure),
         bytes_written: match &answer {
             Ok(response) => u64::try_from(response.body().len()).unwrap_or(u64::MAX),
-            Err(_) => 0,
+            Err(failed) => failed
+                .cut_body()
+                .map_or(0, |cut| u64::try_from(cut.len()).unwrap_or(u64::MAX)),
         },
-        blob_written: stored.is_some(),
+        blob_written: payload.is_some(),
         committed,
     })
+}
+
+impl Payload {
+    /// Hands `put` the body an answer carried, whole or cut at the limit, BEFORE anything parses
+    /// it, and names the digest `put` returns. `None`, and no `put`, for an answer with no body.
+    /// The one rule for `collect` and `newsvault robots refresh` alike.
+    pub fn stored<E>(
+        request: &Request,
+        answer: &Result<RawResponse, TransportError>,
+        put: impl FnOnce(&[u8]) -> Result<String, E>,
+    ) -> Result<Option<Self>, E> {
+        let (body, headers, truncated) = match answer {
+            Ok(response) => (response.body(), response.headers(), false),
+            Err(failed) => match failed.cut_body() {
+                Some(cut) => (cut, failed.headers(), true),
+                None => return Ok(None),
+            },
+        };
+        Ok(Some(Self {
+            raw_blob: put(body)?,
+            url: request.url.clone(),
+            phase: request.phase,
+            listed_date: request.listed_date.clone(),
+            headers: headers.clone(),
+            truncated,
+        }))
+    }
 }
 
 /// Closes every attempt no process can answer for any more, which is [`OutcomeKind::Interrupted`]'s

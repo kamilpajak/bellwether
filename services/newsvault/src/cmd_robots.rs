@@ -10,7 +10,7 @@ use canon::FileDigest;
 use chrono::{DateTime, Utc};
 use news_provider::{
     AttemptSlot, Baseline, BudgetError, Clock, Counts, Credentials, Exchange, Exit, LedgerError,
-    Outcome, OutcomeKind, Provenance, Provider, RawResponse, Request, RequestPhase, RunId,
+    Outcome, OutcomeKind, Payload, Provenance, Provider, RawResponse, Request, RequestPhase, RunId,
     SendFailure, SourceId, Tally, TargetWindow, TransportError, TransportKind, Verdict, Wire,
 };
 use open_web_feed::{HostPin, OpenWebFeed};
@@ -288,11 +288,15 @@ fn fetch(
         Err(SendFailure::Budget(why)) => return Err(RobotsError::Budget(why)),
     };
     let verdict = verdict_of(&answer);
-    let robots = match (&answer, verdict) {
-        (Ok(response), Verdict::Usable) => {
-            Some(RobotsAnswer::Present(store.put_blob(response.body())?))
+    // Every body is stored and linked, a 403 page and a cut body included (P10, section 3.9).
+    let payload = Payload::stored(request, &answer, |body| {
+        store.put_blob(body).map(|digest| digest.hex().to_owned())
+    })?;
+    let robots = match (&payload, verdict) {
+        (Some(stored), Verdict::Usable) => {
+            Some(RobotsAnswer::Present(store.blob_named(&stored.raw_blob)?))
         }
-        (Ok(_), Verdict::Empty) => Some(RobotsAnswer::Absent),
+        (Some(_), Verdict::Empty) => Some(RobotsAnswer::Absent),
         _ => None,
     };
     let outcome = Outcome::decide(
@@ -306,9 +310,11 @@ fn fetch(
     let kind = outcome.kind();
     let closed = slot.close(store, outcome, &answer, ObservationTime::new(clock.now()))?;
     let at = closed.closed_at();
-    match &robots {
-        Some(answered) => store.record_robots(closed, &row.host, answered, at)?,
-        None => store.record(closed, &[], at)?,
+    match (&robots, &payload) {
+        (Some(answered), Some(stored)) => {
+            store.record_robots(closed, &row.host, answered, stored, at)?
+        }
+        (_, stored) => store.record(closed, stored.as_ref(), &[], at)?,
     };
     Ok(Fetched {
         attempt_id: Some(attempt_id),
