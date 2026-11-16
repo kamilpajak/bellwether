@@ -133,8 +133,9 @@ pub struct SourceRow {
     /// `payloads.truncated`. 0 for an attempt closed before user_version 6, which stored no
     /// over-limit body, so 0 there does not mean none was over.
     pub bodies_truncated: i64,
-    /// Section 8 row R15, decision 10: held stories a live index listed under another minute than
-    /// their stored item's, from `relisted`. 0 for an attempt closed before user_version 7.
+    /// Section 8 row R15, decision 10: `relisted` rows, one per live index attempt and held story
+    /// listed under another minute than its kept item's, so k polls count k. 0 also before
+    /// user_version 7 and for a listing R15 does not compare, so 0 does not mean no dispute.
     pub relisted_disputed: i64,
     pub items_new: i64,
     pub rows_committed: i64,

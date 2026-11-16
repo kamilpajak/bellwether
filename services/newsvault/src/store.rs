@@ -2001,9 +2001,10 @@ mod tests {
     const VALID_AT_PAST_THE_SECOND: i64 = VALID_AT + 123_456;
     /// A date with no hour, which is what a filing carrying no acceptance instant publishes at.
     const A_PUBLICATION_DAY: &str = "2026-11-10";
-    /// 00:02 and 00:03 UTC on 1970-01-01, whole minutes on the same clock as `VALID_AT`.
+    /// 00:02, 00:03 and 00:01 UTC on 1970-01-01, whole minutes on the same clock as `VALID_AT`.
     const A_PUBLICATION_MINUTE: i64 = 120 * SECOND;
     const A_LATER_PUBLICATION_MINUTE: i64 = 180 * SECOND;
+    const AN_EARLIER_PUBLICATION_MINUTE: i64 = 60 * SECOND;
     /// Inside `A_PUBLICATION_MINUTE`, its last microsecond, and the instant it closes.
     const INSIDE_THAT_MINUTE: &str = "1970-01-01T00:02:30.000000Z";
     const ONE_MICROSECOND_BEFORE_THAT_MINUTE_CLOSES: &str = "1970-01-01T00:02:59.999999Z";
@@ -3725,6 +3726,84 @@ mod tests {
                 stamped(A_PUBLICATION_MINUTE)
             )]
         );
+        Ok(())
+    }
+
+    /// §8 rows R3 and R15: a twin observed EARLIER but committed second is the kept item, and a
+    /// listing earlier than its minute is recorded against it, not against the first commit.
+    #[test]
+    fn an_earlier_listing_is_compared_with_an_earlier_observation_committed_later() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let commit = |store: &mut Committer, ordinal, valid, observed| -> TestResult {
+            let closed = closed_attempt(store, ordinal, Verdict::Usable)?;
+            let item = minute_row(
+                store,
+                &Spec {
+                    valid,
+                    observed,
+                    ..minute_spec()
+                },
+            )?;
+            store.record(closed, None, &[item], at(5))?;
+            Ok(())
+        };
+        commit(&mut store, 0, A_LATER_PUBLICATION_MINUTE, OBSERVED_AT)?;
+        commit(&mut store, 1, A_PUBLICATION_MINUTE, OBSERVED_EARLIER)?;
+        let index = closed_attempt(&mut store, 2, Verdict::Usable)?;
+        let attempt = index.attempt_id().hex().to_owned();
+        store.record(index, None, &[], at(6))?;
+        store.record_relisted(
+            &attempt,
+            &[relisted(
+                &story_hex(SOURCE, STORY),
+                minute_at(AN_EARLIER_PUBLICATION_MINUTE)?,
+            )],
+        )?;
+        let recorded: Vec<(String, String)> = relisted_rows(&store)?
+            .into_iter()
+            .map(|(_, _, _, listed, stored)| (listed, stored))
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![(
+                stamped(AN_EARLIER_PUBLICATION_MINUTE),
+                stamped(A_PUBLICATION_MINUTE)
+            )]
+        );
+        Ok(())
+    }
+
+    /// §8 row R15: a kept item with no `valid_minute` is not compared, even beside a later
+    /// minute-dated twin the listing disagrees with.
+    #[test]
+    fn a_listing_of_a_story_whose_kept_item_has_no_minute_is_not_recorded() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let first = closed_attempt(&mut store, 0, Verdict::Usable)?;
+        let kept = row(&store, &spec(STORY))?;
+        store.record(first, None, &[kept], at(5))?;
+        let twin_attempt = closed_attempt(&mut store, 1, Verdict::Usable)?;
+        let twin = minute_row(
+            &store,
+            &Spec {
+                valid: A_LATER_PUBLICATION_MINUTE,
+                observed: OBSERVED_LATER,
+                ..minute_spec()
+            },
+        )?;
+        store.record(twin_attempt, None, &[twin], at(6))?;
+        let index = closed_attempt(&mut store, 2, Verdict::Usable)?;
+        let attempt = index.attempt_id().hex().to_owned();
+        store.record(index, None, &[], at(7))?;
+        store.record_relisted(
+            &attempt,
+            &[relisted(
+                &story_hex(SOURCE, STORY),
+                minute_at(A_PUBLICATION_MINUTE)?,
+            )],
+        )?;
+        assert_eq!(count(&store, "relisted")?, 0);
         Ok(())
     }
 

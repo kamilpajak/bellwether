@@ -1885,26 +1885,7 @@ fn a_live_index_whose_commit_was_refused_records_no_held() -> TestResult {
     seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
     let exchange = Gnw::day()?;
     poll(root.path(), RUN_AT, "first", &exchange)?;
-    let ask = Ask {
-        at: instant(LATER_THE_SAME_DAY),
-        schedule: Some("refused".to_owned()),
-        ..ask(root.path(), cmd_collect::TODAY)
-    };
-    let opened = cmd_collect::open_provider(&ask)?;
-    let run = RunId::new("refused");
-    let mut archive = RefusingTheIndex {
-        store: Committer::open(root.path(), &run)?,
-        commits: RefCell::new(0),
-    };
-    let driven = cmd_collect::drive(
-        &ask,
-        opened.provider.as_ref(),
-        &mut archive,
-        &exchange,
-        &At(instant(LATER_THE_SAME_DAY)),
-        &run,
-    )?;
-    drop(archive);
+    let exit = polled_through_a_refused_index(root.path(), &exchange)?;
     let db = Connection::open_with_flags(
         root.path().join(COMMIT_LOG),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -1915,11 +1896,52 @@ fn a_live_index_whose_commit_was_refused_records_no_held() -> TestResult {
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    assert_eq!(
-        (driven.collected.exit(), refused),
-        (Exit::CommitFailed, (None, None))
-    );
+    assert_eq!((exit, refused), (Exit::CommitFailed, (None, None)));
     Ok(())
+}
+
+/// Section 8 row R15, decision 10: an index whose commit was refused re-lists committed release 0
+/// under another minute and records no `relisted` row on its open attempt.
+#[test]
+fn a_live_index_whose_commit_was_refused_records_no_relisted() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let mut exchange = Gnw::day()?;
+    poll(root.path(), RUN_AT, "first", &exchange)?;
+    let relisting = an_index_relisting_release_0(&exchange)?;
+    exchange.pages.insert(INDEX.to_owned(), relisting);
+    let exit = polled_through_a_refused_index(root.path(), &exchange)?;
+    let db = Connection::open_with_flags(
+        root.path().join(COMMIT_LOG),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let relisted: i64 = db.query_row("SELECT COUNT(*) FROM relisted", [], |row| row.get(0))?;
+    assert_eq!((exit, relisted), (Exit::CommitFailed, 0));
+    Ok(())
+}
+
+/// A second poll, later the same day, through a store that refuses its index commit.
+fn polled_through_a_refused_index(root: &Path, exchange: &Gnw) -> Result<Exit, Box<dyn Error>> {
+    let ask = Ask {
+        at: instant(LATER_THE_SAME_DAY),
+        schedule: Some("refused".to_owned()),
+        ..ask(root, cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let run = RunId::new("refused");
+    let mut archive = RefusingTheIndex {
+        store: Committer::open(root, &run)?,
+        commits: RefCell::new(0),
+    };
+    let driven = cmd_collect::drive(
+        &ask,
+        opened.provider.as_ref(),
+        &mut archive,
+        exchange,
+        &At(instant(LATER_THE_SAME_DAY)),
+        &run,
+    )?;
+    Ok(driven.collected.exit())
 }
 
 const EXIT_OK: i32 = 0;
@@ -2114,8 +2136,8 @@ fn an_index_relisting_release_0(gnw: &Gnw) -> Result<Vec<u8>, Box<dyn Error>> {
 }
 
 /// Section 8 row R15, owner decision 10 (2026-11-16): a second poll lists committed release 0
-/// under another minute, as PRN's correction 302913655 was. No fetch, no item changes, one
-/// `relisted` row on the second index attempt, and the ledger counts it.
+/// under another minute, as PRN's correction 302913655 was. No fetch, the `stored_items` columns
+/// unchanged, one `relisted` row on the second index attempt, and the ledger counts it.
 #[test]
 fn a_held_story_listed_under_another_minute_is_recorded_without_a_fetch_and_counted() -> TestResult
 {
