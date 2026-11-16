@@ -95,6 +95,8 @@ const TOO_MANY: u16 = 429;
 const REQUEST_TIMEOUT: u16 = 408;
 const FORBIDDEN: u16 = 403;
 const OK: u16 = 200;
+/// RFC 9110's 3xx codes but 305 (deprecated) and 306 (unused), as open-web's test names them.
+const REDIRECTS: [u16; 7] = [300, 301, 302, 303, 304, 307, 308];
 /// Every sink type this crate may not hold, asserted over its own source. The clock half of this
 /// pair moved to `repo-invariants::clocks` on 2026-11-13: a repo-wide grep that lives inside one
 /// of the crates it checks covers no other provider (CONTRIBUTING.md, "Everything else").
@@ -632,13 +634,22 @@ fn the_sec_profile_paces_both_our_address_and_the_sec_host_at_ten_a_second() -> 
     Ok(())
 }
 
-/// R19 and §10: edgar keeps ureq 3.5.2's former default, so a redirect is followed as before.
+/// `Wire` follows no redirect (§8 row R19), so a 3xx reaches `classify` as the answer; on either
+/// phase it is permanent and never retried, the open-web rule (§11.2, owner decision v, §10).
 #[test]
-fn the_sec_profile_follows_up_to_ten_redirects_as_ureq_did_before() -> Outcome {
-    assert_eq!(
-        provider()?.transport().redirects,
-        news_provider::Redirects::FollowUpTo(10)
-    );
+fn a_redirect_is_permanent_never_transient() -> Outcome {
+    let provider = provider()?;
+    let index = index_request(&provider, A_LISTED_SESSION)?;
+    let document = document_request(&provider, A_LISTED_SESSION)?;
+    for request in [index, document] {
+        for status in REDIRECTS {
+            assert_eq!(
+                verdict(&provider, &request, status, b"")?,
+                Verdict::PermanentFailure,
+                "{status}"
+            );
+        }
+    }
     Ok(())
 }
 

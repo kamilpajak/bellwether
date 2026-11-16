@@ -21,9 +21,7 @@ use news_provider::provider::{
     RawBlob, UnusableReason, UnusableRow, ValidPrecision, ValidSource,
 };
 use news_provider::request::{days_of, HeaderValue, Request, RequestPhase};
-use news_provider::wire::{
-    RawResponse, Redirects, Timeouts, TransportError, TransportKind, TransportProfile,
-};
+use news_provider::wire::{RawResponse, Timeouts, TransportError, TransportKind, TransportProfile};
 use news_provider::{CredentialRef, SourceId, TargetWindow, Verdict};
 use pit::datedness::{end_of_day, Published};
 use pit::{MeasuredLag, ObservationTime, PitError, ValidTime, Visibility};
@@ -79,9 +77,6 @@ const BODY_LIMIT: u64 = 8 * 1_024 * 1_024;
 /// `apps/alphalens-pipeline/CLAUDE.md`); nothing here has measured it, and this paces TO the
 /// ceiling with no margin under it, which row R19 names as the open question it is.
 const SEC_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-/// ureq 3.5.2's default, which `Wire` used until 2026-11-15, kept so edgar's behaviour does not
-/// change: nothing has measured whether SEC redirects any /Archives url (section 10, row R19).
-const SEC_REDIRECTS_FOLLOWED: u32 = 10;
 
 /// Why no request may be made at all. Every one of these is raised BEFORE the first request, so a
 /// broken input is never a vendor event in the coverage ledger.
@@ -469,7 +464,6 @@ impl Provider for EdgarPress {
                 min_interval: SEC_MIN_INTERVAL,
                 per_host: Some(SEC_MIN_INTERVAL),
             },
-            redirects: Redirects::FollowUpTo(SEC_REDIRECTS_FOLLOWED),
         }
     }
 

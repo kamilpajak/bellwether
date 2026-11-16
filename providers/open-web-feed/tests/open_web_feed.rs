@@ -14,8 +14,8 @@ use news_provider::provider::{
 };
 use news_provider::request::{HeaderValue, Request, RequestPhase};
 use news_provider::{
-    AttemptSlot, CredentialRef, RawResponse, Redirects, RunId, TargetWindow, TransportError,
-    TransportKind, Verdict,
+    AttemptSlot, CredentialRef, RawResponse, RunId, TargetWindow, TransportError, TransportKind,
+    Verdict,
 };
 use open_web_feed::{
     AdmittedPath, HostPin, OpenWebFeed, Refusal, RobotsPin, CONTACT_CREDENTIAL, SOURCE,
@@ -492,7 +492,7 @@ fn a_408_request_timeout_is_transient() -> Outcome {
     Ok(())
 }
 
-/// `Redirects::Refuse` hands every 3xx to `classify` as the answer (§11.2); none is retried.
+/// `Wire` hands every 3xx to `classify` as the answer (§11.2, §8 row R19); none is retried.
 #[test]
 fn a_redirect_is_permanent_never_transient() -> Outcome {
     let provider = provider()?;
@@ -1339,13 +1339,6 @@ fn the_real_pr_newswire_article_carries_its_title_its_canonical_link_and_its_www
 }
 
 // ---- transport ----
-
-/// §11.2: a hop ureq follows is a request no pace file and no attempt row sees (row R19).
-#[test]
-fn the_profile_refuses_every_redirect() -> Outcome {
-    assert_eq!(provider()?.transport().redirects, Redirects::Refuse);
-    Ok(())
-}
 
 #[test]
 fn the_profile_paces_every_host_and_our_address_at_one_request_per_ten_seconds() -> Outcome {

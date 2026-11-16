@@ -1,6 +1,6 @@
 //! `newsvault collect` and `newsvault items`, driven over the committed EDGAR fixtures and the
-//! real provider. No test here opens a socket: `Exchange` is the seam and this file's
-//! implementation of it answers out of `providers/edgar-press/tests/fixtures/`.
+//! real provider. `Exchange` is the seam and this file's implementation of it answers out of
+//! `providers/edgar-press/tests/fixtures/`; one test relays a url to a `127.0.0.1` loopback server.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -24,6 +24,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use tempfile::TempDir;
 
+mod loopback;
 mod seed;
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -55,6 +56,7 @@ const MICROSOFT_URL: &str =
     "https://www.sec.gov/Archives/edgar/data/789019/0000789019-26-000045.txt";
 
 const OK: u16 = 200;
+const MOVED_PERMANENTLY: u16 = 301;
 const FORBIDDEN: u16 = 403;
 /// A server error, which `edgar-press::classify` reads as transient from the status alone (the body
 /// is not consulted for a 5xx), so any body fixture states it.
@@ -832,6 +834,58 @@ fn every_body_an_edgar_run_stores_is_indexed_and_linked_to_its_attempt() -> Test
                 document.clone(),
                 document
             ]
+        )
+    );
+    Ok(())
+}
+
+/// Owner decision v of 2026-11-16 (§10): edgar refuses a redirect as open-web does. Apple's filing
+/// goes through edgar's real `Wire` to a loopback server answering `301 Location: /elsewhere`: the
+/// hop is never sent, the 301 closes `permanent_failure`, and its link row names the url asked.
+#[test]
+fn an_edgar_document_answered_with_a_redirect_is_a_permanent_failure_and_its_hop_never_sent(
+) -> TestResult {
+    let root = TempDir::new()?;
+    let ask = ask(root.path(), A_LISTED_SESSION);
+    let opened = cmd_collect::open_provider(&ask)?;
+    let moved = APPLE_URL
+        .strip_prefix("https://www.sec.gov")
+        .ok_or("not an SEC url")?;
+    let server =
+        loopback::Loopback::redirecting(moved, std::fs::read(fixture("filing_8k_apple.txt"))?)?;
+    let stub = Payloads::a_good_day()?;
+    let exchange = loopback::Relay {
+        stub: &stub,
+        wire: cmd_collect::wire_for(&ask, &opened),
+        relayed: BTreeMap::from([(APPLE_URL.to_owned(), server.url(moved))]),
+        asked: RefCell::default(),
+    };
+    let answer = cmd_collect::run(&ask, &opened, &exchange, &Fixed)?;
+    let asked_apple = exchange
+        .sent()
+        .iter()
+        .filter(|url| *url == APPLE_URL)
+        .count();
+    let hops = server.seen()?;
+    server.finish()?;
+    let db = Connection::open_with_flags(
+        root.path().join(COMMIT_LOG),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let redirected: Vec<(String, String)> = db
+        .prepare(
+            "SELECT a.verdict, p.url FROM attempts a JOIN payloads p ON p.attempt_id = a.attempt_id
+              WHERE a.transport_status = ?1",
+        )?
+        .query_map([MOVED_PERMANENTLY], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(
+        (asked_apple, hops, redirected, answer.exit),
+        (
+            1,
+            vec![moved.to_owned()],
+            vec![("permanent_failure".to_owned(), APPLE_URL.to_owned())],
+            Exit::PartialCollect
         )
     );
     Ok(())

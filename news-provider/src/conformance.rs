@@ -222,7 +222,7 @@ mod tests {
         Provenance, Provider, RawBlob, ValidPrecision, ValidSource,
     };
     use crate::request::{HeaderValue, Request, RequestPhase};
-    use crate::wire::{RawResponse, Redirects, Timeouts, TransportError, TransportProfile};
+    use crate::wire::{RawResponse, Timeouts, TransportError, TransportProfile};
     use crate::{SourceId, TargetWindow, Verdict};
     use canon::{Digest, FileDigest};
     use chrono::{DateTime, NaiveDate, Utc};
@@ -353,7 +353,6 @@ mod tests {
                     min_interval: PATIENCE,
                     per_host: None,
                 },
-                redirects: Redirects::Refuse,
             }
         }
 
