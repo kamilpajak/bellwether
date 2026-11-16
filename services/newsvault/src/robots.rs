@@ -93,11 +93,13 @@ struct Group {
 impl Robots {
     /// RFC 9309 section 2.2 grouping: a run of `user-agent` lines opens a group and the next
     /// `Allow`/`Disallow` closes the run; Crawl-delay and unknown lines close nothing (section
-    /// 2.2.4). A rule before any `user-agent` line is read as a `*` rule (owner decision 3c).
+    /// 2.2.4). A `Disallow` or Crawl-delay before any `user-agent` line is read as a `*` rule
+    /// (owner decision 3c); an `Allow` there is ignored, as section 2.2.2 says.
     pub fn parse(body: &[u8]) -> Result<Self, RobotsError> {
         let text = std::str::from_utf8(body).map_err(|_| RobotsError::NotUtf8)?;
         let text = text.strip_prefix(BYTE_ORDER_MARK).unwrap_or(text);
-        if text.trim_start().starts_with(MARKUP) {
+        let first = text.trim_start_matches(|c: char| c.is_whitespace() || c == BYTE_ORDER_MARK);
+        if first.starts_with(MARKUP) {
             return Err(RobotsError::HtmlPage);
         }
         let mut robots = Self {
@@ -127,7 +129,8 @@ impl Robots {
                 rule @ (ALLOW | DISALLOW) => {
                     in_agent_run = false;
                     orphan |= !named_an_agent;
-                    if (group.every_agent || !named_an_agent) && !value.is_empty() {
+                    let applies = group.every_agent || (!named_an_agent && rule == DISALLOW);
+                    if applies && !value.is_empty() {
                         robots.rules.push(PathRule {
                             allow: rule == ALLOW,
                             pattern: value.to_owned(),
@@ -232,7 +235,13 @@ fn seconds(value: &str) -> Result<Duration, RobotsError> {
         .take(NANOS_DIGITS)
         .collect();
     let nanos: u32 = nanos.parse().map_err(|_| refused())?;
-    Ok(Duration::new(secs, nanos))
+    let past_nanos = fraction
+        .bytes()
+        .skip(NANOS_DIGITS)
+        .any(|digit| digit != b'0');
+    Duration::new(secs, nanos)
+        .checked_add(Duration::from_nanos(u64::from(past_nanos)))
+        .ok_or_else(refused)
 }
 
 #[cfg(test)]
@@ -380,9 +389,18 @@ mod tests {
         );
         let read = Robots::parse(b"User-agent: *\nCrawl-delay: 0.5\nCrawl-delay: 2.25\n")?;
         assert_eq!(read.crawl_delay(), Some(Duration::from_millis(2_250)));
-        // A named bot's malformed delay is never read, so it refuses nothing.
+        // A digit past the ninth rounds up, so a delay just above 10 s never reads as 10 s.
+        let past_nanos = Robots::parse(b"User-agent: *\nCrawl-delay: 10.0000000001\n")?;
+        assert_eq!(past_nanos.crawl_delay(), Some(Duration::new(10, 1)));
+        let zeros = Robots::parse(b"User-agent: *\nCrawl-delay: 10.0000000000\n")?;
+        assert_eq!(zeros.crawl_delay(), Some(Duration::from_secs(10)));
+        // A named bot's malformed delay is never read unless `*` shares its run (decision 2).
         let named = Robots::parse(b"User-agent: bingbot\nCrawl-delay: soon\n")?;
         assert_eq!(named.crawl_delay(), None);
+        assert_eq!(
+            Robots::parse(b"User-agent: bingbot\nCrawl-delay: soon\nUser-agent: *\nDisallow: /p\n"),
+            Err(RobotsError::CrawlDelayNotANumber("soon".to_owned()))
+        );
         Ok(())
     }
 
@@ -396,6 +414,7 @@ mod tests {
             "\u{feff} \n\t<!doctype html>\n<html></html>"
                 .as_bytes()
                 .to_vec(),
+            " \u{feff}<html></html>".as_bytes().to_vec(),
             b"Sitemap: https://example.test/s.xml\n".to_vec(),
             b"Service unavailable\n".to_vec(),
             vec![b'U', 0xff, b'\n'],
@@ -406,6 +425,7 @@ mod tests {
         assert_eq!(
             refused,
             [
+                Err(RobotsError::HtmlPage),
                 Err(RobotsError::HtmlPage),
                 Err(RobotsError::HtmlPage),
                 Err(RobotsError::NoUserAgentLine),
@@ -466,6 +486,19 @@ mod tests {
         assert_eq!(
             Robots::parse(b"Crawl-delay: soon\nUser-agent: *\n"),
             Err(RobotsError::CrawlDelayNotANumber("soon".to_owned()))
+        );
+        Ok(())
+    }
+
+    /// An orphan `Allow` is ignored, as RFC 9309 section 2.2.2 says: applied to `*` it would widen
+    /// what `*` may fetch, and decision 3c is the stricter reading. Review 2026-11-16, this body
+    /// allowed `/news/x` while 79a79b8 refused it.
+    #[test]
+    fn an_orphan_allow_widens_nothing() -> TestResult {
+        let robots = Robots::parse(b"Allow: /news/\nUser-agent: *\nDisallow: /\n")?;
+        assert_eq!(
+            (robots.reading(), robots.allows("/news/x")),
+            (Reading::OrphanRulesAppliedToStar, false)
         );
         Ok(())
     }
