@@ -963,6 +963,10 @@ fn a_refresh_reports_the_parse_verdict_of_each_answered_row() -> TestResult {
             OK,
             b"Crawl-delay: 30\nUser-agent: *\nDisallow: /x\n".to_vec(),
         ),
+        (
+            OK,
+            b"Disallow: /o\nUser-agent: *\nCrawl-delay: 30\n".to_vec(),
+        ),
         (OK, robots_fixture("synthetic_html_page.txt")?),
         (OK, robots_fixture("www.nasdaq.com.txt")?),
         (OK, b"User-agent: *\nCrawl-delay: 10\n".to_vec()),
@@ -996,6 +1000,7 @@ fn a_refresh_reports_the_parse_verdict_of_each_answered_row() -> TestResult {
         "rules",
         "no_rules_empty",
         "orphan_rules_ignored",
+        "crawl_delay_over_interval",
         "refused_html",
         "crawl_delay_over_interval",
         "rules",
