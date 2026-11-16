@@ -1854,8 +1854,8 @@ mod tests {
         Ok(answered?)
     }
 
-    /// The loopback answers `heads` in order, 60 ms apart; then one send to `REFUSED`, which is the
-    /// same host, `127.0.0.1`, and one to `LOCALHOST`, another host. Every wait, in order.
+    /// The loopback answers `heads` in order, 60 ms apart; then one send to `LOCALHOST`, another
+    /// host, and one to `REFUSED`, the same host, `127.0.0.1`. Every wait, in order.
     fn waits_after(heads: &[&str]) -> Result<Vec<Duration>, Box<dyn std::error::Error>> {
         let store = tempfile::tempdir()?;
         let clock = WaitedClock::at(RESERVED_AT)?;
@@ -1873,8 +1873,8 @@ mod tests {
             clock.elapse(ELAPSED);
             ordinal += 1;
         }
-        status_of(&wire, &clock, ordinal, REFUSED)?;
-        status_of(&wire, &clock, ordinal + 1, LOCALHOST)?;
+        status_of(&wire, &clock, ordinal, LOCALHOST)?;
+        status_of(&wire, &clock, ordinal + 1, REFUSED)?;
         if answered_by(served)? != heads.len() {
             return Err("the loopback server did not answer every send".into());
         }
@@ -1897,24 +1897,30 @@ mod tests {
         "429 Too Many Requests\r\nRetry-After: 99999999999999999999999",
     ];
     const SERVER_ERROR_WITH_RETRY_AFTER: &str = "500 Internal Server Error\r\nRetry-After: 120";
-    /// 120 s after the answer at `RESERVED_AT`, less the 60 ms elapsed before the next send.
-    const WAIT_OUT_120_S: Duration = Duration::from_millis(119_940);
-    /// 13:05:00 less 13:00:00.060.
-    const WAIT_OUT_THE_DATE: Duration = Duration::from_millis(299_940);
-    /// The 1 s host interval doubled once (2 s) and twice (4 s), less the 60 ms elapsed each time.
+    /// The send to another host 60 ms after the answer owes only the per-IP pace, `EXPECTED_WAIT`,
+    /// so the next send to the answering host leaves 100 ms after it, and each wait below is less
+    /// those 100 ms: 120 s; 13:05:00; the 1 s interval; doubled once, 2 s; doubled twice, 4 s.
+    const WAIT_OUT_120_S: Duration = Duration::from_millis(119_900);
+    const WAIT_OUT_THE_DATE: Duration = Duration::from_millis(299_900);
+    const HOST_WAIT_LATER: Duration = Duration::from_millis(900);
+    const DOUBLED_ONCE_LATER: Duration = Duration::from_millis(1_900);
+    const DOUBLED_TWICE_LATER: Duration = Duration::from_millis(3_900);
+    /// The 2 s interval less the 60 ms elapsed before the second loopback send.
     const DOUBLED_ONCE_WAIT: Duration = Duration::from_millis(1_940);
-    const DOUBLED_TWICE_WAIT: Duration = Duration::from_millis(3_940);
-    /// The per-IP interval, owed by a send to another host straight after the one before.
-    const IP_WAIT: Duration = TEST_INTERVAL;
     const RETRY_AFTER_JSON: &str = "[[\"retry-after\",\"120\"]]";
 
+    /// The waits of `waits_after` one answer, given the wait of the last send.
+    fn one_answer_then(same_host: Duration) -> Vec<Duration> {
+        vec![NO_WAIT, NO_WAIT, NO_WAIT, EXPECTED_WAIT, same_host, NO_WAIT]
+    }
+
     /// RFC 9110 §10.2.3 delta-seconds: the next send to the host waits until 120 s after the
-    /// answer, and another host keeps its own pace.
+    /// answer, and another host asked meanwhile keeps its own pace.
     #[test]
     fn a_429_with_retry_after_seconds_holds_that_host_until_then_and_no_other() -> Checked {
         assert_eq!(
             waits_after(&[RETRY_AFTER_SECONDS])?,
-            vec![NO_WAIT, NO_WAIT, WAIT_OUT_120_S, NO_WAIT, NO_WAIT, IP_WAIT]
+            one_answer_then(WAIT_OUT_120_S)
         );
         Ok(())
     }
@@ -1923,14 +1929,7 @@ mod tests {
     fn a_503_with_an_http_date_holds_that_host_until_that_date() -> Checked {
         assert_eq!(
             waits_after(&[RETRY_AFTER_DATE])?,
-            vec![
-                NO_WAIT,
-                NO_WAIT,
-                WAIT_OUT_THE_DATE,
-                NO_WAIT,
-                NO_WAIT,
-                IP_WAIT
-            ]
+            one_answer_then(WAIT_OUT_THE_DATE)
         );
         Ok(())
     }
@@ -1940,7 +1939,7 @@ mod tests {
     fn a_retry_after_date_in_the_past_holds_nothing_and_doubles_nothing() -> Checked {
         assert_eq!(
             waits_after(&[RETRY_AFTER_PAST])?,
-            vec![NO_WAIT, NO_WAIT, HOST_WAIT, NO_WAIT, NO_WAIT, IP_WAIT]
+            one_answer_then(HOST_WAIT_LATER)
         );
         Ok(())
     }
@@ -1954,10 +1953,10 @@ mod tests {
                 NO_WAIT,
                 DOUBLED_ONCE_WAIT,
                 NO_WAIT,
-                DOUBLED_TWICE_WAIT,
                 NO_WAIT,
-                NO_WAIT,
-                IP_WAIT
+                EXPECTED_WAIT,
+                DOUBLED_TWICE_LATER,
+                NO_WAIT
             ]
         );
         Ok(())
@@ -1968,14 +1967,7 @@ mod tests {
         for head in UNUSABLE_RETRY_AFTERS {
             assert_eq!(
                 waits_after(&[head])?,
-                vec![
-                    NO_WAIT,
-                    NO_WAIT,
-                    DOUBLED_ONCE_WAIT,
-                    NO_WAIT,
-                    NO_WAIT,
-                    IP_WAIT
-                ],
+                one_answer_then(DOUBLED_ONCE_LATER),
                 "{head}"
             );
         }
@@ -1987,7 +1979,7 @@ mod tests {
     fn a_500_is_no_slow_down_answer_even_with_a_retry_after() -> Checked {
         assert_eq!(
             waits_after(&[SERVER_ERROR_WITH_RETRY_AFTER])?,
-            vec![NO_WAIT, NO_WAIT, HOST_WAIT, NO_WAIT, NO_WAIT, IP_WAIT]
+            one_answer_then(HOST_WAIT_LATER)
         );
         Ok(())
     }
