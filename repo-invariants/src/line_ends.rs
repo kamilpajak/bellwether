@@ -1,8 +1,8 @@
 //! Files whose bytes feed a stored or committed digest hold no `\r`. `include_str!` embeds a
 //! `.rs` file's working-tree bytes, `\r` included, while rustc compiles CRLF and LF alike, so a
 //! CRLF checkout moves `extract_version` without changing what runs (rustc 1.99.1, 2026-11-16).
-//! `.gitattributes` stores these files as LF; this gate reads the bytes, which a scp copy or an
-//! editor saving CRLF before a commit can still change. Row: architecture.md §8 row G2.
+//! `.gitattributes` stores these files as LF; this gate reads the working-tree bytes, which an
+//! editor saving CRLF changes before git normalises them on commit. Row: architecture.md §8 G2.
 
 use std::path::{Path, PathBuf};
 
