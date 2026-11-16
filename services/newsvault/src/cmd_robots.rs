@@ -1,7 +1,7 @@
 //! `newsvault robots refresh` - one ledgered robots.txt fetch per hosts-file row, admitted and
-//! candidate alike (architecture.md section 11.2). It writes attempt rows, `robots` rows, blobs
-//! and a run envelope of kind `robots_refresh`, and never the hosts file: a changed pin is an edit
-//! a person makes. How a robots attempt is labelled and kept out of the ledger is section 10.
+//! candidate alike (architecture.md section 11.2). It writes attempt, `payloads` and `robots` rows,
+//! blobs and a run envelope of kind `robots_refresh`, and never the hosts file: a changed pin is
+//! an edit a person makes. How a robots attempt is labelled and kept out of the ledger is section 10.
 
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
