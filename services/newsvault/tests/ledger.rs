@@ -474,6 +474,48 @@ fn the_human_ledger_states_the_listing_unusable_count_of_the_json_row() -> TestR
     Ok(())
 }
 
+/// P10 (section 3.9): a body stored cut at the limit is counted for its source and day, in the
+/// JSON row and on the human line, and an attempt with no link or an uncut one counts nothing.
+/// Mutations 2026-11-16, the `SUM` made constant 0: red; the field dropped from `render_human`: red.
+#[test]
+fn a_body_stored_cut_at_the_limit_is_counted_for_its_source_and_day() -> TestResult {
+    let root = fixture()?;
+    let json = over(&root, FIRST_DAY, FAILED_DAY)?.json()?;
+    let counted = |day: &str, source: &str| {
+        per_source(&json, day, source)
+            .and_then(|row| row.get("bodies_truncated"))
+            .and_then(Value::as_i64)
+    };
+    let human = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .arg("ledger")
+        .args(["--store", &root.path().to_string_lossy()])
+        .args(["--at", AT, "--format", "human"])
+        .args(["--from", FAILED_DAY, "--to", FAILED_DAY])
+        .output()?
+        .stdout;
+    let line = String::from_utf8(human)?
+        .lines()
+        .find(|line| line.trim_start().starts_with(EDGAR))
+        .map(str::to_owned)
+        .ok_or("no human line names the source")?;
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let shown = words
+        .iter()
+        .position(|word| *word == "bodies_truncated")
+        .and_then(|at| words.get(at + 1))
+        .map(|word| (*word).to_owned());
+    assert_eq!(
+        (
+            counted(FAILED_DAY, EDGAR),
+            counted(FAILED_DAY, POLYGON),
+            counted(FIRST_DAY, EDGAR),
+            shown
+        ),
+        (Some(1), Some(0), Some(0), Some("1".to_owned()))
+    );
+    Ok(())
+}
+
 /// Section 3.2 `held`: only a row carrying `vendor_rows` adds its `held`, so an unclosed index
 /// row holding 60 cannot outweigh 59 vendor rows. Mutation 2026-11-15, the ledger summing `held`
 /// over every row again: red.

@@ -9,7 +9,8 @@
 --               answered-and-never-finalised, and a second source
 --   2026-07-02  two runs where the schedule names one, every source closing EMPTY
 --   2026-07-03  every source closing FAILED, which must not read the same as 07-02, plus
---               one attempt the next day's sweep closed as interrupted
+--               one attempt the next day's sweep closed as interrupted; edgar's 403 page was
+--               over the body limit and is linked `truncated`, the only such `payloads` row
 --   2026-07-04  a vendor that answered 59 rows while the store holds none for it
 --   2026-07-05  one ordinary run; its envelope is what the truncation tests overwrite
 --   2026-07-30  the newest asking clock and the newest publication value, 30 min apart
@@ -112,3 +113,13 @@ VALUES
    '2026-08-01T13:00:25.000000Z', 0, NULL, 'b-0801-a', NULL, '2026-08-01T13:00:30.000000Z'),
   (10, 'i-0801-b', 's-0801-b', NULL, 'a-0801-edgar-0', '2026-07-30T23:00:00.000000Z', NULL,
    '2026-08-02T10:00:00.000000Z', 0, NULL, 'b-0801-a', NULL, '2026-08-02T10:00:00.000000Z');
+
+-- P10's link rows (user_version 6): three ordinary bodies and one cut at the body limit.
+INSERT INTO blobs (digest, bytes, first_indexed_at) VALUES
+  ('b-0703-cut', 2048, '2026-07-03T00:34:30.000000Z');
+
+INSERT INTO payloads (attempt_id, url, phase, listed_date, raw_blob, headers, truncated) VALUES
+  ('a-0701-edgar-0', 'https://example.test/0701-0034', 'index', NULL, 'b-0701-a', '[]', 0),
+  ('a-0701-edgar-1', 'https://example.test/0701-0630', 'index', NULL, 'b-0701-b', '[]', 0),
+  ('a-0703-edgar-0', 'https://example.test/0703', 'index', NULL, 'b-0703-cut', '[]', 1),
+  ('a-0705-edgar-0', 'https://example.test/0705', 'index', NULL, 'b-0705-a', '[]', 0);
