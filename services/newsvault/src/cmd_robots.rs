@@ -25,7 +25,8 @@ use crate::cmd_ledger::{Envelope, RunKind, RUN_ENVELOPE_SCHEMA};
 use crate::robots::{Reading, Robots, RobotsError as ParseError};
 use crate::store::{Committer, RobotsAnswer, StoreError};
 
-pub const SCHEMA: &str = "newsvault.robots/1";
+/// Major 2 since 2026-11-16: `parse_verdict` lost `refused_no_user_agent` (architecture.md §10).
+pub const SCHEMA: &str = "newsvault.robots/2";
 /// The `attempts.source` of every robots fetch: robots is a fact about a host, not about one
 /// source, and no registered source carries this name.
 pub const ROBOTS_SOURCE: &str = "robots";
@@ -45,12 +46,12 @@ pub fn parse_verdicts() -> [&'static str; 9] {
     [
         Reading::Rules.name(),
         Reading::NoRulesEmpty.name(),
+        Reading::NoRulesNoGroup.name(),
         Reading::OrphanRulesIgnored.name(),
         NO_RULES_ABSENT,
         CRAWL_DELAY_OVER_INTERVAL,
         ParseError::NotUtf8.verdict(),
         ParseError::HtmlPage.verdict(),
-        ParseError::NoUserAgentLine.verdict(),
         ParseError::CrawlDelayNotANumber(String::new()).verdict(),
     ]
 }

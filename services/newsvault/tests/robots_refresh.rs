@@ -1005,7 +1005,7 @@ fn a_refresh_reports_the_parse_verdict_of_each_answered_row() -> TestResult {
         "crawl_delay_over_interval",
         "rules",
         "refused_crawl_delay",
-        "refused_no_user_agent",
+        "no_rules_no_group",
         "refused_not_utf8",
         "no_rules_absent",
     ];
