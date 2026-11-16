@@ -34,8 +34,12 @@ const GNW_HOST: &str = "rss.globenewswire.com";
 const GNW_ROBOTS: &str = "https://rss.globenewswire.com/robots.txt";
 const PRN_ROBOTS: &str = "https://www.prnewswire.com/robots.txt";
 const ROBOTS_PATH: &str = "/robots.txt";
-/// The committed hosts file's pin: `robots_rss_globenewswire_com.txt`'s sha256.
+/// The GNW row's pin, in the committed hosts file and `gnw_admitted.json`:
+/// `robots_rss_globenewswire_com.txt`'s sha256.
 const GNW_PIN: &str = "eb8bb698171dd56c139c224c9217070adf9947f6ed6cd02336eba55aa4155bfe";
+/// The committed hosts file's PRN pin: `robots_www_prnewswire_com.txt`'s sha256.
+const PRN_PIN: &str = "906828bd8cf3ae9fd8bfd1475ae1abe7db4cfda54a2ddbf88dcb80cd55f522b2";
+const PRN_HOST: &str = "www.prnewswire.com";
 const PRN_BODY: &[u8] = b"User-agent: *\nDisallow: /search/\n";
 const CHANGED_BODY: &[u8] = b"User-agent: *\nDisallow: /\n";
 const OK: u16 = 200;
@@ -66,8 +70,16 @@ fn two_row_hosts() -> PathBuf {
     provider_dir().join("tests/fixtures/hosts/one_admitted_one_candidate.json")
 }
 
+fn committed_hosts() -> PathBuf {
+    provider_dir().join("hosts/open_web_wires.hosts.json")
+}
+
 fn gnw_body() -> Result<Vec<u8>, std::io::Error> {
     std::fs::read(provider_dir().join("tests/fixtures/gnw/robots_rss_globenewswire_com.txt"))
+}
+
+fn prn_body() -> Result<Vec<u8>, std::io::Error> {
+    std::fs::read(provider_dir().join("tests/fixtures/prn/robots_www_prnewswire_com.txt"))
 }
 
 fn ask(store: &Path, hosts: PathBuf) -> Ask {
@@ -480,6 +492,41 @@ fn a_fetched_robots_digest_other_than_the_pin_exits_one_and_names_both() -> Test
             Some(false),
             true,
         )
+    );
+    Ok(())
+}
+
+/// Section 11.2: the production file's two admitted rows, each answered with its committed body.
+/// Mutation 2026-11-16, one character of the PRN pin changed: red (exit 1).
+#[test]
+fn the_committed_hosts_file_refreshed_with_its_committed_bodies_matches_both_pins() -> TestResult {
+    let root = TempDir::new()?;
+    let (gnw, prn) = (gnw_body()?, prn_body()?);
+    let exchange = Robots::of(&[(GNW_ROBOTS, OK, &gnw), (PRN_ROBOTS, OK, &prn)]);
+    let answer = refreshed(root.path(), committed_hosts(), &exchange)?;
+    let matched: Vec<Option<bool>> = (0..2)
+        .map(|nth| answer.report["rows"][nth]["matches_pin"].as_bool())
+        .collect();
+    assert_eq!(
+        (answer.exit, matched, robots_rows(root.path())?),
+        (
+            RobotsExit::Ok,
+            vec![Some(true); 2],
+            vec![
+                (
+                    GNW_HOST.to_owned(),
+                    "present".to_owned(),
+                    Some(GNW_PIN.to_owned())
+                ),
+                (
+                    PRN_HOST.to_owned(),
+                    "present".to_owned(),
+                    Some(PRN_PIN.to_owned())
+                ),
+            ]
+        ),
+        "{:#}",
+        answer.report
     );
     Ok(())
 }
