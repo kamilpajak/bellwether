@@ -160,16 +160,24 @@ pub enum CollectRunError {
     /// Code `robots_refused`, exit 2: the pinned robots.txt disallows a path the row asks.
     #[error("the pinned robots.txt of admitted host {host} disallows {path}, which its row asks")]
     RobotsDisallowsPath { host: String, path: String },
-    /// Code `robots_refused`, exit 2: section 11.1's `max(Crawl-delay, 10 s)` is above the
-    /// per-host interval the provider's profile paces at (`None`: no per-host pace at all).
-    #[error(
-        "admitted host {host} would be paced every {per_host:?}, below its floor {floor:?}, \
-         the larger of its robots Crawl-delay and 10 s"
-    )]
+    /// Code `robots_refused`, exit 2: the provider's per-host interval is below section 11.1's
+    /// 10 s floor (`None`: no per-host pace at all).
+    #[error("admitted host {host} would be paced every {per_host:?}, below the floor {floor:?}")]
     PaceBelowFloor {
         host: String,
         per_host: Option<Duration>,
         floor: Duration,
+    },
+    /// Code `robots_refused`, exit 2: the pinned robots Crawl-delay is above the one per-host
+    /// interval every host shares (owner decision 1, 2026-11-16; §8 row R19 hole 7).
+    #[error(
+        "admitted host {host} asks a Crawl-delay of {crawl_delay:?}, above the {interval:?} \
+         interval every host shares; such a host waits for per-host intervals"
+    )]
+    CrawlDelayOverInterval {
+        host: String,
+        crawl_delay: Duration,
+        interval: Duration,
     },
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -205,6 +213,7 @@ impl CollectRunError {
             | Self::RobotsBlobAltered { .. }
             | Self::RobotsDisallowsPath { .. }
             | Self::PaceBelowFloor { .. }
+            | Self::CrawlDelayOverInterval { .. }
             | Self::Store(_)
             | Self::Driver(_)
             | Self::Io(_)
@@ -461,17 +470,8 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
                 let version = provider.hosts_version().hex().to_owned();
                 let extraction = provider.extract_version().hex().to_owned();
                 let admitted = admitted_robots(&ask.store, &provider)?;
-                let delays = admitted
-                    .iter()
-                    .filter_map(|row| match &row.robots {
-                        PinnedRobots::Read(robots) => {
-                            Some((row.host.clone(), robots.crawl_delay()?))
-                        }
-                        _ => None,
-                    })
-                    .collect();
                 (
-                    Box::new(provider.with_crawl_delays(delays)),
+                    Box::new(provider),
                     (Some(version), Some(extraction)),
                     admitted,
                     None,
@@ -489,8 +489,8 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
     })
 }
 
-/// Each admitted row's pinned robots body, read from the store's blobs by digest before the
-/// provider is boxed, so the Crawl-delay `transport()` paces at is the one `collect` checks.
+/// Each admitted row's pinned robots body, read from the store's blobs by digest when the
+/// provider is opened, so the body `collect` checks is the one read before any `Wire` exists.
 fn admitted_robots(
     store: &Path,
     feed: &OpenWebFeed,
@@ -821,21 +821,36 @@ fn refuse_what_the_pinned_robots_forbids(
     refuse_a_pace_below_the_floor(&row.host, per_host, robots.and_then(Robots::crawl_delay))
 }
 
-/// Section 8 row R19(b): `per_host` must be at least `max(crawl_delay, 10 s)`; `None` is refused.
+/// Section 8 row R19(b): `per_host` must be at least 10 s (`None` is refused), and the Crawl-delay
+/// at most `per_host`, the one interval every host shares (owner decision 1, 2026-11-16).
 pub fn refuse_a_pace_below_the_floor(
     host: &str,
     per_host: Option<Duration>,
     crawl_delay: Option<Duration>,
 ) -> Result<(), CollectRunError> {
-    let floor = crawl_delay.map_or(PACE_FLOOR, |delay| delay.max(PACE_FLOOR));
-    match per_host {
-        Some(interval) if interval >= floor => Ok(()),
-        _ => Err(CollectRunError::PaceBelowFloor {
+    let Some(interval) = per_host.filter(|interval| *interval >= PACE_FLOOR) else {
+        return Err(CollectRunError::PaceBelowFloor {
             host: host.to_owned(),
             per_host,
-            floor,
-        }),
+            floor: PACE_FLOOR,
+        });
+    };
+    match crawl_delay {
+        Some(delay) if crawl_delay_over_interval(delay, interval) => {
+            Err(CollectRunError::CrawlDelayOverInterval {
+                host: host.to_owned(),
+                crawl_delay: delay,
+                interval,
+            })
+        }
+        _ => Ok(()),
     }
+}
+
+/// The one rule `collect` refuses by and `robots refresh` prints as `crawl_delay_over_interval`.
+#[must_use]
+pub fn crawl_delay_over_interval(crawl_delay: Duration, interval: Duration) -> bool {
+    crawl_delay > interval
 }
 
 /// The plan alone, which is what `--dry-run` returns: everything except the mutation.

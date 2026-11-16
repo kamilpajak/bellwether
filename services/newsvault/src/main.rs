@@ -672,6 +672,18 @@ fn robots_refusal(failure: &CollectRunError) -> Option<RobotsRefusal> {
             }),
             false,
         )),
+        CollectRunError::CrawlDelayOverInterval {
+            host,
+            crawl_delay,
+            interval,
+        } => Some(refused(
+            serde_json::json!({
+                "host": host,
+                "crawl_delay_seconds": crawl_delay.as_secs_f64(),
+                "interval_seconds": interval.as_secs_f64(),
+            }),
+            false,
+        )),
         _ => None,
     }
 }

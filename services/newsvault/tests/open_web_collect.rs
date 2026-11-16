@@ -748,6 +748,11 @@ fn verdict(answered: &Result<cmd_collect::Answer, CollectRunError>) -> String {
         Err(CollectRunError::PaceBelowFloor {
             per_host, floor, ..
         }) => format!("paced {per_host:?} below {floor:?}"),
+        Err(CollectRunError::CrawlDelayOverInterval {
+            crawl_delay,
+            interval,
+            ..
+        }) => format!("crawl-delay {crawl_delay:?} over {interval:?}"),
         Err(other) => format!("another refusal: {other}"),
     }
 }
@@ -1206,32 +1211,46 @@ fn a_robots_blob_written_after_the_provider_opened_is_unverified() -> TestResult
     Ok(())
 }
 
-/// §8 row R19(b): nasdaq's 30 s is admitted once handed to the provider, refused without it.
-/// Mutations 2026-11-15, the floor check removed / `max(cd, 10 s)` as `cd` / `>=` as `>` / the
-/// hand-off removed: each red.
+/// §8 row R19(b), owner decision 1 (2026-11-16): a pinned Crawl-delay above the one shared 10 s
+/// interval refuses the host, nasdaq's 30 s and the B2 body's 30 s alike; the provider is never
+/// slowed. Mutations 2026-11-16, the Crawl-delay arm removed: red; `>` as `>=`: red (10 s case);
+/// the 10 s floor check removed: red.
 #[test]
-fn a_hosts_row_faster_than_its_robots_crawl_delay_is_refused() -> TestResult {
+fn a_hosts_row_whose_robots_crawl_delay_is_above_the_shared_interval_is_refused() -> TestResult {
     let secs = |n: u64| Some(Duration::from_secs(n));
-    let dir = TempDir::new()?;
-    let (store, hosts) = pinned_to(dir.path(), &robots_fixture("www.nasdaq.com.txt")?)?;
-    let ask = Ask {
-        hosts: Some(hosts.clone()),
-        dry_run: true,
-        ..ask(&store, cmd_collect::TODAY)
-    };
-    let mut opened = cmd_collect::open_provider(&ask)?;
-    let slowed = opened.provider.transport().budget.per_host;
-    let admitted = verdict(&cmd_collect::run(&ask, &opened, &Gnw::day()?, &Fixed));
-    opened.provider = Box::new(OpenWebFeed::open(&hosts, &ask.rules, CONTACT)?);
-    let unslowed = verdict(&cmd_collect::run(&ask, &opened, &Gnw::day()?, &Fixed));
+    let mut seen = Vec::new();
+    for body in [
+        robots_fixture("www.nasdaq.com.txt")?,
+        b"User-agent: *\nCrawl-delay: 30\nUser-agent: bingbot\nDisallow: /prywatne/\n".to_vec(),
+        b"User-agent: *\nCrawl-delay: 10\n".to_vec(),
+    ] {
+        let dir = TempDir::new()?;
+        let (store, hosts) = pinned_to(dir.path(), &body)?;
+        let ask = Ask {
+            hosts: Some(hosts),
+            dry_run: true,
+            ..ask(&store, cmd_collect::TODAY)
+        };
+        let opened = cmd_collect::open_provider(&ask)?;
+        seen.push((
+            opened.provider.transport().budget.per_host,
+            verdict(&cmd_collect::run(&ask, &opened, &Gnw::day()?, &Fixed)),
+        ));
+    }
+    let over = "crawl-delay 30s over 10s".to_owned();
     assert_eq!(
-        (slowed, admitted.as_str(), unslowed.as_str()),
-        (secs(30), "admitted", "paced Some(10s) below 30s")
+        seen,
+        [
+            (secs(10), over.clone()),
+            (secs(10), over),
+            (secs(10), "admitted".to_owned())
+        ]
     );
-    // (per_host, Crawl-delay, admitted): the floor is 10 s with no delay or a smaller one.
+    // (per_host, Crawl-delay, admitted): 10 s at least, and the delay at most per_host.
     let cases = [
         (secs(10), secs(30), false),
         (secs(30), secs(30), true),
+        (secs(10), secs(10), true),
         (secs(10), secs(5), true),
         (secs(10), None, true),
         (secs(5), secs(5), false),
@@ -1245,15 +1264,20 @@ fn a_hosts_row_faster_than_its_robots_crawl_delay_is_refused() -> TestResult {
     Ok(())
 }
 
-/// Section 5.1: a disallowed path and an unreadable pinned body are `robots_refused`, exit 2, with
-/// the path or the reason in `details` and no suggestion, because a refresh cannot change a pinned
-/// body. Mutation 2026-11-15, the path arm dropped from `robots_refusal`: red.
+/// Section 5.1: a disallowed path, an unreadable pinned body and a Crawl-delay above the shared
+/// interval are `robots_refused`, exit 2, with their fact in `details` and no suggestion, because
+/// a refresh cannot change a pinned body. Mutations: 2026-11-15, the path arm dropped from
+/// `robots_refusal`: red; 2026-11-16, the Crawl-delay arm dropped: red.
 #[test]
 fn a_path_or_unreadable_robots_refusal_names_its_fact_and_suggests_no_refresh() -> TestResult {
     let mut seen = Vec::new();
     for body in [
-        b"User-agent: *\nDisallow: /rssfeed/\n".to_vec(),
+        b"User-agent: *
+Disallow: /rssfeed/
+"
+        .to_vec(),
         robots_fixture("synthetic_html_page.txt")?,
+        robots_fixture("www.nasdaq.com.txt")?,
     ] {
         let dir = TempDir::new()?;
         let (store, hosts) = pinned_to(dir.path(), &body)?;
@@ -1276,35 +1300,46 @@ fn a_path_or_unreadable_robots_refusal_names_its_fact_and_suggests_no_refresh() 
             .stdin(Stdio::null())
             .output()?;
         let error: Value = serde_json::from_slice(&output.stderr)?;
+        let details = &error["details"];
         seen.push((
             output.status.code(),
             output.stdout.len(),
             error["code"].clone(),
-            error["details"]["path"].clone(),
-            error["details"]["why"].clone(),
+            ["path", "why", "crawl_delay_seconds", "interval_seconds"]
+                .map(|field| details[field].clone()),
             error["suggestions"].clone(),
         ));
     }
-    let refused = Value::from("robots_refused");
+    let refused = |facts: [Value; 4]| {
+        (
+            Some(EXIT_USAGE),
+            0,
+            Value::from("robots_refused"),
+            facts,
+            Value::Array(Vec::new()),
+        )
+    };
     assert_eq!(
         seen,
         vec![
-            (
-                Some(EXIT_USAGE),
-                0,
-                refused.clone(),
+            refused([
                 Value::from("/rssfeed/"),
                 Value::Null,
-                Value::Array(Vec::new())
-            ),
-            (
-                Some(EXIT_USAGE),
-                0,
-                refused,
+                Value::Null,
+                Value::Null
+            ]),
+            refused([
                 Value::Null,
                 Value::from("the body names no user-agent"),
-                Value::Array(Vec::new())
-            ),
+                Value::Null,
+                Value::Null
+            ]),
+            refused([
+                Value::Null,
+                Value::Null,
+                Value::from(30.0),
+                Value::from(10.0)
+            ]),
         ]
     );
     Ok(())
