@@ -456,7 +456,7 @@ mod tests {
         Ok(())
     }
 
-    /// Owner decision 3c: a rule or Crawl-delay before the first `user-agent` line is a `*` rule;
+    /// Owner decision 3c: a `Disallow` or Crawl-delay before the first `user-agent` line is `*`'s;
     /// RFC 9309 section 2.2.2 says SHOULD ignore it. Mutations 2026-11-16, orphan rules skipped:
     /// red; an orphan Crawl-delay skipped: red; `orphan` never set: red.
     #[test]
