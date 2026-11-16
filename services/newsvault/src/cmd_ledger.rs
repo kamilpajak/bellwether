@@ -129,8 +129,9 @@ pub struct SourceRow {
     /// poll, so this counts one per fetch of such a story, the first fetch included. Not
     /// subtracted before the zero-rows finding.
     pub listing_unusable: i64,
-    /// P10 (section 3.9): attempts whose body was over `body_limit` and is stored cut at it, so
-    /// the archive holds a prefix of what the vendor sent. Read from `payloads.truncated`.
+    /// P10 (section 3.9): attempts whose body is stored cut at `body_limit`, from
+    /// `payloads.truncated`. 0 for an attempt closed before user_version 6, which stored no
+    /// over-limit body, so 0 there does not mean none was over.
     pub bodies_truncated: i64,
     pub items_new: i64,
     pub rows_committed: i64,
