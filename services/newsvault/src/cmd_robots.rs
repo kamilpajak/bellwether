@@ -5,6 +5,7 @@
 
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use canon::FileDigest;
 use chrono::{DateTime, Utc};
@@ -17,8 +18,11 @@ use open_web_feed::{HostPin, OpenWebFeed};
 use pit::ObservationTime;
 use serde_json::{json, Value};
 
-use crate::cmd_collect::{write_envelope, CollectRunError, Registered, RUN_ID_FORMAT};
+use crate::cmd_collect::{
+    crawl_delay_over_interval, write_envelope, CollectRunError, Registered, RUN_ID_FORMAT,
+};
 use crate::cmd_ledger::{Envelope, RunKind, RUN_ENVELOPE_SCHEMA};
+use crate::robots::{Reading, Robots, RobotsError as ParseError};
 use crate::store::{Committer, RobotsAnswer, StoreError};
 
 pub const SCHEMA: &str = "newsvault.robots/1";
@@ -33,6 +37,23 @@ const TOO_MANY_REQUESTS: u16 = 429;
 const SERVER_ERRORS: RangeInclusive<u16> = 500..=599;
 /// A robots body is no vendor row, so every robots attempt is decided against zero of them.
 const NO_VENDOR_ROWS: u32 = 0;
+const NO_RULES_ABSENT: &str = "no_rules_absent";
+const CRAWL_DELAY_OVER_INTERVAL: &str = "crawl_delay_over_interval";
+/// Every `parse_verdict` a report row can carry besides `null`, as `newsvault schema` lists them.
+#[must_use]
+pub fn parse_verdicts() -> [&'static str; 9] {
+    [
+        Reading::Rules.name(),
+        Reading::NoRulesEmpty.name(),
+        Reading::OrphanRulesAppliedToStar.name(),
+        NO_RULES_ABSENT,
+        CRAWL_DELAY_OVER_INTERVAL,
+        ParseError::NotUtf8.verdict(),
+        ParseError::HtmlPage.verdict(),
+        ParseError::NoUserAgentLine.verdict(),
+        ParseError::CrawlDelayNotANumber(String::new()).verdict(),
+    ]
+}
 
 #[derive(Debug, Clone)]
 pub struct Ask {
@@ -191,6 +212,7 @@ struct Fetched {
     verdict: Option<Verdict>,
     outcome: Option<OutcomeKind>,
     robots: Option<RobotsAnswer>,
+    parse_verdict: Option<&'static str>,
 }
 
 /// Asks each row's robots.txt once, in hosts-file order. No retry and no startup sweep.
@@ -215,6 +237,7 @@ pub fn run(
                 verdict: None,
                 outcome: None,
                 robots: None,
+                parse_verdict: None,
             })
             .collect::<Vec<Fetched>>();
         return Ok(answer_of(ask, feed, &run_id, started, &rows, &planned));
@@ -232,11 +255,17 @@ pub fn run(
     let run = RunId::new(run_id.clone());
     let mut store = Committer::open(&ask.store, &run)?;
     let mut fetched = Vec::with_capacity(rows.len());
+    let interval = feed.transport().budget.per_host;
     for (ordinal, row) in (0_u32..).zip(&rows) {
         let request = request_for(row, feed.hosts_version());
-        fetched.push(fetch(
-            &mut store, exchange, clock, &run, ordinal, row, &request,
-        )?);
+        let asked = Asked {
+            run: &run,
+            ordinal,
+            row,
+            request: &request,
+            interval,
+        };
+        fetched.push(fetch(&mut store, exchange, clock, &asked)?);
     }
     write_envelope(
         &ask.store,
@@ -268,15 +297,29 @@ fn url_of(row: &HostPin) -> String {
     format!("https://{}{ROBOTS_PATH}", row.host)
 }
 
+/// One row's fetch as `run` asks it; `interval` is the per-host pace the parse verdict compares a
+/// Crawl-delay with.
+struct Asked<'a> {
+    run: &'a RunId,
+    ordinal: u32,
+    row: &'a HostPin,
+    request: &'a Request,
+    interval: Option<Duration>,
+}
+
 fn fetch(
     store: &mut Committer,
     exchange: &dyn Exchange,
     clock: &dyn Clock,
-    run: &RunId,
-    ordinal: u32,
-    row: &HostPin,
-    request: &Request,
+    asked: &Asked<'_>,
 ) -> Result<Fetched, RobotsError> {
+    let Asked {
+        run,
+        ordinal,
+        row,
+        request,
+        interval,
+    } = *asked;
     let opened_at = ObservationTime::new(clock.now());
     let mut slot = AttemptSlot::open(store, request, None, run, ordinal, opened_at)?;
     let attempt_id = slot.attempt_id().hex().to_owned();
@@ -308,6 +351,12 @@ fn fetch(
         &Baseline::from_trailing_ok(&[]),
     );
     let kind = outcome.kind();
+    let parse_verdict = match (&robots, &answer) {
+        (Some(answered), Ok(response)) => {
+            Some(parse_verdict_of(answered, response.body(), interval))
+        }
+        _ => None,
+    };
     let closed = slot.close(store, outcome, &answer, ObservationTime::new(clock.now()))?;
     let at = closed.closed_at();
     match (&robots, &payload) {
@@ -325,7 +374,29 @@ fn fetch(
         verdict: Some(verdict),
         outcome: Some(kind),
         robots,
+        parse_verdict,
     })
+}
+
+/// Owner decision 3d: what `collect` would make of this answer, by the same parser and the same
+/// Crawl-delay rule.
+fn parse_verdict_of(
+    robots: &RobotsAnswer,
+    body: &[u8],
+    interval: Option<Duration>,
+) -> &'static str {
+    if matches!(robots, RobotsAnswer::Absent) {
+        return NO_RULES_ABSENT;
+    }
+    match Robots::parse(body) {
+        Err(why) => why.verdict(),
+        Ok(read) => match (read.crawl_delay(), interval) {
+            (Some(delay), Some(interval)) if crawl_delay_over_interval(delay, interval) => {
+                CRAWL_DELAY_OVER_INTERVAL
+            }
+            _ => read.reading().name(),
+        },
+    }
 }
 
 /// 200 is present, 404 is absent (section 11.1); 429, a 5xx and a transport error are transient;
@@ -410,6 +481,7 @@ fn answer_of(
             "fetched_sha256": one.robots.as_ref().and_then(RobotsAnswer::blob).map(|blob| blob.hex()),
             "pinned": row.robots.as_ref().map(open_web_feed::RobotsPin::text),
             "matches_pin": matches_pin(row, one),
+            "parse_verdict": one.parse_verdict,
         })).collect::<Vec<Value>>(),
         "changed": !ask.dry_run,
         "exit": {
@@ -428,11 +500,12 @@ pub fn render_human(report: &Value, out: &mut impl std::io::Write) -> std::io::R
     for row in report["rows"].as_array().unwrap_or(&none) {
         writeln!(
             out,
-            "  {:<28} {:<9} {:<7} matches_pin {}",
+            "  {:<28} {:<9} {:<7} matches_pin {} parse_verdict {}",
             text(row, "host"),
             text(row, "status"),
             row["answer"].as_str().unwrap_or("planned"),
             row["matches_pin"],
+            row["parse_verdict"].as_str().unwrap_or("none"),
         )?;
     }
     writeln!(out, "exit             {}", report["exit"]["code"])?;

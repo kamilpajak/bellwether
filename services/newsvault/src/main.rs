@@ -1043,6 +1043,13 @@ fn print_schema(format: Format) {
                         {"name": "BELLWETHER_VAULT",
                          "doc": "the store when --store is not given, then ~/.bellwether/vault"}],
                 "output": cmd_robots::SCHEMA,
+                "output_fields": [
+                    {"name": "rows[].parse_verdict", "type": "enum",
+                     "values": cmd_robots::parse_verdicts(),
+                     "doc": "how collect would read the answered body: null for a failed fetch \
+                             and a dry run; crawl_delay_over_interval and every refused_* value \
+                             refuse an admitted host"}
+                ],
                 "exits": {
                     "0": "every row answered and every admitted pin matches",
                     "1": "every row answered and an admitted pin differs",
