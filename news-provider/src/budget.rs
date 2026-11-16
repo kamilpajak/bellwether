@@ -34,7 +34,7 @@ pub enum BudgetScope {
 /// A remote host as a pace-file name: lowercased, then only `[a-z0-9.-]`, not empty, no leading
 /// or trailing dot, no empty label (architecture.md section 10, per-host pace). The field is
 /// private, so no caller can name a file outside `pace/`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HostKey(String);
 
 impl HostKey {
@@ -159,11 +159,20 @@ impl Pace {
     /// Reserves this caller's slot and answers how long it must wait before the socket. The lock
     /// is released before the answer comes back, so the wait is outside the critical section.
     pub fn reserve(&self, now: DateTime<Utc>) -> Result<Duration, BudgetError> {
+        self.reserve_not_before(now, None)
+    }
+
+    /// As [`Pace::reserve`], with no slot granted before `floor`: a server's `Retry-After` (row R19).
+    pub fn reserve_not_before(
+        &self,
+        now: DateTime<Utc>,
+        floor: Option<DateTime<Utc>>,
+    ) -> Result<Duration, BudgetError> {
         let interval = TimeDelta::from_std(self.min_interval)
             .map_err(|why| self.unusable("read as an interval", &why))?;
         let file = self.open()?;
         file.lock().map_err(|why| self.unusable("locked", &why))?;
-        let reserved = self.read_reserve_write(&file, now, interval);
+        let reserved = self.read_reserve_write(&file, now.max(floor.unwrap_or(now)), interval);
         let unlocked = file.unlock().map_err(|why| self.unusable("unlocked", &why));
         let go_at = reserved?;
         unlocked?;

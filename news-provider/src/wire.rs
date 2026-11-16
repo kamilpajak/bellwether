@@ -6,13 +6,16 @@
 //! else can know when an answer arrived. The pace wait is read from the same clock, before the
 //! socket, because `send` is the one place every vendor call passes through.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use chrono::{DateTime, Datelike, NaiveDateTime, TimeDelta, Utc};
 use pit::ObservationTime;
 
-use crate::budget::{host_of, BudgetError, BudgetScope, Pace, RequestBudget};
+use crate::budget::{host_of, BudgetError, BudgetScope, HostKey, Pace, RequestBudget};
 use crate::clock::{Clock, Sleeper, ThreadSleeper};
 use crate::ledger::{AttemptId, SendPermit};
 use crate::request::{CredentialRef, HeaderValue, Request, SourceId};
@@ -82,7 +85,7 @@ pub enum SendFailure {
 }
 
 /// The response headers P9 keeps beside the raw blob (architecture.md section 3.9), lowercase.
-pub const KEPT_HEADERS: [&str; 7] = [
+pub const KEPT_HEADERS: [&str; 8] = [
     "content-type",
     "last-modified",
     "etag",
@@ -90,7 +93,31 @@ pub const KEPT_HEADERS: [&str; 7] = [
     "cache-control",
     "vary",
     "content-encoding",
+    RETRY_AFTER,
 ];
+
+const RETRY_AFTER: &str = "retry-after";
+/// RFC 9110 §5.6.7's HTTP-date forms: IMF-fixdate, then the obsolete RFC 850 and asctime ones.
+const HTTP_DATE_FORMATS: [&str; 3] = [
+    "%a, %d %b %Y %H:%M:%S GMT",
+    "%A, %d-%b-%y %H:%M:%S GMT",
+    "%a %b %e %H:%M:%S %Y",
+];
+/// The answers by which a server asks a client to slow down: 429 (RFC 6585 §4) and 503 (RFC 9110
+/// §15.6.4); not SEC's 403 or another 5xx (architecture.md section 10, server back-off).
+const SLOW_DOWN: [u16; 2] = [429, 503];
+/// The last year `Pace::prior` reads back: a later instant is stamped `+YYYYY-…`, which RFC 3339
+/// cannot hold, so the host pace file it reaches is refused on every later run (row R19).
+const LAST_STAMPED_YEAR: i32 = 9999;
+
+/// What the slow-down answers of one host asked of this `Wire`, for the rest of its run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Backoff {
+    /// Slow-down answers with no usable `Retry-After`; the host interval is `per_host` × 2^this.
+    doublings: u32,
+    /// The instant the last usable `Retry-After` named; no host slot is granted before it.
+    not_before: Option<DateTime<Utc>>,
+}
 
 /// The one `Content-Encoding` value ureq 3.5.2's `gzip` feature decodes (`ContentEncoding::from`
 /// matches it exactly, case included), so the body stored here is the one ureq would have stored.
@@ -352,6 +379,8 @@ pub struct Wire {
     /// Where a per-host pace file is opened, one per remote host a request names.
     store: PathBuf,
     sleeper: Box<dyn Sleeper>,
+    /// Held in memory: one `Wire` is one run, and a second process sees only the host slot granted.
+    backoff: RefCell<BTreeMap<HostKey, Backoff>>,
 }
 
 const USER_AGENT: &str = "User-Agent";
@@ -415,6 +444,7 @@ impl Wire {
             pace,
             store: store.to_path_buf(),
             sleeper,
+            backoff: RefCell::default(),
         }
     }
 
@@ -453,11 +483,19 @@ impl Wire {
         let headers = self.headers_for(request)?;
         // The pace wait is owed only by a call that is going to be made, so it comes after the
         // credential check. Unconditional, with no zero-wait branch for a test to leave uncovered.
-        self.wait_out_the_host(&request.url, clock)?;
+        let host = self.paced_host(&request.url)?;
+        self.wait_out_the_host(host.as_ref(), clock)?;
         self.sleeper.sleep(self.pace.reserve(clock.now())?);
         let requested_at = ObservationTime::new(clock.now());
         let answered = self.exchange(&request.url, &headers);
         let received_at = ObservationTime::new(clock.now());
+        if let Some(host) = host {
+            let (status, kept) = match &answered {
+                Ok((status, kept, _)) => (Some(*status), kept),
+                Err(failed) => (failed.status, &failed.headers),
+            };
+            self.heed(host, status, kept, received_at.inner());
+        }
         match answered {
             Ok((status, headers, body)) => {
                 Ok(
@@ -483,19 +521,45 @@ impl Wire {
 
     /// Taken BEFORE the per-IP slot is reserved: an IP slot reserved and then held through a long
     /// host wait would push every other host's call behind it (row R19).
-    fn wait_out_the_host(&self, url: &str, clock: &dyn Clock) -> Result<(), BudgetError> {
-        let Some(interval) = self.profile.budget.per_host else {
+    fn wait_out_the_host(
+        &self,
+        host: Option<&HostKey>,
+        clock: &dyn Clock,
+    ) -> Result<(), BudgetError> {
+        let (Some(interval), Some(host)) = (self.profile.budget.per_host, host) else {
             return Ok(());
         };
-        // ureq 3.5.2 parses a url with this same `http::Uri` and fails before any socket, so an
-        // unparseable one goes on to fail as a `Transport` its attempt row records.
-        let Some(host) = host_of(url)? else {
-            return Ok(());
-        };
-        let scope = BudgetScope::PerHost(host);
+        let backoff = self.backoff.borrow().get(host).copied().unwrap_or_default();
+        let interval = interval.saturating_mul(2_u32.saturating_pow(backoff.doublings));
+        let scope = BudgetScope::PerHost(host.clone());
         let pace = Pace::beside_the_store(&self.store, &scope, interval);
-        self.sleeper.sleep(pace.reserve(clock.now())?);
+        self.sleeper
+            .sleep(pace.reserve_not_before(clock.now(), backoff.not_before)?);
         Ok(())
+    }
+
+    /// The url's host when the profile paces hosts. ureq 3.5.2 parses a url with this same
+    /// `http::Uri` and fails before any socket, so an unparseable one goes on to fail as a
+    /// `Transport` its attempt row records.
+    fn paced_host(&self, url: &str) -> Result<Option<HostKey>, BudgetError> {
+        match self.profile.budget.per_host {
+            Some(_) => host_of(url),
+            None => Ok(None),
+        }
+    }
+
+    /// A [`SLOW_DOWN`] answer holds its host until its `Retry-After`, or without a usable one
+    /// doubles the host interval; either lasts for the rest of this `Wire`'s run (row R19).
+    fn heed(&self, host: HostKey, status: Option<u16>, kept: &Headers, received: DateTime<Utc>) {
+        if !status.is_some_and(|status| SLOW_DOWN.contains(&status)) {
+            return;
+        }
+        let mut held = self.backoff.borrow_mut();
+        let backoff = held.entry(host).or_default();
+        match retry_after(kept, received) {
+            Some(until) => backoff.not_before = Some(until),
+            None => backoff.doublings = backoff.doublings.saturating_add(1),
+        }
     }
 
     /// The socket, and the only call to the agent. Between the two clock reads in [`Wire::send`],
@@ -579,6 +643,31 @@ fn read_up_to(body: impl Read, limit: u64) -> Result<Vec<u8>, Unread> {
     }
 }
 
+/// RFC 9110 §10.2.3: the instant a `Retry-After` names, never before `received`. `None` when absent,
+/// repeated or unparseable, a negative value included, or past [`LAST_STAMPED_YEAR`].
+fn retry_after(headers: &Headers, received: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    named_instant(headers, received).filter(|until| until.year() <= LAST_STAMPED_YEAR)
+}
+
+fn named_instant(headers: &Headers, received: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let mut values = headers
+        .pairs()
+        .iter()
+        .filter(|(name, _)| name == RETRY_AFTER)
+        .map(|(_, value)| value.trim());
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return None;
+    };
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        let seconds = i64::try_from(value.parse::<u64>().ok()?).ok()?;
+        return received.checked_add_signed(TimeDelta::try_seconds(seconds)?);
+    }
+    HTTP_DATE_FORMATS
+        .iter()
+        .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok())
+        .map(|date| date.and_utc().max(received))
+}
+
 /// What [`Wire::exchange`] knew when the conversation failed.
 struct Failed {
     kind: TransportKind,
@@ -591,12 +680,13 @@ struct Failed {
 #[cfg(test)]
 mod tests {
     use super::{
-        Credentials, Headers, RawResponse, SendFailure, Timeouts, TransportError, TransportKind,
-        TransportProfile, Wire, USER_AGENT,
+        retry_after, Credentials, Headers, RawResponse, SendFailure, Timeouts, TransportError,
+        TransportKind, TransportProfile, Wire, USER_AGENT,
     };
     use crate::budget::{BudgetError, RequestBudget};
     use crate::clock::testing::{StepClock, WaitRecorder, WaitedClock};
     use crate::clock::Clock;
+    use crate::collect::Payload;
     use crate::ledger::tests::{at, Recorder};
     use crate::ledger::{AttemptSlot, SendPermit};
     use crate::provider::Provenance;
@@ -1618,7 +1708,7 @@ mod tests {
     const MIXED_HEAD: &[u8] = b"Date: Mon, 16 Nov 2026 09:42:00 GMT\r\nServer: nginx\r\n\
         Content-Type: text/html; charset=utf-8\r\nSet-Cookie: a=b\r\nVary: Accept-Encoding\r\n\
         ETag: \"caf\xe9\"\r\nVARY: User-Agent\r\nLast-Modified: Sun, 15 Nov 2026 10:00:00 GMT\r\n\
-        Cache-Control: max-age=60\r\nLocation: /elsewhere\r\nX-Other: 1\r\n";
+        Cache-Control: max-age=60\r\nLocation: /elsewhere\r\nX-Other: 1\r\nRetry-After: 120\r\n";
 
     #[test]
     fn only_the_allowlisted_headers_are_kept_lowercase_with_every_repeat() -> Checked {
@@ -1635,6 +1725,7 @@ mod tests {
                 ("etag", "\"caf\u{e9}\""),
                 ("last-modified", "Sun, 15 Nov 2026 10:00:00 GMT"),
                 ("cache-control", "max-age=60"),
+                ("retry-after", "120"),
             ])
             .as_slice()
         );
@@ -1699,6 +1790,358 @@ mod tests {
                 Some(vec![b'x'; limit].as_slice())
             )
         );
+        Ok(())
+    }
+
+    type AnswerServer = JoinHandle<std::io::Result<usize>>;
+
+    fn serve_answers(
+        heads: Vec<String>,
+    ) -> Result<(String, AnswerServer), Box<dyn std::error::Error>> {
+        serve(heads.into_iter().map(|head| (head, Vec::new())).collect())
+    }
+
+    /// Answers one connection per `(head, body)`, in order, until all are answered or
+    /// `SERVER_DEADLINE` passes, so a send that never comes cannot hang the suite.
+    fn serve(
+        answers: Vec<(String, Vec<u8>)>,
+    ) -> Result<(String, AnswerServer), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let url = format!("http://{}{REDIRECTED}", listener.local_addr()?);
+        let served = thread::spawn(move || -> std::io::Result<usize> {
+            let deadline = Instant::now() + SERVER_DEADLINE;
+            let mut answered = 0;
+            while answered < answers.len() && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _peer)) => {
+                        stream.set_nonblocking(false)?;
+                        stream.set_read_timeout(Some(TEST_TIMEOUT))?;
+                        let mut asked = Vec::new();
+                        let mut byte = [0_u8; 1];
+                        while !asked.ends_with(b"\r\n\r\n") && stream.read(&mut byte)? == 1 {
+                            asked.extend_from_slice(&byte);
+                        }
+                        let (head, body) = answers.get(answered).cloned().unwrap_or_default();
+                        let length = body.len();
+                        let answer = format!(
+                            "HTTP/1.1 {head}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                        );
+                        stream.write_all(answer.as_bytes())?;
+                        stream.write_all(&body)?;
+                        answered += 1;
+                    }
+                    Err(why) if why.kind() == ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
+                    Err(why) => return Err(why),
+                }
+            }
+            Ok(answered)
+        });
+        Ok((url, served))
+    }
+
+    /// One send to `url`: the status of an answer or of a failure's head, `None` for neither.
+    fn status_of(
+        wire: &Wire,
+        clock: &dyn Clock,
+        ordinal: u32,
+        url: &str,
+    ) -> Result<Option<u16>, Box<dyn std::error::Error>> {
+        let mut sink = Recorder::default();
+        let Some(permit) = permit(&mut sink, ordinal) else {
+            return Err("no permit".into());
+        };
+        let asked = Request {
+            url: url.to_owned(),
+            ..request()
+        };
+        match wire.send(permit, &asked, clock) {
+            Ok(answer) => Ok(Some(answer.status())),
+            Err(SendFailure::Transport(failed)) => Ok(failed.status()),
+            Err(other) => Err(format!("{other:?}").into()),
+        }
+    }
+
+    fn answered_by(served: AnswerServer) -> Result<usize, Box<dyn std::error::Error>> {
+        let Ok(answered) = served.join() else {
+            return Err("the loopback server panicked".into());
+        };
+        Ok(answered?)
+    }
+
+    fn waits_after(heads: &[&str]) -> Result<Vec<Duration>, Box<dyn std::error::Error>> {
+        let answers = heads.iter().map(|head| ((*head).to_owned(), Vec::new()));
+        waits_of(&[], answers.collect())
+    }
+
+    /// One send to each of `before`, then the loopback's `answers` in order, 60 ms apart; then one
+    /// send to `LOCALHOST`, another host, and one to `REFUSED`, the same host, `127.0.0.1`. Every
+    /// wait, in order.
+    fn waits_of(
+        before: &[&str],
+        answers: Vec<(String, Vec<u8>)>,
+    ) -> Result<Vec<Duration>, Box<dyn std::error::Error>> {
+        let store = tempfile::tempdir()?;
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let wire = Wire::with_sleeper(
+            polite_profile(),
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        let asked = answers.len();
+        let (url, served) = serve(answers)?;
+        let mut ordinal = FIRST_ATTEMPT;
+        for other in before {
+            status_of(&wire, &clock, ordinal, other)?;
+            clock.elapse(ELAPSED);
+            ordinal += 1;
+        }
+        for _ in 0..asked {
+            status_of(&wire, &clock, ordinal, &url)?;
+            clock.elapse(ELAPSED);
+            ordinal += 1;
+        }
+        status_of(&wire, &clock, ordinal, LOCALHOST)?;
+        status_of(&wire, &clock, ordinal + 1, REFUSED)?;
+        if answered_by(served)? != asked {
+            return Err("the loopback server did not answer every send".into());
+        }
+        Ok(clock.waits())
+    }
+
+    const RETRY_AFTER_SECONDS: &str = "429 Too Many Requests\r\nRetry-After: 120";
+    /// `RESERVED_AT` plus 5 minutes, as an IMF-fixdate.
+    const RETRY_AFTER_DATE: &str =
+        "503 Service Unavailable\r\nRetry-After: Tue, 10 Nov 2026 13:05:00 GMT";
+    /// An hour before `RESERVED_AT`.
+    const RETRY_AFTER_PAST: &str =
+        "503 Service Unavailable\r\nRetry-After: Tue, 10 Nov 2026 12:00:00 GMT";
+    const NO_RETRY_AFTER: &str = "429 Too Many Requests";
+    /// Negative, a word, a fraction, delta-seconds past `u64` and past year 9999, two values, which
+    /// RFC 9110's singleton field cannot hold, and a weekday chrono 0.4.45 finds off the calendar.
+    const UNUSABLE_RETRY_AFTERS: [&str; 7] = [
+        "429 Too Many Requests\r\nRetry-After: 120\r\nRetry-After: 60",
+        "429 Too Many Requests\r\nRetry-After: -5",
+        "429 Too Many Requests\r\nRetry-After: soon",
+        "429 Too Many Requests\r\nRetry-After: 1.5",
+        "429 Too Many Requests\r\nRetry-After: 99999999999999999999999",
+        PAST_YEAR_9999,
+        "429 Too Many Requests\r\nRetry-After: Mon, 10 Nov 2026 13:05:00 GMT",
+    ];
+    /// About 253,500 years: an instant `DateTime` holds and the pace file's RFC 3339 cannot.
+    const PAST_YEAR_9999: &str = "429 Too Many Requests\r\nRetry-After: 8000000000000";
+    const FORBIDDEN_WITH_RETRY_AFTER: &str = "403 Forbidden\r\nRetry-After: 120";
+    const OVER_THE_LIMIT_WITH_RETRY_AFTER: &str = "503 Service Unavailable\r\nRetry-After: 120";
+    const SERVER_ERROR_WITH_RETRY_AFTER: &str = "500 Internal Server Error\r\nRetry-After: 120";
+    /// The send to another host 60 ms after the answer owes only the per-IP pace, `EXPECTED_WAIT`,
+    /// so the next send to the answering host leaves 100 ms after it, and each wait below is less
+    /// those 100 ms: 120 s; 13:05:00; the 1 s interval; doubled once, 2 s; doubled twice, 4 s.
+    const WAIT_OUT_120_S: Duration = Duration::from_millis(119_900);
+    const WAIT_OUT_THE_DATE: Duration = Duration::from_millis(299_900);
+    const HOST_WAIT_LATER: Duration = Duration::from_millis(900);
+    const DOUBLED_ONCE_LATER: Duration = Duration::from_millis(1_900);
+    const DOUBLED_TWICE_LATER: Duration = Duration::from_millis(3_900);
+    /// The 2 s interval less the 60 ms elapsed before the second loopback send.
+    const DOUBLED_ONCE_WAIT: Duration = Duration::from_millis(1_940);
+    /// `LOCALHOST` granted at 0, the loopback's host slot at 60 ms and its 429 doubling it:
+    /// `LOCALHOST`'s own 1 s, asked at 160 ms; then the loopback's 2 s from 60 ms, asked at 1 s.
+    const OTHER_HOST_UNDOUBLED: Duration = Duration::from_millis(840);
+    const ANSWERING_HOST_DOUBLED: Duration = Duration::from_millis(1_060);
+    const RETRY_AFTER_JSON: &str = "[[\"retry-after\",\"120\"]]";
+
+    /// The waits of `waits_after` one answer, given the wait of the last send.
+    fn one_answer_then(same_host: Duration) -> Vec<Duration> {
+        vec![NO_WAIT, NO_WAIT, NO_WAIT, EXPECTED_WAIT, same_host, NO_WAIT]
+    }
+
+    /// RFC 9110 §10.2.3 delta-seconds: the next send to the host waits until 120 s after the
+    /// answer, and another host asked meanwhile keeps its own pace.
+    #[test]
+    fn a_429_with_retry_after_seconds_holds_that_host_until_then_and_no_other() -> Checked {
+        assert_eq!(
+            waits_after(&[RETRY_AFTER_SECONDS])?,
+            one_answer_then(WAIT_OUT_120_S)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_503_with_an_http_date_holds_that_host_until_that_date() -> Checked {
+        assert_eq!(
+            waits_after(&[RETRY_AFTER_DATE])?,
+            one_answer_then(WAIT_OUT_THE_DATE)
+        );
+        Ok(())
+    }
+
+    /// A date already past is a wait of 0, and a usable value, so the interval is not doubled.
+    #[test]
+    fn a_retry_after_date_in_the_past_holds_nothing_and_doubles_nothing() -> Checked {
+        assert_eq!(
+            waits_after(&[RETRY_AFTER_PAST])?,
+            one_answer_then(HOST_WAIT_LATER)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_429_without_retry_after_doubles_the_host_interval_at_each_answer() -> Checked {
+        assert_eq!(
+            waits_after(&[NO_RETRY_AFTER, NO_RETRY_AFTER])?,
+            vec![
+                NO_WAIT,
+                NO_WAIT,
+                DOUBLED_ONCE_WAIT,
+                NO_WAIT,
+                NO_WAIT,
+                EXPECTED_WAIT,
+                DOUBLED_TWICE_LATER,
+                NO_WAIT
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unparseable_or_negative_retry_after_is_absent_so_the_interval_doubles() -> Checked {
+        for head in UNUSABLE_RETRY_AFTERS {
+            assert_eq!(
+                waits_after(&[head])?,
+                one_answer_then(DOUBLED_ONCE_LATER),
+                "{head}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Only 429 and 503 ask for less: a 500 carrying a `Retry-After` leaves the pace alone.
+    #[test]
+    fn a_500_is_no_slow_down_answer_even_with_a_retry_after() -> Checked {
+        assert_eq!(
+            waits_after(&[SERVER_ERROR_WITH_RETRY_AFTER])?,
+            one_answer_then(HOST_WAIT_LATER)
+        );
+        Ok(())
+    }
+
+    /// P9: a 429's `Retry-After` reaches the `payloads` row's headers, `Payload::stored`'s output.
+    #[test]
+    fn a_429_s_retry_after_is_kept_in_the_payload_headers() -> Checked {
+        let (url, served) = serve_answers(vec![RETRY_AFTER_SECONDS.to_owned()])?;
+        let store = tempfile::tempdir()?;
+        let mut sink = Recorder::default();
+        let Some(permit) = permit(&mut sink, FIRST_ATTEMPT) else {
+            return Err("no permit".into());
+        };
+        let asked = Request { url, ..request() };
+        let clock = clock_over(&[RESERVED_AT]);
+        let answer = match wire(held(), store.path(), &WaitRecorder::default())
+            .send(permit, &asked, &clock)
+        {
+            Ok(answer) => Ok(answer),
+            Err(SendFailure::Transport(failed)) => Err(failed),
+            Err(other) => return Err(format!("{other:?}").into()),
+        };
+        let stored = Payload::stored(&asked, &answer, |_| Ok::<_, String>(String::new()))?;
+        assert_eq!(
+            (
+                answered_by(served)?,
+                stored.map(|payload| payload.headers.to_json())
+            ),
+            (1, Some(RETRY_AFTER_JSON.to_owned()))
+        );
+        Ok(())
+    }
+
+    /// RFC 9110 §5.6.7: a recipient reads all three HTTP-date forms; a past one is the answer's
+    /// own instant, a wait of 0.
+    #[test]
+    fn a_retry_after_in_each_http_date_form_is_read_as_one_instant() -> Checked {
+        let received: chrono::DateTime<chrono::Utc> = RESERVED_AT.parse()?;
+        let expected: chrono::DateTime<chrono::Utc> = "1994-11-06T08:49:37Z".parse()?;
+        let of = |value: &str, at| retry_after(&Headers::new(pairs(&[("retry-after", value)])), at);
+        let read: Vec<_> = [
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+            "Sunday, 06-Nov-94 08:49:37 GMT",
+            "Sun Nov  6 08:49:37 1994",
+        ]
+        .into_iter()
+        .map(|value| of(value, expected))
+        .collect();
+        assert_eq!(
+            (read, of("Sun, 06 Nov 1994 08:49:37 GMT", received)),
+            (vec![Some(expected); 3], Some(received))
+        );
+        Ok(())
+    }
+
+    /// The doubling binds the answering host alone: another host asked before keeps its 1 s.
+    #[test]
+    fn a_doubled_interval_slows_only_the_host_that_answered() -> Checked {
+        let answers = vec![(NO_RETRY_AFTER.to_owned(), Vec::new())];
+        assert_eq!(
+            waits_of(&[LOCALHOST], answers)?,
+            vec![
+                NO_WAIT,
+                NO_WAIT,
+                NO_WAIT,
+                EXPECTED_WAIT,
+                OTHER_HOST_UNDOUBLED,
+                NO_WAIT,
+                ANSWERING_HOST_DOUBLED,
+                NO_WAIT
+            ]
+        );
+        Ok(())
+    }
+
+    /// SEC's 403 is also its S3 `AccessDenied` for a closed day, so it never slows edgar (§10).
+    #[test]
+    fn a_403_is_no_slow_down_answer_even_with_a_retry_after() -> Checked {
+        assert_eq!(
+            waits_after(&[FORBIDDEN_WITH_RETRY_AFTER])?,
+            one_answer_then(HOST_WAIT_LATER)
+        );
+        Ok(())
+    }
+
+    /// A failure that read a head is heeded as an answer: a 503 whose body is over the limit.
+    #[test]
+    fn a_503_whose_body_is_over_the_limit_still_holds_its_host() -> Checked {
+        let over = usize::try_from(TEST_BODY_LIMIT * 2)?;
+        let answers = vec![(OVER_THE_LIMIT_WITH_RETRY_AFTER.to_owned(), vec![b'x'; over])];
+        assert_eq!(waits_of(&[], answers)?, one_answer_then(WAIT_OUT_120_S));
+        Ok(())
+    }
+
+    /// A hold past year 9999 would be stamped `+YYYYY-…` into the host pace file, which every
+    /// later run then refuses as `Unreadable`; read as absent, the next run still sends.
+    #[test]
+    fn a_retry_after_past_year_9999_leaves_the_host_pace_file_readable() -> Checked {
+        let store = tempfile::tempdir()?;
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let wire = Wire::with_sleeper(
+            polite_profile(),
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        let (url, served) = serve_answers(vec![PAST_YEAR_9999.to_owned()])?;
+        status_of(&wire, &clock, FIRST_ATTEMPT, &url)?;
+        status_of(&wire, &clock, SECOND_ATTEMPT, REFUSED)?;
+        let rerun = Wire::with_sleeper(
+            polite_profile(),
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        let again =
+            status_of(&rerun, &clock, FIRST_ATTEMPT, REFUSED).map_err(|why| why.to_string());
+        assert_eq!((answered_by(served)?, again), (1, Ok(None)));
         Ok(())
     }
 }
