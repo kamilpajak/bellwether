@@ -589,7 +589,7 @@ to pick.
 
 - **No service contracts.** API surfaces and error codes are unspecified; the outbox payload is architecture §6.
   "High-level architecture" one level down is missing.
-- **No numbers for N1–N5**, including the backup for an archive the design calls irreplaceable. N5 has one rough datum: a full panel rebuild over 87 lake partitions completed in minutes rather than hours, timed by wall clock only, so the order is measured and the number is not. N4 (retention) is now partly answered by D-2: the archive holds full text, so the question is how long and on what medium, not whether.
+- **No numbers for N1–N5**, including the backup for an archive the design calls irreplaceable. N5 has one rough datum: a full panel rebuild over 87 lake partitions completed in minutes rather than hours, timed by wall clock only, so the order is measured and the number is not. N4 (retention) is now partly answered by D-2: the archive holds full text, so the question is how long and on what medium, not whether. For the payload as received (L2) the owner answered on 2026-11-16: it never expires (architecture §3.9).
 - **No architecture gates.** 22 tests currently enforce repo-wide rules (layer imports, per-vendor
   clients, language) from one place; a successor repo starts with none, and a gate nobody replaced
   is a rule that quietly stopped applying. They must be written at the start, not later.
