@@ -43,9 +43,18 @@ pub struct Robots {
     crawl_delay: Option<Duration>,
 }
 
+/// One group as it is read. Its Crawl-delays wait for the group's end, because a later
+/// `user-agent: *` line of the same run still joins it.
+#[derive(Default)]
+struct Group {
+    every_agent: bool,
+    delays: Vec<String>,
+}
+
 impl Robots {
-    /// RFC 9309 grouping: a run of `user-agent` lines opens a group and the next rule line closes
-    /// the run; a rule before any `user-agent` line belongs to no group. Unknown lines are ignored.
+    /// RFC 9309 section 2.2 grouping: a run of `user-agent` lines opens a group and the next
+    /// `Allow`/`Disallow` closes the run; Crawl-delay and unknown lines close nothing (section
+    /// 2.2.4). A rule before any `user-agent` line belongs to no group.
     pub fn parse(body: &[u8]) -> Result<Self, RobotsError> {
         let text = std::str::from_utf8(body).map_err(|_| RobotsError::NotUtf8)?;
         let text = text.strip_prefix(BYTE_ORDER_MARK).unwrap_or(text);
@@ -53,7 +62,8 @@ impl Robots {
             rules: Vec::new(),
             crawl_delay: None,
         };
-        let (mut named_an_agent, mut in_agent_run, mut every_agent) = (false, false, false);
+        let mut group = Group::default();
+        let (mut named_an_agent, mut in_agent_run) = (false, false);
         for line in text.split(LINE_ENDS) {
             let line = line.split(COMMENT).next().unwrap_or("");
             let Some((key, value)) = line.split_once(':') else {
@@ -62,38 +72,43 @@ impl Robots {
             let value = value.trim();
             match key.trim().to_ascii_lowercase().as_str() {
                 USER_AGENT => {
-                    named_an_agent = true;
                     if !in_agent_run {
-                        every_agent = false;
+                        robots.end(&std::mem::take(&mut group))?;
                         in_agent_run = true;
                     }
-                    every_agent |= value == EVERY_AGENT;
+                    named_an_agent = true;
+                    group.every_agent |= value == EVERY_AGENT;
                 }
                 rule @ (ALLOW | DISALLOW) => {
                     in_agent_run = false;
-                    if every_agent && !value.is_empty() {
+                    if group.every_agent && !value.is_empty() {
                         robots.rules.push(PathRule {
                             allow: rule == ALLOW,
                             pattern: value.to_owned(),
                         });
                     }
                 }
-                CRAWL_DELAY => {
-                    in_agent_run = false;
-                    if every_agent {
-                        let delay = seconds(value)?;
-                        robots.crawl_delay =
-                            Some(robots.crawl_delay.map_or(delay, |d| d.max(delay)));
-                    }
-                }
+                CRAWL_DELAY => group.delays.push(value.to_owned()),
                 _ => {}
             }
         }
+        robots.end(&group)?;
         if named_an_agent {
             Ok(robots)
         } else {
             Err(RobotsError::NoUserAgentLine)
         }
+    }
+
+    /// A group's Crawl-delays count only when it names `*`; the largest of every `*` group wins.
+    fn end(&mut self, group: &Group) -> Result<(), RobotsError> {
+        if group.every_agent {
+            for value in &group.delays {
+                let delay = seconds(value)?;
+                self.crawl_delay = Some(self.crawl_delay.map_or(delay, |d| d.max(delay)));
+            }
+        }
+        Ok(())
     }
 
     /// The largest Crawl-delay the `*` groups state; `None` when they state none.
@@ -325,6 +340,33 @@ mod tests {
             Robots::parse(&[b'U', 0xff, b'\n']),
             Err(RobotsError::NotUtf8)
         );
+        Ok(())
+    }
+
+    /// Owner decision 2 (B2): a Crawl-delay line does not end a `user-agent` run, as RFC 9309
+    /// section 2.2.4 and Google's robotstxt parser read it. Mutations 2026-11-16, the run ended at
+    /// a Crawl-delay again: red; delays applied before the group ends: red (the bingbot-first case).
+    #[test]
+    fn a_crawl_delay_does_not_end_a_user_agent_run() -> TestResult {
+        let star_first = Robots::parse(
+            b"User-agent: *\nCrawl-delay: 30\nUser-agent: bingbot\nDisallow: /prywatne/\n",
+        )?;
+        let star_second = Robots::parse(
+            b"User-agent: bingbot\nCrawl-delay: 30\nUser-agent: *\nDisallow: /prywatne/\n",
+        )?;
+        let read = [&star_first, &star_second].map(|robots| {
+            (
+                robots.crawl_delay(),
+                robots.allows("/prywatne/x"),
+                robots.allows("/public"),
+            )
+        });
+        let expected = (Some(Duration::from_secs(30)), false, true);
+        assert_eq!(read, [expected, expected]);
+        // Only a blank line and the delay sit between `*` and googlebot, so its `Disallow: /`
+        // is `*`'s too; before B2 it was googlebot's alone.
+        let shared = Robots::parse(&fixture("synthetic_star_shares_a_group.txt")?)?;
+        assert!(!shared.allows("/news"));
         Ok(())
     }
 
