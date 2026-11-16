@@ -1145,10 +1145,11 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
 ## 11. `open-web-feed` — our own forward news feed (decided 2026-11-14; §11.5 steps 1 to 5 are built and step 6 has begun with PRN; `newsvault collect` drives it)
 
-- §11.1 and §11.2 hold owner decisions beside records of what was built or measured; a line with no `Built` or `Measured` marker is not thereby an owner decision.
-  - Owner decisions: the 2026-11-14 design; the `ValidSource` cells of §11.1's valid-time table and the bullet below that table, both 2026-11-15; each line that names an owner decision with its date (the held table's 2026-11-15 rows).
-  - Records: the lines marked `Built 2026-11-15`, `Built 2026-11-16` or `Measured 2026-11-16`, and unmarked lines added from 2026-11-15 on (the robots tests bullet, the cost-bound table, the PRN rows of the depth table); the commit that added a line dates it.
-  - The choices among the records that the owner did not make: §10's builder-defaults tables of 2026-11-15 (steps 2, 3, 4) and 2026-11-16 (step 6).
+- §11.1 and §11.2 hold owner decisions beside builder records. A statement's content decides its group, never `git blame`: blame dates a line by its last edit, and `fea3734` (2026-11-15, "compress §10 and §11") rewrote lines the owner decided on 2026-11-14.
+  - Owner decisions of 2026-11-14: the statements of §11.1 and §11.2 as they stand in `50c1705`, wherever they now stand and however reworded. `50c1705` is the last commit dated 2026-11-14 (author date, +0100) that changed §11.1 or §11.2, and its §11 opens "Every line in §11.1 and §11.2 is an owner decision of 2026-11-14". Check: `git show 50c1705:docs/design/architecture.md`. Two examples: "Both poll periods are the owner's choice" and "Follow-up cap: 150 per invocation" (§11.2), which blame dates 2026-11-16 and 2026-11-15.
+  - Later owner decisions, each dated where it stands: the `ValidSource` cells of the CNW, Yahoo and Fool/BI rows of §11.1's valid-time table, and the bullet below that table with its sub-bullets (2026-11-15, `d0b414e` and `800a17a`); decisions 6 and 7 (§10, 2026-11-15) where §11.1 applies them: the held table's two `owner decision 2026-11-15` rows, the two held-read sub-bullets marked `owner decision, §10`, and the 408 of the Classify bullet.
+  - Builder records: every other line, and what a line adds to an owner statement (a test, a mutation, a file or line reference, a count, a measured value). `Built` and `Measured` mark a record where present; a line without them is not thereby an owner decision.
+  - The choices among the records that the owner did not make: §10's tables of builder defaults, 2026-11-15 (steps 2, 3 and 4, and inside decisions 6 and 7) and 2026-11-16 (step 6).
 
 | term | meaning |
 |---|---|
@@ -1213,15 +1214,15 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
     - Built 2026-11-16, not in PRN's body: 302939553's section opens with a `<ul>` of 3 summary `<li>` before its first `<p>`, and paragraph `p` does not read them; `<article>` did not either. Owner choice, open.
   - Depth bound: `PageTooDeep` past 112, read by `depth::nesting_depth` from the source tags before html5ever parses. html5ever is superlinear in nesting: 2,000 / 4,000 / 8,000 nested `<div>` parsed in 0.011 / 0.027 / 0.070 s (release, 2026-11-15), about ×2.5 per doubling; a second run that day: 0.009 / 0.024 / 0.068 s.
 
-| quantity, 2026-11-15 unless the row names another date, release build, one run each | value |
-|---|---|
-| `nesting_depth` of `article_3403075.html` (trimmed); html5ever's element depth of it | 7; 7 |
-| untrimmed release 3403075, the 2026-11-14 probe body (71,657 B, not kept in the repository): `nesting_depth`; html5ever's element depth (debug test build) | 14; 14 |
-| 2026-11-16, debug test build: untrimmed PRN 302939553 / 302938569, the 2026-11-14 probe bodies (not kept): `nesting_depth`; html5ever's element depth | 21 / 21; 21 / 21 |
-| 2026-11-16, debug test build: trimmed `prn/article_302939553.html` / `prn/article_302938569.html`: `nesting_depth`; html5ever's element depth | 10 / 9; 10 / 9 |
-| bound: 14 × 8, so 8 times the untrimmed GNW page's depth; not recomputed for PRN, whose 21 is below it | 112 |
-| a 2 MiB page of closed 112-deep `<div>` blocks (2,096,864 B): scan / parse | 0.007 s / 0.061 s |
-| a 2 MiB page of 419,430 open `<div>`: scan, before the parse is refused | 0.008 s |
+    | quantity, 2026-11-15 unless the row names another date, release build, one run each | value |
+    |---|---|
+    | `nesting_depth` of `article_3403075.html` (trimmed); html5ever's element depth of it | 7; 7 |
+    | untrimmed release 3403075, the 2026-11-14 probe body (71,657 B, not kept in the repository): `nesting_depth`; html5ever's element depth (debug test build) | 14; 14 |
+    | 2026-11-16, debug test build: untrimmed PRN 302939553 / 302938569, the 2026-11-14 probe bodies (not kept): `nesting_depth`; html5ever's element depth | 21 / 21; 21 / 21 |
+    | 2026-11-16, debug test build: trimmed `prn/article_302939553.html` / `prn/article_302938569.html`: `nesting_depth`; html5ever's element depth | 10 / 9; 10 / 9 |
+    | bound: 14 × 8, so 8 times the untrimmed GNW page's depth; not recomputed for PRN, whose 21 is below it | 112 |
+    | a 2 MiB page of closed 112-deep `<div>` blocks (2,096,864 B): scan / parse | 0.007 s / 0.061 s |
+    | a 2 MiB page of 419,430 open `<div>`: scan, before the parse is refused | 0.008 s |
 
     - The scan's first version was itself quadratic: the same 2 MiB page took 346.6 s, because each tag searched the open stack for `svg`/`math`; each entry now carries that count.
     - The count is meant never to fall below html5ever's depth less the implied `html` and `body`: an end tag closes its element only when it is on top or below implied-end elements (`p`, `li`, ...) alone, and is otherwise ignored, as html5ever ignores an end tag naming no open element; raw text is skipped except inside `svg`/`math`; a comment ends where html5ever ends it (`<!-->`, `--!>`); a `>` inside a quoted attribute does not end a tag. `depth::tests::each_rule_of_the_scan_counts_its_own_row`, 17 rows; 14 mutations 2026-11-15, one per rule: 14 red; the stray-end-tag rule's mutation (the implied-end elements popped although the name is not open): red on its 2 rows.
