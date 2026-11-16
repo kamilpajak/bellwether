@@ -104,7 +104,7 @@ const HTTP_DATE_FORMATS: [&str; 3] = [
     "%a %b %e %H:%M:%S %Y",
 ];
 /// The answers by which a server asks a client to slow down: 429 (RFC 6585 §4) and 503 (RFC 9110
-/// §15.6.4), as Google's crawler reads them (architecture.md section 10, server back-off).
+/// §15.6.4); not SEC's 403 or another 5xx (architecture.md section 10, server back-off).
 const SLOW_DOWN: [u16; 2] = [429, 503];
 
 /// What the slow-down answers of one host asked of this `Wire`, for the rest of its run.
