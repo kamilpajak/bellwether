@@ -1,4 +1,4 @@
-//! The seven digests, each a field list over the form in `lib.rs`. `docs/design/architecture.md`
+//! The eight digests, each a field list over the form in `lib.rs`. `docs/design/architecture.md`
 //! section 2's rows state the order of `item_id`, `story_id` and `snapshot_id`, section 3.2's that
 //! of `filter_params` and `result_digest`; only the code below states `doc_id` and `attempt_id`.
 
@@ -118,11 +118,28 @@ pub fn snapshot_id(
     )
 }
 
+/// architecture.md section 2 row `extract_version`: the rules file's digest, then each extraction
+/// source file's name and digest, ordered by name over raw UTF-8 bytes.
+pub fn extract_version(
+    rules_version: &str,
+    sources: &[(&str, &str)],
+) -> Result<Digest, CanonError> {
+    let mut ordered = sources.to_vec();
+    ordered.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    let mut fields = Vec::with_capacity(1 + ordered.len() * 2);
+    fields.push(Field::Text(rules_version));
+    for (name, digest) in ordered {
+        fields.push(Field::Text(name));
+        fields.push(Field::Text(digest));
+    }
+    sha256_canon(Domain::ExtractVersion, &fields)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        attempt_id, doc_id, filter_params, item_id, result_digest, snapshot_id, story_id,
-        ItemFields, Param, ParamValue,
+        attempt_id, doc_id, extract_version, filter_params, item_id, result_digest, snapshot_id,
+        story_id, ItemFields, Param, ParamValue,
     };
     use crate::{CanonError, Digest, Stamp};
     use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
@@ -142,7 +159,7 @@ mod tests {
     const MIDNIGHT_MICROS: i64 = 1_782_864_000_000_000;
     /// Every file in `vectors/` is read by the loop below; the count is here so that deleting one
     /// is a failure rather than a smaller pass.
-    const VECTOR_COUNT: usize = 16;
+    const VECTOR_COUNT: usize = 17;
 
     fn at(micros: i64) -> DateTime<Utc> {
         DateTime::UNIX_EPOCH + TimeDelta::microseconds(micros)
@@ -356,6 +373,17 @@ mod tests {
                     return "unreadable: cutoff".to_string();
                 };
                 snapshot_id(cutoff, &strings(input, "item_ids"))
+            }
+            "extract_version" => {
+                let Some(sources) = input["sources"].as_array().and_then(|members| {
+                    members
+                        .iter()
+                        .map(|member| Some((member["name"].as_str()?, member["sha256"].as_str()?)))
+                        .collect::<Option<Vec<_>>>()
+                }) else {
+                    return "unreadable: sources".to_string();
+                };
+                extract_version(text(input, "rules_version"), &sources)
             }
             other => return format!("unreadable: digest {other}"),
         };

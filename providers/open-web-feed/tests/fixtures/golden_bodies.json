@@ -1,0 +1,16 @@
+{
+  "bodies": {
+    "gnw/article_3403075.html": "702c4e7023122be9aca0773503948c876f81d42db7f04a384d43d4867d220e91",
+    "gnw/synthetic_canonical_differs.html": "312aeb12f555c77d547898e7a040e18cc1b62718e3971362324b0d70538cf08b",
+    "gnw/synthetic_lists_tables_and_addresses.html": "19ea5faf11614dd6173333de8de746983a2df6498a0d5936c816eb981b117df2",
+    "gnw/synthetic_relative_canonical.html": "06807c227b19b3899f8eb6941d2599581bbd62997fbbc687d481ada5223bf249",
+    "gnw/synthetic_script_and_symbol_paragraphs.html": "31cf545a878cf251517e18064d04daa77a847d9f40e2af899deeb419168d9c30",
+    "prn/article_302938569.html": "213ae1e8e473ba9eed15935cb5b59a27c0710854e610ebadf4159c5fe7145db8",
+    "prn/article_302939553.html": "672a743752a3290ce4374534b2d94aae3111f1253e8a13bc6d804cf499149c43",
+    "prn/synthetic_addresses.html": "046478ab3cbf7d4939c8ac04cd3352cb65f917362ed9fafb782cfcf0d5953cc4",
+    "prn/synthetic_heading_line_break.html": "799cabad20e491595a87642d2a5b5df3dde2f7aaef8100be9ca8453665cae33c",
+    "prn/synthetic_lists.html": "4200e33d8e922413c9271d0fdceb43f8815a210d18f8b596ecea7efde9dde01d",
+    "prn/synthetic_tables.html": "13fe1e5d451f5aadc5a093d0c407ed4750aa9923a25bee6cef0e9297897326ac"
+  },
+  "extract_version": "e7f6fc65f9d5289cb0676f8f4a2b670d14b5bb3882b3e0185cb6fa518a2745a1"
+}

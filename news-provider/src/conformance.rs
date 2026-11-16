@@ -305,6 +305,7 @@ mod tests {
                 universe_version: FileDigest::of(ROSTER),
                 listed_date: None,
                 hosts_version: None,
+                extract_version: None,
             }
         }
 

@@ -50,7 +50,7 @@ pub(crate) struct Rule {
     pub(crate) rewrite_hosts: BTreeMap<String, String>,
     pub(crate) title: Pick,
     pub(crate) canonical: Pick,
-    /// The article container; its `paragraph` descendants are the body (section 11.6's rule).
+    /// The article container; its outermost `paragraph` matches and table rows are the body.
     pub(crate) container: Selector,
     pub(crate) paragraph: Selector,
 }

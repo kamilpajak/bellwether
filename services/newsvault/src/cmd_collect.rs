@@ -321,6 +321,9 @@ pub struct Opened {
     pub provider: Box<dyn Provider>,
     /// sha256 of the hosts file the provider was opened on; `None` for a provider with none.
     pub hosts_version: Option<String>,
+    /// The provider's `extract_version` (architecture.md section 2); `None` for a provider that does
+    /// not version its extraction code.
+    pub extract_version: Option<String>,
     /// Every admitted hosts-file row as `collect` checks it; empty for a provider with none.
     pub admitted_robots: Vec<AdmittedRobots>,
     pub lag: Option<AppliedLag>,
@@ -353,6 +356,7 @@ impl std::fmt::Debug for Opened {
         f.debug_struct("Opened")
             .field("registered", &self.registered)
             .field("hosts_version", &self.hosts_version)
+            .field("extract_version", &self.extract_version)
             .field("admitted_robots", &self.admitted_robots)
             .field("lag", &self.lag)
             .finish_non_exhaustive()
@@ -428,7 +432,7 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
             source_id: registered.source(),
         });
     }
-    let (provider, hosts_version, admitted_robots, lag): (Box<dyn Provider>, _, _, _) =
+    let (provider, file_versions, admitted_robots, lag): (Box<dyn Provider>, _, _, _) =
         match registered {
             Registered::EdgarPress => {
                 let roster = required(ask.roster.as_ref(), roster.0, registered)?;
@@ -436,11 +440,11 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
                 match lag_of(ask, registered)? {
                     Some((applied, measured)) => (
                         Box::new(provider.with_observation_lag(measured)),
-                        None,
+                        (None, None),
                         Vec::new(),
                         Some(applied),
                     ),
-                    None => (Box::new(provider), None, Vec::new(), None),
+                    None => (Box::new(provider), (None, None), Vec::new(), None),
                 }
             }
             Registered::OpenWebWires => {
@@ -454,6 +458,7 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
                 let hosts = required(ask.hosts.as_ref(), hosts.0, registered)?;
                 let provider = OpenWebFeed::open(hosts, &ask.rules, &ask.contact)?;
                 let version = provider.hosts_version().hex().to_owned();
+                let extraction = provider.extract_version().hex().to_owned();
                 let admitted = admitted_robots(&ask.store, &provider)?;
                 let delays = admitted
                     .iter()
@@ -466,16 +471,18 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
                     .collect();
                 (
                     Box::new(provider.with_crawl_delays(delays)),
-                    Some(version),
+                    (Some(version), Some(extraction)),
                     admitted,
                     None,
                 )
             }
         };
+    let (hosts_version, extract_version) = file_versions;
     Ok(Opened {
         registered,
         provider,
         hosts_version,
+        extract_version,
         admitted_robots,
         lag,
     })
@@ -920,6 +927,8 @@ fn envelope_of(
         // Which hosts and paces this run was allowed to use (section 11.1); null for a provider
         // that reads no hosts file.
         "hosts_version": opened.hosts_version,
+        // Rules plus extraction code (section 2); null for a provider that does not version its code.
+        "extract_version": opened.extract_version,
         // What dated this run's archive windows, or null. Three fields and not one: the digest
         // names the file, the probe id names the measurement inside it, and the seconds are the
         // quantity every backfilled observation in this run is publication plus.
@@ -1354,6 +1363,7 @@ mod tests {
             universe_version: FileDigest::of(b"{}"),
             listed_date: None,
             hosts_version: None,
+            extract_version: None,
         };
         let at = ObservationTime::new(instant(FETCHED_AT));
         let slot = AttemptSlot::open(&mut store, &request, None, &RunId::new(RUN), 0, at)?;

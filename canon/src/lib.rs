@@ -69,6 +69,7 @@ pub enum Domain {
     FilterParams,
     ResultDigest,
     SnapshotId,
+    ExtractVersion,
 }
 
 impl Domain {
@@ -82,6 +83,7 @@ impl Domain {
             Self::FilterParams => "filter_params",
             Self::ResultDigest => "result_digest",
             Self::SnapshotId => "snapshot_id",
+            Self::ExtractVersion => "extract_version",
         }
     }
 }

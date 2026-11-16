@@ -217,6 +217,7 @@ impl EdgarPress {
             universe_version: self.roster.version.clone(),
             listed_date: None,
             hosts_version: None,
+            extract_version: None,
         }
     }
 
@@ -234,6 +235,7 @@ impl EdgarPress {
             universe_version: self.roster.version.clone(),
             listed_date: Some(row.filed.clone()),
             hosts_version: None,
+            extract_version: None,
         }
     }
 

@@ -801,6 +801,7 @@ fn two_identical_collects_leave_the_right_events_one_blob_set_and_items_new_one_
             answer.envelope["items_committed"].as_u64(),
             answer.envelope["blobs_indexed"].as_u64(),
         ));
+        assert!(answer.envelope["extract_version"].is_null());
     }
     assert_eq!(
         counted,
@@ -829,6 +830,14 @@ fn two_identical_collects_leave_the_right_events_one_blob_set_and_items_new_one_
         |row| row.get(0),
     )?;
     assert_eq!(items_new, i64::from(IN_UNIVERSE_FILINGS));
+    // `extract_version` NULL on every edgar-press attempt (section 3.2). Mutation 2026-11-16, both
+    // edgar `Request` literals given a version: red.
+    let versioned: i64 = db.query_row(
+        "SELECT COUNT(*) FROM attempts WHERE extract_version IS NOT NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(versioned, 0);
     Ok(())
 }
 
@@ -953,6 +962,7 @@ fn an_attempt_a_dead_run_left_open_is_closed_interrupted_by_the_next_run() -> Te
         universe_version: provider.provider.universe_version(),
         listed_date: None,
         hosts_version: None,
+        extract_version: None,
     };
     let orphan = AttemptSlot::open(
         &mut store,
