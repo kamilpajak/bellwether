@@ -1438,8 +1438,10 @@ struct TwoPolls {
     first_attempt: (Option<i64>, String),
     reported: Vec<Option<i64>>,
     exits: (Exit, Exit),
-    /// Release 0's first link row: truncated, the blob's stored bytes, and its digest.
+    /// Release 0's first link row: truncated, the blob's stored bytes, its digest, and headers.
     first_payload: Option<LinkedBlob>,
+    /// The first envelope's `blobs_written` and `bytes_written`.
+    first_written: (u64, u64),
 }
 
 /// The 301's body: the loopback server's own short one, or one byte over the profile's limit.
@@ -1491,11 +1493,24 @@ fn polled_twice_through_a_redirect(moved_body: MovedBody) -> Result<TwoPolls, Bo
         reported,
         exits: (first_answer.exit, second_exit),
         first_payload: first_payload_of(root.path(), 0)?,
+        first_written: (
+            first_answer.envelope["blobs_written"]
+                .as_u64()
+                .ok_or("no blobs_written")?,
+            first_answer.envelope["bytes_written"]
+                .as_u64()
+                .ok_or("no bytes_written")?,
+        ),
     })
 }
 
-/// A link row: truncated, the stored blob's bytes, and its digest.
-type LinkedBlob = (bool, i64, String);
+/// A link row: truncated, the stored blob's bytes, its digest, and its headers.
+type LinkedBlob = (bool, i64, String, String);
+
+/// The loopback 301's link row headers: its `Content-Type`, never its `Location` (section 11.2).
+fn moved_headers() -> String {
+    format!(r#"[["content-type","{}"]]"#, loopback::MOVED_CONTENT_TYPE)
+}
 
 /// A release's first link row.
 fn first_payload_of(root: &Path, release: usize) -> Result<Option<LinkedBlob>, Box<dyn Error>> {
@@ -1504,12 +1519,12 @@ fn first_payload_of(root: &Path, release: usize) -> Result<Option<LinkedBlob>, B
     let story = digest(canon::digest::story_id(SOURCE, key)).ok_or("story id")?;
     Ok(db
         .query_row(
-            "SELECT p.truncated, b.bytes, p.raw_blob FROM attempts a
+            "SELECT p.truncated, b.bytes, p.raw_blob, p.headers FROM attempts a
                JOIN payloads p ON p.attempt_id = a.attempt_id
                JOIN blobs b ON b.digest = p.raw_blob
               WHERE a.story_id = ?1 ORDER BY a.opened_at, a.attempt_id LIMIT 1",
             [&story],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?)
 }
@@ -1536,7 +1551,8 @@ fn a_document_answered_with_a_redirect_is_fetched_again_by_the_next_poll() -> Te
         Some((
             false,
             MOVED_BODY_BYTES,
-            canon::FileDigest::of(MOVED_BODY).hex().to_owned()
+            canon::FileDigest::of(MOVED_BODY).hex().to_owned(),
+            moved_headers()
         ))
     );
     assert_eq!(
@@ -1577,7 +1593,8 @@ fn a_redirect_whose_body_is_over_the_limit_is_fetched_again_by_the_next_poll() -
         Some((
             true,
             OPEN_WEB_BODY_LIMIT,
-            canon::FileDigest::of(&vec![b'x'; limit]).hex().to_owned()
+            canon::FileDigest::of(&vec![b'x'; limit]).hex().to_owned(),
+            moved_headers()
         ))
     );
     assert_eq!(
@@ -1601,6 +1618,17 @@ fn a_redirect_whose_body_is_over_the_limit_is_fetched_again_by_the_next_poll() -
             (Exit::PartialCollect, Exit::VendorRefusedAll),
         )
     );
+    Ok(())
+}
+
+/// Section 3.9: the run envelope's `blobs_written` and `bytes_written` count a body cut at the
+/// limit, so the two runs differ only by the 301 body's length.
+#[test]
+fn a_body_cut_at_the_limit_counts_in_the_envelope_s_blobs_and_bytes_written() -> TestResult {
+    let short = polled_twice_through_a_redirect(MovedBody::Short)?.first_written;
+    let over = polled_twice_through_a_redirect(MovedBody::OverTheLimit)?.first_written;
+    let grown = u64::try_from(OPEN_WEB_BODY_LIMIT - MOVED_BODY_BYTES)?;
+    assert_eq!(over, (short.0, short.1 + grown));
     Ok(())
 }
 

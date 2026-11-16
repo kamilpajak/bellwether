@@ -468,8 +468,8 @@ fn refreshed_through_a_redirect(body_over_the_limit: bool) -> Result<Refreshed, 
     ))
 }
 
-/// Both refusals below leave this, beside the one payload row each links: the loopback 301
-/// carries no allowlisted header, and its `Location` is not kept (section 11.2).
+/// Both refusals below leave this, beside the one payload row each links: the loopback 301's
+/// `Content-Type` is kept, whole body or cut, and its `Location` is not (section 11.2).
 fn refused_robots_redirect(truncated: bool, bytes: i64) -> Refreshed {
     (
         0,
@@ -485,7 +485,11 @@ fn refused_robots_redirect(truncated: bool, bytes: i64) -> Refreshed {
         EXIT_PARTIAL,
         vec![GNW_ROBOTS.to_owned()],
         vec![ROBOTS_PATH.to_owned()],
-        vec![(truncated, bytes, "[]".to_owned())],
+        vec![(
+            truncated,
+            bytes,
+            format!(r#"[["content-type","{}"]]"#, loopback::MOVED_CONTENT_TYPE),
+        )],
     )
 }
 

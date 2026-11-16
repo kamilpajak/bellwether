@@ -17,6 +17,8 @@ use news_provider::{Clock, Exchange, RawResponse, Request, SendFailure, SendPerm
 /// Where the 301 points: a path on the same server, so a followed hop is seen by it.
 pub const REDIRECT_TARGET: &str = "/elsewhere";
 const MOVED_BODY: &[u8] = b"moved";
+/// The 301's one allowlisted header (P9), so a link row shows what its head kept.
+pub const MOVED_CONTENT_TYPE: &str = "text/plain";
 const ACCEPT_POLL: Duration = Duration::from_millis(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bounds the accept loop of a test that returns before `Loopback::finish`.
@@ -32,7 +34,8 @@ pub struct Loopback {
 }
 
 impl Loopback {
-    /// Answers `moved` with `301 Location: REDIRECT_TARGET` and any other path with 200 and
+    /// Answers `moved` with `301 Location: REDIRECT_TARGET`, `Content-Type: MOVED_CONTENT_TYPE` and
+    /// any other path with 200 and
     /// `arrived`, one connection at a time, each closed after its answer.
     pub fn redirecting(moved: &str, arrived: Vec<u8>) -> std::io::Result<Self> {
         Self::redirecting_with(moved, MOVED_BODY.to_vec(), arrived)
@@ -124,7 +127,10 @@ fn answer_one(
         .to_owned();
     let (head, body) = if target == answers.moved {
         (
-            format!("301 Moved Permanently\r\nLocation: {REDIRECT_TARGET}"),
+            format!(
+                "301 Moved Permanently\r\nLocation: {REDIRECT_TARGET}\r\n\
+                 Content-Type: {MOVED_CONTENT_TYPE}"
+            ),
             answers.moved_body.as_slice(),
         )
     } else {
