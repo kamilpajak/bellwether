@@ -119,10 +119,35 @@ const PRN_SECOND_ARTICLE_URL: &str = "https://www.prnewswire.com/news-releases/l
 const PRN_SECOND_ARTICLE_TITLE: &str = "Lilly to present new data across Zepbound, Foundayo, EloraTZP and retatrutide at ObesityWeek 2026, moving obesity care beyond the scale";
 const PRN_NO_RELEASE_BODY_PAGE: &str = "synthetic_no_release_body.html";
 const PRN_LINE_BREAK_PAGE: &str = "synthetic_heading_line_break.html";
+const PRN_LISTS_PAGE: &str = "synthetic_lists.html";
+const PRN_ADDRESSES_PAGE: &str = "synthetic_addresses.html";
+const PRN_TABLES_PAGE: &str = "synthetic_tables.html";
+const GNW_ONE_PATH_PAGE: &str = "synthetic_lists_tables_and_addresses.html";
+/// Section 11.1's P5: every page below, its committed body digest, and the extraction version
+/// that produced them. Rewritten by hand when an extraction change is meant.
+const GOLDEN_BODIES: &str = "golden_bodies.json";
+const GOLDEN_GNW_PAGES: [&str; 5] = [
+    REAL_ARTICLE,
+    "synthetic_canonical_differs.html",
+    "synthetic_relative_canonical.html",
+    PROSE_PAGE,
+    GNW_ONE_PATH_PAGE,
+];
+const GOLDEN_PRN_PAGES: [&str; 6] = [
+    PRN_ARTICLE,
+    PRN_SECOND_ARTICLE,
+    PRN_LINE_BREAK_PAGE,
+    PRN_LISTS_PAGE,
+    PRN_ADDRESSES_PAGE,
+    PRN_TABLES_PAGE,
+];
 const PRN_OFF_PREFIX_URL: &str =
     "https://www.prnewswire.com/apac/news-releases/a-release-off-the-prefix-302999998.html";
 const PRN_ARTICLE_OPENS: &str =
     "PLAINSBORO, N.J. and BAGSVÆRD, Denmark, Nov. 14, 2026 /PRNewswire/ -- Today, Novo Nordisk";
+/// The first of the 3 `<li>` that open `section.release-body` before its first `<p>`.
+const PRN_SUMMARY_OPENS: &str = "Statistically significant reductions in food noise scores";
+const PRN_SUMMARY_ITEMS: usize = 3;
 /// Text the trimmed page holds outside `section.release-body`: the dateline `<p>`, the share
 /// `<p>`, the ld+json `<script>`, and a `<p>` of `section.nav-main`, one of the 4 other
 /// `<section>` elements of the untrimmed page. `<article>` holds the first two.
@@ -1201,17 +1226,27 @@ fn a_pr_newswire_pubdate_is_a_minute_and_never_an_instant() -> Outcome {
     Ok(())
 }
 
-/// §8 row R17 for PR Newswire: `<p>` text inside `section.release-body`. `<article>` would add
-/// the dateline and the share line (2 of 42 `<p>` on the untrimmed page, 2026-11-14 probe).
-/// Mutations 2026-11-16, the container `body`, `article` and `section`: each red.
+/// §8 row R17 for PR Newswire: `p, li` text inside `section.release-body`, the 3 summary `<li>`
+/// first (decision 8). `<article>` would add the dateline and the share line (2 of 42 `<p>` on the
+/// untrimmed page, 2026-11-14 probe). Mutations 2026-11-16, the container `body`, `article` and
+/// `section`: each red.
 #[test]
 fn the_extracted_body_is_article_text_and_never_page_html_on_a_pr_newswire_page() -> Outcome {
     let provider = provider()?;
     let item =
         only_item(&provider.extract(&prn_article_request(&provider)?, &blob(prn(PRN_ARTICLE))))?;
     let body = item.body.ok_or("no body")?.text;
-    assert!(body.starts_with(PRN_ARTICLE_OPENS), "{body}");
-    assert_eq!(body.lines().count(), ARTICLE_PARAGRAPHS, "{body}");
+    let lines: Vec<&str> = body.lines().collect();
+    assert!(lines[0].starts_with(PRN_SUMMARY_OPENS), "{body}");
+    assert!(
+        lines[PRN_SUMMARY_ITEMS].starts_with(PRN_ARTICLE_OPENS),
+        "{body}"
+    );
+    assert_eq!(
+        lines.len(),
+        PRN_SUMMARY_ITEMS + ARTICLE_PARAGRAPHS,
+        "{body}"
+    );
     assert!(!body.contains('<'), "{body}");
     for outside in PRN_OUTSIDE_THE_SECTION {
         assert!(
@@ -1725,6 +1760,124 @@ fn the_open_web_feed_breaks_no_claim_of_the_seam() -> Outcome {
     assert!(
         produced.iter().all(|precision| *precision == ceiling),
         "{produced:?} under {ceiling:?}"
+    );
+    Ok(())
+}
+
+fn prn_body(page: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let provider = provider()?;
+    let item = only_item(&provider.extract(&prn_article_request(&provider)?, &blob(prn(page))))?;
+    Ok(item.body.ok_or("no body")?.text)
+}
+
+/// Decision 8 (section 11.1): `p, li`, the outermost match only, so an `li` holding a `p` and a
+/// nested list are each one line and no text is read twice; an inline `b` adds no space.
+#[test]
+fn a_list_item_holding_a_paragraph_or_a_nested_list_is_one_line_read_once() -> Outcome {
+    assert_eq!(
+        prn_body(PRN_LISTS_PAGE)?,
+        "First summary point\nAmbre Example +45 0000 0000\nOpening paragraph.\n\
+         Outer item inner one inner two\nSecond outer item\nBoldtail block after"
+    );
+    Ok(())
+}
+
+/// P1 and `mailto:` (section 11.1): neither Cloudflare shape nor an address link reaches the
+/// body; a web link does. Before, each placeholder was stored as `[email protected]`.
+#[test]
+fn a_cloudflare_email_placeholder_and_a_mailto_link_never_reach_the_body() -> Outcome {
+    assert_eq!(
+        prn_body(PRN_ADDRESSES_PAGE)?,
+        "Media: today\nInvestors:\nPress: or , see example.com.\nDesk: daily"
+    );
+    Ok(())
+}
+
+/// P2 (section 11.1): one line per `tr` in document order between paragraphs, non-empty cells
+/// joined by ` | `, a cell's `p` read once as part of its row, a nested table flattened into its
+/// outer cell, a caption one line, and a row of empty or no-break-space cells dropped.
+#[test]
+fn a_table_is_read_one_line_per_row_and_a_nested_table_inside_its_outer_cell() -> Outcome {
+    assert_eq!(
+        prn_body(PRN_TABLES_PAGE)?,
+        "Before the tables.\nResults (unaudited)\n(in millions) | Q3 2026 | Q3 2025\nRevenue | 1,234 | 1,100\n\
+         Between the tables.\nAmbre Example +45 0000 0000 | Liz Example (US) +1 000 000 0000\n\
+         Outer inner a inner b inner c | right\nAfter the tables."
+    );
+    Ok(())
+}
+
+/// P6 (section 11.1): GNW reads lists, tables and addresses through PRN's path; only the
+/// container differs.
+#[test]
+fn a_globenewswire_page_reads_lists_tables_and_addresses_through_the_same_path() -> Outcome {
+    let provider = provider()?;
+    let page = blob(gnw(GNW_ONE_PATH_PAGE));
+    let item = only_item(&provider.extract(&article_request(&provider)?, &page))?;
+    assert_eq!(
+        item.body.map(|body| body.text).as_deref(),
+        Some("Opening paragraph.\nPoint one\nPoint two\nContact | or")
+    );
+    Ok(())
+}
+
+/// Every request the feed builds names the version its answer is read under (section 2).
+#[test]
+fn every_planned_request_and_follow_up_carries_the_extraction_version() -> Outcome {
+    let provider = provider()?;
+    let version = Some(provider.extract_version());
+    let index = index_request(&provider)?;
+    let document = article_request(&provider)?;
+    assert_eq!(
+        (
+            index.extract_version.as_ref(),
+            document.extract_version.as_ref()
+        ),
+        (version, version)
+    );
+    Ok(())
+}
+
+/// The committed golden file as JSON, and the same shape computed from the fixtures now.
+fn golden_bodies() -> Result<(serde_json::Value, serde_json::Value), Box<dyn std::error::Error>> {
+    let provider = provider()?;
+    let mut bodies = serde_json::Map::new();
+    let gnw_request = article_request(&provider)?;
+    let prn_request = prn_article_request(&provider)?;
+    let pages = GOLDEN_GNW_PAGES
+        .iter()
+        .map(|page| ("gnw", *page, gnw(page), &gnw_request))
+        .chain(
+            GOLDEN_PRN_PAGES
+                .iter()
+                .map(|page| ("prn", *page, prn(page), &prn_request)),
+        );
+    for (host, page, bytes, request) in pages {
+        let item = only_item(&provider.extract(request, &blob(bytes)))?;
+        let text = item.body.ok_or("no body")?.text;
+        bodies.insert(
+            format!("{host}/{page}"),
+            FileDigest::of(text.as_bytes()).hex().into(),
+        );
+    }
+    let computed = serde_json::json!({
+        "extract_version": provider.extract_version().hex(),
+        "bodies": bodies,
+    });
+    let committed = serde_json::from_slice(&std::fs::read(fixtures().join(GOLDEN_BODIES))?)?;
+    Ok((committed, computed))
+}
+
+/// P5 (section 11.1): a change to the extraction code, the rules file or any body moves this
+/// file's `extract_version` or a digest, and stays red until the file is rewritten by hand.
+#[test]
+fn every_golden_page_extracts_to_its_committed_body_under_the_committed_version() -> Outcome {
+    let (committed, computed) = golden_bodies()?;
+    assert_eq!(
+        committed,
+        computed,
+        "rewrite tests/fixtures/{GOLDEN_BODIES} if the change is meant:\n{}",
+        serde_json::to_string_pretty(&computed)?
     );
     Ok(())
 }
