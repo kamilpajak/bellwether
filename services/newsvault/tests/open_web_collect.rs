@@ -1283,10 +1283,7 @@ fn a_hosts_row_whose_robots_crawl_delay_is_above_the_shared_interval_is_refused(
 fn a_path_or_unreadable_robots_refusal_names_its_fact_and_suggests_no_refresh() -> TestResult {
     let mut seen = Vec::new();
     for body in [
-        b"User-agent: *
-Disallow: /rssfeed/
-"
-        .to_vec(),
+        b"User-agent: *\nDisallow: /rssfeed/\n".to_vec(),
         robots_fixture("synthetic_html_page.txt")?,
         robots_fixture("www.nasdaq.com.txt")?,
     ] {
