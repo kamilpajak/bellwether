@@ -45,7 +45,7 @@ pub fn parse_verdicts() -> [&'static str; 9] {
     [
         Reading::Rules.name(),
         Reading::NoRulesEmpty.name(),
-        Reading::OrphanRulesAppliedToStar.name(),
+        Reading::OrphanRulesIgnored.name(),
         NO_RULES_ABSENT,
         CRAWL_DELAY_OVER_INTERVAL,
         ParseError::NotUtf8.verdict(),

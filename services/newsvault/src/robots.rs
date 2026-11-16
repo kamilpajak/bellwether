@@ -26,7 +26,8 @@ pub enum RobotsError {
     NotUtf8,
     #[error("the body is an HTML page: its first non-whitespace character is <")]
     HtmlPage,
-    /// Text that is not empty or comments only, with neither a `user-agent` line nor a rule.
+    /// Text that is not empty or comments only and has no `user-agent` line; a rule in it belongs
+    /// to no group and is ignored, so no orphan rule saves it.
     #[error("the body names no user-agent")]
     NoUserAgentLine,
     #[error("the * group's Crawl-delay {0:?} is not a non-negative number of seconds")]
@@ -53,9 +54,9 @@ pub enum Reading {
     Rules,
     /// Empty, or comments and blank lines only: no rule, every path allowed.
     NoRulesEmpty,
-    /// An `Allow`, `Disallow` or Crawl-delay before the first `user-agent` line: the `Disallow`
-    /// and the Crawl-delay are read as `*`'s, the `Allow` is ignored.
-    OrphanRulesAppliedToStar,
+    /// A `user-agent` line, and an `Allow`, `Disallow` or Crawl-delay before the first of them:
+    /// every such line is ignored (owner decision 2026-11-16, Google's standard).
+    OrphanRulesIgnored,
 }
 
 impl Reading {
@@ -64,7 +65,7 @@ impl Reading {
         match self {
             Self::Rules => "rules",
             Self::NoRulesEmpty => "no_rules_empty",
-            Self::OrphanRulesAppliedToStar => "orphan_rules_applied_to_star",
+            Self::OrphanRulesIgnored => "orphan_rules_ignored",
         }
     }
 }
@@ -88,16 +89,14 @@ pub struct Robots {
 #[derive(Default)]
 struct Group {
     every_agent: bool,
-    /// The lines before the first `user-agent`: their delays are `*`'s, their `Allow`s nobody's.
-    orphan: bool,
     delays: Vec<String>,
 }
 
 impl Robots {
     /// RFC 9309 section 2.2 grouping: a run of `user-agent` lines opens a group and the next
     /// `Allow`/`Disallow` closes the run; Crawl-delay and unknown lines close nothing (section
-    /// 2.2.4). A `Disallow` or Crawl-delay before any `user-agent` line is read as a `*` rule
-    /// (owner decision 3c); an `Allow` there is ignored, as section 2.2.2 says.
+    /// 2.2.4). Every line before the first `user-agent` line belongs to no group and is ignored,
+    /// as section 2.2.2 says and Google's robots.cc (50a0dac) does, its Crawl-delay included.
     pub fn parse(body: &[u8]) -> Result<Self, RobotsError> {
         let text = std::str::from_utf8(body).map_err(|_| RobotsError::NotUtf8)?;
         let text = text.strip_prefix(BYTE_ORDER_MARK).unwrap_or(text);
@@ -132,8 +131,7 @@ impl Robots {
                 rule @ (ALLOW | DISALLOW) => {
                     in_agent_run = false;
                     orphan |= !named_an_agent;
-                    let applies = group.every_agent || (!named_an_agent && rule == DISALLOW);
-                    if applies && !value.is_empty() {
+                    if group.every_agent && !value.is_empty() {
                         robots.rules.push(PathRule {
                             allow: rule == ALLOW,
                             pattern: value.to_owned(),
@@ -142,7 +140,6 @@ impl Robots {
                 }
                 CRAWL_DELAY => {
                     orphan |= !named_an_agent;
-                    group.orphan |= !named_an_agent;
                     group.delays.push(value.to_owned());
                 }
                 _ => {}
@@ -150,17 +147,18 @@ impl Robots {
         }
         robots.end(&group)?;
         robots.reading = match (named_an_agent, orphan, content) {
-            (_, true, _) => Reading::OrphanRulesAppliedToStar,
+            (true, true, _) => Reading::OrphanRulesIgnored,
             (true, false, _) => Reading::Rules,
-            (false, false, false) => Reading::NoRulesEmpty,
-            (false, false, true) => return Err(RobotsError::NoUserAgentLine),
+            (false, _, false) => Reading::NoRulesEmpty,
+            (false, _, true) => return Err(RobotsError::NoUserAgentLine),
         };
         Ok(robots)
     }
 
     /// A group's Crawl-delays count only when it names `*`; the largest of every `*` group wins.
+    /// The lines before the first `user-agent` end as a group naming nobody.
     fn end(&mut self, group: &Group) -> Result<(), RobotsError> {
-        if group.every_agent || group.orphan {
+        if group.every_agent {
             for value in &group.delays {
                 let delay = seconds(value)?;
                 self.crawl_delay = Some(self.crawl_delay.map_or(delay, |d| d.max(delay)));
@@ -459,53 +457,45 @@ mod tests {
         Ok(())
     }
 
-    /// Owner decision 3c: a `Disallow` or Crawl-delay before the first `user-agent` line is `*`'s;
-    /// RFC 9309 section 2.2.2 says SHOULD ignore it. Mutations 2026-11-16, orphan rules skipped:
-    /// red; an orphan Crawl-delay skipped: red; `orphan` never set: red.
+    /// Owner decision 2026-11-16 (Google's standard): an `Allow`, `Disallow` or Crawl-delay before
+    /// the first `user-agent` line is ignored, as RFC 9309 section 2.2.2 says and Google's
+    /// robots.cc 50a0dac does. Each body gives the reading, `/news/a`, `/prywatne/a`, `/x`, delay.
     #[test]
-    fn a_rule_before_the_first_user_agent_is_read_as_a_star_rule() -> TestResult {
-        let robots = Robots::parse(
-            b"Disallow: /orphan/\nCrawl-delay: 12\n\nUser-agent: bingbot\nDisallow: /named/\n",
-        )?;
-        let alone = Robots::parse(b"# no group at all\nDisallow: /orphan/\n")?;
+    fn a_rule_before_the_first_user_agent_is_ignored() -> TestResult {
+        let read = [
+            &b"Allow: /news/\nUser-agent: *\nDisallow: /\n"[..],
+            b"Disallow: /prywatne/\nUser-agent: *\nAllow: /\n",
+            b"Crawl-delay: 30\nUser-agent: *\nDisallow: /x\n",
+            b"Crawl-delay: soon\nUser-agent: *\n",
+        ]
+        .iter()
+        .map(|body| {
+            Robots::parse(body).map(|robots| {
+                (
+                    robots.reading(),
+                    robots.allows("/news/a"),
+                    robots.allows("/prywatne/a"),
+                    robots.allows("/x"),
+                    robots.crawl_delay(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+        let ignored = Reading::OrphanRulesIgnored;
         assert_eq!(
-            (
-                robots.reading(),
-                robots.allows("/orphan/x"),
-                robots.allows("/named/x"),
-                robots.crawl_delay(),
-                alone.reading(),
-                alone.allows("/orphan/x"),
-            ),
-            (
-                Reading::OrphanRulesAppliedToStar,
-                false,
-                true,
-                Some(Duration::from_secs(12)),
-                Reading::OrphanRulesAppliedToStar,
-                false,
-            )
-        );
-        assert_eq!(
-            Robots::parse(b"Crawl-delay: soon\nUser-agent: *\n"),
-            Err(RobotsError::CrawlDelayNotANumber("soon".to_owned()))
-        );
-        // A Crawl-delay alone is an orphan rule. Mutation 2026-11-16, `orphan` not set by it: red.
-        let delay_only = Robots::parse(b"Crawl-delay: 12\nUser-agent: *\nDisallow: /x\n")?;
-        assert_eq!(
-            (delay_only.reading(), delay_only.crawl_delay()),
-            (
-                Reading::OrphanRulesAppliedToStar,
-                Some(Duration::from_secs(12))
-            )
+            read,
+            [
+                Ok((ignored, false, false, false, None)),
+                Ok((ignored, true, true, true, None)),
+                Ok((ignored, true, true, false, None)),
+                Ok((ignored, true, true, true, None)),
+            ]
         );
         Ok(())
     }
 
-    /// An orphan `Allow` is ignored, as RFC 9309 section 2.2.2 says: applied to `*` it would widen
-    /// what `*` may fetch, and decision 3c is the stricter reading. Review 2026-11-16, the first
-    /// body allowed `/news/x` at 79a79b8, the other two at 41fcbf9 (an orphan Crawl-delay before
-    /// the `Allow` made the orphan group `*`'s); mutation, that 41fcbf9 line restored: red.
+    /// The bodies that widened `*` under decision 3c's builds (79a79b8; 41fcbf9, an orphan
+    /// Crawl-delay before the `Allow`): every orphan line is ignored, so `*`'s `Disallow: /` holds.
     #[test]
     fn an_orphan_allow_widens_nothing() -> TestResult {
         let mut read = Vec::new();
@@ -524,10 +514,26 @@ mod tests {
             ),
         ] {
             let robots = Robots::parse(body)?;
-            read.push((robots.reading(), robots.allows(path)));
+            read.push((robots.reading(), robots.allows(path), robots.crawl_delay()));
         }
-        assert_eq!(read, [(Reading::OrphanRulesAppliedToStar, false); 3]);
+        assert_eq!(read, [(Reading::OrphanRulesIgnored, false, None); 3]);
         Ok(())
+    }
+
+    /// No `user-agent` line means no group, so orphan lines alone are refused like a `Sitemap:`-only
+    /// body (decision 3b), not read as RFC 9309 section 2.2.1's "no rules apply".
+    #[test]
+    fn orphan_rules_with_no_user_agent_line_are_refused() {
+        for body in [
+            &b"Disallow: /orphan/\n"[..],
+            b"# no group at all\nCrawl-delay: 12\nAllow: /\n",
+        ] {
+            assert_eq!(
+                Robots::parse(body),
+                Err(RobotsError::NoUserAgentLine),
+                "{body:?}"
+            );
+        }
     }
 
     /// Owner decision 2 (B2): a Crawl-delay line does not end a `user-agent` run, as RFC 9309
@@ -572,7 +578,7 @@ mod tests {
             RobotsError::CrawlDelayNotANumber(String::new()).verdict(),
             Reading::Rules.name(),
             Reading::NoRulesEmpty.name(),
-            Reading::OrphanRulesAppliedToStar.name(),
+            Reading::OrphanRulesIgnored.name(),
         ];
         assert_eq!(
             names,
@@ -583,7 +589,7 @@ mod tests {
                 "refused_crawl_delay",
                 "rules",
                 "no_rules_empty",
-                "orphan_rules_applied_to_star"
+                "orphan_rules_ignored"
             ]
         );
     }

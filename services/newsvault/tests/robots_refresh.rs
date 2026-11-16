@@ -959,7 +959,10 @@ fn a_refresh_reports_the_parse_verdict_of_each_answered_row() -> TestResult {
     let answers: Vec<(u16, Vec<u8>)> = vec![
         (OK, PRN_BODY.to_vec()),
         (OK, b"# nothing\n\n".to_vec()),
-        (OK, b"Disallow: /private/\n".to_vec()),
+        (
+            OK,
+            b"Crawl-delay: 30\nUser-agent: *\nDisallow: /x\n".to_vec(),
+        ),
         (OK, robots_fixture("synthetic_html_page.txt")?),
         (OK, robots_fixture("www.nasdaq.com.txt")?),
         (OK, b"User-agent: *\nCrawl-delay: 10\n".to_vec()),
@@ -992,7 +995,7 @@ fn a_refresh_reports_the_parse_verdict_of_each_answered_row() -> TestResult {
     let expected = [
         "rules",
         "no_rules_empty",
-        "orphan_rules_applied_to_star",
+        "orphan_rules_ignored",
         "refused_html",
         "crawl_delay_over_interval",
         "rules",
