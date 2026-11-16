@@ -86,7 +86,8 @@ const OUTSIDE_THE_CONTAINER: [&str; 5] = [
 ];
 const PRN_INDEX: &str = "https://www.prnewswire.com/rss/news-releases-list.rss";
 const PRN_HOST: &str = "www.prnewswire.com";
-/// Items 2-4 of the 20 in the 2026-11-14 19:21:04 GMT feed.
+/// Items 2-4 of the 20 in the 2026-11-14 19:21:04 GMT feed. The first is a correction notice
+/// listed under release link 302913655 (§8 row R3).
 const PRN_REAL_INDEX: &str = "rss_3_items.xml";
 const PRN_LINKS: [&str; 3] = [
     "https://www.prnewswire.com/news-releases/north-carolinas-electric-cooperatives-launches-evconnectnc-powered-by-weavegrid-to-maximize-charging-during-lower-demand-and-power-cost-periods-302913655.html",

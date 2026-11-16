@@ -85,8 +85,9 @@ const RELEASES: [(&str, &str, &str, Option<&str>); 3] = [
 ];
 
 const PRN_INDEX: &str = "https://www.prnewswire.com/rss/news-releases-list.rss";
-/// `prn/rss_3_items.xml`'s three links with the page each is answered with. 302913655 is answered
-/// with the synthetic page that has no `section.release-body`.
+/// `prn/rss_3_items.xml`'s three links with the page each is answered with. 302913655 is a
+/// correction notice listed under the release's link (§8 row R3; its page was never fetched), and
+/// is answered with the synthetic page that has no `section.release-body`.
 const PRN_RELEASES: [(&str, &str); 3] = [
     (
         "www.prnewswire.com/news-releases/north-carolinas-electric-cooperatives-launches-evconnectnc-powered-by-weavegrid-to-maximize-charging-during-lower-demand-and-power-cost-periods-302913655.html",

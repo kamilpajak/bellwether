@@ -394,8 +394,8 @@ mod tests {
         Ok(())
     }
 
-    /// PRN's 8 `Disallow` lines sit in its `*` group; `/multivu/` is one of them. Mutation
-    /// 2026-11-16, `Disallow` lines ignored: red.
+    /// PRN's 8 `Disallow` lines sit in its `*` group; `/multivu/` is one of them. Mutations
+    /// 2026-11-16, every `Disallow` read as `Allow`: red; `Disallow` lines skipped: red.
     #[test]
     fn the_prn_robots_allows_the_rss_index_and_the_news_releases_prefix() -> TestResult {
         let prn = Robots::parse(&provider_fixture("prn/robots_www_prnewswire_com.txt")?)?;
