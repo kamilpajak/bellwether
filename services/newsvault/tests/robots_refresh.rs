@@ -709,7 +709,8 @@ fn a_refresh_refused_before_any_fetch_exits_two_or_four_with_an_empty_stdout() -
     Ok(())
 }
 
-/// The library dry run and the binary's: one url per row, nothing written, nothing sent.
+/// The library dry run and the binary's: one url per row, nothing written, nothing sent, no
+/// `parse_verdict`. Mutation 2026-11-16, the dry run's verdict set to `rules`: red.
 #[test]
 fn a_robots_refresh_dry_run_plans_one_url_per_row_and_writes_nothing() -> TestResult {
     let root = TempDir::new()?;
@@ -743,6 +744,18 @@ fn a_robots_refresh_dry_run_plans_one_url_per_row_and_writes_nothing() -> TestRe
         .output()?;
     let printed: Value = serde_json::from_slice(&output.stdout)?;
     let planned = vec![GNW_ROBOTS.to_owned(), PRN_ROBOTS.to_owned()];
+    let verdicts = |report: &Value| -> Vec<Value> {
+        report["rows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|row| row["parse_verdict"].clone())
+            .collect()
+    };
+    assert_eq!(
+        (verdicts(&answer.report), verdicts(&printed)),
+        (vec![Value::Null; 2], vec![Value::Null; 2])
+    );
     assert_eq!(
         (
             answer.exit,
@@ -938,7 +951,8 @@ fn robots_fixture(name: &str) -> Result<Vec<u8>, std::io::Error> {
 /// Owner decision 3d (2026-11-16): each answered row carries the verdict `collect` would reach
 /// over the same body, in the JSON row and on the human line, and the schema lists exactly these
 /// values; a failed fetch carries none. Mutations 2026-11-16, the Crawl-delay check dropped from
-/// `parse_verdict_of`: red; `parse_verdict` dropped from `render_human`: red.
+/// `parse_verdict_of`: red; `parse_verdict` dropped from `render_human`: red; the check written
+/// as `>=` in `parse_verdict_of`: red (the 10 s delay equal to the 10 s interval).
 #[test]
 fn a_refresh_reports_the_parse_verdict_of_each_answered_row() -> TestResult {
     let gnw = gnw_body()?;
@@ -948,6 +962,7 @@ fn a_refresh_reports_the_parse_verdict_of_each_answered_row() -> TestResult {
         (OK, b"Disallow: /private/\n".to_vec()),
         (OK, robots_fixture("synthetic_html_page.txt")?),
         (OK, robots_fixture("www.nasdaq.com.txt")?),
+        (OK, b"User-agent: *\nCrawl-delay: 10\n".to_vec()),
         (OK, b"User-agent: *\nCrawl-delay: soon\n".to_vec()),
         (OK, b"Sitemap: https://www.prnewswire.com/s.xml\n".to_vec()),
         (OK, vec![b'U', 0xff]),
@@ -980,6 +995,7 @@ fn a_refresh_reports_the_parse_verdict_of_each_answered_row() -> TestResult {
         "orphan_rules_applied_to_star",
         "refused_html",
         "crawl_delay_over_interval",
+        "rules",
         "refused_crawl_delay",
         "refused_no_user_agent",
         "refused_not_utf8",
