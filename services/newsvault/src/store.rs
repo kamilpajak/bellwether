@@ -3005,6 +3005,12 @@ mod tests {
             ),
             (SCHEMA_VERSION, Some(version.hex().to_owned()))
         );
+        // The shape check replays `MIGRATIONS[4]` against itself, so only this pins the declared
+        // type. Mutation 2026-11-16, `BLOB` for `TEXT`: green until this line.
+        assert_eq!(
+            super::columns_of(&store.db, "attempts")?.get("extract_version"),
+            Some(&("TEXT".to_owned(), false, None, 0))
+        );
         Ok(())
     }
 

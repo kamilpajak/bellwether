@@ -214,9 +214,10 @@ fn a_robots_refresh_writes_one_attempt_per_hosts_row_under_source_robots() -> Te
     let exchange = Robots::of(&[(GNW_ROBOTS, OK, &body), (PRN_ROBOTS, OK, PRN_BODY)]);
     let answer = refreshed(root.path(), two_row_hosts(), &exchange)?;
     let db = read_only(root.path())?;
-    let versions: Vec<(String, Option<String>)> = db
-        .prepare("SELECT run_id, hosts_version FROM attempts")?
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+    // `extract_version` NULL (section 3.2). Mutation 2026-11-16, `request_for` given a version: red.
+    let versions: Vec<(String, Option<String>, Option<String>)> = db
+        .prepare("SELECT run_id, hosts_version, extract_version FROM attempts")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<Result<_, _>>()?;
     let hosts_version = FileDigest::of(&std::fs::read(two_row_hosts())?);
     assert_eq!(
@@ -241,7 +242,14 @@ fn a_robots_refresh_writes_one_attempt_per_hosts_row_under_source_robots() -> Te
                     "ok".to_owned()
                 ),
             ],
-            vec![(RUN_ID.to_owned(), Some(hosts_version.hex().to_owned())); 2],
+            vec![
+                (
+                    RUN_ID.to_owned(),
+                    Some(hosts_version.hex().to_owned()),
+                    None
+                );
+                2
+            ],
         )
     );
     assert_eq!(
