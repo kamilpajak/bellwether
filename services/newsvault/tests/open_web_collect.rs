@@ -87,8 +87,9 @@ fn provider_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../providers/open-web-feed")
 }
 
+/// The GNW row alone: a byte copy of the committed hosts file before PRN was admitted.
 fn hosts() -> PathBuf {
-    provider_dir().join("hosts/open_web_wires.hosts.json")
+    hosts_fixture("gnw_admitted.json")
 }
 
 fn hosts_fixture(name: &str) -> PathBuf {

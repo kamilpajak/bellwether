@@ -56,8 +56,9 @@ fn provider_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../providers/open-web-feed")
 }
 
-fn committed_hosts() -> PathBuf {
-    provider_dir().join("hosts/open_web_wires.hosts.json")
+/// The GNW row alone: a byte copy of the committed hosts file before PRN was admitted.
+fn gnw_hosts() -> PathBuf {
+    provider_dir().join("tests/fixtures/hosts/gnw_admitted.json")
 }
 
 /// The committed GNW row admitted, and a PRN candidate with no pin.
@@ -269,7 +270,7 @@ fn a_robots_refresh_writes_one_attempt_per_hosts_row_under_source_robots() -> Te
 fn a_robots_404_is_recorded_as_absent_and_pins_no_digest() -> TestResult {
     let root = TempDir::new()?;
     let exchange = Robots::of(&[(GNW_ROBOTS, NOT_FOUND, b"not here")]);
-    let answer = refreshed(root.path(), committed_hosts(), &exchange)?;
+    let answer = refreshed(root.path(), gnw_hosts(), &exchange)?;
     let row = first_row(&answer);
     assert_eq!(
         (
@@ -305,7 +306,7 @@ fn a_robots_403_5xx_or_transport_error_is_a_failed_attempt_with_no_robots_row() 
         (Vec::new(), 7),
     ] {
         let root = TempDir::new()?;
-        let answer = refreshed(root.path(), committed_hosts(), &Robots::of(&answers))?;
+        let answer = refreshed(root.path(), gnw_hosts(), &Robots::of(&answers))?;
         seen.push((
             robots_rows(root.path())?.len(),
             attempts(root.path())?,
@@ -342,7 +343,7 @@ fn a_robots_403_5xx_or_transport_error_is_a_failed_attempt_with_no_robots_row() 
 fn a_robots_408_stays_a_permanent_failure_with_no_robots_row() -> TestResult {
     let root = TempDir::new()?;
     let exchange = Robots::of(&[(GNW_ROBOTS, REQUEST_TIMEOUT, &b""[..])]);
-    let answer = refreshed(root.path(), committed_hosts(), &exchange)?;
+    let answer = refreshed(root.path(), gnw_hosts(), &exchange)?;
     let verdicts: Vec<Option<String>> = read_only(root.path())?
         .prepare("SELECT verdict FROM attempts")?
         .query_map([], |row| row.get(0))?
@@ -373,7 +374,7 @@ type Refreshed = (
 
 fn refreshed_through_a_redirect(body_over_the_limit: bool) -> Result<Refreshed, Box<dyn Error>> {
     let root = TempDir::new()?;
-    let ask = ask(root.path(), committed_hosts());
+    let ask = ask(root.path(), gnw_hosts());
     let feed = cmd_robots::open(&ask)?;
     let server = if body_over_the_limit {
         let over = usize::try_from(feed.transport().body_limit)? + 1;
@@ -457,9 +458,9 @@ fn a_robots_redirect_whose_body_is_over_the_limit_keeps_its_status() -> TestResu
 #[test]
 fn a_fetched_robots_digest_other_than_the_pin_exits_one_and_names_both() -> TestResult {
     let root = TempDir::new()?;
-    let before = std::fs::read(committed_hosts())?;
+    let before = std::fs::read(gnw_hosts())?;
     let exchange = Robots::of(&[(GNW_ROBOTS, OK, CHANGED_BODY)]);
-    let answer = refreshed(root.path(), committed_hosts(), &exchange)?;
+    let answer = refreshed(root.path(), gnw_hosts(), &exchange)?;
     let row = first_row(&answer);
     let changed = FileDigest::of(CHANGED_BODY);
     assert_eq!(
@@ -469,7 +470,7 @@ fn a_fetched_robots_digest_other_than_the_pin_exits_one_and_names_both() -> Test
             row["fetched_sha256"].as_str(),
             row["pinned"].as_str(),
             row["matches_pin"].as_bool(),
-            std::fs::read(committed_hosts())? == before,
+            std::fs::read(gnw_hosts())? == before,
         ),
         (
             RobotsExit::PinDiffers,
@@ -527,7 +528,7 @@ fn a_refresh_writes_its_report_on_stdout_for_exits_zero_one_and_eight_only() -> 
     ] {
         let root = TempDir::new()?;
         let exchange = Robots::of(&[(GNW_ROBOTS, status, answered)]);
-        let answer = refreshed(root.path(), committed_hosts(), &exchange)?;
+        let answer = refreshed(root.path(), gnw_hosts(), &exchange)?;
         seen.push(match answer.emitted(vec![RUN_ID.to_owned()]) {
             Emitted::Stdout(report) => (answer.exit.code(), "stdout", report["schema"].clone()),
             Emitted::Stderr(error) => (answer.exit.code(), "stderr", error["code"].clone()),
@@ -582,7 +583,7 @@ fn a_refresh_refused_before_any_fetch_exits_two_or_four_with_an_empty_stdout() -
         .unwrap_or_default();
     let mut seen = Vec::new();
     for output in [
-        binary("edgar_press", &committed_hosts())?,
+        binary("edgar_press", &gnw_hosts())?,
         binary(SOURCE, &root.path().join("absent.json"))?,
     ] {
         let code = output.status.code();
@@ -691,7 +692,7 @@ fn a_robots_refresh_refuses_a_store_of_another_shape_and_leaves_it_as_found() ->
         let exchange = Robots::of(&[]);
         let ask = Ask {
             dry_run,
-            ..ask(root.path(), committed_hosts())
+            ..ask(root.path(), gnw_hosts())
         };
         let feed = cmd_robots::open(&ask)?;
         let refused = cmd_robots::run(&ask, &feed, &exchange, &Fixed);
@@ -719,7 +720,7 @@ fn a_robots_refresh_run_is_not_counted_against_expected_runs() -> TestResult {
     let body = gnw_body()?;
     refreshed(
         root.path(),
-        committed_hosts(),
+        gnw_hosts(),
         &Robots::of(&[(GNW_ROBOTS, OK, &body)]),
     )?;
     let report = ledger(root.path(), Some(1))?;
@@ -739,7 +740,7 @@ fn a_robots_refresh_runs_attempts_are_not_orphans() -> TestResult {
     let body = gnw_body()?;
     refreshed(
         root.path(),
-        committed_hosts(),
+        gnw_hosts(),
         &Robots::of(&[(GNW_ROBOTS, OK, &body)]),
     )?;
     let report = ledger(root.path(), None)?;
@@ -760,7 +761,7 @@ fn a_robots_refresh_runs_attempts_are_not_orphans() -> TestResult {
 fn a_robots_fetch_moves_neither_the_asking_clock_nor_a_ledger_check_finding() -> TestResult {
     let root = TempDir::new()?;
     let exchange = Robots::of(&[(GNW_ROBOTS, FORBIDDEN, b"Access Denied")]);
-    refreshed(root.path(), committed_hosts(), &exchange)?;
+    refreshed(root.path(), gnw_hosts(), &exchange)?;
     let report = ledger(root.path(), None)?;
     assert_eq!(
         (

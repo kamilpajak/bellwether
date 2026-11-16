@@ -19,7 +19,7 @@ fn provider_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../providers/open-web-feed")
 }
 
-/// The committed 2026-11-14 body the committed hosts file pins.
+/// The committed 2026-11-14 GNW body, which the committed hosts file and `gnw_admitted.json` pin.
 pub fn gnw_robots() -> Result<Vec<u8>, std::io::Error> {
     std::fs::read(provider_dir().join("tests/fixtures/gnw/robots_rss_globenewswire_com.txt"))
 }
