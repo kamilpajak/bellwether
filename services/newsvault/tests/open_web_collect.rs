@@ -2181,9 +2181,14 @@ fn an_index_relisting_release_0(gnw: &Gnw) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(index.replacen(LISTED, RELISTED, 1).into_bytes())
 }
 
+/// Decision x: of the second poll's 3 held releases, 0 (differing) and 1 (equal) are compared;
+/// release 2's page has no article container, so no item holds a minute to compare with.
+const COMPARED_BY_THE_SECOND_POLL: i64 = 2;
+
 /// Section 8 row R15, owner decision 10 (2026-11-16): a second poll lists committed release 0
 /// under another minute, as PRN's correction 302913655 was. No fetch, the `stored_items` columns
-/// unchanged, one `relisted` row on the second index attempt, and the ledger counts it.
+/// unchanged, one `relisted` row on the second index attempt, and the ledger counts it and the
+/// comparisons made (decision x; mutation 2026-11-16, `compared` counting differences only: red).
 #[test]
 fn a_held_story_listed_under_another_minute_is_recorded_without_a_fetch_and_counted() -> TestResult
 {
@@ -2238,11 +2243,11 @@ fn a_held_story_listed_under_another_minute_is_recorded_without_a_fetch_and_coun
             check: false,
         },
     )?;
-    let counted: Vec<i64> = report
+    let counted: Vec<(i64, i64)> = report
         .days
         .iter()
         .flat_map(|one| &one.per_source)
-        .map(|row| row.relisted_disputed)
+        .map(|row| (row.relisted_disputed, row.relisted_compared))
         .collect();
     assert_eq!(
         (second, stored_items(&db)?, recorded, counted),
@@ -2257,7 +2262,7 @@ fn a_held_story_listed_under_another_minute_is_recorded_without_a_fetch_and_coun
                 "2026-11-14T19:05:00.000000Z".to_owned(),
                 "2026-11-14T19:00:00.000000Z".to_owned()
             )],
-            vec![1]
+            vec![(1, COMPARED_BY_THE_SECOND_POLL)]
         )
     );
     Ok(())

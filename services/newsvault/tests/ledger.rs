@@ -563,6 +563,57 @@ fn a_relisted_story_is_counted_for_the_source_and_day_of_its_index_attempt() -> 
     Ok(())
 }
 
+/// Decision x (2026-11-16): `relisted_compared` sums `attempts.relisted_compared` for the source
+/// and day of its index attempt, in the JSON row and on the human line, so 0 disputed among 3
+/// compared differs from nothing compared. Mutations 2026-11-16, the `SUM` made 0: red; the field
+/// dropped from `render_human`: red.
+#[test]
+fn a_relisted_comparison_count_is_summed_for_the_source_and_day_of_its_index_attempt() -> TestResult
+{
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    db.execute(
+        "UPDATE attempts SET relisted_compared = 3 WHERE attempt_id = 'a-0703-edgar-0'",
+        [],
+    )?;
+    drop(db);
+    let json = over(&root, FIRST_DAY, FAILED_DAY)?.json()?;
+    let counted = |day: &str, source: &str, field: &str| {
+        per_source(&json, day, source)
+            .and_then(|row| row.get(field))
+            .and_then(Value::as_i64)
+    };
+    let human = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .arg("ledger")
+        .args(["--store", &root.path().to_string_lossy()])
+        .args(["--at", AT, "--format", "human"])
+        .args(["--from", FAILED_DAY, "--to", FAILED_DAY])
+        .output()?
+        .stdout;
+    let line = String::from_utf8(human)?
+        .lines()
+        .find(|line| line.trim_start().starts_with(EDGAR))
+        .map(str::to_owned)
+        .ok_or("no human line names the source")?;
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let shown = words
+        .iter()
+        .position(|word| *word == "relisted_compared")
+        .and_then(|at| words.get(at + 1))
+        .map(|word| (*word).to_owned());
+    assert_eq!(
+        (
+            counted(FAILED_DAY, EDGAR, "relisted_compared"),
+            counted(FAILED_DAY, EDGAR, "relisted_disputed"),
+            counted(FAILED_DAY, POLYGON, "relisted_compared"),
+            counted(FIRST_DAY, EDGAR, "relisted_compared"),
+            shown
+        ),
+        (Some(3), Some(0), Some(0), Some(0), Some("3".to_owned()))
+    );
+    Ok(())
+}
+
 /// Section 3.2 `held`: only a row carrying `vendor_rows` adds its `held`, so an unclosed index
 /// row holding 60 cannot outweigh 59 vendor rows. Mutation 2026-11-15, the ledger summing `held`
 /// over every row again: red.

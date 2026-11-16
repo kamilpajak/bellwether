@@ -114,11 +114,11 @@ PRAGMA synchronous = FULL;
 ";
 
 /// The `PRAGMA user_version` this build writes, and the only one a read-only reader accepts.
-pub const SCHEMA_VERSION: i32 = 7;
+pub const SCHEMA_VERSION: i32 = 8;
 
 /// Version `i + 1` is reached from version `i` by `MIGRATIONS[i]`, run by [`migrate`] with
 /// foreign keys off, as SQLite's twelve-step table rebuild (lang_altertable.html) requires.
-const MIGRATIONS: [&str; 7] = [
+const MIGRATIONS: [&str; 8] = [
     "
 -- The hosts file a run was admitted under: architecture.md section 2's `hosts_version` row. NULL
 -- for a provider that reads no hosts file.
@@ -225,6 +225,12 @@ CREATE TABLE relisted (
     PRIMARY KEY (attempt_id, story_id),
     CHECK (listed_minute <> stored_minute)
 );
+",
+    "
+-- Decision x (2026-11-16): held stories a live index attempt compared with a kept minute, equal
+-- or not, so a `relisted_disputed` of 0 can be told from nothing compared. NULL on every other
+-- row and on every row before user_version 8, not backfilled.
+ALTER TABLE attempts ADD COLUMN relisted_compared INTEGER;
 ",
 ];
 
@@ -1184,13 +1190,15 @@ impl Committer {
 
     /// Section 8 row R15 for a story a live index did not fetch: a listed minute that differs from
     /// the minute of the item first sighting kept is one `relisted` row on `attempt_id`. A listing
-    /// that is not a minute, and a story with no minute-dated item, are not compared.
+    /// that is not a minute, and a story with no minute-dated item, are not compared. How many
+    /// were compared, equal or not, is `attempts.relisted_compared`, written whatever the count.
     pub fn record_relisted(
         &mut self,
         attempt_id: &str,
         relisted: &[Relisted],
     ) -> Result<(), StoreError> {
         let transaction = self.db.transaction()?;
+        let mut compared: u32 = 0;
         for one in relisted {
             let (Published::AtMinute(minute), Some(raw)) = (&one.listed, &one.listed_raw) else {
                 continue;
@@ -1204,7 +1212,11 @@ impl Committer {
                     |row| row.get(0),
                 )
                 .optional()?;
-            if let Some(stored) = kept.flatten().filter(|stored| *stored != listed) {
+            let Some(stored) = kept.flatten() else {
+                continue;
+            };
+            compared = compared.saturating_add(1);
+            if stored != listed {
                 transaction.execute(
                     "INSERT INTO relisted
                          (attempt_id, story_id, listed_raw, listed_minute, stored_minute)
@@ -1213,6 +1225,10 @@ impl Committer {
                 )?;
             }
         }
+        transaction.execute(
+            "UPDATE attempts SET relisted_compared = ?2 WHERE attempt_id = ?1",
+            params![attempt_id, compared],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -3622,6 +3638,126 @@ mod tests {
         Ok(())
     }
 
+    /// A v7 store: the v6 fixture, `MIGRATIONS[6]` and no later step, with one `relisted` row on
+    /// the v1 attempt.
+    fn a_store_at_user_version_seven(temp: &TempDir) -> TestResult {
+        a_store_at_user_version_six(temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch(MIGRATIONS[6])?;
+        db.pragma_update(None, "user_version", 7)?;
+        db.execute_batch(
+            "INSERT INTO relisted VALUES ('a v1 attempt', 'a v7 story', 'raw',
+                 '2026-11-14T19:05:00.000000Z', '2026-11-14T19:00:00.000000Z');",
+        )?;
+        Ok(())
+    }
+
+    /// Every table a user_version 7 store holds: the v6 seven plus `relisted`.
+    const V7_TABLES: [&str; 8] = [
+        "attempts",
+        "blobs",
+        "items",
+        "seq_reservations",
+        "published",
+        "robots",
+        "payloads",
+        "relisted",
+    ];
+
+    /// §8 row M1 from user_version 7: the step to 8 adds `attempts.relisted_compared`, and a
+    /// comparison count lands in it.
+    #[test]
+    fn a_store_at_user_version_seven_opens_migrates_to_eight_and_takes_a_compared_count(
+    ) -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_seven(&temp)?;
+        let mut store = open(&temp)?;
+        let (_, attempt) = a_kept_minute_and_an_index(&mut store)?;
+        let story = story_hex(SOURCE, STORY);
+        store.record_relisted(
+            &attempt,
+            &[relisted(&story, minute_at(A_PUBLICATION_MINUTE)?)],
+        )?;
+        assert_eq!(
+            (user_version(&store.db)?, compared_on(&store, &attempt)?),
+            (SCHEMA_VERSION, Some(1))
+        );
+        // The shape check replays `MIGRATIONS[7]` against itself, so only this pins the declared
+        // shape (the same limit `MIGRATIONS[4]`'s test records).
+        assert_eq!(
+            super::columns_of(&store.db, "attempts")?.get("relisted_compared"),
+            Some(&("INTEGER".to_owned(), false, None, 0))
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the carried half from user_version 7: every column of every row of every v7
+    /// table, compared by `quote()`; the v7 attempt gains a NULL `relisted_compared`.
+    #[test]
+    fn a_v7_store_keeps_every_v7_column_of_every_row() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_seven(&temp)?;
+        let v7 = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let before = quoted_rows(&v7, 7, &V7_TABLES)?;
+        drop(v7);
+        assert!(super::refuse_an_unreadable_version(temp.path()).is_ok());
+        let store = open(&temp)?;
+        let after = quoted_rows(&store.db, 7, &V7_TABLES)?;
+        assert_eq!(before.len(), V7_TABLES.len() + 1);
+        assert_eq!(
+            (after, compared_on(&store, "a v1 attempt")?),
+            (before, None)
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the per-version shape check at user_version 7.
+    #[test]
+    fn a_v7_store_whose_columns_differ_is_refused_and_left_at_user_version_seven() -> TestResult {
+        let every_relisted_column = [
+            "attempt_id",
+            "listed_minute",
+            "listed_raw",
+            "stored_minute",
+            "story_id",
+        ]
+        .map(|column| format!("relisted.{column}"))
+        .to_vec();
+        let fixtures = [
+            (
+                "ALTER TABLE relisted DROP COLUMN listed_raw;",
+                vec!["relisted.listed_raw".to_owned()],
+            ),
+            ("DROP TABLE relisted;", every_relisted_column),
+        ];
+        let mut named = Vec::new();
+        for (edit, _) in &fixtures {
+            let temp = TempDir::new()?;
+            a_store_at_user_version_seven(&temp)?;
+            let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+            db.execute_batch(edit)?;
+            drop(db);
+            let read_only = match super::refuse_an_unreadable_version(temp.path()) {
+                Err(StoreError::ShapeDiffers { found: 7, columns }) => columns,
+                other => vec![format!("{other:?}")],
+            };
+            let refused = match open(&temp) {
+                Err(StoreError::ShapeDiffers { found: 7, columns }) => columns,
+                other => vec![format!("{other:?}")],
+            };
+            let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+            named.push((refused, read_only, user_version(&db)?));
+        }
+        assert_eq!(
+            named,
+            fixtures
+                .into_iter()
+                .map(|(_, columns)| (columns.clone(), columns, 7))
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
     /// §8 row R15, decision 10 (2026-11-16): a held story listed under another minute than its
     /// kept item's is one row on the index attempt, and the stored item stays byte-identical.
     #[test]
@@ -3640,7 +3776,8 @@ mod tests {
             (
                 relisted_rows(&store)?,
                 row_text(&store, seq)?,
-                count(&store, "items")?
+                count(&store, "items")?,
+                compared_on(&store, &attempt)?
             ),
             (
                 vec![(
@@ -3651,14 +3788,17 @@ mod tests {
                     stamped(A_PUBLICATION_MINUTE)
                 )],
                 before,
-                1
+                1,
+                Some(1)
             )
         );
         Ok(())
     }
 
-    /// §8 row R15: the kept minute listed again, a story with no item, a listed day, and a minute
-    /// with no listed text are not compared, so none is recorded.
+    /// §8 row R15: the kept minute listed again is compared and not recorded; a story with no
+    /// item, a listed day, and a minute with no listed text are not compared (decision x: the
+    /// count is 1). Mutations 2026-11-16, `compared` counting only differences: red; counting
+    /// every listing: red.
     #[test]
     fn a_listing_equal_to_the_kept_minute_or_with_nothing_to_compare_is_not_recorded() -> TestResult
     {
@@ -3670,7 +3810,7 @@ mod tests {
             day: A_PUBLICATION_DAY.parse()?,
             tz: NEW_YORK,
         };
-        for listed in [
+        let listed = [
             relisted(&story, minute_at(A_PUBLICATION_MINUTE)?),
             relisted(
                 &story_hex(SOURCE, "never committed"),
@@ -3681,10 +3821,33 @@ mod tests {
                 listed_raw: None,
                 ..relisted(&story, minute_at(A_LATER_PUBLICATION_MINUTE)?)
             },
-        ] {
-            store.record_relisted(&attempt, &[listed])?;
-        }
-        assert_eq!(count(&store, "relisted")?, 0);
+        ];
+        store.record_relisted(&attempt, &listed)?;
+        assert_eq!(
+            (count(&store, "relisted")?, compared_on(&store, &attempt)?),
+            (0, Some(1))
+        );
+        Ok(())
+    }
+
+    fn compared_on(store: &Committer, attempt: &str) -> Result<Option<i64>, StoreError> {
+        Ok(store.db.query_row(
+            "SELECT relisted_compared FROM attempts WHERE attempt_id = ?1",
+            params![attempt],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Decision x: an index with no held story writes 0, not NULL, so "nothing compared" is a
+    /// stored fact on every live index. Mutation 2026-11-16, the `UPDATE` skipped when 0: red.
+    #[test]
+    fn an_index_with_nothing_held_records_zero_compared() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let (_, attempt) = a_kept_minute_and_an_index(&mut store)?;
+        let before = compared_on(&store, &attempt)?;
+        store.record_relisted(&attempt, &[])?;
+        assert_eq!((before, compared_on(&store, &attempt)?), (None, Some(0)));
         Ok(())
     }
 

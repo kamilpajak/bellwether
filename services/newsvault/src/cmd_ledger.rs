@@ -137,6 +137,10 @@ pub struct SourceRow {
     /// listed under another minute than its kept item's, so k polls count k. 0 also before
     /// user_version 7 and for a listing R15 does not compare, so 0 does not mean no dispute.
     pub relisted_disputed: i64,
+    /// Decision x: held stories live index attempts compared with a kept minute, equal or not,
+    /// from `attempts.relisted_compared`; `relisted_disputed` of them disagreed. 0 also for an
+    /// attempt closed before user_version 8.
+    pub relisted_compared: i64,
     pub items_new: i64,
     pub rows_committed: i64,
 }
@@ -257,6 +261,7 @@ struct Grouped {
     listing_unusable: i64,
     bodies_truncated: i64,
     relisted_disputed: i64,
+    relisted_compared: i64,
     items_new: i64,
 }
 
@@ -421,7 +426,8 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
                 SUM(CASE WHEN vendor_rows IS NOT NULL THEN COALESCE(listing_unusable, 0) ELSE 0 END),
                 SUM(COALESCE((SELECT p.truncated FROM payloads p
                                WHERE p.attempt_id = attempts.attempt_id), 0)),
-                SUM((SELECT COUNT(*) FROM relisted r WHERE r.attempt_id = attempts.attempt_id))
+                SUM((SELECT COUNT(*) FROM relisted r WHERE r.attempt_id = attempts.attempt_id)),
+                SUM(COALESCE(relisted_compared, 0))
          FROM attempts WHERE opened_at <= ?1
          GROUP BY run_id, source, state
          ORDER BY run_id, source, state"
@@ -439,6 +445,7 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
                 listing_unusable: row.get(7)?,
                 bodies_truncated: row.get(8)?,
                 relisted_disputed: row.get(9)?,
+                relisted_compared: row.get(10)?,
             })
         })?
         .collect::<Result<Vec<Grouped>, _>>()?;
@@ -611,6 +618,7 @@ fn day_row(
         row.listing_unusable += entry.listing_unusable;
         row.bodies_truncated += entry.bodies_truncated;
         row.relisted_disputed += entry.relisted_disputed;
+        row.relisted_compared += entry.relisted_compared;
         row.items_new += entry.items_new;
         match entry.state.as_str() {
             OUTCOME_OK => row.ok += entry.attempts,
@@ -680,6 +688,7 @@ impl SourceRow {
             listing_unusable: 0,
             bodies_truncated: 0,
             relisted_disputed: 0,
+            relisted_compared: 0,
             items_new: 0,
             rows_committed: 0,
         }
@@ -781,7 +790,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 out,
                 "  {:<14} ok {} empty {} failed {} interrupted {} in-flight {} \
                  vendor_rows {} held {} listing_unusable {} bodies_truncated {} \
-                 relisted_disputed {} items_new {} rows {}",
+                 relisted_disputed {} relisted_compared {} items_new {} rows {}",
                 row.source,
                 row.ok,
                 row.empty,
@@ -793,6 +802,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 row.listing_unusable,
                 row.bodies_truncated,
                 row.relisted_disputed,
+                row.relisted_compared,
                 row.items_new,
                 row.rows_committed
             )?;
