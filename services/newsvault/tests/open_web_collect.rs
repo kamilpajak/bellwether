@@ -53,7 +53,8 @@ const MOVED_PERMANENTLY: u16 = 301;
 /// Two robots fetches before `RUN_AT`, the second the newer.
 const ROBOTS_EARLIER: &str = "2026-11-14T17:00:00Z";
 const ROBOTS_LATER: &str = "2026-11-14T18:00:00Z";
-/// The committed hosts file's GNW pin, `robots_rss_globenewswire_com.txt`'s sha256.
+/// The GNW row's pin, in the committed hosts file and `gnw_admitted.json`:
+/// `robots_rss_globenewswire_com.txt`'s sha256.
 const GNW_PIN: &str = "eb8bb698171dd56c139c224c9217070adf9947f6ed6cd02336eba55aa4155bfe";
 const CHANGED_ROBOTS: &[u8] = b"User-agent: *\nDisallow: /\n";
 /// One above `store::SCHEMA_VERSION`, which this build must refuse.
@@ -83,12 +84,32 @@ const RELEASES: [(&str, &str, &str, Option<&str>); 3] = [
     ),
 ];
 
+const PRN_INDEX: &str = "https://www.prnewswire.com/rss/news-releases-list.rss";
+/// `prn/rss_3_items.xml`'s three links with the page each is answered with. 302913655 is a
+/// correction notice listed under the release's link (§8 row R3; its page was never fetched), and
+/// is answered with the synthetic page that has no `section.release-body`.
+const PRN_RELEASES: [(&str, &str); 3] = [
+    (
+        "www.prnewswire.com/news-releases/north-carolinas-electric-cooperatives-launches-evconnectnc-powered-by-weavegrid-to-maximize-charging-during-lower-demand-and-power-cost-periods-302913655.html",
+        "synthetic_no_release_body.html",
+    ),
+    (
+        "www.prnewswire.com/news-releases/novos-wegovy-was-associated-with-a-reduction-in-food-noise-according-to-real-world-studies-at-obesityweek-2026-302939553.html",
+        "article_302939553.html",
+    ),
+    (
+        "www.prnewswire.com/news-releases/lilly-to-present-new-data-across-zepbound-foundayo-eloratzp-and-retatrutide-at-obesityweek-2026-moving-obesity-care-beyond-the-scale-302938569.html",
+        "article_302938569.html",
+    ),
+];
+
 fn provider_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../providers/open-web-feed")
 }
 
+/// The GNW row alone: a byte copy of the committed hosts file before PRN was admitted.
 fn hosts() -> PathBuf {
-    provider_dir().join("hosts/open_web_wires.hosts.json")
+    hosts_fixture("gnw_admitted.json")
 }
 
 fn hosts_fixture(name: &str) -> PathBuf {
@@ -154,6 +175,19 @@ impl Gnw {
             asked: RefCell::new(Vec::new()),
             scripted: RefCell::new(BTreeMap::new()),
         })
+    }
+
+    /// `day`, and PR Newswire's index and `PRN_RELEASES` answered from `fixtures/prn`.
+    fn two_hosts() -> Result<Self, Box<dyn Error>> {
+        let mut both = Self::day()?;
+        let fixture =
+            |name: &str| std::fs::read(provider_dir().join("tests/fixtures/prn").join(name));
+        both.pages
+            .insert(PRN_INDEX.to_owned(), fixture("rss_3_items.xml")?);
+        for (key, page) in PRN_RELEASES {
+            both.pages.insert(format!("https://{key}"), fixture(page)?);
+        }
+        Ok(both)
     }
 
     fn answering(self, url: &str, statuses: &[u16]) -> Self {
@@ -247,6 +281,51 @@ fn stored_items(db: &Connection) -> Result<BTreeMap<String, Row>, Box<dyn Error>
     Ok(rows)
 }
 
+/// The rows `Gnw::day` commits for `RELEASES`, keyed by story.
+fn gnw_items() -> BTreeMap<String, Row> {
+    RELEASES
+        .iter()
+        .filter_map(|(key, _, raw, canonical)| {
+            let minute = format!(
+                "{}:00.000000Z",
+                chrono::NaiveDateTime::parse_from_str(raw, "%a, %d %b %Y %H:%M GMT")
+                    .ok()?
+                    .format("%Y-%m-%dT%H:%M")
+            );
+            Some((
+                digest(canon::digest::story_id(SOURCE, key))?,
+                (
+                    digest(canon::digest::doc_id((*canonical)?)),
+                    Some(minute),
+                    None,
+                    Some((*raw).to_owned()),
+                    Some("pubDate".to_owned()),
+                    Some("vendor_published".to_owned()),
+                    RECEIVED_AT.to_owned(),
+                ),
+            ))
+        })
+        .collect()
+}
+
+/// The committed row of `PRN_RELEASES[release]`: its canonical is its own link.
+fn prn_item(release: usize, minute: &str, raw: &str) -> Result<(String, Row), Box<dyn Error>> {
+    let (key, _) = PRN_RELEASES.get(release).ok_or("no such release")?;
+    let story = digest(canon::digest::story_id(SOURCE, key)).ok_or("story id")?;
+    Ok((
+        story,
+        (
+            digest(canon::digest::doc_id(&format!("https://{key}"))),
+            Some(minute.to_owned()),
+            None,
+            Some(raw.to_owned()),
+            Some("pubDate".to_owned()),
+            Some("vendor_published".to_owned()),
+            RECEIVED_AT.to_owned(),
+        ),
+    ))
+}
+
 fn visible(store: &Path, at: &str) -> Result<usize, Box<dyn Error>> {
     let report = cmd_items::read(
         store,
@@ -316,29 +395,7 @@ fn an_open_web_run_collects_a_globenewswire_day_end_to_end() -> TestResult {
         .query_map([SOURCE], |row| row.get::<_, Option<String>>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     assert_eq!(versions, vec![Some(hosts_version.hex().to_owned()); 4]);
-    let expected: BTreeMap<String, Row> = RELEASES
-        .iter()
-        .filter_map(|(key, _, raw, canonical)| {
-            let minute = format!(
-                "{}:00.000000Z",
-                chrono::NaiveDateTime::parse_from_str(raw, "%a, %d %b %Y %H:%M GMT")
-                    .ok()?
-                    .format("%Y-%m-%dT%H:%M")
-            );
-            Some((
-                digest(canon::digest::story_id(SOURCE, key))?,
-                (
-                    digest(canon::digest::doc_id((*canonical)?)),
-                    Some(minute),
-                    None,
-                    Some((*raw).to_owned()),
-                    Some("pubDate".to_owned()),
-                    Some("vendor_published".to_owned()),
-                    RECEIVED_AT.to_owned(),
-                ),
-            ))
-        })
-        .collect();
+    let expected = gnw_items();
     assert_eq!(stored_items(&db)?, expected);
     // Mutation 2026-11-15: `collect` observing at `requested_at` instead of `received_at` was
     // green before the stub told the two apart.
@@ -362,6 +419,101 @@ fn an_open_web_run_collects_a_globenewswire_day_end_to_end() -> TestResult {
             visible(root.path(), AFTER_THE_MINUTE_CLOSED)?
         ),
         (1, 2)
+    );
+    Ok(())
+}
+
+/// Section 11.2, the committed hosts file: GNW's index first, then PR Newswire's, each with its own
+/// three pages. Mutations 2026-11-16, the PRN row removed / set to candidate, one PRN pin character
+/// changed, PRN's `path_prefix` set to `/multivu/`, `document_of` labelling `Published::At`: each red.
+#[test]
+fn an_open_web_run_collects_a_globenewswire_and_a_pr_newswire_day_end_to_end() -> TestResult {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    let ask = Ask {
+        hosts: Some(seed::committed_hosts()),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, &Gnw::two_hosts()?, &Fixed)?;
+    let envelope = &answer.envelope;
+    let attempts = envelope["attempts"].as_array().ok_or("attempts")?;
+    let hosts_version = canon::FileDigest::of(&std::fs::read(seed::committed_hosts())?);
+    assert_eq!(
+        (
+            answer.exit,
+            envelope["hosts_version"].as_str(),
+            attempts.len(),
+            attempts[0]["url"].as_str(),
+            envelope["items_committed"].as_u64(),
+        ),
+        (Exit::Ok, Some(hosts_version.hex()), 8, Some(INDEX), Some(4)),
+        "{envelope:#}"
+    );
+    // Per url: (vendor_rows, unusable_rows, items_committed).
+    type Counts = (Option<u64>, Option<u64>, Option<u64>);
+    let counted: BTreeMap<String, Counts> = attempts
+        .iter()
+        .filter_map(|row| {
+            Some((
+                row["url"].as_str()?.to_owned(),
+                (
+                    row["vendor_rows"].as_u64(),
+                    row["unusable_rows"].as_u64(),
+                    row["items_committed"].as_u64(),
+                ),
+            ))
+        })
+        .collect();
+    let mut expected_counts = BTreeMap::new();
+    for index in [INDEX, PRN_INDEX] {
+        expected_counts.insert(index.to_owned(), (Some(3), Some(0), Some(0)));
+    }
+    let gnw_pages = RELEASES
+        .iter()
+        .map(|(key, _, _, canonical)| (*key, canonical.is_some()));
+    let prn_pages = PRN_RELEASES
+        .iter()
+        .enumerate()
+        .map(|(nth, (key, _))| (*key, nth != 0));
+    for (key, committed) in gnw_pages.chain(prn_pages) {
+        let (unusable, items) = if committed { (0, 1) } else { (1, 0) };
+        expected_counts.insert(
+            format!("https://{key}"),
+            (Some(1), Some(unusable), Some(items)),
+        );
+    }
+    assert_eq!(counted, expected_counts);
+    let db = Connection::open_with_flags(
+        root.path().join(COMMIT_LOG),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let mut versions = db.prepare("SELECT hosts_version FROM attempts WHERE source = ?1")?;
+    let versions = versions
+        .query_map([SOURCE], |row| row.get::<_, Option<String>>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(versions, vec![Some(hosts_version.hex().to_owned()); 8]);
+    let mut expected = gnw_items();
+    expected.extend([
+        prn_item(
+            1,
+            "2026-11-14T17:15:00.000000Z",
+            "Sat, 14 Nov 2026 17:15:00 +0000",
+        )?,
+        prn_item(
+            2,
+            "2026-11-14T17:01:00.000000Z",
+            "Sat, 14 Nov 2026 17:01:00 +0000",
+        )?,
+    ]);
+    assert_eq!(stored_items(&db)?, expected);
+    // GNW's 19:00 minute is still open at 19:00:45; its 18:45 and both PRN minutes are not.
+    assert_eq!(
+        (
+            visible(root.path(), BEFORE_THE_MINUTE_CLOSED)?,
+            visible(root.path(), AFTER_THE_MINUTE_CLOSED)?
+        ),
+        (3, 4)
     );
     Ok(())
 }
@@ -706,8 +858,6 @@ fn an_open_web_collect_against_a_newer_store_is_a_version_refusal() -> TestResul
     Ok(())
 }
 
-const PRN_ROBOTS: &str = "https://www.prnewswire.com/robots.txt";
-
 /// A hosts file in `dir` admitting GNW and PRN, both pinned to the committed GNW body, and a store
 /// whose one refresh answered each url in `answered` with that body: what a dry-run collect says.
 fn collected_over_two_admitted_hosts(
@@ -750,7 +900,7 @@ fn a_second_admitted_host_without_a_ledgered_fetch_is_refused() -> TestResult {
 #[test]
 fn another_hosts_fetch_matching_the_pin_does_not_admit_a_host() -> TestResult {
     let dir = TempDir::new()?;
-    let said = collected_over_two_admitted_hosts(dir.path(), &[PRN_ROBOTS])?;
+    let said = collected_over_two_admitted_hosts(dir.path(), &[seed::PRN_ROBOTS])?;
     assert_eq!(said, "unverified none");
     Ok(())
 }

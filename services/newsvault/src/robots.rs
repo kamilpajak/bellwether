@@ -179,10 +179,16 @@ mod tests {
         )
     }
 
+    fn provider_fixture(name: &str) -> Result<Vec<u8>, std::io::Error> {
+        std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../providers/open-web-feed/tests/fixtures")
+                .join(name),
+        )
+    }
+
     fn gnw() -> Result<Robots, Box<dyn std::error::Error>> {
-        let body = std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-            "../../providers/open-web-feed/tests/fixtures/gnw/robots_rss_globenewswire_com.txt",
-        ))?;
+        let body = provider_fixture("gnw/robots_rss_globenewswire_com.txt")?;
         Ok(Robots::parse(&body)?)
     }
 
@@ -190,16 +196,31 @@ mod tests {
     #[test]
     fn the_star_group_is_read_and_a_named_bot_group_is_not() -> TestResult {
         let delays = [
-            ("www.nasdaq.com.txt", Some(30)),
-            ("www.accessnewswire.com.txt", Some(5)),
-            ("www.prnewswire.com.txt", None),
-            ("synthetic_star_shares_a_group.txt", Some(20)),
-        ]
-        .map(|(name, secs)| (name, secs.map(Duration::from_secs)));
-        for (name, expected) in delays {
+            (
+                "www.nasdaq.com.txt",
+                fixture("www.nasdaq.com.txt")?,
+                Some(30),
+            ),
+            (
+                "www.accessnewswire.com.txt",
+                fixture("www.accessnewswire.com.txt")?,
+                Some(5),
+            ),
+            (
+                "prn/robots_www_prnewswire_com.txt",
+                provider_fixture("prn/robots_www_prnewswire_com.txt")?,
+                None,
+            ),
+            (
+                "synthetic_star_shares_a_group.txt",
+                fixture("synthetic_star_shares_a_group.txt")?,
+                Some(20),
+            ),
+        ];
+        for (name, body, secs) in delays {
             assert_eq!(
-                Robots::parse(&fixture(name)?)?.crawl_delay(),
-                expected,
+                Robots::parse(&body)?.crawl_delay(),
+                secs.map(Duration::from_secs),
                 "{name}"
             );
         }
@@ -367,6 +388,23 @@ mod tests {
                 gnw.allows("/news-release/"),
                 gnw.allows("/search"),
                 gnw.crawl_delay()
+            ),
+            (true, true, false, None)
+        );
+        Ok(())
+    }
+
+    /// PRN's 8 `Disallow` lines sit in its `*` group; `/multivu/` is one of them. Mutations
+    /// 2026-11-16, every `Disallow` read as `Allow`: red; `Disallow` lines skipped: red.
+    #[test]
+    fn the_prn_robots_allows_the_rss_index_and_the_news_releases_prefix() -> TestResult {
+        let prn = Robots::parse(&provider_fixture("prn/robots_www_prnewswire_com.txt")?)?;
+        assert_eq!(
+            (
+                prn.allows("/rss/news-releases-list.rss"),
+                prn.allows("/news-releases/"),
+                prn.allows("/multivu/"),
+                prn.crawl_delay()
             ),
             (true, true, false, None)
         );

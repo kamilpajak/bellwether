@@ -1,4 +1,4 @@
-//! Against committed fixtures and never the network. The GNW files are trimmed from the
+//! Against committed fixtures and never the network. The GNW and PRN files are trimmed from the
 //! 2026-11-14 probes (architecture.md section 11.6); every `synthetic_` file says so in its head.
 
 use std::collections::BTreeSet;
@@ -84,6 +84,54 @@ const OUTSIDE_THE_CONTAINER: [&str; 5] = [
     "pnrApplicationSettings",
     "Tennis Courts Florida",
 ];
+const PRN_INDEX: &str = "https://www.prnewswire.com/rss/news-releases-list.rss";
+const PRN_HOST: &str = "www.prnewswire.com";
+/// Items 2-4 of the 20 in the 2026-11-14 19:21:04 GMT feed. The first is a correction notice
+/// listed under release link 302913655 (§8 row R3).
+const PRN_REAL_INDEX: &str = "rss_3_items.xml";
+const PRN_LINKS: [&str; 3] = [
+    "https://www.prnewswire.com/news-releases/north-carolinas-electric-cooperatives-launches-evconnectnc-powered-by-weavegrid-to-maximize-charging-during-lower-demand-and-power-cost-periods-302913655.html",
+    PRN_ARTICLE_URL,
+    PRN_SECOND_ARTICLE_URL,
+];
+const PRN_PUB_DATES: [&str; 3] = [
+    "Sat, 14 Nov 2026 17:48:00 +0000",
+    "Sat, 14 Nov 2026 17:15:00 +0000",
+    "Sat, 14 Nov 2026 17:01:00 +0000",
+];
+const PRN_MINUTES: [&str; 3] = [
+    "2026-11-14T17:48:00Z",
+    "2026-11-14T17:15:00Z",
+    "2026-11-14T17:01:00Z",
+];
+/// A second inside the minute, another offset, a two-digit year: none is a PRN minute.
+const PRN_NOT_A_MINUTE_PUB_DATES: [&str; 3] = [
+    "Sat, 14 Nov 2026 17:15:30 +0000",
+    "Sat, 14 Nov 2026 17:15:00 -0500",
+    "Sat, 14 Nov 26 17:15:00 +0000",
+];
+const PRN_ARTICLE: &str = "article_302939553.html";
+const PRN_ARTICLE_URL: &str = "https://www.prnewswire.com/news-releases/novos-wegovy-was-associated-with-a-reduction-in-food-noise-according-to-real-world-studies-at-obesityweek-2026-302939553.html";
+const PRN_ARTICLE_KEY: &str = "www.prnewswire.com/news-releases/novos-wegovy-was-associated-with-a-reduction-in-food-noise-according-to-real-world-studies-at-obesityweek-2026-302939553.html";
+const PRN_ARTICLE_TITLE: &str = "Novo's Wegovy® was associated with a reduction in food noise according to real-world studies at ObesityWeek® 2026";
+const PRN_SECOND_ARTICLE: &str = "article_302938569.html";
+const PRN_SECOND_ARTICLE_URL: &str = "https://www.prnewswire.com/news-releases/lilly-to-present-new-data-across-zepbound-foundayo-eloratzp-and-retatrutide-at-obesityweek-2026-moving-obesity-care-beyond-the-scale-302938569.html";
+const PRN_SECOND_ARTICLE_TITLE: &str = "Lilly to present new data across Zepbound, Foundayo, EloraTZP and retatrutide at ObesityWeek 2026, moving obesity care beyond the scale";
+const PRN_NO_RELEASE_BODY_PAGE: &str = "synthetic_no_release_body.html";
+const PRN_LINE_BREAK_PAGE: &str = "synthetic_heading_line_break.html";
+const PRN_OFF_PREFIX_URL: &str =
+    "https://www.prnewswire.com/apac/news-releases/a-release-off-the-prefix-302999998.html";
+const PRN_ARTICLE_OPENS: &str =
+    "PLAINSBORO, N.J. and BAGSVÆRD, Denmark, Nov. 14, 2026 /PRNewswire/ -- Today, Novo Nordisk";
+/// Text the trimmed page holds outside `section.release-body`: the dateline `<p>`, the share
+/// `<p>`, the ld+json `<script>`, and a `<p>` of `section.nav-main`, one of the 4 other
+/// `<section>` elements of the untrimmed page. `<article>` holds the first two.
+const PRN_OUTSIDE_THE_SECTION: [&str; 4] = [
+    "12:15 ET",
+    "Share this article",
+    "NewsArticle",
+    "Searching for your content",
+];
 const FIRST_ATTEMPT: u32 = 0;
 const OK: u16 = 200;
 const REQUEST_TIMEOUT: u16 = 408;
@@ -101,6 +149,10 @@ fn fixtures() -> PathBuf {
 
 fn gnw(name: &str) -> Vec<u8> {
     std::fs::read(fixtures().join("gnw").join(name)).unwrap_or_default()
+}
+
+fn prn(name: &str) -> Vec<u8> {
+    std::fs::read(fixtures().join("prn").join(name)).unwrap_or_default()
 }
 
 fn hosts_path() -> PathBuf {
@@ -160,6 +212,32 @@ fn article_request(provider: &OpenWebFeed) -> Result<Request, Box<dyn std::error
         .first()
         .cloned()
         .ok_or_else(|| "the real index yielded no follow-up".into())
+}
+
+fn prn_index_request(provider: &OpenWebFeed) -> Result<Request, Box<dyn std::error::Error>> {
+    let plan = provider.plan(&TargetWindow::new(RUN_DAY), None, None, at(RUN_AT))?;
+    plan.requests
+        .into_iter()
+        .find(|request| request.url == PRN_INDEX)
+        .ok_or_else(|| "the run day planned no PR Newswire index".into())
+}
+
+/// The follow-up the real PRN index names at `position`, with its real `pubDate`.
+fn prn_follow_up(
+    provider: &OpenWebFeed,
+    position: usize,
+) -> Result<Request, Box<dyn std::error::Error>> {
+    let index = provider.extract(&prn_index_request(provider)?, &blob(prn(PRN_REAL_INDEX)));
+    index
+        .follow_ups
+        .get(position)
+        .cloned()
+        .ok_or_else(|| format!("the real PRN index yielded no follow-up {position}").into())
+}
+
+/// Release 302939553, the second item of the real PRN index.
+fn prn_article_request(provider: &OpenWebFeed) -> Result<Request, Box<dyn std::error::Error>> {
+    prn_follow_up(provider, 1)
 }
 
 fn only_item(extracted: &Extracted) -> Result<CollectedItem, Box<dyn std::error::Error>> {
@@ -227,8 +305,22 @@ fn a_target_other_than_the_run_day_is_refused_before_any_request() -> Outcome {
         );
     }
     let plan = provider.plan(&TargetWindow::new(RUN_DAY), None, None, at(RUN_AT))?;
-    assert_eq!(plan.requests.len(), 1);
+    assert_eq!(plan.requests.len(), 2);
     assert_eq!(plan.not_planned, Vec::new());
+    Ok(())
+}
+
+/// Section 11.2's host order: GNW, then PR Newswire, one index each. Mutations 2026-11-16, the
+/// PRN row made `candidate` and the two rows swapped: each red.
+#[test]
+fn the_committed_hosts_file_plans_globenewswire_then_pr_newswire() -> Outcome {
+    let plan = provider()?.plan(&TargetWindow::new(RUN_DAY), None, None, at(RUN_AT))?;
+    let urls: Vec<&str> = plan
+        .requests
+        .iter()
+        .map(|request| request.url.as_str())
+        .collect();
+    assert_eq!(urls, vec![GNW_INDEX, PRN_INDEX]);
     Ok(())
 }
 
@@ -473,9 +565,15 @@ fn an_answer_from_a_host_no_row_admits_is_permanent() -> Outcome {
         &rules_path(),
         CONTACT,
     )?;
-    for provider in [provider()?, with_a_candidate] {
+    for (provider, url) in [
+        (provider()?, "https://www.businesswire.com/news/home/a.html"),
+        (
+            with_a_candidate,
+            "https://www.prnewswire.com/news-releases/a.html",
+        ),
+    ] {
         let mut request = article_request(&provider)?;
-        request.url = "https://www.prnewswire.com/news-releases/a.html".to_owned();
+        request.url = url.to_owned();
         assert_eq!(
             verdict(&provider, &request, OK, &gnw(REAL_ARTICLE))?,
             Verdict::PermanentFailure
@@ -1001,6 +1099,210 @@ fn a_live_follow_up_whose_story_is_held_is_dropped_and_an_unheld_one_kept() -> O
     Ok(())
 }
 
+// ---- PR Newswire ----
+
+/// No rewrite: each link stays on `www.prnewswire.com` and passes `/news-releases/` (plural).
+/// Mutation 2026-11-16, the prefix GNW's `/news-release/`: red, all 3 filtered out.
+#[test]
+fn the_real_pr_newswire_index_yields_one_follow_up_per_release_with_its_raw_pub_date() -> Outcome {
+    let provider = provider()?;
+    let extracted = provider.extract(&prn_index_request(&provider)?, &blob(prn(PRN_REAL_INDEX)));
+    assert_eq!(
+        (extracted.vendor_rows, extracted.filtered_out),
+        (REAL_ROWS, 0)
+    );
+    let kept: Vec<(&str, Option<&str>, RequestPhase)> = extracted
+        .follow_ups
+        .iter()
+        .map(|request| {
+            (
+                request.url.as_str(),
+                request.listed_date.as_deref(),
+                request.phase,
+            )
+        })
+        .collect();
+    let expected: Vec<(&str, Option<&str>, RequestPhase)> = PRN_LINKS
+        .iter()
+        .zip(PRN_PUB_DATES)
+        .map(|(link, pub_date)| (*link, Some(pub_date), RequestPhase::Document))
+        .collect();
+    assert_eq!(kept, expected);
+    Ok(())
+}
+
+/// The 40 real links of 2026-11-14 and 2026-11-16 are all under `/news-releases/`, so only a
+/// synthetic link tests the prefix from the wide side. Mutation 2026-11-16, the prefix `/`: red.
+#[test]
+fn a_pr_newswire_link_outside_news_releases_is_filtered_out_and_counted() -> Outcome {
+    let provider = provider()?;
+    let item = |link: &str| {
+        format!(
+            "<item><link>{link}</link><pubDate>Sat, 14 Nov 2026 17:15:00 +0000</pubDate></item>"
+        )
+    };
+    let index = format!(
+        "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel>{}{}</channel></rss>",
+        item(PRN_ARTICLE_URL),
+        item(PRN_OFF_PREFIX_URL),
+    );
+    let extracted = provider.extract(&prn_index_request(&provider)?, &blob(index.into_bytes()));
+    let kept: Vec<&str> = extracted
+        .follow_ups
+        .iter()
+        .map(|request| request.url.as_str())
+        .collect();
+    assert_eq!(
+        (extracted.vendor_rows, kept, extracted.filtered_out),
+        (2, vec![PRN_ARTICLE_URL], 1)
+    );
+    Ok(())
+}
+
+/// Section 11.1: every observed PRN item `pubDate` ends `:00 +0000` (40 of 40, feeds of
+/// 2026-11-14 and 2026-11-16) while the channel `pubDate` carries real seconds, so the item value
+/// is a minute. Mutations 2026-11-16: `%S` for `:00`, the loader's seconds check dropped and
+/// `minute_of` truncating to the minute, red (17:15:30 read as 17:15); the round trip removed, red.
+#[test]
+fn a_pr_newswire_pubdate_is_a_minute_and_never_an_instant() -> Outcome {
+    let provider = provider()?;
+    let request = prn_article_request(&provider)?;
+    let extract = |raw: &str| {
+        let dated = Request {
+            listed_date: Some(raw.to_owned()),
+            ..request.clone()
+        };
+        provider.extract(&dated, &blob(prn(PRN_ARTICLE)))
+    };
+    for (raw, minute) in PRN_PUB_DATES.iter().zip(PRN_MINUTES) {
+        let item = only_item(&extract(raw))?;
+        assert_eq!(
+            (&item.valid, precision_of(&item.valid), item.valid_source),
+            (
+                &Published::AtMinute(Minute::new(minute.parse()?)?),
+                ValidPrecision::Minute,
+                ValidSource::VendorPublished
+            ),
+            "{raw}"
+        );
+    }
+    for raw in PRN_NOT_A_MINUTE_PUB_DATES {
+        let row = only_unusable(&extract(raw))?;
+        assert_eq!(
+            (row.reason, row.decided_by, &row.item.valid),
+            (
+                UnusableReason::NoParseableValidTime,
+                DecidedBy::IndexRow,
+                &Published::Unknown
+            ),
+            "{raw}"
+        );
+    }
+    Ok(())
+}
+
+/// §8 row R17 for PR Newswire: `<p>` text inside `section.release-body`. `<article>` would add
+/// the dateline and the share line (2 of 42 `<p>` on the untrimmed page, 2026-11-14 probe).
+/// Mutations 2026-11-16, the container `body`, `article` and `section`: each red.
+#[test]
+fn the_extracted_body_is_article_text_and_never_page_html_on_a_pr_newswire_page() -> Outcome {
+    let provider = provider()?;
+    let item =
+        only_item(&provider.extract(&prn_article_request(&provider)?, &blob(prn(PRN_ARTICLE))))?;
+    let body = item.body.ok_or("no body")?.text;
+    assert!(body.starts_with(PRN_ARTICLE_OPENS), "{body}");
+    assert_eq!(body.lines().count(), ARTICLE_PARAGRAPHS, "{body}");
+    assert!(!body.contains('<'), "{body}");
+    for outside in PRN_OUTSIDE_THE_SECTION {
+        assert!(
+            !body.contains(outside),
+            "{outside} reached the body: {body}"
+        );
+    }
+    Ok(())
+}
+
+/// `body_ref` is an `item_id` input, so fused words would fix every affected id. Mutation
+/// 2026-11-16, the `br` arm removed: red ("About SIGNALSIGNAL is").
+#[test]
+fn a_line_break_inside_a_paragraph_is_read_as_a_space() -> Outcome {
+    let provider = provider()?;
+    let page = blob(prn(PRN_LINE_BREAK_PAGE));
+    let item = only_item(&provider.extract(&prn_article_request(&provider)?, &page))?;
+    assert_eq!(
+        item.body.map(|body| body.text).as_deref(),
+        Some("About SIGNAL SIGNAL is a retrospective cohort study.\nLine one line two.")
+    );
+    Ok(())
+}
+
+/// A page without `section.release-body` is the page's fault, so it is held (section 11.1).
+/// Mutation 2026-11-16, the container `article`: red.
+#[test]
+fn a_pr_newswire_page_with_no_release_body_is_unusable_as_no_article_body() -> Outcome {
+    let provider = provider()?;
+    let page = blob(prn(PRN_NO_RELEASE_BODY_PAGE));
+    let row = only_unusable(&provider.extract(&prn_article_request(&provider)?, &page))?;
+    assert_eq!(
+        (
+            row.reason,
+            row.decided_by,
+            row.raw_blob.as_str(),
+            row.item.body.as_ref()
+        ),
+        (
+            UnusableReason::NoArticleBody,
+            DecidedBy::Page,
+            page.digest.as_str(),
+            None
+        )
+    );
+    assert_eq!(row.item.title, "A Release Without Its Body");
+    Ok(())
+}
+
+/// The key is the link's own host and path; both probe pages' canonical and `og:url` are that
+/// link. Mutation 2026-11-16, a rewrite `www.prnewswire.com` to `prnewswire.com`: red.
+#[test]
+fn the_real_pr_newswire_article_carries_its_title_its_canonical_link_and_its_www_item_key(
+) -> Outcome {
+    let provider = provider()?;
+    assert_eq!(
+        provider.item_key(PRN_ARTICLE_URL).as_deref(),
+        Some(PRN_ARTICLE_KEY)
+    );
+    let mut read = Vec::new();
+    for (position, page) in [(1, PRN_ARTICLE), (2, PRN_SECOND_ARTICLE)] {
+        let request = prn_follow_up(&provider, position)?;
+        let item = only_item(&provider.extract(&request, &blob(prn(page))))?;
+        read.push((
+            item.title,
+            item.canonical_url,
+            item.source_item_id,
+            item.observed,
+        ));
+    }
+    let key_of = |url: &str| url.trim_start_matches("https://").to_owned();
+    assert_eq!(
+        read,
+        vec![
+            (
+                PRN_ARTICLE_TITLE.to_owned(),
+                PRN_ARTICLE_URL.to_owned(),
+                PRN_ARTICLE_KEY.to_owned(),
+                None
+            ),
+            (
+                PRN_SECOND_ARTICLE_TITLE.to_owned(),
+                PRN_SECOND_ARTICLE_URL.to_owned(),
+                key_of(PRN_SECOND_ARTICLE_URL),
+                None
+            ),
+        ]
+    );
+    Ok(())
+}
+
 // ---- transport ----
 
 /// §11.2: a hop ureq follows is a request no pace file and no attempt row sees (row R19).
@@ -1148,7 +1450,7 @@ fn a_hosts_row_naming_a_rule_the_rules_file_lacks_is_refused() {
         Some(Refusal::UnknownRule {
             path,
             host: GNW_HOST.to_owned(),
-            rule: "prn".to_owned()
+            rule: "no_such_rule".to_owned()
         })
     );
 }
@@ -1221,18 +1523,26 @@ fn a_robots_pin_that_is_neither_64_lowercase_hex_nor_absent_is_refused() -> Outc
     Ok(())
 }
 
-/// The committed pin is the committed robots body's sha256, so a refresh answered with that body
-/// matches it (`newsvault`'s `tests/robots_refresh.rs`).
+/// Each committed pin is its committed robots body's sha256, so a refresh answered with that body
+/// matches it (`newsvault`'s `tests/robots_refresh.rs`). Mutation 2026-11-16, one hex digit of
+/// the PRN pin changed: red.
 #[test]
 fn the_committed_hosts_file_pins_the_committed_robots_body() -> Outcome {
-    let body = gnw("robots_rss_globenewswire_com.txt");
+    let pin = |body: Vec<u8>| Some(RobotsPin::Sha256(FileDigest::of(&body).hex().to_owned()));
     assert_eq!(
         provider()?.host_pins(),
-        vec![HostPin {
-            host: GNW_HOST.to_owned(),
-            admitted: true,
-            robots: Some(RobotsPin::Sha256(FileDigest::of(&body).hex().to_owned())),
-        }]
+        vec![
+            HostPin {
+                host: GNW_HOST.to_owned(),
+                admitted: true,
+                robots: pin(gnw("robots_rss_globenewswire_com.txt")),
+            },
+            HostPin {
+                host: PRN_HOST.to_owned(),
+                admitted: true,
+                robots: pin(prn("robots_www_prnewswire_com.txt")),
+            },
+        ]
     );
     Ok(())
 }
@@ -1385,11 +1695,16 @@ fn the_open_web_feed_breaks_no_claim_of_the_seam() -> Outcome {
         .first()
         .cloned()
         .ok_or("no synthetic follow-up")?;
+    let prn_article = prn_article_request(&provider)?;
     let payloads = [
         (index_request(&provider)?, blob(gnw(REAL_INDEX))),
         (article.clone(), blob(gnw(REAL_ARTICLE))),
         (synthetic, blob(gnw(SYNTHETIC_PAGE))),
         (article, blob(gnw(NO_CONTAINER_PAGE))),
+        (prn_index_request(&provider)?, blob(prn(PRN_REAL_INDEX))),
+        (prn_article.clone(), blob(prn(PRN_ARTICLE))),
+        (prn_follow_up(&provider, 2)?, blob(prn(PRN_SECOND_ARTICLE))),
+        (prn_article, blob(prn(PRN_NO_RELEASE_BODY_PAGE))),
     ];
     let subject = Subject {
         target: TargetWindow::new(RUN_DAY),
@@ -1406,7 +1721,7 @@ fn the_open_web_feed_breaks_no_claim_of_the_seam() -> Outcome {
         .flat_map(|(request, raw)| provider.extract(request, raw).items)
         .map(|item| precision_of(&item.valid))
         .collect();
-    assert_eq!(produced.len(), 2);
+    assert_eq!(produced.len(), 4);
     assert!(
         produced.iter().all(|precision| *precision == ceiling),
         "{produced:?} under {ceiling:?}"

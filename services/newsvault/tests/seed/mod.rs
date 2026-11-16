@@ -1,6 +1,5 @@
 //! A ledgered robots fetch, through `cmd_robots::run` over a stub, so an open-web collect passes
 //! §8 row R4(b). The urls named are answered; every other url fails in transport.
-
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -13,15 +12,41 @@ use newsvault::cmd_robots::{self, Ask};
 use pit::ObservationTime;
 
 pub const GNW_ROBOTS: &str = "https://rss.globenewswire.com/robots.txt";
+pub const PRN_ROBOTS: &str = "https://www.prnewswire.com/robots.txt";
 const CONTACT: &str = "bellwether collector contact@example.test";
+const OK: u16 = 200;
 
 fn provider_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../providers/open-web-feed")
 }
 
-/// The committed 2026-11-14 body the committed hosts file pins.
+/// The committed 2026-11-14 GNW body, which the committed hosts file and `gnw_admitted.json` pin.
 pub fn gnw_robots() -> Result<Vec<u8>, std::io::Error> {
     std::fs::read(provider_dir().join("tests/fixtures/gnw/robots_rss_globenewswire_com.txt"))
+}
+
+/// The committed PRN body, which the committed hosts file's PRN row pins.
+pub fn prn_robots() -> Result<Vec<u8>, std::io::Error> {
+    std::fs::read(provider_dir().join("tests/fixtures/prn/robots_www_prnewswire_com.txt"))
+}
+
+/// The committed hosts file.
+pub fn committed_hosts() -> PathBuf {
+    provider_dir().join("hosts/open_web_wires.hosts.json")
+}
+
+/// One `robots refresh` of the committed hosts file into `store` at `at`, both rows answered 200
+/// with their committed bodies.
+pub fn refresh_committed(store: &Path, at: &str) -> Result<cmd_robots::Answer, Box<dyn Error>> {
+    refresh_answering(
+        store,
+        &committed_hosts(),
+        at,
+        &[
+            (GNW_ROBOTS, OK, &gnw_robots()?),
+            (PRN_ROBOTS, OK, &prn_robots()?),
+        ],
+    )
 }
 
 struct At(DateTime<Utc>);

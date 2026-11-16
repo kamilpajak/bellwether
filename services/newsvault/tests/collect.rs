@@ -1594,9 +1594,11 @@ const GNW_INDEX: &str = "https://rss.globenewswire.com/rssfeed/";
 /// `synthetic_index_one_release.xml`'s one `www.` link, rewritten to `rss.` as the rules say.
 const GNW_RELEASE: &str =
     "https://rss.globenewswire.com/news-release/2026/11/14/9999999/0/en/synthetic-release.html";
-/// The committed hosts file admits one host, so a plan holds one index request.
-const ADMITTED_HOSTS: u64 = 1;
-/// Before `SATURDAY_AT`: when the seeded robots fetch of the committed GNW row was ledgered.
+/// The committed hosts file admits GNW and PR Newswire, so a plan holds two index requests.
+const ADMITTED_HOSTS: u64 = 2;
+/// `open_web_hosts()` admits GNW alone.
+const GNW_ONLY_ADMITTED_HOSTS: u64 = 1;
+/// Before `SATURDAY_AT`: when the seeded robots fetches were ledgered.
 const ROBOTS_FETCHED_AT: &str = "2026-11-14T18:00:00Z";
 
 /// §8 row R4(b): the committed GNW row's robots fetch, ledgered so an open-web collect may run.
@@ -1614,11 +1616,12 @@ fn open_web_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../providers/open-web-feed")
 }
 
-/// The production hosts and rules files, as `rules()` is edgar's.
+/// The GNW row alone: a byte copy of the committed hosts file before PRN was admitted.
 fn open_web_hosts() -> PathBuf {
-    open_web_dir().join("hosts/open_web_wires.hosts.json")
+    open_web_dir().join("tests/fixtures/hosts/gnw_admitted.json")
 }
 
+/// The production rules file, as `rules()` is edgar's.
 fn open_web_rules() -> PathBuf {
     open_web_dir().join("rules/open-web-feed.rules.json")
 }
@@ -1819,7 +1822,7 @@ fn window_today_resolves_to_the_utc_date_of_at() -> TestResult {
             envelope["window"].as_str(),
             envelope["plan"]["requests"].as_u64()
         ),
-        (Some(SATURDAY), Some(ADMITTED_HOSTS))
+        (Some(SATURDAY), Some(GNW_ONLY_ADMITTED_HOSTS))
     );
     Ok(())
 }
@@ -1897,14 +1900,17 @@ fn two_sources_in_one_invocation_are_refused() -> TestResult {
     Ok(())
 }
 
+/// The committed hosts file, both robots rows seeded. Mutation 2026-11-16, its PRN row set to
+/// `candidate`: red (one request).
 #[test]
 fn an_open_web_dry_run_plans_one_index_request_per_admitted_host_and_writes_nothing() -> TestResult
 {
     let root = TempDir::new()?;
-    seed_robots(root.path())?;
+    seed::refresh_committed(root.path(), ROBOTS_FETCHED_AT)?;
     let before = tree_digests(root.path());
     let dry = Ask {
         dry_run: true,
+        hosts: Some(seed::committed_hosts()),
         ..open_web_ask(root.path(), SATURDAY_AT)
     };
     let opened = cmd_collect::open_provider(&dry)?;
