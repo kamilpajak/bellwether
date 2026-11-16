@@ -1,16 +1,19 @@
 {
   "bodies": {
     "gnw/article_3403075.html": "702c4e7023122be9aca0773503948c876f81d42db7f04a384d43d4867d220e91",
+    "gnw/article_3403177.html": "c6c1940e197f75ed76f313c21489af88d12f45fa7915051a8e0fcdb11411ef45",
+    "gnw/article_3403225.html": "8c7ec6530f366327b116308097398ab8ca70548ad7d8d1c54893c68ce40ed5a8",
     "gnw/synthetic_canonical_differs.html": "312aeb12f555c77d547898e7a040e18cc1b62718e3971362324b0d70538cf08b",
-    "gnw/synthetic_lists_tables_and_addresses.html": "19ea5faf11614dd6173333de8de746983a2df6498a0d5936c816eb981b117df2",
+    "gnw/synthetic_lists_tables_and_addresses.html": "2bc04768c0f16ed47069d36e4d629d3e7217babbece1691f11b2fa1ae67933c8",
     "gnw/synthetic_relative_canonical.html": "06807c227b19b3899f8eb6941d2599581bbd62997fbbc687d481ada5223bf249",
     "gnw/synthetic_script_and_symbol_paragraphs.html": "31cf545a878cf251517e18064d04daa77a847d9f40e2af899deeb419168d9c30",
     "prn/article_302938569.html": "213ae1e8e473ba9eed15935cb5b59a27c0710854e610ebadf4159c5fe7145db8",
     "prn/article_302939553.html": "672a743752a3290ce4374534b2d94aae3111f1253e8a13bc6d804cf499149c43",
-    "prn/synthetic_addresses.html": "046478ab3cbf7d4939c8ac04cd3352cb65f917362ed9fafb782cfcf0d5953cc4",
+    "prn/article_302939742.html": "f15b871cfaf8d42bcacbb184747fa73540ced2531d1098d393c091eb2c8c893f",
+    "prn/synthetic_addresses.html": "6cb4822b4e4a25342d7dca405e465a0c393e3d8232865a3da13323e10a86c532",
     "prn/synthetic_heading_line_break.html": "799cabad20e491595a87642d2a5b5df3dde2f7aaef8100be9ca8453665cae33c",
     "prn/synthetic_lists.html": "4200e33d8e922413c9271d0fdceb43f8815a210d18f8b596ecea7efde9dde01d",
     "prn/synthetic_tables.html": "13fe1e5d451f5aadc5a093d0c407ed4750aa9923a25bee6cef0e9297897326ac"
   },
-  "extract_version": "05b71aa20440e7a1dc4b41589f437313cd5cebf466934a5961baa37825fd3797"
+  "extract_version": "bef9345bcaae5f8c89cc4145d41ef424b31dff727e3c72bf8ddfbf4836c1e7bb"
 }

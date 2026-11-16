@@ -63,7 +63,9 @@ const LINK: &str = "a";
 /// Cloudflare's obfuscated address: its text is the literal `[email protected]` (P1, section 11.1).
 const CLOUDFLARE_EMAIL_CLASS: &str = "__cf_email__";
 const CLOUDFLARE_EMAIL_PATH: &str = "/cdn-cgi/l/email-protection";
-const MAILTO: &str = "mailto:";
+/// Decision r (section 11.1): `[A-Za-z0-9._%+'-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}`.
+const LOCAL_PART_SYMBOLS: [char; 6] = ['.', '_', '%', '+', '\'', '-'];
+const SHORTEST_TOP_LABEL: usize = 2;
 
 /// One RSS `<item>`, its two fields as the payload spells them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,20 +204,15 @@ fn rows(element: ElementRef, into: &mut Vec<String>) {
     }
 }
 
-/// Never prose, a Cloudflare email placeholder, or a link to an address.
+/// Never prose, or a Cloudflare email placeholder.
 fn skipped(element: ElementRef) -> bool {
     let value = element.value();
     NOT_PROSE.contains(&value.name())
         || value.classes().any(|class| class == CLOUDFLARE_EMAIL_CLASS)
-        || (value.name() == LINK && value.attr("href").is_some_and(names_an_address))
-}
-
-fn names_an_address(href: &str) -> bool {
-    let href = href.trim_start();
-    href.contains(CLOUDFLARE_EMAIL_PATH)
-        || href
-            .get(..MAILTO.len())
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case(MAILTO))
+        || (value.name() == LINK
+            && value
+                .attr("href")
+                .is_some_and(|href| href.contains(CLOUDFLARE_EMAIL_PATH)))
 }
 
 fn collapsed(element: ElementRef) -> String {
@@ -225,7 +222,54 @@ fn collapsed(element: ElementRef) -> String {
 }
 
 fn collapse(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<&str>>().join(" ")
+    without_addresses(text)
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ")
+}
+
+/// The text with every address removed, leftmost first and never overlapping, as the regex at
+/// `LOCAL_PART_SYMBOLS` matches them; local-part characters are ASCII, one byte each.
+fn without_addresses(text: &str) -> String {
+    let mut kept = String::with_capacity(text.len());
+    let mut from = 0;
+    for (at, _) in text.match_indices('@') {
+        let local = text[from..at]
+            .chars()
+            .rev()
+            .take_while(|c| is_local_part(*c))
+            .count();
+        let Some(domain) = domain_length(&text[at + 1..]) else {
+            continue;
+        };
+        if local > 0 {
+            kept.push_str(&text[from..at - local]);
+            from = at + 1 + domain;
+        }
+    }
+    kept.push_str(&text[from..]);
+    kept
+}
+
+fn is_local_part(c: char) -> bool {
+    c.is_ascii_alphanumeric() || LOCAL_PART_SYMBOLS.contains(&c)
+}
+
+/// Bytes of the longest `label(.label)*.letters` prefix, the last part at least
+/// `SHORTEST_TOP_LABEL` ASCII letters; the regex's greedy match is the same prefix.
+fn domain_length(text: &str) -> Option<usize> {
+    let run = text
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '.'))
+        .map_or(text, |end| &text[..end]);
+    let labels: Vec<&str> = run.split('.').collect();
+    let whole = labels.iter().take_while(|label| !label.is_empty()).count();
+    (1..whole).rev().find_map(|last| {
+        let letters = labels[last]
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(labels[last].len());
+        let before: usize = labels[..last].iter().map(|label| label.len() + 1).sum();
+        (letters >= SHORTEST_TOP_LABEL).then_some(before + letters)
+    })
 }
 
 /// With `tables`, a table ends the text so far as one line and is read by `rows`; without, as in
@@ -258,5 +302,65 @@ fn prose(element: ElementRef, into: &mut String, mut tables: Option<&mut Vec<Str
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::without_addresses;
+
+    /// Decision r (section 11.1): each case's result is Python's `re.sub` with the research regex
+    /// and an empty replacement (run 2026-11-16).
+    #[test]
+    fn every_address_the_regex_matches_is_removed_and_nothing_around_it() {
+        let cases = [
+            ("E-mail: ann.example@example.com", "E-mail: "),
+            ("first_last%x@example.com and", " and"),
+            ("(o'neil+ir@mail.example.co.uk).", "()."),
+            ("a@b.cc@d.ee", "@d.ee"),
+            ("x@y@example.com", "x@"),
+            ("ir@example.com2 and ir@example.c", "2 and ir@example.c"),
+            ("über@example.com", "ü"),
+            ("ir@example..com ir@-.example.com", "ir@example..com "),
+        ];
+        let removed: Vec<(&str, String)> = cases
+            .iter()
+            .map(|(text, _)| (*text, without_addresses(text)))
+            .collect();
+        let expected: Vec<(&str, String)> = cases
+            .iter()
+            .map(|(text, kept)| (*text, (*kept).to_owned()))
+            .collect();
+        assert_eq!(removed, expected);
+    }
+
+    /// The regex's own reach (section 11.1): a local part and a top label run on into letters
+    /// joined to them; results from Python's `re.sub` (run 2026-11-16).
+    #[test]
+    fn letters_joined_to_an_address_are_matched_as_part_of_it() {
+        let cases = [
+            ("Media Contactjane@example.com", "Media "),
+            ("E-mail: ir@example.comTel.: +1 555", "E-mail: .: +1 555"),
+            ("at ir@example.com. The", "at . The"),
+        ];
+        let removed: Vec<String> = cases
+            .iter()
+            .map(|(text, _)| without_addresses(text))
+            .collect();
+        let expected: Vec<&str> = cases.iter().map(|(_, kept)| *kept).collect();
+        assert_eq!(removed, expected);
+    }
+
+    /// Forms the 57 research bodies hold that are not addresses, and a phone number, stay.
+    #[test]
+    fn a_handle_a_profile_url_and_a_bare_at_sign_are_kept() {
+        let kept = [
+            "Follow @example on X",
+            "youtube.com/@example and tiktok.com/@example",
+            "ir@example and ir@localhost and @ alone",
+            "Tel.: +31 0 0000 0000",
+        ];
+        let after: Vec<String> = kept.iter().map(|text| without_addresses(text)).collect();
+        assert_eq!(after, kept);
     }
 }

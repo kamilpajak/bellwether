@@ -121,25 +121,36 @@ const PRN_NO_RELEASE_BODY_PAGE: &str = "synthetic_no_release_body.html";
 const PRN_LINE_BREAK_PAGE: &str = "synthetic_heading_line_break.html";
 const PRN_LISTS_PAGE: &str = "synthetic_lists.html";
 const PRN_ADDRESSES_PAGE: &str = "synthetic_addresses.html";
+const PRN_JOINED_ADDRESS_PAGE: &str = "synthetic_joined_address.html";
 const PRN_TABLES_PAGE: &str = "synthetic_tables.html";
+/// Release 302939742 (2026-11-16 09:42Z fetch) cut to its lead, two of its four gallery figures
+/// and one later paragraph; the two figures naming a person were left out.
+const PRN_FIGURE_PAGE: &str = "article_302939742.html";
 const GNW_ONE_PATH_PAGE: &str = "synthetic_lists_tables_and_addresses.html";
+/// Releases 3403177 and 3403225 (2026-11-16 09:42Z and 09:44Z fetches) cut to a contact block,
+/// names, phone digits and addresses replaced: the address in link text, then in plain text.
+const GNW_LINKED_ADDRESS_PAGE: &str = "article_3403177.html";
+const GNW_PLAIN_ADDRESS_PAGE: &str = "article_3403225.html";
 /// Section 11.1's P5: every page below, its committed body digest, and the extraction version
 /// that produced them. Rewritten by hand when an extraction change is meant.
 const GOLDEN_BODIES: &str = "golden_bodies.json";
-const GOLDEN_GNW_PAGES: [&str; 5] = [
+const GOLDEN_GNW_PAGES: [&str; 7] = [
     REAL_ARTICLE,
     "synthetic_canonical_differs.html",
     "synthetic_relative_canonical.html",
     PROSE_PAGE,
     GNW_ONE_PATH_PAGE,
+    GNW_LINKED_ADDRESS_PAGE,
+    GNW_PLAIN_ADDRESS_PAGE,
 ];
-const GOLDEN_PRN_PAGES: [&str; 6] = [
+const GOLDEN_PRN_PAGES: [&str; 7] = [
     PRN_ARTICLE,
     PRN_SECOND_ARTICLE,
     PRN_LINE_BREAK_PAGE,
     PRN_LISTS_PAGE,
     PRN_ADDRESSES_PAGE,
     PRN_TABLES_PAGE,
+    PRN_FIGURE_PAGE,
 ];
 const PRN_OFF_PREFIX_URL: &str =
     "https://www.prnewswire.com/apac/news-releases/a-release-off-the-prefix-302999998.html";
@@ -1775,13 +1786,59 @@ fn a_list_item_holding_a_paragraph_or_a_nested_list_is_one_line_read_once() -> O
     Ok(())
 }
 
-/// P1 and `mailto:` (section 11.1): neither Cloudflare shape nor an address link reaches the
-/// body; a web link does. Before, each placeholder was stored as `[email protected]`.
+/// P1 and decision r (section 11.1): neither Cloudflare shape nor an address reaches the body; a
+/// `mailto:` link's name, a phone number, a label and a web link do.
 #[test]
-fn a_cloudflare_email_placeholder_and_a_mailto_link_never_reach_the_body() -> Outcome {
+fn a_cloudflare_placeholder_and_an_address_never_reach_the_body_and_a_mailto_name_does() -> Outcome
+{
     assert_eq!(
         prn_body(PRN_ADDRESSES_PAGE)?,
-        "Media: today\nInvestors:\nPress: or , see example.com.\nDesk: daily"
+        "Media: today\nInvestors:\nPress: or , see example.com.\n\
+         Contact Jane Example, +45 0000 0000, E-mail:\nDesk: daily"
+    );
+    Ok(())
+}
+
+/// Decision r's measured limit (section 11.1): inline elements join with no space, so the
+/// regex reads letters joined to an address as part of it; with spaces, the words stay.
+#[test]
+fn letters_joined_to_an_address_with_no_space_are_removed_with_it() -> Outcome {
+    assert_eq!(
+        prn_body(PRN_JOINED_ADDRESS_PAGE)?,
+        "Media\n: +1 000 000 0000\nMedia Contact Tel: +1 000 000 0000"
+    );
+    Ok(())
+}
+
+fn gnw_body(page: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let provider = provider()?;
+    let item = only_item(&provider.extract(&article_request(&provider)?, &blob(gnw(page))))?;
+    Ok(item.body.ok_or("no body")?.text)
+}
+
+/// Decision r (section 11.1) on trimmed real GNW pages: an address as a Tracker link's text and as
+/// plain text is removed; the name, the phone number and the `E-mail:` label stay.
+#[test]
+fn an_address_in_link_text_or_plain_text_leaves_a_globenewswire_body_and_the_contact_stays(
+) -> Outcome {
+    let linked = gnw_body(GNW_LINKED_ADDRESS_PAGE)?;
+    let plain = gnw_body(GNW_PLAIN_ADDRESS_PAGE)?;
+    assert_eq!(
+        (linked.lines().nth(3), linked.lines().nth(4)),
+        (
+            Some("Ann Example Philips Global External Relations Tel.: +31 0 0000 0000 E-mail:"),
+            Some("Bo Example Philips Investor Relations Tel.: +31 00 00 00000 E-mail:")
+        ),
+        "{linked}"
+    );
+    assert_eq!(
+        plain.lines().last(),
+        Some("Niu Technologies E-mail:"),
+        "{plain}"
+    );
+    assert!(
+        !linked.contains('@') && !plain.contains('@'),
+        "{linked}\n{plain}"
     );
     Ok(())
 }
@@ -1800,8 +1857,8 @@ fn a_table_is_read_one_line_per_row_and_a_nested_table_inside_its_outer_cell() -
     Ok(())
 }
 
-/// P6 (section 11.1): GNW reads lists, tables and addresses through PRN's path; only the
-/// container differs.
+/// P6 (section 11.1): GNW reads lists, tables, addresses and a `figcaption` through PRN's path;
+/// only the container differs.
 #[test]
 fn a_globenewswire_page_reads_lists_tables_and_addresses_through_the_same_path() -> Outcome {
     let provider = provider()?;
@@ -1809,8 +1866,31 @@ fn a_globenewswire_page_reads_lists_tables_and_addresses_through_the_same_path()
     let item = only_item(&provider.extract(&article_request(&provider)?, &page))?;
     assert_eq!(
         item.body.map(|body| body.text).as_deref(),
-        Some("Opening paragraph.\nPoint one\nPoint two\nContact | or")
+        Some("Opening paragraph.\nPoint one\nPoint two\nContact | or\nA caption on GNW")
     );
+    Ok(())
+}
+
+/// `figcaption` is a paragraph on both hosts (§11.1): each caption is one line in document order,
+/// between the lead and the paragraph after the gallery; the `Continue Reading` link is not read.
+#[test]
+fn a_figure_caption_is_one_line_in_document_order_on_a_pr_newswire_page() -> Outcome {
+    let body = prn_body(PRN_FIGURE_PAGE)?;
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(
+        (lines.len(), lines.get(2..4)),
+        (
+            5,
+            Some(&["Stark Future HQ - Barcelona", "Stark VARG SM_Lineup"][..])
+        ),
+        "{body}"
+    );
+    assert!(
+        lines[1].starts_with("BARCELONA, Spain, Nov. 16, 2026"),
+        "{body}"
+    );
+    assert!(lines[4].starts_with("Founded in 2020"), "{body}");
+    assert!(!body.contains("Continue Reading"), "{body}");
     Ok(())
 }
 

@@ -1,0 +1,5 @@
+* text=auto eol=lf
+providers/*/tests/fixtures/** -text
+services/*/tests/fixtures/** -text
+probes/observation_lag/quarter_index.*.json -text
+*.parquet binary
