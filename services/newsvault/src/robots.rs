@@ -130,7 +130,7 @@ impl Robots {
                 }
                 rule @ (ALLOW | DISALLOW) => {
                     in_agent_run = false;
-                    orphan |= !named_an_agent;
+                    orphan |= !named_an_agent && !value.is_empty();
                     if group.every_agent && !value.is_empty() {
                         robots.rules.push(PathRule {
                             allow: rule == ALLOW,
@@ -139,7 +139,7 @@ impl Robots {
                     }
                 }
                 CRAWL_DELAY => {
-                    orphan |= !named_an_agent;
+                    orphan |= !named_an_agent && !value.is_empty();
                     group.delays.push(value.to_owned());
                 }
                 _ => {}
@@ -467,6 +467,7 @@ mod tests {
             b"Disallow: /prywatne/\nUser-agent: *\nAllow: /\n",
             b"Crawl-delay: 30\nUser-agent: *\nDisallow: /x\n",
             b"Crawl-delay: soon\nUser-agent: *\n",
+            b"Disallow:\nAllow:\nCrawl-delay:\nUser-agent: *\n",
         ]
         .iter()
         .map(|body| {
@@ -489,6 +490,7 @@ mod tests {
                 Ok((ignored, true, true, true, None)),
                 Ok((ignored, true, true, false, None)),
                 Ok((ignored, true, true, true, None)),
+                Ok((Reading::Rules, true, true, true, None)),
             ]
         );
         Ok(())
