@@ -1379,7 +1379,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - GNW article URLs are rewritten from `www.` to `rss.` (both GNW's own): `www.globenewswire.com` returned Akamai 403 on robots.txt twice; its article pages were never tested.
 - Yahoo: only provider keys of wires not fetched directly (`business-wire.com`, `accesswire.ca`), matched exactly, never as substrings. Not PRN, GNW, CNW keys: each release would be stored twice. Deferred: Zero Hedge, Newswire.com, Business Wire direct.
   - Owner decision 2026-11-16 (option C), not built: the key list stays, and the Yahoo index is also read as a coverage cross-check of the direct wires: a Yahoo row under a PRN, GNW or CNW key that no direct index listed names a possible silent drop on our side; it stores no item row. No Yahoo hosts row, rule or cross-check exists.
-  - Rejected: Yahoo alone with every key, because one release is listed under up to 3 keys, the Fed is absent, non-English wire releases are absent and a GNW reprint carries no release id (§11.6, 2026-11-16).
+  - Rejected: Yahoo alone with every key, because one release is listed up to 3 times (`cnwgroup` and `prnewswire` twice), the Fed is absent, non-English wire releases are absent (GNW 0 of 11 by `dc:language`; PRN by reading the titles) and a GNW reprint carries no release id (§11.6, 2026-11-16).
   - Owner decision 2026-11-16, not built: the `newsfile` key joins the list after a body probe of its pages passes; no such probe has run.
   - Owner decision 2026-11-16: Reuters and AFP through Yahoo come later, as `open_web_outlets` (§11.3).
 - Robots: a refresh command fetches robots.txt through `Wire` under an attempt row; the hosts file pins the robots digest. How a robots attempt is labelled and kept out of the expected-run count: §10's "calendar, listing and roster are FILES" paragraph.
@@ -1471,7 +1471,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
 | gate | turns red when | §8 row |
 |---|---|---|
-| a Yahoo row outside the key list is filtered out | exact match becomes substring match | R3 |
+| a Yahoo row outside the key list stores no item row (option C's cross-check reads PRN, GNW and CNW rows, §11.2) | exact match becomes substring match | R3 |
 | the extracted body is article text, per further host (CNW, Fed, Yahoo; PRN's bit 2026-11-16 and is in §8 row R17) | the selector widens to `<body>` | R17 |
 | a rolled-back `record` leaves no outbox row | the insert moves outside the transaction | new row O1 |
 | a zero-item attempt writes one outbox row | the insert is skipped when rows are empty | R14 |
@@ -1674,9 +1674,13 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
   - 302939553's 40th probe paragraph is `_______________________`, which holds no letter or digit, so the extractor drops it (§11.1). Before the `br` space, the extractor gave 9,397 and 19,295 chars.
 
-**Yahoo, 2026-11-16 (Monday).** Every 2026-11-16 number below was taken before US market hours (13:00–21:00Z): 3 news-sitemap polls at 08:04:40, 09:30:00 and 11:00:02Z, article fetches at 10:52–11:24Z; the 2026-11-14 rows are a Saturday. Weekday market-hours turnover, window and lag are unmeasured.
+**Yahoo, 2026-11-16 (Monday).**
 
-- Sitemap window: each poll holds 1,000 rows; the span is newest minus oldest `news:publication_date`. The 2026-11-14 22:36Z row is a Saturday probe body, recomputed 2026-11-16; the 19:20Z one (18.27 h) is above.
+- Every 2026-11-16 number below was taken by 11:24Z, before 08:00 ET (13:00Z) and before the NYSE session (14:30–21:00Z): 3 news-sitemap polls at 08:04:40, 09:30:00 and 11:00:02Z, article fetches at 10:52–11:24Z.
+- The 2026-11-14 rows are a Saturday.
+- Turnover, window and lag during weekday US hours (13:00–21:00Z, the research's window) are unmeasured.
+- Sitemap window: each poll holds 1,000 rows; the span is newest minus oldest `news:publication_date`.
+- The 2026-11-14 22:36Z row is a Saturday probe body, recomputed 2026-11-16; the 19:20Z one (18.27 h) is above.
 
   | poll (UTC) | oldest – newest `publication_date` | span |
   |---|---|---|
@@ -1695,17 +1699,20 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
   - 3 rows of the second 2026-11-16 pair left although newer than the next poll's oldest row: one URL retitled, one moved to another path under the same numeric suffix, one removed. So a Yahoo URL is not a stable identity.
   - 32 and 38 URLs first appeared in the later poll of each 2026-11-16 pair although their `publication_date` predates the earlier poll; the delay after that date reached 48.7 and 689.8 min (lower bounds).
-- Coverage of the direct wires, union of the 3 polls (1,456 URLs); a wire item counts when its `pubDate` lies between 2026-11-15T11:38Z (the first poll's oldest row) and 09:00Z (the last poll minus 2 h); matched by equal normalised title (HTML unescaped, lowercase, non-alphanumeric runs collapsed); English by `dc:language` for GNW and, for PRN and CNW, which carry no language field, by an ASCII title holding an English stopword:
+- Coverage of the direct wires, union of the 3 polls (1,456 URLs); a wire item counts when its `pubDate` lies between 2026-11-15T11:38Z (the first poll's oldest row) and 09:00Z (the last poll minus 2 h); matched by equal normalised title (HTML unescaped, lowercase, non-alphanumeric runs collapsed); English by `dc:language` for GNW and, for PRN and CNW, which carry no language field, by a title whose every code point is below U+2000 and that holds an English stopword (`cov2.py`):
 
-  | wire | eligible | English | English found on Yahoo | non-English found on Yahoo |
-  |---|---|---|---|---|
-  | PRN | 36 | 18 | 12 | 0 |
-  | GNW | 35 | 24 | 23 | 0 of 11 |
-  | CNW | 30 | 26 | 26 | 0 of 4 |
+  | wire | eligible | found on Yahoo | English | English found on Yahoo | non-English found on Yahoo |
+  |---|---|---|---|---|---|
+  | PRN | 36 | 17 | 18 | 12 | 5 of 18, each an English title the heuristic rejects (`€`, or no stopword) |
+  | GNW | 35 | 23 | 24 | 23 | 0 of 11 |
+  | CNW | 30 | 30 | 26 | 26 | 4 of 4, each an English title the heuristic rejects |
 
+  - Found on Yahoo: `coverage` in `out.json`; non-English found = found minus English found; titles read 2026-11-16 by re-running `cov.py`'s parse over the same probe6 bodies.
+  - So no non-English PRN or CNW title was found on Yahoo: every rejected title found is English, and PRN's Spanish and German titles the heuristic calls English are misses.
   - 2 of PRN's 6 English misses are the heuristic's errors (a Spanish and a German title), so PRN is 12 of 16.
+  - PRN and GNW RSS hold 20 items each, so their eligible items run from 07:30Z on 2026-11-16 (oldest 07:31Z and 07:30Z), about 1.5 h; CNW's sitemap reaches back to 2026-11-13.
   - Fed: 0 of 20 Fed items in each of the 3 polls, matched by the first 50 normalised title characters against all 3 sitemaps.
-  - 12 GNW law-firm notices of 10:46–10:47Z were absent from the 11:00Z poll, and no Yahoo title of the union holds `investor notice`, `securities fraud` or `class action`; exclusion and lag cannot be told apart from one batch.
+  - 12 GNW law-firm notices of 10:46–10:47Z were absent from the 11:00Z poll, and no Yahoo title of the union starts with `investor notice` or holds `securities fraud` or `class action`; exclusion and lag cannot be told apart from one batch.
 - Latency: Yahoo's `publication_date` copies the wire's minute (median difference 0 min over 17 PRN, 23 GNW and 30 CNW matches), so it is not an observation time. By first listing poll, 6 items (3 PRN, 3 GNW, all wire time 08:00Z) reached Yahoo one poll after the wire's own index: more than about 4 and at most 86 min later.
 - Duplicates, same 1,456-URL union, grouped by equal title:
 
@@ -1730,5 +1737,5 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
   | added | `Story Continues` button text, 9 of 12 Yahoo pages, with the rest of the body in the same HTML; a `Cision` / `View original content` trailer, PRN 4 of 4, CNW 2 of 2 |
   | link back to the release | PRN 4 of 4 (release id); CNW a legacy archive URL only, whose 301 costs one more request; GNW none, 3 of 3 (only `globenewswire.com/Tracker?data=…` links), so a GNW reprint carries no release id |
 
-- Article pages, probe7, 5 Yahoo URLs fetched 10:52:47–10:53:30Z: status 200 and no redirect 5 of 5; 948,262–1,002,016 B decoded; 44.5–47.1% of the bytes inside `<script>` elements (regex over `<script…</script>`, measured 2026-11-16); no JSON-LD `articleBody`; the article text is in the server HTML, after `Story Continues` too (4 of the 5 carry that text, with 1,012–3,756 chars of `<p>` text after it). Compressed size: §3.9.
+- Article pages, probe7, 5 Yahoo URLs fetched 10:52:47–10:53:30Z: status 200 and no redirect 5 of 5; 948,262–1,002,016 B decoded; 44.5–47.1% of the bytes inside `<script>` elements (regex over `<script…</script>`, measured 2026-11-16); no JSON-LD `articleBody`; the article text is in the server HTML, after `Story Continues` too (4 of the 5 carry that text, with 993–3,745 chars of `<p>` text after its first occurrence: Python `html.parser`, each paragraph whitespace-collapsed, summed, 2026-11-16; a regex over `<p>…</p>` gives 1,008–3,745). Compressed size: §3.9.
 
