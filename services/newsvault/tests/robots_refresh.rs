@@ -2,7 +2,7 @@
 //! (architecture.md section 11.2), and what the ledger reads of the runs it leaves (section 10).
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -709,7 +709,8 @@ fn a_refresh_refused_before_any_fetch_exits_two_or_four_with_an_empty_stdout() -
     Ok(())
 }
 
-/// The library dry run and the binary's: one url per row, nothing written, nothing sent.
+/// The library dry run and the binary's: one url per row, nothing written, nothing sent, no
+/// `parse_verdict`. Mutation 2026-11-16, the dry run's verdict set to `rules`: red.
 #[test]
 fn a_robots_refresh_dry_run_plans_one_url_per_row_and_writes_nothing() -> TestResult {
     let root = TempDir::new()?;
@@ -743,6 +744,18 @@ fn a_robots_refresh_dry_run_plans_one_url_per_row_and_writes_nothing() -> TestRe
         .output()?;
     let printed: Value = serde_json::from_slice(&output.stdout)?;
     let planned = vec![GNW_ROBOTS.to_owned(), PRN_ROBOTS.to_owned()];
+    let verdicts = |report: &Value| -> Vec<Value> {
+        report["rows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|row| row["parse_verdict"].clone())
+            .collect()
+    };
+    assert_eq!(
+        (verdicts(&answer.report), verdicts(&printed)),
+        (vec![Value::Null; 2], vec![Value::Null; 2])
+    );
     assert_eq!(
         (
             answer.exit,
@@ -923,6 +936,111 @@ fn every_option_the_robots_refresh_parser_takes_is_in_the_machine_readable_schem
     assert!(
         !named.is_empty() && missing.is_empty(),
         "{named:?} {missing:?}"
+    );
+    Ok(())
+}
+
+fn robots_fixture(name: &str) -> Result<Vec<u8>, std::io::Error> {
+    std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/robots")
+            .join(name),
+    )
+}
+
+/// Owner decision 3d (2026-11-16): each answered row carries the verdict `collect` would reach
+/// over the same body, in the JSON row and on the human line, and the schema lists exactly these
+/// values; a failed fetch carries none. Mutations 2026-11-16, the Crawl-delay check dropped from
+/// `parse_verdict_of`: red; `parse_verdict` dropped from `render_human`: red; the check written
+/// as `>=` in `parse_verdict_of`: red (the 10 s delay equal to the 10 s interval).
+#[test]
+fn a_refresh_reports_the_parse_verdict_of_each_answered_row() -> TestResult {
+    let gnw = gnw_body()?;
+    let answers: Vec<(u16, Vec<u8>)> = vec![
+        (OK, PRN_BODY.to_vec()),
+        (OK, b"# nothing\n\n".to_vec()),
+        (
+            OK,
+            b"Crawl-delay: 30\nUser-agent: *\nDisallow: /x\n".to_vec(),
+        ),
+        (
+            OK,
+            b"Disallow: /o\nUser-agent: *\nCrawl-delay: 30\n".to_vec(),
+        ),
+        (OK, robots_fixture("synthetic_html_page.txt")?),
+        (OK, robots_fixture("www.nasdaq.com.txt")?),
+        (OK, b"User-agent: *\nCrawl-delay: 10\n".to_vec()),
+        (OK, b"User-agent: *\nCrawl-delay: soon\n".to_vec()),
+        (OK, b"Sitemap: https://www.prnewswire.com/s.xml\n".to_vec()),
+        (OK, vec![b'U', 0xff]),
+        (NOT_FOUND, b"not here".to_vec()),
+        (UNAVAILABLE, Vec::new()),
+    ];
+    let mut verdicts = Vec::new();
+    let mut shown = Vec::new();
+    for (status, body) in &answers {
+        let root = TempDir::new()?;
+        let exchange = Robots::of(&[(GNW_ROBOTS, OK, &gnw), (PRN_ROBOTS, *status, body)]);
+        let answer = refreshed(root.path(), two_row_hosts(), &exchange)?;
+        let rows = &answer.report["rows"];
+        verdicts.push((
+            rows[0]["parse_verdict"].clone(),
+            rows[1]["parse_verdict"].clone(),
+        ));
+        let mut human = Vec::new();
+        cmd_robots::render_human(&answer.report, &mut human)?;
+        let line = String::from_utf8(human)?
+            .lines()
+            .find(|line| line.trim_start().starts_with(PRN_HOST))
+            .and_then(|line| line.split_whitespace().last())
+            .map(str::to_owned);
+        shown.push(line.unwrap_or_default());
+    }
+    let expected = [
+        "rules",
+        "no_rules_empty",
+        "orphan_rules_ignored",
+        "crawl_delay_over_interval",
+        "refused_html",
+        "crawl_delay_over_interval",
+        "rules",
+        "refused_crawl_delay",
+        "refused_no_user_agent",
+        "refused_not_utf8",
+        "no_rules_absent",
+    ];
+    let mut wanted: Vec<(Value, Value)> = expected
+        .iter()
+        .map(|verdict| (Value::from("rules"), Value::from(*verdict)))
+        .collect();
+    wanted.push((Value::from("rules"), Value::Null));
+    assert_eq!(verdicts, wanted);
+    assert_eq!(
+        shown,
+        expected.iter().copied().chain(["none"]).collect::<Vec<_>>()
+    );
+    let schema: Value = serde_json::from_slice(
+        &Command::new(env!("CARGO_BIN_EXE_newsvault"))
+            .args(["schema", "--format", "json"])
+            .output()?
+            .stdout,
+    )?;
+    let listed: BTreeSet<String> = schema["commands"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|command| command["path"] == serde_json::json!(["robots", "refresh"]))
+        .and_then(|command| command["output_fields"][0]["values"].as_array().cloned())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        listed,
+        expected
+            .iter()
+            .map(|verdict| (*verdict).to_owned())
+            .collect()
     );
     Ok(())
 }

@@ -47,8 +47,9 @@ const VENDOR_PATIENCE: Duration = Duration::from_secs(30);
 /// The largest page of the 2026-11-14 probes was 979,950 B (cnbc.com), the GNW article 71,657 B
 /// and the GNW RSS 36,687 B, all as decompressed by curl (§11.6's method).
 const BODY_LIMIT: u64 = 2 * 1_024 * 1_024;
-/// Section 11.1's floor; per IP the same, because no measurement places a smaller one. A host's
-/// robots Crawl-delay raises `per_host` above it (`with_crawl_delays`), never below.
+/// Section 11.1's floor; per IP the same, because no measurement places a smaller one. One
+/// `per_host` for every host (§8 row R19 hole 7): `newsvault collect` refuses a host whose robots
+/// Crawl-delay is above it (owner decision 1, 2026-11-16).
 const INTERVAL: Duration = Duration::from_secs(10);
 
 /// Why no request may be made at all, each raised by `open` before the first request.
@@ -147,8 +148,6 @@ pub struct OpenWebFeed {
     extract_version: Digest,
     /// Every rule's host rewrite, which `item_key` applies whatever host a url names.
     rewrites: BTreeMap<String, String>,
-    /// Per host, the Crawl-delay `newsvault` read from the pinned robots.txt (section 11.2).
-    crawl_delays: BTreeMap<String, Duration>,
 }
 
 impl OpenWebFeed {
@@ -186,19 +185,7 @@ impl OpenWebFeed {
             rules_version,
             extract_version,
             rewrites,
-            crawl_delays: BTreeMap::new(),
         })
-    }
-
-    /// The Crawl-delay per host, read by `newsvault` from each pinned robots.txt. `transport()`
-    /// paces at the largest an ADMITTED host states when it is above 10 s; one `per_host` serves
-    /// every host (§8 row R19 hole 7), so one slow host slows them all.
-    #[must_use]
-    pub fn with_crawl_delays(self, crawl_delays: BTreeMap<String, Duration>) -> Self {
-        Self {
-            crawl_delays,
-            ..self
-        }
     }
 
     /// Every path an admitted row asks of its host (section 11.2), in hosts-file order.
@@ -216,14 +203,6 @@ impl OpenWebFeed {
                     })
             })
             .collect()
-    }
-
-    /// The one per-host interval: 10 s, or the largest admitted host's Crawl-delay above it.
-    fn per_host_interval(&self) -> Duration {
-        self.hosts
-            .admitted()
-            .filter_map(|row| self.crawl_delays.get(&row.host))
-            .fold(INTERVAL, |slowest, delay| slowest.max(*delay))
     }
 
     /// Every row of the hosts file, admitted and candidate, with its robots pin: what `newsvault
@@ -427,7 +406,7 @@ impl Provider for OpenWebFeed {
             body_limit: BODY_LIMIT,
             budget: RequestBudget {
                 min_interval: INTERVAL,
-                per_host: Some(self.per_host_interval()),
+                per_host: Some(INTERVAL),
             },
         }
     }

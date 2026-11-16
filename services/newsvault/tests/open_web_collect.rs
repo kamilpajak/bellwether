@@ -748,6 +748,11 @@ fn verdict(answered: &Result<cmd_collect::Answer, CollectRunError>) -> String {
         Err(CollectRunError::PaceBelowFloor {
             per_host, floor, ..
         }) => format!("paced {per_host:?} below {floor:?}"),
+        Err(CollectRunError::CrawlDelayOverInterval {
+            crawl_delay,
+            interval,
+            ..
+        }) => format!("crawl-delay {crawl_delay:?} over {interval:?}"),
         Err(other) => format!("another refusal: {other}"),
     }
 }
@@ -1175,17 +1180,28 @@ fn an_admitted_row_whose_index_or_path_prefix_robots_disallows_is_refused() -> T
     Ok(())
 }
 
-/// A pinned body this reader refuses is `robots_refused`, never a robots.txt with no rule.
+/// A pinned body this reader refuses is `robots_refused`, never a robots.txt with no rule; an
+/// empty or comment-only body is no rule (owner decision 3a) and admits the host.
 /// Mutation 2026-11-15, `Unreadable` read as no robots: red.
 #[test]
 fn a_pinned_robots_body_that_does_not_parse_is_refused() -> TestResult {
-    let dir = TempDir::new()?;
-    let said = collected_under_robots(
-        dir.path(),
-        &robots_fixture("synthetic_html_page.txt")?,
-        true,
-    )?;
-    assert_eq!(said, "unreadable: the body names no user-agent");
+    let mut said = Vec::new();
+    for body in [
+        robots_fixture("synthetic_html_page.txt")?,
+        b"Service unavailable\n".to_vec(),
+        b"# nothing to say\n".to_vec(),
+    ] {
+        let dir = TempDir::new()?;
+        said.push(collected_under_robots(dir.path(), &body, true)?);
+    }
+    assert_eq!(
+        said,
+        [
+            "unreadable: the body is an HTML page: its first non-whitespace character is <",
+            "unreadable: the body names no user-agent",
+            "admitted",
+        ]
+    );
     Ok(())
 }
 
@@ -1206,32 +1222,46 @@ fn a_robots_blob_written_after_the_provider_opened_is_unverified() -> TestResult
     Ok(())
 }
 
-/// §8 row R19(b): nasdaq's 30 s is admitted once handed to the provider, refused without it.
-/// Mutations 2026-11-15, the floor check removed / `max(cd, 10 s)` as `cd` / `>=` as `>` / the
-/// hand-off removed: each red.
+/// §8 row R19(b), owner decision 1 (2026-11-16): a pinned Crawl-delay above the one shared 10 s
+/// interval refuses the host, nasdaq's 30 s and the B2 body's 30 s alike; the provider is never
+/// slowed. Mutations 2026-11-16, the Crawl-delay arm removed: red; `>` as `>=`: red (10 s case);
+/// the 10 s floor check removed: red.
 #[test]
-fn a_hosts_row_faster_than_its_robots_crawl_delay_is_refused() -> TestResult {
+fn a_hosts_row_whose_robots_crawl_delay_is_above_the_shared_interval_is_refused() -> TestResult {
     let secs = |n: u64| Some(Duration::from_secs(n));
-    let dir = TempDir::new()?;
-    let (store, hosts) = pinned_to(dir.path(), &robots_fixture("www.nasdaq.com.txt")?)?;
-    let ask = Ask {
-        hosts: Some(hosts.clone()),
-        dry_run: true,
-        ..ask(&store, cmd_collect::TODAY)
-    };
-    let mut opened = cmd_collect::open_provider(&ask)?;
-    let slowed = opened.provider.transport().budget.per_host;
-    let admitted = verdict(&cmd_collect::run(&ask, &opened, &Gnw::day()?, &Fixed));
-    opened.provider = Box::new(OpenWebFeed::open(&hosts, &ask.rules, CONTACT)?);
-    let unslowed = verdict(&cmd_collect::run(&ask, &opened, &Gnw::day()?, &Fixed));
+    let mut seen = Vec::new();
+    for body in [
+        robots_fixture("www.nasdaq.com.txt")?,
+        b"User-agent: *\nCrawl-delay: 30\nUser-agent: bingbot\nDisallow: /prywatne/\n".to_vec(),
+        b"User-agent: *\nCrawl-delay: 10\n".to_vec(),
+    ] {
+        let dir = TempDir::new()?;
+        let (store, hosts) = pinned_to(dir.path(), &body)?;
+        let ask = Ask {
+            hosts: Some(hosts),
+            dry_run: true,
+            ..ask(&store, cmd_collect::TODAY)
+        };
+        let opened = cmd_collect::open_provider(&ask)?;
+        seen.push((
+            opened.provider.transport().budget.per_host,
+            verdict(&cmd_collect::run(&ask, &opened, &Gnw::day()?, &Fixed)),
+        ));
+    }
+    let over = "crawl-delay 30s over 10s".to_owned();
     assert_eq!(
-        (slowed, admitted.as_str(), unslowed.as_str()),
-        (secs(30), "admitted", "paced Some(10s) below 30s")
+        seen,
+        [
+            (secs(10), over.clone()),
+            (secs(10), over),
+            (secs(10), "admitted".to_owned())
+        ]
     );
-    // (per_host, Crawl-delay, admitted): the floor is 10 s with no delay or a smaller one.
+    // (per_host, Crawl-delay, admitted): 10 s at least, and the delay at most per_host.
     let cases = [
         (secs(10), secs(30), false),
         (secs(30), secs(30), true),
+        (secs(10), secs(10), true),
         (secs(10), secs(5), true),
         (secs(10), None, true),
         (secs(5), secs(5), false),
@@ -1245,15 +1275,17 @@ fn a_hosts_row_faster_than_its_robots_crawl_delay_is_refused() -> TestResult {
     Ok(())
 }
 
-/// Section 5.1: a disallowed path and an unreadable pinned body are `robots_refused`, exit 2, with
-/// the path or the reason in `details` and no suggestion, because a refresh cannot change a pinned
-/// body. Mutation 2026-11-15, the path arm dropped from `robots_refusal`: red.
+/// Section 5.1: a disallowed path, an unreadable pinned body and a Crawl-delay above the shared
+/// interval are `robots_refused`, exit 2, with their fact in `details` and no suggestion, because
+/// a refresh cannot change a pinned body. Mutations: 2026-11-15, the path arm dropped from
+/// `robots_refusal`: red; 2026-11-16, the Crawl-delay arm dropped: red.
 #[test]
 fn a_path_or_unreadable_robots_refusal_names_its_fact_and_suggests_no_refresh() -> TestResult {
     let mut seen = Vec::new();
     for body in [
         b"User-agent: *\nDisallow: /rssfeed/\n".to_vec(),
         robots_fixture("synthetic_html_page.txt")?,
+        robots_fixture("www.nasdaq.com.txt")?,
     ] {
         let dir = TempDir::new()?;
         let (store, hosts) = pinned_to(dir.path(), &body)?;
@@ -1276,35 +1308,46 @@ fn a_path_or_unreadable_robots_refusal_names_its_fact_and_suggests_no_refresh() 
             .stdin(Stdio::null())
             .output()?;
         let error: Value = serde_json::from_slice(&output.stderr)?;
+        let details = &error["details"];
         seen.push((
             output.status.code(),
             output.stdout.len(),
             error["code"].clone(),
-            error["details"]["path"].clone(),
-            error["details"]["why"].clone(),
+            ["path", "why", "crawl_delay_seconds", "interval_seconds"]
+                .map(|field| details[field].clone()),
             error["suggestions"].clone(),
         ));
     }
-    let refused = Value::from("robots_refused");
+    let refused = |facts: [Value; 4]| {
+        (
+            Some(EXIT_USAGE),
+            0,
+            Value::from("robots_refused"),
+            facts,
+            Value::Array(Vec::new()),
+        )
+    };
     assert_eq!(
         seen,
         vec![
-            (
-                Some(EXIT_USAGE),
-                0,
-                refused.clone(),
+            refused([
                 Value::from("/rssfeed/"),
                 Value::Null,
-                Value::Array(Vec::new())
-            ),
-            (
-                Some(EXIT_USAGE),
-                0,
-                refused,
                 Value::Null,
-                Value::from("the body names no user-agent"),
-                Value::Array(Vec::new())
-            ),
+                Value::Null
+            ]),
+            refused([
+                Value::Null,
+                Value::from("the body is an HTML page: its first non-whitespace character is <"),
+                Value::Null,
+                Value::Null
+            ]),
+            refused([
+                Value::Null,
+                Value::Null,
+                Value::from(30.0),
+                Value::from(10.0)
+            ]),
         ]
     );
     Ok(())
@@ -1901,7 +1944,8 @@ fn a_live_index_whose_commit_was_refused_records_no_held() -> TestResult {
 }
 
 /// Section 8 row R15, decision 10: an index whose commit was refused re-lists committed release 0
-/// under another minute and records no `relisted` row on its open attempt.
+/// under another minute and records no `relisted` row and no `relisted_compared` on its open
+/// attempt. Mutation 2026-11-16, a refused index recording an empty comparison: red.
 #[test]
 fn a_live_index_whose_commit_was_refused_records_no_relisted() -> TestResult {
     let root = TempDir::new()?;
@@ -1916,7 +1960,13 @@ fn a_live_index_whose_commit_was_refused_records_no_relisted() -> TestResult {
         OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
     let relisted: i64 = db.query_row("SELECT COUNT(*) FROM relisted", [], |row| row.get(0))?;
-    assert_eq!((exit, relisted), (Exit::CommitFailed, 0));
+    let compared: Option<i64> = db.query_row(
+        "SELECT relisted_compared FROM attempts WHERE story_id IS NULL
+         ORDER BY opened_at DESC, attempt_id DESC LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!((exit, relisted, compared), (Exit::CommitFailed, 0, None));
     Ok(())
 }
 
@@ -2135,9 +2185,14 @@ fn an_index_relisting_release_0(gnw: &Gnw) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(index.replacen(LISTED, RELISTED, 1).into_bytes())
 }
 
+/// Decision x: of the second poll's 3 held releases, 0 (differing) and 1 (equal) are compared;
+/// release 2's page has no article container, so no item holds a minute to compare with.
+const COMPARED_BY_THE_SECOND_POLL: i64 = 2;
+
 /// Section 8 row R15, owner decision 10 (2026-11-16): a second poll lists committed release 0
 /// under another minute, as PRN's correction 302913655 was. No fetch, the `stored_items` columns
-/// unchanged, one `relisted` row on the second index attempt, and the ledger counts it.
+/// unchanged, one `relisted` row on the second index attempt, and the ledger counts it and the
+/// comparisons made (decision x; mutation 2026-11-16, `compared` counting differences only: red).
 #[test]
 fn a_held_story_listed_under_another_minute_is_recorded_without_a_fetch_and_counted() -> TestResult
 {
@@ -2192,11 +2247,11 @@ fn a_held_story_listed_under_another_minute_is_recorded_without_a_fetch_and_coun
             check: false,
         },
     )?;
-    let counted: Vec<i64> = report
+    let counted: Vec<(i64, i64)> = report
         .days
         .iter()
         .flat_map(|one| &one.per_source)
-        .map(|row| row.relisted_disputed)
+        .map(|row| (row.relisted_disputed, row.relisted_compared))
         .collect();
     assert_eq!(
         (second, stored_items(&db)?, recorded, counted),
@@ -2211,7 +2266,7 @@ fn a_held_story_listed_under_another_minute_is_recorded_without_a_fetch_and_coun
                 "2026-11-14T19:05:00.000000Z".to_owned(),
                 "2026-11-14T19:00:00.000000Z".to_owned()
             )],
-            vec![1]
+            vec![(1, COMPARED_BY_THE_SECOND_POLL)]
         )
     );
     Ok(())

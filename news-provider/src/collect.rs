@@ -151,7 +151,8 @@ pub trait Archive: Sink {
     fn record_held(&mut self, attempt_id: &str, held: u32) -> Result<(), ArchiveError>;
 
     /// Records, beside a live index attempt, each held story whose listed publication value
-    /// differs from its stored item's (section 8 row R15). No stored row is updated.
+    /// differs from its stored item's, and how many were compared (section 8 row R15). No stored
+    /// row is updated.
     fn record_relisted(
         &mut self,
         attempt_id: &str,

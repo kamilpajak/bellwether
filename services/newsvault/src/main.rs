@@ -672,6 +672,18 @@ fn robots_refusal(failure: &CollectRunError) -> Option<RobotsRefusal> {
             }),
             false,
         )),
+        CollectRunError::CrawlDelayOverInterval {
+            host,
+            crawl_delay,
+            interval,
+        } => Some(refused(
+            serde_json::json!({
+                "host": host,
+                "crawl_delay_seconds": crawl_delay.as_secs_f64(),
+                "interval_seconds": interval.as_secs_f64(),
+            }),
+            false,
+        )),
         _ => None,
     }
 }
@@ -1031,6 +1043,13 @@ fn print_schema(format: Format) {
                         {"name": "BELLWETHER_VAULT",
                          "doc": "the store when --store is not given, then ~/.bellwether/vault"}],
                 "output": cmd_robots::SCHEMA,
+                "output_fields": [
+                    {"name": "rows[].parse_verdict", "type": "enum",
+                     "values": cmd_robots::parse_verdicts(),
+                     "doc": "how collect would read the answered body: null for a failed fetch \
+                             and a dry run; crawl_delay_over_interval and every refused_* value \
+                             refuse an admitted host"}
+                ],
                 "exits": {
                     "0": "every row answered and every admitted pin matches",
                     "1": "every row answered and an admitted pin differs",

@@ -14,6 +14,7 @@ const WILDCARD: char = '*';
 const END_ANCHOR: char = '$';
 const COMMENT: char = '#';
 const BYTE_ORDER_MARK: char = '\u{feff}';
+const MARKUP: char = '<';
 /// RFC 9309 section 2.2's EOL is CR, LF or CRLF; `str::lines` splits on LF alone.
 const LINE_ENDS: [char; 2] = ['\r', '\n'];
 const NANOS_DIGITS: usize = 9;
@@ -23,11 +24,50 @@ const NANOS_DIGITS: usize = 9;
 pub enum RobotsError {
     #[error("the body is not UTF-8")]
     NotUtf8,
-    /// A 200 with no group at all is most often an HTML page served at the robots path.
+    #[error("the body is an HTML page: its first non-whitespace character is <")]
+    HtmlPage,
+    /// Text that is not empty or comments only and has no `user-agent` line; a rule in it belongs
+    /// to no group and is ignored, so no orphan rule saves it.
     #[error("the body names no user-agent")]
     NoUserAgentLine,
     #[error("the * group's Crawl-delay {0:?} is not a non-negative number of seconds")]
     CrawlDelayNotANumber(String),
+}
+
+impl RobotsError {
+    /// The parse verdict `robots refresh` prints for a body refused here.
+    #[must_use]
+    pub const fn verdict(&self) -> &'static str {
+        match self {
+            Self::NotUtf8 => "refused_not_utf8",
+            Self::HtmlPage => "refused_html",
+            Self::NoUserAgentLine => "refused_no_user_agent",
+            Self::CrawlDelayNotANumber(_) => "refused_crawl_delay",
+        }
+    }
+}
+
+/// How a body that parsed was read (owner decision 3, 2026-11-16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reading {
+    /// At least one `user-agent` line and no rule before the first of them.
+    Rules,
+    /// Empty, or comments and blank lines only: no rule, every path allowed.
+    NoRulesEmpty,
+    /// A `user-agent` line, and an `Allow`, `Disallow` or Crawl-delay before the first of them:
+    /// every such line is ignored (owner decision 2026-11-16, Google's standard).
+    OrphanRulesIgnored,
+}
+
+impl Reading {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Rules => "rules",
+            Self::NoRulesEmpty => "no_rules_empty",
+            Self::OrphanRulesIgnored => "orphan_rules_ignored",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,37 +81,57 @@ struct PathRule {
 pub struct Robots {
     rules: Vec<PathRule>,
     crawl_delay: Option<Duration>,
+    reading: Reading,
+}
+
+/// One group as it is read. Its Crawl-delays wait for the group's end, because a later
+/// `user-agent: *` line of the same run still joins it.
+#[derive(Default)]
+struct Group {
+    every_agent: bool,
+    delays: Vec<String>,
 }
 
 impl Robots {
-    /// RFC 9309 grouping: a run of `user-agent` lines opens a group and the next rule line closes
-    /// the run; a rule before any `user-agent` line belongs to no group. Unknown lines are ignored.
+    /// RFC 9309 section 2.2 grouping: a run of `user-agent` lines opens a group and the next
+    /// `Allow`/`Disallow` closes the run; Crawl-delay and unknown lines close nothing (section
+    /// 2.2.4). Every line before the first `user-agent` line belongs to no group and is ignored,
+    /// as section 2.2.2 says and Google's robots.cc (50a0dac) does, its Crawl-delay included.
     pub fn parse(body: &[u8]) -> Result<Self, RobotsError> {
         let text = std::str::from_utf8(body).map_err(|_| RobotsError::NotUtf8)?;
         let text = text.strip_prefix(BYTE_ORDER_MARK).unwrap_or(text);
+        let first = text.trim_start_matches(|c: char| c.is_whitespace() || c == BYTE_ORDER_MARK);
+        if first.starts_with(MARKUP) {
+            return Err(RobotsError::HtmlPage);
+        }
         let mut robots = Self {
             rules: Vec::new(),
             crawl_delay: None,
+            reading: Reading::Rules,
         };
-        let (mut named_an_agent, mut in_agent_run, mut every_agent) = (false, false, false);
+        let mut group = Group::default();
+        let (mut named_an_agent, mut in_agent_run) = (false, false);
+        let (mut orphan, mut content) = (false, false);
         for line in text.split(LINE_ENDS) {
             let line = line.split(COMMENT).next().unwrap_or("");
+            content |= !line.trim().is_empty();
             let Some((key, value)) = line.split_once(':') else {
                 continue;
             };
             let value = value.trim();
             match key.trim().to_ascii_lowercase().as_str() {
                 USER_AGENT => {
-                    named_an_agent = true;
                     if !in_agent_run {
-                        every_agent = false;
+                        robots.end(&std::mem::take(&mut group))?;
                         in_agent_run = true;
                     }
-                    every_agent |= value == EVERY_AGENT;
+                    named_an_agent = true;
+                    group.every_agent |= value == EVERY_AGENT;
                 }
                 rule @ (ALLOW | DISALLOW) => {
                     in_agent_run = false;
-                    if every_agent && !value.is_empty() {
+                    orphan |= !named_an_agent && !value.is_empty();
+                    if group.every_agent && !value.is_empty() {
                         robots.rules.push(PathRule {
                             allow: rule == ALLOW,
                             pattern: value.to_owned(),
@@ -79,27 +139,43 @@ impl Robots {
                     }
                 }
                 CRAWL_DELAY => {
-                    in_agent_run = false;
-                    if every_agent {
-                        let delay = seconds(value)?;
-                        robots.crawl_delay =
-                            Some(robots.crawl_delay.map_or(delay, |d| d.max(delay)));
-                    }
+                    orphan |= !named_an_agent && !value.is_empty();
+                    group.delays.push(value.to_owned());
                 }
                 _ => {}
             }
         }
-        if named_an_agent {
-            Ok(robots)
-        } else {
-            Err(RobotsError::NoUserAgentLine)
+        robots.end(&group)?;
+        robots.reading = match (named_an_agent, orphan, content) {
+            (true, true, _) => Reading::OrphanRulesIgnored,
+            (true, false, _) => Reading::Rules,
+            (false, _, false) => Reading::NoRulesEmpty,
+            (false, _, true) => return Err(RobotsError::NoUserAgentLine),
+        };
+        Ok(robots)
+    }
+
+    /// A group's Crawl-delays count only when it names `*`; the largest of every `*` group wins.
+    /// The lines before the first `user-agent` end as a group naming nobody.
+    fn end(&mut self, group: &Group) -> Result<(), RobotsError> {
+        if group.every_agent {
+            for value in &group.delays {
+                let delay = seconds(value)?;
+                self.crawl_delay = Some(self.crawl_delay.map_or(delay, |d| d.max(delay)));
+            }
         }
+        Ok(())
     }
 
     /// The largest Crawl-delay the `*` groups state; `None` when they state none.
     #[must_use]
     pub const fn crawl_delay(&self) -> Option<Duration> {
         self.crawl_delay
+    }
+
+    #[must_use]
+    pub const fn reading(&self) -> Reading {
+        self.reading
     }
 
     /// RFC 9309 section 2.2.2: the longest matching pattern decides, `Allow` wins a tie, and a
@@ -160,12 +236,18 @@ fn seconds(value: &str) -> Result<Duration, RobotsError> {
         .take(NANOS_DIGITS)
         .collect();
     let nanos: u32 = nanos.parse().map_err(|_| refused())?;
-    Ok(Duration::new(secs, nanos))
+    let past_nanos = fraction
+        .bytes()
+        .skip(NANOS_DIGITS)
+        .any(|digit| digit != b'0');
+    Duration::new(secs, nanos)
+        .checked_add(Duration::from_nanos(u64::from(past_nanos)))
+        .ok_or_else(refused)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Robots, RobotsError};
+    use super::{Reading, Robots, RobotsError};
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -308,24 +390,210 @@ mod tests {
         );
         let read = Robots::parse(b"User-agent: *\nCrawl-delay: 0.5\nCrawl-delay: 2.25\n")?;
         assert_eq!(read.crawl_delay(), Some(Duration::from_millis(2_250)));
-        // A named bot's malformed delay is never read, so it refuses nothing.
+        // A digit past the ninth rounds up, so a delay just above 10 s never reads as 10 s.
+        let past_nanos = Robots::parse(b"User-agent: *\nCrawl-delay: 10.0000000001\n")?;
+        assert_eq!(past_nanos.crawl_delay(), Some(Duration::new(10, 1)));
+        let zeros = Robots::parse(b"User-agent: *\nCrawl-delay: 10.0000000000\n")?;
+        assert_eq!(zeros.crawl_delay(), Some(Duration::from_secs(10)));
+        // A named bot's malformed delay is never read unless `*` shares its run (decision 2).
         let named = Robots::parse(b"User-agent: bingbot\nCrawl-delay: soon\n")?;
         assert_eq!(named.crawl_delay(), None);
+        assert_eq!(
+            Robots::parse(b"User-agent: bingbot\nCrawl-delay: soon\nUser-agent: *\nDisallow: /p\n"),
+            Err(RobotsError::CrawlDelayNotANumber("soon".to_owned()))
+        );
+        Ok(())
+    }
+
+    /// Owner decision 3b: a body whose first non-whitespace character is `<`, a BOM before it
+    /// included (the Fed's 404 page of 2026-11-16 starts so). Text with no group and no rule
+    /// stays refused. Mutation 2026-11-16, the `<` check removed: red.
+    #[test]
+    fn an_html_body_is_refused_and_text_with_no_group_or_rule_too() -> TestResult {
+        let refused = [
+            fixture("synthetic_html_page.txt")?,
+            "\u{feff} \n\t<!doctype html>\n<html></html>"
+                .as_bytes()
+                .to_vec(),
+            " \u{feff}<html></html>".as_bytes().to_vec(),
+            b"Sitemap: https://example.test/s.xml\n".to_vec(),
+            b"Service unavailable\n".to_vec(),
+            vec![b'U', 0xff, b'\n'],
+        ]
+        .iter()
+        .map(|body| Robots::parse(body).map(|robots| robots.reading()))
+        .collect::<Vec<_>>();
+        assert_eq!(
+            refused,
+            [
+                Err(RobotsError::HtmlPage),
+                Err(RobotsError::HtmlPage),
+                Err(RobotsError::HtmlPage),
+                Err(RobotsError::NoUserAgentLine),
+                Err(RobotsError::NoUserAgentLine),
+                Err(RobotsError::NotUtf8),
+            ]
+        );
+        Ok(())
+    }
+
+    /// Owner decision 3a: an empty or comment-only 200 is no rules, every path allowed, no delay.
+    /// Mutation 2026-11-16, the empty arm made `NoUserAgentLine`: red.
+    #[test]
+    fn an_empty_or_comment_only_body_reads_as_no_rules() -> TestResult {
+        for body in [
+            &b""[..],
+            b"\n\r\n  \t\n",
+            b"# nothing here\n\n   # nor here\r\n",
+            "\u{feff}# a BOM, then a comment\n".as_bytes(),
+        ] {
+            let robots = Robots::parse(body)?;
+            assert_eq!(
+                (robots.reading(), robots.allows("/"), robots.crawl_delay()),
+                (Reading::NoRulesEmpty, true, None),
+                "{body:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Owner decision 2026-11-16 (Google's standard): an `Allow`, `Disallow` or Crawl-delay before
+    /// the first `user-agent` line is ignored, as RFC 9309 section 2.2.2 says and Google's
+    /// robots.cc 50a0dac does. Each body gives the reading, `/news/a`, `/prywatne/a`, `/x`, delay.
+    #[test]
+    fn a_rule_before_the_first_user_agent_is_ignored() -> TestResult {
+        let read = [
+            &b"Allow: /news/\nUser-agent: *\nDisallow: /\n"[..],
+            b"Disallow: /prywatne/\nUser-agent: *\nAllow: /\n",
+            b"Crawl-delay: 30\nUser-agent: *\nDisallow: /x\n",
+            b"Crawl-delay: soon\nUser-agent: *\n",
+            b"Disallow:\nAllow:\nCrawl-delay:\nUser-agent: *\n",
+        ]
+        .iter()
+        .map(|body| {
+            Robots::parse(body).map(|robots| {
+                (
+                    robots.reading(),
+                    robots.allows("/news/a"),
+                    robots.allows("/prywatne/a"),
+                    robots.allows("/x"),
+                    robots.crawl_delay(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+        let ignored = Reading::OrphanRulesIgnored;
+        assert_eq!(
+            read,
+            [
+                Ok((ignored, false, false, false, None)),
+                Ok((ignored, true, true, true, None)),
+                Ok((ignored, true, true, false, None)),
+                Ok((ignored, true, true, true, None)),
+                Ok((Reading::Rules, true, true, true, None)),
+            ]
+        );
+        Ok(())
+    }
+
+    /// The bodies that widened `*` under decision 3c's builds (79a79b8; 41fcbf9, an orphan
+    /// Crawl-delay before the `Allow`): every orphan line is ignored, so `*`'s `Disallow: /` holds.
+    #[test]
+    fn an_orphan_allow_widens_nothing() -> TestResult {
+        let mut read = Vec::new();
+        for (body, path) in [
+            (
+                &b"Allow: /news/\nUser-agent: *\nDisallow: /\n"[..],
+                "/news/x",
+            ),
+            (
+                b"Crawl-delay: 5\nAllow: /news/\nUser-agent: *\nDisallow: /\n",
+                "/news/x",
+            ),
+            (
+                b"Crawl-delay: 5\nDisallow: /a\nAllow: /a/b\nUser-agent: *\nDisallow: /\n",
+                "/a/b/c",
+            ),
+        ] {
+            let robots = Robots::parse(body)?;
+            read.push((robots.reading(), robots.allows(path), robots.crawl_delay()));
+        }
+        assert_eq!(read, [(Reading::OrphanRulesIgnored, false, None); 3]);
+        Ok(())
+    }
+
+    /// No `user-agent` line means no group, so orphan lines alone are refused like a `Sitemap:`-only
+    /// body (decision 3b), not read as RFC 9309 section 2.2.1's "no rules apply".
+    #[test]
+    fn orphan_rules_with_no_user_agent_line_are_refused() {
+        for body in [
+            &b"Disallow: /orphan/\n"[..],
+            b"# no group at all\nCrawl-delay: 12\nAllow: /\n",
+        ] {
+            assert_eq!(
+                Robots::parse(body),
+                Err(RobotsError::NoUserAgentLine),
+                "{body:?}"
+            );
+        }
+    }
+
+    /// Owner decision 2 (B2): a Crawl-delay line does not end a `user-agent` run, as RFC 9309
+    /// section 2.2.4 and Google's robotstxt parser read it. Mutations 2026-11-16, the run ended at
+    /// a Crawl-delay again: red; delays applied before the group ends: red (the bingbot-first case).
+    #[test]
+    fn a_crawl_delay_does_not_end_a_user_agent_run() -> TestResult {
+        let star_first = Robots::parse(
+            b"User-agent: *\nCrawl-delay: 30\nUser-agent: bingbot\nDisallow: /prywatne/\n",
+        )?;
+        let star_second = Robots::parse(
+            b"User-agent: bingbot\nCrawl-delay: 30\nUser-agent: *\nDisallow: /prywatne/\n",
+        )?;
+        let read = [&star_first, &star_second].map(|robots| {
+            (
+                robots.reading(),
+                robots.crawl_delay(),
+                robots.allows("/prywatne/x"),
+                robots.allows("/public"),
+            )
+        });
+        let expected = (Reading::Rules, Some(Duration::from_secs(30)), false, true);
+        assert_eq!(read, [expected, expected]);
+        // Only a blank line and the delay sit between `*` and googlebot, so its `Disallow: /`
+        // is `*`'s too; before B2 it was googlebot's alone.
+        let shared = Robots::parse(&fixture("synthetic_star_shares_a_group.txt")?)?;
+        assert!(!shared.allows("/news"));
+        // Nor does an unknown line. Mutation 2026-11-16, the `_` arm ending the run: red.
+        let unknown = Robots::parse(
+            b"User-agent: *\nUser-agent: bingbot\nSitemap: x\nUser-agent: googlebot\nDisallow: /g\n",
+        )?;
+        assert!(!unknown.allows("/g"));
         Ok(())
     }
 
     #[test]
-    fn a_robots_200_with_no_user_agent_line_is_refused() -> TestResult {
+    fn every_verdict_has_its_own_name() {
+        let names = [
+            RobotsError::NotUtf8.verdict(),
+            RobotsError::HtmlPage.verdict(),
+            RobotsError::NoUserAgentLine.verdict(),
+            RobotsError::CrawlDelayNotANumber(String::new()).verdict(),
+            Reading::Rules.name(),
+            Reading::NoRulesEmpty.name(),
+            Reading::OrphanRulesIgnored.name(),
+        ];
         assert_eq!(
-            Robots::parse(&fixture("synthetic_html_page.txt")?),
-            Err(RobotsError::NoUserAgentLine)
+            names,
+            [
+                "refused_not_utf8",
+                "refused_html",
+                "refused_no_user_agent",
+                "refused_crawl_delay",
+                "rules",
+                "no_rules_empty",
+                "orphan_rules_ignored"
+            ]
         );
-        assert_eq!(Robots::parse(b""), Err(RobotsError::NoUserAgentLine));
-        assert_eq!(
-            Robots::parse(&[b'U', 0xff, b'\n']),
-            Err(RobotsError::NotUtf8)
-        );
-        Ok(())
     }
 
     /// Read with `str::lines` and no BOM strip, each body parsed Ok with no `*` rule and no delay.

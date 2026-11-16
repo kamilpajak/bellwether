@@ -36,6 +36,7 @@
           "listing_unusable": 0,
           "bodies_truncated": 0,
           "relisted_disputed": 0,
+          "relisted_compared": 0,
           "items_new": 3,
           "rows_committed": 3
         },
@@ -54,6 +55,7 @@
           "listing_unusable": 0,
           "bodies_truncated": 0,
           "relisted_disputed": 0,
+          "relisted_compared": 0,
           "items_new": 1,
           "rows_committed": 1
         }
@@ -82,6 +84,7 @@
           "listing_unusable": 0,
           "bodies_truncated": 0,
           "relisted_disputed": 0,
+          "relisted_compared": 0,
           "items_new": 0,
           "rows_committed": 0
         },
@@ -100,6 +103,7 @@
           "listing_unusable": 0,
           "bodies_truncated": 0,
           "relisted_disputed": 0,
+          "relisted_compared": 0,
           "items_new": 0,
           "rows_committed": 0
         }
@@ -128,6 +132,7 @@
           "listing_unusable": 0,
           "bodies_truncated": 1,
           "relisted_disputed": 0,
+          "relisted_compared": 0,
           "items_new": 0,
           "rows_committed": 0
         },
@@ -146,6 +151,7 @@
           "listing_unusable": 0,
           "bodies_truncated": 0,
           "relisted_disputed": 0,
+          "relisted_compared": 0,
           "items_new": 0,
           "rows_committed": 0
         }
@@ -174,6 +180,7 @@
           "listing_unusable": 0,
           "bodies_truncated": 0,
           "relisted_disputed": 0,
+          "relisted_compared": 0,
           "items_new": 0,
           "rows_committed": 0
         }
@@ -202,6 +209,7 @@
           "listing_unusable": 0,
           "bodies_truncated": 0,
           "relisted_disputed": 0,
+          "relisted_compared": 0,
           "items_new": 1,
           "rows_committed": 1
         }
