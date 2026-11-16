@@ -201,8 +201,7 @@ ALTER TABLE attempts ADD COLUMN extract_version TEXT;
     "
 -- P10's link (architecture.md section 3.9): one row per attempt that got an HTTP answer, naming
 -- its payload as received, cut at `body_limit` when `truncated`. `headers` is
--- `news_provider::Headers::to_json`. No row for an attempt closed before user_version 6. From
--- this version a robots fetch's body is named here and its `robots.blob` is NULL.
+-- `news_provider::Headers::to_json`. From this version a robots body is named here only.
 CREATE TABLE payloads (
     attempt_id  TEXT PRIMARY KEY REFERENCES attempts(attempt_id),
     url         TEXT NOT NULL,
@@ -3424,6 +3423,59 @@ mod tests {
         Ok(())
     }
 
+    /// `payloads`' two CHECKs and two foreign keys each refuse a row by hand; the control row,
+    /// which breaks none of them, is taken.
+    #[test]
+    fn a_payload_row_breaking_any_constraint_of_its_table_is_refused() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let closed = closed_attempt(&mut store, 0, Verdict::PermanentFailure)?;
+        let attempt = closed.attempt_id().hex().to_owned();
+        store.db.execute(
+            "INSERT INTO blobs VALUES ('by hand', 1, '1970-01-01T00:00:00.000000Z')",
+            [],
+        )?;
+        let insert = "INSERT INTO payloads VALUES (?1, 'by hand', ?2, NULL, ?3, '[]', ?4)";
+        let rows = [
+            ("no such attempt", "index", "by hand", 0),
+            (attempt.as_str(), "other", "by hand", 0),
+            (attempt.as_str(), "index", "no such blob", 0),
+            (attempt.as_str(), "index", "by hand", 2),
+            (attempt.as_str(), "index", "by hand", 1),
+        ];
+        let mut taken = Vec::new();
+        for (attempt, phase, blob, truncated) in rows {
+            taken.push(
+                store
+                    .db
+                    .execute(insert, params![attempt, phase, blob, truncated])
+                    .is_ok(),
+            );
+        }
+        assert_eq!(taken, [false, false, false, false, true]);
+        Ok(())
+    }
+
+    /// An abandoned attempt carries no payload either: the door refuses the link as it refuses
+    /// items, and writes nothing.
+    #[test]
+    fn an_abandoned_attempt_may_not_carry_a_payload() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let slot = AttemptSlot::open(&mut store, &request(), None, &RunId::new(RUN), 0, at(1))?;
+        let in_flight = slot.attempt_id().clone();
+        drop(slot);
+        let closed = abandon(&mut store, in_flight, at(9), &RunId::new(SWEEPING_RUN))?;
+        let raw = store.put_blob(PAYLOAD)?;
+        let refused = store.record(closed, Some(&a_payload(&raw)), &[], at(10));
+        assert!(
+            matches!(refused, Err(StoreError::ItemsUnderAbandonedAttempt { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(count(&store, "payloads")?, 0);
+        Ok(())
+    }
+
     /// `record`'s replay rule covers the link row: the same claim is a no-op, another is refused.
     /// Mutation 2026-11-16, the payload comparison skipped: red.
     #[test]
@@ -3480,10 +3532,9 @@ mod tests {
         Ok(())
     }
 
-    /// One home for a robots body (section 3.2): a row from before user_version 6 is read through
-    /// `robots.blob`, a newer one, whose `robots.blob` is NULL, through its `payloads` row, and a
+    /// Section 3.2: a pre-6 row is read through `robots.blob`, a newer one through `payloads`, and a
     /// present row naming neither is a named error. Mutations 2026-11-16, `ROBOTS_BODY` read as
-    /// `r.blob` alone: red (the newer host); as `p.raw_blob` alone: red (the older host).
+    /// `r.blob` alone / `p.raw_blob` alone: red (the newer / the older host).
     #[test]
     fn a_robots_body_is_read_from_robots_blob_before_user_version_six_and_from_payloads_after(
     ) -> TestResult {
