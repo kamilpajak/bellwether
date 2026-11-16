@@ -3938,7 +3938,8 @@ mod tests {
     }
 
     /// §8 row R15: a kept item with no `valid_minute` is not compared, even beside a later
-    /// minute-dated twin the listing disagrees with.
+    /// minute-dated twin the listing disagrees with, and is not counted. Mutation 2026-11-16, a
+    /// kept row counted whatever its minute: red.
     #[test]
     fn a_listing_of_a_story_whose_kept_item_has_no_minute_is_not_recorded() -> TestResult {
         let temp = TempDir::new()?;
@@ -3966,7 +3967,37 @@ mod tests {
                 minute_at(A_PUBLICATION_MINUTE)?,
             )],
         )?;
-        assert_eq!(count(&store, "relisted")?, 0);
+        assert_eq!(
+            (count(&store, "relisted")?, compared_on(&store, &attempt)?),
+            (0, Some(0))
+        );
+        Ok(())
+    }
+
+    /// Decision x: the count and the `relisted` rows commit together, so a refused count keeps no
+    /// row. Mutation 2026-11-16, the `UPDATE` run after the commit: red.
+    #[test]
+    fn a_refused_comparison_count_keeps_no_relisted_row() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let (_, attempt) = a_kept_minute_and_an_index(&mut store)?;
+        store.db.execute_batch(
+            "CREATE TEMP TRIGGER refuse_the_count BEFORE UPDATE OF relisted_compared ON attempts
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )?;
+        let differing = [relisted(
+            &story_hex(SOURCE, STORY),
+            minute_at(A_LATER_PUBLICATION_MINUTE)?,
+        )];
+        let refused = store.record_relisted(&attempt, &differing).is_err();
+        assert_eq!(
+            (
+                refused,
+                count(&store, "relisted")?,
+                compared_on(&store, &attempt)?
+            ),
+            (true, 0, None)
+        );
         Ok(())
     }
 

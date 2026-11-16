@@ -1944,7 +1944,8 @@ fn a_live_index_whose_commit_was_refused_records_no_held() -> TestResult {
 }
 
 /// Section 8 row R15, decision 10: an index whose commit was refused re-lists committed release 0
-/// under another minute and records no `relisted` row on its open attempt.
+/// under another minute and records no `relisted` row and no `relisted_compared` on its open
+/// attempt. Mutation 2026-11-16, a refused index recording an empty comparison: red.
 #[test]
 fn a_live_index_whose_commit_was_refused_records_no_relisted() -> TestResult {
     let root = TempDir::new()?;
@@ -1959,7 +1960,13 @@ fn a_live_index_whose_commit_was_refused_records_no_relisted() -> TestResult {
         OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
     let relisted: i64 = db.query_row("SELECT COUNT(*) FROM relisted", [], |row| row.get(0))?;
-    assert_eq!((exit, relisted), (Exit::CommitFailed, 0));
+    let compared: Option<i64> = db.query_row(
+        "SELECT relisted_compared FROM attempts WHERE story_id IS NULL
+         ORDER BY opened_at DESC, attempt_id DESC LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!((exit, relisted, compared), (Exit::CommitFailed, 0, None));
     Ok(())
 }
 

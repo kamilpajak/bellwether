@@ -565,16 +565,20 @@ fn a_relisted_story_is_counted_for_the_source_and_day_of_its_index_attempt() -> 
 
 /// Decision x (2026-11-16): `relisted_compared` sums `attempts.relisted_compared` for the source
 /// and day of its index attempt, in the JSON row and on the human line, so 0 disputed among 3
-/// compared differs from nothing compared. Mutations 2026-11-16, the `SUM` made 0: red; the field
-/// dropped from `render_human`: red.
+/// compared differs from nothing compared. Two attempts share one (run, source, outcome) group and
+/// a third, interrupted, has its own. Mutations 2026-11-16, the `SUM` made 0: red; made `MAX`: red;
+/// the per-source `+=` made a maximum: red; the field dropped from `render_human`: red.
 #[test]
 fn a_relisted_comparison_count_is_summed_for_the_source_and_day_of_its_index_attempt() -> TestResult
 {
     let root = fixture()?;
     let db = Connection::open(root.path().join(COMMIT_LOG))?;
-    db.execute(
-        "UPDATE attempts SET relisted_compared = 3 WHERE attempt_id = 'a-0703-edgar-0'",
-        [],
+    db.execute_batch(
+        "UPDATE attempts SET relisted_compared = 3 WHERE attempt_id = 'a-0703-edgar-0';
+         UPDATE attempts SET relisted_compared = 4 WHERE attempt_id = 'a-0703-edgar-1';
+         CREATE TEMP TABLE twin AS SELECT * FROM attempts WHERE attempt_id = 'a-0703-edgar-0';
+         UPDATE twin SET attempt_id = 'a-0703-edgar-2', relisted_compared = 5;
+         INSERT INTO attempts SELECT * FROM twin;",
     )?;
     drop(db);
     let json = over(&root, FIRST_DAY, FAILED_DAY)?.json()?;
@@ -609,7 +613,7 @@ fn a_relisted_comparison_count_is_summed_for_the_source_and_day_of_its_index_att
             counted(FIRST_DAY, EDGAR, "relisted_compared"),
             shown
         ),
-        (Some(3), Some(0), Some(0), Some(0), Some("3".to_owned()))
+        (Some(12), Some(0), Some(0), Some(0), Some("12".to_owned()))
     );
     Ok(())
 }
