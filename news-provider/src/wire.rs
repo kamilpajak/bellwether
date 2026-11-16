@@ -1628,6 +1628,17 @@ mod tests {
         Ok(())
     }
 
+    /// ureq 3.5.2 decodes with `MultiGzDecoder` (`body/gzip.rs`), which reads every member of the
+    /// stream; `GzDecoder` would stop after the first.
+    #[test]
+    fn a_gzip_body_of_two_members_is_decoded_to_both() -> Checked {
+        let (url, served) = serve_bytes(GZIP_HEAD.to_vec(), [GZIPPED_PAGE; 2].concat())?;
+        let (answer, _head) = exchanged(url, served)?;
+        let answer = answer.map_err(|failed| format!("{failed:?}"))?;
+        assert_eq!(answer.body(), [PLAIN_PAGE; 2].concat().as_slice());
+        Ok(())
+    }
+
     /// ureq 3.5.2 decodes `gzip` alone, matched exactly; any other coding is stored as received.
     #[test]
     fn a_coding_ureq_did_not_decode_is_stored_as_received() -> Checked {
