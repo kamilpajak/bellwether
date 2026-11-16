@@ -159,7 +159,8 @@ fn picked(html: &Html, pick: &Pick) -> Option<String> {
 }
 
 /// The container's lines in document order: each outermost `paragraph` match is one line, and
-/// each row of a table outside a paragraph is one line, so a `p` inside a cell is read once.
+/// each table row is one line, so a `p` inside a cell is read once and a table inside a matched
+/// `li` splits that line around its rows.
 fn blocks(element: ElementRef, paragraph: &Selector, into: &mut Vec<String>) {
     for inner in element.children().filter_map(ElementRef::wrap) {
         if skipped(inner) {
@@ -168,7 +169,9 @@ fn blocks(element: ElementRef, paragraph: &Selector, into: &mut Vec<String>) {
         if inner.value().name() == TABLE {
             rows(inner, into);
         } else if paragraph.matches(&inner) {
-            into.push(collapsed(inner));
+            let mut text = String::new();
+            prose(inner, &mut text, Some(into));
+            into.push(collapse(&text));
         } else {
             blocks(inner, paragraph, into);
         }
@@ -217,11 +220,17 @@ fn names_an_address(href: &str) -> bool {
 
 fn collapsed(element: ElementRef) -> String {
     let mut text = String::new();
-    prose(element, &mut text);
+    prose(element, &mut text, None);
+    collapse(&text)
+}
+
+fn collapse(text: &str) -> String {
     text.split_whitespace().collect::<Vec<&str>>().join(" ")
 }
 
-fn prose(element: ElementRef, into: &mut String) {
+/// With `tables`, a table ends the text so far as one line and is read by `rows`; without, as in
+/// a cell, it is read as text.
+fn prose(element: ElementRef, into: &mut String, mut tables: Option<&mut Vec<String>>) {
     for child in element.children() {
         match child.value() {
             Node::Text(text) => into.push_str(text),
@@ -235,12 +244,16 @@ fn prose(element: ElementRef, into: &mut String) {
                 }
                 if name == LINE_BREAK {
                     into.push(' ');
+                } else if let (TABLE, Some(lines)) = (name, tables.as_deref_mut()) {
+                    lines.push(collapse(into));
+                    into.clear();
+                    rows(inner, lines);
                 } else if BLOCKS.contains(&name) {
                     into.push(' ');
-                    prose(inner, into);
+                    prose(inner, into, tables.as_deref_mut());
                     into.push(' ');
                 } else {
-                    prose(inner, into);
+                    prose(inner, into, tables.as_deref_mut());
                 }
             }
             _ => {}

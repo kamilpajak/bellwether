@@ -1800,9 +1800,9 @@ fn a_cloudflare_email_placeholder_and_a_mailto_link_never_reach_the_body() -> Ou
 fn a_table_is_read_one_line_per_row_and_a_nested_table_inside_its_outer_cell() -> Outcome {
     assert_eq!(
         prn_body(PRN_TABLES_PAGE)?,
-        "Before the tables.\nResults (unaudited)\n(in millions) | Q3 2026 | Q3 2025\nRevenue | 1,234 | 1,100\n\
+        "Before the tables.\nResults (unaudited)\n(in millions) | Q3 2026 | Q3 2025\nRevenue | 1,234 | 1,100\nIR\n\
          Between the tables.\nAmbre Example +45 0000 0000 | Liz Example (US) +1 000 000 0000\n\
-         Outer inner a inner b inner c | right\nAfter the tables."
+         Outer inner a inner b inner c | right\nAfter the tables.\nListed:\nCost | 4\nafter the listed table"
     );
     Ok(())
 }
