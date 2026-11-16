@@ -2113,10 +2113,9 @@ fn an_index_relisting_release_0(gnw: &Gnw) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(index.replacen(LISTED, RELISTED, 1).into_bytes())
 }
 
-/// Section 8 row R15, owner decision 10 (2026-11-16): a later poll lists release 0, which the
-/// first poll committed, under another minute, the shape of PRN's correction 302913655. Its page
-/// is not fetched, no item changes, and the second index attempt carries one `relisted` row,
-/// which the ledger counts for that source and day.
+/// Section 8 row R15, owner decision 10 (2026-11-16): a second poll lists committed release 0
+/// under another minute, as PRN's correction 302913655 was. No fetch, no item changes, one
+/// `relisted` row on the second index attempt, and the ledger counts it.
 #[test]
 fn a_held_story_listed_under_another_minute_is_recorded_without_a_fetch_and_counted() -> TestResult
 {
