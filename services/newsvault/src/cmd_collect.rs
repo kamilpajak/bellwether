@@ -871,8 +871,11 @@ fn cross_check_of(store: &Committer, checker: &CrossChecker, collected: &Collect
 /// write is `error` here, the poll's column stays NULL ("not looked") and the run finishes.
 fn continuity_of(store: &mut Committer, paged: &PagedPolls) -> Value {
     let source = SourceId::new(open_web_feed::SOURCE);
-    let payloads = match store.usable_index_pages(&source) {
-        Ok(payloads) => payloads,
+    let read = store
+        .usable_index_pages(&source)
+        .and_then(|usable| Ok((usable, store.empty_index_pages(&source)?)));
+    let (payloads, empty) = match read {
+        Ok(read) => read,
         Err(failure) => {
             return json!([{"error": read_failure("store_unreadable", failure.to_string())}])
         }
@@ -891,7 +894,11 @@ fn continuity_of(store: &mut Committer, paged: &PagedPolls) -> Value {
                 "continuity": Value::Null,
                 "error": Value::Null,
             });
-            match recorded(store, paged, index_url, &pages, basis) {
+            let next = pages.last().and_then(|(page, _)| page.checked_add(1));
+            let ran_out = empty
+                .iter()
+                .any(|payload| paged.paging.page_of(index_url, &payload.url) == next);
+            match recorded(store, paged, index_url, &pages, ran_out, basis) {
                 Ok(continuity) => poll["continuity"] = json!(continuity.map(Continuity::name)),
                 Err(failure) => poll["error"] = failure,
             }
@@ -902,11 +909,13 @@ fn continuity_of(store: &mut Committer, paged: &PagedPolls) -> Value {
 }
 
 /// One poll's continuity, written on its page-1 attempt; `None` when it read no usable page.
+/// `ran_out`: the page after the last one read answered with no row.
 fn recorded(
     store: &mut Committer,
     paged: &PagedPolls,
     index_url: &str,
     pages: &[(u32, &IndexPayload)],
+    ran_out: bool,
     basis: Option<&Basis>,
 ) -> Result<Option<Continuity>, Value> {
     let Some((_, first)) = pages.first() else {
@@ -916,7 +925,7 @@ fn recorded(
         .iter()
         .map(|(_, page)| read_blob(store, &page.raw_blob))
         .collect::<Result<Vec<Vec<u8>>, Value>>()?;
-    let continuity = paged.paging.continuity(index_url, &bytes, basis);
+    let continuity = paged.paging.continuity(index_url, &bytes, basis, ran_out);
     if let Some(continuity) = continuity {
         store
             .record_continuity(&first.attempt_id, continuity.name())

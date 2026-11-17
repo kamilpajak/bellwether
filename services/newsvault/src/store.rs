@@ -243,7 +243,8 @@ ALTER TABLE attempts ADD COLUMN robots_disallowed INTEGER;
 -- 11.2), on the poll's usable page-1 attempt. NULL on every other attempt, on a poll that read no
 -- usable page and on every row before user_version 10, not backfilled.
 ALTER TABLE attempts ADD COLUMN continuity TEXT
-    CHECK (continuity IN ('complete', 'boundary_no_shared_key', 'no_previous_key', 'first_poll'));
+    CHECK (continuity IN ('complete', 'boundary_no_shared_key', 'no_previous_key', 'first_poll',
+                          'next_page_unread'));
 ",
 ];
 
@@ -772,16 +773,17 @@ pub fn basis_pages(
         )
         .optional()?;
     match newest {
-        Some(run) => usable_index_pages(&db, &run, source),
+        Some(run) => index_pages(&db, &run, source, Verdict::Usable),
         None => Ok(Vec::new()),
     }
 }
 
-/// Every usable index payload one run of `source` filed, earliest answer first.
-fn usable_index_pages(
+/// Every index payload one run of `source` filed under `verdict`, earliest answer first.
+fn index_pages(
     db: &Connection,
     run: &str,
     source: &SourceId,
+    verdict: Verdict,
 ) -> Result<Vec<IndexPayload>, StoreError> {
     let mut statement = db.prepare(
         "SELECT p.attempt_id, p.url, p.raw_blob, a.received_at
@@ -790,17 +792,14 @@ fn usable_index_pages(
           ORDER BY a.received_at, p.attempt_id",
     )?;
     let rows = statement
-        .query_map(
-            params![run, source.as_str(), Verdict::Usable.name()],
-            |row| {
-                Ok(IndexPayload {
-                    attempt_id: row.get(0)?,
-                    url: row.get(1)?,
-                    raw_blob: row.get(2)?,
-                    received_at: row.get(3)?,
-                })
-            },
-        )?
+        .query_map(params![run, source.as_str(), verdict.name()], |row| {
+            Ok(IndexPayload {
+                attempt_id: row.get(0)?,
+                url: row.get(1)?,
+                raw_blob: row.get(2)?,
+                received_at: row.get(3)?,
+            })
+        })?
         .collect::<Result<Vec<IndexPayload>, _>>()?;
     Ok(rows)
 }
@@ -1540,7 +1539,13 @@ impl Committer {
     /// Every usable index payload this run's `source` attempts filed, earliest answer first: a
     /// paged index's pages (section 11.2).
     pub fn usable_index_pages(&self, source: &SourceId) -> Result<Vec<IndexPayload>, StoreError> {
-        usable_index_pages(&self.db, self.run.as_str(), source)
+        index_pages(&self.db, self.run.as_str(), source, Verdict::Usable)
+    }
+
+    /// Every index payload this run of `source` filed that answered with no row: a paged walk's
+    /// end (section 11.2).
+    pub fn empty_index_pages(&self, source: &SourceId) -> Result<Vec<IndexPayload>, StoreError> {
+        index_pages(&self.db, self.run.as_str(), source, Verdict::Empty)
     }
 
     /// Records how a paged index's poll joins the poll before it, on its page-1 attempt: its own

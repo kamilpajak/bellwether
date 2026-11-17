@@ -102,6 +102,8 @@ const PROBE10_1410: &str = "sitemap_p1_1410.xml";
 const PROBE10_1410_PAGE_2: &str = "sitemap_p2_1410.xml";
 /// 14:10Z page 1's oldest row, the value its page 2 must reach past.
 const PROBE10_1410_OLDEST: &str = "2026-11-17T09:00:00-05:00";
+/// Two probe10 rows listed at 09:00 ET, keys in no other fixture: a page whose oldest minute ties.
+const PRN_TIE_0900: &str = "sitemap_tie_0900.xml";
 /// Release 302939742 (page 10), then `rss_3_items.xml`'s three releases (page 12), of the
 /// 2026-11-17 08:17-08:21Z research pass, every `image:image` dropped.
 const PRN_SITEMAP_4_URLS: &str = "sitemap_news_4_urls.xml";
@@ -3362,17 +3364,27 @@ fn next_pages(extracted: &Extracted) -> Vec<(String, Option<String>)> {
         .collect()
 }
 
-/// How a poll that read `pages` joins the poll that read `basis_pages` (none: no basis).
+/// How a poll that read `pages` joins the poll that read `basis_pages` (none: no basis), the page
+/// after the last one not answered.
 fn continuity(
     pages: &[&str],
     basis_pages: &[&str],
+) -> Result<Option<Continuity>, Box<dyn std::error::Error>> {
+    continuity_ending(pages, basis_pages, false)
+}
+
+/// `continuity`, with `ran_out`: the page after the last one read answered with no row.
+fn continuity_ending(
+    pages: &[&str],
+    basis_pages: &[&str],
+    ran_out: bool,
 ) -> Result<Option<Continuity>, Box<dyn std::error::Error>> {
     let paging = provider()?.paging();
     let read = |names: &[&str]| -> Vec<Vec<u8>> { names.iter().map(|page| prn(page)).collect() };
     let basis: Option<Basis> = (!basis_pages.is_empty())
         .then(|| paging.basis_of(PRN_SITEMAP, &read(basis_pages)))
         .flatten();
-    Ok(paging.continuity(PRN_SITEMAP, &read(pages), basis.as_ref()))
+    Ok(paging.continuity(PRN_SITEMAP, &read(pages), basis.as_ref(), ran_out))
 }
 
 /// Section 11.2: one item key rule for PRN's RSS and its sitemap, so a release both list is one
@@ -3479,9 +3491,9 @@ fn a_page_one_sharing_a_key_with_the_basis_ends_a_complete_poll() -> Outcome {
     Ok(())
 }
 
-/// Probe10 14:10Z (§11.6): page 2 is planned past page 1's oldest row and holds a 14:05Z key, and
-/// the two pages share none, so the poll is `boundary_no_shared_key`. Mutation 2026-11-17, the
-/// boundary check dropped from `continuity`: red.
+/// Probe10 14:10Z (§11.6): page 2 holds a 14:05Z key and shares none with page 1, so the poll is
+/// `boundary_no_shared_key`; page 1 alone is `next_page_unread`, or `no_previous_key` once page 2
+/// answered with no row. Mutations 2026-11-17, the boundary and the next-page checks dropped: red.
 #[test]
 fn the_1410_poll_reads_page_two_and_records_its_broken_boundary() -> Outcome {
     let provider = based_on(&[PROBE10_1405])?;
@@ -3500,6 +3512,7 @@ fn the_1410_poll_reads_page_two_and_records_its_broken_boundary() -> Outcome {
             next_pages(&page_2),
             continuity(&[PROBE10_1410, PROBE10_1410_PAGE_2], &[PROBE10_1405])?,
             continuity(&[PROBE10_1410], &[PROBE10_1405])?,
+            continuity_ending(&[PROBE10_1410], &[PROBE10_1405], true)?,
         ),
         (
             vec![(
@@ -3508,6 +3521,7 @@ fn the_1410_poll_reads_page_two_and_records_its_broken_boundary() -> Outcome {
             )],
             Vec::new(),
             Some(Continuity::BoundaryNoSharedKey),
+            Some(Continuity::NextPageUnread),
             Some(Continuity::NoPreviousKey),
         )
     );
@@ -3515,27 +3529,57 @@ fn the_1410_poll_reads_page_two_and_records_its_broken_boundary() -> Outcome {
 }
 
 /// A page whose oldest row is older than every basis row cannot lead to one (pages list newest
-/// first), and a page that does not reach past the page before it cannot either. Mutations
-/// 2026-11-17, each of the two stops dropped from `next_page`: each red.
+/// first), and a page newer than the page before it cannot either. Mutations 2026-11-17, each of
+/// the two stops dropped from `next_page`: each red.
 #[test]
-fn a_page_older_than_the_basis_or_no_older_than_the_page_before_ends_the_poll() -> Outcome {
+fn a_page_older_than_the_basis_or_newer_than_the_page_before_ends_the_poll() -> Outcome {
     let provider = based_on(&[PROBE10_1205])?;
     let page_1 = provider.extract(&prn_sitemap_request(&provider)?, &blob(prn(PROBE10_1410)));
-    let repeated_request = Request {
+    let newer_request = Request {
         url: PRN_SITEMAP_PAGE_2.to_owned(),
-        listed_date: Some(PROBE10_1410_OLDEST.to_owned()),
+        listed_date: Some("2026-11-17T08:15:00-05:00".to_owned()),
         ..prn_sitemap_request(&provider)?
     };
-    let repeated = provider.extract(&repeated_request, &blob(prn(PROBE10_1410)));
+    let newer = provider.extract(&newer_request, &blob(prn(PROBE10_1410)));
     let past_the_basis = based_on(&[PROBE10_1410])?
         .extract(&prn_sitemap_request(&provider)?, &blob(prn(PROBE10_1405)));
     assert_eq!(
         (
             next_pages(&page_1).len(),
-            next_pages(&repeated),
+            next_pages(&newer),
             next_pages(&past_the_basis)
         ),
         (1, Vec::new(), Vec::new())
+    );
+    Ok(())
+}
+
+/// One minute can fill a page (107 releases at 09:00 ET on 2026-11-17, §11.6), so a page whose
+/// oldest minute ties the page before or the basis's oldest still plans the next. Mutations
+/// 2026-11-17, each tie read as a stop (`<` and `<=` swapped in `next_page`): each red.
+#[test]
+fn a_page_whose_oldest_minute_ties_the_page_before_or_the_basis_plans_the_next() -> Outcome {
+    let provider = based_on(&[PROBE10_1405])?;
+    let tied_request = Request {
+        url: PRN_SITEMAP_PAGE_2.to_owned(),
+        listed_date: Some(PROBE10_1410_OLDEST.to_owned()),
+        ..prn_sitemap_request(&provider)?
+    };
+    let tied_page = provider.extract(&tied_request, &blob(prn(PRN_TIE_0900)));
+    let tied_basis = based_on(&[PROBE10_1410])?
+        .extract(&prn_sitemap_request(&provider)?, &blob(prn(PRN_TIE_0900)));
+    assert_eq!(
+        (next_pages(&tied_page), next_pages(&tied_basis)),
+        (
+            vec![(
+                "https://www.prnewswire.com/sitemap-news.xml?page=3".to_owned(),
+                Some(PROBE10_1410_OLDEST.to_owned())
+            )],
+            vec![(
+                PRN_SITEMAP_PAGE_2.to_owned(),
+                Some(PROBE10_1410_OLDEST.to_owned())
+            )],
+        )
     );
     Ok(())
 }
@@ -3569,6 +3613,51 @@ fn a_next_page_the_robots_disallow_is_not_planned() -> Outcome {
         &blob(prn(PROBE10_1410)),
     );
     assert_eq!(next_pages(&extracted), Vec::new());
+    Ok(())
+}
+
+/// The per-document robots check (PR #46) reads a PRN sitemap row on page 1 and on a next page.
+/// Mutations 2026-11-17, the check skipped for a `sitemap-news` url and for a next page: each red.
+#[test]
+fn a_prn_sitemap_row_the_robots_disallow_is_counted_and_not_fetched_on_any_page() -> Outcome {
+    let rules: Arc<dyn RobotsRules> = Arc::new(Disallowing {
+        prefix: "/news-releases/rapidscale-".to_owned(),
+        asked: Mutex::new(Vec::new()),
+    });
+    let feed = handed(
+        OpenWebFeed::open(&hosts_path(), &rules_path(), CONTACT)?,
+        |host| {
+            if host == PRN_HOST {
+                HostRobots::Rules(rules.clone())
+            } else {
+                HostRobots::Absent
+            }
+        },
+    );
+    let page_1_request = prn_sitemap_request(&feed)?;
+    let page_2_request = Request {
+        url: PRN_SITEMAP_PAGE_2.to_owned(),
+        listed_date: Some(PROBE10_1410_OLDEST.to_owned()),
+        ..page_1_request.clone()
+    };
+    let read = |request: &Request| {
+        let extracted = feed.extract(request, &blob(prn(PRN_TIE_0900)));
+        let followed: Vec<String> = extracted
+            .follow_ups
+            .iter()
+            .filter(|follow_up| follow_up.phase == RequestPhase::Document)
+            .map(|follow_up| follow_up.url.clone())
+            .collect();
+        (extracted.robots_disallowed, followed)
+    };
+    let only_sibling = vec![
+        "https://www.prnewswire.com/news-releases/mo-clamps-new-ownership-invests-to-accelerate-growth-302941569.html"
+            .to_owned(),
+    ];
+    assert_eq!(
+        (read(&page_1_request), read(&page_2_request)),
+        ((1, only_sibling.clone()), (1, only_sibling))
+    );
     Ok(())
 }
 

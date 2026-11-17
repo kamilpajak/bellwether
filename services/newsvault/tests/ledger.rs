@@ -513,28 +513,42 @@ fn the_human_ledger_states_the_robots_disallowed_count_of_the_json_row() -> Test
 }
 
 /// Section 11.2: each `attempts.continuity` value is counted under its own name, in the JSON row
-/// and on the human line, and an attempt with none counts nowhere. Mutations 2026-11-17, two
-/// `SUM`s swapped in `grouped_attempts` and the human line printing `complete` twice: each red.
+/// and on the human line, and an attempt with none counts nowhere; 1 to 5 of each, so a swap shows.
+/// Mutations 2026-11-17, two `SUM`s swapped and the human line printing `complete` twice: each red.
 #[test]
 fn every_continuity_value_is_counted_under_its_own_name_in_json_and_human() -> TestResult {
     let root = fixture()?;
     let db = Connection::open(root.path().join(COMMIT_LOG))?;
     db.execute_batch(
-        "UPDATE attempts SET continuity = 'complete'
-          WHERE attempt_id IN ('a-0701-edgar-0', 'a-0701-edgar-2');
-         UPDATE attempts SET continuity = 'boundary_no_shared_key'
-          WHERE attempt_id = 'a-0701-edgar-1';
-         UPDATE attempts SET continuity = 'first_poll' WHERE attempt_id = 'a-0701-edgar-3';",
+        "CREATE TEMP TABLE copied AS SELECT * FROM attempts WHERE attempt_id = 'a-0701-edgar-3';",
     )?;
-    drop(db);
-    let day = "2026-07-01";
-    let json = over(&root, day, day)?.json()?;
+    for copy in 4..16 {
+        db.execute(
+            "UPDATE copied SET attempt_id = ?1",
+            [format!("a-0701-edgar-{copy}")],
+        )?;
+        db.execute("INSERT INTO attempts SELECT * FROM copied", [])?;
+    }
     let names = [
         "complete",
         "boundary_no_shared_key",
         "no_previous_key",
         "first_poll",
+        "next_page_unread",
     ];
+    let mut attempt = 0;
+    for (count, name) in (1..).zip(names) {
+        for _ in 0..count {
+            db.execute(
+                "UPDATE attempts SET continuity = ?1 WHERE attempt_id = ?2",
+                [name.to_owned(), format!("a-0701-edgar-{attempt}")],
+            )?;
+            attempt += 1;
+        }
+    }
+    drop(db);
+    let day = "2026-07-01";
+    let json = over(&root, day, day)?.json()?;
     let counted: Vec<Option<i64>> = names
         .iter()
         .map(|name| {
@@ -567,7 +581,7 @@ fn every_continuity_value_is_counted_under_its_own_name_in_json_and_human() -> T
                 .and_then(|word| word.parse().ok())
         })
         .collect();
-    let expected = vec![Some(2), Some(1), Some(0), Some(1)];
+    let expected = vec![Some(1), Some(2), Some(3), Some(4), Some(5)];
     assert_eq!((counted, shown), (expected.clone(), expected));
     Ok(())
 }

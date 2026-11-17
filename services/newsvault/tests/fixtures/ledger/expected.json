@@ -42,7 +42,8 @@
             "complete": 0,
             "boundary_no_shared_key": 0,
             "no_previous_key": 0,
-            "first_poll": 0
+            "first_poll": 0,
+            "next_page_unread": 0
           },
           "items_new": 3,
           "rows_committed": 3
@@ -68,7 +69,8 @@
             "complete": 0,
             "boundary_no_shared_key": 0,
             "no_previous_key": 0,
-            "first_poll": 0
+            "first_poll": 0,
+            "next_page_unread": 0
           },
           "items_new": 1,
           "rows_committed": 1
@@ -104,7 +106,8 @@
             "complete": 0,
             "boundary_no_shared_key": 0,
             "no_previous_key": 0,
-            "first_poll": 0
+            "first_poll": 0,
+            "next_page_unread": 0
           },
           "items_new": 0,
           "rows_committed": 0
@@ -130,7 +133,8 @@
             "complete": 0,
             "boundary_no_shared_key": 0,
             "no_previous_key": 0,
-            "first_poll": 0
+            "first_poll": 0,
+            "next_page_unread": 0
           },
           "items_new": 0,
           "rows_committed": 0
@@ -166,7 +170,8 @@
             "complete": 0,
             "boundary_no_shared_key": 0,
             "no_previous_key": 0,
-            "first_poll": 0
+            "first_poll": 0,
+            "next_page_unread": 0
           },
           "items_new": 0,
           "rows_committed": 0
@@ -192,7 +197,8 @@
             "complete": 0,
             "boundary_no_shared_key": 0,
             "no_previous_key": 0,
-            "first_poll": 0
+            "first_poll": 0,
+            "next_page_unread": 0
           },
           "items_new": 0,
           "rows_committed": 0
@@ -228,7 +234,8 @@
             "complete": 0,
             "boundary_no_shared_key": 0,
             "no_previous_key": 0,
-            "first_poll": 0
+            "first_poll": 0,
+            "next_page_unread": 0
           },
           "items_new": 0,
           "rows_committed": 0
@@ -264,7 +271,8 @@
             "complete": 0,
             "boundary_no_shared_key": 0,
             "no_previous_key": 0,
-            "first_poll": 0
+            "first_poll": 0,
+            "next_page_unread": 0
           },
           "items_new": 1,
           "rows_committed": 1

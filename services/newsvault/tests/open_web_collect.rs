@@ -3466,6 +3466,7 @@ const PROBE10_1205: &str = "2026-11-17T12:05:30Z";
 const PROBE10_1405: &str = "2026-11-17T14:05:30Z";
 const PROBE10_1410: &str = "2026-11-17T14:10:30Z";
 const PROBE10_1415: &str = "2026-11-17T14:15:30Z";
+const PROBE10_1420: &str = "2026-11-17T14:20:30Z";
 
 /// One collect over the committed hosts at `at`, PRN's sitemap pages answered as `sitemap` names
 /// them: the answer, and every url sent.
@@ -3474,7 +3475,15 @@ fn paged_poll(
     at: &str,
     sitemap: &[(&str, &str)],
 ) -> Result<(cmd_collect::Answer, Vec<String>), Box<dyn Error>> {
-    let exchange = Gnw::paged(sitemap)?;
+    paged_poll_over(store, at, Gnw::paged(sitemap)?)
+}
+
+/// `paged_poll` over `exchange`.
+fn paged_poll_over(
+    store: &Path,
+    at: &str,
+    exchange: Gnw,
+) -> Result<(cmd_collect::Answer, Vec<String>), Box<dyn Error>> {
     let ask = Ask {
         hosts: Some(seed::committed_hosts()),
         at: instant(at),
@@ -3499,8 +3508,9 @@ fn poll_continuity(answer: &cmd_collect::Answer) -> (Vec<u64>, Option<String>) {
     )
 }
 
-/// The ledger's continuity counts for 2026-11-17, `[complete, boundary, no previous, first]`.
-fn ledgered_continuity(store: &Path) -> Result<Vec<[i64; 4]>, Box<dyn Error>> {
+/// The ledger's continuity counts for 2026-11-17, `[complete, boundary, no previous, first,
+/// next page unread]`.
+fn ledgered_continuity(store: &Path) -> Result<Vec<[i64; 5]>, Box<dyn Error>> {
     let day: chrono::NaiveDate = "2026-11-17".parse()?;
     let report = newsvault::cmd_ledger::read(
         store,
@@ -3525,6 +3535,7 @@ fn ledgered_continuity(store: &Path) -> Result<Vec<[i64; 4]>, Box<dyn Error>> {
                 counts.boundary_no_shared_key,
                 counts.no_previous_key,
                 counts.first_poll,
+                counts.next_page_unread,
             ]
         })
         .collect())
@@ -3584,7 +3595,7 @@ fn a_poll_whose_page_one_overlaps_the_first_poll_is_complete_and_reads_one_page(
             0,
             1,
             vec!["pubDate".to_owned(), "pubDate".to_owned()],
-            vec![[1, 0, 0, 1]],
+            vec![[1, 0, 0, 1, 0]],
         )
     );
     Ok(())
@@ -3684,7 +3695,90 @@ fn a_poll_whose_page_one_failed_records_no_continuity() -> TestResult {
         (
             (Vec::new(), None),
             (vec![1], Some("complete".to_owned())),
-            vec![[1, 0, 0, 1]],
+            vec![[1, 0, 0, 1, 0]],
+        )
+    );
+    Ok(())
+}
+
+/// A page 2 that failed leaves 13:51-13:59Z unread, so 14:10Z is `next_page_unread` and no basis:
+/// 14:15Z reads back to 14:05Z, and 14:20Z anchors to both 14:15Z pages. Mutations 2026-11-17,
+/// the next-page check dropped from `continuity` and the basis built from page 1 only: each red.
+#[test]
+fn a_poll_whose_page_two_failed_is_no_basis_and_the_next_reads_back_across_it() -> TestResult {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    let joined = [
+        (PRN_SITEMAP, "sitemap_p1_1410.xml"),
+        (PRN_SITEMAP_PAGE_2, "sitemap_p2_joined.xml"),
+    ];
+    paged_poll(
+        root.path(),
+        PROBE10_1405,
+        &[(PRN_SITEMAP, "sitemap_p1_1405.xml")],
+    )?;
+    let failing = Gnw::paged(&[(PRN_SITEMAP, "sitemap_p1_1410.xml")])?
+        .answering(PRN_SITEMAP_PAGE_2, &[UNAVAILABLE; 3]);
+    let (failed, failed_sent) = paged_poll_over(root.path(), PROBE10_1410, failing)?;
+    let (after, after_sent) = paged_poll(root.path(), PROBE10_1415, &joined)?;
+    let (anchored, _) = paged_poll(
+        root.path(),
+        PROBE10_1420,
+        &[(PRN_SITEMAP, "sitemap_p2_1410.xml")],
+    )?;
+    assert_eq!(
+        (
+            poll_continuity(&failed),
+            sends_of(&failed_sent, PRN_SITEMAP_PAGE_2),
+            poll_continuity(&after),
+            sends_of(&after_sent, PRN_SITEMAP_PAGE_2),
+            poll_continuity(&anchored),
+            ledgered_continuity(root.path())?,
+        ),
+        (
+            (vec![1], Some("next_page_unread".to_owned())),
+            3,
+            (vec![1, 2], Some("complete".to_owned())),
+            1,
+            (vec![1], Some("complete".to_owned())),
+            vec![[2, 0, 0, 1, 1]],
+        )
+    );
+    Ok(())
+}
+
+/// A page 2 that answered with no row ends the walk, so 14:05Z is `no_previous_key` and a basis,
+/// and 14:10Z anchors to it, the newest basis, not to 12:00Z. Mutations 2026-11-17, `ran_out`
+/// ignored and the basis ordered oldest first: each red.
+#[test]
+fn a_poll_whose_page_two_had_no_row_ran_out_and_is_the_basis_of_the_next() -> TestResult {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    let ran_out = [
+        (PRN_SITEMAP, "sitemap_p1_1405.xml"),
+        (PRN_SITEMAP_PAGE_2, "sitemap_no_rows.xml"),
+    ];
+    paged_poll(
+        root.path(),
+        PROBE10_1200,
+        &[(PRN_SITEMAP, "sitemap_p1_1200.xml")],
+    )?;
+    let (empty, _) = paged_poll(root.path(), PROBE10_1405, &ran_out)?;
+    let (next, next_sent) = paged_poll(
+        root.path(),
+        PROBE10_1410,
+        &[(PRN_SITEMAP, "sitemap_p1_1405.xml")],
+    )?;
+    assert_eq!(
+        (
+            poll_continuity(&empty),
+            poll_continuity(&next),
+            sends_of(&next_sent, PRN_SITEMAP_PAGE_2),
+        ),
+        (
+            (vec![1], Some("no_previous_key".to_owned())),
+            (vec![1], Some("complete".to_owned())),
+            0,
         )
     );
     Ok(())

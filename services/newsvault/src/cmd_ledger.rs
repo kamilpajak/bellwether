@@ -160,16 +160,19 @@ pub struct ContinuityCounts {
     pub boundary_no_shared_key: i64,
     pub no_previous_key: i64,
     pub first_poll: i64,
+    pub next_page_unread: i64,
 }
 
 impl ContinuityCounts {
-    const fn of(counts: [i64; 4]) -> Self {
-        let [complete, boundary_no_shared_key, no_previous_key, first_poll] = counts;
+    const fn of(counts: [i64; 5]) -> Self {
+        let [complete, boundary_no_shared_key, no_previous_key, first_poll, next_page_unread] =
+            counts;
         Self {
             complete,
             boundary_no_shared_key,
             no_previous_key,
             first_poll,
+            next_page_unread,
         }
     }
 
@@ -179,6 +182,7 @@ impl ContinuityCounts {
             boundary_no_shared_key: self.boundary_no_shared_key + other.boundary_no_shared_key,
             no_previous_key: self.no_previous_key + other.no_previous_key,
             first_poll: self.first_poll + other.first_poll,
+            next_page_unread: self.next_page_unread + other.next_page_unread,
         }
     }
 }
@@ -459,7 +463,7 @@ fn code_of(failure: &serde_json::Error) -> &'static str {
 /// answers with three HTTP calls at decision time: "is this vendor down for every name, or is
 /// this one name quiet?" - one aggregate over rows already on disk answers it for every name.
 fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerReadError> {
-    let [complete, boundary, no_previous, first] = Continuity::ALL.map(Continuity::name);
+    let [complete, boundary, no_previous, first, unread] = Continuity::ALL.map(Continuity::name);
     let mut statement = db.prepare(&format!(
         "SELECT run_id, source, COALESCE(outcome, '{IN_FLIGHT}') AS state, COUNT(*),
                 SUM(COALESCE(vendor_rows, 0)), SUM(COALESCE(items_new, 0)),
@@ -471,7 +475,8 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
                 SUM(COALESCE(relisted_compared, 0)),
                 SUM(COALESCE(robots_disallowed, 0)),
                 SUM(continuity IS '{complete}'), SUM(continuity IS '{boundary}'),
-                SUM(continuity IS '{no_previous}'), SUM(continuity IS '{first}')
+                SUM(continuity IS '{no_previous}'), SUM(continuity IS '{first}'),
+                SUM(continuity IS '{unread}')
          FROM attempts WHERE opened_at <= ?1
          GROUP BY run_id, source, state
          ORDER BY run_id, source, state"
@@ -496,6 +501,7 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
                     row.get(13)?,
                     row.get(14)?,
                     row.get(15)?,
+                    row.get(16)?,
                 ]),
             })
         })?
@@ -847,7 +853,8 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                  vendor_rows {} held {} listing_unusable {} bodies_truncated {} \
                  relisted_disputed {} relisted_compared {} robots_disallowed {} \
                  continuity_complete {} continuity_boundary_no_shared_key {} \
-                 continuity_no_previous_key {} continuity_first_poll {} items_new {} rows {}",
+                 continuity_no_previous_key {} continuity_first_poll {} \
+                 continuity_next_page_unread {} items_new {} rows {}",
                 row.source,
                 row.ok,
                 row.empty,
@@ -865,6 +872,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 row.continuity.boundary_no_shared_key,
                 row.continuity.no_previous_key,
                 row.continuity.first_poll,
+                row.continuity.next_page_unread,
                 row.items_new,
                 row.rows_committed
             )?;

@@ -34,18 +34,23 @@ pub enum Continuity {
     Complete,
     /// Two neighbouring pages shared no key: a later page from an older generation (section 11.6).
     BoundaryNoSharedKey,
-    /// The last page read holds no key of the basis poll.
+    /// The last page read holds no key of the basis poll, and the walk ran out: no next page was
+    /// due, or the one asked answered with no row.
     NoPreviousKey,
     /// No earlier poll is a basis, so nothing before this poll's own pages was looked at.
     FirstPoll,
+    /// The last page read holds no key of the basis poll and a next page was due but not read:
+    /// it failed, or robots disallow it. That stretch is still listed, so the poll is no basis.
+    NextPageUnread,
 }
 
 impl Continuity {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Complete,
         Self::BoundaryNoSharedKey,
         Self::NoPreviousKey,
         Self::FirstPoll,
+        Self::NextPageUnread,
     ];
 
     #[must_use]
@@ -55,6 +60,7 @@ impl Continuity {
             Self::BoundaryNoSharedKey => "boundary_no_shared_key",
             Self::NoPreviousKey => "no_previous_key",
             Self::FirstPoll => "first_poll",
+            Self::NextPageUnread => "next_page_unread",
         }
     }
 
@@ -63,11 +69,11 @@ impl Continuity {
         Self::ALL.into_iter().find(|arm| arm.name() == name)
     }
 
-    /// A poll whose own boundaries all shared a key: the next poll anchors to it. A broken
-    /// boundary is not, so the next poll reads back across that stretch.
+    /// A poll whose own boundaries all shared a key and whose walk ran out: the next poll anchors
+    /// to it. A broken boundary or an unread next page is not, so the next poll reads back across.
     #[must_use]
     pub const fn is_basis(self) -> bool {
-        !matches!(self, Self::BoundaryNoSharedKey)
+        !matches!(self, Self::BoundaryNoSharedKey | Self::NextPageUnread)
     }
 }
 
@@ -120,7 +126,7 @@ pub(crate) fn next_page(
     }
     let (minute, raw) = oldest(rows)?;
     let before_basis = basis.oldest.is_some_and(|from| minute.start() < from);
-    let moved_back = page == 1 || reached.is_some_and(|at| minute.start() < at.start());
+    let moved_back = page == 1 || reached.is_some_and(|at| minute.start() <= at.start());
     (!before_basis && moved_back)
         .then(|| page.checked_add(1).map(|next| (next, raw.clone())))
         .flatten()
@@ -130,8 +136,13 @@ fn keys(rows: &[PageRow]) -> BTreeSet<&str> {
     rows.iter().map(|row| row.key.as_str()).collect()
 }
 
-/// `pages` in page order from page 1; `None` when there is none.
-pub(crate) fn continuity(pages: &[Vec<PageRow>], basis: Option<&Basis>) -> Option<Continuity> {
+/// `pages` in page order from page 1; `None` when there is none. `ran_out`: the page after the last
+/// one read answered with no row.
+pub(crate) fn continuity(
+    pages: &[Vec<PageRow>],
+    basis: Option<&Basis>,
+    ran_out: bool,
+) -> Option<Continuity> {
     let last = pages.last()?;
     let Some(basis) = basis else {
         return Some(Continuity::FirstPoll);
@@ -143,9 +154,26 @@ pub(crate) fn continuity(pages: &[Vec<PageRow>], basis: Option<&Basis>) -> Optio
         Continuity::BoundaryNoSharedKey
     } else if last.iter().any(|row| basis.keys.contains(&row.key)) {
         Continuity::Complete
+    } else if !ran_out && next_page_due(pages, basis) {
+        Continuity::NextPageUnread
     } else {
         Continuity::NoPreviousKey
     })
+}
+
+/// Whether `next_page` plans a page after the last of `pages`, as the feed asked it.
+fn next_page_due(pages: &[Vec<PageRow>], basis: &Basis) -> bool {
+    let Some((last, before)) = pages.split_last() else {
+        return false;
+    };
+    let reached = before
+        .last()
+        .and_then(|rows| oldest(rows))
+        .map(|(minute, _)| *minute);
+    u32::try_from(pages.len())
+        .ok()
+        .and_then(|page| next_page(page, last, reached, Some(basis)))
+        .is_some()
 }
 
 pub(crate) fn basis_of(pages: &[Vec<PageRow>]) -> Basis {
@@ -210,14 +238,15 @@ impl Paging {
     }
 
     /// How `pages` (page order from page 1) join `basis`; `None` when there is no page or one
-    /// does not parse.
+    /// does not parse. `ran_out`: the page after the last one read answered with no row.
     #[must_use]
     pub fn continuity(
         &self,
         index_url: &str,
         pages: &[Vec<u8>],
         basis: Option<&Basis>,
+        ran_out: bool,
     ) -> Option<Continuity> {
-        continuity(&self.rows_of(index_url, pages)?, basis)
+        continuity(&self.rows_of(index_url, pages)?, basis, ran_out)
     }
 }
