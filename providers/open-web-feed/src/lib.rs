@@ -42,6 +42,7 @@ const REQUEST_TIMEOUT: u16 = 408;
 const TOO_MANY_REQUESTS: u16 = 429;
 const SERVER_ERRORS: std::ops::RangeInclusive<u16> = 500..=599;
 const SCHEMES: [&str; 2] = ["https://", "http://"];
+const NOT_PLAIN: [u8; 2] = *b"%#";
 /// An ASSUMPTION taken by default, as edgar-press's is: nothing here has timed a GNW response.
 const VENDOR_PATIENCE: Duration = Duration::from_secs(30);
 /// The largest page of the 2026-11-14 probes was 979,950 B (cnbc.com), the GNW article 71,657 B
@@ -81,6 +82,16 @@ pub enum Refusal {
         host: String,
         url: String,
     },
+    /// Decision 4: robots.txt is matched against the path as written, which such a byte gives a
+    /// second spelling.
+    #[error(
+        "the hosts file at {path} reads the index of {host} at {target:?}, which holds %, a non-ASCII or a control byte"
+    )]
+    IndexTargetNotPlain {
+        path: PathBuf,
+        host: String,
+        target: String,
+    },
     /// R6: zero admitted rows plans zero requests, which reads as a quiet day.
     #[error("the hosts file at {0} admits no host")]
     NoHostAdmitted(PathBuf),
@@ -110,6 +121,15 @@ pub enum Refusal {
     /// A url path starts with `/`, so any other prefix filters out every link.
     #[error("the rules at {path} filter rule {rule} on {prefix}, which does not start with /")]
     PathPrefixNotRooted {
+        path: PathBuf,
+        rule: String,
+        prefix: String,
+    },
+    /// Decision 4, as `IndexTargetNotPlain`.
+    #[error(
+        "the rules at {path} filter rule {rule} on {prefix:?}, which holds %, a non-ASCII or a control byte"
+    )]
+    PathPrefixNotPlain {
         path: PathBuf,
         rule: String,
         prefix: String,
@@ -543,6 +563,13 @@ pub(crate) fn host_and_path(url: &str) -> Option<(String, String)> {
     let (host, target) = host_and_target(url)?;
     let path = target.split('?').next().unwrap_or("/");
     Some((host, path.to_owned()))
+}
+
+/// Owner decision 4 (2026-11-17): a path robots.txt is checked against holds no `%`, no non-ASCII
+/// byte and no control byte; nor a `#`, which robots.cc 50a0dac cuts from a url (lines 146-148).
+pub(crate) fn plain_path(path: &str) -> bool {
+    path.bytes()
+        .all(|byte| !NOT_PLAIN.contains(&byte) && byte.is_ascii() && !byte.is_ascii_control())
 }
 
 /// `host_and_path` with the query kept: the path robots.txt rules are matched against.

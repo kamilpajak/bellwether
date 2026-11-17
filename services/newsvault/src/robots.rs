@@ -1,10 +1,9 @@
 //! The robots.txt subset `collect` reads from a pinned body (architecture.md section 11.2): the
 //! `user-agent: *` groups, merged, their `Allow`/`Disallow` rules and their `Crawl-delay`. A group
 //! naming our own product token is never read: the token is `BELLWETHER_FEED_CONTACT`'s, not code's.
-//! Percent-encoding is not normalised, so `/a%2Fb` and `/a/b` are two paths here. Key spellings,
-//! the colon-less split, `*` and whitespace are read as Google's robots.cc
-//! (github.com/google/robotstxt, 50a0dac) reads them; the differences kept are in architecture.md
-//! section 10, row "key and line spellings".
+//! Lines, keys, pattern escaping and matching are read as Google's robots.cc
+//! (github.com/google/robotstxt, 50a0dac) reads them, reimplemented; a path is matched as given.
+//! The exceptions are in architecture.md section 10, row "key and line spellings".
 
 use std::time::Duration;
 
@@ -23,16 +22,25 @@ const DISALLOW_KEYS: [&str; 6] = [
 /// robots.cc names no Crawl-delay key, so ours is matched whole, case aside (owner decision 1).
 const CRAWL_DELAY_KEY: &str = "crawl-delay";
 /// absl's ASCII whitespace, which robots.cc line 296 strips; Rust's `is_ascii_whitespace` lacks VT.
-const ASCII_SPACE: [char; 6] = [' ', '\t', '\n', '\x0b', '\x0c', '\r'];
+const ASCII_SPACE: [u8; 6] = *b" \t\n\x0b\x0c\r";
 /// robots.cc line 327: the blanks that may stand in for a missing colon.
-const BLANKS: [char; 2] = [' ', '\t'];
+const BLANKS: [u8; 2] = *b" \t";
+const SEPARATOR: u8 = b':';
 const WILDCARD: char = '*';
 const END_ANCHOR: char = '$';
-const COMMENT: char = '#';
+const COMMENT: u8 = b'#';
 const BYTE_ORDER_MARK: char = '\u{feff}';
 const MARKUP: char = '<';
 /// RFC 9309 section 2.2's EOL is CR, LF or CRLF; `str::lines` splits on LF alone.
-const LINE_ENDS: [char; 2] = ['\r', '\n'];
+const LINE_ENDS: [u8; 2] = *b"\r\n";
+/// robots.cc 418-447: a line buffer of 2083 × 8 bytes whose last byte holds the terminator.
+const MAX_LINE_BYTES: usize = 2083 * 8 - 1;
+/// robots.cc reads a line as a C string, so it ends at the first NUL.
+const NUL: u8 = 0;
+const PERCENT: u8 = b'%';
+/// robots.cc 655-668: an unmatched `Allow` whose text from its last `/` starts so also allows
+/// `<text up to that slash>/$`.
+const INDEX_PAGE: &str = "/index.htm";
 const NANOS_DIGITS: usize = 9;
 
 /// Why a pinned robots body cannot be read; each refuses the run as `robots_refused` (section 5.1).
@@ -85,10 +93,36 @@ impl Reading {
     }
 }
 
+/// `pattern` is escaped as robots.cc 167-213 escapes it; `index_directory` is set on an `Allow`
+/// only, as `INDEX_PAGE` says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PathRule {
     allow: bool,
     pattern: String,
+    index_directory: Option<String>,
+}
+
+impl PathRule {
+    fn new(allow: bool, value: &[u8]) -> Self {
+        let pattern = escape_pattern(value);
+        let index_directory = allow.then(|| index_directory(&pattern)).flatten();
+        Self {
+            allow,
+            pattern,
+            index_directory,
+        }
+    }
+
+    /// The matched pattern's length, which is the rule's priority; `None` when it does not match.
+    fn priority(&self, path: &str) -> Option<usize> {
+        if matches(&self.pattern, path) {
+            return Some(self.pattern.len());
+        }
+        self.index_directory
+            .as_deref()
+            .filter(|directory| matches(directory, path))
+            .map(str::len)
+    }
 }
 
 /// What the `*` groups of one robots.txt say.
@@ -127,12 +161,16 @@ impl Robots {
         let mut group = Group::default();
         let (mut named_an_agent, mut in_agent_run) = (false, false);
         let (mut orphan, mut content) = (false, false);
-        for line in text.split(LINE_ENDS) {
-            let line = line
-                .split(COMMENT)
-                .next()
-                .unwrap_or("")
-                .trim_matches(ASCII_SPACE);
+        for raw in text.as_bytes().split(|byte| LINE_ENDS.contains(byte)) {
+            if let Some(value) = crawl_delay_value(raw) {
+                content = true;
+                orphan |= !named_an_agent && !value.is_empty();
+                group
+                    .delays
+                    .push(String::from_utf8_lossy(value).into_owned());
+                continue;
+            }
+            let line = read_line(raw);
             content |= !line.is_empty();
             let Some((key, value)) = directive(line) else {
                 continue;
@@ -150,17 +188,10 @@ impl Robots {
                     in_agent_run = false;
                     orphan |= !named_an_agent && !value.is_empty();
                     if group.every_agent && !value.is_empty() {
-                        robots.rules.push(PathRule {
-                            allow: rule == Key::Allow,
-                            pattern: value.to_owned(),
-                        });
+                        robots.rules.push(PathRule::new(rule == Key::Allow, value));
                     }
                 }
-                Key::CrawlDelay => {
-                    orphan |= !named_an_agent && !value.is_empty();
-                    group.delays.push(value.to_owned());
-                }
-                Key::Other => {}
+                Key::CrawlDelay | Key::Other => {}
             }
         }
         robots.end(&group)?;
@@ -197,19 +228,14 @@ impl Robots {
     }
 
     /// RFC 9309 section 2.2.2: the longest matching pattern decides, `Allow` wins a tie, and a
-    /// path no rule matches is allowed. `path` is matched as written, query included.
+    /// path no rule matches is allowed. `path` is matched as written, query included, unescaped.
     #[must_use]
     pub fn allows(&self, path: &str) -> bool {
         self.rules
             .iter()
-            .filter(|rule| matches(&rule.pattern, path))
-            .max_by(|a, b| {
-                a.pattern
-                    .len()
-                    .cmp(&b.pattern.len())
-                    .then(a.allow.cmp(&b.allow))
-            })
-            .is_none_or(|rule| rule.allow)
+            .filter_map(|rule| rule.priority(path).map(|priority| (priority, rule.allow)))
+            .max()
+            .is_none_or(|(_, allow)| allow)
     }
 }
 
@@ -224,10 +250,9 @@ enum Key {
 
 impl Key {
     /// robots.cc 50a0dac lines 488-500 try user-agent, then allow, then disallow.
-    fn of(key: &str) -> Self {
+    fn of(key: &[u8]) -> Self {
         let starts = |prefix: &&str| {
-            key.as_bytes()
-                .get(..prefix.len())
+            key.get(..prefix.len())
                 .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
         };
         if USER_AGENT_KEYS.iter().any(starts) {
@@ -236,7 +261,7 @@ impl Key {
             Self::Allow
         } else if DISALLOW_KEYS.iter().any(starts) {
             Self::Disallow
-        } else if key.eq_ignore_ascii_case(CRAWL_DELAY_KEY) {
+        } else if key.eq_ignore_ascii_case(CRAWL_DELAY_KEY.as_bytes()) {
             Self::CrawlDelay
         } else {
             Self::Other
@@ -246,27 +271,95 @@ impl Key {
 
 /// robots.cc 50a0dac lines 323-345 over a stripped line with its comment cut: the first colon
 /// splits it; with none, one run of blanks does when exactly two words remain. No key, no line.
-fn directive(line: &str) -> Option<(&str, &str)> {
-    let (key, value) = match line.split_once(':') {
-        Some(split) => split,
+fn directive(line: &[u8]) -> Option<(&[u8], &[u8])> {
+    let mut halves = line.splitn(2, |byte| *byte == SEPARATOR);
+    let head = halves.next()?;
+    let (key, value) = match halves.next() {
+        Some(value) => (head, value),
         None => {
-            let (key, value) = line.split_once(BLANKS)?;
-            let value = value.trim_start_matches(BLANKS);
-            if value.contains(BLANKS) {
+            let mut words = line.splitn(2, |byte| BLANKS.contains(byte));
+            let (key, value) = (words.next()?, trim(words.next()?, &BLANKS));
+            if value.iter().any(|byte| BLANKS.contains(byte)) {
                 return None;
             }
             (key, value)
         }
     };
-    let key = key.trim_matches(ASCII_SPACE);
-    (!key.is_empty()).then(|| (key, value.trim_matches(ASCII_SPACE)))
+    let key = trim(key, &ASCII_SPACE);
+    (!key.is_empty()).then(|| (key, trim(value, &ASCII_SPACE)))
+}
+
+/// One physical line as robots.cc 50a0dac reads it: its first `MAX_LINE_BYTES` bytes, up to its
+/// first NUL, its comment cut (line 302), its ASCII whitespace stripped (296).
+fn read_line(line: &[u8]) -> &[u8] {
+    let kept = line.get(..MAX_LINE_BYTES).unwrap_or(line);
+    let kept = kept.split(|byte| *byte == NUL).next().unwrap_or(kept);
+    let kept = kept.split(|byte| *byte == COMMENT).next().unwrap_or(kept);
+    trim(kept, &ASCII_SPACE)
+}
+
+/// A Crawl-delay line's value as ours read it before 2026-11-17 (owner decision 1): the whole
+/// line, NUL and bytes past `MAX_LINE_BYTES` kept, its comment cut. `None` for any other line.
+fn crawl_delay_value(line: &[u8]) -> Option<&[u8]> {
+    let kept = line.split(|byte| *byte == COMMENT).next().unwrap_or(line);
+    let (key, value) = directive(trim(kept, &ASCII_SPACE))?;
+    (Key::of(key) == Key::CrawlDelay).then_some(value)
+}
+
+fn trim<'a>(mut bytes: &'a [u8], strip: &[u8]) -> &'a [u8] {
+    while let [first, rest @ ..] = bytes {
+        if !strip.contains(first) {
+            break;
+        }
+        bytes = rest;
+    }
+    while let [rest @ .., last] = bytes {
+        if !strip.contains(last) {
+            break;
+        }
+        bytes = rest;
+    }
+    bytes
 }
 
 /// robots.cc 50a0dac line 625: `*` alone, or followed by whitespace and more, names every agent.
-fn names_every_agent(value: &str) -> bool {
-    value
-        .strip_prefix(WILDCARD)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with(ASCII_SPACE))
+fn names_every_agent(value: &[u8]) -> bool {
+    match value.split_first() {
+        Some((first, rest)) if char::from(*first) == WILDCARD => {
+            rest.first().is_none_or(|next| ASCII_SPACE.contains(next))
+        }
+        _ => false,
+    }
+}
+
+/// robots.cc 50a0dac 167-213: a byte at or above 0x80 becomes `%XX`, and a `%` with two hex
+/// digits after it keeps them, uppercased; every other byte is kept.
+fn escape_pattern(value: &[u8]) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some((&byte, tail)) = rest.split_first() {
+        rest = tail;
+        match tail {
+            [high, low, after @ ..]
+                if byte == PERCENT && high.is_ascii_hexdigit() && low.is_ascii_hexdigit() =>
+            {
+                escaped.push(char::from(PERCENT));
+                escaped.push(char::from(high.to_ascii_uppercase()));
+                escaped.push(char::from(low.to_ascii_uppercase()));
+                rest = after;
+            }
+            _ if !byte.is_ascii() => escaped.push_str(&format!("%{byte:02X}")),
+            _ => escaped.push(char::from(byte)),
+        }
+    }
+    escaped
+}
+
+/// `INDEX_PAGE`'s directory pattern for an escaped `Allow` pattern, when it has one.
+fn index_directory(pattern: &str) -> Option<String> {
+    let (directory, last) = pattern.split_at(pattern.rfind('/')?);
+    last.starts_with(INDEX_PAGE)
+        .then(|| format!("{directory}/{END_ANCHOR}"))
 }
 
 /// A pattern matches a path prefix; `*` matches any run of characters, a final `$` the end.
@@ -477,6 +570,33 @@ mod tests {
             Err(RobotsError::CrawlDelayNotANumber("soon".to_owned()))
         );
         Ok(())
+    }
+
+    /// Owner decision 1 keeps our Crawl-delay reading: robots.cc reads no Crawl-delay, so its line
+    /// is read whole, never cut at a NUL or at 16,663 bytes as a rule line is.
+    #[test]
+    fn a_crawl_delay_line_is_read_whole_and_not_cut_as_googles_parser_cuts_a_rule_line() {
+        let blanks = " ".repeat(16_700);
+        let read = [
+            b"User-agent: *\nCrawl-delay: 5\0x\n".to_vec(),
+            format!("User-agent: *\nCrawl-delay: 5{blanks}x\n").into_bytes(),
+            format!("User-agent: *\nCrawl-delay:{blanks}5\n").into_bytes(),
+            b"User-agent: *\nCrawl-delay 5\0 x\n".to_vec(),
+        ]
+        .map(|body| {
+            Robots::parse(&body)
+                .map(|robots| robots.crawl_delay())
+                .map_err(|refused| refused.verdict())
+        });
+        assert_eq!(
+            read,
+            [
+                Err("refused_crawl_delay"),
+                Err("refused_crawl_delay"),
+                Ok(Some(Duration::from_secs(5))),
+                Ok(None),
+            ]
+        );
     }
 
     /// Owner decision 3b: a body whose first non-whitespace character is `<`, a BOM before it
@@ -806,6 +926,294 @@ mod tests {
         )?;
         assert!(!unknown.allows("/g"));
         Ok(())
+    }
+
+    /// A parity row: a body, a path, and whether Google's `robots.cc` allowed it. Every verdict
+    /// below came from robots.cc 50a0dac compiled with clang++ and run 2026-11-17 for agent
+    /// `bellwether` on `https://example.test<path>`.
+    type Row = (Vec<u8>, String, bool);
+
+    fn star(rules: &[u8], path: &str, google: bool) -> Row {
+        (
+            [&b"User-agent: *\n"[..], rules].concat(),
+            path.to_owned(),
+            google,
+        )
+    }
+
+    /// The rows ours reads differently from Google, named by index and path.
+    fn disagreements(rows: &[Row]) -> Result<Vec<String>, RobotsError> {
+        let mut differ = Vec::new();
+        for (index, (body, path, google)) in rows.iter().enumerate() {
+            if Robots::parse(body)?.allows(path) != *google {
+                differ.push(format!("row {index}: {path:.40}"));
+            }
+        }
+        Ok(differ)
+    }
+
+    /// The `a` run that, after `Disallow: /`, fills a line to 16,663 bytes, the last one kept.
+    const KEPT_RUN: usize = 16_652;
+
+    fn run_of_a(length: usize) -> String {
+        "a".repeat(length)
+    }
+
+    /// §10 (b), robots.cc 167-213: a pattern's non-ASCII bytes become `%XX` and its `%xx` gets
+    /// uppercase hex; a path is matched as given; the escaped length is the priority.
+    #[test]
+    fn a_pattern_is_escaped_as_googles_parser_escapes_it() -> TestResult {
+        let rows = [
+            star(b"Disallow:\n", "/", true),
+            star(b"Disallow:\n", "/x", true),
+            star(b"Disallow: /JSWidget/\n", "/JSWidget/x", false),
+            star(b"Disallow: /JSWidget/\n", "/rssfeed/", true),
+            star("Disallow: /ä\n".as_bytes(), "/ä", true),
+            star("Disallow: /ä\n".as_bytes(), "/%C3%A4", false),
+            star("Disallow: /ä\n".as_bytes(), "/%c3%a4", true),
+            star(b"Disallow: /%C3%A4\n", "/ä", true),
+            star(b"Disallow: /%C3%A4\n", "/%C3%A4", false),
+            star(b"Disallow: /%C3%A4\n", "/%c3%a4", true),
+            star(b"Disallow: /%c3%a4\n", "/ä", true),
+            star(b"Disallow: /%c3%a4\n", "/%C3%A4", false),
+            star(b"Disallow: /%c3%a4\n", "/%c3%a4", true),
+            star(b"Disallow: /a%2Fb\n", "/a/b", true),
+            star(b"Disallow: /a%2Fb\n", "/a%2Fb", false),
+            star(b"Disallow: /a%2Fb\n", "/a%2fb", true),
+            star(b"Disallow: /~joe\n", "/~joe", false),
+            star(b"Disallow: /~joe\n", "/%7Ejoe", true),
+            star(b"Disallow: /%62az\n", "/baz", true),
+            star(b"Disallow: /%62az\n", "/%62az", false),
+            star(b"Disallow: /a%2Ab\n", "/a*b", true),
+            star(b"Disallow: /a%2Ab\n", "/a%2Ab", false),
+            star(b"Disallow: /x%\n", "/x%", false),
+            star(b"Disallow: /x%\n", "/x%25", false),
+            star(b"Disallow: /x%a\n", "/x%a", false),
+            star(b"Disallow: /x%a\n", "/x%A", true),
+            star(b"Disallow: /x%ag\n", "/x%ag", false),
+            star(b"Disallow: /x%ag\n", "/x%AG", true),
+            star(b"Disallow: /w%3D%3D\n", "/w%3d%3d", true),
+            star(b"Disallow: /w%3D%3D\n", "/w%3D%3D", false),
+            star(b"Disallow: /w%3d\n", "/w%3D", false),
+            star(b"Disallow: /w%3d\n", "/w%3d", true),
+            star("Allow: /ä\nDisallow: /%C3\n".as_bytes(), "/%C3%A4", true),
+            star("Allow: /ä\nDisallow: /%C3%A4\n".as_bytes(), "/%C3%A4", true),
+            star(b"Allow: /%c3\nDisallow: /%C3\n", "/%C3x", true),
+            star("Disallow: /*ä$\n".as_bytes(), "/x/%C3%A4", false),
+            star("Disallow: /*ä$\n".as_bytes(), "/x/ä", true),
+        ];
+        assert_eq!(disagreements(&rows)?, Vec::<String>::new());
+        Ok(())
+    }
+
+    /// §10 (a), robots.cc 655-668: an `Allow` that does not match, whose text from its last `/`
+    /// starts with `/index.htm`, allows `<that prefix>/$` at that pattern's length.
+    #[test]
+    fn an_index_page_allow_also_allows_its_directory_as_google_reads_it() -> TestResult {
+        let index = b"Allow: /foo/index.html\nDisallow: /\n";
+        let rows = [
+            star(index, "/foo/", true),
+            star(index, "/foo/index.html", true),
+            star(index, "/foo/index.htm", false),
+            star(index, "/foo/x", false),
+            star(index, "/foo/?q=1", false),
+            star(b"Allow: /index.html\nDisallow: /\n", "/", true),
+            star(b"Allow: /index.html\nDisallow: /\n", "/?x=1", false),
+            star(b"Allow: /index.html\nDisallow: /\n", "/index.html", true),
+            star(b"Allow: /foo/index.htmlx\nDisallow: /\n", "/foo/", true),
+            star(b"Allow: /*/index.html\nDisallow: /\n", "/a/", true),
+            star(b"Allow: /*/index.html\nDisallow: /\n", "/a/b/", true),
+            star(b"Allow: /*/index.html\nDisallow: /\n", "/", false),
+            star(b"Allow: /foo/index.html\nDisallow: /foo/$\n", "/foo/", true),
+            star(
+                b"Allow: /foo/index.html\nDisallow: /foo/$x\n",
+                "/foo/$x",
+                false,
+            ),
+            star(b"Disallow: /foo/index.html\n", "/foo/", true),
+            star(b"Allow: /foo/index.php\nDisallow: /\n", "/foo/", false),
+            star(b"Allow: /foo/INDEX.HTML\nDisallow: /\n", "/foo/", false),
+            star(
+                "Allow: /ä/index.htm\nDisallow: /\n".as_bytes(),
+                "/%C3%A4/",
+                true,
+            ),
+            star(
+                "Allow: /ä/index.htm\nDisallow: /\n".as_bytes(),
+                "/ä/",
+                false,
+            ),
+            star(b"Allow: index.html\nDisallow: /\n", "/", false),
+            star(b"Allow: index.html\nDisallow: /\n", "/index.html", false),
+            star(
+                b"Allow: /foo/index.html\nDisallow: /f*o*/$\n",
+                "/foo/",
+                false,
+            ),
+            star(
+                b"Allow: /foo/index.html\nDisallow: /f*o*/$\n",
+                "/foo/x",
+                true,
+            ),
+            star(b"Allow: /foo/index.html\nDisallow: /foo\n", "/foo/", true),
+            star(b"Allow: /foo/index.html\nDisallow: /foo\n", "/foo/x", false),
+        ];
+        assert_eq!(disagreements(&rows)?, Vec::<String>::new());
+        Ok(())
+    }
+
+    /// §10 (c), robots.cc 418-447: a line keeps its first 16,663 bytes, after the BOM and before
+    /// its line end, and is still read.
+    #[test]
+    fn a_long_line_is_cut_where_googles_parser_cuts_it() -> TestResult {
+        let disallow = |run: usize, tail: &str| format!("Disallow: /{}{tail}\n", run_of_a(run));
+        let past = format!("Disallow: /{}b\n", run_of_a(16_700));
+        let star_after = |blanks: usize| format!("User-agent:{}*bot\n", " ".repeat(blanks));
+        let rows = [
+            star(
+                past.as_bytes(),
+                &format!("/{}", run_of_a(KEPT_RUN - 1)),
+                true,
+            ),
+            star(past.as_bytes(), &format!("/{}", run_of_a(KEPT_RUN)), false),
+            star(
+                past.as_bytes(),
+                &format!("/{}c", run_of_a(KEPT_RUN + 1)),
+                false,
+            ),
+            star(
+                format!("Disallow: /\nAllow: /{}b\n", run_of_a(16_700)).as_bytes(),
+                &format!("/{}zzz", run_of_a(16_655)),
+                true,
+            ),
+            star(
+                format!("#{}\nDisallow: /y\n", "x".repeat(16_700)).as_bytes(),
+                "/y",
+                false,
+            ),
+            star(
+                disallow(KEPT_RUN, "b\r").as_bytes(),
+                &format!("/{}c", run_of_a(KEPT_RUN)),
+                false,
+            ),
+            star(
+                disallow(KEPT_RUN, "b\r").as_bytes(),
+                &format!("/{}c", run_of_a(KEPT_RUN - 1)),
+                true,
+            ),
+            star(
+                disallow(KEPT_RUN - 1, "b").as_bytes(),
+                &format!("/{}c", run_of_a(KEPT_RUN - 1)),
+                true,
+            ),
+            star(
+                disallow(KEPT_RUN - 1, "b").as_bytes(),
+                &format!("/{}b", run_of_a(KEPT_RUN - 1)),
+                false,
+            ),
+            star(
+                disallow(KEPT_RUN - 1, "ä").as_bytes(),
+                &format!("/{}%C3%A4", run_of_a(KEPT_RUN - 1)),
+                false,
+            ),
+            star(
+                disallow(KEPT_RUN - 1, "ä").as_bytes(),
+                &format!("/{}%C3x", run_of_a(KEPT_RUN - 1)),
+                false,
+            ),
+            star(
+                format!("  {}", disallow(KEPT_RUN, "b")).as_bytes(),
+                &format!("/{}c", run_of_a(KEPT_RUN - 1)),
+                false,
+            ),
+            star(
+                format!("  {}", disallow(KEPT_RUN, "b")).as_bytes(),
+                &format!("/{}c", run_of_a(KEPT_RUN - 3)),
+                true,
+            ),
+            star(
+                format!("Allow: /{}\nDisallow: /a\n", run_of_a(16_700)).as_bytes(),
+                &format!("/{}", run_of_a(16_655)),
+                true,
+            ),
+            star(
+                format!("Allow: /{}\nDisallow: /a\n", run_of_a(16_700)).as_bytes(),
+                &format!("/{}", run_of_a(100)),
+                false,
+            ),
+            (
+                format!("\u{feff}{}Disallow: /x\n", star_after(16_651)).into_bytes(),
+                "/x".to_owned(),
+                false,
+            ),
+            (
+                format!("{}Disallow: /x\n", star_after(16_651)).into_bytes(),
+                "/x".to_owned(),
+                false,
+            ),
+            (
+                format!("{}Disallow: /x\n", star_after(16_652)).into_bytes(),
+                "/x".to_owned(),
+                true,
+            ),
+        ];
+        assert_eq!(disagreements(&rows)?, Vec::<String>::new());
+        Ok(())
+    }
+
+    /// §10 (d): robots.cc reads each line as a C string, so a line ends at its first NUL byte,
+    /// whether that sits in a key, before the colon or in a value.
+    #[test]
+    fn a_line_ends_at_its_first_nul_as_googles_parser_reads_it() -> TestResult {
+        let rows = [
+            star(b"Disallow: /x\0y\n", "/x", false),
+            star(b"Disallow: /x\0y\n", "/xy", false),
+            star(b"Disallow: /x\0y\n", "/x/z", false),
+            star(b"Disallow\0: /x\n", "/x", true),
+            (
+                b"User-agent: *\0bot\nDisallow: /x\n".to_vec(),
+                "/x".to_owned(),
+                false,
+            ),
+            star(b"Disallow: /\0\nAllow: /x\n", "/x", true),
+            star(b"Disallow: /\0\nAllow: /x\n", "/y", false),
+            star(b"Disallow: /x\x01y\n", "/x", true),
+            star(b"Disallow: /x\x01y\n", "/x\x01y", false),
+            star(b"Disallow: /x\x7fy\n", "/x", true),
+            star(b"Disallow: /x\0# hidden\n", "/x", false),
+            star(b"Disal\0low: /x\n", "/x", true),
+            star(b"\0Disallow: /x\n", "/x", true),
+            (
+                b"User\0-agent: *\nDisallow: /x\n".to_vec(),
+                "/x".to_owned(),
+                true,
+            ),
+            star(b"Disallow: /x \0/y\n", "/x", false),
+            star(b"Disallow: /x \0/y\n", "/x /y", false),
+        ];
+        assert_eq!(disagreements(&rows)?, Vec::<String>::new());
+        Ok(())
+    }
+
+    /// The owner's exceptions to Google (2026-11-17): an HTML body and a bad `*` Crawl-delay are
+    /// refused where Google allows `/y`. Kept outside that decision (§10): a non-UTF-8 body is
+    /// refused where Google reads its bytes.
+    #[test]
+    fn the_bodies_google_reads_and_ours_refuses_are_the_named_exceptions() {
+        let refused = [
+            &b"<html>\nUser-agent: *\nDisallow: /x\n"[..],
+            b"User-agent: *\nCrawl-delay: soon\nDisallow: /x\n",
+            b"User-agent: *\nDisallow: /\xe4\n",
+        ]
+        .map(|body| Robots::parse(body).map(|robots| robots.allows("/y")));
+        assert_eq!(
+            refused,
+            [
+                Err(RobotsError::HtmlPage),
+                Err(RobotsError::CrawlDelayNotANumber("soon".to_owned())),
+                Err(RobotsError::NotUtf8),
+            ]
+        );
     }
 
     #[test]

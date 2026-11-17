@@ -2319,6 +2319,27 @@ fn a_hosts_row_whose_index_is_on_another_host_is_refused() {
     );
 }
 
+/// Owner decision 4 (2026-11-17): robots.txt is matched against the index target as written.
+#[test]
+fn an_index_target_holding_a_percent_a_non_ascii_or_a_control_byte_is_refused() {
+    let read = [
+        ("index_target_percent.json", "/rssfeed/?page=%31"),
+        ("index_target_non_ascii.json", "/rssfeed/ä"),
+        ("index_target_control.json", "/rssfeed/\u{7f}"),
+    ]
+    .map(|(name, target)| {
+        let path = hosts_fixture(name);
+        let refused = Refusal::IndexTargetNotPlain {
+            path: path.clone(),
+            host: GNW_HOST.to_owned(),
+            target: target.to_owned(),
+        };
+        (refusal_of(&path, &rules_path(), CONTACT), Some(refused))
+    });
+    let (got, wanted): (Vec<_>, Vec<_>) = read.into_iter().unzip();
+    assert_eq!(got, wanted);
+}
+
 /// R6: zero admitted rows would plan zero requests, which reads as a quiet day.
 #[test]
 fn a_hosts_file_admitting_no_host_is_refused() {
@@ -2501,6 +2522,29 @@ fn a_path_filter_not_starting_with_a_slash_is_refused() {
             prefix: "news-release/".to_owned()
         })
     );
+}
+
+/// Owner decision 4 (2026-11-17), as for an index target; also a `#`, which Google's parser cuts
+/// from a url and an index target never holds (`host_and_target` cuts it).
+#[test]
+fn a_path_filter_holding_a_percent_a_non_ascii_or_a_control_byte_is_refused() {
+    let read = [
+        ("rules_path_prefix_percent.json", "/news-r%65lease/"),
+        ("rules_path_prefix_non_ascii.json", "/news-release/ä/"),
+        ("rules_path_prefix_control.json", "/news-release/\t"),
+        ("rules_path_prefix_fragment.json", "/news-release/#x"),
+    ]
+    .map(|(name, prefix)| {
+        let path = rules_fixture(name);
+        let refused = Refusal::PathPrefixNotPlain {
+            path: path.clone(),
+            rule: "gnw".to_owned(),
+            prefix: prefix.to_owned(),
+        };
+        (refusal_of(&hosts_path(), &path, CONTACT), Some(refused))
+    });
+    let (got, wanted): (Vec<_>, Vec<_>) = read.into_iter().unzip();
+    assert_eq!(got, wanted);
 }
 
 /// A format printing seconds reads only GNW values at second 0; every real one would be unusable.
