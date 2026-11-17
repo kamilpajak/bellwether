@@ -15,7 +15,8 @@ use crate::{known_fields, minute_of, strict, Refusal};
 
 pub(crate) const RULES_SCHEMA: &str = "open-web-feed.rules/1";
 const TOP: [&str; 2] = ["schema", "rules"];
-const RULE: [&str; 7] = [
+const RULE: [&str; 8] = [
+    "index",
     "valid_field",
     "valid_format",
     "path_prefix",
@@ -26,6 +27,10 @@ const RULE: [&str; 7] = [
 ];
 const PICK: [&str; 2] = ["selector", "attribute"];
 const BODY: [&str; 2] = ["container", "paragraph"];
+const RSS: &str = "rss";
+const NEWS_SITEMAP: &str = "news_sitemap";
+/// A news sitemap rule's `valid_field` names a child of `news:news` behind this prefix.
+pub(crate) const NEWS_FIELD_PREFIX: &str = "news:";
 /// The minute every `valid_format` must print and read back, 2026-11-14T19:07Z, and a second
 /// inside it that the format must not print.
 const PROBE_MINUTE: (i32, u32, u32, u32, u32) = (2026, 11, 14, 19, 7);
@@ -38,8 +43,17 @@ pub(crate) struct Pick {
     pub(crate) attribute: String,
 }
 
+/// A host's index shape. A rule with no `index` field is `Rss`, as every rule before it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexFormat {
+    Rss,
+    /// A Google news sitemap: `urlset/url/loc` and `url/news:news/<valid_field>`.
+    NewsSitemap,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Rule {
+    pub(crate) index: IndexFormat,
     /// The index row's element holding the publication value, and `CollectedItem.valid_field`.
     pub(crate) valid_field: String,
     /// A chrono format with no seconds field: a value it cannot read is `NoParseableValidTime`.
@@ -141,10 +155,25 @@ fn parse_rule(name: &str, rule: &Map<String, Value>, path: &Path) -> Result<Rule
             format: valid_format,
         });
     }
+    let index = match rule.get("index").map(Value::as_str) {
+        None | Some(Some(RSS)) => IndexFormat::Rss,
+        Some(Some(NEWS_SITEMAP)) => IndexFormat::NewsSitemap,
+        Some(other) => return Err(unparseable(format!("index {other:?}"))),
+    };
+    let valid_field = text("valid_field")?;
+    let news_field = valid_field
+        .strip_prefix(NEWS_FIELD_PREFIX)
+        .is_some_and(|name| !name.is_empty());
+    if index == IndexFormat::NewsSitemap && !news_field {
+        return Err(unparseable(format!(
+            "valid_field {valid_field} names no {NEWS_FIELD_PREFIX} element"
+        )));
+    }
     let body = object("body")?;
     known_fields(body, &BODY, path)?;
     Ok(Rule {
-        valid_field: text("valid_field")?,
+        index,
+        valid_field,
         valid_format,
         path_prefix,
         rewrite_hosts,
@@ -174,10 +203,11 @@ fn reads_a_minute(format: &str) -> bool {
     }
 }
 
+/// At offset zero, so a format holding `%:z` prints too and reads back as the same instant.
 fn printed(at: NaiveDateTime, format: &str) -> Option<String> {
     use std::fmt::Write;
     let mut text = String::new();
-    write!(text, "{}", at.format(format)).ok()?;
+    write!(text, "{}", at.and_utc().fixed_offset().format(format)).ok()?;
     Some(text)
 }
 

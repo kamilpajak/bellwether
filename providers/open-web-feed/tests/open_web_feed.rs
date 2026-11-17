@@ -1,5 +1,6 @@
 //! Against committed fixtures and never the network. The GNW and PRN files are trimmed from the
-//! 2026-11-14 probes (architecture.md section 11.6); every `synthetic_` file says so in its head.
+//! 2026-11-14 and 2026-11-16 probes, the CNW files from the 2026-11-16 weekday probe
+//! (architecture.md section 11.6); every `synthetic_` file says so in its head.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -168,6 +169,68 @@ const PRN_OUTSIDE_THE_SECTION: [&str; 4] = [
     "NewsArticle",
     "Searching for your content",
 ];
+const CNW_INDEX: &str = "https://www.newswire.ca/sitemap-news.xml?page=1";
+const CNW_HOST: &str = "www.newswire.ca";
+/// Urls 1-3 of the 100 in the 2026-11-16 08:04:39Z news sitemap (§11.6 weekday probe, p0800).
+const CNW_REAL_INDEX: &str = "sitemap_news_3_urls.xml";
+const CNW_LINKS: [&str; 3] = [
+    CNW_ARTICLE_URL,
+    CNW_SECOND_ARTICLE_URL,
+    "https://www.newswire.ca/news-releases/hkex-launches-offshore-rmb-bond-index-807505308.html",
+];
+const CNW_PUBLICATION_DATES: [&str; 3] = [
+    "2026-11-16T02:22:00-05:00",
+    "2026-11-16T01:47:00-05:00",
+    "2026-11-16T01:33:00-05:00",
+];
+const CNW_MINUTES: [&str; 3] = [
+    "2026-11-16T07:22:00Z",
+    "2026-11-16T06:47:00Z",
+    "2026-11-16T06:33:00Z",
+];
+/// Daylight time's offset and UTC's: each is the instant its own offset names.
+const CNW_OTHER_OFFSETS: [(&str, &str); 2] = [
+    ("2026-07-16T03:22:00-04:00", "2026-07-16T07:22:00Z"),
+    ("2026-11-16T07:22:00+00:00", "2026-11-16T07:22:00Z"),
+];
+/// A second inside the minute, `Z` for the offset, no seconds field, a two-digit year.
+const CNW_NOT_A_MINUTE: [&str; 4] = [
+    "2026-11-16T02:22:30-05:00",
+    "2026-11-16T07:22:00Z",
+    "2026-11-16T02:22-05:00",
+    "26-11-16T02:22:00-05:00",
+];
+/// Release 805423040 (p0800 fetch) cut to its lead, two of its three gallery figures, four later
+/// paragraphs and its contact line, whose name, phone digits and encoded address are replaced.
+const CNW_ARTICLE: &str = "article_805423040.html";
+const CNW_ARTICLE_URL: &str = "https://www.newswire.ca/news-releases/global-voltage-travel-ready-protection-elegrp-powers-dyson-supersonic-travel-hair-dryer-805423040.html";
+const CNW_ARTICLE_KEY: &str = "www.newswire.ca/news-releases/global-voltage-travel-ready-protection-elegrp-powers-dyson-supersonic-travel-hair-dryer-805423040.html";
+const CNW_ARTICLE_TITLE: &str =
+    "Global Voltage, Travel-Ready Protection: ELEGRP Powers Dyson Supersonic Travel hair dryer";
+/// Release 823884942 (p0800 fetch) cut to the paragraphs naming no driver; its encoded address
+/// is replaced.
+const CNW_SECOND_ARTICLE: &str = "article_823884942.html";
+const CNW_SECOND_ARTICLE_URL: &str = "https://www.newswire.ca/news-releases/segway-powersports-secures-class-2-one-two-finish-on-score-baja-1000-debut-823884942.html";
+const CNW_SECOND_ARTICLE_TITLE: &str =
+    "Segway Powersports Secures Class 2 One-Two Finish on SCORE Baja 1000 Debut";
+const CNW_NO_RELEASE_BODY_PAGE: &str = "synthetic_no_release_body.html";
+/// The shape of the page's own organisation link, `/news/segway-powersports/`.
+const CNW_OFF_PREFIX_URL: &str = "https://www.newswire.ca/news/an-organisation/";
+/// The trimmed 805423040 body, one line per `p`, `li` or `figcaption`.
+const CNW_ARTICLE_LINES: [&str; 4] = [
+    "LAS VEGAS, Nov. 16, 2026 /CNW/ -- With carry-on space at a premium",
+    "ELEGRP Global Voltage Travel-Ready Protection",
+    "ELEGRP 100V–240V Wide-Voltage Travel Safety",
+    "The Dyson Supersonic Travel hair dryer is 32% smaller",
+];
+/// What the trimmed 805423040 holds outside `section.release-body`, as PRN's page does.
+const CNW_OUTSIDE_THE_SECTION: [&str; 4] = [
+    "02:22 ET",
+    "Share this article",
+    "NewsArticle",
+    "Searching for your content",
+];
+const GOLDEN_CNW_PAGES: [&str; 2] = [CNW_ARTICLE, CNW_SECOND_ARTICLE];
 const FIRST_ATTEMPT: u32 = 0;
 const OK: u16 = 200;
 const REQUEST_TIMEOUT: u16 = 408;
@@ -189,6 +252,10 @@ fn gnw(name: &str) -> Vec<u8> {
 
 fn prn(name: &str) -> Vec<u8> {
     std::fs::read(fixtures().join("prn").join(name)).unwrap_or_default()
+}
+
+fn cnw(name: &str) -> Vec<u8> {
+    std::fs::read(fixtures().join("cnw").join(name)).unwrap_or_default()
 }
 
 fn hosts_path() -> PathBuf {
@@ -276,6 +343,45 @@ fn prn_article_request(provider: &OpenWebFeed) -> Result<Request, Box<dyn std::e
     prn_follow_up(provider, 1)
 }
 
+fn cnw_index_request(provider: &OpenWebFeed) -> Result<Request, Box<dyn std::error::Error>> {
+    let plan = provider.plan(&TargetWindow::new(RUN_DAY), None, None, at(RUN_AT))?;
+    plan.requests
+        .into_iter()
+        .find(|request| request.url == CNW_INDEX)
+        .ok_or_else(|| "the run day planned no Canada Newswire index".into())
+}
+
+/// The follow-up the real CNW sitemap names at `position`, with its real publication date.
+fn cnw_follow_up(
+    provider: &OpenWebFeed,
+    position: usize,
+) -> Result<Request, Box<dyn std::error::Error>> {
+    let index = provider.extract(&cnw_index_request(provider)?, &blob(cnw(CNW_REAL_INDEX)));
+    index
+        .follow_ups
+        .get(position)
+        .cloned()
+        .ok_or_else(|| format!("the real CNW sitemap yielded no follow-up {position}").into())
+}
+
+/// One synthetic news sitemap holding each `(link, publication date)` as one `url`.
+fn cnw_sitemap(rows: &[(&str, &str)]) -> Vec<u8> {
+    let urls: String = rows
+        .iter()
+        .map(|(link, date)| {
+            format!(
+                "<url><loc>{link}</loc><news:news><news:publication_date>{date}\
+                 </news:publication_date></news:news></url>"
+            )
+        })
+        .collect();
+    format!(
+        "<?xml version=\"1.0\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\" \
+         xmlns:news=\"http://www.google.com/schemas/sitemap-news/0.9\">{urls}</urlset>"
+    )
+    .into_bytes()
+}
+
 fn only_item(extracted: &Extracted) -> Result<CollectedItem, Box<dyn std::error::Error>> {
     match extracted.items.as_slice() {
         [item] => Ok(item.clone()),
@@ -341,22 +447,23 @@ fn a_target_other_than_the_run_day_is_refused_before_any_request() -> Outcome {
         );
     }
     let plan = provider.plan(&TargetWindow::new(RUN_DAY), None, None, at(RUN_AT))?;
-    assert_eq!(plan.requests.len(), 2);
+    assert_eq!(plan.requests.len(), 3);
     assert_eq!(plan.not_planned, Vec::new());
     Ok(())
 }
 
-/// Section 11.2's host order: GNW, then PR Newswire, one index each. Mutations 2026-11-16, the
-/// PRN row made `candidate` and the two rows swapped: each red.
+/// Section 11.2's host order: GNW, then PR Newswire, then Canada Newswire, one index each.
+/// Mutations 2026-11-16, the PRN row made `candidate` and the two rows swapped: each red; 2026-11-17,
+/// the CNW row made `candidate`, and its index the RSS feed: each red.
 #[test]
-fn the_committed_hosts_file_plans_globenewswire_then_pr_newswire() -> Outcome {
+fn the_committed_hosts_file_plans_globenewswire_then_pr_newswire_then_canada_newswire() -> Outcome {
     let plan = provider()?.plan(&TargetWindow::new(RUN_DAY), None, None, at(RUN_AT))?;
     let urls: Vec<&str> = plan
         .requests
         .iter()
         .map(|request| request.url.as_str())
         .collect();
-    assert_eq!(urls, vec![GNW_INDEX, PRN_INDEX]);
+    assert_eq!(urls, vec![GNW_INDEX, PRN_INDEX, CNW_INDEX]);
     Ok(())
 }
 
@@ -1349,6 +1456,311 @@ fn the_real_pr_newswire_article_carries_its_title_its_canonical_link_and_its_www
     Ok(())
 }
 
+// ---- Canada Newswire ----
+
+/// The news sitemap's `loc` and `news:publication_date`, no rewrite, `/news-releases/`.
+/// Mutation 2026-11-17, the prefix GNW's `/news-release/`: red, all 3 filtered out.
+#[test]
+fn the_real_canada_newswire_sitemap_yields_one_follow_up_per_release_with_its_raw_date() -> Outcome
+{
+    let provider = provider()?;
+    let extracted = provider.extract(&cnw_index_request(&provider)?, &blob(cnw(CNW_REAL_INDEX)));
+    assert_eq!(
+        (extracted.vendor_rows, extracted.filtered_out),
+        (REAL_ROWS, 0)
+    );
+    let kept: Vec<(&str, Option<&str>, RequestPhase)> = extracted
+        .follow_ups
+        .iter()
+        .map(|request| {
+            (
+                request.url.as_str(),
+                request.listed_date.as_deref(),
+                request.phase,
+            )
+        })
+        .collect();
+    let expected: Vec<(&str, Option<&str>, RequestPhase)> = CNW_LINKS
+        .iter()
+        .zip(CNW_PUBLICATION_DATES)
+        .map(|(link, date)| (*link, Some(date), RequestPhase::Document))
+        .collect();
+    assert_eq!(kept, expected);
+    Ok(())
+}
+
+/// The 2,600 real rows of 2026-11-16 are all under `/news-releases/`, so only a synthetic link
+/// tests the prefix from the wide side. Mutation 2026-11-17, the prefix `/`: red.
+#[test]
+fn a_canada_newswire_link_outside_news_releases_is_filtered_out_and_counted() -> Outcome {
+    let provider = provider()?;
+    let index = cnw_sitemap(&[
+        (CNW_ARTICLE_URL, CNW_PUBLICATION_DATES[0]),
+        (CNW_OFF_PREFIX_URL, CNW_PUBLICATION_DATES[0]),
+    ]);
+    let extracted = provider.extract(&cnw_index_request(&provider)?, &blob(index));
+    let kept: Vec<&str> = extracted
+        .follow_ups
+        .iter()
+        .map(|request| request.url.as_str())
+        .collect();
+    assert_eq!(
+        (extracted.vendor_rows, kept, extracted.filtered_out),
+        (2, vec![CNW_ARTICLE_URL], 1)
+    );
+    Ok(())
+}
+
+/// Elements are matched by namespace: an `image:loc` and a `news:publication_date` of another
+/// namespace placed first are never read. Mutation 2026-11-17, the namespace test dropped: red.
+#[test]
+fn a_sitemap_element_named_like_a_field_in_another_namespace_is_never_read() -> Outcome {
+    let provider = provider()?;
+    let index = format!(
+        "<?xml version=\"1.0\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\" \
+         xmlns:news=\"http://www.google.com/schemas/sitemap-news/0.9\" \
+         xmlns:image=\"http://www.google.com/schemas/sitemap-image/1.1\" \
+         xmlns:other=\"urn:example:other\"><url>\
+         <image:loc>https://www.newswire.ca/news-releases/an-image-1.html</image:loc>\
+         <loc>{CNW_ARTICLE_URL}</loc><news:news>\
+         <other:publication_date>2026-11-16T03:00:00-05:00</other:publication_date>\
+         <news:publication_date>{}</news:publication_date></news:news></url></urlset>",
+        CNW_PUBLICATION_DATES[0]
+    );
+    let extracted = provider.extract(&cnw_index_request(&provider)?, &blob(index.into_bytes()));
+    let kept: Vec<(&str, Option<&str>)> = extracted
+        .follow_ups
+        .iter()
+        .map(|request| (request.url.as_str(), request.listed_date.as_deref()))
+        .collect();
+    assert_eq!(
+        kept,
+        vec![(CNW_ARTICLE_URL, Some(CNW_PUBLICATION_DATES[0]))]
+    );
+    Ok(())
+}
+
+/// Section 11.1: CNW's valid time is the sitemap's `news:publication_date`, so its index is the
+/// sitemap and RSS is a permanent failure there; the sitemap is one on an RSS host. Mutation
+/// 2026-11-17, the `cnw` rule reading `rss`: red.
+#[test]
+fn the_canada_newswire_index_is_its_news_sitemap_and_an_rss_answer_is_permanent() -> Outcome {
+    let provider = provider()?;
+    let request = cnw_index_request(&provider)?;
+    let empty = cnw_sitemap(&[]);
+    assert_eq!(
+        (
+            verdict(&provider, &request, OK, &cnw(CNW_REAL_INDEX))?,
+            verdict(&provider, &request, OK, &empty)?,
+            verdict(&provider, &request, OK, &prn(PRN_REAL_INDEX))?,
+            verdict(
+                &provider,
+                &prn_index_request(&provider)?,
+                OK,
+                &cnw(CNW_REAL_INDEX)
+            )?,
+        ),
+        (
+            Verdict::Usable,
+            Verdict::Empty,
+            Verdict::PermanentFailure,
+            Verdict::PermanentFailure
+        )
+    );
+    Ok(())
+}
+
+/// Section 11.1: every observed CNW value ends `:00` and an offset (2,600 of 2,600, 2026-11-16),
+/// so it is a minute at that offset. Mutations 2026-11-17: the offset dropped from `minute_of`,
+/// red (02:22 read as 02:22Z); the round trip removed, red.
+#[test]
+fn a_canada_newswire_publication_date_is_a_minute_at_its_own_offset_and_never_an_instant() -> Outcome
+{
+    let provider = provider()?;
+    let request = cnw_follow_up(&provider, 0)?;
+    let extract = |raw: &str| {
+        let dated = Request {
+            listed_date: Some(raw.to_owned()),
+            ..request.clone()
+        };
+        provider.extract(&dated, &blob(cnw(CNW_ARTICLE)))
+    };
+    let read = CNW_PUBLICATION_DATES
+        .iter()
+        .copied()
+        .zip(CNW_MINUTES)
+        .chain(CNW_OTHER_OFFSETS);
+    for (raw, minute) in read {
+        let item = only_item(&extract(raw))?;
+        assert_eq!(
+            (
+                &item.valid,
+                precision_of(&item.valid),
+                item.valid_source,
+                item.valid_raw.as_str(),
+                item.valid_field.as_str()
+            ),
+            (
+                &Published::AtMinute(Minute::new(minute.parse()?)?),
+                ValidPrecision::Minute,
+                ValidSource::VendorPublished,
+                raw,
+                "news:publication_date"
+            ),
+            "{raw}"
+        );
+    }
+    for raw in CNW_NOT_A_MINUTE {
+        let row = only_unusable(&extract(raw))?;
+        assert_eq!(
+            (row.reason, row.decided_by, &row.item.valid),
+            (
+                UnusableReason::NoParseableValidTime,
+                DecidedBy::IndexRow,
+                &Published::Unknown
+            ),
+            "{raw}"
+        );
+    }
+    Ok(())
+}
+
+/// §8 row R17 for Canada Newswire: `p, li, figcaption` in `section.release-body`, captions in
+/// document order; `article` adds the dateline and the share line (§11.1). Mutations 2026-11-17,
+/// the container `body`, `article` and `section`: each red.
+#[test]
+fn the_extracted_body_is_article_text_and_never_page_html_on_a_canada_newswire_page() -> Outcome {
+    let provider = provider()?;
+    let item =
+        only_item(&provider.extract(&cnw_follow_up(&provider, 0)?, &blob(cnw(CNW_ARTICLE))))?;
+    let body = item.body.ok_or("no body")?.text;
+    let lines: Vec<&str> = body.lines().collect();
+    let opened: Vec<bool> = [0, 2, 3, 4]
+        .iter()
+        .zip(CNW_ARTICLE_LINES)
+        .map(|(line, opens)| lines.get(*line).is_some_and(|text| text.starts_with(opens)))
+        .collect();
+    assert_eq!(opened, vec![true; CNW_ARTICLE_LINES.len()], "{body}");
+    assert_eq!(
+        lines.last().copied(),
+        Some("Jane Example, , 00-00000000000"),
+        "{body}"
+    );
+    assert!(!body.contains('<') && !body.contains('@'), "{body}");
+    for outside in CNW_OUTSIDE_THE_SECTION
+        .into_iter()
+        .chain(["Continue Reading"])
+    {
+        assert!(
+            !body.contains(outside),
+            "{outside} reached the body: {body}"
+        );
+    }
+    Ok(())
+}
+
+/// A page without `section.release-body` is the page's fault, so it is held (section 11.1). The
+/// synthetic page holds a bare `div.release-content`, the container nested in the section on every
+/// real page. Mutations 2026-11-17, the container `article` and `div.release-content`: each red.
+#[test]
+fn a_canada_newswire_page_with_no_release_body_is_unusable_as_no_article_body() -> Outcome {
+    let provider = provider()?;
+    let page = blob(cnw(CNW_NO_RELEASE_BODY_PAGE));
+    let row = only_unusable(&provider.extract(&cnw_follow_up(&provider, 2)?, &page))?;
+    assert_eq!(
+        (
+            row.reason,
+            row.decided_by,
+            row.raw_blob.as_str(),
+            row.item.body.as_ref(),
+            row.item.title.as_str()
+        ),
+        (
+            UnusableReason::NoArticleBody,
+            DecidedBy::Page,
+            page.digest.as_str(),
+            None,
+            "A Release Without Its Body"
+        )
+    );
+    Ok(())
+}
+
+/// The key is the link's own host and path; on all 7 CNW urls fetched 2026-11-16 the canonical
+/// link and `og:url` are that link. Mutation 2026-11-17, a rewrite `www.newswire.ca` to
+/// `newswire.ca`: red.
+#[test]
+fn the_real_canada_newswire_article_carries_its_title_its_canonical_link_and_its_item_key(
+) -> Outcome {
+    let provider = provider()?;
+    assert_eq!(
+        provider.item_key(CNW_ARTICLE_URL).as_deref(),
+        Some(CNW_ARTICLE_KEY)
+    );
+    let mut read = Vec::new();
+    for (position, page) in [(0, CNW_ARTICLE), (1, CNW_SECOND_ARTICLE)] {
+        let request = cnw_follow_up(&provider, position)?;
+        let item = only_item(&provider.extract(&request, &blob(cnw(page))))?;
+        read.push((
+            item.title,
+            item.canonical_url,
+            item.source_item_id,
+            item.observed,
+        ));
+    }
+    let key_of = |url: &str| url.trim_start_matches("https://").to_owned();
+    assert_eq!(
+        read,
+        vec![
+            (
+                CNW_ARTICLE_TITLE.to_owned(),
+                CNW_ARTICLE_URL.to_owned(),
+                CNW_ARTICLE_KEY.to_owned(),
+                None
+            ),
+            (
+                CNW_SECOND_ARTICLE_TITLE.to_owned(),
+                CNW_SECOND_ARTICLE_URL.to_owned(),
+                key_of(CNW_SECOND_ARTICLE_URL),
+                None
+            ),
+        ]
+    );
+    Ok(())
+}
+
+/// Section 11.2: what the committed CNW row asks of `www.newswire.ca`, which its robots.txt must
+/// allow; the sitemap's query is part of it.
+#[test]
+fn the_committed_canada_newswire_row_asks_its_sitemap_with_its_query_and_its_prefix() -> Outcome {
+    let asked: Vec<String> = provider()?
+        .admitted_paths()
+        .into_iter()
+        .filter(|path| path.host == CNW_HOST)
+        .map(|path| path.path)
+        .collect();
+    assert_eq!(asked, vec!["/sitemap-news.xml?page=1", "/news-releases/"]);
+    Ok(())
+}
+
+/// A rule that names an index shape the reader does not know, or a news sitemap field outside
+/// `news:news`, would read no row; both are refused before any request.
+#[test]
+fn an_unknown_index_or_a_sitemap_field_outside_news_is_refused() {
+    for name in [
+        "rules_unknown_index.json",
+        "rules_sitemap_field_not_news.json",
+    ] {
+        assert!(
+            matches!(
+                refusal_of(&hosts_path(), &rules_fixture(name), CONTACT),
+                Some(Refusal::RulesUnparseable { .. })
+            ),
+            "{name}"
+        );
+    }
+}
+
 // ---- transport ----
 
 #[test]
@@ -1530,8 +1942,8 @@ fn a_robots_pin_that_is_neither_64_lowercase_hex_nor_absent_is_refused() -> Outc
 }
 
 /// Each committed pin is its committed robots body's sha256, so a refresh answered with that body
-/// matches it (`newsvault`'s `tests/robots_refresh.rs`). Mutation 2026-11-16, one hex digit of
-/// the PRN pin changed: red.
+/// matches it (`newsvault`'s `tests/robots_refresh.rs`). Mutations 2026-11-16 and 2026-11-17, one
+/// hex digit of the PRN pin and of the CNW pin changed: each red.
 #[test]
 fn the_committed_hosts_file_pins_the_committed_robots_body() -> Outcome {
     let pin = |body: Vec<u8>| Some(RobotsPin::Sha256(FileDigest::of(&body).hex().to_owned()));
@@ -1547,6 +1959,11 @@ fn the_committed_hosts_file_pins_the_committed_robots_body() -> Outcome {
                 host: PRN_HOST.to_owned(),
                 admitted: true,
                 robots: pin(prn("robots_www_prnewswire_com.txt")),
+            },
+            HostPin {
+                host: CNW_HOST.to_owned(),
+                admitted: true,
+                robots: pin(cnw("robots_www_newswire_ca.txt")),
             },
         ]
     );
@@ -1711,6 +2128,13 @@ fn the_open_web_feed_breaks_no_claim_of_the_seam() -> Outcome {
         (prn_article.clone(), blob(prn(PRN_ARTICLE))),
         (prn_follow_up(&provider, 2)?, blob(prn(PRN_SECOND_ARTICLE))),
         (prn_article, blob(prn(PRN_NO_RELEASE_BODY_PAGE))),
+        (cnw_index_request(&provider)?, blob(cnw(CNW_REAL_INDEX))),
+        (cnw_follow_up(&provider, 0)?, blob(cnw(CNW_ARTICLE))),
+        (cnw_follow_up(&provider, 1)?, blob(cnw(CNW_SECOND_ARTICLE))),
+        (
+            cnw_follow_up(&provider, 2)?,
+            blob(cnw(CNW_NO_RELEASE_BODY_PAGE)),
+        ),
     ];
     let subject = Subject {
         target: TargetWindow::new(RUN_DAY),
@@ -1727,7 +2151,7 @@ fn the_open_web_feed_breaks_no_claim_of_the_seam() -> Outcome {
         .flat_map(|(request, raw)| provider.extract(request, raw).items)
         .map(|item| precision_of(&item.valid))
         .collect();
-    assert_eq!(produced.len(), 4);
+    assert_eq!(produced.len(), 6);
     assert!(
         produced.iter().all(|precision| *precision == ceiling),
         "{produced:?} under {ceiling:?}"
@@ -1884,6 +2308,7 @@ fn golden_bodies() -> Result<(serde_json::Value, serde_json::Value), Box<dyn std
     let mut bodies = serde_json::Map::new();
     let gnw_request = article_request(&provider)?;
     let prn_request = prn_article_request(&provider)?;
+    let cnw_request = cnw_follow_up(&provider, 0)?;
     let pages = GOLDEN_GNW_PAGES
         .iter()
         .map(|page| ("gnw", *page, gnw(page), &gnw_request))
@@ -1891,6 +2316,11 @@ fn golden_bodies() -> Result<(serde_json::Value, serde_json::Value), Box<dyn std
             GOLDEN_PRN_PAGES
                 .iter()
                 .map(|page| ("prn", *page, prn(page), &prn_request)),
+        )
+        .chain(
+            GOLDEN_CNW_PAGES
+                .iter()
+                .map(|page| ("cnw", *page, cnw(page), &cnw_request)),
         );
     for (host, page, bytes, request) in pages {
         let item = only_item(&provider.extract(request, &blob(bytes)))?;

@@ -38,6 +38,25 @@
         "container": "section.release-body",
         "paragraph": "p, li, figcaption"
       }
+    },
+    "cnw": {
+      "index": "news_sitemap",
+      "valid_field": "news:publication_date",
+      "valid_format": "%Y-%m-%dT%H:%M:00%:z",
+      "path_prefix": "/news-releases/",
+      "rewrite_hosts": {},
+      "title": {
+        "selector": "meta[property=\"og:title\"]",
+        "attribute": "content"
+      },
+      "canonical": {
+        "selector": "link[rel=\"canonical\"]",
+        "attribute": "href"
+      },
+      "body": {
+        "container": "section.release-body",
+        "paragraph": "p, li, figcaption"
+      }
     }
   }
 }

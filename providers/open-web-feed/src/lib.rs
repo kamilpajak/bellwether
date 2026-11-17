@@ -1,7 +1,7 @@
 //! Our own forward news feed: dated indexes and article pages from admitted hosts, collected live
-//! for the run's UTC day only. The design is `docs/design/architecture.md` section 11; GNW and PR
-//! Newswire are the admitted hosts (section 11.5 steps 2 and 6). It declares no HTTP dependency
-//! and holds no clock and no `Sink`.
+//! for the run's UTC day only. The design is `docs/design/architecture.md` section 11; GNW, PR
+//! Newswire and Canada Newswire are the admitted hosts (section 11.5 steps 2 and 6). It declares
+//! no HTTP dependency and holds no clock and no `Sink`.
 
 mod depth;
 mod hosts;
@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use canon::{Digest, FileDigest};
-use chrono::NaiveDateTime;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use news_provider::provider::{
     Cadence, Calendar, CollectedItem, DecidedBy, Extracted, ExtractedBody, Listing, Plan,
     PlanRefusal, Provenance, Provider, RawBlob, UnusableReason, UnusableRow, ValidPrecision,
@@ -588,15 +588,24 @@ fn absolute(href: &str, base: &str) -> Option<String> {
 
 /// The exact minute form the rule names: the value must print back byte for byte, because
 /// chrono's `%Y` reads `26` as the year 26 and `%H` reads `9` (review 2026-11-15). A value with
-/// seconds is refused by `Minute::new`.
+/// seconds is refused by `Minute::new`. A format with an offset reprints at the value's own one.
 pub(crate) fn minute_of(raw: &str, format: &str) -> Option<Minute> {
     use std::fmt::Write;
     let raw = raw.trim();
-    let naive = NaiveDateTime::parse_from_str(raw, format).ok()?;
     let mut printed = String::new();
-    write!(printed, "{}", naive.format(format)).ok()?;
+    let instant = match DateTime::parse_from_str(raw, format) {
+        Ok(stated) => {
+            write!(printed, "{}", stated.format(format)).ok()?;
+            stated.with_timezone(&Utc)
+        }
+        Err(_) => {
+            let naive = NaiveDateTime::parse_from_str(raw, format).ok()?;
+            write!(printed, "{}", naive.format(format)).ok()?;
+            naive.and_utc()
+        }
+    };
     (printed == raw).then_some(())?;
-    Minute::new(naive.and_utc()).ok()
+    Minute::new(instant).ok()
 }
 
 fn empty_roster() -> FileDigest {

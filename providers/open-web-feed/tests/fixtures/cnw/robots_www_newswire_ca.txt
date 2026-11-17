@@ -1,0 +1,8 @@
+User-Agent: *
+Disallow: /templates/get-bitly-url.txt
+
+Sitemap: https://www.newswire.ca/sitemap.xml
+Sitemap: https://www.newswire.ca/sitemap-news.xml
+
+Sitemap: https://www.newswire.ca/fr/sitemap.xml
+Sitemap: https://www.newswire.ca/fr/sitemap-news.xml
