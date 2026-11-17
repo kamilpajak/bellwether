@@ -195,7 +195,7 @@ pub fn open(ask: &Ask) -> Result<OpenWebFeed, RobotsError> {
 
 /// The one place a refresh builds its `Wire`, for `main.rs` and the loopback test alike: the
 /// collector's open-web profile, credential and pace files, so a robots fetch waits for the same
-/// per-IP and per-host slots a collect run does.
+/// per-host slots a collect run does.
 #[must_use]
 pub fn wire_for(ask: &Ask, feed: &OpenWebFeed) -> Wire {
     Wire::new(

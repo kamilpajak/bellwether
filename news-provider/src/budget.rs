@@ -104,8 +104,9 @@ enum Held {
 /// least `per_host` less the per-IP wait owed after the host wait apart (row R19, hole 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestBudget {
-    /// The smallest gap between two calls leaving our address for this vendor.
-    pub min_interval: Duration,
+    /// The smallest gap between two calls leaving our address for this vendor, when the vendor
+    /// counts one; `None` paces each host alone (owner decision 1, 2026-11-17, §10).
+    pub min_interval: Option<Duration>,
     /// The gap between two host reservations to one remote host, when the vendor states one.
     pub per_host: Option<Duration>,
 }
@@ -130,6 +131,9 @@ pub enum BudgetError {
     /// A host that is not a safe pace-file name, such as an IPv6 literal: refused, not unpaced.
     #[error("{host} is not a host a per-host pace file can be named after")]
     NotAHostKey { host: String },
+    /// A budget with neither a per-IP nor a per-host pace: refused, not sent unpaced.
+    #[error("the profile states neither a per-IP nor a per-host pace")]
+    NoPace,
 }
 
 /// The directory the pace file sits in, under the store root the run writes to.

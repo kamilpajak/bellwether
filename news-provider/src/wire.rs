@@ -47,7 +47,8 @@ pub struct TransportProfile {
     /// Bytes of response body read before ureq refuses the rest.
     pub body_limit: u64,
     /// How fast this vendor may be called, so both intervals have one producer: the provider.
-    /// `Wire::new` builds the per-IP pace file; `Wire::send` opens a per-host one per url host.
+    /// `Wire::new` builds the per-IP pace file when one is stated; `Wire::send` opens a per-host
+    /// one per url host.
     pub budget: RequestBudget,
 }
 
@@ -377,7 +378,8 @@ pub struct Wire {
     agent: ureq::Agent,
     profile: TransportProfile,
     credentials: Credentials,
-    pace: Pace,
+    /// `None` when the profile states no per-IP pace.
+    pace: Option<Pace>,
     /// Where a per-host pace file is opened, one per remote host a request names.
     store: PathBuf,
     sleeper: Box<dyn Sleeper>,
@@ -414,11 +416,9 @@ impl Wire {
         source: &SourceId,
         sleeper: Box<dyn Sleeper>,
     ) -> Self {
-        let pace = Pace::beside_the_store(
-            store,
-            &BudgetScope::PerIp(source.clone()),
-            profile.budget.min_interval,
-        );
+        let pace = profile.budget.min_interval.map(|interval| {
+            Pace::beside_the_store(store, &BudgetScope::PerIp(source.clone()), interval)
+        });
         let timeouts = profile.timeouts;
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(timeouts.global))
@@ -483,11 +483,16 @@ impl Wire {
     ) -> Result<RawResponse, SendFailure> {
         let attempt_id = permit.into_attempt_id();
         let headers = self.headers_for(request)?;
+        if self.pace.is_none() && self.profile.budget.per_host.is_none() {
+            return Err(BudgetError::NoPace.into());
+        }
         // The pace wait is owed only by a call that is going to be made, so it comes after the
         // credential check. Unconditional, with no zero-wait branch for a test to leave uncovered.
         let host = self.paced_host(&request.url)?;
         self.wait_out_the_host(host.as_ref(), clock)?;
-        self.sleeper.sleep(self.pace.reserve(clock.now())?);
+        if let Some(pace) = &self.pace {
+            self.sleeper.sleep(pace.reserve(clock.now())?);
+        }
         let requested_at = ObservationTime::new(clock.now());
         let answered = self.exchange(&request.url, &headers);
         let received_at = ObservationTime::new(clock.now());
@@ -789,7 +794,7 @@ mod tests {
             },
             body_limit: TEST_BODY_LIMIT,
             budget: RequestBudget {
-                min_interval: TEST_INTERVAL,
+                min_interval: Some(TEST_INTERVAL),
                 per_host: None,
             },
         }
@@ -800,6 +805,16 @@ mod tests {
         let mut polite = profile();
         polite.budget.per_host = Some(HOST_INTERVAL);
         polite
+    }
+
+    /// Open-web's shape since owner decision 1 of 2026-11-17: a host pace and no per-IP one.
+    fn hosts_only_profile() -> TransportProfile {
+        let mut hosts_only = profile();
+        hosts_only.budget = RequestBudget {
+            min_interval: None,
+            per_host: Some(FLOOR),
+        };
+        hosts_only
     }
 
     fn request() -> Request {
@@ -2180,6 +2195,159 @@ mod tests {
         let again =
             status_of(&rerun, &clock, FIRST_ATTEMPT, REFUSED).map_err(|why| why.to_string());
         assert_eq!((answered_by(served)?, again), (1, Ok(None)));
+        Ok(())
+    }
+
+    /// Section 11.1's open-web floor, so the arithmetic below reads as the vendor's.
+    const FLOOR: Duration = Duration::from_secs(10);
+    /// `FLOOR` less the 60 ms elapsed since that host's last grant.
+    const FLOOR_LESS_ELAPSED: Duration = Duration::from_millis(9_940);
+    /// The 120 s `Retry-After`, asked 120 ms after the answer that named it.
+    const HOLD_LESS_TWO_STEPS: Duration = Duration::from_millis(119_880);
+    /// Under `polite_profile`: the hold asked at 160 ms, and the 100 ms per-IP pace less 60 ms.
+    const HOLD_LESS_THREE_STEPS: Duration = Duration::from_millis(119_840);
+    const IP_PACE_LESS_ELAPSED: Duration = Duration::from_millis(40);
+    const LOOPBACK_IP: &str = "127.0.0.1";
+    const LOOPBACK_NAME: &str = "localhost";
+    const LOOPBACK_HOST_PACE_FILE: &str = "127.0.0.1.per-host";
+
+    /// Every file under `<store>/pace/`, sorted.
+    fn pace_files(store: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let mut files: Vec<String> = std::fs::read_dir(store.join(PACE_DIR))?
+            .map(|entry| entry.map(|found| found.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<_, _>>()?;
+        files.sort();
+        Ok(files)
+    }
+
+    /// Host A, `127.0.0.1`, answers a 120 s `Retry-After`; host B, `localhost`, is asked 60 ms
+    /// later; then A, then B twice, with no time between. Every wait in order, and the pace files.
+    fn two_hosts_one_held(
+        profile: TransportProfile,
+    ) -> Result<(Vec<Duration>, Vec<String>), Box<dyn std::error::Error>> {
+        let store = tempfile::tempdir()?;
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let wire = Wire::with_sleeper(
+            profile,
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        let (host_a, served_a) =
+            serve_answers(vec![RETRY_AFTER_SECONDS.to_owned(), OK_HEAD.to_owned()])?;
+        let (on_ip, served_b) = serve_answers(vec![OK_HEAD.to_owned(); 3])?;
+        let host_b = on_ip.replacen(LOOPBACK_IP, LOOPBACK_NAME, 1);
+        status_of(&wire, &clock, FIRST_ATTEMPT, &host_a)?;
+        clock.elapse(ELAPSED);
+        status_of(&wire, &clock, SECOND_ATTEMPT, &host_b)?;
+        clock.elapse(ELAPSED);
+        let mut answers = Vec::new();
+        for (ordinal, url) in [(2, &host_a), (3, &host_b), (4, &host_b)] {
+            answers.push(status_of(&wire, &clock, ordinal, url)?);
+        }
+        let served = (answered_by(served_a)?, answered_by(served_b)?);
+        if served != (2, 3) || answers != [Some(OK_STATUS); 3] {
+            return Err(format!("served {served:?}, answered {answers:?}").into());
+        }
+        Ok((clock.waits(), pace_files(store.path())?))
+    }
+
+    /// Owner decision 1, 2026-11-17: a hold on A is A's alone, and B never owes a slot A took.
+    #[test]
+    fn a_hold_on_one_host_leaves_another_host_owing_only_its_own_floor() -> Checked {
+        let (waits, _) = two_hosts_one_held(hosts_only_profile())?;
+        assert_eq!(
+            waits,
+            vec![NO_WAIT, NO_WAIT, HOLD_LESS_TWO_STEPS, NO_WAIT, FLOOR]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_hosts_only_profile_writes_one_pace_file_per_host_and_no_per_ip_file() -> Checked {
+        let (_, files) = two_hosts_one_held(hosts_only_profile())?;
+        assert_eq!(
+            files,
+            vec![
+                LOOPBACK_HOST_PACE_FILE.to_owned(),
+                HOST_PACE_FILE.to_owned()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn two_sends_to_one_host_under_a_hosts_only_profile_are_still_its_floor_apart() -> Checked {
+        let store = tempfile::tempdir()?;
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let wire = Wire::with_sleeper(
+            hosts_only_profile(),
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        send_to(&wire, &clock, FIRST_ATTEMPT, LOCALHOST)?;
+        clock.elapse(ELAPSED);
+        send_to(&wire, &clock, SECOND_ATTEMPT, LOCALHOST)?;
+        assert_eq!(clock.waits(), vec![NO_WAIT, FLOOR_LESS_ELAPSED]);
+        Ok(())
+    }
+
+    /// edgar's shape: the same sends still pay the per-IP pace across hosts (host, then IP wait).
+    #[test]
+    fn a_profile_with_a_per_ip_pace_still_spaces_two_hosts_by_it() -> Checked {
+        let (waits, files) = two_hosts_one_held(polite_profile())?;
+        assert_eq!(
+            (waits, files.contains(&SOURCE_PACE_FILE.to_owned())),
+            (
+                vec![
+                    NO_WAIT,
+                    NO_WAIT,
+                    NO_WAIT,
+                    IP_PACE_LESS_ELAPSED,
+                    HOLD_LESS_THREE_STEPS,
+                    NO_WAIT,
+                    NO_WAIT,
+                    TEST_INTERVAL,
+                    HOST_WAIT_LATER,
+                    NO_WAIT
+                ],
+                true
+            )
+        );
+        Ok(())
+    }
+
+    /// A profile with neither pace would send unpaced; refused before any clock read or wait.
+    #[test]
+    fn a_profile_stating_no_pace_at_all_is_refused_before_any_wait() -> Checked {
+        let store = tempfile::tempdir()?;
+        let mut unpaced = profile();
+        unpaced.budget.min_interval = None;
+        let clock = clock_over(&[RESERVED_AT]);
+        let waits = WaitRecorder::default();
+        let wire = Wire::with_sleeper(
+            unpaced,
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(waits.clone()),
+        );
+        let mut sink = Recorder::default();
+        let Some(permit) = permit(&mut sink, FIRST_ATTEMPT) else {
+            return Err("no permit".into());
+        };
+        let refused = wire.send(permit, &request(), &clock).err();
+        assert_eq!(
+            (refused, waits.waits(), clock.reads()),
+            (
+                Some(SendFailure::Budget(BudgetError::NoPace)),
+                Vec::new(),
+                NO_READS
+            )
+        );
         Ok(())
     }
 }

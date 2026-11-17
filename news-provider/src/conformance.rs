@@ -350,7 +350,7 @@ mod tests {
                 },
                 body_limit: 1,
                 budget: RequestBudget {
-                    min_interval: PATIENCE,
+                    min_interval: Some(PATIENCE),
                     per_host: None,
                 },
             }

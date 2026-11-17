@@ -454,7 +454,7 @@ impl Provider for EdgarPress {
             // Per IP, because the contact above does not scope the quota; per host as well, keyed
             // on `www.sec.gov` and not on this source, so a second SEC source shares the bucket.
             budget: RequestBudget {
-                min_interval: SEC_MIN_INTERVAL,
+                min_interval: Some(SEC_MIN_INTERVAL),
                 per_host: Some(SEC_MIN_INTERVAL),
             },
         }
