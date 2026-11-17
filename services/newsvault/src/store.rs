@@ -261,8 +261,9 @@ ALTER TABLE attempts ADD COLUMN boundary_generation_unknown INTEGER
     "
 -- GNW's id walk (section 11.2): `continuity` takes `id_unread` and `range_unread`, and a CHECK
 -- cannot be altered in place, so `attempts` is rebuilt, every column and row carried. The walk
--- columns sit on the walked index's usable attempt, NULL on every other row and on every row
--- before user_version 12.
+-- columns (section 3.2) sit on the walked index's usable attempt, NULL on every other row and on
+-- every row before user_version 12. No `--` comment inside the column list: with one there, CI's
+-- SQLite (Ubuntu 24.04) failed a test's DROP COLUMN, `incomplete input` (run 44192197582).
 CREATE TABLE attempts_v12 (
     attempt_id                  TEXT PRIMARY KEY,
     run_id                      TEXT NOT NULL,
@@ -303,13 +304,9 @@ CREATE TABLE attempts_v12 (
     boundary_older_generation   INTEGER CHECK (boundary_older_generation >= 0),
     boundary_newer_generation   INTEGER CHECK (boundary_newer_generation >= 0),
     boundary_generation_unknown INTEGER CHECK (boundary_generation_unknown >= 0),
-    -- The highest id the poll walked through, which the next poll walks from.
     walk_through                INTEGER CHECK (walk_through >= 0),
-    -- Walked ids answered 410 (owner decision 2026-11-17): permanent, never asked again.
     walk_gone                   INTEGER CHECK (walk_gone >= 0),
-    -- Walked ids moved to another language and not fetched (owner decision PG-D4).
     walk_other_language         INTEGER CHECK (walk_other_language >= 0),
-    -- Ids of the poll's range with no answer in the store after it.
     walk_unread                 INTEGER CHECK (walk_unread >= 0)
 );
 INSERT INTO attempts_v12
