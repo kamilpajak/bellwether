@@ -21,8 +21,8 @@ use news_provider::{
 };
 use open_web_feed::{
     AdmittedPath, Basis, Continuity, CrossChecker, DirectAnswer, Generation, HostPin, HostRobots,
-    OpenWebFeed, Refusal, RobotsPin, RobotsRules, Walk, WalkBasis, WalkRange, CONTACT_CREDENTIAL,
-    DIRECT_LEAD, GENERATION_HEADER, LONGEST_POLL_PERIOD, SOURCE,
+    OpenWebFeed, Refusal, RobotsPin, RobotsRules, Walk, WalkBasis, WalkPlan, WalkRange,
+    CONTACT_CREDENTIAL, DIRECT_LEAD, GENERATION_HEADER, LONGEST_POLL_PERIOD, SOURCE,
 };
 use pit::datedness::{Minute, Published};
 use pit::ObservationTime;
@@ -3531,9 +3531,10 @@ fn the_1410_poll_reads_page_two_and_records_its_broken_boundary() -> Outcome {
 }
 
 /// Owner decision 2026-11-17 (option B): every poll that read all the pages or ids it planned is
-/// a basis, a broken boundary included; only `next_page_unread` and `id_unread` are not.
+/// a basis, a broken boundary included; only `next_page_unread`, `id_unread` and `range_unread`
+/// are not.
 #[test]
-fn every_continuity_but_an_unread_page_or_id_is_a_basis() {
+fn every_continuity_but_an_unread_page_id_or_range_is_a_basis() {
     let basis: Vec<(&str, bool)> = Continuity::ALL
         .into_iter()
         .map(|arm| (arm.name(), arm.is_basis()))
@@ -3547,6 +3548,7 @@ fn every_continuity_but_an_unread_page_or_id_is_a_basis() {
             ("first_poll", true),
             ("next_page_unread", false),
             ("id_unread", false),
+            ("range_unread", false),
         ]
     );
 }
@@ -4576,15 +4578,19 @@ fn walking(range: Option<WalkRange>) -> Result<OpenWebFeed, Refusal> {
 /// The range a poll walks after a first poll that read `RSS_1200` and walked nothing.
 fn after_the_first_poll(answered: &[u64]) -> Result<Option<WalkRange>, Refusal> {
     let first = gnw(RSS_1200);
-    Ok(provider()?.walk().range(
-        GNW_INDEX,
-        Some(&first),
-        Some(WalkBasis {
-            walked_through: None,
-            index: &first,
-        }),
-        answered.iter().copied().collect(),
-    ))
+    Ok(provider()?
+        .walk()
+        .range(
+            GNW_INDEX,
+            Some(&first),
+            Some(WalkBasis {
+                walked_through: None,
+                index: &first,
+            }),
+            answered.iter().copied().collect(),
+        )
+        .range()
+        .cloned())
 }
 
 fn gnw_index_on(
@@ -4620,9 +4626,8 @@ fn walked_urls(ids: &[u64]) -> Vec<Walked> {
 }
 
 /// GNW serves one release under any slug, date and middle number (research 2026-11-17), so its
-/// story key is `(id, language)`: the listed url, the www spelling and the walk's url of 3404422
-/// are one story, and its French twin another. Mutation 2026-11-17, `Keys::key` reverted to host
-/// plus path: red.
+/// story key is `(id, language)`. Mutation 2026-11-17, `Keys::key` reverted to host plus path:
+/// red.
 #[test]
 fn a_release_is_keyed_by_its_id_and_language_whatever_its_slug_date_or_number() -> Outcome {
     let feed = provider()?;
@@ -4720,7 +4725,7 @@ fn a_first_poll_has_no_range_and_walks_nothing() -> Outcome {
             walk.range(GNW_INDEX, Some(&first), None, BTreeSet::new()),
             walked(&walking(None)?, RSS_1200)?,
         ),
-        (None, None, Vec::new())
+        (WalkPlan::FirstPoll, WalkPlan::FirstPoll, Vec::new())
     );
     Ok(())
 }
@@ -4740,10 +4745,46 @@ fn a_basis_that_walked_is_walked_from_the_id_it_walked_through() -> Outcome {
             }),
             BTreeSet::new(),
         )
+        .range()
+        .cloned()
         .ok_or("no range")?;
     assert_eq!(
         (range.after(), range.through()),
         (FIRST_FRONTIER, 3_404_462)
+    );
+    Ok(())
+}
+
+/// `rss` with every release link moved under `/en/`, a shape no release is read from.
+fn shifted(rss: &str) -> Vec<u8> {
+    String::from_utf8_lossy(&gnw(rss))
+        .replace(
+            "globenewswire.com/news-release/",
+            "globenewswire.com/en/news-release/",
+        )
+        .into_bytes()
+}
+
+/// A previous answer or a basis that lists no release leaves the range unknown: `range_unread`,
+/// never a `first_poll` that would drop the basis's `walk_through` (PR #49 review, 2026-11-18).
+#[test]
+fn a_poll_whose_previous_or_basis_answer_lists_no_release_is_range_unread() -> Outcome {
+    let walk = provider()?.walk();
+    let (listing, moved) = (gnw(RSS_1200), shifted(RSS_1200));
+    let walked = WalkBasis {
+        walked_through: Some(FIRST_FRONTIER),
+        index: &listing,
+    };
+    let unwalked = WalkBasis {
+        walked_through: None,
+        index: &moved,
+    };
+    assert_eq!(
+        (
+            walk.range(GNW_INDEX, Some(&moved), Some(walked), BTreeSet::new()),
+            walk.range(GNW_INDEX, Some(&listing), Some(unwalked), BTreeSet::new()),
+        ),
+        (WalkPlan::RangeUnread, WalkPlan::RangeUnread)
     );
     Ok(())
 }
@@ -4829,6 +4870,46 @@ fn a_walked_page_with_no_readable_time_is_unusable_decided_by_the_page() -> Outc
     Ok(())
 }
 
+/// Only the walk's own url is dated by its page: a listed spelling of the same release with no
+/// listed value is undated, decided by its index row (PR #49 review, 2026-11-18: it was dated).
+#[test]
+fn a_listed_url_with_no_listed_value_is_not_dated_by_its_page() -> Outcome {
+    let feed = provider()?;
+    let request = Request {
+        url:
+            "https://rss.globenewswire.com/news-release/2026/11/17/3404423/0/en/Some-Real-Slug.html"
+                .to_owned(),
+        phase: RequestPhase::Document,
+        listed_date: None,
+        ..gnw_index_on(&feed, WALK_DAY, WALK_AT)?
+    };
+    let unusable = only_unusable(&feed.extract(&request, &blob(gnw(WALKED_3404423))))?;
+    assert_eq!(
+        (unusable.reason, unusable.decided_by),
+        (UnusableReason::NoParseableValidTime, DecidedBy::IndexRow)
+    );
+    Ok(())
+}
+
+/// A walked id is the walk's own url inside the range: a listed spelling of an id in the range,
+/// or the walk's url of an id outside it, is not one.
+#[test]
+fn only_the_walks_own_url_inside_the_range_is_a_walked_id() -> Outcome {
+    let walk = provider()?.walk();
+    let range = after_the_first_poll(&[])?.ok_or("no range")?;
+    let listed = "https://rss.globenewswire.com/news-release/2026/11/17/3404416/0/en/a-slug.html";
+    assert_eq!(
+        [
+            walk.walked_id(GNW_INDEX, &range, &walk_url("2026/11/17", 3_404_416)),
+            walk.walked_id(GNW_INDEX, &range, listed),
+            walk.walked_id(GNW_INDEX, &range, &walk_url("2026/11/18", 3_404_416)),
+            walk.walked_id(GNW_INDEX, &range, &walk_url("2026/11/17", 3_404_423)),
+        ],
+        [Some(3_404_416), None, None, None]
+    );
+    Ok(())
+}
+
 fn moved_verdict(url: &str, location: Option<&str>) -> Result<Verdict, Box<dyn std::error::Error>> {
     let feed = provider()?;
     let request = Request {
@@ -4902,8 +4983,8 @@ fn a_walked_id_answered_410_is_permanent() -> Outcome {
     Ok(())
 }
 
-/// `first_poll` with no range; `complete` when every id of it is answered; `id_unread` with the
-/// ids that are not, which makes the poll no basis.
+/// `first_poll` and `range_unread` as planned; `complete` when every id of the range is answered;
+/// `id_unread` with the ids that are not, which makes the poll no basis.
 #[test]
 fn a_walk_is_complete_only_when_every_id_of_its_range_is_answered() -> Outcome {
     let range = after_the_first_poll(&[])?.ok_or("no range")?;
@@ -4911,12 +4992,14 @@ fn a_walk_is_complete_only_when_every_id_of_its_range_is_answered() -> Outcome {
     let all_but_one: BTreeSet<u64> = range.ids().filter(|id| *id != 3_404_420).collect();
     assert_eq!(
         (
-            Walk::continuity(None, &every),
-            Walk::continuity(Some(&range), &every),
-            Walk::continuity(Some(&range), &all_but_one),
+            Walk::continuity(&WalkPlan::FirstPoll, &every),
+            Walk::continuity(&WalkPlan::RangeUnread, &every),
+            Walk::continuity(&WalkPlan::Range(range.clone()), &every),
+            Walk::continuity(&WalkPlan::Range(range), &all_but_one),
         ),
         (
             (Continuity::FirstPoll, Vec::new()),
+            (Continuity::RangeUnread, Vec::new()),
             (Continuity::Complete, Vec::new()),
             (Continuity::IdUnread, vec![3_404_420]),
         )

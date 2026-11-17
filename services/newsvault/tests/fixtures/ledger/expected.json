@@ -55,6 +55,7 @@
             "complete": 0,
             "first_poll": 0,
             "id_unread": 0,
+            "range_unread": 0,
             "gone": 0,
             "other_language": 0,
             "unread": 0
@@ -96,6 +97,7 @@
             "complete": 0,
             "first_poll": 0,
             "id_unread": 0,
+            "range_unread": 0,
             "gone": 0,
             "other_language": 0,
             "unread": 0
@@ -147,6 +149,7 @@
             "complete": 0,
             "first_poll": 0,
             "id_unread": 0,
+            "range_unread": 0,
             "gone": 0,
             "other_language": 0,
             "unread": 0
@@ -188,6 +191,7 @@
             "complete": 0,
             "first_poll": 0,
             "id_unread": 0,
+            "range_unread": 0,
             "gone": 0,
             "other_language": 0,
             "unread": 0
@@ -239,6 +243,7 @@
             "complete": 0,
             "first_poll": 0,
             "id_unread": 0,
+            "range_unread": 0,
             "gone": 0,
             "other_language": 0,
             "unread": 0
@@ -280,6 +285,7 @@
             "complete": 0,
             "first_poll": 0,
             "id_unread": 0,
+            "range_unread": 0,
             "gone": 0,
             "other_language": 0,
             "unread": 0
@@ -331,6 +337,7 @@
             "complete": 0,
             "first_poll": 0,
             "id_unread": 0,
+            "range_unread": 0,
             "gone": 0,
             "other_language": 0,
             "unread": 0
@@ -382,6 +389,7 @@
             "complete": 0,
             "first_poll": 0,
             "id_unread": 0,
+            "range_unread": 0,
             "gone": 0,
             "other_language": 0,
             "unread": 0

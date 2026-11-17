@@ -200,6 +200,7 @@ pub struct WalkCounts {
     pub complete: i64,
     pub first_poll: i64,
     pub id_unread: i64,
+    pub range_unread: i64,
     pub gone: i64,
     pub other_language: i64,
     pub unread: i64,
@@ -211,6 +212,7 @@ impl WalkCounts {
             complete: self.complete + other.complete,
             first_poll: self.first_poll + other.first_poll,
             id_unread: self.id_unread + other.id_unread,
+            range_unread: self.range_unread + other.range_unread,
             gone: self.gone + other.gone,
             other_language: self.other_language + other.other_language,
             unread: self.unread + other.unread,
@@ -516,7 +518,7 @@ fn code_of(failure: &serde_json::Error) -> &'static str {
 /// answers with three HTTP calls at decision time: "is this vendor down for every name, or is
 /// this one name quiet?" - one aggregate over rows already on disk answers it for every name.
 fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerReadError> {
-    let [complete, boundary, no_previous, first, unread, id_unread] =
+    let [complete, boundary, no_previous, first, unread, id_unread, range_unread] =
         Continuity::ALL.map(Continuity::name);
     let mut statement = db.prepare(&format!(
         "SELECT run_id, source, COALESCE(outcome, '{IN_FLIGHT}') AS state, COUNT(*),
@@ -540,6 +542,7 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
                 SUM(continuity IS '{complete}' AND walk_unread IS NOT NULL),
                 SUM(continuity IS '{first}' AND walk_unread IS NOT NULL),
                 SUM(continuity IS '{id_unread}' AND walk_unread IS NOT NULL),
+                SUM(continuity IS '{range_unread}' AND walk_unread IS NOT NULL),
                 SUM(COALESCE(walk_gone, 0)),
                 SUM(COALESCE(walk_other_language, 0)),
                 SUM(COALESCE(walk_unread, 0))
@@ -579,9 +582,10 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
                     complete: row.get(21)?,
                     first_poll: row.get(22)?,
                     id_unread: row.get(23)?,
-                    gone: row.get(24)?,
-                    other_language: row.get(25)?,
-                    unread: row.get(26)?,
+                    range_unread: row.get(24)?,
+                    gone: row.get(25)?,
+                    other_language: row.get(26)?,
+                    unread: row.get(27)?,
                 },
             })
         })?
@@ -941,7 +945,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                  continuity_next_page_unread {} boundary_same_generation {} \
                  boundary_older_generation {} boundary_newer_generation {} \
                  boundary_generation_unknown {} walk_complete {} walk_first_poll {} \
-                 walk_id_unread {} walk_gone {} walk_other_language {} walk_unread {} \
+                 walk_id_unread {} walk_range_unread {} walk_gone {} walk_other_language {} walk_unread {} \
                  items_new {} rows {}",
                 row.source,
                 row.ok,
@@ -968,6 +972,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 row.walk.complete,
                 row.walk.first_poll,
                 row.walk.id_unread,
+                row.walk.range_unread,
                 row.walk.gone,
                 row.walk.other_language,
                 row.walk.unread,

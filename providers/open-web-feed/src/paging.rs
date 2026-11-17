@@ -46,16 +46,20 @@ pub enum Continuity {
     /// An id walk left an id of its range with no answer in the store: a transient failure left
     /// after its retries, or robots disallow its url. The next poll walks the range again.
     IdUnread,
+    /// An id walk with a basis could not read its range: its previous answer or its basis's
+    /// lists no release on the walked host. The next poll walks from the same basis.
+    RangeUnread,
 }
 
 impl Continuity {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Complete,
         Self::BoundaryNoSharedKey,
         Self::NoPreviousKey,
         Self::FirstPoll,
         Self::NextPageUnread,
         Self::IdUnread,
+        Self::RangeUnread,
     ];
 
     #[must_use]
@@ -67,6 +71,7 @@ impl Continuity {
             Self::FirstPoll => "first_poll",
             Self::NextPageUnread => "next_page_unread",
             Self::IdUnread => "id_unread",
+            Self::RangeUnread => "range_unread",
         }
     }
 
@@ -79,7 +84,10 @@ impl Continuity {
     /// 2026-11-17, option B): the next poll anchors to it. An unread one is not, so it is read.
     #[must_use]
     pub const fn is_basis(self) -> bool {
-        !matches!(self, Self::NextPageUnread | Self::IdUnread)
+        !matches!(
+            self,
+            Self::NextPageUnread | Self::IdUnread | Self::RangeUnread
+        )
     }
 }
 

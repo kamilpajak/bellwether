@@ -259,9 +259,10 @@ ALTER TABLE attempts ADD COLUMN boundary_generation_unknown INTEGER
     CHECK (boundary_generation_unknown >= 0);
 ",
     "
--- GNW's id walk (section 11.2): `continuity` takes `id_unread`, and a CHECK cannot be altered in
--- place, so `attempts` is rebuilt, every column and row carried. The walk columns sit on the
--- walked index's usable attempt, NULL on every other row and on every row before user_version 12.
+-- GNW's id walk (section 11.2): `continuity` takes `id_unread` and `range_unread`, and a CHECK
+-- cannot be altered in place, so `attempts` is rebuilt, every column and row carried. The walk
+-- columns sit on the walked index's usable attempt, NULL on every other row and on every row
+-- before user_version 12.
 CREATE TABLE attempts_v12 (
     attempt_id                  TEXT PRIMARY KEY,
     run_id                      TEXT NOT NULL,
@@ -297,7 +298,7 @@ CREATE TABLE attempts_v12 (
     robots_disallowed           INTEGER,
     continuity                  TEXT
         CHECK (continuity IN ('complete', 'boundary_no_shared_key', 'no_previous_key',
-                              'first_poll', 'next_page_unread', 'id_unread')),
+                              'first_poll', 'next_page_unread', 'id_unread', 'range_unread')),
     boundary_same_generation    INTEGER CHECK (boundary_same_generation >= 0),
     boundary_older_generation   INTEGER CHECK (boundary_older_generation >= 0),
     boundary_newer_generation   INTEGER CHECK (boundary_newer_generation >= 0),

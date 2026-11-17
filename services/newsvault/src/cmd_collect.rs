@@ -23,7 +23,7 @@ use news_provider::{
 };
 use open_web_feed::{
     Basis, Continuity, CrossChecker, DirectAnswer, Generation, HostRobots, OpenWebFeed, Paging,
-    RobotsPin, Walk, WalkBasis, WalkRange, GENERATION_HEADER,
+    RobotsPin, Walk, WalkBasis, WalkPlan, WalkRange, GENERATION_HEADER,
 };
 use pit::{MeasuredLag, ObservationTime};
 use serde_json::{json, Value};
@@ -373,12 +373,12 @@ pub struct PagedPolls {
     pub basis: BTreeMap<String, Basis>,
 }
 
-/// Section 11.2's walked indexes and, per index url, the range handed to the feed (`None`: a
-/// first poll, which walks nothing).
+/// Section 11.2's walked indexes and, per index url, what each poll walks; only a `WalkPlan::Range`
+/// is handed to the feed.
 #[derive(Debug, Clone)]
 pub struct WalkedPolls {
     pub walk: Walk,
-    pub ranges: BTreeMap<String, Option<WalkRange>>,
+    pub ranges: BTreeMap<String, WalkPlan>,
 }
 
 /// One admitted hosts row (section 11.2): its pin, its pinned robots body as read when the
@@ -521,7 +521,7 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
                 let ranges = ranges_of(&ask.store, &walk)?;
                 let handed = ranges
                     .iter()
-                    .filter_map(|(url, range)| Some((url.clone(), range.clone()?)))
+                    .filter_map(|(url, plan)| Some((url.clone(), plan.range()?.clone())))
                     .collect();
                 let provider = provider
                     .with_robots(handed_robots(&admitted))
@@ -555,10 +555,7 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
 /// Each walked index's range (section 11.2): through the highest id the newest usable answer of
 /// the index lists, after the id the newest basis poll walked through. Read before the lease; a
 /// blob the store names and does not hold refuses the run, as a paged basis does.
-fn ranges_of(
-    store: &Path,
-    walk: &Walk,
-) -> Result<BTreeMap<String, Option<WalkRange>>, CollectRunError> {
+fn ranges_of(store: &Path, walk: &Walk) -> Result<BTreeMap<String, WalkPlan>, CollectRunError> {
     let kept = basis_names();
     let source = SourceId::new(open_web_feed::SOURCE);
     let held = |digest: &str| -> Result<Vec<u8>, CollectRunError> {
@@ -1059,7 +1056,8 @@ fn walk_of(store: &mut Committer, walked: &WalkedPolls, collected: &Collected) -
         .walk
         .index_urls()
         .map(|index_url| {
-            let range = walked.ranges.get(index_url).and_then(Option::as_ref);
+            let plan = walked.ranges.get(index_url);
+            let range = plan.and_then(WalkPlan::range);
             let attempt = usable.iter().rev().find(|payload| payload.url == index_url);
             let mut poll = json!({
                 "index_url": index_url,
@@ -1081,7 +1079,9 @@ fn walk_of(store: &mut Committer, walked: &WalkedPolls, collected: &Collected) -
                 .iter()
                 .filter_map(|url| walked.walk.release_id(index_url, url))
                 .collect();
-            let (continuity, unread) = Walk::continuity(range, &answered_ids);
+            let (continuity, unread) = plan.map_or((Continuity::FirstPoll, Vec::new()), |plan| {
+                Walk::continuity(plan, &answered_ids)
+            });
             let answers = range.map_or_else(BTreeMap::new, |range| {
                 walked_answers(&walked.walk, index_url, range, collected)
             });

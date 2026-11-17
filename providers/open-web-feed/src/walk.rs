@@ -100,6 +100,27 @@ impl WalkRange {
     }
 }
 
+/// What one poll walks (section 11.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalkPlan {
+    /// No usable answer of the index before this poll, or no basis poll.
+    FirstPoll,
+    /// A previous answer and a basis, and one of them lists no release on the walked host, so
+    /// the range is not known.
+    RangeUnread,
+    Range(WalkRange),
+}
+
+impl WalkPlan {
+    #[must_use]
+    pub const fn range(&self) -> Option<&WalkRange> {
+        match self {
+            Self::Range(range) => Some(range),
+            Self::FirstPoll | Self::RangeUnread => None,
+        }
+    }
+}
+
 /// The basis poll as the driver read it from the store: the id it walked through (`None`: it
 /// walked nothing, a first poll) and its own index answer.
 #[derive(Debug, Clone, Copy)]
@@ -159,9 +180,8 @@ impl Walk {
             .flatten()
     }
 
-    /// The range a poll walks: after the basis's own `walked_through`, or below the lowest id its
-    /// index listed when it walked nothing, through the highest id `previous` lists. `None`: no
-    /// previous answer or no basis, a first poll.
+    /// What a poll walks: after the basis's own `walked_through`, or below the lowest id its index
+    /// listed when it walked nothing, through the highest id `previous` lists.
     #[must_use]
     pub fn range(
         &self,
@@ -169,27 +189,29 @@ impl Walk {
         previous: Option<&[u8]>,
         basis: Option<WalkBasis>,
         answered: BTreeSet<u64>,
-    ) -> Option<WalkRange> {
+    ) -> WalkPlan {
+        let (Some(previous), Some(basis)) = (previous, basis) else {
+            return WalkPlan::FirstPoll;
+        };
         let frontier = self
-            .releases(index_url, previous?)?
-            .into_iter()
-            .max_by_key(|release| release.id)?;
-        let basis = basis?;
-        let after = match basis.walked_through {
-            Some(through) => through,
-            None => self
-                .releases(index_url, basis.index)?
+            .releases(index_url, previous)
+            .and_then(|releases| releases.into_iter().max_by_key(|release| release.id));
+        let after = basis.walked_through.or_else(|| {
+            self.releases(index_url, basis.index)?
                 .iter()
                 .map(|release| release.id)
                 .min()?
-                .checked_sub(1)?,
-        };
-        Some(WalkRange {
-            after,
-            through: frontier.id,
-            date: frontier.date,
-            answered,
-        })
+                .checked_sub(1)
+        });
+        match (frontier, after) {
+            (Some(frontier), Some(after)) => WalkPlan::Range(WalkRange {
+                after,
+                through: frontier.id,
+                date: frontier.date,
+                answered,
+            }),
+            _ => WalkPlan::RangeUnread,
+        }
     }
 
     /// The release id `url` names on the walked host of `index_url`, when in the walk's language.
@@ -223,15 +245,14 @@ impl Walk {
         )
     }
 
-    /// `FirstPoll` with no range; else `Complete` when every id of the range is in `answered`, and
-    /// `IdUnread` with the ids that are not.
+    /// `FirstPoll` and `RangeUnread` as planned; else `Complete` when every id of the range is in
+    /// `answered`, and `IdUnread` with the ids that are not.
     #[must_use]
-    pub fn continuity(
-        range: Option<&WalkRange>,
-        answered: &BTreeSet<u64>,
-    ) -> (Continuity, Vec<u64>) {
-        let Some(range) = range else {
-            return (Continuity::FirstPoll, Vec::new());
+    pub fn continuity(plan: &WalkPlan, answered: &BTreeSet<u64>) -> (Continuity, Vec<u64>) {
+        let range = match plan {
+            WalkPlan::FirstPoll => return (Continuity::FirstPoll, Vec::new()),
+            WalkPlan::RangeUnread => return (Continuity::RangeUnread, Vec::new()),
+            WalkPlan::Range(range) => range,
         };
         let unread: Vec<u64> = range.ids().filter(|id| !answered.contains(id)).collect();
         let continuity = if unread.is_empty() {

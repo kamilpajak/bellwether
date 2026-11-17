@@ -4316,8 +4316,9 @@ fn walk_columns(store: &Path, answer: &cmd_collect::Answer) -> Result<WalkColumn
     )?)
 }
 
-/// Per source: walked polls `complete`, `first_poll`, `id_unread`, then ids gone, moved, unread.
-type WalkLedger = Vec<[i64; 6]>;
+/// Per source: walked polls `complete`, `first_poll`, `id_unread`, `range_unread`, then ids gone,
+/// moved, unread.
+type WalkLedger = Vec<[i64; 7]>;
 
 /// The day's walk counts per source, from the JSON report and from its human line.
 fn ledgered_walk(store: &Path) -> Result<(WalkLedger, String), Box<dyn Error>> {
@@ -4332,6 +4333,7 @@ fn ledgered_walk(store: &Path) -> Result<(WalkLedger, String), Box<dyn Error>> {
                 walk.complete,
                 walk.first_poll,
                 walk.id_unread,
+                walk.range_unread,
                 walk.gone,
                 walk.other_language,
                 walk.unread,
@@ -4377,24 +4379,23 @@ fn a_first_walked_poll_asks_no_id_and_records_first_poll() -> TestResult {
                 Some(0),
                 Some(0)
             ),
-            vec![[0, 1, 0, 0, 0, 0]],
+            vec![[0, 1, 0, 0, 0, 0, 0]],
         )
     );
     Ok(())
 }
 
-/// The second poll walks the ids below the frontier the FIRST poll listed (PG-D2), never the
-/// higher ids its own index lists, and records each answer: a 301 to Hebrew as "id exists,
-/// language he, not fetched" and not followed (PG-D4), a 410 permanent, asked once and counted,
-/// and a walked page dated by its own time and observed when its fetch returned. A 410 is an
-/// answer, so the poll is `complete`; it exits 8 as any 4xx does.
+/// The second poll walks below the FIRST poll's frontier only (PG-D2) and records each answer: a
+/// 301 to Hebrew not followed (PG-D4), each 410 asked once and counted apart from the 301, a
+/// walked page dated by its own time. A 410 is an answer: `complete`, and exit 8 as any 4xx.
 #[test]
 fn a_second_poll_walks_below_the_previous_frontier_only_and_records_each_answer() -> TestResult {
     let root = after_a_first_walked_poll()?;
     let moved = "/news-release/2026/11/17/3404417/0/he/lepas-aura.html";
     let exchange = Gnw::walked(RSS_1205)?
         .moved(&walk_url(3_404_417), moved)
-        .answering(&walk_url(3_404_418), &[GONE]);
+        .answering(&walk_url(3_404_418), &[GONE])
+        .answering(&walk_url(3_404_420), &[GONE]);
     let second = walked_poll(
         root.path(),
         hosts_fixture(WALK_HOSTS),
@@ -4423,7 +4424,7 @@ fn a_second_poll_walks_below_the_previous_frontier_only_and_records_each_answer(
             Value::from(5),
             Value::from("complete"),
             serde_json::json!([]),
-            serde_json::json!([3_404_418]),
+            serde_json::json!([3_404_418, 3_404_420]),
             serde_json::json!([{"id": 3_404_417, "language": "he"}]),
         )
     );
@@ -4436,16 +4437,16 @@ fn a_second_poll_walks_below_the_previous_frontier_only_and_records_each_answer(
             (
                 Some("complete".to_owned()),
                 Some(i64::try_from(FIRST_FRONTIER)?),
-                Some(1),
+                Some(2),
                 Some(1),
                 Some(0)
             ),
-            vec![[1, 1, 0, 1, 1, 0]],
+            vec![[1, 1, 0, 0, 2, 1, 0]],
         )
     );
     let human = ledgered_walk(root.path())?.1;
     assert!(
-        human.contains("walk_complete 1 walk_first_poll 1 walk_id_unread 0 walk_gone 1 walk_other_language 1 walk_unread 0"),
+        human.contains("walk_complete 1 walk_first_poll 1 walk_id_unread 0 walk_range_unread 0 walk_gone 2 walk_other_language 1 walk_unread 0"),
         "{human}"
     );
     let db = Connection::open_with_flags(
@@ -4572,7 +4573,7 @@ fn an_id_unread_after_its_retries_is_walked_again_by_the_next_poll() -> TestResu
             expected,
             Value::from(BELOW_THE_FIRST_POLL),
             Value::from("complete"),
-            vec![[1, 1, 1, 0, 0, 1]],
+            vec![[1, 1, 1, 0, 0, 0, 1]],
         )
     );
     Ok(())
@@ -4649,6 +4650,217 @@ fn a_walked_id_robots_disallow_leaves_the_poll_no_basis() -> TestResult {
             Value::from("id_unread"),
             serde_json::json!([3_404_420]),
         )
+    );
+    Ok(())
+}
+
+const WALK_FOURTH: &str = "2026-11-17T12:15:30Z";
+
+/// `RSS_1205` with every release link moved under `/en/`, a shape no release is read from.
+fn shifted_index() -> Result<Gnw, Box<dyn Error>> {
+    let mut exchange = Gnw::walked(RSS_1205)?;
+    let listed = exchange.pages.get(INDEX).ok_or("no index page")?;
+    let moved = String::from_utf8_lossy(listed).replace(
+        "globenewswire.com/news-release/",
+        "globenewswire.com/en/news-release/",
+    );
+    exchange.pages.insert(INDEX.to_owned(), moved.into_bytes());
+    Ok(exchange)
+}
+
+/// A previous answer that lists no release leaves the range unknown: `range_unread`, no basis and
+/// no `walk_through`, so the next poll walks from the basis before it. PR #49 review, 2026-11-18:
+/// recorded `first_poll`, the next poll started at 3404423 and never asked 3404423.
+#[test]
+fn a_poll_whose_previous_answer_lists_no_release_is_range_unread_and_keeps_the_basis() -> TestResult
+{
+    let root = after_a_first_walked_poll()?;
+    let hosts = || hosts_fixture(WALK_HOSTS);
+    walked_poll(root.path(), hosts(), WALK_SECOND, &shifted_index()?)?;
+    let exchange = Gnw::walked(RSS_1205)?;
+    let third = walked_poll(root.path(), hosts(), WALK_THIRD, &exchange)?;
+    let (third_sent, _) = exchange.sent();
+    let fourth = walked_poll(root.path(), hosts(), WALK_FOURTH, &exchange)?;
+    let (fourth_sent, _) = exchange.sent();
+    assert_eq!(
+        (
+            walked_ids(&third_sent),
+            walk_poll(&third).0,
+            walk_poll(&third).4,
+            walk_columns(root.path(), &third)?,
+            walk_poll(&fourth).0,
+            walked_ids(&fourth_sent).first().copied(),
+            walk_poll(&fourth).4,
+            ledgered_walk(root.path())?.0,
+        ),
+        (
+            Vec::new(),
+            Value::Null,
+            Value::from("range_unread"),
+            (
+                Some("range_unread".to_owned()),
+                None,
+                Some(0),
+                Some(0),
+                Some(0)
+            ),
+            Value::from(FIRST_FRONTIER),
+            Some(FIRST_FRONTIER + 1),
+            Value::from("complete"),
+            vec![[2, 1, 0, 1, 0, 0, 0]],
+        )
+    );
+    Ok(())
+}
+
+/// A previous answer whose highest id is below the basis's `walk_through` walks nothing and keeps
+/// that `walk_through` (`max(after, through)`, §3.2), so no answered id is walked again.
+#[test]
+fn a_poll_whose_frontier_fell_below_its_basis_keeps_the_id_the_basis_walked_through() -> TestResult
+{
+    let root = after_a_first_walked_poll()?;
+    let hosts = || hosts_fixture(WALK_HOSTS);
+    walked_poll(root.path(), hosts(), WALK_SECOND, &Gnw::walked(RSS_1205)?)?;
+    walked_poll(
+        root.path(),
+        hosts(),
+        WALK_THIRD,
+        &Gnw::walked(RSS_1200_TWO)?,
+    )?;
+    let exchange = Gnw::walked(RSS_1205)?;
+    let fourth = walked_poll(root.path(), hosts(), WALK_FOURTH, &exchange)?;
+    let (sent, _) = exchange.sent();
+    let poll = walk_poll(&fourth);
+    assert_eq!(
+        (
+            walked_ids(&sent),
+            poll.0,
+            poll.1,
+            poll.3,
+            poll.4,
+            walk_columns(root.path(), &fourth)?.1,
+        ),
+        (
+            Vec::new(),
+            Value::from(SECOND_FRONTIER),
+            Value::from(FIRST_FRONTIER),
+            Value::from(0),
+            Value::from("complete"),
+            Some(i64::try_from(SECOND_FRONTIER)?),
+        )
+    );
+    Ok(())
+}
+
+/// A real store whose held set also names `also`: a story committed by another run after
+/// `open_provider` read the walk's answered ids and before this run's index was extracted.
+struct HoldingToo {
+    store: Committer,
+    also: std::collections::BTreeSet<String>,
+}
+
+impl Sink for HoldingToo {
+    fn write(&mut self, event: &AttemptEvent) -> Result<(), LedgerError> {
+        self.store.write(event)
+    }
+}
+
+impl Archive for HoldingToo {
+    fn put_blob(&self, payload: &[u8]) -> Result<String, ArchiveError> {
+        Archive::put_blob(&self.store, payload)
+    }
+
+    fn commit(
+        &mut self,
+        closed: AttemptReceipt,
+        items: &[CollectedItem],
+        payload: Option<&news_provider::Payload>,
+        observed: ObservationTime,
+    ) -> Result<Committed, ArchiveError> {
+        Archive::commit(&mut self.store, closed, items, payload, observed)
+    }
+
+    fn ok_vendor_rows(&self, source: &SourceId) -> Result<Vec<u32>, ArchiveError> {
+        Archive::ok_vendor_rows(&self.store, source)
+    }
+
+    fn attempts_in_flight(&self) -> Result<Vec<String>, ArchiveError> {
+        Archive::attempts_in_flight(&self.store)
+    }
+
+    fn covered_story_ids(
+        &self,
+        source: &SourceId,
+        target_window: &TargetWindow,
+    ) -> Result<std::collections::BTreeSet<String>, ArchiveError> {
+        Archive::covered_story_ids(&self.store, source, target_window)
+    }
+
+    fn held_story_ids(
+        &self,
+        source: &SourceId,
+    ) -> Result<std::collections::BTreeSet<String>, ArchiveError> {
+        let mut held = Archive::held_story_ids(&self.store, source)?;
+        held.extend(self.also.iter().cloned());
+        Ok(held)
+    }
+
+    fn record_planned_coverage(
+        &mut self,
+        attempt_id: &str,
+        matched: u32,
+    ) -> Result<(), ArchiveError> {
+        Archive::record_planned_coverage(&mut self.store, attempt_id, matched)
+    }
+
+    fn record_held(&mut self, attempt_id: &str, held: u32) -> Result<(), ArchiveError> {
+        Archive::record_held(&mut self.store, attempt_id, held)
+    }
+
+    fn record_relisted(
+        &mut self,
+        attempt_id: &str,
+        relisted: &[news_provider::Relisted],
+    ) -> Result<(), ArchiveError> {
+        Archive::record_relisted(&mut self.store, attempt_id, relisted)
+    }
+}
+
+/// The driver drops a walked id whose story became held after `open_provider` read the answered
+/// ids (`news_provider::collect::attempt_once`); the feed's own filter cannot see it.
+#[test]
+fn a_walked_id_held_after_the_range_was_read_is_not_asked() -> TestResult {
+    let root = after_a_first_walked_poll()?;
+    let ask = Ask {
+        hosts: Some(hosts_fixture(WALK_HOSTS)),
+        at: instant(WALK_SECOND),
+        schedule: Some("walk".to_owned()),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let run = RunId::new("held-after-open");
+    let held = digest(canon::digest::story_id(
+        SOURCE,
+        "rss.globenewswire.com/news-release/3404416/en",
+    ))
+    .ok_or("story id")?;
+    let mut archive = HoldingToo {
+        store: Committer::open(root.path(), &run)?,
+        also: std::collections::BTreeSet::from([held]),
+    };
+    let exchange = Gnw::walked(RSS_1205)?;
+    cmd_collect::drive(
+        &ask,
+        opened.provider.as_ref(),
+        &mut archive,
+        &exchange,
+        &At(instant(WALK_SECOND)),
+        &run,
+    )?;
+    let (sent, _) = exchange.sent();
+    assert_eq!(
+        walked_ids(&sent),
+        vec![3_404_417, 3_404_418, 3_404_420, 3_404_421]
     );
     Ok(())
 }

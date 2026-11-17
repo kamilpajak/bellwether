@@ -41,7 +41,7 @@ use crate::hosts::{read_hosts, HostRow, Hosts, Status, HOSTS_SCHEMA};
 pub use crate::paging::{Basis, Continuity, Generation, Paging, GENERATION_HEADER};
 use crate::rules::{parse_rules, Rule, StoryKey, RULES_SCHEMA};
 use crate::walk::{release_of, WalkedIndex};
-pub use crate::walk::{Walk, WalkBasis, WalkRange};
+pub use crate::walk::{Walk, WalkBasis, WalkPlan, WalkRange};
 
 pub const SOURCE: &str = "open_web_wires";
 /// The User-Agent, a product token plus a contact address, travels by NAME as SEC's does
@@ -658,6 +658,20 @@ impl OpenWebFeed {
         })
     }
 
+    /// The walk's own url of one release on the request's host: an index row with no listed value
+    /// is not one, so it is not dated by its page.
+    fn walked(&self, request: &Request, rule: &Rule) -> bool {
+        let Some(walk) = self
+            .admitted_row(&request.url)
+            .and_then(|row| row.walk.as_ref())
+        else {
+            return false;
+        };
+        host_and_path(&request.url)
+            .and_then(|(_, path)| release_of(&rule.path_prefix, &path))
+            .is_some_and(|release| walk.url_for(&release.date, release.id) == request.url)
+    }
+
     /// One article page, which is the one row a document payload holds.
     fn document_of(&self, request: &Request, raw: &RawBlob) -> Extracted {
         let Some(rule) = self.rule_of(request) else {
@@ -668,7 +682,7 @@ impl OpenWebFeed {
         // No index row listed a walked id, so its own page dates it (section 11.2).
         let (valid, valid_raw, valid_field, dated_by) =
             match (&request.listed_date, &rule.page_valid) {
-                (None, Some(page_valid)) => {
+                (None, Some(page_valid)) if self.walked(request, rule) => {
                     let text = page.valid.clone().unwrap_or_default();
                     let valid = minute_containing(&text, &page_valid.format)
                         .map_or(Published::Unknown, Published::AtMinute);
@@ -1001,11 +1015,10 @@ pub(crate) fn minute_of(raw: &str, format: &str) -> Option<Minute> {
 
 /// The minute holding a value `format` reads to the second, read as exactly as `minute_of` reads:
 /// 16 of 16 GNW pages' `og:article:published_time` fell in their RSS `pubDate`'s minute (§11.6).
+/// A fractional second is refused, by `Minute::new`.
 pub(crate) fn minute_containing(raw: &str, format: &str) -> Option<Minute> {
     use chrono::Timelike;
-    let instant = read_exactly(raw, format)?;
-    (instant.nanosecond() == 0).then_some(())?;
-    Minute::new(instant.with_second(0)?).ok()
+    Minute::new(read_exactly(raw, format)?.with_second(0)?).ok()
 }
 
 fn read_exactly(raw: &str, format: &str) -> Option<DateTime<Utc>> {
