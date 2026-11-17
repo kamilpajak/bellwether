@@ -2588,6 +2588,39 @@ fn a_cross_check_key_whose_host_no_other_admitted_row_holds_is_refused() {
     );
 }
 
+/// `cross_check` is a key-to-host object: the pre-map list, a key mapped to `""` and one mapped to
+/// `null` are each `RulesUnparseable`. Mutations 2026-11-17, a non-object read as no key and the
+/// empty-host check removed: each red (green before this test).
+#[test]
+fn a_cross_check_that_maps_no_key_to_a_host_is_unparseable() {
+    for name in [
+        "rules_cross_check_a_list.json",
+        "rules_cross_check_to_an_empty_host.json",
+        "rules_cross_check_to_a_non_string.json",
+    ] {
+        assert!(
+            matches!(
+                refusal_of(&hosts_path(), &rules_fixture(name), CONTACT),
+                Some(Refusal::RulesUnparseable { .. })
+            ),
+            "{name}"
+        );
+    }
+}
+
+/// The hosts file's hosts are lowercased, so a `cross_check` host is too: `WWW.PRNEWSWIRE.COM`
+/// names the admitted PRN row. Mutation 2026-11-17, the rules host kept as written: red (green
+/// before this test).
+#[test]
+fn a_cross_check_host_in_upper_case_names_its_admitted_row() {
+    assert!(refusal_of(
+        &hosts_path(),
+        &rules_fixture("rules_cross_check_host_in_upper_case.json"),
+        CONTACT
+    )
+    .is_none());
+}
+
 // ---- Yahoo cross-check (section 11.2, option C) ----
 
 fn checker() -> Result<CrossChecker, Box<dyn std::error::Error>> {
@@ -2871,8 +2904,8 @@ fn a_direct_answer_received_before_the_keyed_minute_still_lists_the_row() -> Out
 
 /// A row is compared only when its key's own index parsed an answer after the row's minute
 /// closed: PRN absent, a PRN 503 body, or a PRN answer inside the minute (09:00:30Z for Horizon's
-/// 09:00) leaves the PRN rows "not looked", never "unlisted". Review 2026-11-17: a CNW 503 run
-/// named three rows unlisted.
+/// 09:00) leaves the PRN rows "not looked", never "unlisted"; one at 09:01:00Z looks. Review
+/// 2026-11-17: a CNW 503 run named three rows unlisted. Mutation 2026-11-17, `>=` as `>`: red.
 #[test]
 fn a_row_whose_own_index_did_not_answer_after_is_not_looked_and_never_unlisted() -> Outcome {
     let checker = checker()?;
@@ -2902,18 +2935,26 @@ fn a_row_whose_own_index_did_not_answer_after_is_not_looked_and_never_unlisted()
         "2026-11-16T09:00:30Z",
         EMPTY_RSS.to_vec(),
     )?);
+    let mut prn_at_close = without_prn.clone();
+    prn_at_close.push(answer(
+        PRN_INDEX,
+        "2026-11-16T09:01:00Z",
+        EMPTY_RSS.to_vec(),
+    )?);
     assert_eq!(
         (
             looked(&all),
             looked(&without_prn),
             looked(&prn_503),
-            looked(&prn_early)
+            looked(&prn_early),
+            looked(&prn_at_close)
         ),
         (
             Some((0, 3, 4)),
             Some((2, 1, 3)),
             Some((2, 1, 3)),
-            Some((1, 2, 4))
+            Some((1, 2, 4)),
+            Some((0, 3, 4))
         )
     );
     Ok(())
