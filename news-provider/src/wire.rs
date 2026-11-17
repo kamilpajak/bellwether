@@ -697,7 +697,7 @@ mod tests {
     use crate::budget::{BudgetError, RequestBudget};
     use crate::clock::testing::{StepClock, WaitRecorder, WaitedClock};
     use crate::clock::Clock;
-    use crate::collect::Payload;
+    use crate::collect::{HostQueue, Payload, Queued};
     use crate::ledger::tests::{at, Recorder};
     use crate::ledger::{AttemptSlot, SendPermit};
     use crate::provider::Provenance;
@@ -2315,6 +2315,125 @@ mod tests {
                     NO_WAIT
                 ],
                 true
+            )
+        );
+        Ok(())
+    }
+
+    /// `inet_aton`'s short form of `127.0.0.1`: a third loopback host name, so a third pace file.
+    const LOOPBACK_SHORT: &str = "127.1";
+    const TIMEOUT_HEAD: &str = "408 Request Timeout";
+    /// The statuses the test loop retries, as `collect` classes a 408 and a 503 transient.
+    const RETRIED_STATUSES: [u16; 2] = [408, 503];
+    /// Three `FLOOR` waits: host A's second page, its third send, and its retry.
+    const ROUND_ROBIN_WAITED: Duration = Duration::from_secs(30);
+    /// One `FLOOR`, the 120 s hold, then two `FLOOR`s on B behind it.
+    const HELD_ROUND_ROBIN_WAITED: Duration = Duration::from_secs(150);
+    const HOLD: Duration = Duration::from_secs(120);
+
+    /// A loopback host: the heads its server answers in order, and how many pages its index lists.
+    type Host<'a> = (&'a [&'a str], usize);
+
+    /// `collect`'s loop over `HostQueue` and a real `Wire`, no time between sends: one index per
+    /// host, on `127.0.0.1`, `localhost` and `127.1` in order, each listing its pages on its own
+    /// host. Every wait in order, and how many sends each host's server answered.
+    fn driven_through_a_wire(
+        hosts: &[Host],
+    ) -> Result<(Vec<Duration>, Vec<usize>), Box<dyn std::error::Error>> {
+        let store = tempfile::tempdir()?;
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let wire = Wire::with_sleeper(
+            hosts_only_profile(),
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        let mut indexes = Vec::new();
+        let mut servers = Vec::new();
+        let mut pages_of = std::collections::BTreeMap::new();
+        for ((heads, pages), name) in hosts
+            .iter()
+            .zip([LOOPBACK_IP, LOOPBACK_NAME, LOOPBACK_SHORT])
+        {
+            let (on_ip, served) =
+                serve_answers(heads.iter().map(|&head| head.to_owned()).collect())?;
+            let url = on_ip.replacen(LOOPBACK_IP, name, 1);
+            pages_of.insert(url.clone(), *pages);
+            indexes.push(Request { url, ..request() });
+            servers.push(served);
+        }
+        let mut queue = HostQueue::of(indexes);
+        let mut ordinal = FIRST_ATTEMPT;
+        while let Some(Queued { request, retries }) = queue.pop() {
+            let mut sink = Recorder::default();
+            let Some(permit) = permit(&mut sink, ordinal) else {
+                return Err("no permit".into());
+            };
+            ordinal += 1;
+            let status = match wire.send(permit, &request, &clock) {
+                Ok(answer) => Some(answer.status()),
+                Err(SendFailure::Transport(failed)) => failed.status(),
+                Err(other) => return Err(format!("{other:?}").into()),
+            };
+            let pages = pages_of.get(&request.url).copied().unwrap_or_default();
+            let follow_ups = (0..pages)
+                .map(|page| Request {
+                    url: format!("{}p{page}", request.url),
+                    phase: RequestPhase::Document,
+                    ..request.clone()
+                })
+                .collect();
+            let transient = status.is_some_and(|code| RETRIED_STATUSES.contains(&code));
+            let retrying = Queued::retried(transient, retries);
+            queue.requeue(follow_ups, Queued { request, retries }, retrying);
+        }
+        let served = servers
+            .into_iter()
+            .map(answered_by)
+            .collect::<Result<_, _>>()?;
+        Ok((clock.waits(), served))
+    }
+
+    /// Owner decision 2026-11-17 (§10): round-robin lets each host's floor run while the others
+    /// are asked; block order (A, B, C, A, A, B, B, C, C, A), the former FIFO, waited 40 s here.
+    #[test]
+    fn round_robin_by_host_overlaps_the_host_floors_through_a_real_wire() -> Checked {
+        let (waits, served) = driven_through_a_wire(&[
+            (&[OK_HEAD, TIMEOUT_HEAD, OK_HEAD, OK_HEAD], 2),
+            (&[OK_HEAD; 3], 2),
+            (&[OK_HEAD; 3], 2),
+        ])?;
+        let waited: Duration = waits.iter().sum();
+        assert_eq!(
+            (waits, waited, served),
+            (
+                vec![
+                    NO_WAIT, NO_WAIT, NO_WAIT, FLOOR, NO_WAIT, NO_WAIT, FLOOR, NO_WAIT, NO_WAIT,
+                    FLOOR
+                ],
+                ROUND_ROBIN_WAITED,
+                vec![4, 3, 3]
+            )
+        );
+        Ok(())
+    }
+
+    /// §10 and R19 hole 12: A's retry waits out a 120 s hold on A's turn, and B's due pages wait
+    /// behind it; block order (A, B, A, B, B, B, B, A) asked A's retry last and waited 130 s here.
+    #[test]
+    fn a_hold_on_one_host_delays_the_other_hosts_turns_under_round_robin() -> Checked {
+        let (waits, served) = driven_through_a_wire(&[
+            (&[OK_HEAD, OVER_THE_LIMIT_WITH_RETRY_AFTER, OK_HEAD], 1),
+            (&[OK_HEAD; 5], 4),
+        ])?;
+        let waited: Duration = waits.iter().sum();
+        assert_eq!(
+            (waits, waited, served),
+            (
+                vec![NO_WAIT, NO_WAIT, FLOOR, NO_WAIT, HOLD, NO_WAIT, FLOOR, FLOOR],
+                HELD_ROUND_ROBIN_WAITED,
+                vec![3, 5]
             )
         );
         Ok(())
