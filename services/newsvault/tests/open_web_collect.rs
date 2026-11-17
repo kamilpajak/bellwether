@@ -367,6 +367,56 @@ fn stored_items(db: &Connection) -> Result<BTreeMap<String, Row>, Box<dyn Error>
     Ok(rows)
 }
 
+/// `(item_id, raw_blob, body_blob)` of a committed row: `item_id` hashes the title and body.
+type Content = (String, String, Option<String>);
+
+fn stored_content(db: &Connection) -> Result<BTreeMap<String, Content>, Box<dyn Error>> {
+    let mut query = db.prepare("SELECT story_id, item_id, raw_blob, body_blob FROM items")?;
+    let rows = query
+        .query_map([], |row| {
+            Ok((row.get(0)?, (row.get(1)?, row.get(2)?, row.get(3)?)))
+        })?
+        .collect::<Result<BTreeMap<String, Content>, _>>()?;
+    Ok(rows)
+}
+
+/// The content the release keyed `key` must be stored with when answered by `fixtures/<dir>/<page>`:
+/// that page's bytes as `raw_blob`, its `golden_bodies.json` body as `body_blob`, and an `item_id`
+/// over `title` and that body. The minute is the stored one, which `stored_items` checks.
+fn committed_content(
+    (dir, key, page, title): (&str, &str, &str, &str),
+    golden: &Value,
+    stored: &BTreeMap<String, Row>,
+) -> Result<(String, Content), Box<dyn Error>> {
+    let story = digest(canon::digest::story_id(SOURCE, key)).ok_or("story id")?;
+    let raw = std::fs::read(provider_dir().join("tests/fixtures").join(dir).join(page))?;
+    let body = golden["bodies"][format!("{dir}/{page}")]
+        .as_str()
+        .ok_or("no golden body")?;
+    let minute: DateTime<Utc> = stored
+        .get(&story)
+        .and_then(|row| row.1.as_deref())
+        .ok_or("no stored minute")?
+        .parse()?;
+    let item = digest(canon::digest::item_id(&canon::digest::ItemFields {
+        source: SOURCE,
+        source_item_id: key,
+        url: &format!("https://{key}"),
+        valid: canon::Stamp::Minute(minute),
+        title,
+        body_ref: Some(body),
+    }))
+    .ok_or("item id")?;
+    Ok((
+        story,
+        (
+            item,
+            canon::FileDigest::of(&raw).hex().to_owned(),
+            Some(body.to_owned()),
+        ),
+    ))
+}
+
 /// The rows `Gnw::day` commits for `RELEASES`, keyed by story.
 fn gnw_items() -> BTreeMap<String, Row> {
     gnw_items_received(RECEIVED_AT)
@@ -796,7 +846,69 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_and_a_fed_day_end_to_end() -> Test
             MONDAY_RECEIVED_AT,
         )?,
     ]);
-    assert_eq!(stored_items(&db)?, expected);
+    let stored = stored_items(&db)?;
+    assert_eq!(stored, expected);
+    // Each story holds the page its url was answered with. Mutations 2026-11-17, the stub's pages
+    // swapped for Fed 0/2 (green before this assertion), PRN 1/2 and CNW 0/1: each red.
+    let golden: Value = serde_json::from_slice(&std::fs::read(
+        provider_dir().join("tests/fixtures/golden_bodies.json"),
+    )?)?;
+    // The page and title are written out, not read from the stub's tables they check.
+    let committed_pages = [
+        (
+            "gnw",
+            RELEASES[0].0,
+            "article_3403075.html",
+            "USTA FLORIDA RELEASES 2026 STATE OF FLORIDA TENNIS REPORT",
+        ),
+        (
+            "gnw",
+            RELEASES[1].0,
+            "synthetic_canonical_differs.html",
+            "Synthetic Release",
+        ),
+        (
+            "prn",
+            PRN_RELEASES[1].0,
+            "article_302939553.html",
+            "Novo's Wegovy® was associated with a reduction in food noise according to real-world studies at ObesityWeek® 2026",
+        ),
+        (
+            "prn",
+            PRN_RELEASES[2].0,
+            "article_302938569.html",
+            "Lilly to present new data across Zepbound, Foundayo, EloraTZP and retatrutide at ObesityWeek 2026, moving obesity care beyond the scale",
+        ),
+        (
+            "cnw",
+            CNW_RELEASES[0].0,
+            "article_805423040.html",
+            "Global Voltage, Travel-Ready Protection: ELEGRP Powers Dyson Supersonic Travel hair dryer",
+        ),
+        (
+            "cnw",
+            CNW_RELEASES[1].0,
+            "article_823884942.html",
+            "Segway Powersports Secures Class 2 One-Two Finish on SCORE Baja 1000 Debut",
+        ),
+        (
+            "fed",
+            FED_RELEASES[0].0,
+            "article_bcreg20261113a.html",
+            "Agencies extend comment period for proposed third-party risk management guidance",
+        ),
+        (
+            "fed",
+            FED_RELEASES[2].0,
+            "article_orders20261109a.html",
+            "Federal Reserve Board announces approval of two applications by Mutual Federal Bancorp, MHC, and MFB Bancorp, Inc.",
+        ),
+    ];
+    let expected_content = committed_pages
+        .into_iter()
+        .map(|page| committed_content(page, &golden, &stored))
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    assert_eq!(stored_content(&db)?, expected_content);
     // Nothing is visible before the run observed it, and all eight after.
     assert_eq!(
         (
