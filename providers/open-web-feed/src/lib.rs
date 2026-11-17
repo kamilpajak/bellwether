@@ -42,6 +42,7 @@ const REQUEST_TIMEOUT: u16 = 408;
 const TOO_MANY_REQUESTS: u16 = 429;
 const SERVER_ERRORS: std::ops::RangeInclusive<u16> = 500..=599;
 const SCHEMES: [&str; 2] = ["https://", "http://"];
+const NOT_PLAIN: [u8; 2] = *b"%#";
 /// An ASSUMPTION taken by default, as edgar-press's is: nothing here has timed a GNW response.
 const VENDOR_PATIENCE: Duration = Duration::from_secs(30);
 /// The largest page of the 2026-11-14 probes was 979,950 B (cnbc.com), the GNW article 71,657 B
@@ -564,14 +565,14 @@ pub(crate) fn host_and_path(url: &str) -> Option<(String, String)> {
     Some((host, path.to_owned()))
 }
 
-/// `host_and_path` with the query kept: the path robots.txt rules are matched against.
 /// Owner decision 4 (2026-11-17): a path robots.txt is checked against holds no `%`, no non-ASCII
-/// byte and no control byte.
+/// byte and no control byte; nor a `#`, which robots.cc 50a0dac cuts from a url (lines 146-148).
 pub(crate) fn plain_path(path: &str) -> bool {
     path.bytes()
-        .all(|byte| byte != b'%' && byte.is_ascii() && !byte.is_ascii_control())
+        .all(|byte| !NOT_PLAIN.contains(&byte) && byte.is_ascii() && !byte.is_ascii_control())
 }
 
+/// `host_and_path` with the query kept: the path robots.txt rules are matched against.
 pub(crate) fn host_and_target(url: &str) -> Option<(String, String)> {
     let (authority, tail) = authority_and_tail(url)?;
     news_provider::HostKey::new(authority).ok()?;

@@ -2524,13 +2524,15 @@ fn a_path_filter_not_starting_with_a_slash_is_refused() {
     );
 }
 
-/// Owner decision 4 (2026-11-17), as for an index target.
+/// Owner decision 4 (2026-11-17), as for an index target; also a `#`, which Google's parser cuts
+/// from a url and an index target never holds (`host_and_target` cuts it).
 #[test]
 fn a_path_filter_holding_a_percent_a_non_ascii_or_a_control_byte_is_refused() {
     let read = [
         ("rules_path_prefix_percent.json", "/news-r%65lease/"),
         ("rules_path_prefix_non_ascii.json", "/news-release/ä/"),
         ("rules_path_prefix_control.json", "/news-release/\t"),
+        ("rules_path_prefix_fragment.json", "/news-release/#x"),
     ]
     .map(|(name, prefix)| {
         let path = rules_fixture(name);
