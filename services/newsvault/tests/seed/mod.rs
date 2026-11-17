@@ -14,8 +14,10 @@ use pit::ObservationTime;
 pub const GNW_ROBOTS: &str = "https://rss.globenewswire.com/robots.txt";
 pub const PRN_ROBOTS: &str = "https://www.prnewswire.com/robots.txt";
 pub const CNW_ROBOTS: &str = "https://www.newswire.ca/robots.txt";
+pub const FED_ROBOTS: &str = "https://www.federalreserve.gov/robots.txt";
 const CONTACT: &str = "bellwether collector contact@example.test";
 const OK: u16 = 200;
+const NOT_FOUND: u16 = 404;
 
 fn provider_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../providers/open-web-feed")
@@ -36,13 +38,18 @@ pub fn cnw_robots() -> Result<Vec<u8>, std::io::Error> {
     std::fs::read(provider_dir().join("tests/fixtures/cnw/robots_www_newswire_ca.txt"))
 }
 
+/// The Fed's robots.txt 404 page, trimmed; the Fed row pins `absent`, so its bytes pin nothing.
+pub fn fed_robots_404() -> Result<Vec<u8>, std::io::Error> {
+    std::fs::read(provider_dir().join("tests/fixtures/fed/robots_404_www_federalreserve_gov.html"))
+}
+
 /// The committed hosts file.
 pub fn committed_hosts() -> PathBuf {
     provider_dir().join("hosts/open_web_wires.hosts.json")
 }
 
-/// One `robots refresh` of the committed hosts file into `store` at `at`, every row answered 200
-/// with its committed body.
+/// One `robots refresh` of the committed hosts file into `store` at `at`, every pinned row
+/// answered 200 with its committed body and the Fed's answered 404.
 pub fn refresh_committed(store: &Path, at: &str) -> Result<cmd_robots::Answer, Box<dyn Error>> {
     refresh_answering(
         store,
@@ -52,6 +59,7 @@ pub fn refresh_committed(store: &Path, at: &str) -> Result<cmd_robots::Answer, B
             (GNW_ROBOTS, OK, &gnw_robots()?),
             (PRN_ROBOTS, OK, &prn_robots()?),
             (CNW_ROBOTS, OK, &cnw_robots()?),
+            (FED_ROBOTS, NOT_FOUND, &fed_robots_404()?),
         ],
     )
 }

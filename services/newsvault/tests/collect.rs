@@ -1741,8 +1741,9 @@ const GNW_INDEX: &str = "https://rss.globenewswire.com/rssfeed/";
 /// `synthetic_index_one_release.xml`'s one `www.` link, rewritten to `rss.` as the rules say.
 const GNW_RELEASE: &str =
     "https://rss.globenewswire.com/news-release/2026/11/14/9999999/0/en/synthetic-release.html";
-/// The committed hosts file admits GNW, PR Newswire and Canada Newswire: three index requests.
-const ADMITTED_HOSTS: u64 = 3;
+/// The committed hosts file admits GNW, PR Newswire, Canada Newswire and the Fed: four index
+/// requests.
+const ADMITTED_HOSTS: u64 = 4;
 /// `open_web_hosts()` admits GNW alone.
 const GNW_ONLY_ADMITTED_HOSTS: u64 = 1;
 /// Before `SATURDAY_AT`: when the seeded robots fetches were ledgered.
@@ -2048,7 +2049,8 @@ fn two_sources_in_one_invocation_are_refused() -> TestResult {
 }
 
 /// The committed hosts file, every robots row seeded. Mutations 2026-11-16, its PRN row set to
-/// `candidate`: red (one request); 2026-11-17, its CNW row set to `candidate`: red (two requests).
+/// `candidate`: red (one request); 2026-11-17, its CNW row and its Fed row set to `candidate`: each
+/// red (one request fewer).
 #[test]
 fn an_open_web_dry_run_plans_one_index_request_per_admitted_host_and_writes_nothing() -> TestResult
 {
