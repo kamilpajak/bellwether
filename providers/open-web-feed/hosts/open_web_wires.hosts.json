@@ -28,6 +28,13 @@
       "index_url": "https://www.federalreserve.gov/feeds/press_all.xml",
       "rule": "fed",
       "robots": "absent"
+    },
+    {
+      "host": "finance.yahoo.com",
+      "status": "admitted",
+      "index_url": "https://finance.yahoo.com/news-sitemap.xml",
+      "rule": "yahoo",
+      "robots": "a01715ceceb6faead3058d083abc97bdec68c7e4c6f522f3211dd0819ce38eb2"
     }
   ]
 }

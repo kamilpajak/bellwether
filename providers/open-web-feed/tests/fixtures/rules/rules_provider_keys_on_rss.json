@@ -1,0 +1,36 @@
+{
+  "schema": "open-web-feed.rules/1",
+  "rules": {
+    "yahoo": {
+      "index": "rss",
+      "valid_field": "pubDate",
+      "valid_format": "%Y-%m-%dT%H:%M:00Z",
+      "path_prefix": "/",
+      "rewrite_hosts": {},
+      "provider_keys": {
+        "image_key_after": "https://media.zenfs.com/en/",
+        "follow": [
+          "business-wire.com",
+          "accesswire.ca"
+        ],
+        "cross_check": [
+          "prnewswire.com",
+          "globenewswire.com",
+          "cnwgroup.com"
+        ]
+      },
+      "title": {
+        "selector": "meta[property=\"og:title\"]",
+        "attribute": "content"
+      },
+      "canonical": {
+        "selector": "link[rel=\"canonical\"]",
+        "attribute": "href"
+      },
+      "body": {
+        "container": "div[data-testid=\"article-body\"]",
+        "paragraph": "p, li, figcaption"
+      }
+    }
+  }
+}

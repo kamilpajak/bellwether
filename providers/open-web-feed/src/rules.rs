@@ -2,7 +2,7 @@
 //! or `item_key`, so `extract_rules_version` covers the path filter and the host rewrite too
 //! (architecture.md section 11.1).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use scraper::Selector;
@@ -15,8 +15,9 @@ use crate::{known_fields, minute_of, plain_path, strict, Refusal};
 
 pub(crate) const RULES_SCHEMA: &str = "open-web-feed.rules/1";
 const TOP: [&str; 2] = ["schema", "rules"];
-const RULE: [&str; 8] = [
+const RULE: [&str; 9] = [
     "index",
+    "provider_keys",
     "valid_field",
     "valid_format",
     "path_prefix",
@@ -27,6 +28,7 @@ const RULE: [&str; 8] = [
 ];
 const PICK: [&str; 2] = ["selector", "attribute"];
 const BODY: [&str; 2] = ["container", "paragraph"];
+const PROVIDER_KEYS: [&str; 3] = ["image_key_after", "follow", "cross_check"];
 const RSS: &str = "rss";
 const NEWS_SITEMAP: &str = "news_sitemap";
 /// A news sitemap rule's `valid_field` names a child of `news:news` behind this prefix.
@@ -35,6 +37,26 @@ pub(crate) const NEWS_FIELD_PREFIX: &str = "news:";
 /// inside it that the format must not print.
 const PROBE_MINUTE: (i32, u32, u32, u32, u32) = (2026, 11, 14, 19, 7);
 const PROBE_SECOND: u32 = 31;
+
+/// Section 11.2's provider key filter: a news sitemap row's key is the url segment after
+/// `image_key_after` in its first `image:loc`. A row is followed only when its key equals a
+/// `follow` key; a row under a `cross_check` key is read by `CrossChecker` alone.
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderKeys {
+    pub(crate) image_key_after: String,
+    pub(crate) follow: BTreeSet<String>,
+    pub(crate) cross_check: BTreeSet<String>,
+}
+
+impl ProviderKeys {
+    /// The segment after the first `image_key_after`, up to the next `/`; `None` when the mark is
+    /// absent or no `/` ends a non-empty segment.
+    pub(crate) fn key_of<'a>(&self, image: &'a str) -> Option<&'a str> {
+        let (_, after) = image.split_once(self.image_key_after.as_str())?;
+        let (key, _) = after.split_once('/')?;
+        (!key.is_empty()).then_some(key)
+    }
+}
 
 /// One element's attribute, picked by a CSS selector.
 #[derive(Debug, Clone)]
@@ -62,6 +84,8 @@ pub(crate) struct Rule {
     pub(crate) path_prefix: String,
     /// Host to host, applied before the path filter and inside `item_key` (section 11.2).
     pub(crate) rewrite_hosts: BTreeMap<String, String>,
+    /// Absent: every row the path filter keeps is followed.
+    pub(crate) provider_keys: Option<ProviderKeys>,
     pub(crate) title: Pick,
     pub(crate) canonical: Pick,
     /// The article container; its outermost `paragraph` matches and table rows are the body.
@@ -176,6 +200,20 @@ fn parse_rule(name: &str, rule: &Map<String, Value>, path: &Path) -> Result<Rule
             "valid_field {valid_field} names no {NEWS_FIELD_PREFIX} element"
         )));
     }
+    let provider_keys = match rule.get("provider_keys") {
+        None => None,
+        Some(keys) => {
+            let keys = keys
+                .as_object()
+                .ok_or_else(|| unparseable("provider_keys is not an object".to_owned()))?;
+            if index != IndexFormat::NewsSitemap {
+                return Err(unparseable(
+                    "provider_keys are read from a news sitemap's image:loc only".to_owned(),
+                ));
+            }
+            Some(provider_keys(keys, path, &unparseable)?)
+        }
+    };
     let body = object("body")?;
     known_fields(body, &BODY, path)?;
     Ok(Rule {
@@ -184,6 +222,7 @@ fn parse_rule(name: &str, rule: &Map<String, Value>, path: &Path) -> Result<Rule
         valid_format,
         path_prefix,
         rewrite_hosts,
+        provider_keys,
         title: pick(object("title")?, path, &unparseable)?,
         canonical: pick(object("canonical")?, path, &unparseable)?,
         container: selector(body.get("container"), &unparseable)?,
@@ -216,6 +255,48 @@ fn printed(at: NaiveDateTime, format: &str) -> Option<String> {
     let mut text = String::new();
     write!(text, "{}", at.and_utc().fixed_offset().format(format)).ok()?;
     Some(text)
+}
+
+fn provider_keys(
+    keys: &Map<String, Value>,
+    path: &Path,
+    unparseable: &dyn Fn(String) -> Refusal,
+) -> Result<ProviderKeys, Refusal> {
+    known_fields(keys, &PROVIDER_KEYS, path)?;
+    let image_key_after = keys
+        .get("image_key_after")
+        .and_then(Value::as_str)
+        .filter(|mark| mark.len() > 1 && mark.ends_with('/'))
+        .ok_or_else(|| unparseable("image_key_after names no mark ending in /".to_owned()))?;
+    let list = |name: &str| -> Result<BTreeSet<String>, Refusal> {
+        let listed = keys
+            .get(name)
+            .and_then(Value::as_array)
+            .ok_or_else(|| unparseable(format!("provider_keys has no {name} list")))?;
+        listed
+            .iter()
+            .map(|key| {
+                key.as_str()
+                    .filter(|key| !key.is_empty() && !key.contains('/'))
+                    .map(str::to_owned)
+                    .ok_or_else(|| unparseable(format!("{name} holds {key}, which is no key")))
+            })
+            .collect()
+    };
+    let (follow, cross_check) = (list("follow")?, list("cross_check")?);
+    if follow.is_empty() {
+        return Err(unparseable("provider_keys follows no key".to_owned()));
+    }
+    if let Some(both) = follow.intersection(&cross_check).next() {
+        return Err(unparseable(format!(
+            "{both} is both followed and cross-checked"
+        )));
+    }
+    Ok(ProviderKeys {
+        image_key_after: image_key_after.to_owned(),
+        follow,
+        cross_check,
+    })
 }
 
 fn pick(
