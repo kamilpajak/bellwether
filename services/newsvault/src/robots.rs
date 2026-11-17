@@ -1441,4 +1441,24 @@ mod tests {
         );
         Ok(())
     }
+
+    /// Yahoo's `*` group allows the sitemap and `/`, the path filter collect checks, and names no
+    /// Crawl-delay; it disallows paths below `/`, which no followed row was under on 2026-11-16.
+    /// Mutations 2026-11-17, every `Disallow` read as `Allow`; `Disallow` lines skipped: each red.
+    #[test]
+    fn the_yahoo_robots_allows_the_news_sitemap_and_every_path_but_its_disallowed_ones(
+    ) -> TestResult {
+        let yahoo = Robots::parse(&provider_fixture("yahoo/robots_finance_yahoo_com.txt")?)?;
+        assert_eq!(
+            (
+                yahoo.allows("/news-sitemap.xml"),
+                yahoo.allows("/"),
+                yahoo.allows("/healthcare/articles/laverock-therapeutics-091700844.html"),
+                yahoo.allows("/m/an-article.html"),
+                yahoo.crawl_delay()
+            ),
+            (true, true, true, false, None)
+        );
+        Ok(())
+    }
 }

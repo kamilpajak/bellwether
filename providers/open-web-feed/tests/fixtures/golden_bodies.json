@@ -17,7 +17,9 @@
     "prn/synthetic_addresses.html": "6cb4822b4e4a25342d7dca405e465a0c393e3d8232865a3da13323e10a86c532",
     "prn/synthetic_heading_line_break.html": "799cabad20e491595a87642d2a5b5df3dde2f7aaef8100be9ca8453665cae33c",
     "prn/synthetic_lists.html": "4200e33d8e922413c9271d0fdceb43f8815a210d18f8b596ecea7efde9dde01d",
-    "prn/synthetic_tables.html": "13fe1e5d451f5aadc5a093d0c407ed4750aa9923a25bee6cef0e9297897326ac"
+    "prn/synthetic_tables.html": "13fe1e5d451f5aadc5a093d0c407ed4750aa9923a25bee6cef0e9297897326ac",
+    "yahoo/article_horizon_090000908.html": "a726b4330e435012dac89db471e18b80ba03443ba6739c43883e38660dc05151",
+    "yahoo/article_laverock_091700844.html": "bb64fc4e2703aff3bad153fee423751d1ee76e4b4f8fc8cd9ecda37930e52bfd"
   },
-  "extract_version": "10de7edb09de5732c5c3114c68ea2ce416f95fd7f764e78da206b4dca4118be9"
+  "extract_version": "c3da9d0fe2447e53db992dbfdd04b217efa60cd82007a1ceb7ddefa542aa21f7"
 }

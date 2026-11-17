@@ -1,0 +1,19 @@
+{
+  "schema": "open-web-feed.hosts/2",
+  "hosts": [
+    {
+      "host": "www.newswire.ca",
+      "status": "admitted",
+      "index_url": "https://www.newswire.ca/sitemap-news.xml?page=1",
+      "rule": "cnw",
+      "robots": "ab9873af0f8c94c48918cd75345a8fc609665602dfcd96aa1e574881a34fb2a0"
+    },
+    {
+      "host": "finance.yahoo.com",
+      "status": "admitted",
+      "index_url": "https://finance.yahoo.com/news-sitemap.xml",
+      "rule": "yahoo",
+      "robots": "a01715ceceb6faead3058d083abc97bdec68c7e4c6f522f3211dd0819ce38eb2"
+    }
+  ]
+}

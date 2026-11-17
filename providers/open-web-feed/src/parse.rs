@@ -15,6 +15,8 @@ pub(crate) const DEEPEST_PAGE: usize = 14 * 8;
 /// The sitemaps.org 0.9 namespace and Google's news sitemap namespace.
 const SITEMAP_NAMESPACE: &str = "http://www.sitemaps.org/schemas/sitemap/0.9";
 const NEWS_NAMESPACE: &str = "http://www.google.com/schemas/sitemap-news/0.9";
+const IMAGE_NAMESPACE: &str = "http://www.google.com/schemas/sitemap-image/1.1";
+const TITLE: &str = "title";
 /// Elements whose text is never prose.
 const NOT_PROSE: [&str; 4] = ["script", "style", "noscript", "template"];
 /// Read as a space: PRN's `<b>About SIGNAL<br /></b>SIGNAL is` otherwise fused to `SIGNALSIGNAL`
@@ -70,11 +72,14 @@ const CLOUDFLARE_EMAIL_PATH: &str = "/cdn-cgi/l/email-protection";
 const LOCAL_PART_SYMBOLS: [char; 6] = ['.', '_', '%', '+', '\'', '-'];
 const SHORTEST_TOP_LABEL: usize = 2;
 
-/// One RSS `<item>`, its two fields as the payload spells them.
+/// One index row's fields as the payload spells them. `title` is RSS `title` or `news:title`;
+/// `image` is a news sitemap row's first `image:loc`, `None` for RSS.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IndexRow {
     pub(crate) link: Option<String>,
     pub(crate) valid_raw: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) image: Option<String>,
 }
 
 /// The rows of the rule's index shape, or `None` when the payload is not one at all, which is what
@@ -103,11 +108,20 @@ fn sitemap_rows(document: &roxmltree::Document, rule: &Rule) -> Option<Vec<Index
     Some(
         root.children()
             .filter(|node| is_in(*node, SITEMAP_NAMESPACE, "url"))
-            .map(|url| IndexRow {
-                link: child_in(url, SITEMAP_NAMESPACE, "loc").and_then(text_of),
-                valid_raw: child_in(url, NEWS_NAMESPACE, "news")
-                    .and_then(|news| child_in(news, NEWS_NAMESPACE, field))
-                    .and_then(text_of),
+            .map(|url| {
+                let news = child_in(url, NEWS_NAMESPACE, "news");
+                IndexRow {
+                    link: child_in(url, SITEMAP_NAMESPACE, "loc").and_then(text_of),
+                    valid_raw: news
+                        .and_then(|news| child_in(news, NEWS_NAMESPACE, field))
+                        .and_then(text_of),
+                    title: news
+                        .and_then(|news| child_in(news, NEWS_NAMESPACE, TITLE))
+                        .and_then(text_of),
+                    image: child_in(url, IMAGE_NAMESPACE, "image")
+                        .and_then(|image| child_in(image, IMAGE_NAMESPACE, "loc"))
+                        .and_then(text_of),
+                }
             })
             .collect(),
     )
@@ -145,6 +159,8 @@ fn rss_rows(document: &roxmltree::Document, rule: &Rule) -> Option<Vec<IndexRow>
             .map(|item| IndexRow {
                 link: child_text(item, "link"),
                 valid_raw: child_text(item, rule.valid_field.as_str()),
+                title: child_text(item, TITLE),
+                image: None,
             })
             .collect(),
     )

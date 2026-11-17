@@ -1,8 +1,10 @@
 //! Our own forward news feed: dated indexes and article pages from admitted hosts, collected live
 //! for the run's UTC day only. The design is `docs/design/architecture.md` section 11; GNW, PR
-//! Newswire, Canada Newswire and the Federal Reserve are the admitted hosts (section 11.5 steps 2
-//! and 6). It declares no HTTP dependency and holds no clock and no `Sink`.
+//! Newswire, Canada Newswire, the Federal Reserve and Yahoo Finance's wire keys are the admitted
+//! hosts (section 11.5 steps 2 and 6). It declares no HTTP dependency and holds no clock and no
+//! `Sink`.
 
+mod crosscheck;
 mod depth;
 mod hosts;
 mod parse;
@@ -28,6 +30,9 @@ use pit::datedness::{Minute, Published};
 use pit::ObservationTime;
 use serde_json::{Map, Value};
 
+pub use crate::crosscheck::{
+    normalised, CrossCheck, CrossChecker, DirectAnswer, Unlisted, DIRECT_LEAD,
+};
 pub use crate::hosts::RobotsPin;
 use crate::hosts::{read_hosts, HostRow, Hosts, Status, HOSTS_SCHEMA};
 use crate::rules::{parse_rules, Rule, RULES_SCHEMA};
@@ -240,6 +245,29 @@ impl OpenWebFeed {
             .collect()
     }
 
+    /// The first admitted row whose rule names `cross_check` keys, against every other admitted
+    /// row's index (section 11.2, option C); `None` when no rule names one.
+    #[must_use]
+    pub fn cross_checker(&self) -> Option<CrossChecker> {
+        let (keyed, rule, keys) = self.hosts.admitted().find_map(|row| {
+            let rule = self.rules.get(&row.rule)?;
+            let keys = rule.provider_keys.as_ref()?;
+            (!keys.cross_check.is_empty()).then_some((row, rule, keys))
+        })?;
+        let direct = self
+            .hosts
+            .admitted()
+            .filter(|row| row.host != keyed.host)
+            .filter_map(|row| Some((row.index_url.clone(), self.rules.get(&row.rule)?.clone())))
+            .collect();
+        Some(CrossChecker::new(
+            keyed.index_url.clone(),
+            rule.clone(),
+            keys.clone(),
+            direct,
+        ))
+    }
+
     /// `hosts_version`: the sha256 of the hosts file as read.
     #[must_use]
     pub const fn hosts_version(&self) -> &FileDigest {
@@ -292,9 +320,9 @@ impl OpenWebFeed {
         }
     }
 
-    /// Each RSS item whose rewritten link stays on the index's own host, passes the path filter
-    /// and keys a story no earlier row of this index keyed is one follow-up; the raw publication
-    /// value rides `listed_date`, never sent.
+    /// Each index row whose rewritten link stays on the index's own host, passes the path filter
+    /// and the provider key filter, and keys a story no earlier row of this index keyed is one
+    /// follow-up; the raw publication value rides `listed_date`, never sent.
     fn index_rows_of(&self, request: &Request, raw: &RawBlob) -> Extracted {
         let (Some(rule), Some((host, _))) =
             (self.rule_for(&request.url), host_and_path(&request.url))
@@ -310,9 +338,16 @@ impl OpenWebFeed {
             let kept = row.link.as_deref().and_then(|link| {
                 let (at, path) = self.rewritten(link)?;
                 let walks = path.split('/').any(|segment| matches!(segment, "." | ".."));
+                let followed = rule.provider_keys.as_ref().is_none_or(|keys| {
+                    row.image
+                        .as_deref()
+                        .and_then(|image| keys.key_of(image))
+                        .is_some_and(|key| keys.follow.contains(key))
+                });
                 (at == host
                     && path.starts_with(&rule.path_prefix)
                     && !walks
+                    && followed
                     && keyed.insert(format!("{at}{path}")))
                 .then(|| format!("https://{at}{path}"))
             });

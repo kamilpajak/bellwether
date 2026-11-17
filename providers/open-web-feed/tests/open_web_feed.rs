@@ -1,5 +1,5 @@
 //! Against committed fixtures and never the network. The GNW and PRN files are trimmed from the
-//! 2026-11-14 and 2026-11-16 probes, the CNW files from the 2026-11-16 weekday probe
+//! 2026-11-14 and 2026-11-16 probes, the CNW, Fed and Yahoo files from the 2026-11-16 probes
 //! (architecture.md section 11.6); every `synthetic_` file says so in its head.
 
 use std::collections::BTreeSet;
@@ -19,7 +19,8 @@ use news_provider::{
     Verdict,
 };
 use open_web_feed::{
-    AdmittedPath, HostPin, OpenWebFeed, Refusal, RobotsPin, CONTACT_CREDENTIAL, SOURCE,
+    AdmittedPath, CrossChecker, DirectAnswer, HostPin, OpenWebFeed, Refusal, RobotsPin,
+    CONTACT_CREDENTIAL, DIRECT_LEAD, SOURCE,
 };
 use pit::datedness::{Minute, Published};
 use pit::ObservationTime;
@@ -317,6 +318,78 @@ const FED_SECOND_ARTICLE_BODY: [&str; 4] = [
     "Order (PDF)",
 ];
 const GOLDEN_FED_PAGES: [&str; 2] = [FED_ARTICLE, FED_SECOND_ARTICLE];
+const YAHOO_INDEX: &str = "https://finance.yahoo.com/news-sitemap.xml";
+const YAHOO_HOST: &str = "finance.yahoo.com";
+/// 8 of the 1,000 `url` rows of the 2026-11-16 09:30:00Z sitemap (§11.6 weekday probe, p0930),
+/// byte for byte: keys `motleyfool.com`, none, `business-wire.com`, `newsfile_64`,
+/// `globenewswire.com`, `prnewswire.com`, `accesswire.ca` and `prnewswire.com`, in that order.
+const YAHOO_REAL_INDEX: &str = "news_sitemap_8_urls.xml";
+const YAHOO_ROWS: u32 = 8;
+/// The `business-wire.com` row, then the `accesswire.ca` row: the two the key filter follows.
+const YAHOO_LINKS: [&str; 2] = [
+    YAHOO_ARTICLE_URL,
+    "https://finance.yahoo.com/technology/ai/articles/reo-dev-launches-100-ai-084000068.html",
+];
+const YAHOO_PUBLICATION_DATES: [&str; 2] = ["2026-11-16T09:17:00Z", "2026-11-16T08:40:00Z"];
+const YAHOO_MINUTES: [&str; 2] = ["2026-11-16T09:17:00Z", "2026-11-16T08:40:00Z"];
+/// An outlet row's second (`motleyfool.com`, 09:22:02Z), an offset, no seconds field, a space
+/// for the `T`, a two-digit year: none is a Yahoo minute.
+const YAHOO_NOT_A_MINUTE: [&str; 5] = [
+    "2026-11-16T09:22:02Z",
+    "2026-11-16T09:17:00+00:00",
+    "2026-11-16T09:17Z",
+    "2026-11-16 09:17:00Z",
+    "26-11-16T09:17:00Z",
+];
+/// The `business-wire.com` reprint (probe7 fetch 2026-11-16 10:53Z) cut to its head, the paid
+/// release disclaimer, the `h1` and `div[data-testid="article-body"]` whole; the contact's name
+/// and address replaced.
+const YAHOO_ARTICLE: &str = "article_laverock_091700844.html";
+const YAHOO_ARTICLE_URL: &str = "https://finance.yahoo.com/healthcare/articles/laverock-therapeutics-appoints-parker-moss-091700844.html";
+const YAHOO_ARTICLE_KEY: &str = "finance.yahoo.com/healthcare/articles/laverock-therapeutics-appoints-parker-moss-091700844.html";
+const YAHOO_ARTICLE_TITLE: &str = "Laverock Therapeutics Appoints Parker Moss as Chief Executive Officer and Paul J. Sekhri as Executive Chairman";
+/// A `prnewswire.com` reprint (probe7 fetch 2026-11-16 10:52Z), cut the same way: its logo
+/// caption, `Story Continues` button and Cision trailer. That key is cross-checked, not followed.
+const YAHOO_PRN_REPRINT: &str = "article_horizon_090000908.html";
+const YAHOO_NO_ARTICLE_BODY_PAGE: &str = "synthetic_no_article_body.html";
+/// The Laverock body opens each line so, in order; line 9 is the first after `Story Continues`.
+const YAHOO_ARTICLE_LINES: [&str; 15] = [
+    "Appointment of experienced transatlantic leadership team",
+    "Interim Chair Lisa Deschamps to transition",
+    "David Venables will step down as Chief Executive Officer on 31 December following a period of transition",
+    "LONDON, November 16, 2026--(BUSINESS WIRE)--Laverock Therapeutics",
+    "Parker Moss is a life sciences and technology leader",
+    "Paul J. Sekhri brings nearly four decades",
+    "Laverock's platform technology enables",
+    "Paul J. Sekhri, Executive Chairman of Laverock Therapeutics, said:",
+    "Parker Moss, Chief Executive Officer of Laverock Therapeutics, added:",
+    "Lisa Deschamps, Non-Executive Director",
+    "David Venables will step down as Chief Executive Officer on 31 December following a period of transition. Lisa",
+    "For more information, please visit www.laverocktx.com",
+    "View source version on businesswire.com: https://www.businesswire.com/news/home/20261116863333/en/",
+    "Contacts",
+    "Zyme Communications Dr Jane Example",
+];
+/// The button, the disclaimer, the page chrome around the body, the `h1`, the body's JSON
+/// `script`, and the contact address decision r removes.
+const YAHOO_OUTSIDE_THE_BODY: [&str; 7] = [
+    "Story Continues",
+    "This is a paid press release",
+    "Yahoo Finance navigation",
+    "Related story outside the body",
+    YAHOO_ARTICLE_TITLE,
+    "contentId",
+    "jane.example@example.com",
+];
+const GOLDEN_YAHOO_PAGES: [&str; 2] = [YAHOO_ARTICLE, YAHOO_PRN_REPRINT];
+/// What the real sitemap's `image:loc` reads before the key, and one image per key or shape.
+const YAHOO_IMAGE: &str = "https://s.yimg.com/ny/mysterio/api/0/ynews/resizefill_w1200;quality_80;format_webp/https://media.zenfs.com/en/";
+/// The CNW fixture's first title, which the real Yahoo row 7 carries under `prnewswire.com`.
+const YAHOO_ROW_LISTED_BY_CNW: &str = "https://finance.yahoo.com/technology/articles/global-voltage-travel-ready-protection-072200770.html";
+const YAHOO_GNW_ROW: &str =
+    "https://finance.yahoo.com/energy/articles/geely-holding-announces-evsa-global-090500744.html";
+const YAHOO_PRN_ROW: &str =
+    "https://finance.yahoo.com/economy/articles/kyiv-based-horizon-capital-reaches-090000908.html";
 const FIRST_ATTEMPT: u32 = 0;
 const OK: u16 = 200;
 const REQUEST_TIMEOUT: u16 = 408;
@@ -503,6 +576,56 @@ fn fed_rss(rows: &[(&str, &str)]) -> Vec<u8> {
         .into_bytes()
 }
 
+fn yahoo(name: &str) -> Vec<u8> {
+    std::fs::read(fixtures().join("yahoo").join(name)).unwrap_or_default()
+}
+
+fn yahoo_index_request(provider: &OpenWebFeed) -> Result<Request, Box<dyn std::error::Error>> {
+    let plan = provider.plan(&TargetWindow::new(RUN_DAY), None, None, at(RUN_AT))?;
+    plan.requests
+        .into_iter()
+        .find(|request| request.url == YAHOO_INDEX)
+        .ok_or_else(|| "the run day planned no Yahoo index".into())
+}
+
+/// The follow-up the real Yahoo sitemap names at `position`, with its real publication date.
+fn yahoo_follow_up(
+    provider: &OpenWebFeed,
+    position: usize,
+) -> Result<Request, Box<dyn std::error::Error>> {
+    let index = provider.extract(
+        &yahoo_index_request(provider)?,
+        &blob(yahoo(YAHOO_REAL_INDEX)),
+    );
+    index
+        .follow_ups
+        .get(position)
+        .cloned()
+        .ok_or_else(|| format!("the real Yahoo sitemap yielded no follow-up {position}").into())
+}
+
+/// One synthetic news sitemap holding each `(link, publication date, image:loc)` as one `url`.
+fn yahoo_sitemap(rows: &[(&str, &str, Option<&str>)]) -> Vec<u8> {
+    let urls: String = rows
+        .iter()
+        .map(|(link, date, image)| {
+            let image = image.map_or_else(String::new, |loc| {
+                format!("<image:image><image:loc>{loc}</image:loc></image:image>")
+            });
+            format!(
+                "<url><loc>{link}</loc><news:news><news:publication_date>{date}\
+                 </news:publication_date><news:title>{link}</news:title></news:news>{image}</url>"
+            )
+        })
+        .collect();
+    format!(
+        "<?xml version=\"1.0\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\" \
+         xmlns:news=\"http://www.google.com/schemas/sitemap-news/0.9\" \
+         xmlns:image=\"http://www.google.com/schemas/sitemap-image/1.1\">{urls}</urlset>"
+    )
+    .into_bytes()
+}
+
 fn only_item(extracted: &Extracted) -> Result<CollectedItem, Box<dyn std::error::Error>> {
     match extracted.items.as_slice() {
         [item] => Ok(item.clone()),
@@ -568,23 +691,26 @@ fn a_target_other_than_the_run_day_is_refused_before_any_request() -> Outcome {
         );
     }
     let plan = provider.plan(&TargetWindow::new(RUN_DAY), None, None, at(RUN_AT))?;
-    assert_eq!(plan.requests.len(), 4);
+    assert_eq!(plan.requests.len(), 5);
     assert_eq!(plan.not_planned, Vec::new());
     Ok(())
 }
 
-/// Section 11.2's host order: GNW, then PR Newswire, Canada Newswire and the Fed, one index each.
-/// Mutations 2026-11-16, the PRN row made `candidate` and the two rows swapped: each red; 2026-11-17,
-/// the CNW row made `candidate`, and its index the RSS feed: each red; the Fed row `candidate`: red.
+/// Section 11.2's host order, one index each. Mutations 2026-11-16, the PRN row `candidate` and
+/// the GNW and PRN rows swapped: each red; 2026-11-17, the CNW, Fed and Yahoo rows `candidate`
+/// and CNW's index the RSS feed: each red.
 #[test]
-fn the_committed_hosts_file_plans_gnw_then_prn_then_cnw_then_the_fed() -> Outcome {
+fn the_committed_hosts_file_plans_gnw_then_prn_then_cnw_then_the_fed_then_yahoo() -> Outcome {
     let plan = provider()?.plan(&TargetWindow::new(RUN_DAY), None, None, at(RUN_AT))?;
     let urls: Vec<&str> = plan
         .requests
         .iter()
         .map(|request| request.url.as_str())
         .collect();
-    assert_eq!(urls, vec![GNW_INDEX, PRN_INDEX, CNW_INDEX, FED_INDEX]);
+    assert_eq!(
+        urls,
+        vec![GNW_INDEX, PRN_INDEX, CNW_INDEX, FED_INDEX, YAHOO_INDEX]
+    );
     Ok(())
 }
 
@@ -2193,6 +2319,615 @@ fn the_committed_federal_reserve_row_asks_its_feed_and_its_prefix() -> Outcome {
     Ok(())
 }
 
+// ---- Yahoo Finance ----
+
+/// Section 11.2: of the real sitemap's 8 rows only the `business-wire.com` and `accesswire.ca`
+/// ones are followed, with their raw `news:publication_date`; the 6 others are counted.
+#[test]
+fn the_real_yahoo_sitemap_follows_only_its_business_wire_and_accesswire_rows() -> Outcome {
+    let provider = provider()?;
+    let extracted = provider.extract(
+        &yahoo_index_request(&provider)?,
+        &blob(yahoo(YAHOO_REAL_INDEX)),
+    );
+    let kept: Vec<(&str, Option<&str>, RequestPhase)> = extracted
+        .follow_ups
+        .iter()
+        .map(|request| {
+            (
+                request.url.as_str(),
+                request.listed_date.as_deref(),
+                request.phase,
+            )
+        })
+        .collect();
+    let expected: Vec<(&str, Option<&str>, RequestPhase)> = YAHOO_LINKS
+        .iter()
+        .zip(YAHOO_PUBLICATION_DATES)
+        .map(|(link, date)| (*link, Some(date), RequestPhase::Document))
+        .collect();
+    assert_eq!(
+        (extracted.vendor_rows, kept, extracted.filtered_out),
+        (YAHOO_ROWS, expected, YAHOO_ROWS - 2)
+    );
+    Ok(())
+}
+
+/// Section 11.2: a key is matched exactly, never as a substring and never in another case; a mark
+/// with no segment after it, another mark and no image are no key. Mutations 2026-11-17, the
+/// match by `contains` either way and by `eq_ignore_ascii_case`: each red.
+#[test]
+fn a_provider_key_is_matched_whole_and_never_as_a_substring() -> Outcome {
+    let provider = provider()?;
+    let link = |n: u8| format!("https://finance.yahoo.com/markets/stocks/articles/a-{n}.html");
+    let images = [
+        Some(format!("{YAHOO_IMAGE}business-wire.com/a.jpg")),
+        Some(format!("{YAHOO_IMAGE}business-wire.com.au/a.jpg")),
+        Some(format!("{YAHOO_IMAGE}xbusiness-wire.com/a.jpg")),
+        Some(format!("{YAHOO_IMAGE}accesswire.ca_9/a.jpg")),
+        Some(format!("{YAHOO_IMAGE}Business-Wire.com/a.jpg")),
+        Some(format!("{YAHOO_IMAGE}wire.com/a.jpg")),
+        Some(format!("{YAHOO_IMAGE}business-wire.com")),
+        Some("https://media.zenfs.com/fr/business-wire.com/a.jpg".to_owned()),
+        Some(format!("{YAHOO_IMAGE}prnewswire.com/a.jpg")),
+        None,
+    ];
+    let links: Vec<String> = (0..).take(images.len()).map(link).collect();
+    let rows: Vec<(&str, &str, Option<&str>)> = links
+        .iter()
+        .zip(&images)
+        .map(|(link, image)| (link.as_str(), YAHOO_PUBLICATION_DATES[0], image.as_deref()))
+        .collect();
+    let extracted = provider.extract(
+        &yahoo_index_request(&provider)?,
+        &blob(yahoo_sitemap(&rows)),
+    );
+    let kept: Vec<&str> = extracted
+        .follow_ups
+        .iter()
+        .map(|request| request.url.as_str())
+        .collect();
+    assert_eq!(
+        (extracted.vendor_rows, kept, extracted.filtered_out),
+        (10, vec![links[0].as_str()], 9)
+    );
+    Ok(())
+}
+
+/// Section 11.1: every `business-wire.com` and `accesswire.ca` row of the 26 polls of 2026-11-16
+/// is `Z` with second `00` (2,017 of 2,017); outlet rows carry seconds (12,247 of 23,983 others)
+/// and are never followed. Mutation 2026-11-17, `minute_of`'s round trip removed: red.
+#[test]
+fn a_yahoo_publication_date_is_a_minute_and_never_an_instant() -> Outcome {
+    let provider = provider()?;
+    let request = yahoo_follow_up(&provider, 0)?;
+    let extract = |raw: &str| {
+        let dated = Request {
+            listed_date: Some(raw.to_owned()),
+            ..request.clone()
+        };
+        provider.extract(&dated, &blob(yahoo(YAHOO_ARTICLE)))
+    };
+    for (raw, minute) in YAHOO_PUBLICATION_DATES.iter().copied().zip(YAHOO_MINUTES) {
+        let item = only_item(&extract(raw))?;
+        assert_eq!(
+            (
+                &item.valid,
+                item.valid_source,
+                item.valid_raw.as_str(),
+                item.valid_field.as_str()
+            ),
+            (
+                &Published::AtMinute(Minute::new(minute.parse()?)?),
+                ValidSource::VendorPublished,
+                raw,
+                "news:publication_date"
+            ),
+            "{raw}"
+        );
+    }
+    for raw in YAHOO_NOT_A_MINUTE {
+        let row = only_unusable(&extract(raw))?;
+        assert_eq!(
+            (row.reason, row.decided_by),
+            (UnusableReason::NoParseableValidTime, DecidedBy::IndexRow),
+            "{raw}"
+        );
+    }
+    Ok(())
+}
+
+/// §8 row R17 for Yahoo, P6: `Story Continues` is a `button` and an ad slot holds only `div`s, so
+/// neither yields a line; the text after the button does (16 of 16 pages, 2026-11-17). Mutations
+/// 2026-11-17, the container `body` and `div.bodyItems-wrapper`: each red.
+#[test]
+fn the_extracted_body_is_article_text_and_never_page_html_on_a_yahoo_page() -> Outcome {
+    let provider = provider()?;
+    let item =
+        only_item(&provider.extract(&yahoo_follow_up(&provider, 0)?, &blob(yahoo(YAHOO_ARTICLE))))?;
+    let body = item.body.ok_or("no body")?.text;
+    let opened: Vec<bool> = body
+        .lines()
+        .zip(YAHOO_ARTICLE_LINES)
+        .map(|(line, opens)| line.starts_with(opens))
+        .collect();
+    assert_eq!(opened, vec![true; YAHOO_ARTICLE_LINES.len()], "{body}");
+    assert_eq!(body.lines().count(), YAHOO_ARTICLE_LINES.len(), "{body}");
+    assert!(!body.contains('<'), "{body}");
+    for outside in YAHOO_OUTSIDE_THE_BODY {
+        assert!(
+            !body.contains(outside),
+            "{outside} reached the body: {body}"
+        );
+    }
+    let reprint = only_item(&provider.extract(
+        &yahoo_follow_up(&provider, 0)?,
+        &blob(yahoo(YAHOO_PRN_REPRINT)),
+    ))?;
+    let reprinted = reprint.body.ok_or("no body")?.text;
+    let added: Vec<bool> = ["Horizon Capital logo", "Cision", "Contact: Jane Doe"]
+        .iter()
+        .map(|line| reprinted.lines().any(|read| read == *line))
+        .collect();
+    assert_eq!(
+        (added, reprinted.contains("Story Continues")),
+        (vec![true; 3], false),
+        "{reprinted}"
+    );
+    Ok(())
+}
+
+/// A page with no `div[data-testid="article-body"]` is the page's fault, so it is held (section
+/// 11.1). Mutations 2026-11-17, the container `article`, `body` and `div.body`: each red.
+#[test]
+fn a_yahoo_page_with_no_article_body_is_unusable_as_no_article_body() -> Outcome {
+    let provider = provider()?;
+    let page = blob(yahoo(YAHOO_NO_ARTICLE_BODY_PAGE));
+    let row = only_unusable(&provider.extract(&yahoo_follow_up(&provider, 1)?, &page))?;
+    assert_eq!(
+        (
+            row.reason,
+            row.decided_by,
+            row.raw_blob.as_str(),
+            row.item.title.as_str()
+        ),
+        (
+            UnusableReason::NoArticleBody,
+            DecidedBy::Page,
+            page.digest.as_str(),
+            "A Reprint Without Its Body"
+        )
+    );
+    Ok(())
+}
+
+/// The key is the Yahoo link's own host and path; a reprint is never keyed by the wire release it
+/// copies. Mutation 2026-11-17, a rewrite `finance.yahoo.com` to `yahoo.com`: red.
+#[test]
+fn the_real_yahoo_reprint_carries_its_title_its_canonical_link_and_its_item_key() -> Outcome {
+    let provider = provider()?;
+    let item =
+        only_item(&provider.extract(&yahoo_follow_up(&provider, 0)?, &blob(yahoo(YAHOO_ARTICLE))))?;
+    assert_eq!(
+        (
+            item.title.as_str(),
+            item.canonical_url.as_str(),
+            item.source_item_id.as_str(),
+            item.observed
+        ),
+        (
+            YAHOO_ARTICLE_TITLE,
+            YAHOO_ARTICLE_URL,
+            YAHOO_ARTICLE_KEY,
+            None
+        )
+    );
+    Ok(())
+}
+
+/// Section 11.2: Yahoo's article paths start in 9 sections (`/technology/`, `/markets/`, ...; 26
+/// polls of 2026-11-16), so the path filter is `/` and the key filter narrows. Mutation
+/// 2026-11-17, the prefix `/markets/`: red.
+#[test]
+fn the_committed_yahoo_row_asks_its_sitemap_and_every_path() -> Outcome {
+    let asked: Vec<String> = provider()?
+        .admitted_paths()
+        .into_iter()
+        .filter(|path| path.host == YAHOO_HOST)
+        .map(|path| path.path)
+        .collect();
+    assert_eq!(asked, vec!["/news-sitemap.xml", "/"]);
+    Ok(())
+}
+
+/// A key filter reads `image:loc`, which only a news sitemap has; a key both followed and
+/// cross-checked would be stored and compared; a list holding a `/` cannot be one segment.
+#[test]
+fn a_provider_key_filter_nothing_can_read_whole_is_refused() {
+    for name in [
+        "rules_provider_keys_on_rss.json",
+        "rules_provider_keys_followed_and_cross_checked.json",
+        "rules_provider_keys_following_none.json",
+        "rules_provider_keys_mark_without_slash.json",
+        "rules_provider_keys_key_with_slash.json",
+    ] {
+        assert!(
+            matches!(
+                refusal_of(&hosts_path(), &rules_fixture(name), CONTACT),
+                Some(Refusal::RulesUnparseable { .. })
+            ),
+            "{name}"
+        );
+    }
+}
+
+// ---- Yahoo cross-check (section 11.2, option C) ----
+
+fn checker() -> Result<CrossChecker, Box<dyn std::error::Error>> {
+    provider()?
+        .cross_checker()
+        .ok_or_else(|| "the committed files cross-check nothing".into())
+}
+
+fn instant(text: &str) -> Option<DateTime<Utc>> {
+    text.parse().ok()
+}
+
+/// After every keyed row of the real Yahoo sitemap closed.
+const LOOKED_AT: &str = "2026-11-16T09:30:29Z";
+const EMPTY_RSS: &[u8] = b"<rss version=\"2.0\"><channel></channel></rss>";
+const EMPTY_SITEMAP: &[u8] = b"<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\"/>";
+
+fn answer(url: &str, at: &str, bytes: Vec<u8>) -> Result<DirectAnswer, Box<dyn std::error::Error>> {
+    Ok(DirectAnswer {
+        url: url.to_owned(),
+        received_at: instant(at).ok_or("not an instant")?,
+        bytes,
+    })
+}
+
+/// Each committed direct index answered at `at`: by `given` when named there, else an empty index.
+fn every_index_at(
+    at: &str,
+    given: &[(&str, Vec<u8>)],
+) -> Result<Vec<DirectAnswer>, Box<dyn std::error::Error>> {
+    [GNW_INDEX, PRN_INDEX, CNW_INDEX, FED_INDEX]
+        .iter()
+        .map(|url| {
+            let empty = if *url == CNW_INDEX {
+                EMPTY_SITEMAP
+            } else {
+                EMPTY_RSS
+            };
+            let bytes = given
+                .iter()
+                .find(|(named, _)| named == url)
+                .map_or_else(|| empty.to_vec(), |(_, bytes)| bytes.clone());
+            answer(url, at, bytes)
+        })
+        .collect()
+}
+
+/// The committed files: Yahoo is the keyed index, and the other four admitted indexes are direct.
+#[test]
+fn the_committed_hosts_file_cross_checks_yahoo_against_the_other_four_indexes() -> Outcome {
+    let checker = checker()?;
+    let direct: Vec<bool> = [GNW_INDEX, PRN_INDEX, CNW_INDEX, FED_INDEX, YAHOO_INDEX]
+        .iter()
+        .map(|url| checker.is_direct_index(url))
+        .collect();
+    assert_eq!(
+        (checker.index_url(), direct),
+        (YAHOO_INDEX, vec![true, true, true, true, false])
+    );
+    Ok(())
+}
+
+/// Option C: a `cross_check` row whose title no direct index listed is named, one whose title the
+/// CNW sitemap listed is counted, and the other rows are counted by key. Mutations 2026-11-17,
+/// every title read as listed, and a cross-check row counted as followed: each red.
+#[test]
+fn a_cross_check_row_no_direct_index_listed_is_named_and_a_listed_one_counted() -> Outcome {
+    let checked = checker()?
+        .check(
+            &yahoo(YAHOO_REAL_INDEX),
+            &every_index_at(LOOKED_AT, &[(CNW_INDEX, cnw(CNW_REAL_INDEX))])?,
+            instant("2026-11-16T07:00:00Z"),
+        )
+        .ok_or("the real sitemap did not parse")?;
+    let unlisted: Vec<(&str, &str, &str)> = checked
+        .unlisted
+        .iter()
+        .map(|row| (row.key.as_str(), row.url.as_str(), row.listed_raw.as_str()))
+        .collect();
+    assert_eq!(
+        (
+            [
+                checked.followed,
+                checked.cross_checked,
+                checked.other_key,
+                checked.no_key
+            ],
+            checked.not_compared,
+            checked.not_looked,
+            checked.listed_directly,
+            unlisted,
+            checked.direct_titles
+        ),
+        (
+            [2, 3, 2, 1],
+            0,
+            0,
+            1,
+            vec![
+                ("globenewswire.com", YAHOO_GNW_ROW, "2026-11-16T09:05:00Z"),
+                ("prnewswire.com", YAHOO_PRN_ROW, "2026-11-16T09:00:00Z"),
+            ],
+            3
+        )
+    );
+    Ok(())
+}
+
+/// A row listed before the first direct answer could not have been seen directly, so it is not
+/// compared; with no direct answer at all, none is. Mutation 2026-11-17, `>=` as `>`: red.
+#[test]
+fn a_cross_check_row_dated_before_the_first_direct_answer_is_not_compared() -> Outcome {
+    let checker = checker()?;
+    let direct = every_index_at(LOOKED_AT, &[(CNW_INDEX, cnw(CNW_REAL_INDEX))])?;
+    let index = yahoo(YAHOO_REAL_INDEX);
+    let compared = |from: Option<DateTime<Utc>>| {
+        checker.check(&index, &direct, from).map(|checked| {
+            let urls: Vec<String> = checked.unlisted.into_iter().map(|row| row.url).collect();
+            (checked.not_compared, checked.listed_directly, urls)
+        })
+    };
+    assert_eq!(
+        (
+            compared(instant("2026-11-16T09:01:00Z")),
+            compared(instant("2026-11-16T09:00:00Z")),
+            compared(None)
+        ),
+        (
+            Some((2, 0, vec![YAHOO_GNW_ROW.to_owned()])),
+            Some((
+                1,
+                0,
+                vec![YAHOO_GNW_ROW.to_owned(), YAHOO_PRN_ROW.to_owned()]
+            )),
+            Some((3, 0, Vec::new()))
+        )
+    );
+    Ok(())
+}
+
+/// Section 11.6's title match: case and every run of punctuation fold away, and a title is never
+/// matched by a prefix of it. A payload under a url no admitted row names adds no title.
+/// Mutations 2026-11-17, the case kept, a prefix match and any rule that parses it: each red.
+#[test]
+fn titles_match_after_case_and_punctuation_fold_and_never_by_a_prefix() -> Outcome {
+    let checker = checker()?;
+    let rss = |titles: &[&str]| -> Vec<u8> {
+        let items: String = titles
+            .iter()
+            .map(|title| format!("<item><title>{title}</title></item>"))
+            .collect();
+        format!("<rss version=\"2.0\"><channel>{items}</channel></rss>").into_bytes()
+    };
+    let mut direct = every_index_at(
+        LOOKED_AT,
+        &[(
+            PRN_INDEX,
+            rss(&[
+                "kyiv based horizon capital reaches 200 million at second closing of catalyst fund",
+                "Geely Holding Announces EVSA",
+            ]),
+        )],
+    )?;
+    direct.push(answer(
+        "https://www.prnewswire.com/rss/elsewhere.rss",
+        LOOKED_AT,
+        cnw(CNW_REAL_INDEX),
+    )?);
+    let checked = checker
+        .check(
+            &yahoo(YAHOO_REAL_INDEX),
+            &direct,
+            instant("2026-11-16T07:00:00Z"),
+        )
+        .ok_or("the real sitemap did not parse")?;
+    let unlisted: Vec<&str> = checked
+        .unlisted
+        .iter()
+        .map(|row| row.url.as_str())
+        .collect();
+    assert_eq!(
+        (checked.listed_directly, unlisted),
+        (1, vec![YAHOO_GNW_ROW, YAHOO_ROW_LISTED_BY_CNW])
+    );
+    assert_eq!(
+        open_web_feed::normalised("Share Buy-back Programme – Transactions Week 46"),
+        "share buy back programme transactions week 46"
+    );
+    Ok(())
+}
+
+/// Collect reads direct answers from `DIRECT_LEAD` before the oldest `cross_check` row's minute;
+/// rows of another key, a followed key or none do not move it. Mutations 2026-11-17, `min` as
+/// `max` and the minimum over every row: each red.
+#[test]
+fn the_earliest_cross_check_minute_is_the_oldest_cross_check_row() -> Outcome {
+    let index = yahoo_sitemap(&[
+        (
+            "https://finance.yahoo.com/a",
+            "2026-11-16T08:00:00Z",
+            Some("https://media.zenfs.com/en/prnewswire.com/a.jpg"),
+        ),
+        (
+            "https://finance.yahoo.com/b",
+            "2026-11-16T07:30:00Z",
+            Some("https://media.zenfs.com/en/globenewswire.com/b.jpg"),
+        ),
+        (
+            "https://finance.yahoo.com/c",
+            "2026-11-16T06:00:00Z",
+            Some("https://media.zenfs.com/en/newsfile_64/c.jpg"),
+        ),
+        (
+            "https://finance.yahoo.com/d",
+            "2026-11-16T05:00:00Z",
+            Some("https://media.zenfs.com/en/business-wire.com/d.jpg"),
+        ),
+        ("https://finance.yahoo.com/e", "2026-11-16T04:00:00Z", None),
+    ]);
+    let checker = checker()?;
+    let read_from = instant("2026-11-16T07:30:00Z").map(|minute| minute - DIRECT_LEAD);
+    assert_eq!(
+        (
+            checker.earliest_cross_checked(&index),
+            checker.read_from(&index),
+            checker.earliest_cross_checked(&yahoo(YAHOO_REAL_INDEX)),
+        ),
+        (
+            instant("2026-11-16T07:30:00Z"),
+            read_from,
+            instant("2026-11-16T07:22:00Z")
+        )
+    );
+    Ok(())
+}
+
+/// Yahoo dated a PRN row 72 min after a PRN answer listed it (2026-11-16): an answer 72 min before
+/// the earliest `cross_check` minute (07:22Z) is read and lists its row. Mutation 2026-11-17,
+/// `DIRECT_LEAD` zero: red.
+#[test]
+fn a_direct_answer_received_before_the_keyed_minute_still_lists_the_row() -> Outcome {
+    let checker = checker()?;
+    let index = yahoo(YAHOO_REAL_INDEX);
+    let earlier = answer(
+        PRN_INDEX,
+        "2026-11-16T06:10:00Z",
+        rss_titles(&[
+            "Kyiv-based Horizon Capital reaches $200 million at second closing of Catalyst Fund",
+        ]),
+    )?;
+    let read_from = checker.read_from(&index).ok_or("no cross-check row")?;
+    let mut direct = every_index_at(LOOKED_AT, &[])?;
+    direct.push(earlier.clone());
+    let checked = checker
+        .check(&index, &direct, instant("2026-11-16T07:00:00Z"))
+        .ok_or("the real sitemap did not parse")?;
+    let unlisted: Vec<String> = checked.unlisted.into_iter().map(|row| row.url).collect();
+    assert_eq!(
+        (
+            earlier.received_at >= read_from,
+            checked.listed_directly,
+            unlisted
+        ),
+        (
+            true,
+            1,
+            vec![YAHOO_GNW_ROW.to_owned(), YAHOO_ROW_LISTED_BY_CNW.to_owned()]
+        )
+    );
+    Ok(())
+}
+
+/// A row is compared only when every direct index parsed an answer after its minute closed: a
+/// failed index, a 503 body, or an answer inside the minute (09:05:30Z for 09:05) is "not looked",
+/// never "unlisted". Review 2026-11-17: a CNW 503 run named three rows unlisted.
+#[test]
+fn a_row_no_direct_index_answered_after_is_not_looked_and_never_unlisted() -> Outcome {
+    let checker = checker()?;
+    let index = yahoo(YAHOO_REAL_INDEX);
+    let looked = |direct: &[DirectAnswer]| {
+        checker
+            .check(&index, direct, instant("2026-11-16T07:00:00Z"))
+            .map(|checked| {
+                (
+                    checked.not_looked,
+                    checked.listed_directly + u32::try_from(checked.unlisted.len()).unwrap_or(0),
+                    checked.direct_parsed,
+                )
+            })
+    };
+    let all = every_index_at(LOOKED_AT, &[(CNW_INDEX, cnw(CNW_REAL_INDEX))])?;
+    let without_cnw: Vec<DirectAnswer> = all
+        .iter()
+        .filter(|answer| answer.url != CNW_INDEX)
+        .cloned()
+        .collect();
+    let mut cnw_503 = without_cnw.clone();
+    cnw_503.push(answer(
+        CNW_INDEX,
+        LOOKED_AT,
+        b"Service Unavailable".to_vec(),
+    )?);
+    let mut cnw_early = without_cnw.clone();
+    cnw_early.push(answer(
+        CNW_INDEX,
+        "2026-11-16T09:05:30Z",
+        cnw(CNW_REAL_INDEX),
+    )?);
+    assert_eq!(
+        (
+            looked(&all),
+            looked(&without_cnw),
+            looked(&cnw_503),
+            looked(&cnw_early)
+        ),
+        (
+            Some((0, 3, 4)),
+            Some((3, 0, 3)),
+            Some((3, 0, 3)),
+            Some((1, 2, 4))
+        )
+    );
+    Ok(())
+}
+
+/// A title or a key that folds to nothing matches nothing: an empty title is never "listed", and
+/// an image with an empty key segment has no key. Review 2026-11-17: both caught only by golden.
+#[test]
+fn an_empty_title_or_an_empty_key_matches_nothing() -> Outcome {
+    let checker = checker()?;
+    let index = b"<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\" \
+         xmlns:news=\"http://www.google.com/schemas/sitemap-news/0.9\" \
+         xmlns:image=\"http://www.google.com/schemas/sitemap-image/1.1\">\
+         <url><loc>https://finance.yahoo.com/a</loc><news:news><news:publication_date>\
+         2026-11-16T09:00:00Z</news:publication_date><news:title>?!</news:title></news:news>\
+         <image:image><image:loc>https://media.zenfs.com/en/prnewswire.com/a.jpg</image:loc>\
+         </image:image></url>\
+         <url><loc>https://finance.yahoo.com/b</loc><news:news><news:publication_date>\
+         2026-11-16T09:00:00Z</news:publication_date><news:title>b</news:title></news:news>\
+         <image:image><image:loc>https://media.zenfs.com/en//b.jpg</image:loc>\
+         </image:image></url></urlset>"
+        .to_vec();
+    let direct = every_index_at(LOOKED_AT, &[(PRN_INDEX, rss_titles(&["--"]))])?;
+    let checked = checker
+        .check(&index, &direct, instant("2026-11-16T07:00:00Z"))
+        .ok_or("the sitemap did not parse")?;
+    assert_eq!(
+        (
+            checked.no_key,
+            checked.other_key,
+            checked.listed_directly,
+            checked.unlisted.len(),
+            checked.direct_titles
+        ),
+        (1, 0, 0, 1, 0)
+    );
+    Ok(())
+}
+
+fn rss_titles(titles: &[&str]) -> Vec<u8> {
+    let items: String = titles
+        .iter()
+        .map(|title| format!("<item><title>{title}</title></item>"))
+        .collect();
+    format!("<rss version=\"2.0\"><channel>{items}</channel></rss>").into_bytes()
+}
+
 // ---- transport ----
 
 /// Owner decision 1, 2026-11-17: each host its own 10 s queue, and no per-IP queue across hosts.
@@ -2396,8 +3131,8 @@ fn a_robots_pin_that_is_neither_64_lowercase_hex_nor_absent_is_refused() -> Outc
 }
 
 /// Each pin is its committed robots body's sha256 (`newsvault`'s `tests/robots_refresh.rs`), or
-/// `absent` for the Fed's 404. Mutations 2026-11-16 and 2026-11-17, one hex digit of the PRN pin
-/// and of the CNW pin changed, and the Fed pin a digest: each red.
+/// `absent` for the Fed's 404. Mutations 2026-11-16 and 2026-11-17, one hex digit of the PRN, CNW
+/// and Yahoo pins changed, and the Fed pin a digest: each red.
 #[test]
 fn the_committed_hosts_file_pins_the_committed_robots_body() -> Outcome {
     let pin = |body: Vec<u8>| Some(RobotsPin::Sha256(FileDigest::of(&body).hex().to_owned()));
@@ -2423,6 +3158,11 @@ fn the_committed_hosts_file_pins_the_committed_robots_body() -> Outcome {
                 host: FED_HOST.to_owned(),
                 admitted: true,
                 robots: Some(RobotsPin::Absent),
+            },
+            HostPin {
+                host: YAHOO_HOST.to_owned(),
+                admitted: true,
+                robots: pin(yahoo("robots_finance_yahoo_com.txt")),
             },
         ]
     );
@@ -2624,6 +3364,15 @@ fn the_open_web_feed_breaks_no_claim_of_the_seam() -> Outcome {
             blob(fed(FED_NO_ARTICLE_BLOCK_PAGE)),
         ),
         (fed_follow_up(&provider, 2)?, blob(fed(FED_SECOND_ARTICLE))),
+        (
+            yahoo_index_request(&provider)?,
+            blob(yahoo(YAHOO_REAL_INDEX)),
+        ),
+        (yahoo_follow_up(&provider, 0)?, blob(yahoo(YAHOO_ARTICLE))),
+        (
+            yahoo_follow_up(&provider, 1)?,
+            blob(yahoo(YAHOO_NO_ARTICLE_BODY_PAGE)),
+        ),
     ];
     let subject = Subject {
         target: TargetWindow::new(RUN_DAY),
@@ -2640,7 +3389,7 @@ fn the_open_web_feed_breaks_no_claim_of_the_seam() -> Outcome {
         .flat_map(|(request, raw)| provider.extract(request, raw).items)
         .map(|item| precision_of(&item.valid))
         .collect();
-    assert_eq!(produced.len(), 8);
+    assert_eq!(produced.len(), 9);
     assert!(
         produced.iter().all(|precision| *precision == ceiling),
         "{produced:?} under {ceiling:?}"
@@ -2799,6 +3548,7 @@ fn golden_bodies() -> Result<(serde_json::Value, serde_json::Value), Box<dyn std
     let prn_request = prn_article_request(&provider)?;
     let cnw_request = cnw_follow_up(&provider, 0)?;
     let fed_request = fed_follow_up(&provider, 0)?;
+    let yahoo_request = yahoo_follow_up(&provider, 0)?;
     let pages = GOLDEN_GNW_PAGES
         .iter()
         .map(|page| ("gnw", *page, gnw(page), &gnw_request))
@@ -2816,6 +3566,11 @@ fn golden_bodies() -> Result<(serde_json::Value, serde_json::Value), Box<dyn std
             GOLDEN_FED_PAGES
                 .iter()
                 .map(|page| ("fed", *page, fed(page), &fed_request)),
+        )
+        .chain(
+            GOLDEN_YAHOO_PAGES
+                .iter()
+                .map(|page| ("yahoo", *page, yahoo(page), &yahoo_request)),
         );
     for (host, page, bytes, request) in pages {
         let item = only_item(&provider.extract(request, &blob(bytes)))?;
