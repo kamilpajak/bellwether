@@ -8,12 +8,22 @@ use canon::FileDigest;
 use news_provider::HostKey;
 use serde_json::Value;
 
-use crate::rules::Rule;
+use crate::rules::{reads_the_other, IndexFormat, Rule};
 use crate::{host_and_target, known_fields, plain_path, strict, Refusal};
 
 pub(crate) const HOSTS_SCHEMA: &str = "open-web-feed.hosts/2";
 const TOP: [&str; 2] = ["schema", "hosts"];
-const ROW: [&str; 5] = ["host", "status", "index_url", "rule", "robots"];
+const ROW: [&str; 6] = [
+    "host",
+    "status",
+    "index_url",
+    "rule",
+    "robots",
+    "paged_index",
+];
+const PAGED: [&str; 2] = ["index_url", "rule"];
+/// A paged index is named at its first page; page N is this query pair with N in place of 1.
+const FIRST_PAGE: &str = "page=1";
 const ADMITTED: &str = "admitted";
 const CANDIDATE: &str = "candidate";
 /// A robots.txt 404 is "no robots" and pins no digest (section 11.1).
@@ -69,6 +79,34 @@ pub(crate) struct HostRow {
     pub(crate) rule: String,
     /// Required on an admitted row, optional on a candidate one.
     pub(crate) robots: Option<RobotsPin>,
+    /// A second index on the same host, read page by page (architecture.md section 11.2).
+    pub(crate) paged: Option<PagedIndex>,
+}
+
+/// A news sitemap whose page N+1 is asked only while page N holds no key of the previous poll.
+#[derive(Debug, Clone)]
+pub(crate) struct PagedIndex {
+    /// Page 1's url, which `plan` asks.
+    pub(crate) index_url: String,
+    pub(crate) index_target: String,
+    pub(crate) rule: String,
+    /// `index_url` without its final `1`: page N is this stem followed by N.
+    pub(crate) stem: String,
+}
+
+impl PagedIndex {
+    /// The page `url` names: the stem, then a decimal with no sign and no leading zero.
+    pub(crate) fn page_of(&self, url: &str) -> Option<u32> {
+        let number = url.strip_prefix(&self.stem)?;
+        let digits = !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit());
+        (digits && !number.starts_with('0'))
+            .then(|| number.parse().ok())
+            .flatten()
+    }
+
+    pub(crate) fn page_url(&self, page: u32) -> String {
+        format!("{}{page}", self.stem)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +216,10 @@ pub(crate) fn read_hosts(path: &Path, rules: &BTreeMap<String, Rule>) -> Result<
                 "{host} is admitted and pins no robots"
             )));
         }
+        let paged = match row.get("paged_index") {
+            None => None,
+            Some(paged) => Some(paged_index(paged, &host, &rule, rules, path)?),
+        };
         rows.push(HostRow {
             host,
             status,
@@ -185,6 +227,7 @@ pub(crate) fn read_hosts(path: &Path, rules: &BTreeMap<String, Rule>) -> Result<
             index_target,
             rule,
             robots,
+            paged,
         });
     }
     let hosts = Hosts {
@@ -195,4 +238,88 @@ pub(crate) fn read_hosts(path: &Path, rules: &BTreeMap<String, Rule>) -> Result<
         return Err(Refusal::NoHostAdmitted(path.to_path_buf()));
     }
     Ok(hosts)
+}
+
+/// A row's `paged_index`: on the row's host, plain, a news sitemap named at page 1, read under a
+/// rule whose valid format and the row's own cannot both read one listed value.
+fn paged_index(
+    paged: &Value,
+    host: &str,
+    row_rule: &str,
+    rules: &BTreeMap<String, Rule>,
+    path: &Path,
+) -> Result<PagedIndex, Refusal> {
+    let unparseable = |why: String| Refusal::HostsUnparseable {
+        path: path.to_path_buf(),
+        why: format!("{host}'s paged_index {why}"),
+    };
+    let object = paged
+        .as_object()
+        .ok_or_else(|| unparseable("is not an object".to_owned()))?;
+    known_fields(object, &PAGED, path)?;
+    let field = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| unparseable(format!("has no {key}")))
+    };
+    let (index_url, rule) = (field("index_url")?, field("rule")?);
+    let (Some(read), Some(own)) = (rules.get(&rule), rules.get(row_rule)) else {
+        return Err(Refusal::UnknownRule {
+            path: path.to_path_buf(),
+            host: host.to_owned(),
+            rule,
+        });
+    };
+    let index_target = match host_and_target(&index_url) {
+        Some((at, target)) if at == host => target,
+        _ => {
+            return Err(Refusal::IndexOffHost {
+                path: path.to_path_buf(),
+                host: host.to_owned(),
+                url: index_url,
+            })
+        }
+    };
+    if !plain_path(&index_target) {
+        return Err(Refusal::IndexTargetNotPlain {
+            path: path.to_path_buf(),
+            host: host.to_owned(),
+            target: index_target,
+        });
+    }
+    let last_pair = index_target
+        .split_once('?')
+        .and_then(|(_, query)| query.rsplit('&').next());
+    let stem = match (last_pair, index_url.strip_suffix('1')) {
+        (Some(FIRST_PAGE), Some(stem)) => stem.to_owned(),
+        _ => {
+            return Err(Refusal::PagedIndexNotPageOne {
+                path: path.to_path_buf(),
+                host: host.to_owned(),
+                url: index_url,
+            })
+        }
+    };
+    if read.index != IndexFormat::NewsSitemap {
+        return Err(Refusal::PagedIndexNotASitemap {
+            path: path.to_path_buf(),
+            host: host.to_owned(),
+            rule,
+        });
+    }
+    if reads_the_other(read, own) || reads_the_other(own, read) {
+        return Err(Refusal::IndexFormatsOverlap {
+            path: path.to_path_buf(),
+            host: host.to_owned(),
+            rules: format!("{row_rule} and {rule}"),
+        });
+    }
+    Ok(PagedIndex {
+        index_url,
+        index_target,
+        rule,
+        stem,
+    })
 }

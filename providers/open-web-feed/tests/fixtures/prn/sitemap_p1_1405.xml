@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:news="http://www.google.com/schemas/sitemap-news/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1" xmlns:video="http://www.google.com/schemas/sitemap-video/1.1">
+  <url>
+    <loc>https://www.prnewswire.com/news-releases/viatris-completes-acquisition-of-pacira-biosciences-302942214.html</loc>
+    <news:news>
+      <news:publication>
+        <news:name>PR Newswire</news:name>
+        <news:language>en</news:language>
+      </news:publication>
+      <news:genres>PressRelease</news:genres>
+      <news:publication_date>2026-11-17T08:50:00-05:00</news:publication_date>
+      <news:title>Viatris Completes Acquisition of Pacira BioSciences</news:title>
+      <news:keywords>Medical Pharmaceuticals,Health Care &amp; Hospitals,Pharmaceuticals,Biotechnology,Acquisitions, Mergers and Takeovers</news:keywords>
+      <news:stock_tickers>NASDAQ-NMS:VTRS,NASDAQ:PCRX,NASDAQ:VTRS</news:stock_tickers>
+    </news:news>
+  </url>
+  <url>
+    <loc>https://www.prnewswire.com/news-releases/for-newborns-and-preemies-the-cdc-says-sanitize-every-day-most-kitchens-arent-built-for-that-302941351.html</loc>
+    <news:news>
+      <news:publication>
+        <news:name>PR Newswire</news:name>
+        <news:language>en</news:language>
+      </news:publication>
+      <news:genres>PressRelease</news:genres>
+      <news:publication_date>2026-11-17T08:35:00-05:00</news:publication_date>
+      <news:title>For Newborns and Preemies, the CDC Says Sanitize Every Day. Most Kitchens Aren&apos;t Built for That</news:title>
+      <news:keywords>Water Utilities,Household, Consumer &amp; Cosmetics ,Retail,Household Products,Broadcast Feed Annoucement</news:keywords>
+    </news:news>
+    <video:video>
+      <video:thumbnail_loc>https://mmx.prnewswire.com/media/MS2037260/Feeding-and-Hygine.mp4?id=OA3083437&amp;p=thumbnail</video:thumbnail_loc>
+      <video:title>Papablic SafeguardPlus™ Baby Bottle Washer System Video</video:title>
+      <video:description>Papablic SafeguardPlus™ Baby Bottle Washer System Video</video:description>
+      <video:content_loc>https://mmx.prnewswire.com/media/MS2037260/Feeding-and-Hygine.mp4?id=OA3083437</video:content_loc>
+    </video:video>
+  </url>
+  <url>
+    <loc>https://www.prnewswire.com/news-releases/adp-national-employment-report-preliminary-estimate-for-october-31-2026-302941211.html</loc>
+    <news:news>
+      <news:publication>
+        <news:name>PR Newswire</news:name>
+        <news:language>en</news:language>
+      </news:publication>
+      <news:genres>PressRelease</news:genres>
+      <news:publication_date>2026-11-17T08:15:00-05:00</news:publication_date>
+      <news:title>ADP National Employment Report Preliminary Estimate for October 31, 2026</news:title>
+      <news:keywords>Banking &amp; Financial Services,Computer Software,Computer &amp; Electronics,Data Analytics,Financial Technology,Human Resource &amp; Workforce Management ,Surveys, Polls and Research ,Economic News, Trends, Analysis</news:keywords>
+      <news:stock_tickers>NASDAQ-NMS:ADP,NASDAQ:ADP</news:stock_tickers>
+    </news:news>
+  </url>
+</urlset>

@@ -38,6 +38,12 @@
           "relisted_disputed": 0,
           "relisted_compared": 0,
           "robots_disallowed": 0,
+          "continuity": {
+            "complete": 0,
+            "boundary_no_shared_key": 0,
+            "no_previous_key": 0,
+            "first_poll": 0
+          },
           "items_new": 3,
           "rows_committed": 3
         },
@@ -58,6 +64,12 @@
           "relisted_disputed": 0,
           "relisted_compared": 0,
           "robots_disallowed": 0,
+          "continuity": {
+            "complete": 0,
+            "boundary_no_shared_key": 0,
+            "no_previous_key": 0,
+            "first_poll": 0
+          },
           "items_new": 1,
           "rows_committed": 1
         }
@@ -88,6 +100,12 @@
           "relisted_disputed": 0,
           "relisted_compared": 0,
           "robots_disallowed": 0,
+          "continuity": {
+            "complete": 0,
+            "boundary_no_shared_key": 0,
+            "no_previous_key": 0,
+            "first_poll": 0
+          },
           "items_new": 0,
           "rows_committed": 0
         },
@@ -108,6 +126,12 @@
           "relisted_disputed": 0,
           "relisted_compared": 0,
           "robots_disallowed": 0,
+          "continuity": {
+            "complete": 0,
+            "boundary_no_shared_key": 0,
+            "no_previous_key": 0,
+            "first_poll": 0
+          },
           "items_new": 0,
           "rows_committed": 0
         }
@@ -138,6 +162,12 @@
           "relisted_disputed": 0,
           "relisted_compared": 0,
           "robots_disallowed": 0,
+          "continuity": {
+            "complete": 0,
+            "boundary_no_shared_key": 0,
+            "no_previous_key": 0,
+            "first_poll": 0
+          },
           "items_new": 0,
           "rows_committed": 0
         },
@@ -158,6 +188,12 @@
           "relisted_disputed": 0,
           "relisted_compared": 0,
           "robots_disallowed": 0,
+          "continuity": {
+            "complete": 0,
+            "boundary_no_shared_key": 0,
+            "no_previous_key": 0,
+            "first_poll": 0
+          },
           "items_new": 0,
           "rows_committed": 0
         }
@@ -188,6 +224,12 @@
           "relisted_disputed": 0,
           "relisted_compared": 0,
           "robots_disallowed": 0,
+          "continuity": {
+            "complete": 0,
+            "boundary_no_shared_key": 0,
+            "no_previous_key": 0,
+            "first_poll": 0
+          },
           "items_new": 0,
           "rows_committed": 0
         }
@@ -218,6 +260,12 @@
           "relisted_disputed": 0,
           "relisted_compared": 0,
           "robots_disallowed": 0,
+          "continuity": {
+            "complete": 0,
+            "boundary_no_shared_key": 0,
+            "no_previous_key": 0,
+            "first_poll": 0
+          },
           "items_new": 1,
           "rows_committed": 1
         }

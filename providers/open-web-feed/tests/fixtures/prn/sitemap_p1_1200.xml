@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:news="http://www.google.com/schemas/sitemap-news/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1" xmlns:video="http://www.google.com/schemas/sitemap-video/1.1">
+  <url>
+    <loc>https://www.prnewswire.com/news-releases/designer-brands-inc-announces-third-quarter-2026-earnings-release-date-302941008.html</loc>
+    <news:news>
+      <news:publication>
+        <news:name>PR Newswire</news:name>
+        <news:language>en</news:language>
+      </news:publication>
+      <news:genres>PressRelease</news:genres>
+      <news:publication_date>2026-11-17T06:45:00-05:00</news:publication_date>
+      <news:title>Designer Brands Inc. Announces Third Quarter 2026 Earnings Release Date</news:title>
+      <news:keywords>Fashion,Retail,Household, Consumer &amp; Cosmetics ,Household Products,Conference Call Announcements </news:keywords>
+      <news:stock_tickers>NYSE:DBI</news:stock_tickers>
+    </news:news>
+  </url>
+  <url>
+    <loc>https://www.prnewswire.com/news-releases/hyperscale-data-inc-announces-intent-to-launch-previously-announced-exchange-offer-on-or-about-november-20-2026-302941554.html</loc>
+    <news:news>
+      <news:publication>
+        <news:name>PR Newswire</news:name>
+        <news:language>en</news:language>
+      </news:publication>
+      <news:genres>PressRelease</news:genres>
+      <news:publication_date>2026-11-17T06:00:00-05:00</news:publication_date>
+      <news:title>Hyperscale Data, Inc. Announces Intent to Launch Previously Announced Exchange Offer on or about November 20, 2026</news:title>
+      <news:keywords>Artificial Intelligence,Computer Hardware,Networks,Computer Software,Computer &amp; Electronics,Telecommunications Industry,Stock Offering</news:keywords>
+      <news:stock_tickers>Amex:GPUS,NYSE:GPUS,NYSE-MKT:GPUS</news:stock_tickers>
+    </news:news>
+  </url>
+  <url>
+    <loc>https://www.prnewswire.com/news-releases/childfund-alliance-world-index-2026-safe-enough-to-have-a-future-302941908.html</loc>
+    <news:news>
+      <news:publication>
+        <news:name>PR Newswire</news:name>
+        <news:language>en</news:language>
+      </news:publication>
+      <news:genres>PressRelease</news:genres>
+      <news:publication_date>2026-11-17T05:00:00-05:00</news:publication_date>
+      <news:title>ChildFund Alliance World Index 2026: Safe Enough to Have a Future</news:title>
+      <news:keywords>Publishing &amp; Information Services ,Health Care &amp; Hospitals,Mental Health,Children,Surveys, Polls and Research ,Handicapped, Disabled</news:keywords>
+    </news:news>
+  </url>
+</urlset>

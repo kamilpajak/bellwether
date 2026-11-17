@@ -114,11 +114,11 @@ PRAGMA synchronous = FULL;
 ";
 
 /// The `PRAGMA user_version` this build writes, and the only one a read-only reader accepts.
-pub const SCHEMA_VERSION: i32 = 9;
+pub const SCHEMA_VERSION: i32 = 10;
 
 /// Version `i + 1` is reached from version `i` by `MIGRATIONS[i]`, run by [`migrate`] with
 /// foreign keys off, as SQLite's twelve-step table rebuild (lang_altertable.html) requires.
-const MIGRATIONS: [&str; 9] = [
+const MIGRATIONS: [&str; 10] = [
     "
 -- The hosts file a run was admitted under: architecture.md section 2's `hosts_version` row. NULL
 -- for a provider that reads no hosts file.
@@ -237,6 +237,13 @@ ALTER TABLE attempts ADD COLUMN relisted_compared INTEGER;
 -- robots.txt disallows their url (owner decision 2026-11-17, section 11.1). NULL for an abandoned
 -- attempt and for every row closed before user_version 9, not backfilled.
 ALTER TABLE attempts ADD COLUMN robots_disallowed INTEGER;
+",
+    "
+-- `open_web_feed::Continuity::name`: how a paged index's poll joins the poll before it (section
+-- 11.2), on the poll's usable page-1 attempt. NULL on every other attempt, on a poll that read no
+-- usable page and on every row before user_version 10, not backfilled.
+ALTER TABLE attempts ADD COLUMN continuity TEXT
+    CHECK (continuity IN ('complete', 'boundary_no_shared_key', 'no_previous_key', 'first_poll'));
 ",
 ];
 
@@ -729,6 +736,73 @@ pub fn blob_bytes(root: &Path, hex: &str) -> Result<Option<Vec<u8>>, StoreError>
         Some(digest) => Ok(Some(blobs.read_verified(&digest)?)),
         None => Ok(None),
     }
+}
+
+/// The usable index pages of the newest run whose attempt at `index_url` recorded a continuity in
+/// `kept`, read-only before the lease (section 11.2). Empty with no commit log, and with a log at
+/// another version: an older one recorded no continuity, a newer one is refused before any send.
+pub fn basis_pages(
+    root: &Path,
+    source: &SourceId,
+    index_url: &str,
+    kept: &[&str],
+) -> Result<Vec<IndexPayload>, StoreError> {
+    let log = root.join(COMMIT_LOG);
+    if !log.exists() {
+        return Ok(Vec::new());
+    }
+    let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    if user_version(&db)? != SCHEMA_VERSION {
+        return Ok(Vec::new());
+    }
+    let marks = vec!["?"; kept.len()].join(", ");
+    let newest: Option<String> = db
+        .query_row(
+            &format!(
+                "SELECT a.run_id FROM attempts a JOIN payloads p ON p.attempt_id = a.attempt_id
+                  WHERE a.source = ? AND p.url = ? AND a.continuity IN ({marks})
+                  ORDER BY a.received_at DESC, a.attempt_id DESC LIMIT 1"
+            ),
+            rusqlite::params_from_iter(
+                [source.as_str(), index_url]
+                    .into_iter()
+                    .chain(kept.iter().copied()),
+            ),
+            |row| row.get(0),
+        )
+        .optional()?;
+    match newest {
+        Some(run) => usable_index_pages(&db, &run, source),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Every usable index payload one run of `source` filed, earliest answer first.
+fn usable_index_pages(
+    db: &Connection,
+    run: &str,
+    source: &SourceId,
+) -> Result<Vec<IndexPayload>, StoreError> {
+    let mut statement = db.prepare(
+        "SELECT p.attempt_id, p.url, p.raw_blob, a.received_at
+           FROM payloads p JOIN attempts a ON a.attempt_id = p.attempt_id
+          WHERE a.run_id = ?1 AND a.source = ?2 AND p.phase = 'index' AND a.verdict = ?3
+          ORDER BY a.received_at, p.attempt_id",
+    )?;
+    let rows = statement
+        .query_map(
+            params![run, source.as_str(), Verdict::Usable.name()],
+            |row| {
+                Ok(IndexPayload {
+                    attempt_id: row.get(0)?,
+                    url: row.get(1)?,
+                    raw_blob: row.get(2)?,
+                    received_at: row.get(3)?,
+                })
+            },
+        )?
+        .collect::<Result<Vec<IndexPayload>, _>>()?;
+    Ok(rows)
 }
 
 /// One robots row as `StoreError::RobotsReplayDiffers` names it.
@@ -1461,6 +1535,26 @@ impl Committer {
                 },
             )
             .optional()?)
+    }
+
+    /// Every usable index payload this run's `source` attempts filed, earliest answer first: a
+    /// paged index's pages (section 11.2).
+    pub fn usable_index_pages(&self, source: &SourceId) -> Result<Vec<IndexPayload>, StoreError> {
+        usable_index_pages(&self.db, self.run.as_str(), source)
+    }
+
+    /// Records how a paged index's poll joins the poll before it, on its page-1 attempt: its own
+    /// `UPDATE` after the commit, as [`Committer::record_held`].
+    pub fn record_continuity(
+        &mut self,
+        attempt_id: &str,
+        continuity: &str,
+    ) -> Result<(), StoreError> {
+        self.db.execute(
+            "UPDATE attempts SET continuity = ?2 WHERE attempt_id = ?1",
+            params![attempt_id, continuity],
+        )?;
+        Ok(())
     }
 
     /// Every index payload a `source` attempt filed, earliest answer first: the cross-check's
@@ -3911,6 +4005,97 @@ mod tests {
         assert_eq!(
             (refused, read_only, user_version(&db)?),
             (expected.clone(), expected, 8)
+        );
+        Ok(())
+    }
+
+    /// A v9 store: the v8 fixture and `MIGRATIONS[8]`, with a robots count on the v1 attempt.
+    fn a_store_at_user_version_nine(temp: &TempDir) -> TestResult {
+        a_store_at_user_version_eight(temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch(MIGRATIONS[8])?;
+        db.pragma_update(None, "user_version", 9)?;
+        db.execute_batch(
+            "UPDATE attempts SET robots_disallowed = 1 WHERE attempt_id = 'a v1 attempt';",
+        )?;
+        Ok(())
+    }
+
+    fn continuity_on(store: &Committer, attempt: &str) -> Result<Option<String>, rusqlite::Error> {
+        store.db.query_row(
+            "SELECT continuity FROM attempts WHERE attempt_id = ?1",
+            params![attempt],
+            |row| row.get(0),
+        )
+    }
+
+    /// §8 row M1 from user_version 9: the step to 10 adds `attempts.continuity`, which takes every
+    /// `open_web_feed::Continuity` name and refuses any other text.
+    #[test]
+    fn a_store_at_user_version_nine_opens_migrates_to_ten_and_takes_a_continuity() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_nine(&temp)?;
+        let mut store = open(&temp)?;
+        let mut taken = Vec::new();
+        for continuity in open_web_feed::Continuity::ALL {
+            store.record_continuity("a v1 attempt", continuity.name())?;
+            taken.push(continuity_on(&store, "a v1 attempt")?);
+        }
+        let refused = store.record_continuity("a v1 attempt", "gap").is_err();
+        assert_eq!(
+            (user_version(&store.db)?, taken, refused),
+            (
+                SCHEMA_VERSION,
+                open_web_feed::Continuity::ALL
+                    .map(|continuity| Some(continuity.name().to_owned()))
+                    .to_vec(),
+                true
+            )
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the carried half from user_version 9: every column of every row of every v9
+    /// table, compared by `quote()`; the v9 attempt gains a NULL `continuity`.
+    #[test]
+    fn a_v9_store_keeps_every_v9_column_of_every_row() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_nine(&temp)?;
+        let v9 = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let before = quoted_rows(&v9, 9, &V7_TABLES)?;
+        drop(v9);
+        assert!(super::refuse_an_unreadable_version(temp.path()).is_ok());
+        let store = open(&temp)?;
+        let after = quoted_rows(&store.db, 9, &V7_TABLES)?;
+        assert_eq!(before.len(), V7_TABLES.len() + 1);
+        assert_eq!(
+            (after, continuity_on(&store, "a v1 attempt")?),
+            (before, None)
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the per-version shape check at user_version 9.
+    #[test]
+    fn a_v9_store_whose_columns_differ_is_refused_and_left_at_user_version_nine() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_nine(&temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch("ALTER TABLE attempts DROP COLUMN robots_disallowed;")?;
+        drop(db);
+        let read_only = match super::refuse_an_unreadable_version(temp.path()) {
+            Err(StoreError::ShapeDiffers { found: 9, columns }) => columns,
+            other => vec![format!("{other:?}")],
+        };
+        let refused = match open(&temp) {
+            Err(StoreError::ShapeDiffers { found: 9, columns }) => columns,
+            other => vec![format!("{other:?}")],
+        };
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let expected = vec!["attempts.robots_disallowed".to_owned()];
+        assert_eq!(
+            (refused, read_only, user_version(&db)?),
+            (expected.clone(), expected, 9)
         );
         Ok(())
     }

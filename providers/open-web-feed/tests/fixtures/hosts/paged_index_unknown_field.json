@@ -1,0 +1,1 @@
+{"schema":"open-web-feed.hosts/2","hosts":[{"host":"www.prnewswire.com","status":"admitted","index_url":"https://www.prnewswire.com/rss/news-releases-list.rss","rule":"prn","robots":"906828bd8cf3ae9fd8bfd1475ae1abe7db4cfda54a2ddbf88dcb80cd55f522b2","paged_index":{"index_url":"https://www.prnewswire.com/sitemap-news.xml?page=1","rule":"prn_sitemap","page":1}}]}

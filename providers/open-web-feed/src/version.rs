@@ -5,11 +5,12 @@ use canon::{CanonError, Digest, FileDigest};
 
 /// Every file under `src/`, as compiled. A file missing here is caught by
 /// `every_source_file_is_in_the_extraction_version`, which reads the directory.
-const SOURCES: [(&str, &str); 8] = [
+const SOURCES: [(&str, &str); 9] = [
     ("crosscheck.rs", include_str!("crosscheck.rs")),
     ("depth.rs", include_str!("depth.rs")),
     ("hosts.rs", include_str!("hosts.rs")),
     ("lib.rs", include_str!("lib.rs")),
+    ("paging.rs", include_str!("paging.rs")),
     ("parse.rs", include_str!("parse.rs")),
     ("rules.rs", include_str!("rules.rs")),
     ("strict.rs", include_str!("strict.rs")),

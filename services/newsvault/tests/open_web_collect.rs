@@ -112,6 +112,12 @@ const PRN_RELEASES: [(&str, &str); 3] = [
     ),
 ];
 
+/// PR Newswire's paged sitemap (section 11.2). `prn/sitemap_news_4_urls.xml` lists release
+/// 302939742 and then `PRN_RELEASES`, each under its sitemap time.
+const PRN_SITEMAP: &str = "https://www.prnewswire.com/sitemap-news.xml?page=1";
+const PRN_SITEMAP_PAGE_2: &str = "https://www.prnewswire.com/sitemap-news.xml?page=2";
+const PRN_RELEASE_PREFIX: &str = "https://www.prnewswire.com/news-releases/";
+const PRN_SITEMAP_ONLY: &str = "www.prnewswire.com/news-releases/stark-future-closes-financing-round-in-excess-of-150-million-in-total-transactional-value-as-its-electric-motorcycles-overtake-combustion-on-the-world-stage-302939742.html";
 const CNW_INDEX: &str = "https://www.newswire.ca/sitemap-news.xml?page=1";
 /// `cnw/sitemap_news_3_urls.xml`'s three links with the page each is answered with. HKEX's page
 /// is not kept, so 807505308 is answered with the synthetic page that has no `section.release-body`.
@@ -231,6 +237,8 @@ struct Gnw {
     asked: RefCell<Vec<String>>,
     /// Statuses a url answers with, front first and with an empty body, before its page.
     scripted: RefCell<BTreeMap<String, Vec<u16>>>,
+    /// `(url prefix, page)`: what a url no page answers is answered with when it starts so.
+    fallback: Option<(String, Vec<u8>)>,
 }
 
 impl Gnw {
@@ -245,7 +253,23 @@ impl Gnw {
             pages,
             asked: RefCell::new(Vec::new()),
             scripted: RefCell::new(BTreeMap::new()),
+            fallback: None,
         })
+    }
+
+    /// `five_hosts`, PRN's sitemap pages answered from `fixtures/prn` (`(url, file)`), and every
+    /// other PRN release with the synthetic page that has no `section.release-body`.
+    fn paged(sitemap: &[(&str, &str)]) -> Result<Self, Box<dyn Error>> {
+        let prn = |name: &str| std::fs::read(provider_dir().join("tests/fixtures/prn").join(name));
+        let mut all = Self::five_hosts()?;
+        for (url, file) in sitemap {
+            all.pages.insert((*url).to_owned(), prn(file)?);
+        }
+        all.fallback = Some((
+            PRN_RELEASE_PREFIX.to_owned(),
+            prn("synthetic_no_release_body.html")?,
+        ));
+        Ok(all)
     }
 
     /// `day`, and PR Newswire's index and `PRN_RELEASES` answered from `fixtures/prn`.
@@ -287,7 +311,8 @@ impl Gnw {
         Ok(all)
     }
 
-    /// `four_hosts`, and Yahoo's sitemap and `YAHOO_RELEASES` answered from `fixtures/yahoo`.
+    /// `four_hosts`, Yahoo's sitemap and `YAHOO_RELEASES` answered from `fixtures/yahoo`, and PR
+    /// Newswire's sitemap page 1 and its one sitemap-only release from `fixtures/prn`.
     fn five_hosts() -> Result<Self, Box<dyn Error>> {
         let mut all = Self::four_hosts()?;
         let fixture =
@@ -297,6 +322,13 @@ impl Gnw {
         for (key, page) in YAHOO_RELEASES {
             all.pages.insert(format!("https://{key}"), fixture(page)?);
         }
+        let prn = |name: &str| std::fs::read(provider_dir().join("tests/fixtures/prn").join(name));
+        all.pages
+            .insert(PRN_SITEMAP.to_owned(), prn("sitemap_news_4_urls.xml")?);
+        all.pages.insert(
+            format!("https://{PRN_SITEMAP_ONLY}"),
+            prn("article_302939742.html")?,
+        );
         Ok(all)
     }
 
@@ -340,7 +372,12 @@ impl Exchange for Gnw {
                 ));
             }
         }
-        match self.pages.get(&request.url) {
+        let fallback = self
+            .fallback
+            .as_ref()
+            .filter(|(prefix, _)| request.url.starts_with(prefix.as_str()))
+            .map(|(_, page)| page);
+        match self.pages.get(&request.url).or(fallback) {
             Some(body) => Ok(RawResponse::new(attempt, OK, body.clone(), sent, received)
                 .with_headers(Headers::new(vec![(
                     CONTENT_TYPE.to_owned(),
@@ -724,10 +761,13 @@ fn every_body_an_open_web_run_stores_is_indexed_and_linked_to_its_attempt() -> T
 }
 
 /// Section 11.2, the committed hosts file: the GNW, PRN, CNW, Fed and Yahoo indexes, then each
-/// host's pages, on Monday 2026-11-16. The mutations that turn it red are §11.5 step 6's tables.
+/// host's pages and PRN's sitemap page 1, on Monday 2026-11-16. The sitemap lists the three RSS
+/// releases, fetched once each from the RSS, and release 302939742, fetched once from the sitemap.
+/// The mutations that turn it red are §11.5 step 6's tables.
 #[test]
 fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end() -> TestResult {
-    const ATTEMPTS: usize = 19;
+    const ATTEMPTS: usize = 21;
+    const ITEMS: usize = 10;
     let root = TempDir::new()?;
     seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
     let ask = Ask {
@@ -736,7 +776,8 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
         ..ask(root.path(), cmd_collect::TODAY)
     };
     let opened = cmd_collect::open_provider(&ask)?;
-    let answer = cmd_collect::run(&ask, &opened, &Gnw::five_hosts()?, &Monday)?;
+    let exchange = Gnw::five_hosts()?;
+    let answer = cmd_collect::run(&ask, &opened, &exchange, &Monday)?;
     let envelope = &answer.envelope;
     let attempts = envelope["attempts"].as_array().ok_or("attempts")?;
     let hosts_version = canon::FileDigest::of(&std::fs::read(seed::committed_hosts())?);
@@ -765,7 +806,7 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
                 Some(FED_INDEX),
                 Some(YAHOO_INDEX)
             ],
-            Some(9)
+            Some(ITEMS as u64)
         ),
         "{envelope:#}"
     );
@@ -789,6 +830,11 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
         expected_counts.insert(index.to_owned(), (Some(3), Some(0), Some(0)));
     }
     expected_counts.insert(YAHOO_INDEX.to_owned(), (Some(8), Some(0), Some(0)));
+    expected_counts.insert(PRN_SITEMAP.to_owned(), (Some(4), Some(0), Some(0)));
+    expected_counts.insert(
+        format!("https://{PRN_SITEMAP_ONLY}"),
+        (Some(1), Some(0), Some(1)),
+    );
     let gnw_pages = RELEASES
         .iter()
         .map(|(key, _, _, canonical)| (*key, canonical.is_some()));
@@ -901,6 +947,13 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
             ("2026-11-16T09:17:00.000000Z", "2026-11-16T09:17:00Z"),
             MONDAY_RECEIVED_AT,
         )?,
+        // Listed by the sitemap alone, so dated by its `news:publication_date`.
+        own_link_item(
+            PRN_SITEMAP_ONLY,
+            "news:publication_date",
+            ("2026-11-16T08:00:00.000000Z", "2026-11-16T03:00:00-05:00"),
+            MONDAY_RECEIVED_AT,
+        )?,
     ]);
     let stored = stored_items(&db)?;
     assert_eq!(stored, expected);
@@ -965,19 +1018,66 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
             "article_laverock_091700844.html",
             "Laverock Therapeutics Appoints Parker Moss as Chief Executive Officer and Paul J. Sekhri as Executive Chairman",
         ),
+        (
+            "prn",
+            PRN_SITEMAP_ONLY,
+            "article_302939742.html",
+            "Stark Future Closes Financing Round in Excess of €150 Million in Total Transactional Value as Its Electric Motorcycles Overtake Combustion on the World Stage",
+        ),
     ];
     let expected_content = committed_pages
         .into_iter()
         .map(|page| committed_content(page, &golden, &stored))
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     assert_eq!(stored_content(&db)?, expected_content);
-    // Nothing is visible before the run observed it, and all nine after.
+    // Nothing is visible before the run observed it, and all after.
     assert_eq!(
         (
             visible(root.path(), "2026-11-16T09:30:00Z")?,
             visible(root.path(), "2026-11-16T09:31:00Z")?
         ),
-        (0, 9)
+        (0, ITEMS)
+    );
+    // Section 11.2 on a fresh store: no basis, so PRN's sitemap is read at page 1 and recorded
+    // `first_poll` on that attempt; the RSS listed the three shared releases first, so the
+    // sitemap's attempt holds them. Mutation 2026-11-17, the run's issued set left out of `collect`'s
+    // held stories: red (each shared release asked twice).
+    let sitemap_attempt = attempts
+        .iter()
+        .find(|row| row["url"] == PRN_SITEMAP)
+        .and_then(|row| row["attempt_id"].as_str())
+        .ok_or("no sitemap attempt")?;
+    let (continuity, held): (Option<String>, Option<i64>) = db.query_row(
+        "SELECT continuity, held FROM attempts WHERE attempt_id = ?1",
+        [sitemap_attempt],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let (sent, _) = exchange.sent();
+    let asked: Vec<usize> = PRN_RELEASES
+        .iter()
+        .map(|(key, _)| key)
+        .chain([&PRN_SITEMAP_ONLY])
+        .map(|key| {
+            sent.iter()
+                .filter(|url| **url == format!("https://{key}"))
+                .count()
+        })
+        .collect();
+    assert_eq!(
+        (&envelope["continuity"], continuity.as_deref(), held, asked),
+        (
+            &serde_json::json!([{
+                "index_url": PRN_SITEMAP,
+                "attempt_id": sitemap_attempt,
+                "pages_read": [1],
+                "basis_keys": null,
+                "continuity": "first_poll",
+                "error": null,
+            }]),
+            Some("first_poll"),
+            Some(3),
+            vec![1, 1, 1, 1],
+        )
     );
     // Option C on a fresh store: the first direct answer is this run's, after every keyed row's
     // minute, so the three cross-check rows are counted and none is compared.
@@ -1014,19 +1114,27 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
         ..ask.clone()
     };
     let planned = cmd_collect::run(&dry, &opened, &Gnw::five_hosts()?, &Monday)?;
+    let human = String::from_utf8(human)?;
+    let line = |start: &str| {
+        human
+            .lines()
+            .find(|line| line.starts_with(start))
+            .map(str::to_owned)
+    };
     assert_eq!(
         (
-            String::from_utf8(human)?
-                .lines()
-                .find(|line| line.starts_with("cross-check"))
-                .map(str::to_owned),
+            line("cross-check"),
+            line("continuity"),
             planned.envelope["cross_check"].is_null(),
+            planned.envelope["continuity"].is_null(),
         ),
         (
             Some(
                 "cross-check      0 unlisted directly, 0 listed, 3 not compared, 0 not looked"
                     .to_owned()
             ),
+            Some(format!("continuity       {PRN_SITEMAP} pages 1 first_poll")),
+            true,
             true,
         )
     );
@@ -1311,34 +1419,37 @@ fn five_host_attempts(exchange: &Gnw) -> Result<Vec<(String, String)>, Box<dyn E
         .collect()
 }
 
-/// The five indexes, then one release of GNW, PRN, CNW, the Fed and Yahoo per turn, a host whose
-/// releases ran out skipped; and GNW's first release.
-fn round_robin_of_five_hosts() -> (Vec<String>, String) {
-    let hosts = five_host_urls();
+/// The five indexes, then one request of each host's lane per turn, a lane that ran out skipped.
+fn round_robin(hosts: &[(String, Vec<String>)]) -> Vec<String> {
     let mut order: Vec<String> = hosts.iter().map(|(index, _)| index.clone()).collect();
-    for nth in 0..RELEASES.len() {
-        order.extend(
-            hosts
-                .iter()
-                .filter_map(|(_, pages)| pages.get(nth).cloned()),
-        );
+    let longest = hosts.iter().map(|(_, lane)| lane.len()).max().unwrap_or(0);
+    for nth in 0..longest {
+        order.extend(hosts.iter().filter_map(|(_, lane)| lane.get(nth).cloned()));
     }
-    let first = hosts[0].1.first().cloned().unwrap_or_default();
-    (order, first)
+    order
 }
 
-/// `(host's index, host's releases)` as urls, GNW, PRN, CNW, Fed, Yahoo.
+/// `round_robin` of the committed five hosts, and GNW's first release.
+fn round_robin_of_five_hosts() -> (Vec<String>, String) {
+    let hosts = five_host_urls();
+    let first = hosts[0].1.first().cloned().unwrap_or_default();
+    (round_robin(&hosts), first)
+}
+
+/// `(host's index, the rest of the host's lane)` as urls, GNW, PRN, CNW, Fed, Yahoo. PRN's lane
+/// holds its sitemap page 1, the three RSS releases, then the sitemap-only release.
 fn five_host_urls() -> [(String, Vec<String>); 5] {
     let pages = |keys: Vec<&str>| keys.iter().map(|key| format!("https://{key}")).collect();
+    let prn_lane: Vec<String> = std::iter::once(PRN_SITEMAP.to_owned())
+        .chain(pages(PRN_RELEASES.iter().map(|(key, _)| *key).collect()))
+        .chain([format!("https://{PRN_SITEMAP_ONLY}")])
+        .collect();
     [
         (
             INDEX.to_owned(),
             pages(RELEASES.iter().map(|(key, ..)| *key).collect()),
         ),
-        (
-            PRN_INDEX.to_owned(),
-            pages(PRN_RELEASES.iter().map(|(key, _)| *key).collect()),
-        ),
+        (PRN_INDEX.to_owned(), prn_lane),
         (
             CNW_INDEX.to_owned(),
             pages(CNW_RELEASES.iter().map(|(key, _)| *key).collect()),
@@ -1369,8 +1480,10 @@ fn a_five_host_run_asks_its_hosts_round_robin() -> TestResult {
 /// GNW's lane, after every request already queued, and stops at `MAX_TRANSIENT_RETRIES`.
 #[test]
 fn a_retried_release_waits_behind_the_other_hosts_and_stops_at_the_cap() -> TestResult {
-    let (mut expected, failing) = round_robin_of_five_hosts();
-    expected.extend([failing.clone(), failing.clone()]);
+    let (_, failing) = round_robin_of_five_hosts();
+    let mut hosts = five_host_urls();
+    hosts[0].1.extend([failing.clone(), failing.clone()]);
+    let expected = round_robin(&hosts);
     let exchange = Gnw::five_hosts()?.answering(&failing, &[UNAVAILABLE; 3]);
     let attempts = five_host_attempts(&exchange)?;
     let urls: Vec<String> = attempts.into_iter().map(|(url, _)| url).collect();
@@ -1378,35 +1491,26 @@ fn a_retried_release_waits_behind_the_other_hosts_and_stops_at_the_cap() -> Test
     Ok(())
 }
 
-/// §8 R21 with lanes of unequal length: PRN's index fails every time, so PRN's lane holds only its
-/// retry, which is asked on PRN's next turn and never waits for the other hosts' releases to drain.
+/// §8 R21 with lanes of unequal length: PRN's RSS fails every time, so each retry is asked on a
+/// later PRN turn and never waits for the other hosts' releases to drain. The sitemap, asked
+/// between, lists every PRN release, so all four are fetched from it.
 #[test]
 fn a_retried_index_keeps_its_host_turn_while_the_other_hosts_releases_are_served() -> TestResult {
-    let [(gnw, gnw_pages), (prn, _), (cnw, cnw_pages), (fed, fed_pages), (yahoo, yahoo_pages)] =
-        five_host_urls();
-    let expected = [
-        &gnw,
-        &prn,
-        &cnw,
-        &fed,
-        &yahoo,
-        &gnw_pages[0],
-        &prn,
-        &cnw_pages[0],
-        &fed_pages[0],
-        &yahoo_pages[0],
-        &gnw_pages[1],
-        &prn,
-        &cnw_pages[1],
-        &fed_pages[1],
-        &yahoo_pages[1],
-        &gnw_pages[2],
-        &cnw_pages[2],
-        &fed_pages[2],
-    ];
+    let mut hosts = five_host_urls();
+    let prn_releases: Vec<String> = PRN_RELEASES
+        .iter()
+        .map(|(key, _)| format!("https://{key}"))
+        .collect();
+    hosts[1].1 = [PRN_SITEMAP.to_owned(), PRN_INDEX.to_owned()]
+        .into_iter()
+        .chain([format!("https://{PRN_SITEMAP_ONLY}")])
+        .chain(prn_releases)
+        .chain([PRN_INDEX.to_owned()])
+        .collect();
+    let expected = round_robin(&hosts);
     let exchange = Gnw::five_hosts()?.answering(PRN_INDEX, &[UNAVAILABLE; 3]);
     let attempts = five_host_attempts(&exchange)?;
-    let urls: Vec<&String> = attempts.iter().map(|(url, _)| url).collect();
+    let urls: Vec<String> = attempts.into_iter().map(|(url, _)| url).collect();
     assert_eq!(urls, expected);
     Ok(())
 }
@@ -1418,7 +1522,7 @@ fn a_replayed_five_host_run_gives_every_attempt_the_same_id_and_url() -> TestRes
     let first = five_host_attempts(&Gnw::five_hosts()?)?;
     let second = five_host_attempts(&Gnw::five_hosts()?)?;
     let distinct: std::collections::BTreeSet<&String> = first.iter().map(|(_, id)| id).collect();
-    assert_eq!((first.len(), distinct.len(), &first), (19, 19, &second));
+    assert_eq!((first.len(), distinct.len(), &first), (21, 21, &second));
     Ok(())
 }
 
@@ -2254,6 +2358,7 @@ fn a_yahoo_row_under_a_robots_disallow_is_not_fetched_and_its_siblings_are() -> 
                 (Some(CNW_INDEX), Some(0), Some(0)),
                 (Some(FED_INDEX), Some(0), Some(0)),
                 (Some(YAHOO_INDEX), Some(6), Some(1)),
+                (Some(PRN_SITEMAP), Some(0), Some(0)),
             ],
             Some(Some(1)),
             1,
@@ -3350,6 +3455,242 @@ fn a_held_story_listed_under_another_minute_is_recorded_without_a_fetch_and_coun
                 "2026-11-14T19:00:00.000000Z".to_owned()
             )],
             vec![(1, COMPARED_BY_THE_SECOND_POLL)]
+        )
+    );
+    Ok(())
+}
+
+// ---- PRN's paged sitemap across polls (section 11.2), probe10's pages on 2026-11-17 ----
+
+/// Probe10's polls, 30 s into each cycle's minute (§11.6).
+const PROBE10_1200: &str = "2026-11-17T12:00:30Z";
+const PROBE10_1205: &str = "2026-11-17T12:05:30Z";
+const PROBE10_1405: &str = "2026-11-17T14:05:30Z";
+const PROBE10_1410: &str = "2026-11-17T14:10:30Z";
+const PROBE10_1415: &str = "2026-11-17T14:15:30Z";
+
+/// One collect over the committed hosts at `at`, PRN's sitemap pages answered as `sitemap` names
+/// them: the answer, and every url sent.
+fn paged_poll(
+    store: &Path,
+    at: &str,
+    sitemap: &[(&str, &str)],
+) -> Result<(cmd_collect::Answer, Vec<String>), Box<dyn Error>> {
+    let exchange = Gnw::paged(sitemap)?;
+    let ask = Ask {
+        hosts: Some(seed::committed_hosts()),
+        at: instant(at),
+        schedule: Some("probe10".to_owned()),
+        ..ask(store, cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, &exchange, &At(instant(at)))?;
+    let (sent, _) = exchange.sent();
+    Ok((answer, sent))
+}
+
+/// The poll's pages read and its continuity, from the envelope.
+fn poll_continuity(answer: &cmd_collect::Answer) -> (Vec<u64>, Option<String>) {
+    let poll = &answer.envelope["continuity"][0];
+    (
+        poll["pages_read"]
+            .as_array()
+            .map(|pages| pages.iter().filter_map(Value::as_u64).collect())
+            .unwrap_or_default(),
+        poll["continuity"].as_str().map(str::to_owned),
+    )
+}
+
+/// The ledger's continuity counts for 2026-11-17, `[complete, boundary, no previous, first]`.
+fn ledgered_continuity(store: &Path) -> Result<Vec<[i64; 4]>, Box<dyn Error>> {
+    let day: chrono::NaiveDate = "2026-11-17".parse()?;
+    let report = newsvault::cmd_ledger::read(
+        store,
+        &newsvault::cmd_ledger::Ask {
+            at: instant("2026-11-18T00:00:00Z"),
+            from: day,
+            to: day,
+            source: None,
+            expected_runs: None,
+            limit: None,
+            check: false,
+        },
+    )?;
+    Ok(report
+        .days
+        .iter()
+        .flat_map(|one| &one.per_source)
+        .map(|row| {
+            let counts = row.continuity;
+            [
+                counts.complete,
+                counts.boundary_no_shared_key,
+                counts.no_previous_key,
+                counts.first_poll,
+            ]
+        })
+        .collect())
+}
+
+fn sends_of(sent: &[String], url: &str) -> usize {
+    sent.iter().filter(|asked| *asked == url).count()
+}
+
+/// Probe10's cycles 0 and 1 through `collect`: an empty store's first poll reads page 1 only and is
+/// `first_poll`; the next poll's page 1 shares a key with it, so it reads page 1 only and is
+/// `complete`; the shared release is fetched once, and the RSS releases no sitemap page lists are
+/// committed under their `pubDate`. The ledger counts one of each. Mutation 2026-11-17, the run's
+/// handed basis left empty (`basis_of` returning no entry): red.
+#[test]
+fn a_poll_whose_page_one_overlaps_the_first_poll_is_complete_and_reads_one_page() -> TestResult {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    let (first, first_sent) = paged_poll(
+        root.path(),
+        PROBE10_1200,
+        &[(PRN_SITEMAP, "sitemap_p1_1200.xml")],
+    )?;
+    let (second, second_sent) = paged_poll(
+        root.path(),
+        PROBE10_1205,
+        &[(PRN_SITEMAP, "sitemap_p1_1205.xml")],
+    )?;
+    let shared = "https://www.prnewswire.com/news-releases/designer-brands-inc-announces-third-quarter-2026-earnings-release-date-302941008.html";
+    let db = Connection::open_with_flags(
+        root.path().join(COMMIT_LOG),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let rss_fields: Vec<String> = PRN_RELEASES
+        .iter()
+        .skip(1)
+        .map(|(key, _)| {
+            let story = digest(canon::digest::story_id(SOURCE, key)).unwrap_or_default();
+            db.query_row(
+                "SELECT valid_field FROM items WHERE story_id = ?1",
+                [story],
+                |row| row.get(0),
+            )
+            .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(
+        (
+            poll_continuity(&first),
+            poll_continuity(&second),
+            sends_of(&first_sent, PRN_SITEMAP_PAGE_2) + sends_of(&second_sent, PRN_SITEMAP_PAGE_2),
+            sends_of(&first_sent, shared) + sends_of(&second_sent, shared),
+            rss_fields,
+            ledgered_continuity(root.path())?,
+        ),
+        (
+            (vec![1], Some("first_poll".to_owned())),
+            (vec![1], Some("complete".to_owned())),
+            0,
+            1,
+            vec!["pubDate".to_owned(), "pubDate".to_owned()],
+            vec![[1, 0, 0, 1]],
+        )
+    );
+    Ok(())
+}
+
+/// Probe10's 14:10Z cycle through `collect` (§11.6): page 1 shares no key with 14:05Z's, so page 2
+/// is asked; it holds a 14:05Z key but shares none with page 1, so the poll is
+/// `boundary_no_shared_key` and not looked across 13:51-13:59Z. Such a poll is no basis: the
+/// 14:15Z poll, whose page 1 is 14:10Z's again, reads back to 14:05Z through page 2 once more.
+/// Mutations 2026-11-17, `is_basis` true for every arm and the boundary check dropped: each red.
+#[test]
+fn the_1410_poll_reads_two_pages_records_its_gap_and_is_no_basis_for_the_next() -> TestResult {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    let pages_of_1410 = [
+        (PRN_SITEMAP, "sitemap_p1_1410.xml"),
+        (PRN_SITEMAP_PAGE_2, "sitemap_p2_1410.xml"),
+    ];
+    let (before, _) = paged_poll(
+        root.path(),
+        PROBE10_1405,
+        &[(PRN_SITEMAP, "sitemap_p1_1405.xml")],
+    )?;
+    let (gap, gap_sent) = paged_poll(root.path(), PROBE10_1410, &pages_of_1410)?;
+    let (after, after_sent) = paged_poll(root.path(), PROBE10_1415, &pages_of_1410)?;
+    let db = Connection::open_with_flags(
+        root.path().join(COMMIT_LOG),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let gap_attempt = gap.envelope["continuity"][0]["attempt_id"]
+        .as_str()
+        .ok_or("no page-1 attempt")?;
+    let page_2_listed: Option<String> = db.query_row(
+        "SELECT listed_date FROM payloads WHERE url = ?1 ORDER BY attempt_id LIMIT 1",
+        [PRN_SITEMAP_PAGE_2],
+        |row| row.get(0),
+    )?;
+    let stored: Option<String> = db.query_row(
+        "SELECT continuity FROM attempts WHERE attempt_id = ?1",
+        [gap_attempt],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        (
+            poll_continuity(&before),
+            poll_continuity(&gap),
+            stored,
+            sends_of(&gap_sent, PRN_SITEMAP_PAGE_2),
+            page_2_listed,
+            poll_continuity(&after),
+            sends_of(&after_sent, PRN_SITEMAP_PAGE_2),
+            gap.exit,
+        ),
+        (
+            (vec![1], Some("first_poll".to_owned())),
+            (vec![1, 2], Some("boundary_no_shared_key".to_owned())),
+            Some("boundary_no_shared_key".to_owned()),
+            1,
+            Some("2026-11-17T09:00:00-05:00".to_owned()),
+            (vec![1, 2], Some("boundary_no_shared_key".to_owned())),
+            1,
+            Exit::Ok,
+        )
+    );
+    Ok(())
+}
+
+/// A poll whose page 1 never answered records no continuity, so it is "not looked", never
+/// complete, and the next poll anchors to the poll before it.
+#[test]
+fn a_poll_whose_page_one_failed_records_no_continuity() -> TestResult {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    paged_poll(
+        root.path(),
+        PROBE10_1200,
+        &[(PRN_SITEMAP, "sitemap_p1_1200.xml")],
+    )?;
+    let exchange = Gnw::paged(&[])?.answering(PRN_SITEMAP, &[UNAVAILABLE; 3]);
+    let ask = Ask {
+        hosts: Some(seed::committed_hosts()),
+        at: instant(PROBE10_1205),
+        schedule: Some("probe10".to_owned()),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let failed = cmd_collect::run(&ask, &opened, &exchange, &At(instant(PROBE10_1205)))?;
+    let (next, _) = paged_poll(
+        root.path(),
+        PROBE10_1405,
+        &[(PRN_SITEMAP, "sitemap_p1_1205.xml")],
+    )?;
+    assert_eq!(
+        (
+            poll_continuity(&failed),
+            poll_continuity(&next),
+            ledgered_continuity(root.path())?,
+        ),
+        (
+            (Vec::new(), None),
+            (vec![1], Some("complete".to_owned())),
+            vec![[1, 0, 0, 1]],
         )
     );
     Ok(())
