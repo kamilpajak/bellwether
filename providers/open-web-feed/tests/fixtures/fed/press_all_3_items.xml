@@ -1,0 +1,33 @@
+﻿<?xml version="1.0" encoding="utf-8" ?>
+<rss version="2.0">
+    <channel>
+        <title>FRB: Press Release - All Releases</title>
+        <link><![CDATA[https://www.federalreserve.gov/feeds/feeds.htm]]></link>
+        <description><![CDATA[All recent press releases from the Federal Reserve Board]]></description>
+        <language>en</language>
+        <item>
+            <title>Agencies extend comment period for proposed third-party risk management guidance </title>
+            <link><![CDATA[https://www.federalreserve.gov/newsevents/pressreleases/bcreg20261113a.htm]]></link>
+            <guid><![CDATA[https://www.federalreserve.gov/newsevents/pressreleases/bcreg20261113a.htm]]></guid>
+            <description><![CDATA[Agencies extend comment period for proposed third-party risk management guidance ]]></description>
+            <category>Banking and Consumer Regulatory Policy</category>
+            <pubDate><![CDATA[Fri, 13 Nov 2026 21:15:00 GMT]]></pubDate>    
+        </item>
+        <item>
+            <title>Federal Reserve announces revised tentative schedule of Federal Open Market Committee meetings in 2027</title>
+            <link><![CDATA[https://www.federalreserve.gov/newsevents/pressreleases/monetary20261112a.htm]]></link>
+            <guid><![CDATA[https://www.federalreserve.gov/newsevents/pressreleases/monetary20261112a.htm]]></guid>
+            <description><![CDATA[Federal Reserve announces revised tentative schedule of Federal Open Market Committee meetings in 2027]]></description>
+            <category>Monetary Policy</category>
+            <pubDate><![CDATA[Thu, 12 Nov 2026 17:45:00 GMT]]></pubDate>    
+        </item>
+        <item>
+            <title>Federal Reserve Board announces approval of two applications by Mutual Federal Bancorp, MHC, and MFB Bancorp, Inc.</title>
+            <link><![CDATA[https://www.federalreserve.gov/newsevents/pressreleases/orders20261109a.htm]]></link>
+            <guid><![CDATA[https://www.federalreserve.gov/newsevents/pressreleases/orders20261109a.htm]]></guid>
+            <description><![CDATA[Federal Reserve Board announces approval of two applications by Mutual Federal Bancorp, MHC, and MFB Bancorp, Inc.]]></description>
+            <category>Orders on Banking Applications</category>
+            <pubDate><![CDATA[Mon, 9 Nov 2026 21:00:00 GMT]]></pubDate>    
+        </item>
+    </channel>
+</rss>

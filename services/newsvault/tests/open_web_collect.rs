@@ -128,6 +128,24 @@ const CNW_RELEASES: [(&str, &str); 3] = [
         "synthetic_no_release_body.html",
     ),
 ];
+const FED_INDEX: &str = "https://www.federalreserve.gov/feeds/press_all.xml";
+/// `fed/press_all_3_items.xml`'s three links with the page each is answered with. The FOMC
+/// schedule's page is not kept, so monetary20261112a is answered with the synthetic page that
+/// has no `div#article`.
+const FED_RELEASES: [(&str, &str); 3] = [
+    (
+        "www.federalreserve.gov/newsevents/pressreleases/bcreg20261113a.htm",
+        "article_bcreg20261113a.html",
+    ),
+    (
+        "www.federalreserve.gov/newsevents/pressreleases/monetary20261112a.htm",
+        "synthetic_no_article_block.html",
+    ),
+    (
+        "www.federalreserve.gov/newsevents/pressreleases/orders20261109a.htm",
+        "article_orders20261109a.html",
+    ),
+];
 /// Monday 2026-11-16, after the CNW fixtures' publication minutes (07:22Z newest), so no CNW item
 /// is observed before it was published; one second before it, the stub's `received_at`.
 const MONDAY_AT: &str = "2026-11-16T08:05:30Z";
@@ -241,6 +259,19 @@ impl Gnw {
         Ok(all)
     }
 
+    /// `three_hosts`, and the Fed's feed and `FED_RELEASES` answered from `fixtures/fed`.
+    fn four_hosts() -> Result<Self, Box<dyn Error>> {
+        let mut all = Self::three_hosts()?;
+        let fixture =
+            |name: &str| std::fs::read(provider_dir().join("tests/fixtures/fed").join(name));
+        all.pages
+            .insert(FED_INDEX.to_owned(), fixture("press_all_3_items.xml")?);
+        for (key, page) in FED_RELEASES {
+            all.pages.insert(format!("https://{key}"), fixture(page)?);
+        }
+        Ok(all)
+    }
+
     fn answering(self, url: &str, statuses: &[u16]) -> Self {
         self.scripted
             .borrow_mut()
@@ -336,6 +367,56 @@ fn stored_items(db: &Connection) -> Result<BTreeMap<String, Row>, Box<dyn Error>
     Ok(rows)
 }
 
+/// `(item_id, raw_blob, body_blob)` of a committed row: `item_id` hashes the title and body.
+type Content = (String, String, Option<String>);
+
+fn stored_content(db: &Connection) -> Result<BTreeMap<String, Content>, Box<dyn Error>> {
+    let mut query = db.prepare("SELECT story_id, item_id, raw_blob, body_blob FROM items")?;
+    let rows = query
+        .query_map([], |row| {
+            Ok((row.get(0)?, (row.get(1)?, row.get(2)?, row.get(3)?)))
+        })?
+        .collect::<Result<BTreeMap<String, Content>, _>>()?;
+    Ok(rows)
+}
+
+/// The content the release keyed `key` must be stored with when answered by `fixtures/<dir>/<page>`:
+/// that page's bytes as `raw_blob`, its `golden_bodies.json` body as `body_blob`, and an `item_id`
+/// over `title` and that body. The minute is the stored one, which `stored_items` checks.
+fn committed_content(
+    (dir, key, page, title): (&str, &str, &str, &str),
+    golden: &Value,
+    stored: &BTreeMap<String, Row>,
+) -> Result<(String, Content), Box<dyn Error>> {
+    let story = digest(canon::digest::story_id(SOURCE, key)).ok_or("story id")?;
+    let raw = std::fs::read(provider_dir().join("tests/fixtures").join(dir).join(page))?;
+    let body = golden["bodies"][format!("{dir}/{page}")]
+        .as_str()
+        .ok_or("no golden body")?;
+    let minute: DateTime<Utc> = stored
+        .get(&story)
+        .and_then(|row| row.1.as_deref())
+        .ok_or("no stored minute")?
+        .parse()?;
+    let item = digest(canon::digest::item_id(&canon::digest::ItemFields {
+        source: SOURCE,
+        source_item_id: key,
+        url: &format!("https://{key}"),
+        valid: canon::Stamp::Minute(minute),
+        title,
+        body_ref: Some(body),
+    }))
+    .ok_or("item id")?;
+    Ok((
+        story,
+        (
+            item,
+            canon::FileDigest::of(&raw).hex().to_owned(),
+            Some(body.to_owned()),
+        ),
+    ))
+}
+
 /// The rows `Gnw::day` commits for `RELEASES`, keyed by story.
 fn gnw_items() -> BTreeMap<String, Row> {
     gnw_items_received(RECEIVED_AT)
@@ -409,6 +490,17 @@ fn cnw_item(
 ) -> Result<(String, Row), Box<dyn Error>> {
     let (key, _) = CNW_RELEASES.get(release).ok_or("no such release")?;
     own_link_item(key, "news:publication_date", dated, received)
+}
+
+/// The committed row of `FED_RELEASES[release]`: no Fed page names a canonical link, so its
+/// `doc_id` is the requested url.
+fn fed_item(
+    release: usize,
+    dated: (&str, &str),
+    received: &str,
+) -> Result<(String, Row), Box<dyn Error>> {
+    let (key, _) = FED_RELEASES.get(release).ok_or("no such release")?;
+    own_link_item(key, "pubDate", dated, received)
 }
 
 fn visible(store: &Path, at: &str) -> Result<usize, Box<dyn Error>> {
@@ -593,12 +685,11 @@ fn every_body_an_open_web_run_stores_is_indexed_and_linked_to_its_attempt() -> T
     Ok(())
 }
 
-/// Section 11.2, the committed hosts file: the GNW, PRN and CNW indexes, then each host's three
-/// pages, on Monday 2026-11-16. The PRN and CNW mutations that turn it red, re-run 2026-11-17, are
-/// §11.5 step 6's tables.
+/// Section 11.2, the committed hosts file: the GNW, PRN, CNW and Fed indexes, then each host's
+/// three pages, on Monday 2026-11-16. The mutations that turn it red are §11.5 step 6's tables.
 #[test]
-fn an_open_web_run_collects_a_gnw_a_prn_and_a_cnw_day_end_to_end() -> TestResult {
-    const ATTEMPTS: usize = 12;
+fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_and_a_fed_day_end_to_end() -> TestResult {
+    const ATTEMPTS: usize = 16;
     let root = TempDir::new()?;
     seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
     let ask = Ask {
@@ -607,12 +698,12 @@ fn an_open_web_run_collects_a_gnw_a_prn_and_a_cnw_day_end_to_end() -> TestResult
         ..ask(root.path(), cmd_collect::TODAY)
     };
     let opened = cmd_collect::open_provider(&ask)?;
-    let answer = cmd_collect::run(&ask, &opened, &Gnw::three_hosts()?, &Monday)?;
+    let answer = cmd_collect::run(&ask, &opened, &Gnw::four_hosts()?, &Monday)?;
     let envelope = &answer.envelope;
     let attempts = envelope["attempts"].as_array().ok_or("attempts")?;
     let hosts_version = canon::FileDigest::of(&std::fs::read(seed::committed_hosts())?);
     // Every index is asked before any page.
-    let indexes: Vec<Option<&str>> = [0, 1, 2].map(|nth| attempts[nth]["url"].as_str()).into();
+    let indexes: Vec<Option<&str>> = [0, 1, 2, 3].map(|nth| attempts[nth]["url"].as_str()).into();
     assert_eq!(
         (
             answer.exit,
@@ -627,8 +718,13 @@ fn an_open_web_run_collects_a_gnw_a_prn_and_a_cnw_day_end_to_end() -> TestResult
             Some("2026-11-16"),
             Some(hosts_version.hex()),
             ATTEMPTS,
-            vec![Some(INDEX), Some(PRN_INDEX), Some(CNW_INDEX)],
-            Some(6)
+            vec![
+                Some(INDEX),
+                Some(PRN_INDEX),
+                Some(CNW_INDEX),
+                Some(FED_INDEX)
+            ],
+            Some(8)
         ),
         "{envelope:#}"
     );
@@ -648,7 +744,7 @@ fn an_open_web_run_collects_a_gnw_a_prn_and_a_cnw_day_end_to_end() -> TestResult
         })
         .collect();
     let mut expected_counts = BTreeMap::new();
-    for index in [INDEX, PRN_INDEX, CNW_INDEX] {
+    for index in [INDEX, PRN_INDEX, CNW_INDEX, FED_INDEX] {
         expected_counts.insert(index.to_owned(), (Some(3), Some(0), Some(0)));
     }
     let gnw_pages = RELEASES
@@ -662,7 +758,11 @@ fn an_open_web_run_collects_a_gnw_a_prn_and_a_cnw_day_end_to_end() -> TestResult
         .iter()
         .enumerate()
         .map(|(nth, (key, _))| (*key, nth != 2));
-    for (key, committed) in gnw_pages.chain(prn_pages).chain(cnw_pages) {
+    let fed_pages = FED_RELEASES
+        .iter()
+        .enumerate()
+        .map(|(nth, (key, _))| (*key, nth != 1));
+    for (key, committed) in gnw_pages.chain(prn_pages).chain(cnw_pages).chain(fed_pages) {
         let (unusable, items) = if committed { (0, 1) } else { (1, 0) };
         expected_counts.insert(
             format!("https://{key}"),
@@ -728,21 +828,100 @@ fn an_open_web_run_collects_a_gnw_a_prn_and_a_cnw_day_end_to_end() -> TestResult
             ("2026-11-16T06:47:00.000000Z", "2026-11-16T01:47:00-05:00"),
             MONDAY_RECEIVED_AT,
         )?,
+        // A day before the 10th is printed unpadded, and read as that day.
+        fed_item(
+            0,
+            (
+                "2026-11-13T21:15:00.000000Z",
+                "Fri, 13 Nov 2026 21:15:00 GMT",
+            ),
+            MONDAY_RECEIVED_AT,
+        )?,
+        fed_item(
+            2,
+            (
+                "2026-11-09T21:00:00.000000Z",
+                "Mon, 9 Nov 2026 21:00:00 GMT",
+            ),
+            MONDAY_RECEIVED_AT,
+        )?,
     ]);
-    assert_eq!(stored_items(&db)?, expected);
-    // Nothing is visible before the run observed it, and all six after.
+    let stored = stored_items(&db)?;
+    assert_eq!(stored, expected);
+    // Each story holds the page its url was answered with. Mutations 2026-11-17, the stub's pages
+    // swapped for Fed 0/2 (green before this assertion), PRN 1/2 and CNW 0/1: each red.
+    let golden: Value = serde_json::from_slice(&std::fs::read(
+        provider_dir().join("tests/fixtures/golden_bodies.json"),
+    )?)?;
+    // The page and title are written out, not read from the stub's tables they check.
+    let committed_pages = [
+        (
+            "gnw",
+            RELEASES[0].0,
+            "article_3403075.html",
+            "USTA FLORIDA RELEASES 2026 STATE OF FLORIDA TENNIS REPORT",
+        ),
+        (
+            "gnw",
+            RELEASES[1].0,
+            "synthetic_canonical_differs.html",
+            "Synthetic Release",
+        ),
+        (
+            "prn",
+            PRN_RELEASES[1].0,
+            "article_302939553.html",
+            "Novo's Wegovy® was associated with a reduction in food noise according to real-world studies at ObesityWeek® 2026",
+        ),
+        (
+            "prn",
+            PRN_RELEASES[2].0,
+            "article_302938569.html",
+            "Lilly to present new data across Zepbound, Foundayo, EloraTZP and retatrutide at ObesityWeek 2026, moving obesity care beyond the scale",
+        ),
+        (
+            "cnw",
+            CNW_RELEASES[0].0,
+            "article_805423040.html",
+            "Global Voltage, Travel-Ready Protection: ELEGRP Powers Dyson Supersonic Travel hair dryer",
+        ),
+        (
+            "cnw",
+            CNW_RELEASES[1].0,
+            "article_823884942.html",
+            "Segway Powersports Secures Class 2 One-Two Finish on SCORE Baja 1000 Debut",
+        ),
+        (
+            "fed",
+            FED_RELEASES[0].0,
+            "article_bcreg20261113a.html",
+            "Agencies extend comment period for proposed third-party risk management guidance",
+        ),
+        (
+            "fed",
+            FED_RELEASES[2].0,
+            "article_orders20261109a.html",
+            "Federal Reserve Board announces approval of two applications by Mutual Federal Bancorp, MHC, and MFB Bancorp, Inc.",
+        ),
+    ];
+    let expected_content = committed_pages
+        .into_iter()
+        .map(|page| committed_content(page, &golden, &stored))
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    assert_eq!(stored_content(&db)?, expected_content);
+    // Nothing is visible before the run observed it, and all eight after.
     assert_eq!(
         (
             visible(root.path(), "2026-11-16T08:05:00Z")?,
             visible(root.path(), "2026-11-16T08:06:00Z")?
         ),
-        (0, 6)
+        (0, 8)
     );
     Ok(())
 }
 
-/// The committed three-host file on Monday, on a fresh store: each attempt's url and id, in order.
-fn three_host_attempts(exchange: &Gnw) -> Result<Vec<(String, String)>, Box<dyn Error>> {
+/// The committed four-host file on Monday, on a fresh store: each attempt's url and id, in order.
+fn four_host_attempts(exchange: &Gnw) -> Result<Vec<(String, String)>, Box<dyn Error>> {
     let root = TempDir::new()?;
     seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
     let ask = Ask {
@@ -764,22 +943,24 @@ fn three_host_attempts(exchange: &Gnw) -> Result<Vec<(String, String)>, Box<dyn 
         .collect()
 }
 
-/// The three indexes, then one release of GNW, PRN and CNW per turn; and GNW's first release.
-fn round_robin_of_three_hosts() -> (Vec<String>, String) {
-    let [(gnw, gnw_pages), (prn, prn_pages), (cnw, cnw_pages)] = three_host_urls();
-    let mut order = vec![gnw, prn, cnw];
+/// The four indexes, then one release of GNW, PRN, CNW and the Fed per turn; and GNW's first
+/// release.
+fn round_robin_of_four_hosts() -> (Vec<String>, String) {
+    let [(gnw, gnw_pages), (prn, prn_pages), (cnw, cnw_pages), (fed, fed_pages)] = four_host_urls();
+    let mut order = vec![gnw, prn, cnw, fed];
     for nth in 0..RELEASES.len() {
         order.extend([
             gnw_pages[nth].clone(),
             prn_pages[nth].clone(),
             cnw_pages[nth].clone(),
+            fed_pages[nth].clone(),
         ]);
     }
     (order, gnw_pages[0].clone())
 }
 
-/// `(host's index, host's releases)` as urls, GNW, PRN, CNW.
-fn three_host_urls() -> [(String, Vec<String>); 3] {
+/// `(host's index, host's releases)` as urls, GNW, PRN, CNW, Fed.
+fn four_host_urls() -> [(String, Vec<String>); 4] {
     let pages = |keys: Vec<&str>| keys.iter().map(|key| format!("https://{key}")).collect();
     [
         (
@@ -794,15 +975,19 @@ fn three_host_urls() -> [(String, Vec<String>); 3] {
             CNW_INDEX.to_owned(),
             pages(CNW_RELEASES.iter().map(|(key, _)| *key).collect()),
         ),
+        (
+            FED_INDEX.to_owned(),
+            pages(FED_RELEASES.iter().map(|(key, _)| *key).collect()),
+        ),
     ]
 }
 
 /// Owner decision 2026-11-17 (§10): `collect` serves its hosts round-robin, in first-appearance
-/// order, so the three indexes, then one release of each host per turn.
+/// order, so the four indexes, then one release of each host per turn.
 #[test]
-fn a_three_host_run_asks_its_hosts_round_robin() -> TestResult {
-    let (expected, _) = round_robin_of_three_hosts();
-    let attempts = three_host_attempts(&Gnw::three_hosts()?)?;
+fn a_four_host_run_asks_its_hosts_round_robin() -> TestResult {
+    let (expected, _) = round_robin_of_four_hosts();
+    let attempts = four_host_attempts(&Gnw::four_hosts()?)?;
     let urls: Vec<String> = attempts.into_iter().map(|(url, _)| url).collect();
     assert_eq!(urls, expected);
     Ok(())
@@ -812,35 +997,39 @@ fn a_three_host_run_asks_its_hosts_round_robin() -> TestResult {
 /// GNW's lane, after every request already queued, and stops at `MAX_TRANSIENT_RETRIES`.
 #[test]
 fn a_retried_release_waits_behind_the_other_hosts_and_stops_at_the_cap() -> TestResult {
-    let (mut expected, failing) = round_robin_of_three_hosts();
+    let (mut expected, failing) = round_robin_of_four_hosts();
     expected.extend([failing.clone(), failing.clone()]);
-    let exchange = Gnw::three_hosts()?.answering(&failing, &[UNAVAILABLE; 3]);
-    let attempts = three_host_attempts(&exchange)?;
+    let exchange = Gnw::four_hosts()?.answering(&failing, &[UNAVAILABLE; 3]);
+    let attempts = four_host_attempts(&exchange)?;
     let urls: Vec<String> = attempts.into_iter().map(|(url, _)| url).collect();
     assert_eq!(urls, expected);
     Ok(())
 }
 
 /// §8 R21 with lanes of unequal length: PRN's index fails every time, so PRN's lane holds only its
-/// retry, which is asked on PRN's next turn and never waits for GNW's and CNW's releases to drain.
+/// retry, which is asked on PRN's next turn and never waits for the other hosts' releases to drain.
 #[test]
 fn a_retried_index_keeps_its_host_turn_while_the_other_hosts_releases_are_served() -> TestResult {
-    let [(gnw, gnw_pages), (prn, _), (cnw, cnw_pages)] = three_host_urls();
+    let [(gnw, gnw_pages), (prn, _), (cnw, cnw_pages), (fed, fed_pages)] = four_host_urls();
     let expected = [
         &gnw,
         &prn,
         &cnw,
+        &fed,
         &gnw_pages[0],
         &prn,
         &cnw_pages[0],
+        &fed_pages[0],
         &gnw_pages[1],
         &prn,
         &cnw_pages[1],
+        &fed_pages[1],
         &gnw_pages[2],
         &cnw_pages[2],
+        &fed_pages[2],
     ];
-    let exchange = Gnw::three_hosts()?.answering(PRN_INDEX, &[UNAVAILABLE; 3]);
-    let attempts = three_host_attempts(&exchange)?;
+    let exchange = Gnw::four_hosts()?.answering(PRN_INDEX, &[UNAVAILABLE; 3]);
+    let attempts = four_host_attempts(&exchange)?;
     let urls: Vec<&String> = attempts.iter().map(|(url, _)| url).collect();
     assert_eq!(urls, expected);
     Ok(())
@@ -849,11 +1038,11 @@ fn a_retried_index_keeps_its_host_turn_while_the_other_hosts_releases_are_served
 /// An attempt id hashes (run, source, window, ordinal), and the ordinal is the position in the
 /// round-robin order: the same plan and answers on two fresh stores give the same ids, url by url.
 #[test]
-fn a_replayed_three_host_run_gives_every_attempt_the_same_id_and_url() -> TestResult {
-    let first = three_host_attempts(&Gnw::three_hosts()?)?;
-    let second = three_host_attempts(&Gnw::three_hosts()?)?;
+fn a_replayed_four_host_run_gives_every_attempt_the_same_id_and_url() -> TestResult {
+    let first = four_host_attempts(&Gnw::four_hosts()?)?;
+    let second = four_host_attempts(&Gnw::four_hosts()?)?;
     let distinct: std::collections::BTreeSet<&String> = first.iter().map(|(_, id)| id).collect();
-    assert_eq!((first.len(), distinct.len(), &first), (12, 12, &second));
+    assert_eq!((first.len(), distinct.len(), &first), (16, 16, &second));
     Ok(())
 }
 
