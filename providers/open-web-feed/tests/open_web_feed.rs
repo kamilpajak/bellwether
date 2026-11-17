@@ -1166,6 +1166,46 @@ fn the_path_handed_to_robots_is_the_fetched_urls_path_as_written() -> Outcome {
     Ok(())
 }
 
+/// robots.cc reads a url only %-encoded (robots.h:153) and matches it as written, so a raw
+/// non-ASCII, space or control byte would be checked unescaped; `%2e` segments would walk.
+#[test]
+fn a_document_path_robots_cannot_read_as_written_is_filtered_out_and_never_asked() -> Outcome {
+    let item = |link: &str| {
+        format!("<item><link>{link}</link><pubDate>Sat, 14 Nov 2026 19:00 GMT</pubDate></item>")
+    };
+    let index = format!(
+        "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel>{}{}{}{}{}{}</channel></rss>",
+        item("https://rss.globenewswire.com/news-release/1/caf\u{e9}.html"),
+        item("https://rss.globenewswire.com/news-release/2/a b.html"),
+        item("https://rss.globenewswire.com/news-release/3/%2e%2e/x.html"),
+        item("https://rss.globenewswire.com/news-release/4/.%2E/x.html"),
+        item("https://rss.globenewswire.com/news-release/5/%2E/x.html"),
+        item("https://rss.globenewswire.com/news-release/6/%2e%2e.html"),
+    );
+    let (feed, rules) = gnw_disallowing("/never/")?;
+    let extracted = follow_ups(&feed, index.as_bytes())?;
+    let kept: Vec<&str> = extracted
+        .follow_ups
+        .iter()
+        .map(|request| request.url.as_str())
+        .collect();
+    assert_eq!(
+        (
+            asked(&rules),
+            kept,
+            extracted.filtered_out,
+            extracted.robots_disallowed
+        ),
+        (
+            vec!["/news-release/6/%2e%2e.html".to_owned()],
+            vec!["https://rss.globenewswire.com/news-release/6/%2e%2e.html"],
+            5,
+            0
+        )
+    );
+    Ok(())
+}
+
 /// Fail closed: a host whose robots were never handed over follows nothing, and every row it
 /// would have followed is counted as disallowed rather than dropped.
 #[test]

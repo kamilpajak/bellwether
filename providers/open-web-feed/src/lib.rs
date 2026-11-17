@@ -398,7 +398,7 @@ impl OpenWebFeed {
         for row in &rows {
             let kept = row.link.as_deref().and_then(|link| {
                 let (at, path) = self.rewritten(link)?;
-                let walks = path.split('/').any(|segment| matches!(segment, "." | ".."));
+                let readable = followable_path(&path);
                 let followed = rule.provider_keys.as_ref().is_none_or(|keys| {
                     row.image
                         .as_deref()
@@ -407,7 +407,7 @@ impl OpenWebFeed {
                 });
                 (at == host
                     && path.starts_with(&rule.path_prefix)
-                    && !walks
+                    && readable
                     && followed
                     && keyed.insert(format!("{at}{path}")))
                 .then(|| format!("https://{at}{path}"))
@@ -669,6 +669,16 @@ pub(crate) fn host_and_path(url: &str) -> Option<(String, String)> {
 pub(crate) fn plain_path(path: &str) -> bool {
     path.bytes()
         .all(|byte| !NOT_PLAIN.contains(&byte) && byte.is_ascii() && !byte.is_ascii_control())
+}
+
+/// A document path robots.cc reads as fetched (robots.h:153 wants it %-encoded): printable ASCII
+/// with no space, and no segment that is `.` or `..`, written or as `%2e`, which servers walk.
+fn followable_path(path: &str) -> bool {
+    path.bytes().all(|byte| byte.is_ascii_graphic())
+        && path.split('/').all(|segment| {
+            let dots = segment.replace("%2e", ".").replace("%2E", ".");
+            !matches!(dots.as_str(), "." | "..")
+        })
 }
 
 /// `host_and_path` with the query kept: the path robots.txt rules are matched against.
