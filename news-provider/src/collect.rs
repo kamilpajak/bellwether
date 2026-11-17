@@ -439,19 +439,9 @@ pub fn collect<A: Archive>(
     while let Some(Queued { request, retries }) = queue.pop() {
         let attempted = attempt_once(&driving, archive, &request, ordinal)?;
         ordinal += 1;
-        // Re-queue a transient failure under the cap to the BACK of its host's lane, so the pace
-        // limiter (R19) spaces the retry; it is just another `attempt_once`. §8 R21.
-        let retrying = attempted.is_transient() && retries < MAX_TRANSIENT_RETRIES;
+        let retrying = Queued::retried(attempted.is_transient(), retries);
         collected.absorb(&attempted, retrying);
-        for follow_up in attempted.follow_ups {
-            queue.push(Queued::first_attempt(follow_up));
-        }
-        if retrying {
-            queue.push(Queued {
-                request,
-                retries: retries + 1,
-            });
-        }
+        queue.requeue(attempted.follow_ups, Queued { request, retries }, retrying);
     }
     collected.per_source = vec![tally_of(&source, &collected)];
     Ok(collected)
@@ -475,6 +465,11 @@ impl Queued {
             request,
             retries: 0,
         }
+    }
+
+    /// A transient failure is asked again until `MAX_TRANSIENT_RETRIES` re-attempts. §8 R21.
+    pub(crate) const fn retried(transient: bool, retries: u32) -> bool {
+        transient && retries < MAX_TRANSIENT_RETRIES
     }
 }
 
@@ -500,11 +495,25 @@ impl HostQueue {
     }
 
     /// To the back of its host's lane; a host not seen before opens a lane after every other.
-    pub(crate) fn push(&mut self, queued: Queued) {
+    fn push(&mut self, queued: Queued) {
         let host = host_of(&queued.request.url).ok().flatten();
         match self.lanes.iter_mut().find(|(key, _)| *key == host) {
             Some((_, lane)) => lane.push_back(queued),
             None => self.lanes.push((host, VecDeque::from([queued]))),
+        }
+    }
+
+    /// After `asked` is attempted: its follow-ups, then itself again when `retrying`, each to the
+    /// back of its host's lane, so the pace limiter (R19) spaces the retry. §8 R21.
+    pub(crate) fn requeue(&mut self, follow_ups: Vec<Request>, asked: Queued, retrying: bool) {
+        for follow_up in follow_ups {
+            self.push(Queued::first_attempt(follow_up));
+        }
+        if retrying {
+            self.push(Queued {
+                request: asked.request,
+                retries: asked.retries + 1,
+            });
         }
     }
 
@@ -839,25 +848,23 @@ mod tests {
         }
     }
 
-    /// `collect`'s loop without the socket: each index answers `pages` follow-ups on its own host,
-    /// and `failing` fails transiently on every attempt. Every url popped, in order.
-    fn driven(plan: &[&str], pages: usize, failing: &str) -> Vec<String> {
-        let mut queue = HostQueue::of(plan.iter().map(|base| asking(base, "index")).collect());
+    /// `collect`'s loop without the socket: each `(host, pages)` index answers `pages` follow-ups
+    /// on its own host, and `failing` fails transiently on every attempt. Every url popped, in order.
+    fn driven(plan: &[(&str, usize)], failing: &str) -> Vec<String> {
+        let mut queue = HostQueue::of(plan.iter().map(|(base, _)| asking(base, "index")).collect());
         let mut popped = Vec::new();
         while let Some(Queued { request, retries }) = queue.pop() {
             popped.push(request.url.clone());
-            if request.url.ends_with("index") {
-                let base = request.url.trim_end_matches("index");
-                for page in 0..pages {
-                    queue.push(Queued::first_attempt(asking(base, &format!("p{page}"))));
-                }
-            }
-            if request.url == failing && retries < super::MAX_TRANSIENT_RETRIES {
-                queue.push(Queued {
-                    request,
-                    retries: retries + 1,
-                });
-            }
+            let base = request.url.trim_end_matches("index");
+            let pages = plan
+                .iter()
+                .find(|(host, _)| request.url.ends_with("index") && *host == base)
+                .map_or(0, |(_, pages)| *pages);
+            let follow_ups = (0..pages)
+                .map(|page| asking(base, &format!("p{page}")))
+                .collect();
+            let retrying = Queued::retried(request.url == failing, retries);
+            queue.requeue(follow_ups, Queued { request, retries }, retrying);
         }
         popped
     }
@@ -872,7 +879,7 @@ mod tests {
     #[test]
     fn the_queue_serves_three_hosts_round_robin_in_the_order_each_host_first_appeared() {
         assert_eq!(
-            driven(&[GNW, PRN, CNW], 2, ""),
+            driven(&[(GNW, 2), (PRN, 2), (CNW, 2)], ""),
             urls(&[
                 (GNW, "index"),
                 (PRN, "index"),
@@ -892,7 +899,7 @@ mod tests {
     fn a_retry_goes_to_the_back_of_its_host_lane_and_stops_at_the_cap() {
         let failing = format!("{PRN}p0");
         assert_eq!(
-            driven(&[GNW, PRN], 2, &failing),
+            driven(&[(GNW, 2), (PRN, 2)], &failing),
             urls(&[
                 (GNW, "index"),
                 (PRN, "index"),
@@ -906,12 +913,32 @@ mod tests {
         );
     }
 
+    /// §8 R21: a retry on a host with a shorter lane keeps that host's turn and does not wait for
+    /// the longer lane to drain, which the former back-of-the-whole-queue order would.
+    #[test]
+    fn a_retry_on_a_short_lane_is_served_in_its_host_turn_while_a_longer_lane_drains() {
+        let failing = format!("{GNW}p0");
+        assert_eq!(
+            driven(&[(GNW, 1), (PRN, 3)], &failing),
+            urls(&[
+                (GNW, "index"),
+                (PRN, "index"),
+                (GNW, "p0"),
+                (PRN, "p0"),
+                (GNW, "p0"),
+                (PRN, "p1"),
+                (GNW, "p0"),
+                (PRN, "p2"),
+            ])
+        );
+    }
+
     /// EDGAR asks one host, so its order is the FIFO it was before round-robin.
     #[test]
     fn one_host_is_one_lane_and_keeps_the_fifo_order() {
         let failing = format!("{SEC}p0");
         assert_eq!(
-            driven(&[SEC], 2, &failing),
+            driven(&[(SEC, 2)], &failing),
             urls(&[
                 (SEC, "index"),
                 (SEC, "p0"),

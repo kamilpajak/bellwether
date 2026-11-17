@@ -821,6 +821,31 @@ fn a_retried_release_waits_behind_the_other_hosts_and_stops_at_the_cap() -> Test
     Ok(())
 }
 
+/// §8 R21 with lanes of unequal length: PRN's index fails every time, so PRN's lane holds only its
+/// retry, which is asked on PRN's next turn and never waits for GNW's and CNW's releases to drain.
+#[test]
+fn a_retried_index_keeps_its_host_turn_while_the_other_hosts_releases_are_served() -> TestResult {
+    let [(gnw, gnw_pages), (prn, _), (cnw, cnw_pages)] = three_host_urls();
+    let expected = [
+        &gnw,
+        &prn,
+        &cnw,
+        &gnw_pages[0],
+        &prn,
+        &cnw_pages[0],
+        &gnw_pages[1],
+        &prn,
+        &cnw_pages[1],
+        &gnw_pages[2],
+        &cnw_pages[2],
+    ];
+    let exchange = Gnw::three_hosts()?.answering(PRN_INDEX, &[UNAVAILABLE; 3]);
+    let attempts = three_host_attempts(&exchange)?;
+    let urls: Vec<&String> = attempts.iter().map(|(url, _)| url).collect();
+    assert_eq!(urls, expected);
+    Ok(())
+}
+
 /// An attempt id hashes (run, source, window, ordinal), and the ordinal is the position in the
 /// round-robin order: the same plan and answers on two fresh stores give the same ids, url by url.
 #[test]

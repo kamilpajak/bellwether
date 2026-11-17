@@ -1712,25 +1712,19 @@ fn a_request_that_fails_transiently_every_time_is_bounded_to_n_plus_one_attempts
 }
 
 /// EDGAR asks one host, `www.sec.gov`, so round-robin by host (§10, 2026-11-17) is its FIFO: the
-/// index, its filings in index order, then each retry at the back.
+/// index, its filings in index order, then each retry of the FIRST filing behind the second.
 #[test]
 fn an_edgar_run_on_its_one_host_keeps_the_fifo_order_retries_last() -> TestResult {
     let root = TempDir::new()?;
     let always = Payloads::of(&[
         (INDEX_URL, OK, "form.20261110.idx"),
-        (APPLE_URL, OK, "filing_8k_apple.txt"),
-        (MICROSOFT_URL, SERVICE_UNAVAILABLE, "error_403_traffic.html"),
+        (APPLE_URL, SERVICE_UNAVAILABLE, "error_403_traffic.html"),
+        (MICROSOFT_URL, OK, "filing_8k_microsoft_no_acceptance.txt"),
     ])?;
     collected(root.path(), A_LISTED_SESSION, &always)?;
     assert_eq!(
         asked(&always),
-        [
-            INDEX_URL,
-            APPLE_URL,
-            MICROSOFT_URL,
-            MICROSOFT_URL,
-            MICROSOFT_URL
-        ]
+        [INDEX_URL, APPLE_URL, MICROSOFT_URL, APPLE_URL, APPLE_URL]
     );
     Ok(())
 }
