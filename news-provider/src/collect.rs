@@ -320,6 +320,7 @@ pub struct AttemptRow {
     pub outcome: &'static str,
     pub vendor_rows: u32,
     pub filtered_out: u32,
+    pub robots_disallowed: u32,
     pub unusable_rows: u32,
     pub items_committed: u32,
     /// Present when the store refused this attempt's rows, so exit 8 names the attempt rather
@@ -340,6 +341,7 @@ pub struct SourceTally {
     pub failed: u32,
     pub vendor_rows: u32,
     pub filtered_out: u32,
+    pub robots_disallowed: u32,
     pub unusable_rows: u32,
     pub items_committed: u32,
 }
@@ -609,24 +611,27 @@ fn attempt_once<A: Archive>(
         )),
         _ => None,
     };
-    let (vendor_rows, filtered_out, unusable_rows, listing_unusable) = match &extracted {
-        Some(extracted) => (
-            extracted.vendor_rows,
-            extracted.filtered_out,
-            count(extracted.unusable.len()),
-            count(
-                extracted
-                    .unusable
-                    .iter()
-                    .filter(|row| row.decided_by == DecidedBy::IndexRow)
-                    .count(),
+    let (vendor_rows, filtered_out, robots_disallowed, unusable_rows, listing_unusable) =
+        match &extracted {
+            Some(extracted) => (
+                extracted.vendor_rows,
+                extracted.filtered_out,
+                extracted.robots_disallowed,
+                count(extracted.unusable.len()),
+                count(
+                    extracted
+                        .unusable
+                        .iter()
+                        .filter(|row| row.decided_by == DecidedBy::IndexRow)
+                        .count(),
+                ),
             ),
-        ),
-        None => (0, 0, 0, 0),
-    };
+            None => (0, 0, 0, 0, 0),
+        };
     let counts = Counts {
         vendor_rows,
         listing_unusable,
+        robots_disallowed,
     };
     let outcome = Outcome::decide(&verdict, counts, baseline);
     let kind = outcome.kind();
@@ -681,6 +686,7 @@ fn attempt_once<A: Archive>(
             outcome: kind.name(),
             vendor_rows,
             filtered_out,
+            robots_disallowed,
             unusable_rows,
             items_committed: committed.items_committed,
             commit_refused: refusal,
@@ -810,6 +816,7 @@ fn tally_of(source: &SourceId, collected: &Collected) -> SourceTally {
         failed: outcomes(OutcomeKind::Failed.name()),
         vendor_rows: sum(|row| row.vendor_rows),
         filtered_out: sum(|row| row.filtered_out),
+        robots_disallowed: sum(|row| row.robots_disallowed),
         unusable_rows: sum(|row| row.unusable_rows),
         items_committed: sum(|row| row.items_committed),
     }

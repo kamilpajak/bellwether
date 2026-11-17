@@ -347,6 +347,7 @@ fn fetch(
         Counts {
             vendor_rows: NO_VENDOR_ROWS,
             listing_unusable: 0,
+            robots_disallowed: 0,
         },
         &Baseline::from_trailing_ok(&[]),
     );

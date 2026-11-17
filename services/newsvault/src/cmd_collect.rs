@@ -5,7 +5,9 @@
 //! The run envelope is on disk with `finished_at` null BEFORE the lease is attempted, so a run
 //! that dies holding nothing still left a record that it started (accepted attack A3.13).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use canon::digest::{doc_id, item_id, story_id, ItemFields};
@@ -19,7 +21,7 @@ use news_provider::{
     Committed, Credentials, Exchange, Exit, Payload, Provider, Relisted, Run, RunId, SourceId,
     TargetWindow, Wire,
 };
-use open_web_feed::{CrossChecker, DirectAnswer, OpenWebFeed, RobotsPin};
+use open_web_feed::{CrossChecker, DirectAnswer, HostRobots, OpenWebFeed, RobotsPin};
 use pit::{MeasuredLag, ObservationTime};
 use serde_json::{json, Value};
 
@@ -478,6 +480,7 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
                 let version = provider.hosts_version().hex().to_owned();
                 let extraction = provider.extract_version().hex().to_owned();
                 let admitted = admitted_robots(&ask.store, &provider)?;
+                let provider = provider.with_robots(handed_robots(&admitted));
                 cross_checker = provider.cross_checker();
                 (
                     Box::new(provider),
@@ -531,6 +534,25 @@ fn admitted_robots(
         });
     }
     Ok(admitted)
+}
+
+/// The pinned robots the feed checks each follow-up against (owner decision 2026-11-17). A row
+/// whose pin cannot be read is handed nothing, so the feed follows none of its rows; the run is
+/// refused before any request anyway (`refuse_what_the_pinned_robots_forbids`).
+fn handed_robots(admitted: &[AdmittedRobots]) -> BTreeMap<String, HostRobots> {
+    admitted
+        .iter()
+        .filter_map(|row| {
+            let handed = match &row.robots {
+                PinnedRobots::NoRobots => HostRobots::Absent,
+                PinnedRobots::Read(robots) => HostRobots::Rules(Arc::new(robots.clone())),
+                PinnedRobots::BlobMissing
+                | PinnedRobots::Altered(_)
+                | PinnedRobots::Unreadable(_) => return None,
+            };
+            Some((row.host.clone(), handed))
+        })
+        .collect()
 }
 
 /// The policy's entry for this source's archive arm, read once per call from the caller's file.
@@ -1131,6 +1153,7 @@ fn envelope_of(
             "outcome": row.outcome,
             "vendor_rows": row.vendor_rows,
             "filtered_out": row.filtered_out,
+            "robots_disallowed": row.robots_disallowed,
             "unusable_rows": row.unusable_rows,
             "items_committed": row.items_committed,
             "commit_refused": row.commit_refused,
@@ -1145,6 +1168,7 @@ fn envelope_of(
             "failed": row.failed,
             "vendor_rows": row.vendor_rows,
             "filtered_out": row.filtered_out,
+            "robots_disallowed": row.robots_disallowed,
             "unusable_rows": row.unusable_rows,
             "items_committed": row.items_committed,
         })).collect::<Vec<Value>>(),
@@ -1191,11 +1215,12 @@ pub fn render_human(envelope: &Value, out: &mut impl std::io::Write) -> std::io:
     for attempt in envelope["attempts"].as_array().unwrap_or(&none) {
         writeln!(
             out,
-            "  {:<9} {:<8} rows {} filtered {} items {}",
+            "  {:<9} {:<8} rows {} filtered {} robots {} items {}",
             text(attempt, "phase"),
             text(attempt, "outcome"),
             attempt["vendor_rows"],
             attempt["filtered_out"],
+            attempt["robots_disallowed"],
             attempt["items_committed"],
         )?;
     }
@@ -1576,6 +1601,7 @@ mod tests {
             Counts {
                 vendor_rows: 1,
                 listing_unusable: 0,
+                robots_disallowed: 0,
             },
             &Baseline::from_trailing_ok(&[1]),
         );

@@ -46,7 +46,7 @@
 //! let raw = committer.put_blob(b"{}")?;
 //! let mut slot = AttemptSlot::open(&mut committer, &request, None, &run, 0, at)?;
 //! let answer = RawResponse::new(slot.attempt_id().clone(), 200, b"{}".to_vec(), at, at);
-//! let counts = Counts { vendor_rows: 1, listing_unusable: 0 };
+//! let counts = Counts { vendor_rows: 1, listing_unusable: 0, robots_disallowed: 0 };
 //! let outcome = Outcome::decide(&Verdict::Usable, counts, &Baseline::from_trailing_ok(&[1]));
 //! let closed = slot.close(&mut committer, outcome, &Ok(answer), at)?;
 //! let rows = [ItemRow {
@@ -114,11 +114,11 @@ PRAGMA synchronous = FULL;
 ";
 
 /// The `PRAGMA user_version` this build writes, and the only one a read-only reader accepts.
-pub const SCHEMA_VERSION: i32 = 8;
+pub const SCHEMA_VERSION: i32 = 9;
 
 /// Version `i + 1` is reached from version `i` by `MIGRATIONS[i]`, run by [`migrate`] with
 /// foreign keys off, as SQLite's twelve-step table rebuild (lang_altertable.html) requires.
-const MIGRATIONS: [&str; 8] = [
+const MIGRATIONS: [&str; 9] = [
     "
 -- The hosts file a run was admitted under: architecture.md section 2's `hosts_version` row. NULL
 -- for a provider that reads no hosts file.
@@ -231,6 +231,12 @@ CREATE TABLE relisted (
 -- or not, so a `relisted_disputed` of 0 can be told from nothing compared. NULL on every other
 -- row and on every row before user_version 8, not backfilled.
 ALTER TABLE attempts ADD COLUMN relisted_compared INTEGER;
+",
+    "
+-- `news_provider::Counts::robots_disallowed`: index rows not followed because the host's pinned
+-- robots.txt disallows their url (owner decision 2026-11-17, section 11.1). NULL for an abandoned
+-- attempt and for every row closed before user_version 9, not backfilled.
+ALTER TABLE attempts ADD COLUMN robots_disallowed INTEGER;
 ",
 ];
 
@@ -1944,7 +1950,7 @@ fn apply(db: &Connection, event: &AttemptEvent) -> Result<(), StoreError> {
                 "UPDATE attempts SET outcome = ?2, vendor_rows = ?3,
                      baseline_count = ?4, baseline_window = ?5, baseline_construction = ?6,
                      baseline_ratio = ?7, slots = ?8, closed_at = ?9, verdict = ?10,
-                     listing_unusable = ?11
+                     listing_unusable = ?11, robots_disallowed = ?12
                  WHERE attempt_id = ?1",
                 params![
                     attempt_id.hex(),
@@ -1957,7 +1963,8 @@ fn apply(db: &Connection, event: &AttemptEvent) -> Result<(), StoreError> {
                     cost.map(|Cost::Slots(slots)| slots),
                     stamp(closed_at.inner()),
                     outcome.verdict().map(Verdict::name),
-                    counts.map(|counts| counts.listing_unusable)
+                    counts.map(|counts| counts.listing_unusable),
+                    counts.map(|counts| counts.robots_disallowed)
                 ],
             )?;
             Ok(())
@@ -2301,6 +2308,7 @@ mod tests {
             Counts {
                 vendor_rows,
                 listing_unusable: 0,
+                robots_disallowed: 0,
             },
             &Baseline::from_trailing_ok(&TRAILING_OK),
         );
@@ -2334,6 +2342,7 @@ mod tests {
             Counts {
                 vendor_rows,
                 listing_unusable: 0,
+                robots_disallowed: 0,
             },
             &Baseline::from_trailing_ok(&TRAILING_OK),
         );
@@ -2861,6 +2870,7 @@ mod tests {
             Counts {
                 vendor_rows: 0,
                 listing_unusable: 0,
+                robots_disallowed: 0,
             },
             &Baseline::from_trailing_ok(&[]),
         );
@@ -3785,6 +3795,122 @@ mod tests {
                 .into_iter()
                 .map(|(_, columns)| (columns.clone(), columns, 7))
                 .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    /// A v8 store: the v7 fixture and `MIGRATIONS[7]`, with a compared count on the v1 attempt.
+    fn a_store_at_user_version_eight(temp: &TempDir) -> TestResult {
+        a_store_at_user_version_seven(temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch(MIGRATIONS[7])?;
+        db.pragma_update(None, "user_version", 8)?;
+        db.execute_batch(
+            "UPDATE attempts SET relisted_compared = 2 WHERE attempt_id = 'a v1 attempt';",
+        )?;
+        Ok(())
+    }
+
+    fn disallowed_on(store: &Committer, attempt: &str) -> Result<Option<u32>, rusqlite::Error> {
+        store.db.query_row(
+            "SELECT robots_disallowed FROM attempts WHERE attempt_id = ?1",
+            params![attempt],
+            |row| row.get(0),
+        )
+    }
+
+    /// §8 row M1 from user_version 8: the step to 9 adds `attempts.robots_disallowed`, and a
+    /// closed attempt's count lands in it.
+    #[test]
+    fn a_store_at_user_version_eight_opens_migrates_to_nine_and_takes_a_robots_count() -> TestResult
+    {
+        const DISALLOWED: u32 = 2;
+        let temp = TempDir::new()?;
+        a_store_at_user_version_eight(&temp)?;
+        let mut store = open(&temp)?;
+        let slot = AttemptSlot::open(
+            &mut store,
+            &request_from(SOURCE),
+            None,
+            &RunId::new(RUN),
+            0,
+            at(1),
+        )?;
+        let attempt = slot.attempt_id().hex().to_owned();
+        let answer = RawResponse::new(
+            slot.attempt_id().clone(),
+            STATUS_OK,
+            PAYLOAD.to_vec(),
+            at(2),
+            at(3),
+        );
+        let outcome = Outcome::decide(
+            &Verdict::Usable,
+            Counts {
+                vendor_rows: VENDOR_ROWS,
+                listing_unusable: 0,
+                robots_disallowed: DISALLOWED,
+            },
+            &Baseline::from_trailing_ok(&TRAILING_OK),
+        );
+        let closed = slot.close(&mut store, outcome, &Ok(answer), at(4))?;
+        store.record(closed, None, &[], at(5))?;
+        assert_eq!(
+            (
+                user_version(&store.db)?,
+                disallowed_on(&store, &attempt)?,
+                super::columns_of(&store.db, "attempts")?.get("robots_disallowed")
+            ),
+            (
+                SCHEMA_VERSION,
+                Some(DISALLOWED),
+                Some(&("INTEGER".to_owned(), false, None, 0))
+            )
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the carried half from user_version 8: every column of every row of every v8
+    /// table, compared by `quote()`; the v8 attempt gains a NULL `robots_disallowed`.
+    #[test]
+    fn a_v8_store_keeps_every_v8_column_of_every_row() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_eight(&temp)?;
+        let v8 = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let before = quoted_rows(&v8, 8, &V7_TABLES)?;
+        drop(v8);
+        assert!(super::refuse_an_unreadable_version(temp.path()).is_ok());
+        let store = open(&temp)?;
+        let after = quoted_rows(&store.db, 8, &V7_TABLES)?;
+        assert_eq!(before.len(), V7_TABLES.len() + 1);
+        assert_eq!(
+            (after, disallowed_on(&store, "a v1 attempt")?),
+            (before, None)
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the per-version shape check at user_version 8.
+    #[test]
+    fn a_v8_store_whose_columns_differ_is_refused_and_left_at_user_version_eight() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_eight(&temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch("ALTER TABLE attempts DROP COLUMN relisted_compared;")?;
+        drop(db);
+        let read_only = match super::refuse_an_unreadable_version(temp.path()) {
+            Err(StoreError::ShapeDiffers { found: 8, columns }) => columns,
+            other => vec![format!("{other:?}")],
+        };
+        let refused = match open(&temp) {
+            Err(StoreError::ShapeDiffers { found: 8, columns }) => columns,
+            other => vec![format!("{other:?}")],
+        };
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let expected = vec!["attempts.relisted_compared".to_owned()];
+        assert_eq!(
+            (refused, read_only, user_version(&db)?),
+            (expected.clone(), expected, 8)
         );
         Ok(())
     }
@@ -4815,6 +4941,7 @@ mod tests {
             Counts {
                 vendor_rows: 0,
                 listing_unusable,
+                robots_disallowed: 0,
             },
             &Baseline::from_trailing_ok(&TRAILING_OK),
         );
@@ -4971,6 +5098,7 @@ mod tests {
             Counts {
                 vendor_rows: VENDOR_ROWS,
                 listing_unusable: 0,
+                robots_disallowed: 0,
             },
             &Baseline::from_trailing_ok(&TRAILING_OK),
         );
@@ -5586,6 +5714,7 @@ mod tests {
             Counts {
                 vendor_rows: VENDOR_ROWS,
                 listing_unusable: 0,
+                robots_disallowed: 0,
             },
             &Baseline::from_trailing_ok(&TRAILING_OK),
         );

@@ -585,6 +585,7 @@ fn an_empty_daily_index_closes_empty_and_writes_its_row() -> Outcome {
         news_provider::Counts {
             vendor_rows: 0,
             listing_unusable: 0,
+            robots_disallowed: 0,
         },
         &news_provider::Baseline::from_trailing_ok(&[]),
     );

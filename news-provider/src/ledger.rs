@@ -170,6 +170,9 @@ pub struct Counts {
     /// Unusable rows whose reason the index row decided ([`crate::DecidedBy::IndexRow`]): a
     /// usable Document attempt with any is not held (architecture.md section 11.1).
     pub listing_unusable: u32,
+    /// Index rows not followed because the host's pinned robots.txt disallows their url
+    /// (architecture.md section 11.1): looked at, deliberately not asked.
+    pub robots_disallowed: u32,
 }
 
 /// What one attempt cost. There is no metered arm until a metered vendor arrives.
@@ -598,6 +601,7 @@ pub(crate) mod tests {
             Counts {
                 vendor_rows: VENDOR_ROWS,
                 listing_unusable: 0,
+                robots_disallowed: 0,
             },
             &baseline(),
         )
@@ -771,6 +775,7 @@ pub(crate) mod tests {
                 Counts {
                     vendor_rows: VENDOR_ROWS,
                     listing_unusable: 0,
+                    robots_disallowed: 0,
                 },
                 &baseline(),
             );
@@ -791,6 +796,7 @@ pub(crate) mod tests {
                     Counts {
                         vendor_rows: VENDOR_ROWS,
                         listing_unusable: 0,
+                        robots_disallowed: 0,
                     },
                     &baseline(),
                 )
@@ -813,6 +819,7 @@ pub(crate) mod tests {
             Counts {
                 vendor_rows: COLLAPSE_SHAPED_ROWS,
                 listing_unusable: 0,
+                robots_disallowed: 0,
             },
             &baseline(),
         );
@@ -837,6 +844,7 @@ pub(crate) mod tests {
             Counts {
                 vendor_rows: VENDOR_ROWS,
                 listing_unusable: 0,
+                robots_disallowed: 0,
             },
             &Baseline::from_trailing_ok(&[]),
         );
