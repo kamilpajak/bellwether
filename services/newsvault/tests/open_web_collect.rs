@@ -111,6 +111,28 @@ const PRN_RELEASES: [(&str, &str); 3] = [
     ),
 ];
 
+const CNW_INDEX: &str = "https://www.newswire.ca/sitemap-news.xml?page=1";
+/// `cnw/sitemap_news_3_urls.xml`'s three links with the page each is answered with. HKEX's page
+/// is not kept, so 807505308 is answered with the synthetic page that has no `section.release-body`.
+const CNW_RELEASES: [(&str, &str); 3] = [
+    (
+        "www.newswire.ca/news-releases/global-voltage-travel-ready-protection-elegrp-powers-dyson-supersonic-travel-hair-dryer-805423040.html",
+        "article_805423040.html",
+    ),
+    (
+        "www.newswire.ca/news-releases/segway-powersports-secures-class-2-one-two-finish-on-score-baja-1000-debut-823884942.html",
+        "article_823884942.html",
+    ),
+    (
+        "www.newswire.ca/news-releases/hkex-launches-offshore-rmb-bond-index-807505308.html",
+        "synthetic_no_release_body.html",
+    ),
+];
+/// Monday 2026-11-16, after the CNW fixtures' publication minutes (07:22Z newest), so no CNW item
+/// is observed before it was published; one second before it, the stub's `received_at`.
+const MONDAY_AT: &str = "2026-11-16T08:05:30Z";
+const MONDAY_RECEIVED_AT: &str = "2026-11-16T08:05:29.000000Z";
+
 fn provider_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../providers/open-web-feed")
 }
@@ -161,6 +183,14 @@ impl Clock for Fixed {
     }
 }
 
+struct Monday;
+
+impl Clock for Monday {
+    fn now(&self) -> DateTime<Utc> {
+        instant(MONDAY_AT)
+    }
+}
+
 /// Answers each url out of a committed fixture, sent two seconds and received one second before
 /// the clock's instant, so the three instants differ and the stored observation names one of them.
 struct Gnw {
@@ -196,6 +226,19 @@ impl Gnw {
             both.pages.insert(format!("https://{key}"), fixture(page)?);
         }
         Ok(both)
+    }
+
+    /// `two_hosts`, and Canada Newswire's sitemap and `CNW_RELEASES` answered from `fixtures/cnw`.
+    fn three_hosts() -> Result<Self, Box<dyn Error>> {
+        let mut all = Self::two_hosts()?;
+        let fixture =
+            |name: &str| std::fs::read(provider_dir().join("tests/fixtures/cnw").join(name));
+        all.pages
+            .insert(CNW_INDEX.to_owned(), fixture("sitemap_news_3_urls.xml")?);
+        for (key, page) in CNW_RELEASES {
+            all.pages.insert(format!("https://{key}"), fixture(page)?);
+        }
+        Ok(all)
     }
 
     fn answering(self, url: &str, statuses: &[u16]) -> Self {
@@ -295,6 +338,11 @@ fn stored_items(db: &Connection) -> Result<BTreeMap<String, Row>, Box<dyn Error>
 
 /// The rows `Gnw::day` commits for `RELEASES`, keyed by story.
 fn gnw_items() -> BTreeMap<String, Row> {
+    gnw_items_received(RECEIVED_AT)
+}
+
+/// `gnw_items`, each page received at `received`.
+fn gnw_items_received(received: &str) -> BTreeMap<String, Row> {
     RELEASES
         .iter()
         .filter_map(|(key, _, raw, canonical)| {
@@ -313,16 +361,21 @@ fn gnw_items() -> BTreeMap<String, Row> {
                     Some((*raw).to_owned()),
                     Some("pubDate".to_owned()),
                     Some("vendor_published".to_owned()),
-                    RECEIVED_AT.to_owned(),
+                    received.to_owned(),
                 ),
             ))
         })
         .collect()
 }
 
-/// The committed row of `PRN_RELEASES[release]`: its canonical is its own link.
-fn prn_item(release: usize, minute: &str, raw: &str) -> Result<(String, Row), Box<dyn Error>> {
-    let (key, _) = PRN_RELEASES.get(release).ok_or("no such release")?;
+/// The committed row of the release keyed `key`, whose canonical is its own link, read from the
+/// index field `field` and received at `received`.
+fn own_link_item(
+    key: &str,
+    field: &str,
+    (minute, raw): (&str, &str),
+    received: &str,
+) -> Result<(String, Row), Box<dyn Error>> {
     let story = digest(canon::digest::story_id(SOURCE, key)).ok_or("story id")?;
     Ok((
         story,
@@ -331,11 +384,31 @@ fn prn_item(release: usize, minute: &str, raw: &str) -> Result<(String, Row), Bo
             Some(minute.to_owned()),
             None,
             Some(raw.to_owned()),
-            Some("pubDate".to_owned()),
+            Some(field.to_owned()),
             Some("vendor_published".to_owned()),
-            RECEIVED_AT.to_owned(),
+            received.to_owned(),
         ),
     ))
+}
+
+/// The committed row of `PRN_RELEASES[release]`.
+fn prn_item(
+    release: usize,
+    dated: (&str, &str),
+    received: &str,
+) -> Result<(String, Row), Box<dyn Error>> {
+    let (key, _) = PRN_RELEASES.get(release).ok_or("no such release")?;
+    own_link_item(key, "pubDate", dated, received)
+}
+
+/// The committed row of `CNW_RELEASES[release]`.
+fn cnw_item(
+    release: usize,
+    dated: (&str, &str),
+    received: &str,
+) -> Result<(String, Row), Box<dyn Error>> {
+    let (key, _) = CNW_RELEASES.get(release).ok_or("no such release")?;
+    own_link_item(key, "news:publication_date", dated, received)
 }
 
 fn visible(store: &Path, at: &str) -> Result<usize, Box<dyn Error>> {
@@ -520,31 +593,43 @@ fn every_body_an_open_web_run_stores_is_indexed_and_linked_to_its_attempt() -> T
     Ok(())
 }
 
-/// Section 11.2, the committed hosts file: GNW's index first, then PR Newswire's, each with its own
-/// three pages. Mutations 2026-11-16, the PRN row removed / set to candidate, one PRN pin character
-/// changed, PRN's `path_prefix` set to `/multivu/`, `document_of` labelling `Published::At`: each red.
+/// Section 11.2, the committed hosts file: the GNW, PRN and CNW indexes, then each host's three
+/// pages, on Monday 2026-11-16. The PRN and CNW mutations that turn it red, re-run 2026-11-17, are
+/// §11.5 step 6's tables.
 #[test]
-fn an_open_web_run_collects_a_globenewswire_and_a_pr_newswire_day_end_to_end() -> TestResult {
+fn an_open_web_run_collects_a_gnw_a_prn_and_a_cnw_day_end_to_end() -> TestResult {
+    const ATTEMPTS: usize = 12;
     let root = TempDir::new()?;
     seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
     let ask = Ask {
         hosts: Some(seed::committed_hosts()),
+        at: instant(MONDAY_AT),
         ..ask(root.path(), cmd_collect::TODAY)
     };
     let opened = cmd_collect::open_provider(&ask)?;
-    let answer = cmd_collect::run(&ask, &opened, &Gnw::two_hosts()?, &Fixed)?;
+    let answer = cmd_collect::run(&ask, &opened, &Gnw::three_hosts()?, &Monday)?;
     let envelope = &answer.envelope;
     let attempts = envelope["attempts"].as_array().ok_or("attempts")?;
     let hosts_version = canon::FileDigest::of(&std::fs::read(seed::committed_hosts())?);
+    // Every index is asked before any page.
+    let indexes: Vec<Option<&str>> = [0, 1, 2].map(|nth| attempts[nth]["url"].as_str()).into();
     assert_eq!(
         (
             answer.exit,
+            envelope["window"].as_str(),
             envelope["hosts_version"].as_str(),
             attempts.len(),
-            attempts[0]["url"].as_str(),
+            indexes,
             envelope["items_committed"].as_u64(),
         ),
-        (Exit::Ok, Some(hosts_version.hex()), 8, Some(INDEX), Some(4)),
+        (
+            Exit::Ok,
+            Some("2026-11-16"),
+            Some(hosts_version.hex()),
+            ATTEMPTS,
+            vec![Some(INDEX), Some(PRN_INDEX), Some(CNW_INDEX)],
+            Some(6)
+        ),
         "{envelope:#}"
     );
     // Per url: (vendor_rows, unusable_rows, items_committed).
@@ -563,7 +648,7 @@ fn an_open_web_run_collects_a_globenewswire_and_a_pr_newswire_day_end_to_end() -
         })
         .collect();
     let mut expected_counts = BTreeMap::new();
-    for index in [INDEX, PRN_INDEX] {
+    for index in [INDEX, PRN_INDEX, CNW_INDEX] {
         expected_counts.insert(index.to_owned(), (Some(3), Some(0), Some(0)));
     }
     let gnw_pages = RELEASES
@@ -573,7 +658,11 @@ fn an_open_web_run_collects_a_globenewswire_and_a_pr_newswire_day_end_to_end() -
         .iter()
         .enumerate()
         .map(|(nth, (key, _))| (*key, nth != 0));
-    for (key, committed) in gnw_pages.chain(prn_pages) {
+    let cnw_pages = CNW_RELEASES
+        .iter()
+        .enumerate()
+        .map(|(nth, (key, _))| (*key, nth != 2));
+    for (key, committed) in gnw_pages.chain(prn_pages).chain(cnw_pages) {
         let (unusable, items) = if committed { (0, 1) } else { (1, 0) };
         expected_counts.insert(
             format!("https://{key}"),
@@ -589,7 +678,10 @@ fn an_open_web_run_collects_a_globenewswire_and_a_pr_newswire_day_end_to_end() -
     let versions = versions
         .query_map([SOURCE], |row| row.get::<_, Option<String>>(0))?
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(versions, vec![Some(hosts_version.hex().to_owned()); 8]);
+    assert_eq!(
+        versions,
+        vec![Some(hosts_version.hex().to_owned()); ATTEMPTS]
+    );
     // Section 2's `extract_version`, rules plus extraction code: on the envelope and on every
     // attempt row. Mutation 2026-11-16, `commit_opened` writing NULL for it: red.
     let extraction = OpenWebFeed::open(&seed::committed_hosts(), &ask.rules, CONTACT)?
@@ -602,29 +694,49 @@ fn an_open_web_run_collects_a_globenewswire_and_a_pr_newswire_day_end_to_end() -
         .collect::<Result<Vec<_>, _>>()?;
     assert_eq!(
         (envelope["extract_version"].as_str(), extracted),
-        (Some(extraction.as_str()), vec![Some(extraction.clone()); 8])
+        (
+            Some(extraction.as_str()),
+            vec![Some(extraction.clone()); ATTEMPTS]
+        )
     );
-    let mut expected = gnw_items();
+    let mut expected = gnw_items_received(MONDAY_RECEIVED_AT);
     expected.extend([
         prn_item(
             1,
-            "2026-11-14T17:15:00.000000Z",
-            "Sat, 14 Nov 2026 17:15:00 +0000",
+            (
+                "2026-11-14T17:15:00.000000Z",
+                "Sat, 14 Nov 2026 17:15:00 +0000",
+            ),
+            MONDAY_RECEIVED_AT,
         )?,
         prn_item(
             2,
-            "2026-11-14T17:01:00.000000Z",
-            "Sat, 14 Nov 2026 17:01:00 +0000",
+            (
+                "2026-11-14T17:01:00.000000Z",
+                "Sat, 14 Nov 2026 17:01:00 +0000",
+            ),
+            MONDAY_RECEIVED_AT,
+        )?,
+        // The sitemap's -05:00 local minute, stored as its UTC minute beside the raw text.
+        cnw_item(
+            0,
+            ("2026-11-16T07:22:00.000000Z", "2026-11-16T02:22:00-05:00"),
+            MONDAY_RECEIVED_AT,
+        )?,
+        cnw_item(
+            1,
+            ("2026-11-16T06:47:00.000000Z", "2026-11-16T01:47:00-05:00"),
+            MONDAY_RECEIVED_AT,
         )?,
     ]);
     assert_eq!(stored_items(&db)?, expected);
-    // GNW's 19:00 minute is still open at 19:00:45; its 18:45 and both PRN minutes are not.
+    // Nothing is visible before the run observed it, and all six after.
     assert_eq!(
         (
-            visible(root.path(), BEFORE_THE_MINUTE_CLOSED)?,
-            visible(root.path(), AFTER_THE_MINUTE_CLOSED)?
+            visible(root.path(), "2026-11-16T08:05:00Z")?,
+            visible(root.path(), "2026-11-16T08:06:00Z")?
         ),
-        (3, 4)
+        (0, 6)
     );
     Ok(())
 }

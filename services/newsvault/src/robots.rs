@@ -915,4 +915,21 @@ mod tests {
         );
         Ok(())
     }
+
+    /// CNW's one `Disallow` sits in its `*` group; its `Sitemap` lines are no rules. Mutations
+    /// 2026-11-17, every `Disallow` read as `Allow`: red; `Disallow` lines skipped: red.
+    #[test]
+    fn the_cnw_robots_allows_the_news_sitemap_and_the_news_releases_prefix() -> TestResult {
+        let cnw = Robots::parse(&provider_fixture("cnw/robots_www_newswire_ca.txt")?)?;
+        assert_eq!(
+            (
+                cnw.allows("/sitemap-news.xml?page=1"),
+                cnw.allows("/news-releases/"),
+                cnw.allows("/templates/get-bitly-url.txt"),
+                cnw.crawl_delay()
+            ),
+            (true, true, false, None)
+        );
+        Ok(())
+    }
 }

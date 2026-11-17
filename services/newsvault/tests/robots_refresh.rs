@@ -40,6 +40,10 @@ const GNW_PIN: &str = "eb8bb698171dd56c139c224c9217070adf9947f6ed6cd02336eba55aa
 /// The committed hosts file's PRN pin: `robots_www_prnewswire_com.txt`'s sha256.
 const PRN_PIN: &str = "906828bd8cf3ae9fd8bfd1475ae1abe7db4cfda54a2ddbf88dcb80cd55f522b2";
 const PRN_HOST: &str = "www.prnewswire.com";
+const CNW_ROBOTS: &str = "https://www.newswire.ca/robots.txt";
+/// The committed hosts file's CNW pin: `robots_www_newswire_ca.txt`'s sha256.
+const CNW_PIN: &str = "ab9873af0f8c94c48918cd75345a8fc609665602dfcd96aa1e574881a34fb2a0";
+const CNW_HOST: &str = "www.newswire.ca";
 const PRN_BODY: &[u8] = b"User-agent: *\nDisallow: /search/\n";
 const CHANGED_BODY: &[u8] = b"User-agent: *\nDisallow: /\n";
 const OK: u16 = 200;
@@ -80,6 +84,10 @@ fn gnw_body() -> Result<Vec<u8>, std::io::Error> {
 
 fn prn_body() -> Result<Vec<u8>, std::io::Error> {
     std::fs::read(provider_dir().join("tests/fixtures/prn/robots_www_prnewswire_com.txt"))
+}
+
+fn cnw_body() -> Result<Vec<u8>, std::io::Error> {
+    std::fs::read(provider_dir().join("tests/fixtures/cnw/robots_www_newswire_ca.txt"))
 }
 
 fn ask(store: &Path, hosts: PathBuf) -> Ask {
@@ -553,27 +561,38 @@ fn a_fetched_robots_digest_other_than_the_pin_exits_one_and_names_both() -> Test
     Ok(())
 }
 
-/// Section 11.2: the production file's two admitted rows, each answered with its committed body.
-/// Mutation 2026-11-16, one character of the PRN pin changed: red (exit 1).
+/// Section 11.2: the production file's three admitted rows, each answered with its committed
+/// body. Mutations 2026-11-16 and 2026-11-17, one character of the PRN pin and of the CNW pin
+/// changed: each red (exit 1).
 #[test]
-fn the_committed_hosts_file_refreshed_with_its_committed_bodies_matches_both_pins() -> TestResult {
+fn the_committed_hosts_file_refreshed_with_its_committed_bodies_matches_every_pin() -> TestResult {
     let root = TempDir::new()?;
-    let (gnw, prn) = (gnw_body()?, prn_body()?);
-    let exchange = Robots::of(&[(GNW_ROBOTS, OK, &gnw), (PRN_ROBOTS, OK, &prn)]);
+    let (gnw, prn, cnw) = (gnw_body()?, prn_body()?, cnw_body()?);
+    let exchange = Robots::of(&[
+        (GNW_ROBOTS, OK, &gnw),
+        (PRN_ROBOTS, OK, &prn),
+        (CNW_ROBOTS, OK, &cnw),
+    ]);
     let answer = refreshed(root.path(), committed_hosts(), &exchange)?;
-    let matched: Vec<Option<bool>> = (0..2)
+    let matched: Vec<Option<bool>> = (0..3)
         .map(|nth| answer.report["rows"][nth]["matches_pin"].as_bool())
         .collect();
     assert_eq!(
         (answer.exit, matched, robots_rows(root.path())?),
         (
             RobotsExit::Ok,
-            vec![Some(true); 2],
+            vec![Some(true); 3],
+            // `robots_rows` orders by host.
             vec![
                 (
                     GNW_HOST.to_owned(),
                     "present".to_owned(),
                     Some(GNW_PIN.to_owned())
+                ),
+                (
+                    CNW_HOST.to_owned(),
+                    "present".to_owned(),
+                    Some(CNW_PIN.to_owned())
                 ),
                 (
                     PRN_HOST.to_owned(),
