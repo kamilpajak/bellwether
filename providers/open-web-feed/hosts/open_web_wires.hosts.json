@@ -14,6 +14,13 @@
       "index_url": "https://www.prnewswire.com/rss/news-releases-list.rss",
       "rule": "prn",
       "robots": "906828bd8cf3ae9fd8bfd1475ae1abe7db4cfda54a2ddbf88dcb80cd55f522b2"
+    },
+    {
+      "host": "www.newswire.ca",
+      "status": "admitted",
+      "index_url": "https://www.newswire.ca/sitemap-news.xml?page=1",
+      "rule": "cnw",
+      "robots": "ab9873af0f8c94c48918cd75345a8fc609665602dfcd96aa1e574881a34fb2a0"
     }
   ]
 }

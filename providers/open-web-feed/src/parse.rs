@@ -6,12 +6,15 @@ use news_provider::provider::UnusableReason;
 use scraper::{ElementRef, Html, Node, Selector};
 
 use crate::depth::nesting_depth;
-use crate::rules::{Pick, Rule};
+use crate::rules::{IndexFormat, Pick, Rule, NEWS_FIELD_PREFIX};
 
 /// The deepest page `page` parses: 8 times 14, the untrimmed 3403075 page's depth by
 /// `depth::nesting_depth` and by html5ever (2026-11-15, from the 2026-11-14 probe body, which is
 /// not kept). The trimmed `article_3403075.html` measures 7.
 pub(crate) const DEEPEST_PAGE: usize = 14 * 8;
+/// The sitemaps.org 0.9 namespace and Google's news sitemap namespace.
+const SITEMAP_NAMESPACE: &str = "http://www.sitemaps.org/schemas/sitemap/0.9";
+const NEWS_NAMESPACE: &str = "http://www.google.com/schemas/sitemap-news/0.9";
 /// Elements whose text is never prose.
 const NOT_PROSE: [&str; 4] = ["script", "style", "noscript", "template"];
 /// Read as a space: PRN's `<b>About SIGNAL<br /></b>SIGNAL is` otherwise fused to `SIGNALSIGNAL`
@@ -74,11 +77,56 @@ pub(crate) struct IndexRow {
     pub(crate) valid_raw: Option<String>,
 }
 
-/// The rows of an RSS 2.0 feed, or `None` when the payload is not one at all, which is what makes
-/// a 200 carrying something else a permanent failure rather than a quiet hour.
+/// The rows of the rule's index shape, or `None` when the payload is not one at all, which is what
+/// makes a 200 carrying something else a permanent failure rather than a quiet hour.
 pub(crate) fn index_rows(payload: &[u8], rule: &Rule) -> Option<Vec<IndexRow>> {
     let text = std::str::from_utf8(payload).ok()?;
     let document = roxmltree::Document::parse(text).ok()?;
+    match rule.index {
+        IndexFormat::Rss => rss_rows(&document, rule),
+        IndexFormat::NewsSitemap => sitemap_rows(&document, rule),
+    }
+}
+
+/// Each `url` of a news sitemap: its `loc`, and the `news:news` child `valid_field` names. Every
+/// element is matched by namespace and local name, never by its prefix.
+fn sitemap_rows(document: &roxmltree::Document, rule: &Rule) -> Option<Vec<IndexRow>> {
+    let root = document.root_element();
+    if !is_in(root, SITEMAP_NAMESPACE, "urlset") {
+        return None;
+    }
+    let field = rule
+        .valid_field
+        .strip_prefix(NEWS_FIELD_PREFIX)
+        .unwrap_or(&rule.valid_field);
+    let text_of = |node: roxmltree::Node| node.text().map(|text| text.trim().to_owned());
+    Some(
+        root.children()
+            .filter(|node| is_in(*node, SITEMAP_NAMESPACE, "url"))
+            .map(|url| IndexRow {
+                link: child_in(url, SITEMAP_NAMESPACE, "loc").and_then(text_of),
+                valid_raw: child_in(url, NEWS_NAMESPACE, "news")
+                    .and_then(|news| child_in(news, NEWS_NAMESPACE, field))
+                    .and_then(text_of),
+            })
+            .collect(),
+    )
+}
+
+fn child_in<'a, 'input>(
+    node: roxmltree::Node<'a, 'input>,
+    namespace: &str,
+    name: &str,
+) -> Option<roxmltree::Node<'a, 'input>> {
+    node.children().find(|inner| is_in(*inner, namespace, name))
+}
+
+fn is_in(node: roxmltree::Node, namespace: &str, name: &str) -> bool {
+    let tag = node.tag_name();
+    node.is_element() && tag.namespace() == Some(namespace) && tag.name() == name
+}
+
+fn rss_rows(document: &roxmltree::Document, rule: &Rule) -> Option<Vec<IndexRow>> {
     let root = document.root_element();
     if !is_rss(root, "rss") {
         return None;

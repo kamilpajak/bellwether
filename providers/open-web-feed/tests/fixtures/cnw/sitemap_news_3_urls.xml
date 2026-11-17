@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:news="http://www.google.com/schemas/sitemap-news/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1" xmlns:video="http://www.google.com/schemas/sitemap-video/1.1">
+  <url>
+    <loc>https://www.newswire.ca/news-releases/global-voltage-travel-ready-protection-elegrp-powers-dyson-supersonic-travel-hair-dryer-805423040.html</loc>
+    <news:news>
+      <news:publication>
+        <news:name>Canada NewsWire</news:name>
+        <news:language>en</news:language>
+      </news:publication>
+      <news:genres>PressRelease</news:genres>
+      <news:publication_date>2026-11-16T02:22:00-05:00</news:publication_date>
+      <news:title>Global Voltage, Travel-Ready Protection: ELEGRP Powers Dyson Supersonic Travel hair dryer</news:title>
+      <news:keywords>Household Products,Household, Consumer &amp; Cosmetics ,Retail,Electrical Utilities ,Utilities</news:keywords>
+    </news:news>
+    <image:image>
+      <image:loc>https://mmx.prnewswire.com/media/MS2035231/20261115225015EST_image_2.jpg?id=OA3079267</image:loc>
+      <image:caption><![CDATA[ELEGRP Global Voltage Travel-Ready Protection]]></image:caption>
+    </image:image>
+    <image:image>
+      <image:loc>https://mmx.prnewswire.com/media/MS2035229/20261115225015EST_image_3.jpg?id=OA3079265</image:loc>
+      <image:caption><![CDATA[ELEGRP 100V–240V Wide-Voltage Travel Safety]]></image:caption>
+    </image:image>
+    <image:image>
+      <image:loc>https://mmx.prnewswire.com/media/MS2035230/20261115225015EST_image_1.jpg?id=OA3079266</image:loc>
+      <image:caption><![CDATA[ELEGRP PBE Technology Platform Capabilities]]></image:caption>
+    </image:image>
+  </url>
+  <url>
+    <loc>https://www.newswire.ca/news-releases/segway-powersports-secures-class-2-one-two-finish-on-score-baja-1000-debut-823884942.html</loc>
+    <news:news>
+      <news:publication>
+        <news:name>Canada NewsWire</news:name>
+        <news:language>en</news:language>
+      </news:publication>
+      <news:genres>PressRelease</news:genres>
+      <news:publication_date>2026-11-16T01:47:00-05:00</news:publication_date>
+      <news:title>Segway Powersports Secures Class 2 One-Two Finish on SCORE Baja 1000 Debut</news:title>
+      <news:keywords>Sporting Events,Automotive,Transportation, Trucking &amp; Railroad,General Sports,Sports Equipment &amp; Accessories,Outdoors, Camping &amp; Hiking,General Manufacturing</news:keywords>
+    </news:news>
+    <image:image>
+      <image:loc>https://mmx.prnewswire.com/media/MS2035289/20261116005444EST_image_1.jpg?id=OA3079425</image:loc>
+      <image:caption><![CDATA[Segway Powersports team celebrates at the Baja 1000 finish line]]></image:caption>
+    </image:image>
+  </url>
+  <url>
+    <loc>https://www.newswire.ca/news-releases/hkex-launches-offshore-rmb-bond-index-807505308.html</loc>
+    <news:news>
+      <news:publication>
+        <news:name>Canada NewsWire</news:name>
+        <news:language>en</news:language>
+      </news:publication>
+      <news:genres>PressRelease</news:genres>
+      <news:publication_date>2026-11-16T01:33:00-05:00</news:publication_date>
+      <news:title>HKEX Launches Offshore RMB Bond Index</news:title>
+      <news:keywords>Banking &amp; Financial Services,New Products &amp; Services </news:keywords>
+      <news:stock_tickers>HongKong:0388</news:stock_tickers>
+    </news:news>
+  </url>
+</urlset>

@@ -13,6 +13,7 @@ use pit::ObservationTime;
 
 pub const GNW_ROBOTS: &str = "https://rss.globenewswire.com/robots.txt";
 pub const PRN_ROBOTS: &str = "https://www.prnewswire.com/robots.txt";
+pub const CNW_ROBOTS: &str = "https://www.newswire.ca/robots.txt";
 const CONTACT: &str = "bellwether collector contact@example.test";
 const OK: u16 = 200;
 
@@ -30,13 +31,18 @@ pub fn prn_robots() -> Result<Vec<u8>, std::io::Error> {
     std::fs::read(provider_dir().join("tests/fixtures/prn/robots_www_prnewswire_com.txt"))
 }
 
+/// The committed CNW body, which the committed hosts file's CNW row pins.
+pub fn cnw_robots() -> Result<Vec<u8>, std::io::Error> {
+    std::fs::read(provider_dir().join("tests/fixtures/cnw/robots_www_newswire_ca.txt"))
+}
+
 /// The committed hosts file.
 pub fn committed_hosts() -> PathBuf {
     provider_dir().join("hosts/open_web_wires.hosts.json")
 }
 
-/// One `robots refresh` of the committed hosts file into `store` at `at`, both rows answered 200
-/// with their committed bodies.
+/// One `robots refresh` of the committed hosts file into `store` at `at`, every row answered 200
+/// with its committed body.
 pub fn refresh_committed(store: &Path, at: &str) -> Result<cmd_robots::Answer, Box<dyn Error>> {
     refresh_answering(
         store,
@@ -45,6 +51,7 @@ pub fn refresh_committed(store: &Path, at: &str) -> Result<cmd_robots::Answer, B
         &[
             (GNW_ROBOTS, OK, &gnw_robots()?),
             (PRN_ROBOTS, OK, &prn_robots()?),
+            (CNW_ROBOTS, OK, &cnw_robots()?),
         ],
     )
 }
