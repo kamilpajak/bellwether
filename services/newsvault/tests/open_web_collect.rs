@@ -1161,11 +1161,13 @@ fn a_cross_check_row_no_direct_index_answered_after_is_not_looked() -> TestResul
     Ok(())
 }
 
-/// The cross-check reads after the commit: a direct blob altered on disk is its `error`, and the
-/// run still finishes with its items. Review 2026-11-17: the run failed with `BlobAltered` and its
-/// envelope kept `finished_at` null.
-#[test]
-fn an_altered_direct_blob_is_a_cross_check_error_and_the_run_finishes() -> TestResult {
+type Damage = fn(&Path, &[u8]) -> std::io::Result<()>;
+
+/// A second run after the first run's CNW sitemap blob was `damage`d on disk: how many blobs were
+/// damaged, the run's exit, its cross-check, and (envelopes, any without `finished_at`).
+fn run_over_a_damaged_sitemap(
+    damage: Damage,
+) -> Result<(usize, Exit, Value, (usize, bool)), Box<dyn Error>> {
     let (root, hosts) = cnw_and_yahoo_store()?;
     cross_checked_at(
         root.path(),
@@ -1173,20 +1175,23 @@ fn an_altered_direct_blob_is_a_cross_check_error_and_the_run_finishes() -> TestR
         "2026-11-16T07:20:30Z",
         &Gnw::five_hosts()?.answering(YAHOO_INDEX, &[UNAVAILABLE; 3]),
     )?;
-    let mut sitemaps = Vec::new();
+    let mut damaged = 0;
     for file in blob_paths(&root.path().join("blobs"))? {
         let bytes = std::fs::read(&file)?;
         let text = String::from_utf8_lossy(&bytes);
         if text.contains("<urlset") && text.contains("newswire.ca") {
-            std::fs::write(&file, [bytes.as_slice(), b" "].concat())?;
-            sitemaps.push(file);
+            damage(&file, &bytes)?;
+            damaged += 1;
         }
     }
+    // CNW 503 now, so this run stores no fresh copy of the same sitemap over the damaged one.
     let (exit, checked) = cross_checked_at(
         root.path(),
         &hosts,
         MONDAY_AT,
-        &Gnw::five_hosts()?.answering(YAHOO_INDEX, &[UNAVAILABLE]),
+        &Gnw::five_hosts()?
+            .answering(YAHOO_INDEX, &[UNAVAILABLE])
+            .answering(CNW_INDEX, &[UNAVAILABLE; 3]),
     )?;
     let unfinished = std::fs::read_dir(root.path().join(RUNS_DIR))?
         .map(|entry| -> Result<bool, Box<dyn Error>> {
@@ -1194,16 +1199,50 @@ fn an_altered_direct_blob_is_a_cross_check_error_and_the_run_finishes() -> TestR
             Ok(envelope["finished_at"].is_null())
         })
         .collect::<Result<Vec<bool>, _>>()?;
-    assert_eq!(
-        (
-            sitemaps.len(),
+    Ok((
+        damaged,
+        exit,
+        checked,
+        (unfinished.len(), unfinished.contains(&true)),
+    ))
+}
+
+/// The cross-check reads after the commit: a direct blob altered or missing on disk is its
+/// `error`, and the run still finishes. Review 2026-11-17: an altered blob failed the run with
+/// `BlobAltered` and left `finished_at` null; a missing one silently added no titles.
+#[test]
+fn a_damaged_direct_blob_is_a_cross_check_error_and_the_run_finishes() -> TestResult {
+    let altered: Damage = |file, bytes| std::fs::write(file, [bytes, b" "].concat());
+    let removed: Damage = |file, _| std::fs::remove_file(file);
+    let mut seen = Vec::new();
+    for damage in [altered, removed] {
+        let (damaged, exit, checked, envelopes) = run_over_a_damaged_sitemap(damage)?;
+        seen.push((
+            damaged,
             exit,
-            checked["error"]["code"].as_str(),
+            checked["error"]["code"].as_str().map(str::to_owned),
             checked["result"].is_null(),
-            (unfinished.len(), unfinished.contains(&true)),
-        ),
-        (1, Exit::Ok, Some("blob_altered"), true, (3, false)),
-        "{checked:#}"
+            envelopes,
+        ));
+    }
+    assert_eq!(
+        seen,
+        [
+            (
+                1,
+                Exit::PartialCollect,
+                Some("blob_altered".to_owned()),
+                true,
+                (3, false)
+            ),
+            (
+                1,
+                Exit::PartialCollect,
+                Some("blob_absent".to_owned()),
+                true,
+                (3, false)
+            ),
+        ]
     );
     Ok(())
 }
