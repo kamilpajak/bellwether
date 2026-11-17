@@ -2797,18 +2797,16 @@ fn the_earliest_cross_check_minute_is_the_oldest_cross_check_row() -> Outcome {
     Ok(())
 }
 
-/// Yahoo dated a PRN row 72 min after a PRN answer listed it (2026-11-16): an answer received
-/// before the row's minute but inside `DIRECT_LEAD` lists it. Review 2026-11-17: red without it.
+/// Yahoo dated a PRN row 72 min after a PRN answer listed it (2026-11-16): an answer 72 min before
+/// the earliest `cross_check` minute (07:22Z) is read and lists its row. Mutation 2026-11-17,
+/// `DIRECT_LEAD` zero: red.
 #[test]
 fn a_direct_answer_received_before_the_keyed_minute_still_lists_the_row() -> Outcome {
     let checker = checker()?;
     let index = yahoo(YAHOO_REAL_INDEX);
-    let lead_ago = instant("2026-11-16T09:00:00Z")
-        .map(|minute| (minute - DIRECT_LEAD).to_rfc3339())
-        .ok_or("no minute")?;
     let earlier = answer(
         PRN_INDEX,
-        &lead_ago,
+        "2026-11-16T06:10:00Z",
         rss_titles(&[
             "Kyiv-based Horizon Capital reaches $200 million at second closing of Catalyst Fund",
         ]),
@@ -2836,8 +2834,8 @@ fn a_direct_answer_received_before_the_keyed_minute_still_lists_the_row() -> Out
 }
 
 /// A row is compared only when every direct index parsed an answer after its minute closed: a
-/// failed index, a 503 body, or an answer from before the minute is "not looked", never
-/// "unlisted". Review 2026-11-17: a CNW 503 run named three rows unlisted.
+/// failed index, a 503 body, or an answer inside the minute (09:05:30Z for 09:05) is "not looked",
+/// never "unlisted". Review 2026-11-17: a CNW 503 run named three rows unlisted.
 #[test]
 fn a_row_no_direct_index_answered_after_is_not_looked_and_never_unlisted() -> Outcome {
     let checker = checker()?;
@@ -2868,7 +2866,7 @@ fn a_row_no_direct_index_answered_after_is_not_looked_and_never_unlisted() -> Ou
     let mut cnw_early = without_cnw.clone();
     cnw_early.push(answer(
         CNW_INDEX,
-        "2026-11-16T09:04:59Z",
+        "2026-11-16T09:05:30Z",
         cnw(CNW_REAL_INDEX),
     )?);
     assert_eq!(
