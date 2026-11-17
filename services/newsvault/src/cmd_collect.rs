@@ -19,7 +19,7 @@ use news_provider::{
     Committed, Credentials, Exchange, Exit, Payload, Provider, Relisted, Run, RunId, SourceId,
     TargetWindow, Wire,
 };
-use open_web_feed::{CrossChecker, OpenWebFeed, RobotsPin};
+use open_web_feed::{CrossChecker, DirectAnswer, OpenWebFeed, RobotsPin};
 use pit::{MeasuredLag, ObservationTime};
 use serde_json::{json, Value};
 
@@ -715,7 +715,7 @@ pub fn run(
     let mut store = Committer::open(&ask.store, &run)?;
     let mut driven = drive(ask, provider, &mut store, exchange, clock, &run)?;
     if let Some(checker) = opened.cross_checker.as_ref() {
-        driven.cross_check = cross_check_of(&store, checker, &driven.collected)?;
+        driven.cross_check = cross_check_of(&store, checker, &driven.collected);
     }
     let finished = Envelope {
         finished_at: Some(clock.now()),
@@ -729,77 +729,140 @@ pub fn run(
 }
 
 /// Section 11.2's option C: this run's keyed index answer against every direct index answer the
-/// store holds from the keyed `cross_check` rows' earliest minute on. `result` is null when this
-/// run filed no readable keyed payload, so "not looked" stays apart from "nothing unlisted".
-fn cross_check_of(
-    store: &Committer,
-    checker: &CrossChecker,
-    collected: &Collected,
-) -> Result<Value, CollectRunError> {
+/// store holds from `CrossChecker::read_from` on. `result` is null when this run filed no readable
+/// keyed payload, so "not looked" stays apart from "nothing unlisted". It runs after the commit,
+/// so a store it cannot read is `error` here and never fails the run.
+fn cross_check_of(store: &Committer, checker: &CrossChecker, collected: &Collected) -> Value {
     // The last attempt: a retried index's earlier answers are the failures it was retried for.
     let keyed = collected
         .attempts
         .iter()
         .rev()
         .find(|row| row.phase == RequestPhase::Index.name() && row.url == checker.index_url());
-    let keyed_bytes = match keyed {
-        Some(row) => match store.payload_of(&row.attempt_id)? {
-            Some(payload) => crate::store::blob_bytes(store.root(), &payload.raw_blob)?,
-            None => None,
-        },
+    let read = keyed.map_or_else(
+        || Ok(Read::default()),
+        |row| read_answers(store, checker, &row.attempt_id, &row.source),
+    );
+    let mut checked = match read {
+        Ok(read) => checked_json(checker, &read),
+        Err(failure) => json!({
+            "watched_from": Value::Null,
+            "direct_payloads_read": Value::Null,
+            "direct_payloads_parsed": Value::Null,
+            "result": Value::Null,
+            "error": failure,
+        }),
+    };
+    if let Some(fields) = checked.as_object_mut() {
+        fields.insert("index_url".to_owned(), json!(checker.index_url()));
+        fields.insert(
+            "attempt_id".to_owned(),
+            json!(keyed.map(|row| row.attempt_id.clone())),
+        );
+        fields.insert("matching_rule".to_owned(), json!(CROSS_CHECK_MATCH));
+    }
+    checked
+}
+
+/// What `cross_check_of` read from the store: the keyed bytes and the direct answers it compares.
+#[derive(Default)]
+struct Read {
+    keyed: Option<Vec<u8>>,
+    direct: Vec<DirectAnswer>,
+    watched_from: Option<DateTime<Utc>>,
+}
+
+fn checked_json(checker: &CrossChecker, read: &Read) -> Value {
+    let checked = read
+        .keyed
+        .as_deref()
+        .and_then(|bytes| checker.check(bytes, &read.direct, read.watched_from));
+    let result = checked.as_ref().map(|checked| {
+        json!({
+            "rows": {
+                "followed": checked.followed,
+                "cross_checked": checked.cross_checked,
+                "other_key": checked.other_key,
+                "no_key": checked.no_key,
+            },
+            "not_compared": checked.not_compared,
+            "not_looked": checked.not_looked,
+            "listed_directly": checked.listed_directly,
+            "unlisted_count": checked.unlisted.len(),
+            "unlisted": checked.unlisted.iter().map(|row| json!({
+                "key": row.key,
+                "url": row.url,
+                "title": row.title,
+                "listed_raw": row.listed_raw,
+            })).collect::<Vec<Value>>(),
+            "direct_titles": checked.direct_titles,
+        })
+    });
+    json!({
+        "watched_from": read.watched_from.map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)),
+        "direct_payloads_read": read.direct.len(),
+        "direct_payloads_parsed": checked.map(|checked| checked.direct_parsed),
+        "result": result,
+        "error": Value::Null,
+    })
+}
+
+/// A store failure as the envelope's `cross_check.error`: a stable code and a free message.
+fn read_failure(code: &str, message: String) -> Value {
+    json!({"code": code, "message": message})
+}
+
+fn read_blob(store: &Committer, hex: &str) -> Result<Vec<u8>, Value> {
+    match crate::store::blob_bytes(store.root(), hex) {
+        Ok(Some(bytes)) => Ok(bytes),
+        Ok(None) => Err(read_failure(
+            "blob_absent",
+            format!("no blob is stored under {hex}"),
+        )),
+        Err(failure @ StoreError::BlobAltered { .. }) => {
+            Err(read_failure("blob_altered", failure.to_string()))
+        }
+        Err(failure) => Err(read_failure("store_unreadable", failure.to_string())),
+    }
+}
+
+fn read_answers(
+    store: &Committer,
+    checker: &CrossChecker,
+    attempt_id: &str,
+    source: &str,
+) -> Result<Read, Value> {
+    let unreadable = |failure: StoreError| read_failure("store_unreadable", failure.to_string());
+    let keyed = match store.payload_of(attempt_id).map_err(unreadable)? {
+        Some(payload) => Some(read_blob(store, &payload.raw_blob)?),
         None => None,
     };
-    let direct: Vec<IndexPayload> = match keyed {
-        Some(row) => store
-            .index_payloads(&SourceId::new(row.source.clone()))?
-            .into_iter()
-            .filter(|payload| checker.is_direct_index(&payload.url))
-            .collect(),
-        None => Vec::new(),
-    };
+    let direct: Vec<IndexPayload> = store
+        .index_payloads(&SourceId::new(source.to_owned()))
+        .map_err(unreadable)?
+        .into_iter()
+        .filter(|payload| checker.is_direct_index(&payload.url))
+        .collect();
     let watched_from = direct.first().and_then(|first| instant(&first.received_at));
-    let since = keyed_bytes
-        .as_deref()
-        .and_then(|bytes| checker.earliest_cross_checked(bytes));
-    let mut read = Vec::new();
+    let since = keyed.as_deref().and_then(|bytes| checker.read_from(bytes));
+    let mut answers = Vec::new();
     for payload in &direct {
-        if since.is_some_and(|since| instant(&payload.received_at).is_some_and(|at| at >= since)) {
-            if let Some(bytes) = crate::store::blob_bytes(store.root(), &payload.raw_blob)? {
-                read.push((payload.url.clone(), bytes));
-            }
+        let Some(at) = instant(&payload.received_at) else {
+            continue;
+        };
+        if since.is_some_and(|since| at >= since) {
+            answers.push(DirectAnswer {
+                url: payload.url.clone(),
+                received_at: at,
+                bytes: read_blob(store, &payload.raw_blob)?,
+            });
         }
     }
-    let result = keyed_bytes
-        .as_deref()
-        .and_then(|bytes| checker.check(bytes, &read, watched_from))
-        .map(|checked| {
-            json!({
-                "rows": {
-                    "followed": checked.followed,
-                    "cross_checked": checked.cross_checked,
-                    "other_key": checked.other_key,
-                    "no_key": checked.no_key,
-                },
-                "not_compared": checked.not_compared,
-                "listed_directly": checked.listed_directly,
-                "unlisted_count": checked.unlisted.len(),
-                "unlisted": checked.unlisted.iter().map(|row| json!({
-                    "key": row.key,
-                    "url": row.url,
-                    "title": row.title,
-                    "listed_raw": row.listed_raw,
-                })).collect::<Vec<Value>>(),
-                "direct_titles": checked.direct_titles,
-            })
-        });
-    Ok(json!({
-        "index_url": checker.index_url(),
-        "attempt_id": keyed.map(|row| row.attempt_id.clone()),
-        "matching_rule": CROSS_CHECK_MATCH,
-        "watched_from": watched_from.map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)),
-        "direct_payloads_read": read.len(),
-        "result": result,
-    }))
+    Ok(Read {
+        keyed,
+        direct: answers,
+        watched_from,
+    })
 }
 
 fn instant(stamp: &str) -> Option<DateTime<Utc>> {
@@ -1137,12 +1200,22 @@ pub fn render_human(envelope: &Value, out: &mut impl std::io::Write) -> std::io:
         )?;
     }
     writeln!(out, "items committed  {}", envelope["items_committed"])?;
-    let checked = &envelope["cross_check"]["result"];
-    if !envelope["cross_check"].is_null() {
+    let cross_check = &envelope["cross_check"];
+    let checked = &cross_check["result"];
+    if !cross_check["error"].is_null() {
         writeln!(
             out,
-            "cross-check      {} unlisted directly, {} listed, {} not compared",
-            checked["unlisted_count"], checked["listed_directly"], checked["not_compared"]
+            "cross-check      error {}",
+            text(&cross_check["error"], "code")
+        )?;
+    } else if !cross_check.is_null() {
+        writeln!(
+            out,
+            "cross-check      {} unlisted directly, {} listed, {} not compared, {} not looked",
+            checked["unlisted_count"],
+            checked["listed_directly"],
+            checked["not_compared"],
+            checked["not_looked"]
         )?;
     }
     writeln!(

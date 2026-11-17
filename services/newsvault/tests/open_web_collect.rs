@@ -16,7 +16,7 @@ use news_provider::{
 };
 use newsvault::cmd_collect::{self, Ask, CollectRunError};
 use newsvault::cmd_items::{self, PerStory};
-use newsvault::store::{Committer, StoreError, COMMIT_LOG, SCHEMA_VERSION};
+use newsvault::store::{Committer, StoreError, COMMIT_LOG, RUNS_DIR, SCHEMA_VERSION};
 use open_web_feed::OpenWebFeed;
 use pit::ObservationTime;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
@@ -986,30 +986,62 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
             checked["index_url"].as_str(),
             checked["watched_from"].as_str(),
             checked["direct_payloads_read"].as_u64(),
+            checked["direct_payloads_parsed"].as_u64(),
             &checked["result"]["rows"],
             checked["result"]["not_compared"].as_u64(),
             checked["result"]["unlisted_count"].as_u64(),
+            checked["error"].is_null(),
         ),
         (
             Some(YAHOO_INDEX),
             Some(MONDAY_RECEIVED_AT),
             Some(4),
+            Some(4),
             &serde_json::json!({"followed": 2, "cross_checked": 3, "other_key": 2, "no_key": 1}),
             Some(3),
             Some(0),
+            true,
         ),
         "{checked:#}"
+    );
+    // The human rendering carries the same counts; a dry run looks at nothing, so it has none.
+    // Review 2026-11-17: the human line dropped, and a dry run's `{}`, each green before this.
+    let mut human = Vec::new();
+    cmd_collect::render_human(envelope, &mut human)?;
+    let dry = Ask {
+        dry_run: true,
+        ..ask.clone()
+    };
+    let planned = cmd_collect::run(&dry, &opened, &Gnw::five_hosts()?, &Monday)?;
+    assert_eq!(
+        (
+            String::from_utf8(human)?
+                .lines()
+                .find(|line| line.starts_with("cross-check"))
+                .map(str::to_owned),
+            planned.envelope["cross_check"].is_null(),
+        ),
+        (
+            Some(
+                "cross-check      0 unlisted directly, 0 listed, 3 not compared, 0 not looked"
+                    .to_owned()
+            ),
+            true,
+        )
     );
     Ok(())
 }
 
-/// Two runs over CNW and Yahoo, Yahoo 503 in the first and retried in the second: two wire-key
-/// rows no CNW sitemap listed are named and one is counted. Mutations 2026-11-17: the `since` bound
-/// removed, `watched_from` the newest direct answer, the first keyed attempt read: each red.
-#[test]
-fn a_yahoo_row_under_a_wire_key_no_direct_index_listed_is_named_in_the_run_envelope() -> TestResult
-{
-    const EARLY_AT: &str = "2026-11-16T07:20:30Z";
+struct FixedAt(DateTime<Utc>);
+
+impl Clock for FixedAt {
+    fn now(&self) -> DateTime<Utc> {
+        self.0
+    }
+}
+
+/// A store over CNW and Yahoo with both robots fetches ledgered.
+fn cnw_and_yahoo_store() -> Result<(TempDir, PathBuf), Box<dyn Error>> {
     let root = TempDir::new()?;
     let hosts = hosts_fixture("cnw_and_yahoo_admitted.json");
     seed::refresh_answering(
@@ -1021,21 +1053,37 @@ fn a_yahoo_row_under_a_wire_key_no_direct_index_listed_is_named_in_the_run_envel
             (seed::YAHOO_ROBOTS, OK, &seed::yahoo_robots()?),
         ],
     )?;
-    struct FixedAt(DateTime<Utc>);
-    impl Clock for FixedAt {
-        fn now(&self) -> DateTime<Utc> {
-            self.0
-        }
-    }
-    let run_at = |at: &str, exchange: &Gnw| -> Result<Value, Box<dyn Error>> {
-        let ask = Ask {
-            hosts: Some(hosts.clone()),
-            at: instant(at),
-            ..ask(root.path(), cmd_collect::TODAY)
-        };
-        let opened = cmd_collect::open_provider(&ask)?;
-        let answer = cmd_collect::run(&ask, &opened, exchange, &FixedAt(instant(at)))?;
-        Ok(answer.envelope["cross_check"].clone())
+    Ok((root, hosts))
+}
+
+/// One collect at `at` over `hosts`: its exit and its envelope's `cross_check`.
+fn cross_checked_at(
+    root: &Path,
+    hosts: &Path,
+    at: &str,
+    exchange: &Gnw,
+) -> Result<(Exit, Value), Box<dyn Error>> {
+    let ask = Ask {
+        hosts: Some(hosts.to_path_buf()),
+        at: instant(at),
+        ..ask(root, cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, exchange, &FixedAt(instant(at)))?;
+    Ok((answer.exit, answer.envelope["cross_check"].clone()))
+}
+
+/// Two runs over CNW and Yahoo, Yahoo 503 in the first and retried in the second: two wire-key
+/// rows no CNW sitemap listed are named and one is counted. The first run's CNW answer is older
+/// than `read_from` and is not read. Mutations 2026-11-17: the `since` bound removed,
+/// `watched_from` the newest direct answer, the first keyed attempt read: each red.
+#[test]
+fn a_yahoo_row_under_a_wire_key_no_direct_index_listed_is_named_in_the_run_envelope() -> TestResult
+{
+    const EARLY_AT: &str = "2026-11-16T05:00:30Z";
+    let (root, hosts) = cnw_and_yahoo_store()?;
+    let run_at = |at: &str, exchange: &Gnw| {
+        cross_checked_at(root.path(), &hosts, at, exchange).map(|(_, checked)| checked)
     };
     let early = run_at(
         EARLY_AT,
@@ -1062,7 +1110,7 @@ fn a_yahoo_row_under_a_wire_key_no_direct_index_listed_is_named_in_the_run_envel
         ),
         (
             true,
-            Some("2026-11-16T07:20:29.000000Z"),
+            Some("2026-11-16T05:00:29.000000Z"),
             Some(1),
             Some(0),
             Some(1),
@@ -1080,6 +1128,100 @@ fn a_yahoo_row_under_a_wire_key_no_direct_index_listed_is_named_in_the_run_envel
         "{checked:#}"
     );
     Ok(())
+}
+
+/// A direct index that did not answer after a row's minute has not looked for it: CNW 503 in the
+/// second run names nothing unlisted, and a 503 body is read but never parsed. Review 2026-11-17:
+/// three rows were named unlisted, and `direct_payloads_read` counted the 503 bodies as read.
+#[test]
+fn a_cross_check_row_no_direct_index_answered_after_is_not_looked() -> TestResult {
+    let (root, hosts) = cnw_and_yahoo_store()?;
+    cross_checked_at(
+        root.path(),
+        &hosts,
+        "2026-11-16T00:00:30Z",
+        &Gnw::five_hosts()?.answering(YAHOO_INDEX, &[UNAVAILABLE; 3]),
+    )?;
+    let (_, checked) = cross_checked_at(
+        root.path(),
+        &hosts,
+        MONDAY_AT,
+        &Gnw::five_hosts()?.answering(CNW_INDEX, &[UNAVAILABLE; 3]),
+    )?;
+    assert_eq!(
+        (
+            checked["direct_payloads_read"].as_u64(),
+            checked["direct_payloads_parsed"].as_u64(),
+            checked["result"]["not_looked"].as_u64(),
+            checked["result"]["unlisted_count"].as_u64(),
+        ),
+        (Some(3), Some(0), Some(3), Some(0)),
+        "{checked:#}"
+    );
+    Ok(())
+}
+
+/// The cross-check reads after the commit: a direct blob altered on disk is its `error`, and the
+/// run still finishes with its items. Review 2026-11-17: the run failed with `BlobAltered` and its
+/// envelope kept `finished_at` null.
+#[test]
+fn an_altered_direct_blob_is_a_cross_check_error_and_the_run_finishes() -> TestResult {
+    let (root, hosts) = cnw_and_yahoo_store()?;
+    cross_checked_at(
+        root.path(),
+        &hosts,
+        "2026-11-16T07:20:30Z",
+        &Gnw::five_hosts()?.answering(YAHOO_INDEX, &[UNAVAILABLE; 3]),
+    )?;
+    let mut sitemaps = Vec::new();
+    for file in blob_paths(&root.path().join("blobs"))? {
+        let bytes = std::fs::read(&file)?;
+        let text = String::from_utf8_lossy(&bytes);
+        if text.contains("<urlset") && text.contains("newswire.ca") {
+            std::fs::write(&file, [bytes.as_slice(), b" "].concat())?;
+            sitemaps.push(file);
+        }
+    }
+    let (exit, checked) = cross_checked_at(
+        root.path(),
+        &hosts,
+        MONDAY_AT,
+        &Gnw::five_hosts()?.answering(YAHOO_INDEX, &[UNAVAILABLE]),
+    )?;
+    let unfinished = std::fs::read_dir(root.path().join(RUNS_DIR))?
+        .map(|entry| -> Result<bool, Box<dyn Error>> {
+            let envelope: Value = serde_json::from_slice(&std::fs::read(entry?.path())?)?;
+            Ok(envelope["finished_at"].is_null())
+        })
+        .collect::<Result<Vec<bool>, _>>()?;
+    assert_eq!(
+        (
+            sitemaps.len(),
+            exit,
+            checked["error"]["code"].as_str(),
+            checked["result"].is_null(),
+            (unfinished.len(), unfinished.contains(&true)),
+        ),
+        (1, Exit::Ok, Some("blob_altered"), true, (3, false)),
+        "{checked:#}"
+    );
+    Ok(())
+}
+
+fn blob_paths(dir: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// The committed five-host file on Monday, on a fresh store: each attempt's url and id, in order.

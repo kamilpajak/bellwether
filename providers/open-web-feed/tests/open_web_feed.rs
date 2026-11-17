@@ -19,8 +19,8 @@ use news_provider::{
     Verdict,
 };
 use open_web_feed::{
-    AdmittedPath, CrossChecker, HostPin, OpenWebFeed, Refusal, RobotsPin, CONTACT_CREDENTIAL,
-    SOURCE,
+    AdmittedPath, CrossChecker, DirectAnswer, HostPin, OpenWebFeed, Refusal, RobotsPin,
+    CONTACT_CREDENTIAL, DIRECT_LEAD, SOURCE,
 };
 use pit::datedness::{Minute, Published};
 use pit::ObservationTime;
@@ -2573,6 +2573,41 @@ fn instant(text: &str) -> Option<DateTime<Utc>> {
     text.parse().ok()
 }
 
+/// After every keyed row of the real Yahoo sitemap closed.
+const LOOKED_AT: &str = "2026-11-16T09:30:29Z";
+const EMPTY_RSS: &[u8] = b"<rss version=\"2.0\"><channel></channel></rss>";
+const EMPTY_SITEMAP: &[u8] = b"<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\"/>";
+
+fn answer(url: &str, at: &str, bytes: Vec<u8>) -> Result<DirectAnswer, Box<dyn std::error::Error>> {
+    Ok(DirectAnswer {
+        url: url.to_owned(),
+        received_at: instant(at).ok_or("not an instant")?,
+        bytes,
+    })
+}
+
+/// Each committed direct index answered at `at`: by `given` when named there, else an empty index.
+fn every_index_at(
+    at: &str,
+    given: &[(&str, Vec<u8>)],
+) -> Result<Vec<DirectAnswer>, Box<dyn std::error::Error>> {
+    [GNW_INDEX, PRN_INDEX, CNW_INDEX, FED_INDEX]
+        .iter()
+        .map(|url| {
+            let empty = if *url == CNW_INDEX {
+                EMPTY_SITEMAP
+            } else {
+                EMPTY_RSS
+            };
+            let bytes = given
+                .iter()
+                .find(|(named, _)| named == url)
+                .map_or_else(|| empty.to_vec(), |(_, bytes)| bytes.clone());
+            answer(url, at, bytes)
+        })
+        .collect()
+}
+
 /// The committed files: Yahoo is the keyed index, and the other four admitted indexes are direct.
 #[test]
 fn the_committed_hosts_file_cross_checks_yahoo_against_the_other_four_indexes() -> Outcome {
@@ -2596,7 +2631,7 @@ fn a_cross_check_row_no_direct_index_listed_is_named_and_a_listed_one_counted() 
     let checked = checker()?
         .check(
             &yahoo(YAHOO_REAL_INDEX),
-            &[(CNW_INDEX.to_owned(), cnw(CNW_REAL_INDEX))],
+            &every_index_at(LOOKED_AT, &[(CNW_INDEX, cnw(CNW_REAL_INDEX))])?,
             instant("2026-11-16T07:00:00Z"),
         )
         .ok_or("the real sitemap did not parse")?;
@@ -2614,12 +2649,14 @@ fn a_cross_check_row_no_direct_index_listed_is_named_and_a_listed_one_counted() 
                 checked.no_key
             ],
             checked.not_compared,
+            checked.not_looked,
             checked.listed_directly,
             unlisted,
             checked.direct_titles
         ),
         (
             [2, 3, 2, 1],
+            0,
             0,
             1,
             vec![
@@ -2637,7 +2674,7 @@ fn a_cross_check_row_no_direct_index_listed_is_named_and_a_listed_one_counted() 
 #[test]
 fn a_cross_check_row_dated_before_the_first_direct_answer_is_not_compared() -> Outcome {
     let checker = checker()?;
-    let direct = [(CNW_INDEX.to_owned(), cnw(CNW_REAL_INDEX))];
+    let direct = every_index_at(LOOKED_AT, &[(CNW_INDEX, cnw(CNW_REAL_INDEX))])?;
     let index = yahoo(YAHOO_REAL_INDEX);
     let compared = |from: Option<DateTime<Utc>>| {
         checker.check(&index, &direct, from).map(|checked| {
@@ -2677,19 +2714,21 @@ fn titles_match_after_case_and_punctuation_fold_and_never_by_a_prefix() -> Outco
             .collect();
         format!("<rss version=\"2.0\"><channel>{items}</channel></rss>").into_bytes()
     };
-    let direct = [
-        (
-            PRN_INDEX.to_owned(),
+    let mut direct = every_index_at(
+        LOOKED_AT,
+        &[(
+            PRN_INDEX,
             rss(&[
                 "kyiv based horizon capital reaches 200 million at second closing of catalyst fund",
                 "Geely Holding Announces EVSA",
             ]),
-        ),
-        (
-            "https://www.prnewswire.com/rss/elsewhere.rss".to_owned(),
-            cnw(CNW_REAL_INDEX),
-        ),
-    ];
+        )],
+    )?;
+    direct.push(answer(
+        "https://www.prnewswire.com/rss/elsewhere.rss",
+        LOOKED_AT,
+        cnw(CNW_REAL_INDEX),
+    )?);
     let checked = checker
         .check(
             &yahoo(YAHOO_REAL_INDEX),
@@ -2713,15 +2752,182 @@ fn titles_match_after_case_and_punctuation_fold_and_never_by_a_prefix() -> Outco
     Ok(())
 }
 
-/// No direct answer before a keyed row's minute can have listed it: the earliest `cross_check`
-/// minute bounds what collect reads. Mutation 2026-11-17, `min` as `max`: red.
+/// Collect reads direct answers from `DIRECT_LEAD` before the oldest `cross_check` row's minute;
+/// rows of another key, a followed key or none do not move it. Mutations 2026-11-17, `min` as
+/// `max` and the minimum over every row: each red.
 #[test]
 fn the_earliest_cross_check_minute_is_the_oldest_cross_check_row() -> Outcome {
+    let index = yahoo_sitemap(&[
+        (
+            "https://finance.yahoo.com/a",
+            "2026-11-16T08:00:00Z",
+            Some("https://media.zenfs.com/en/prnewswire.com/a.jpg"),
+        ),
+        (
+            "https://finance.yahoo.com/b",
+            "2026-11-16T07:30:00Z",
+            Some("https://media.zenfs.com/en/globenewswire.com/b.jpg"),
+        ),
+        (
+            "https://finance.yahoo.com/c",
+            "2026-11-16T06:00:00Z",
+            Some("https://media.zenfs.com/en/newsfile_64/c.jpg"),
+        ),
+        (
+            "https://finance.yahoo.com/d",
+            "2026-11-16T05:00:00Z",
+            Some("https://media.zenfs.com/en/business-wire.com/d.jpg"),
+        ),
+        ("https://finance.yahoo.com/e", "2026-11-16T04:00:00Z", None),
+    ]);
+    let checker = checker()?;
+    let read_from = instant("2026-11-16T07:30:00Z").map(|minute| minute - DIRECT_LEAD);
     assert_eq!(
-        checker()?.earliest_cross_checked(&yahoo(YAHOO_REAL_INDEX)),
-        instant("2026-11-16T07:22:00Z")
+        (
+            checker.earliest_cross_checked(&index),
+            checker.read_from(&index),
+            checker.earliest_cross_checked(&yahoo(YAHOO_REAL_INDEX)),
+        ),
+        (
+            instant("2026-11-16T07:30:00Z"),
+            read_from,
+            instant("2026-11-16T07:22:00Z")
+        )
     );
     Ok(())
+}
+
+/// Yahoo dated a PRN row 72 min after a PRN answer listed it (2026-11-16): an answer received
+/// before the row's minute but inside `DIRECT_LEAD` lists it. Review 2026-11-17: red without it.
+#[test]
+fn a_direct_answer_received_before_the_keyed_minute_still_lists_the_row() -> Outcome {
+    let checker = checker()?;
+    let index = yahoo(YAHOO_REAL_INDEX);
+    let lead_ago = instant("2026-11-16T09:00:00Z")
+        .map(|minute| (minute - DIRECT_LEAD).to_rfc3339())
+        .ok_or("no minute")?;
+    let earlier = answer(
+        PRN_INDEX,
+        &lead_ago,
+        rss_titles(&[
+            "Kyiv-based Horizon Capital reaches $200 million at second closing of Catalyst Fund",
+        ]),
+    )?;
+    let read_from = checker.read_from(&index).ok_or("no cross-check row")?;
+    let mut direct = every_index_at(LOOKED_AT, &[])?;
+    direct.push(earlier.clone());
+    let checked = checker
+        .check(&index, &direct, instant("2026-11-16T07:00:00Z"))
+        .ok_or("the real sitemap did not parse")?;
+    let unlisted: Vec<String> = checked.unlisted.into_iter().map(|row| row.url).collect();
+    assert_eq!(
+        (
+            earlier.received_at >= read_from,
+            checked.listed_directly,
+            unlisted
+        ),
+        (
+            true,
+            1,
+            vec![YAHOO_GNW_ROW.to_owned(), YAHOO_ROW_LISTED_BY_CNW.to_owned()]
+        )
+    );
+    Ok(())
+}
+
+/// A row is compared only when every direct index parsed an answer after its minute closed: a
+/// failed index, a 503 body, or an answer from before the minute is "not looked", never
+/// "unlisted". Review 2026-11-17: a CNW 503 run named three rows unlisted.
+#[test]
+fn a_row_no_direct_index_answered_after_is_not_looked_and_never_unlisted() -> Outcome {
+    let checker = checker()?;
+    let index = yahoo(YAHOO_REAL_INDEX);
+    let looked = |direct: &[DirectAnswer]| {
+        checker
+            .check(&index, direct, instant("2026-11-16T07:00:00Z"))
+            .map(|checked| {
+                (
+                    checked.not_looked,
+                    checked.listed_directly + u32::try_from(checked.unlisted.len()).unwrap_or(0),
+                    checked.direct_parsed,
+                )
+            })
+    };
+    let all = every_index_at(LOOKED_AT, &[(CNW_INDEX, cnw(CNW_REAL_INDEX))])?;
+    let without_cnw: Vec<DirectAnswer> = all
+        .iter()
+        .filter(|answer| answer.url != CNW_INDEX)
+        .cloned()
+        .collect();
+    let mut cnw_503 = without_cnw.clone();
+    cnw_503.push(answer(
+        CNW_INDEX,
+        LOOKED_AT,
+        b"Service Unavailable".to_vec(),
+    )?);
+    let mut cnw_early = without_cnw.clone();
+    cnw_early.push(answer(
+        CNW_INDEX,
+        "2026-11-16T09:04:59Z",
+        cnw(CNW_REAL_INDEX),
+    )?);
+    assert_eq!(
+        (
+            looked(&all),
+            looked(&without_cnw),
+            looked(&cnw_503),
+            looked(&cnw_early)
+        ),
+        (
+            Some((0, 3, 4)),
+            Some((3, 0, 3)),
+            Some((3, 0, 3)),
+            Some((1, 2, 4))
+        )
+    );
+    Ok(())
+}
+
+/// A title or a key that folds to nothing matches nothing: an empty title is never "listed", and
+/// an image with an empty key segment has no key. Review 2026-11-17: both caught only by golden.
+#[test]
+fn an_empty_title_or_an_empty_key_matches_nothing() -> Outcome {
+    let checker = checker()?;
+    let index = b"<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\" \
+         xmlns:news=\"http://www.google.com/schemas/sitemap-news/0.9\" \
+         xmlns:image=\"http://www.google.com/schemas/sitemap-image/1.1\">\
+         <url><loc>https://finance.yahoo.com/a</loc><news:news><news:publication_date>\
+         2026-11-16T09:00:00Z</news:publication_date><news:title>?!</news:title></news:news>\
+         <image:image><image:loc>https://media.zenfs.com/en/prnewswire.com/a.jpg</image:loc>\
+         </image:image></url>\
+         <url><loc>https://finance.yahoo.com/b</loc><news:news><news:publication_date>\
+         2026-11-16T09:00:00Z</news:publication_date><news:title>b</news:title></news:news>\
+         <image:image><image:loc>https://media.zenfs.com/en//b.jpg</image:loc>\
+         </image:image></url></urlset>"
+        .to_vec();
+    let direct = every_index_at(LOOKED_AT, &[(PRN_INDEX, rss_titles(&["--"]))])?;
+    let checked = checker
+        .check(&index, &direct, instant("2026-11-16T07:00:00Z"))
+        .ok_or("the sitemap did not parse")?;
+    assert_eq!(
+        (
+            checked.no_key,
+            checked.other_key,
+            checked.listed_directly,
+            checked.unlisted.len(),
+            checked.direct_titles
+        ),
+        (1, 0, 0, 1, 0)
+    );
+    Ok(())
+}
+
+fn rss_titles(titles: &[&str]) -> Vec<u8> {
+    let items: String = titles
+        .iter()
+        .map(|title| format!("<item><title>{title}</title></item>"))
+        .collect();
+    format!("<rss version=\"2.0\"><channel>{items}</channel></rss>").into_bytes()
 }
 
 // ---- transport ----

@@ -3,11 +3,23 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::minute_of;
 use crate::parse::index_rows;
 use crate::rules::{ProviderKeys, Rule};
+
+/// How long before a keyed row's minute a direct answer is still read. Yahoo dated a row up to
+/// 72 min after a direct answer listed it: 29 of 4,042 matched row-polls, 26 polls of 2026-11-16.
+pub const DIRECT_LEAD: TimeDelta = TimeDelta::hours(2);
+
+/// One stored direct index answer: the url it was asked at, when it arrived, its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectAnswer {
+    pub url: String,
+    pub received_at: DateTime<Utc>,
+    pub bytes: Vec<u8>,
+}
 
 /// One keyed index row under a `cross_check` key whose title no direct index listed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,10 +41,15 @@ pub struct CrossCheck {
     pub no_key: u32,
     /// `cross_checked` rows dated before `watched_from`, or with no minute the rule reads.
     pub not_compared: u32,
+    /// `cross_checked` rows some admitted direct index has no parsed answer for after their minute
+    /// closed: "we did not look", never "not listed".
+    pub not_looked: u32,
     pub listed_directly: u32,
     pub unlisted: Vec<Unlisted>,
     /// Distinct normalised titles the readable direct payloads listed.
     pub direct_titles: u32,
+    /// Direct answers under an admitted direct index url that parsed as its rule's index shape.
+    pub direct_parsed: u32,
 }
 
 /// The keyed row's rule and every admitted direct row's index url with its rule.
@@ -71,8 +88,15 @@ impl CrossChecker {
         self.direct.contains_key(url)
     }
 
-    /// The earliest minute a `cross_check` row of `keyed` is listed at: no direct index answered
-    /// before it can have listed any of them.
+    /// The earliest direct answer `check` needs: `DIRECT_LEAD` before the earliest `cross_check`
+    /// row's minute.
+    #[must_use]
+    pub fn read_from(&self, keyed: &[u8]) -> Option<DateTime<Utc>> {
+        self.earliest_cross_checked(keyed)?
+            .checked_sub_signed(DIRECT_LEAD)
+    }
+
+    /// The earliest minute a `cross_check` row of `keyed` is listed at.
     #[must_use]
     pub fn earliest_cross_checked(&self, keyed: &[u8]) -> Option<DateTime<Utc>> {
         index_rows(keyed, &self.rule)?
@@ -88,32 +112,56 @@ impl CrossChecker {
             .min()
     }
 
-    /// `None` when `keyed` is not the rule's index shape. A direct payload whose url is no
-    /// admitted direct index, or that does not parse, adds no title.
+    /// `None` when `keyed` is not the rule's index shape. A direct answer whose url is no
+    /// admitted direct index, or that does not parse, adds no title and counts as no answer.
     #[must_use]
     pub fn check(
         &self,
         keyed: &[u8],
-        direct: &[(String, Vec<u8>)],
+        direct: &[DirectAnswer],
         watched_from: Option<DateTime<Utc>>,
     ) -> Option<CrossCheck> {
         let rows = index_rows(keyed, &self.rule)?;
-        let listed: BTreeSet<String> = direct
-            .iter()
-            .filter_map(|(url, bytes)| index_rows(bytes, self.direct.get(url)?))
-            .flatten()
-            .filter_map(|row| row.title.as_deref().map(normalised))
-            .filter(|title| !title.is_empty())
-            .collect();
+        let mut listed: BTreeSet<String> = BTreeSet::new();
+        let mut newest: BTreeMap<&str, DateTime<Utc>> = BTreeMap::new();
+        let mut direct_parsed: u32 = 0;
+        for answer in direct {
+            let Some(parsed) = self
+                .direct
+                .get(&answer.url)
+                .and_then(|rule| index_rows(&answer.bytes, rule))
+            else {
+                continue;
+            };
+            direct_parsed = direct_parsed.saturating_add(1);
+            let at = newest
+                .entry(answer.url.as_str())
+                .or_insert(answer.received_at);
+            *at = (*at).max(answer.received_at);
+            listed.extend(
+                parsed
+                    .iter()
+                    .filter_map(|row| row.title.as_deref().map(normalised))
+                    .filter(|title| !title.is_empty()),
+            );
+        }
+        // The oldest of each direct index's newest answers: every index looked after it.
+        let looked_until = if newest.len() == self.direct.len() {
+            newest.values().min().copied()
+        } else {
+            None
+        };
         let mut checked = CrossCheck {
             followed: 0,
             cross_checked: 0,
             other_key: 0,
             no_key: 0,
             not_compared: 0,
+            not_looked: 0,
             listed_directly: 0,
             unlisted: Vec::new(),
             direct_titles: u32::try_from(listed.len()).unwrap_or(u32::MAX),
+            direct_parsed,
         };
         for row in &rows {
             let key = row
@@ -139,8 +187,13 @@ impl CrossChecker {
                 .and_then(|raw| minute_of(raw, &self.rule.valid_format));
             let watched = minute
                 .is_some_and(|minute| watched_from.is_some_and(|from| minute.start() >= from));
+            let looked = minute
+                .and_then(|minute| minute.closes())
+                .is_some_and(|closes| looked_until.is_some_and(|until| until >= closes));
             if !watched {
                 checked.not_compared += 1;
+            } else if !looked {
+                checked.not_looked += 1;
             } else if row
                 .title
                 .as_deref()

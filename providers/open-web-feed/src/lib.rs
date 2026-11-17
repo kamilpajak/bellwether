@@ -30,7 +30,9 @@ use pit::datedness::{Minute, Published};
 use pit::ObservationTime;
 use serde_json::{Map, Value};
 
-pub use crate::crosscheck::{normalised, CrossCheck, CrossChecker, Unlisted};
+pub use crate::crosscheck::{
+    normalised, CrossCheck, CrossChecker, DirectAnswer, Unlisted, DIRECT_LEAD,
+};
 pub use crate::hosts::RobotsPin;
 use crate::hosts::{read_hosts, HostRow, Hosts, Status, HOSTS_SCHEMA};
 use crate::rules::{parse_rules, Rule, RULES_SCHEMA};
