@@ -1,7 +1,7 @@
 //! The robots.txt subset `collect` reads from a pinned body (architecture.md section 11.2): the
 //! `user-agent: *` groups, merged, their `Allow`/`Disallow` rules and their `Crawl-delay`. A group
 //! naming our own product token is never read: the token is `BELLWETHER_FEED_CONTACT`'s, not code's.
-//! Lines, keys, pattern escaping and matching are read as Google's robots.cc
+//! The body's bytes, lines, keys, pattern escaping and matching are read as Google's robots.cc
 //! (github.com/google/robotstxt, 50a0dac) reads them, reimplemented; a path is matched as given.
 //! The exceptions are in architecture.md section 10, row "key and line spellings".
 
@@ -29,8 +29,8 @@ const SEPARATOR: u8 = b':';
 const WILDCARD: char = '*';
 const END_ANCHOR: char = '$';
 const COMMENT: u8 = b'#';
-const BYTE_ORDER_MARK: char = '\u{feff}';
-const MARKUP: char = '<';
+const BYTE_ORDER_MARK: [u8; 3] = *b"\xef\xbb\xbf";
+const MARKUP: u8 = b'<';
 /// RFC 9309 section 2.2's EOL is CR, LF or CRLF; `str::lines` splits on LF alone.
 const LINE_ENDS: [u8; 2] = *b"\r\n";
 /// robots.cc 418-447: a line buffer of 2083 × 8 bytes whose last byte holds the terminator.
@@ -46,11 +46,10 @@ const NANOS_DIGITS: usize = 9;
 /// Why a pinned robots body cannot be read; each refuses the run as `robots_refused` (section 5.1).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RobotsError {
-    #[error("the body is not UTF-8")]
-    NotUtf8,
     #[error("the body is an HTML page: its first non-whitespace character is <")]
     HtmlPage,
-    #[error("the * group's Crawl-delay {0:?} is not a non-negative number of seconds")]
+    /// The value's bytes as `<[u8]>::escape_ascii` writes them, so `5\xe4` stays `5\xe4`.
+    #[error("the * group's Crawl-delay \"{0}\" is not a non-negative number of seconds")]
     CrawlDelayNotANumber(String),
 }
 
@@ -59,7 +58,6 @@ impl RobotsError {
     #[must_use]
     pub const fn verdict(&self) -> &'static str {
         match self {
-            Self::NotUtf8 => "refused_not_utf8",
             Self::HtmlPage => "refused_html",
             Self::CrawlDelayNotANumber(_) => "refused_crawl_delay",
         }
@@ -147,10 +145,8 @@ impl Robots {
     /// 2.2.4). Every line before the first `user-agent` line belongs to no group and is ignored,
     /// as section 2.2.2 says and Google's robots.cc (50a0dac) does, its Crawl-delay included.
     pub fn parse(body: &[u8]) -> Result<Self, RobotsError> {
-        let text = std::str::from_utf8(body).map_err(|_| RobotsError::NotUtf8)?;
-        let text = text.strip_prefix(BYTE_ORDER_MARK).unwrap_or(text);
-        let first = text.trim_start_matches(|c: char| c.is_whitespace() || c == BYTE_ORDER_MARK);
-        if first.starts_with(MARKUP) {
+        let body = skip_byte_order_mark(body);
+        if starts_with_markup(body) {
             return Err(RobotsError::HtmlPage);
         }
         let mut robots = Self {
@@ -161,13 +157,11 @@ impl Robots {
         let mut group = Group::default();
         let (mut named_an_agent, mut in_agent_run) = (false, false);
         let (mut orphan, mut content) = (false, false);
-        for raw in text.as_bytes().split(|byte| LINE_ENDS.contains(byte)) {
+        for raw in body.split(|byte| LINE_ENDS.contains(byte)) {
             if let Some(value) = crawl_delay_value(raw) {
                 content = true;
                 orphan |= !named_an_agent && !value.is_empty();
-                group
-                    .delays
-                    .push(String::from_utf8_lossy(value).into_owned());
+                group.delays.push(value.escape_ascii().to_string());
                 continue;
             }
             let line = read_line(raw);
@@ -287,6 +281,24 @@ fn directive(line: &[u8]) -> Option<(&[u8], &[u8])> {
     };
     let key = trim(key, &ASCII_SPACE);
     (!key.is_empty()).then(|| (key, trim(value, &ASCII_SPACE)))
+}
+
+/// robots.cc 50a0dac 434-441 skips each leading byte that continues the BOM, so `EF BB` alone goes.
+fn skip_byte_order_mark(body: &[u8]) -> &[u8] {
+    let skipped = body
+        .iter()
+        .zip(BYTE_ORDER_MARK)
+        .take_while(|(byte, mark)| **byte == *mark)
+        .count();
+    body.get(skipped..).unwrap_or(body)
+}
+
+/// Owner decision 3b over bytes: past ASCII whitespace, NUL and every byte at or above 0x80 (any
+/// BOM, UTF-8 or Latin-1 whitespace, a UTF-16 unit's zero half), the first byte is `<`.
+fn starts_with_markup(body: &[u8]) -> bool {
+    body.iter()
+        .find(|byte| !(ASCII_SPACE.contains(byte) || **byte == NUL || !byte.is_ascii()))
+        == Some(&MARKUP)
 }
 
 /// One physical line as robots.cc 50a0dac reads it: its first `MAX_LINE_BYTES` bytes, up to its
@@ -610,21 +622,49 @@ mod tests {
                 .as_bytes()
                 .to_vec(),
             " \u{feff}<html></html>".as_bytes().to_vec(),
-            vec![b'U', 0xff, b'\n'],
+            b"\xef\xbb <html>\xff".to_vec(),
+            b"\xff<html>".to_vec(),
         ]
         .iter()
         .map(|body| Robots::parse(body).map(|robots| robots.reading()))
         .collect::<Vec<_>>();
-        assert_eq!(
-            refused,
-            [
-                Err(RobotsError::HtmlPage),
-                Err(RobotsError::HtmlPage),
-                Err(RobotsError::HtmlPage),
-                Err(RobotsError::NotUtf8),
-            ]
-        );
+        assert_eq!(refused, vec![Err(RobotsError::HtmlPage); 5]);
         Ok(())
+    }
+
+    fn utf16(text: &str, little_endian: bool) -> Vec<u8> {
+        text.encode_utf16()
+            .flat_map(|unit| {
+                if little_endian {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                }
+            })
+            .collect()
+    }
+
+    /// Review of 2026-11-17: an HTML page that is not UTF-8 was read for rules, so every path was
+    /// allowed; Unicode whitespace before `<` is skipped too. Each body stands as a soft-404 page.
+    #[test]
+    fn an_html_body_that_is_not_utf8_or_starts_with_unicode_space_is_refused() {
+        let page = "<!doctype html>\n<html><body>Not found</body></html>\n";
+        let refused = [
+            [&b"\xff\xfe"[..], &utf16(page, true)].concat(),
+            [&b"\xfe\xff"[..], &utf16(page, false)].concat(),
+            utf16(page, false),
+            utf16(page, true),
+            [&b"\xa0"[..], page.as_bytes()].concat(),
+            format!("\u{a0}\u{2003}\u{3000}\u{85}\u{feff}{page}").into_bytes(),
+        ]
+        .map(|body| Robots::parse(&body).map(|robots| robots.reading()));
+        assert_eq!(refused.to_vec(), vec![Err(RobotsError::HtmlPage); 6]);
+        let read = [
+            &b"\xa0User-agent: *\nDisallow: /x\n"[..],
+            "\u{3000}\nUser-agent: *\nDisallow: /x # <y>\n".as_bytes(),
+        ]
+        .map(|body| Robots::parse(body).map(|robots| robots.allows("/x")));
+        assert_eq!(read, [Ok(true), Ok(false)]);
     }
 
     /// Owner decision 3a: an empty or comment-only 200 is no rules, every path allowed, no delay.
@@ -1195,15 +1235,69 @@ mod tests {
         Ok(())
     }
 
+    /// Owner decision 2026-11-17: a non-UTF-8 body is read as bytes, as robots.cc reads it (§10 (e)).
+    /// Mutations 2026-11-17, the UTF-8 refusal restored: red; only a whole BOM skipped: red.
+    #[test]
+    fn a_body_that_is_not_utf8_is_read_as_bytes_as_googles_parser_reads_it() -> TestResult {
+        let latin1 = b"# Datei f\xfcr Roboter\nUser-agent: *\nDisallow: /caf\xe9/\nAllow: /caf\xe9/men\xfc\n";
+        let row = |body: &[u8], path: &str, google| (body.to_vec(), path.to_owned(), google);
+        let rows = [
+            star(b"Disallow: /\xe4\n", "/%E4", false),
+            star(b"Disallow: /\xe4\n", "/%e4", true),
+            star(b"Disallow: /\xe4\n", "/\u{e4}", true),
+            star(b"Disallow: /\xe4\n", "/x", true),
+            star(b"Disallow: /\xe4\xfc\n", "/%E4%FC", false),
+            star(b"Disallow: /\xe4\xfc\n", "/%E4", true),
+            star(b"Disallow: /%e4\xe4\n", "/%E4%E4", false),
+            star(b"Disallow: /%e4\xe4\n", "/%e4%E4", true),
+            star(b"Disallow: /\xe4%\n", "/%E4%25", false),
+            star(b"Allow: /\xe4\nDisallow: /%E4\n", "/%E4", true),
+            star(b"Disallow: /\x80\x80*\xff$\n", "/%80%80a%FF", false),
+            star(b"Disallow: /\x80\x80*\xff$\n", "/%80%80a%FFb", true),
+            star(b"Allow: /\xe4/index.htm\nDisallow: /\n", "/%E4/", true),
+            star(b"Allow: /\xe4/index.htm\nDisallow: /\n", "/%E4/x", false),
+            row(latin1, "/caf%E9/x", false),
+            row(latin1, "/caf%E9/men%FC", true),
+            row(latin1, "/caf%C3%A9/x", true),
+            row(latin1, "/x", true),
+            star(b"Disallow: /\xc3\0\xa4\n", "/%C3", false),
+            star(b"Disallow: /\xc3\0\xa4\n", "/%C3x", false),
+            star(b"Disallow: /\xc3\0\xa4\n", "/x", true),
+            row(b"User-agent: *\xa0x\nDisallow: /x\n", "/x", true),
+            row(b"User-agent: *\xe4\nDisallow: /x\n", "/x", true),
+            row(b"User-agent: \xe4*\nDisallow: /x\n", "/x", true),
+            row(b"User-agent: b\xe4t\nDisallow: /x\n", "/x", true),
+            row(
+                b"User-agent: *\nUser-agent: b\xe4t\nDisallow: /x\n",
+                "/x",
+                false,
+            ),
+            row(b"Us\xe4r-agent: *\nDisallow: /x\n", "/x", true),
+            row(b"User-agent\xe4: *\nDisallow: /x\n", "/x", false),
+            star(b"Disallow\xe4: /x\n", "/x", false),
+            row(b"\xef\xbbUser-agent: *\nDisallow: /x\n", "/x", false),
+            row(b"\xefUser-agent: *\nDisallow: /x\n", "/x", false),
+            row(b"\xbbUser-agent: *\nDisallow: /x\n", "/x", true),
+            row(b"\xffUser-agent: *\nDisallow: /x\n", "/x", true),
+            row(
+                b"\xef\xbb\xbf\xef\xbb\xbfUser-agent: *\nDisallow: /x\n",
+                "/x",
+                true,
+            ),
+        ];
+        assert_eq!(disagreements(&rows)?, Vec::<String>::new());
+        Ok(())
+    }
+
     /// The owner's exceptions to Google (2026-11-17): an HTML body and a bad `*` Crawl-delay are
-    /// refused where Google allows `/y`. Kept outside that decision (§10): a non-UTF-8 body is
-    /// refused where Google reads its bytes.
+    /// refused where Google allows `/y`; a non-ASCII Crawl-delay is no number, where Google
+    /// disallows `/x` (compiled robots.cc, 2026-11-17).
     #[test]
     fn the_bodies_google_reads_and_ours_refuses_are_the_named_exceptions() {
         let refused = [
             &b"<html>\nUser-agent: *\nDisallow: /x\n"[..],
             b"User-agent: *\nCrawl-delay: soon\nDisallow: /x\n",
-            b"User-agent: *\nDisallow: /\xe4\n",
+            b"User-agent: *\nCrawl-delay: 5\xe4\nDisallow: /x\n",
         ]
         .map(|body| Robots::parse(body).map(|robots| robots.allows("/y")));
         assert_eq!(
@@ -1211,15 +1305,23 @@ mod tests {
             [
                 Err(RobotsError::HtmlPage),
                 Err(RobotsError::CrawlDelayNotANumber("soon".to_owned())),
-                Err(RobotsError::NotUtf8),
+                Err(RobotsError::CrawlDelayNotANumber(r"5\xe4".to_owned())),
             ]
+        );
+        assert_eq!(
+            refused
+                .get(2)
+                .map(|verdict| verdict.as_ref().err().map(ToString::to_string)),
+            Some(Some(
+                r#"the * group's Crawl-delay "5\xe4" is not a non-negative number of seconds"#
+                    .to_owned()
+            ))
         );
     }
 
     #[test]
     fn every_verdict_has_its_own_name() {
         let names = [
-            RobotsError::NotUtf8.verdict(),
             RobotsError::HtmlPage.verdict(),
             RobotsError::CrawlDelayNotANumber(String::new()).verdict(),
             Reading::Rules.name(),
@@ -1230,7 +1332,6 @@ mod tests {
         assert_eq!(
             names,
             [
-                "refused_not_utf8",
                 "refused_html",
                 "refused_crawl_delay",
                 "rules",

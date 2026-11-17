@@ -777,15 +777,15 @@ fn a_refresh_writes_its_report_on_stdout_for_exits_zero_one_and_eight_only() -> 
     Ok(())
 }
 
-/// Major 2 since recommendation #2 removed `refused_no_user_agent`, a value major 1 released
-/// (architecture.md section 10, `parse_verdict` row).
+/// Major 3 since the owner decision of 2026-11-17 removed `refused_not_utf8`, a value major 2
+/// released (architecture.md section 10, `parse_verdict` row).
 #[test]
-fn a_refresh_report_is_robots_schema_major_two() -> TestResult {
+fn a_refresh_report_is_robots_schema_major_three() -> TestResult {
     let root = TempDir::new()?;
     let body = gnw_body()?;
     let exchange = Robots::of(&[(GNW_ROBOTS, OK, body.as_slice())]);
     let answer = refreshed(root.path(), gnw_hosts(), &exchange)?;
-    assert_eq!(answer.report["schema"], "newsvault.robots/2");
+    assert_eq!(answer.report["schema"], "newsvault.robots/3");
     Ok(())
 }
 
@@ -1110,7 +1110,7 @@ fn a_refresh_reports_the_parse_verdict_of_each_answered_row() -> TestResult {
         (OK, b"User-agent: *\nCrawl-delay: 10\n".to_vec()),
         (OK, b"User-agent: *\nCrawl-delay: soon\n".to_vec()),
         (OK, b"Sitemap: https://www.prnewswire.com/s.xml\n".to_vec()),
-        (OK, vec![b'U', 0xff]),
+        (OK, b"User-agent: *\nDisallow: /\xe4\n".to_vec()),
         (NOT_FOUND, b"not here".to_vec()),
         (UNAVAILABLE, Vec::new()),
     ];
@@ -1144,7 +1144,7 @@ fn a_refresh_reports_the_parse_verdict_of_each_answered_row() -> TestResult {
         "rules",
         "refused_crawl_delay",
         "no_rules_no_group",
-        "refused_not_utf8",
+        "rules",
         "no_rules_absent",
     ];
     let mut wanted: Vec<(Value, Value)> = expected
