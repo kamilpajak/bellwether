@@ -753,9 +753,12 @@ pub fn blob_bytes(root: &Path, hex: &str) -> Result<Option<Vec<u8>>, StoreError>
     }
 }
 
+/// The first `PRAGMA user_version` whose attempts record a continuity: `MIGRATIONS[9]`.
+const CONTINUITY_VERSION: i32 = 10;
+
 /// The usable index pages of the newest run whose attempt at `index_url` recorded a continuity in
-/// `kept`, read-only before the lease (section 11.2). Empty with no commit log, and with a log at
-/// another version: an older one recorded no continuity, a newer one is refused before any send.
+/// `kept`, read-only before the lease (section 11.2), which migrates a store from 10 after it. Empty
+/// with no commit log and below 10; a newer log is refused before any send.
 pub fn basis_pages(
     root: &Path,
     source: &SourceId,
@@ -767,7 +770,7 @@ pub fn basis_pages(
         return Ok(Vec::new());
     }
     let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    if user_version(&db)? != SCHEMA_VERSION {
+    if !(CONTINUITY_VERSION..=SCHEMA_VERSION).contains(&user_version(&db)?) {
         return Ok(Vec::new());
     }
     let marks = vec!["?"; kept.len()].join(", ");
@@ -4172,13 +4175,20 @@ mod tests {
         let mut store = open(&temp)?;
         store.record_continuity("a v1 attempt", "boundary_no_shared_key", [1, 2, 3, 4])?;
         let taken = boundaries_on(&store, "a v1 attempt")?;
-        let refused = store
-            .db
-            .execute(
-                "UPDATE attempts SET boundary_older_generation = -1 WHERE attempt_id = 'a v1 attempt'",
-                [],
-            )
-            .is_err();
+        let refused: Vec<bool> = BOUNDARY_COLUMNS
+            .iter()
+            .map(|column| {
+                store
+                    .db
+                    .execute(
+                        &format!(
+                            "UPDATE attempts SET {column} = -1 WHERE attempt_id = 'a v1 attempt'"
+                        ),
+                        [],
+                    )
+                    .is_err()
+            })
+            .collect();
         let columns = super::columns_of(&store.db, "attempts")?;
         let shapes: Vec<Option<&super::ColumnShape>> = BOUNDARY_COLUMNS
             .iter()
@@ -4190,7 +4200,7 @@ mod tests {
             (
                 SCHEMA_VERSION,
                 vec![Some(1), Some(2), Some(3), Some(4)],
-                true,
+                vec![true; 4],
                 vec![Some(&integer); 4]
             )
         );

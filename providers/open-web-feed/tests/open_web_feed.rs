@@ -3621,6 +3621,32 @@ fn only_a_boundary_sharing_no_key_is_labelled() -> Outcome {
     Ok(())
 }
 
+/// A boundary's label reads its own two pages' stamps: pages 2–3 broken, pages 1–2 joined. Stamps
+/// of the 12-page pass's pages 3–5 (§11.6): 3 → 4 newer, 4 → 5 older. Review 2026-11-17: every
+/// boundary read against page 1's stamp was green before this.
+#[test]
+fn a_boundary_past_page_two_is_labelled_by_its_own_pages_stamps() -> Outcome {
+    let paging = provider()?.paging();
+    let read: Vec<Vec<u8>> = [
+        PROBE10_1410,
+        "sitemap_p2_joined.xml",
+        "sitemap_p2_after_1410.xml",
+    ]
+    .iter()
+    .map(|page| prn(page))
+    .collect();
+    let stamps = [
+        Some("2026-11-17T07:59:13.474Z"),
+        Some("2026-11-17T08:02:54.800Z"),
+        Some("2026-11-17T08:02:06.879Z"),
+    ];
+    assert_eq!(
+        paging.generations(PRN_SITEMAP, &read, &stamps),
+        Some(vec![Generation::Older])
+    );
+    Ok(())
+}
+
 /// A page whose oldest row is older than every basis row cannot lead to one (pages list newest
 /// first), and a page newer than the page before it cannot either. Mutations 2026-11-17, each of
 /// the two stops dropped from `next_page`: each red.

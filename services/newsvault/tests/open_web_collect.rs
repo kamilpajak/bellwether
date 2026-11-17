@@ -3812,12 +3812,22 @@ type Labelled = (Option<String>, Value, Vec<[i64; 4]>);
 /// continuity, its envelope `boundaries`, and the day's ledger counts in `Generation::ALL` order.
 fn labelled_1410(page_1: Option<&str>, page_2: Option<&str>) -> Result<Labelled, Box<dyn Error>> {
     let root = TempDir::new()?;
-    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
-    paged_poll(
-        root.path(),
-        PROBE10_1405,
-        &[(PRN_SITEMAP, "sitemap_p1_1405.xml")],
-    )?;
+    let answer = stamped_1410(root.path(), page_1, page_2)?;
+    Ok((
+        poll_continuity(&answer).1,
+        answer.envelope["continuity"][0]["boundaries"].clone(),
+        ledgered_boundaries(root.path())?,
+    ))
+}
+
+/// 14:05Z, then 14:10Z's two pages stamped `page_1` and `page_2`, in a fresh store at `root`.
+fn stamped_1410(
+    root: &Path,
+    page_1: Option<&str>,
+    page_2: Option<&str>,
+) -> Result<cmd_collect::Answer, Box<dyn Error>> {
+    seed::refresh_committed(root, ROBOTS_EARLIER)?;
+    paged_poll(root, PROBE10_1405, &[(PRN_SITEMAP, "sitemap_p1_1405.xml")])?;
     let stamps: Vec<(&str, &str)> = [(PRN_SITEMAP, page_1), (PRN_SITEMAP_PAGE_2, page_2)]
         .into_iter()
         .filter_map(|(url, stamp)| Some((url, stamp?)))
@@ -3827,12 +3837,8 @@ fn labelled_1410(page_1: Option<&str>, page_2: Option<&str>) -> Result<Labelled,
         (PRN_SITEMAP_PAGE_2, "sitemap_p2_1410.xml"),
     ])?
     .stamped(&stamps);
-    let (answer, _) = paged_poll_over(root.path(), PROBE10_1410, exchange)?;
-    Ok((
-        poll_continuity(&answer).1,
-        answer.envelope["continuity"][0]["boundaries"].clone(),
-        ledgered_boundaries(root.path())?,
-    ))
+    let (answer, _) = paged_poll_over(root, PROBE10_1410, exchange)?;
+    Ok(answer)
 }
 
 /// `[same, older, newer, unknown]` as the envelope's `boundaries` object for one broken boundary.
@@ -3907,6 +3913,105 @@ fn a_broken_boundary_missing_or_misreading_a_stamp_is_generation_unknown() -> Te
             )?,
         ),
         (unknown.clone(), unknown)
+    );
+    Ok(())
+}
+
+/// The human `continuity` line names each label's own count. Review 2026-11-17: one label's
+/// count printed under all four was green before this.
+#[test]
+fn the_human_continuity_line_prints_each_label_with_its_own_count() -> TestResult {
+    let root = TempDir::new()?;
+    let answer = stamped_1410(
+        root.path(),
+        Some(STAMP_1410_PAGE_1),
+        Some(STAMP_1410_PAGE_2),
+    )?;
+    let mut human = Vec::new();
+    cmd_collect::render_human(&answer.envelope, &mut human)?;
+    let human = String::from_utf8(human)?;
+    assert_eq!(
+        human
+            .lines()
+            .find(|line| line.starts_with("continuity"))
+            .map(str::to_owned),
+        Some(format!(
+            "continuity       {PRN_SITEMAP} pages 2 boundary_no_shared_key same_generation 0 \
+             older_generation 1 newer_generation 0 generation_unknown 0"
+        )),
+        "{human}"
+    );
+    Ok(())
+}
+
+/// A stored `payloads.headers` text that does not parse is `store_unreadable`, never an empty
+/// header set, which would label the boundary `generation_unknown` with no error. A trigger
+/// corrupts page 2's text as it is filed.
+#[test]
+fn an_unreadable_stored_header_text_is_store_unreadable_and_records_no_continuity() -> TestResult {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    paged_poll(
+        root.path(),
+        PROBE10_1405,
+        &[(PRN_SITEMAP, "sitemap_p1_1405.xml")],
+    )?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    db.execute_batch(&format!(
+        "CREATE TRIGGER corrupt_headers AFTER INSERT ON payloads WHEN NEW.url = '{PRN_SITEMAP_PAGE_2}'
+         BEGIN UPDATE payloads SET headers = 'not json' WHERE rowid = NEW.rowid; END;"
+    ))?;
+    drop(db);
+    let exchange = Gnw::paged(&[
+        (PRN_SITEMAP, "sitemap_p1_1410.xml"),
+        (PRN_SITEMAP_PAGE_2, "sitemap_p2_1410.xml"),
+    ])?
+    .stamped(&[
+        (PRN_SITEMAP, STAMP_1410_PAGE_1),
+        (PRN_SITEMAP_PAGE_2, STAMP_1410_PAGE_2),
+    ]);
+    let (answer, _) = paged_poll_over(root.path(), PROBE10_1410, exchange)?;
+    let poll = &answer.envelope["continuity"][0];
+    assert_eq!(
+        (
+            poll["error"]["code"].as_str(),
+            poll["continuity"].as_str(),
+            poll["boundaries"].clone(),
+            ledgered_boundaries(root.path())?,
+        ),
+        (Some("store_unreadable"), None, Value::Null, vec![[0; 4]])
+    );
+    Ok(())
+}
+
+/// The first run of a v11 build over a v10 store reads its v10 basis: `basis_pages` runs before
+/// the run migrates the store. Review 2026-11-17: it read none and recorded `first_poll`.
+#[test]
+fn a_v10_store_keeps_its_basis_for_the_run_that_migrates_it() -> TestResult {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    paged_poll(
+        root.path(),
+        PROBE10_1200,
+        &[(PRN_SITEMAP, "sitemap_p1_1200.xml")],
+    )?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    db.execute_batch(
+        "ALTER TABLE attempts DROP COLUMN boundary_same_generation;
+         ALTER TABLE attempts DROP COLUMN boundary_older_generation;
+         ALTER TABLE attempts DROP COLUMN boundary_newer_generation;
+         ALTER TABLE attempts DROP COLUMN boundary_generation_unknown;
+         PRAGMA user_version = 10;",
+    )?;
+    drop(db);
+    let (second, _) = paged_poll(
+        root.path(),
+        PROBE10_1205,
+        &[(PRN_SITEMAP, "sitemap_p1_1205.xml")],
+    )?;
+    assert_eq!(
+        poll_continuity(&second),
+        (vec![1], Some("complete".to_owned()))
     );
     Ok(())
 }
