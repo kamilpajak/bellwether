@@ -161,8 +161,16 @@ impl Robots {
         let mut group = Group::default();
         let (mut named_an_agent, mut in_agent_run) = (false, false);
         let (mut orphan, mut content) = (false, false);
-        for line in text.as_bytes().split(|byte| LINE_ENDS.contains(byte)) {
-            let line = read_line(line);
+        for raw in text.as_bytes().split(|byte| LINE_ENDS.contains(byte)) {
+            if let Some(value) = crawl_delay_value(raw) {
+                content = true;
+                orphan |= !named_an_agent && !value.is_empty();
+                group
+                    .delays
+                    .push(String::from_utf8_lossy(value).into_owned());
+                continue;
+            }
+            let line = read_line(raw);
             content |= !line.is_empty();
             let Some((key, value)) = directive(line) else {
                 continue;
@@ -183,13 +191,7 @@ impl Robots {
                         robots.rules.push(PathRule::new(rule == Key::Allow, value));
                     }
                 }
-                Key::CrawlDelay => {
-                    orphan |= !named_an_agent && !value.is_empty();
-                    group
-                        .delays
-                        .push(String::from_utf8_lossy(value).into_owned());
-                }
-                Key::Other => {}
+                Key::CrawlDelay | Key::Other => {}
             }
         }
         robots.end(&group)?;
@@ -294,6 +296,14 @@ fn read_line(line: &[u8]) -> &[u8] {
     let kept = kept.split(|byte| *byte == NUL).next().unwrap_or(kept);
     let kept = kept.split(|byte| *byte == COMMENT).next().unwrap_or(kept);
     trim(kept, &ASCII_SPACE)
+}
+
+/// A Crawl-delay line's value as ours read it before 2026-11-17 (owner decision 1): the whole
+/// line, NUL and bytes past `MAX_LINE_BYTES` kept, its comment cut. `None` for any other line.
+fn crawl_delay_value(line: &[u8]) -> Option<&[u8]> {
+    let kept = line.split(|byte| *byte == COMMENT).next().unwrap_or(line);
+    let (key, value) = directive(trim(kept, &ASCII_SPACE))?;
+    (Key::of(key) == Key::CrawlDelay).then_some(value)
 }
 
 fn trim<'a>(mut bytes: &'a [u8], strip: &[u8]) -> &'a [u8] {
@@ -560,6 +570,33 @@ mod tests {
             Err(RobotsError::CrawlDelayNotANumber("soon".to_owned()))
         );
         Ok(())
+    }
+
+    /// Owner decision 1 keeps our Crawl-delay reading: robots.cc reads no Crawl-delay, so its line
+    /// is read whole, never cut at a NUL or at 16,663 bytes as a rule line is.
+    #[test]
+    fn a_crawl_delay_line_is_read_whole_and_not_cut_as_googles_parser_cuts_a_rule_line() {
+        let blanks = " ".repeat(16_700);
+        let read = [
+            b"User-agent: *\nCrawl-delay: 5\0x\n".to_vec(),
+            format!("User-agent: *\nCrawl-delay: 5{blanks}x\n").into_bytes(),
+            format!("User-agent: *\nCrawl-delay:{blanks}5\n").into_bytes(),
+            b"User-agent: *\nCrawl-delay 5\0 x\n".to_vec(),
+        ]
+        .map(|body| {
+            Robots::parse(&body)
+                .map(|robots| robots.crawl_delay())
+                .map_err(|refused| refused.verdict())
+        });
+        assert_eq!(
+            read,
+            [
+                Err("refused_crawl_delay"),
+                Err("refused_crawl_delay"),
+                Ok(Some(Duration::from_secs(5))),
+                Ok(None),
+            ]
+        );
     }
 
     /// Owner decision 3b: a body whose first non-whitespace character is `<`, a BOM before it
@@ -927,8 +964,10 @@ mod tests {
     #[test]
     fn a_pattern_is_escaped_as_googles_parser_escapes_it() -> TestResult {
         let rows = [
+            star(b"Disallow:\n", "/", true),
             star(b"Disallow:\n", "/x", true),
             star(b"Disallow: /JSWidget/\n", "/JSWidget/x", false),
+            star(b"Disallow: /JSWidget/\n", "/rssfeed/", true),
             star("Disallow: /ä\n".as_bytes(), "/ä", true),
             star("Disallow: /ä\n".as_bytes(), "/%C3%A4", false),
             star("Disallow: /ä\n".as_bytes(), "/%c3%a4", true),
@@ -941,15 +980,22 @@ mod tests {
             star(b"Disallow: /a%2Fb\n", "/a/b", true),
             star(b"Disallow: /a%2Fb\n", "/a%2Fb", false),
             star(b"Disallow: /a%2Fb\n", "/a%2fb", true),
+            star(b"Disallow: /~joe\n", "/~joe", false),
             star(b"Disallow: /~joe\n", "/%7Ejoe", true),
             star(b"Disallow: /%62az\n", "/baz", true),
+            star(b"Disallow: /%62az\n", "/%62az", false),
             star(b"Disallow: /a%2Ab\n", "/a*b", true),
+            star(b"Disallow: /a%2Ab\n", "/a%2Ab", false),
+            star(b"Disallow: /x%\n", "/x%", false),
             star(b"Disallow: /x%\n", "/x%25", false),
             star(b"Disallow: /x%a\n", "/x%a", false),
             star(b"Disallow: /x%a\n", "/x%A", true),
             star(b"Disallow: /x%ag\n", "/x%ag", false),
             star(b"Disallow: /x%ag\n", "/x%AG", true),
             star(b"Disallow: /w%3D%3D\n", "/w%3d%3d", true),
+            star(b"Disallow: /w%3D%3D\n", "/w%3D%3D", false),
+            star(b"Disallow: /w%3d\n", "/w%3D", false),
+            star(b"Disallow: /w%3d\n", "/w%3d", true),
             star("Allow: /ä\nDisallow: /%C3\n".as_bytes(), "/%C3%A4", true),
             star("Allow: /ä\nDisallow: /%C3%A4\n".as_bytes(), "/%C3%A4", true),
             star(b"Allow: /%c3\nDisallow: /%C3\n", "/%C3x", true),
@@ -973,6 +1019,7 @@ mod tests {
             star(index, "/foo/?q=1", false),
             star(b"Allow: /index.html\nDisallow: /\n", "/", true),
             star(b"Allow: /index.html\nDisallow: /\n", "/?x=1", false),
+            star(b"Allow: /index.html\nDisallow: /\n", "/index.html", true),
             star(b"Allow: /foo/index.htmlx\nDisallow: /\n", "/foo/", true),
             star(b"Allow: /*/index.html\nDisallow: /\n", "/a/", true),
             star(b"Allow: /*/index.html\nDisallow: /\n", "/a/b/", true),
@@ -997,6 +1044,17 @@ mod tests {
                 false,
             ),
             star(b"Allow: index.html\nDisallow: /\n", "/", false),
+            star(b"Allow: index.html\nDisallow: /\n", "/index.html", false),
+            star(
+                b"Allow: /foo/index.html\nDisallow: /f*o*/$\n",
+                "/foo/",
+                false,
+            ),
+            star(
+                b"Allow: /foo/index.html\nDisallow: /f*o*/$\n",
+                "/foo/x",
+                true,
+            ),
             star(b"Allow: /foo/index.html\nDisallow: /foo\n", "/foo/", true),
             star(b"Allow: /foo/index.html\nDisallow: /foo\n", "/foo/x", false),
         ];
@@ -1039,9 +1097,24 @@ mod tests {
                 false,
             ),
             star(
+                disallow(KEPT_RUN, "b\r").as_bytes(),
+                &format!("/{}c", run_of_a(KEPT_RUN - 1)),
+                true,
+            ),
+            star(
                 disallow(KEPT_RUN - 1, "b").as_bytes(),
                 &format!("/{}c", run_of_a(KEPT_RUN - 1)),
                 true,
+            ),
+            star(
+                disallow(KEPT_RUN - 1, "b").as_bytes(),
+                &format!("/{}b", run_of_a(KEPT_RUN - 1)),
+                false,
+            ),
+            star(
+                disallow(KEPT_RUN - 1, "ä").as_bytes(),
+                &format!("/{}%C3%A4", run_of_a(KEPT_RUN - 1)),
+                false,
             ),
             star(
                 disallow(KEPT_RUN - 1, "ä").as_bytes(),
@@ -1049,9 +1122,24 @@ mod tests {
                 false,
             ),
             star(
+                format!("  {}", disallow(KEPT_RUN, "b")).as_bytes(),
+                &format!("/{}c", run_of_a(KEPT_RUN - 1)),
+                false,
+            ),
+            star(
+                format!("  {}", disallow(KEPT_RUN, "b")).as_bytes(),
+                &format!("/{}c", run_of_a(KEPT_RUN - 3)),
+                true,
+            ),
+            star(
                 format!("Allow: /{}\nDisallow: /a\n", run_of_a(16_700)).as_bytes(),
                 &format!("/{}", run_of_a(16_655)),
                 true,
+            ),
+            star(
+                format!("Allow: /{}\nDisallow: /a\n", run_of_a(16_700)).as_bytes(),
+                &format!("/{}", run_of_a(100)),
+                false,
             ),
             (
                 format!("\u{feff}{}Disallow: /x\n", star_after(16_651)).into_bytes(),
@@ -1079,6 +1167,7 @@ mod tests {
     fn a_line_ends_at_its_first_nul_as_googles_parser_reads_it() -> TestResult {
         let rows = [
             star(b"Disallow: /x\0y\n", "/x", false),
+            star(b"Disallow: /x\0y\n", "/xy", false),
             star(b"Disallow: /x\0y\n", "/x/z", false),
             star(b"Disallow\0: /x\n", "/x", true),
             (
@@ -1099,6 +1188,7 @@ mod tests {
                 "/x".to_owned(),
                 true,
             ),
+            star(b"Disallow: /x \0/y\n", "/x", false),
             star(b"Disallow: /x \0/y\n", "/x /y", false),
         ];
         assert_eq!(disagreements(&rows)?, Vec::<String>::new());
@@ -1106,7 +1196,8 @@ mod tests {
     }
 
     /// The owner's exceptions to Google (2026-11-17): an HTML body and a bad `*` Crawl-delay are
-    /// refused where Google allows `/y`; a non-UTF-8 body is refused where Google reads it.
+    /// refused where Google allows `/y`. Kept outside that decision (§10): a non-UTF-8 body is
+    /// refused where Google reads its bytes.
     #[test]
     fn the_bodies_google_reads_and_ours_refuses_are_the_named_exceptions() {
         let refused = [
