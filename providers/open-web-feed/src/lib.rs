@@ -47,9 +47,9 @@ const VENDOR_PATIENCE: Duration = Duration::from_secs(30);
 /// The largest page of the 2026-11-14 probes was 979,950 B (cnbc.com), the GNW article 71,657 B
 /// and the GNW RSS 36,687 B, all as decompressed by curl (§11.6's method).
 const BODY_LIMIT: u64 = 2 * 1_024 * 1_024;
-/// Section 11.1's floor; per IP the same, because no measurement places a smaller one. One
-/// `per_host` for every host (§8 row R19 hole 7): `newsvault collect` refuses a host whose robots
-/// Crawl-delay is above it (owner decision 1, 2026-11-16).
+/// Section 11.1's floor, as `per_host` for every host (§8 row R19 hole 7): `newsvault collect`
+/// refuses a host whose robots Crawl-delay is above it (owner decision 1, 2026-11-16). No per-IP
+/// pace: each host is its own queue (owner decision 1, 2026-11-17, §10).
 const INTERVAL: Duration = Duration::from_secs(10);
 
 /// Why no request may be made at all, each raised by `open` before the first request.
@@ -405,7 +405,7 @@ impl Provider for OpenWebFeed {
             },
             body_limit: BODY_LIMIT,
             budget: RequestBudget {
-                min_interval: INTERVAL,
+                min_interval: None,
                 per_host: Some(INTERVAL),
             },
         }

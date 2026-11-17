@@ -627,7 +627,7 @@ fn the_sec_profile_paces_both_our_address_and_the_sec_host_at_ten_a_second() -> 
     assert_eq!(
         provider()?.transport().budget,
         news_provider::RequestBudget {
-            min_interval: tenth_of_a_second,
+            min_interval: Some(tenth_of_a_second),
             per_host: Some(tenth_of_a_second),
         }
     );

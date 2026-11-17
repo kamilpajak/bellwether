@@ -1819,13 +1819,14 @@ fn an_unknown_index_or_a_sitemap_field_outside_news_is_refused() {
 
 // ---- transport ----
 
+/// Owner decision 1, 2026-11-17: each host its own 10 s queue, and no per-IP queue across hosts.
 #[test]
-fn the_profile_paces_every_host_and_our_address_at_one_request_per_ten_seconds() -> Outcome {
+fn the_profile_paces_each_host_at_one_request_per_ten_seconds_and_no_shared_ip_queue() -> Outcome {
     let profile = provider()?.transport();
     let ten = std::time::Duration::from_secs(10);
     assert_eq!(
         (profile.budget.min_interval, profile.budget.per_host),
-        (ten, Some(ten))
+        (None, Some(ten))
     );
     assert_eq!(
         profile.user_agent,
