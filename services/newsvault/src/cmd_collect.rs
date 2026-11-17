@@ -18,11 +18,12 @@ use news_provider::provider::{Cadence, Calendar, CalendarError, Listing, PlanRef
 use news_provider::request::RequestPhase;
 use news_provider::{
     stamp_of, Archive, ArchiveError, AttemptReceipt, Clock, CollectError, Collected, CollectedItem,
-    Committed, Credentials, Exchange, Exit, Payload, Provider, Relisted, Run, RunId, SourceId,
-    TargetWindow, Wire,
+    Committed, Credentials, Exchange, Exit, Headers, Payload, Provider, Relisted, Run, RunId,
+    SourceId, TargetWindow, Wire,
 };
 use open_web_feed::{
-    Basis, Continuity, CrossChecker, DirectAnswer, HostRobots, OpenWebFeed, Paging, RobotsPin,
+    Basis, Continuity, CrossChecker, DirectAnswer, Generation, HostRobots, OpenWebFeed, Paging,
+    RobotsPin, GENERATION_HEADER,
 };
 use pit::{MeasuredLag, ObservationTime};
 use serde_json::{json, Value};
@@ -892,6 +893,7 @@ fn continuity_of(store: &mut Committer, paged: &PagedPolls) -> Value {
                 "pages_read": pages.iter().map(|(page, _)| *page).collect::<Vec<u32>>(),
                 "basis_keys": basis.map(|basis| basis.keys().len()),
                 "continuity": Value::Null,
+                "boundaries": Value::Null,
                 "error": Value::Null,
             });
             let next = pages.last().and_then(|(page, _)| page.checked_add(1));
@@ -899,7 +901,16 @@ fn continuity_of(store: &mut Committer, paged: &PagedPolls) -> Value {
                 .iter()
                 .any(|payload| paged.paging.page_of(index_url, &payload.url) == next);
             match recorded(store, paged, index_url, &pages, ran_out, basis) {
-                Ok(continuity) => poll["continuity"] = json!(continuity.map(Continuity::name)),
+                Ok(Some((continuity, boundaries))) => {
+                    poll["continuity"] = json!(continuity.name());
+                    poll["boundaries"] = Generation::ALL
+                        .iter()
+                        .zip(boundaries)
+                        .map(|(label, count)| (label.name().to_owned(), json!(count)))
+                        .collect::<serde_json::Map<String, Value>>()
+                        .into();
+                }
+                Ok(None) => {}
                 Err(failure) => poll["error"] = failure,
             }
             poll
@@ -908,8 +919,9 @@ fn continuity_of(store: &mut Committer, paged: &PagedPolls) -> Value {
     json!(polls)
 }
 
-/// One poll's continuity, written on its page-1 attempt; `None` when it read no usable page.
-/// `ran_out`: the page after the last one read answered with no row.
+/// One poll's continuity and its boundaries sharing no key counted per `Generation::ALL`, written
+/// on its page-1 attempt; `None` when it read no usable page. `ran_out`: the page after the last
+/// one read answered with no row.
 fn recorded(
     store: &mut Committer,
     paged: &PagedPolls,
@@ -917,7 +929,7 @@ fn recorded(
     pages: &[(u32, &IndexPayload)],
     ran_out: bool,
     basis: Option<&Basis>,
-) -> Result<Option<Continuity>, Value> {
+) -> Result<Option<(Continuity, [u32; 4])>, Value> {
     let Some((_, first)) = pages.first() else {
         return Ok(None);
     };
@@ -925,13 +937,27 @@ fn recorded(
         .iter()
         .map(|(_, page)| read_blob(store, &page.raw_blob))
         .collect::<Result<Vec<Vec<u8>>, Value>>()?;
+    let headers = pages
+        .iter()
+        .map(|(_, page)| Headers::from_json(&page.headers))
+        .collect::<Result<Vec<Headers>, _>>()
+        .map_err(|failure| read_failure("store_unreadable", failure.to_string()))?;
+    let stamps: Vec<Option<&str>> = headers
+        .iter()
+        .map(|kept| kept.first(GENERATION_HEADER))
+        .collect();
     let continuity = paged.paging.continuity(index_url, &bytes, basis, ran_out);
-    if let Some(continuity) = continuity {
-        store
-            .record_continuity(&first.attempt_id, continuity.name())
-            .map_err(|failure| read_failure("store_unwritable", failure.to_string()))?;
-    }
-    Ok(continuity)
+    let labels = paged.paging.generations(index_url, &bytes, &stamps);
+    let (Some(continuity), Some(labels)) = (continuity, labels) else {
+        return Ok(None);
+    };
+    let boundaries =
+        Generation::ALL.map(|label| labels.iter().filter(|one| **one == label).count());
+    let boundaries = boundaries.map(|count| u32::try_from(count).unwrap_or(u32::MAX));
+    store
+        .record_continuity(&first.attempt_id, continuity.name(), boundaries)
+        .map_err(|failure| read_failure("store_unwritable", failure.to_string()))?;
+    Ok(Some((continuity, boundaries)))
 }
 
 /// What `cross_check_of` read from the store: the keyed bytes and the direct answers it compares.
@@ -1399,9 +1425,16 @@ pub fn render_human(envelope: &Value, out: &mut impl std::io::Write) -> std::io:
             .as_str()
             .or_else(|| poll["error"]["code"].as_str())
             .unwrap_or("no usable page");
+        let boundaries: String = Generation::ALL
+            .iter()
+            .filter_map(|label| {
+                let count = poll["boundaries"].get(label.name())?;
+                Some(format!(" {} {count}", label.name()))
+            })
+            .collect();
         writeln!(
             out,
-            "continuity       {} pages {pages} {state}",
+            "continuity       {} pages {pages} {state}{boundaries}",
             text(poll, "index_url")
         )?;
     }

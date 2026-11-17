@@ -18,7 +18,7 @@ use news_provider::{
 use newsvault::cmd_collect::{self, Ask, CollectRunError};
 use newsvault::cmd_items::{self, PerStory};
 use newsvault::store::{Committer, StoreError, COMMIT_LOG, RUNS_DIR, SCHEMA_VERSION};
-use open_web_feed::OpenWebFeed;
+use open_web_feed::{OpenWebFeed, GENERATION_HEADER};
 use pit::ObservationTime;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
@@ -116,6 +116,7 @@ const PRN_RELEASES: [(&str, &str); 3] = [
 /// 302939742 and then `PRN_RELEASES`, each under its sitemap time.
 const PRN_SITEMAP: &str = "https://www.prnewswire.com/sitemap-news.xml?page=1";
 const PRN_SITEMAP_PAGE_2: &str = "https://www.prnewswire.com/sitemap-news.xml?page=2";
+const PRN_SITEMAP_PAGE_3: &str = "https://www.prnewswire.com/sitemap-news.xml?page=3";
 const PRN_RELEASE_PREFIX: &str = "https://www.prnewswire.com/news-releases/";
 const PRN_SITEMAP_ONLY: &str = "www.prnewswire.com/news-releases/stark-future-closes-financing-round-in-excess-of-150-million-in-total-transactional-value-as-its-electric-motorcycles-overtake-combustion-on-the-world-stage-302939742.html";
 const CNW_INDEX: &str = "https://www.newswire.ca/sitemap-news.xml?page=1";
@@ -239,6 +240,8 @@ struct Gnw {
     scripted: RefCell<BTreeMap<String, Vec<u16>>>,
     /// `(url prefix, page)`: what a url no page answers is answered with when it starts so.
     fallback: Option<(String, Vec<u8>)>,
+    /// The `x-sitemap-generated-at` a url's page is answered with, when it has one.
+    stamps: BTreeMap<String, String>,
 }
 
 impl Gnw {
@@ -254,6 +257,7 @@ impl Gnw {
             asked: RefCell::new(Vec::new()),
             scripted: RefCell::new(BTreeMap::new()),
             fallback: None,
+            stamps: BTreeMap::new(),
         })
     }
 
@@ -332,6 +336,14 @@ impl Gnw {
         Ok(all)
     }
 
+    /// Each `(url, stamp)`'s page answered with `stamp` as its `x-sitemap-generated-at`.
+    fn stamped(mut self, stamps: &[(&str, &str)]) -> Self {
+        for (url, stamp) in stamps {
+            self.stamps.insert((*url).to_owned(), (*stamp).to_owned());
+        }
+        self
+    }
+
     fn answering(self, url: &str, statuses: &[u16]) -> Self {
         self.scripted
             .borrow_mut()
@@ -377,12 +389,17 @@ impl Exchange for Gnw {
             .as_ref()
             .filter(|(prefix, _)| request.url.starts_with(prefix.as_str()))
             .map(|(_, page)| page);
+        let stamp = self
+            .stamps
+            .get(&request.url)
+            .map(|stamp| (GENERATION_HEADER.to_owned(), stamp.clone()));
+        let headers = [(CONTENT_TYPE.to_owned(), PAGE_TYPE.to_owned())]
+            .into_iter()
+            .chain(stamp)
+            .collect();
         match self.pages.get(&request.url).or(fallback) {
             Some(body) => Ok(RawResponse::new(attempt, OK, body.clone(), sent, received)
-                .with_headers(Headers::new(vec![(
-                    CONTENT_TYPE.to_owned(),
-                    PAGE_TYPE.to_owned(),
-                )]))),
+                .with_headers(Headers::new(headers))),
             None => Err(SendFailure::Transport(TransportError::new(
                 attempt,
                 at,
@@ -1070,6 +1087,12 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
                 "pages_read": [1],
                 "basis_keys": null,
                 "continuity": "first_poll",
+                "boundaries": {
+                    "same_generation": 0,
+                    "older_generation": 0,
+                    "newer_generation": 0,
+                    "generation_unknown": 0,
+                },
                 "error": null,
             }]),
             Some("first_poll"),
@@ -1131,7 +1154,10 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
                 "cross-check      0 unlisted directly, 0 listed, 3 not compared, 0 not looked"
                     .to_owned()
             ),
-            Some(format!("continuity       {PRN_SITEMAP} pages 1 first_poll")),
+            Some(format!(
+                "continuity       {PRN_SITEMAP} pages 1 first_poll same_generation 0 \
+                 older_generation 0 newer_generation 0 generation_unknown 0"
+            )),
             true,
             true,
         )
@@ -3508,11 +3534,10 @@ fn poll_continuity(answer: &cmd_collect::Answer) -> (Vec<u64>, Option<String>) {
     )
 }
 
-/// The ledger's continuity counts for 2026-11-17, `[complete, boundary, no previous, first,
-/// next page unread]`.
-fn ledgered_continuity(store: &Path) -> Result<Vec<[i64; 5]>, Box<dyn Error>> {
+/// The ledger's report for 2026-11-17.
+fn ledgered(store: &Path) -> Result<newsvault::cmd_ledger::Report, Box<dyn Error>> {
     let day: chrono::NaiveDate = "2026-11-17".parse()?;
-    let report = newsvault::cmd_ledger::read(
+    Ok(newsvault::cmd_ledger::read(
         store,
         &newsvault::cmd_ledger::Ask {
             at: instant("2026-11-18T00:00:00Z"),
@@ -3523,8 +3548,31 @@ fn ledgered_continuity(store: &Path) -> Result<Vec<[i64; 5]>, Box<dyn Error>> {
             limit: None,
             check: false,
         },
-    )?;
-    Ok(report
+    )?)
+}
+
+/// The ledger's boundary counts for 2026-11-17, `[same, older, newer, unknown]`.
+fn ledgered_boundaries(store: &Path) -> Result<Vec<[i64; 4]>, Box<dyn Error>> {
+    Ok(ledgered(store)?
+        .days
+        .iter()
+        .flat_map(|one| &one.per_source)
+        .map(|row| {
+            let counts = row.boundaries;
+            [
+                counts.same_generation,
+                counts.older_generation,
+                counts.newer_generation,
+                counts.generation_unknown,
+            ]
+        })
+        .collect())
+}
+
+/// The ledger's continuity counts for 2026-11-17, `[complete, boundary, no previous, first,
+/// next page unread]`.
+fn ledgered_continuity(store: &Path) -> Result<Vec<[i64; 5]>, Box<dyn Error>> {
+    Ok(ledgered(store)?
         .days
         .iter()
         .flat_map(|one| &one.per_source)
@@ -3601,11 +3649,10 @@ fn a_poll_whose_page_one_overlaps_the_first_poll_is_complete_and_reads_one_page(
     Ok(())
 }
 
-/// Probe10 14:10Z (§11.6): two pages, `boundary_no_shared_key`; being no basis, 14:15Z reads back to
-/// 14:05Z through page 2 again. Mutations 2026-11-17, `is_basis` true for every arm and the
-/// boundary check dropped: each red.
+/// Probe10 14:10Z (§11.6): two pages, `boundary_no_shared_key`, and a basis (option B), so 14:15Z
+/// with the same pages is `complete` at page 1. Mutations: §11.5 step 6's PRN completeness table.
 #[test]
-fn the_1410_poll_reads_two_pages_records_its_gap_and_is_no_basis_for_the_next() -> TestResult {
+fn the_1410_poll_reads_two_pages_records_its_gap_and_is_the_basis_of_the_next() -> TestResult {
     let root = TempDir::new()?;
     seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
     let pages_of_1410 = [
@@ -3653,10 +3700,318 @@ fn the_1410_poll_reads_two_pages_records_its_gap_and_is_no_basis_for_the_next() 
             Some("boundary_no_shared_key".to_owned()),
             1,
             Some("2026-11-17T09:00:00-05:00".to_owned()),
-            (vec![1, 2], Some("boundary_no_shared_key".to_owned())),
-            1,
+            (vec![1], Some("complete".to_owned())),
+            0,
             Exit::Ok,
         )
+    );
+    Ok(())
+}
+
+/// The review's case (PR #47 F1): 14:10Z and 14:15Z each cross a broken boundary. 14:10Z is a
+/// basis, so 14:15Z's page 2, holding a key of 14:10Z's page 2 and none of 14:05Z, ends the walk.
+/// Mutations: §11.5 step 6's PRN completeness table.
+#[test]
+fn a_poll_after_a_broken_boundary_reads_back_only_to_that_poll() -> TestResult {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    let (first, _) = paged_poll(
+        root.path(),
+        PROBE10_1405,
+        &[(PRN_SITEMAP, "sitemap_p1_1405.xml")],
+    )?;
+    let (second, _) = paged_poll(
+        root.path(),
+        PROBE10_1410,
+        &[
+            (PRN_SITEMAP, "sitemap_p1_1410.xml"),
+            (PRN_SITEMAP_PAGE_2, "sitemap_p2_1410.xml"),
+        ],
+    )?;
+    let (third, third_sent) = paged_poll(
+        root.path(),
+        PROBE10_1415,
+        &[
+            (PRN_SITEMAP, "sitemap_tie_0900.xml"),
+            (PRN_SITEMAP_PAGE_2, "sitemap_p2_after_1410.xml"),
+        ],
+    )?;
+    assert_eq!(
+        (
+            poll_continuity(&first),
+            poll_continuity(&second),
+            poll_continuity(&third),
+            third.envelope["continuity"][0]["basis_keys"].as_u64(),
+            sends_of(&third_sent, PRN_SITEMAP_PAGE_3),
+            ledgered_continuity(root.path())?,
+        ),
+        (
+            (vec![1], Some("first_poll".to_owned())),
+            (vec![1, 2], Some("boundary_no_shared_key".to_owned())),
+            (vec![1, 2], Some("boundary_no_shared_key".to_owned())),
+            Some(6),
+            0,
+            vec![[0, 2, 0, 1, 0]],
+        )
+    );
+    Ok(())
+}
+
+/// A poll whose boundary broke and whose planned page 3 failed read less than it planned, so it
+/// is `next_page_unread`, not `boundary_no_shared_key`, and no basis: 14:15Z anchors to 12:05Z.
+/// Mutations: §11.5 step 6's PRN completeness table.
+#[test]
+fn a_broken_poll_whose_next_page_failed_is_next_page_unread_and_no_basis() -> TestResult {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    paged_poll(
+        root.path(),
+        PROBE10_1205,
+        &[(PRN_SITEMAP, "sitemap_p1_1205.xml")],
+    )?;
+    let failing = Gnw::paged(&[
+        (PRN_SITEMAP, "sitemap_tie_0900.xml"),
+        (PRN_SITEMAP_PAGE_2, "sitemap_p2_1410.xml"),
+    ])?
+    .answering(PRN_SITEMAP_PAGE_3, &[UNAVAILABLE; 3]);
+    let (unread, unread_sent) = paged_poll_over(root.path(), PROBE10_1410, failing)?;
+    let (next, next_sent) = paged_poll(
+        root.path(),
+        PROBE10_1415,
+        &[(PRN_SITEMAP, "sitemap_p1_1205.xml")],
+    )?;
+    assert_eq!(
+        (
+            poll_continuity(&unread),
+            sends_of(&unread_sent, PRN_SITEMAP_PAGE_3),
+            unread.envelope["continuity"][0]["boundaries"]["generation_unknown"].as_u64(),
+            poll_continuity(&next),
+            next.envelope["continuity"][0]["basis_keys"].as_u64(),
+            sends_of(&next_sent, PRN_SITEMAP_PAGE_2),
+        ),
+        (
+            (vec![1, 2], Some("next_page_unread".to_owned())),
+            3,
+            Some(1),
+            (vec![1], Some("complete".to_owned())),
+            Some(3),
+            0,
+        )
+    );
+    Ok(())
+}
+
+/// Probe10's 14:10Z stamps (raw records, 2026-11-17): page 1 14:01:42.474Z, page 2 13:55:47.638Z.
+const STAMP_1410_PAGE_1: &str = "2026-11-17T14:01:42.474Z";
+const STAMP_1410_PAGE_2: &str = "2026-11-17T13:55:47.638Z";
+
+/// A poll's continuity, its envelope `boundaries` and the day's ledger boundary counts.
+type Labelled = (Option<String>, Value, Vec<[i64; 4]>);
+
+/// 14:05Z, then 14:10Z's two pages stamped `page_1` and `page_2` (`None`: no header): 14:10Z's
+/// continuity, its envelope `boundaries`, and the day's ledger counts in `Generation::ALL` order.
+fn labelled_1410(page_1: Option<&str>, page_2: Option<&str>) -> Result<Labelled, Box<dyn Error>> {
+    let root = TempDir::new()?;
+    let answer = stamped_1410(root.path(), page_1, page_2)?;
+    Ok((
+        poll_continuity(&answer).1,
+        answer.envelope["continuity"][0]["boundaries"].clone(),
+        ledgered_boundaries(root.path())?,
+    ))
+}
+
+/// 14:05Z, then 14:10Z's two pages stamped `page_1` and `page_2`, in a fresh store at `root`.
+fn stamped_1410(
+    root: &Path,
+    page_1: Option<&str>,
+    page_2: Option<&str>,
+) -> Result<cmd_collect::Answer, Box<dyn Error>> {
+    seed::refresh_committed(root, ROBOTS_EARLIER)?;
+    paged_poll(root, PROBE10_1405, &[(PRN_SITEMAP, "sitemap_p1_1405.xml")])?;
+    let stamps: Vec<(&str, &str)> = [(PRN_SITEMAP, page_1), (PRN_SITEMAP_PAGE_2, page_2)]
+        .into_iter()
+        .filter_map(|(url, stamp)| Some((url, stamp?)))
+        .collect();
+    let exchange = Gnw::paged(&[
+        (PRN_SITEMAP, "sitemap_p1_1410.xml"),
+        (PRN_SITEMAP_PAGE_2, "sitemap_p2_1410.xml"),
+    ])?
+    .stamped(&stamps);
+    let (answer, _) = paged_poll_over(root, PROBE10_1410, exchange)?;
+    Ok(answer)
+}
+
+/// `[same, older, newer, unknown]` as the envelope's `boundaries` object for one broken boundary.
+fn one_boundary(labelled: [u64; 4]) -> Value {
+    let [same, older, newer, unknown] = labelled;
+    serde_json::json!({
+        "same_generation": same,
+        "older_generation": older,
+        "newer_generation": newer,
+        "generation_unknown": unknown,
+    })
+}
+
+/// Equal stamps: one generation, so no row fell between the pages; the poll stays
+/// `boundary_no_shared_key`, which the label never decides.
+#[test]
+fn a_broken_boundary_between_pages_of_one_generation_is_same_generation() -> TestResult {
+    assert_eq!(
+        labelled_1410(Some(STAMP_1410_PAGE_1), Some(STAMP_1410_PAGE_1))?,
+        (
+            Some("boundary_no_shared_key".to_owned()),
+            one_boundary([1, 0, 0, 0]),
+            vec![[1, 0, 0, 0]]
+        )
+    );
+    Ok(())
+}
+
+/// Probe10's 14:10Z: page 2 from an older generation, a real gap.
+#[test]
+fn a_broken_boundary_whose_later_page_is_older_is_older_generation() -> TestResult {
+    assert_eq!(
+        labelled_1410(Some(STAMP_1410_PAGE_1), Some(STAMP_1410_PAGE_2))?,
+        (
+            Some("boundary_no_shared_key".to_owned()),
+            one_boundary([0, 1, 0, 0]),
+            vec![[0, 1, 0, 0]]
+        )
+    );
+    Ok(())
+}
+
+/// The stamps reversed: page 2 newer than page 1, by the millisecond part as well.
+#[test]
+fn a_broken_boundary_whose_later_page_is_newer_is_newer_generation() -> TestResult {
+    assert_eq!(
+        labelled_1410(Some(STAMP_1410_PAGE_2), Some("2026-11-17T13:55:47.639Z"))?,
+        (
+            Some("boundary_no_shared_key".to_owned()),
+            one_boundary([0, 0, 1, 0]),
+            vec![[0, 0, 1, 0]]
+        )
+    );
+    Ok(())
+}
+
+/// A stamp absent on page 2, or on page 1 in `Last-Modified`'s form, which drops the
+/// milliseconds: `generation_unknown` both times, and the poll as it was before the header.
+#[test]
+fn a_broken_boundary_missing_or_misreading_a_stamp_is_generation_unknown() -> TestResult {
+    let unknown = (
+        Some("boundary_no_shared_key".to_owned()),
+        one_boundary([0, 0, 0, 1]),
+        vec![[0, 0, 0, 1]],
+    );
+    assert_eq!(
+        (
+            labelled_1410(Some(STAMP_1410_PAGE_1), None)?,
+            labelled_1410(
+                Some("Tue, 17 Nov 2026 14:01:42 GMT"),
+                Some(STAMP_1410_PAGE_2)
+            )?,
+        ),
+        (unknown.clone(), unknown)
+    );
+    Ok(())
+}
+
+/// The human `continuity` line names each label's own count. Review 2026-11-17: one label's
+/// count printed under all four was green before this.
+#[test]
+fn the_human_continuity_line_prints_each_label_with_its_own_count() -> TestResult {
+    let root = TempDir::new()?;
+    let answer = stamped_1410(
+        root.path(),
+        Some(STAMP_1410_PAGE_1),
+        Some(STAMP_1410_PAGE_2),
+    )?;
+    let mut human = Vec::new();
+    cmd_collect::render_human(&answer.envelope, &mut human)?;
+    let human = String::from_utf8(human)?;
+    assert_eq!(
+        human
+            .lines()
+            .find(|line| line.starts_with("continuity"))
+            .map(str::to_owned),
+        Some(format!(
+            "continuity       {PRN_SITEMAP} pages 2 boundary_no_shared_key same_generation 0 \
+             older_generation 1 newer_generation 0 generation_unknown 0"
+        )),
+        "{human}"
+    );
+    Ok(())
+}
+
+/// A stored `payloads.headers` text that does not parse is `store_unreadable`, never an empty
+/// header set, which would label the boundary `generation_unknown` with no error. A trigger
+/// corrupts page 2's text as it is filed.
+#[test]
+fn an_unreadable_stored_header_text_is_store_unreadable_and_records_no_continuity() -> TestResult {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    paged_poll(
+        root.path(),
+        PROBE10_1405,
+        &[(PRN_SITEMAP, "sitemap_p1_1405.xml")],
+    )?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    db.execute_batch(&format!(
+        "CREATE TRIGGER corrupt_headers AFTER INSERT ON payloads WHEN NEW.url = '{PRN_SITEMAP_PAGE_2}'
+         BEGIN UPDATE payloads SET headers = 'not json' WHERE rowid = NEW.rowid; END;"
+    ))?;
+    drop(db);
+    let exchange = Gnw::paged(&[
+        (PRN_SITEMAP, "sitemap_p1_1410.xml"),
+        (PRN_SITEMAP_PAGE_2, "sitemap_p2_1410.xml"),
+    ])?
+    .stamped(&[
+        (PRN_SITEMAP, STAMP_1410_PAGE_1),
+        (PRN_SITEMAP_PAGE_2, STAMP_1410_PAGE_2),
+    ]);
+    let (answer, _) = paged_poll_over(root.path(), PROBE10_1410, exchange)?;
+    let poll = &answer.envelope["continuity"][0];
+    assert_eq!(
+        (
+            poll["error"]["code"].as_str(),
+            poll["continuity"].as_str(),
+            poll["boundaries"].clone(),
+            ledgered_boundaries(root.path())?,
+        ),
+        (Some("store_unreadable"), None, Value::Null, vec![[0; 4]])
+    );
+    Ok(())
+}
+
+/// The first run of a v11 build over a v10 store reads its v10 basis: `basis_pages` runs before
+/// the run migrates the store. Review 2026-11-17: it read none and recorded `first_poll`.
+#[test]
+fn a_v10_store_keeps_its_basis_for_the_run_that_migrates_it() -> TestResult {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    paged_poll(
+        root.path(),
+        PROBE10_1200,
+        &[(PRN_SITEMAP, "sitemap_p1_1200.xml")],
+    )?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    db.execute_batch(
+        "ALTER TABLE attempts DROP COLUMN boundary_same_generation;
+         ALTER TABLE attempts DROP COLUMN boundary_older_generation;
+         ALTER TABLE attempts DROP COLUMN boundary_newer_generation;
+         ALTER TABLE attempts DROP COLUMN boundary_generation_unknown;
+         PRAGMA user_version = 10;",
+    )?;
+    drop(db);
+    let (second, _) = paged_poll(
+        root.path(),
+        PROBE10_1205,
+        &[(PRN_SITEMAP, "sitemap_p1_1205.xml")],
+    )?;
+    assert_eq!(
+        poll_continuity(&second),
+        (vec![1], Some("complete".to_owned()))
     );
     Ok(())
 }
@@ -3747,16 +4102,16 @@ fn a_poll_whose_page_two_failed_is_no_basis_and_the_next_reads_back_across_it() 
     Ok(())
 }
 
-/// A page 2 that answered with no row ends the walk, so 14:05Z is `no_previous_key` and a basis,
-/// and 14:10Z anchors to it, the newest basis, not to 12:00Z. Mutations 2026-11-17, `ran_out`
-/// ignored and the basis ordered oldest first: each red.
+/// Page 2 answered with PRN's real page past the end (probe 11: page 24, 200, an empty `urlset`):
+/// the walk ran out, the run exits 0, 14:05Z is `no_previous_key` and the basis of 14:10Z, not
+/// 12:00Z. Mutations 2026-11-17, `ran_out` ignored and the basis ordered oldest first: each red.
 #[test]
-fn a_poll_whose_page_two_had_no_row_ran_out_and_is_the_basis_of_the_next() -> TestResult {
+fn a_poll_whose_next_page_is_past_the_end_ran_out_and_is_the_basis_of_the_next() -> TestResult {
     let root = TempDir::new()?;
     seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
     let ran_out = [
         (PRN_SITEMAP, "sitemap_p1_1405.xml"),
-        (PRN_SITEMAP_PAGE_2, "sitemap_no_rows.xml"),
+        (PRN_SITEMAP_PAGE_2, "sitemap_past_end_p24.xml"),
     ];
     paged_poll(
         root.path(),
@@ -3772,11 +4127,13 @@ fn a_poll_whose_page_two_had_no_row_ran_out_and_is_the_basis_of_the_next() -> Te
     assert_eq!(
         (
             poll_continuity(&empty),
+            empty.exit,
             poll_continuity(&next),
             sends_of(&next_sent, PRN_SITEMAP_PAGE_2),
         ),
         (
             (vec![1], Some("no_previous_key".to_owned())),
+            Exit::Ok,
             (vec![1], Some("complete".to_owned())),
             0,
         )

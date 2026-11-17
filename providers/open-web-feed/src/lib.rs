@@ -37,7 +37,7 @@ pub use crate::crosscheck::{
 };
 pub use crate::hosts::RobotsPin;
 use crate::hosts::{read_hosts, HostRow, Hosts, Status, HOSTS_SCHEMA};
-pub use crate::paging::{Basis, Continuity, Paging};
+pub use crate::paging::{Basis, Continuity, Generation, Paging, GENERATION_HEADER};
 use crate::rules::{parse_rules, Rule, RULES_SCHEMA};
 
 pub const SOURCE: &str = "open_web_wires";

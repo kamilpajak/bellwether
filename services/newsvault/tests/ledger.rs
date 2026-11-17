@@ -586,6 +586,66 @@ fn every_continuity_value_is_counted_under_its_own_name_in_json_and_human() -> T
     Ok(())
 }
 
+/// Section 11.2: each `attempts.boundary_*` count is summed over the day's polls under its own
+/// label, in the JSON row and on the human line; distinct sums 11 to 44, so a swap shows.
+#[test]
+fn every_boundary_generation_is_summed_under_its_own_label_in_json_and_human() -> TestResult {
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    for (attempt, scale) in [("a-0701-edgar-0", 1), ("a-0701-edgar-1", 10)] {
+        db.execute(
+            "UPDATE attempts SET boundary_same_generation = ?2, boundary_older_generation = ?3,
+                    boundary_newer_generation = ?4, boundary_generation_unknown = ?5
+              WHERE attempt_id = ?1",
+            rusqlite::params![attempt, scale, 2 * scale, 3 * scale, 4 * scale],
+        )?;
+    }
+    drop(db);
+    let labels = [
+        "same_generation",
+        "older_generation",
+        "newer_generation",
+        "generation_unknown",
+    ];
+    let day = "2026-07-01";
+    let json = over(&root, day, day)?.json()?;
+    let counted: Vec<Option<i64>> = labels
+        .iter()
+        .map(|label| {
+            per_source(&json, day, EDGAR)
+                .and_then(|edgar| edgar.get("boundaries"))
+                .and_then(|counts| counts.get(*label))
+                .and_then(Value::as_i64)
+        })
+        .collect();
+    let human = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .arg("ledger")
+        .args(["--store", &root.path().to_string_lossy()])
+        .args(["--at", AT, "--format", "human"])
+        .args(["--from", day, "--to", day])
+        .output()?
+        .stdout;
+    let line = String::from_utf8(human)?
+        .lines()
+        .find(|line| line.trim_start().starts_with(EDGAR))
+        .map(str::to_owned)
+        .ok_or("no human line names the source")?;
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let shown: Vec<Option<i64>> = labels
+        .iter()
+        .map(|label| {
+            words
+                .iter()
+                .position(|word| *word == format!("boundary_{label}"))
+                .and_then(|at| words.get(at + 1))
+                .and_then(|word| word.parse().ok())
+        })
+        .collect();
+    let expected = vec![Some(11), Some(22), Some(33), Some(44)];
+    assert_eq!((counted, shown), (expected.clone(), expected));
+    Ok(())
+}
+
 /// Section 10: `--check` does not subtract `robots_disallowed`, so a day whose every vendor row
 /// robots refused still exits 1. Mutation 2026-11-17, the count subtracted: green to exit 0.
 #[test]

@@ -45,6 +45,12 @@
             "first_poll": 0,
             "next_page_unread": 0
           },
+          "boundaries": {
+            "same_generation": 0,
+            "older_generation": 0,
+            "newer_generation": 0,
+            "generation_unknown": 0
+          },
           "items_new": 3,
           "rows_committed": 3
         },
@@ -71,6 +77,12 @@
             "no_previous_key": 0,
             "first_poll": 0,
             "next_page_unread": 0
+          },
+          "boundaries": {
+            "same_generation": 0,
+            "older_generation": 0,
+            "newer_generation": 0,
+            "generation_unknown": 0
           },
           "items_new": 1,
           "rows_committed": 1
@@ -109,6 +121,12 @@
             "first_poll": 0,
             "next_page_unread": 0
           },
+          "boundaries": {
+            "same_generation": 0,
+            "older_generation": 0,
+            "newer_generation": 0,
+            "generation_unknown": 0
+          },
           "items_new": 0,
           "rows_committed": 0
         },
@@ -135,6 +153,12 @@
             "no_previous_key": 0,
             "first_poll": 0,
             "next_page_unread": 0
+          },
+          "boundaries": {
+            "same_generation": 0,
+            "older_generation": 0,
+            "newer_generation": 0,
+            "generation_unknown": 0
           },
           "items_new": 0,
           "rows_committed": 0
@@ -173,6 +197,12 @@
             "first_poll": 0,
             "next_page_unread": 0
           },
+          "boundaries": {
+            "same_generation": 0,
+            "older_generation": 0,
+            "newer_generation": 0,
+            "generation_unknown": 0
+          },
           "items_new": 0,
           "rows_committed": 0
         },
@@ -199,6 +229,12 @@
             "no_previous_key": 0,
             "first_poll": 0,
             "next_page_unread": 0
+          },
+          "boundaries": {
+            "same_generation": 0,
+            "older_generation": 0,
+            "newer_generation": 0,
+            "generation_unknown": 0
           },
           "items_new": 0,
           "rows_committed": 0
@@ -237,6 +273,12 @@
             "first_poll": 0,
             "next_page_unread": 0
           },
+          "boundaries": {
+            "same_generation": 0,
+            "older_generation": 0,
+            "newer_generation": 0,
+            "generation_unknown": 0
+          },
           "items_new": 0,
           "rows_committed": 0
         }
@@ -273,6 +315,12 @@
             "no_previous_key": 0,
             "first_poll": 0,
             "next_page_unread": 0
+          },
+          "boundaries": {
+            "same_generation": 0,
+            "older_generation": 0,
+            "newer_generation": 0,
+            "generation_unknown": 0
           },
           "items_new": 1,
           "rows_committed": 1

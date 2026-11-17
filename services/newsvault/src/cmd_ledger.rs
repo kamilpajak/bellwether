@@ -149,6 +149,9 @@ pub struct SourceRow {
     /// Section 11.2: paged index polls by `attempts.continuity`. Every arm but `complete` left a
     /// stretch of the index not looked at; a poll that read no usable page is in none.
     pub continuity: ContinuityCounts,
+    /// Section 11.2: those polls' page boundaries that shared no key, one count per
+    /// `open_web_feed::Generation` from `attempts.boundary_*`; 0 before user_version 11.
+    pub boundaries: BoundaryCounts,
     pub items_new: i64,
     pub rows_committed: i64,
 }
@@ -183,6 +186,26 @@ impl ContinuityCounts {
             no_previous_key: self.no_previous_key + other.no_previous_key,
             first_poll: self.first_poll + other.first_poll,
             next_page_unread: self.next_page_unread + other.next_page_unread,
+        }
+    }
+}
+
+/// One count per `open_web_feed::Generation` label.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct BoundaryCounts {
+    pub same_generation: i64,
+    pub older_generation: i64,
+    pub newer_generation: i64,
+    pub generation_unknown: i64,
+}
+
+impl BoundaryCounts {
+    const fn add(self, other: Self) -> Self {
+        Self {
+            same_generation: self.same_generation + other.same_generation,
+            older_generation: self.older_generation + other.older_generation,
+            newer_generation: self.newer_generation + other.newer_generation,
+            generation_unknown: self.generation_unknown + other.generation_unknown,
         }
     }
 }
@@ -306,6 +329,7 @@ struct Grouped {
     relisted_compared: i64,
     robots_disallowed: i64,
     continuity: ContinuityCounts,
+    boundaries: BoundaryCounts,
     items_new: i64,
 }
 
@@ -476,7 +500,11 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
                 SUM(COALESCE(robots_disallowed, 0)),
                 SUM(continuity IS '{complete}'), SUM(continuity IS '{boundary}'),
                 SUM(continuity IS '{no_previous}'), SUM(continuity IS '{first}'),
-                SUM(continuity IS '{unread}')
+                SUM(continuity IS '{unread}'),
+                SUM(COALESCE(boundary_same_generation, 0)),
+                SUM(COALESCE(boundary_older_generation, 0)),
+                SUM(COALESCE(boundary_newer_generation, 0)),
+                SUM(COALESCE(boundary_generation_unknown, 0))
          FROM attempts WHERE opened_at <= ?1
          GROUP BY run_id, source, state
          ORDER BY run_id, source, state"
@@ -503,6 +531,12 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
                     row.get(15)?,
                     row.get(16)?,
                 ]),
+                boundaries: BoundaryCounts {
+                    same_generation: row.get(17)?,
+                    older_generation: row.get(18)?,
+                    newer_generation: row.get(19)?,
+                    generation_unknown: row.get(20)?,
+                },
             })
         })?
         .collect::<Result<Vec<Grouped>, _>>()?;
@@ -678,6 +712,7 @@ fn day_row(
         row.relisted_compared += entry.relisted_compared;
         row.robots_disallowed += entry.robots_disallowed;
         row.continuity = row.continuity.add(entry.continuity);
+        row.boundaries = row.boundaries.add(entry.boundaries);
         row.items_new += entry.items_new;
         match entry.state.as_str() {
             OUTCOME_OK => row.ok += entry.attempts,
@@ -750,6 +785,7 @@ impl SourceRow {
             relisted_compared: 0,
             robots_disallowed: 0,
             continuity: ContinuityCounts::default(),
+            boundaries: BoundaryCounts::default(),
             items_new: 0,
             rows_committed: 0,
         }
@@ -854,7 +890,9 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                  relisted_disputed {} relisted_compared {} robots_disallowed {} \
                  continuity_complete {} continuity_boundary_no_shared_key {} \
                  continuity_no_previous_key {} continuity_first_poll {} \
-                 continuity_next_page_unread {} items_new {} rows {}",
+                 continuity_next_page_unread {} boundary_same_generation {} \
+                 boundary_older_generation {} boundary_newer_generation {} \
+                 boundary_generation_unknown {} items_new {} rows {}",
                 row.source,
                 row.ok,
                 row.empty,
@@ -873,6 +911,10 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 row.continuity.no_previous_key,
                 row.continuity.first_poll,
                 row.continuity.next_page_unread,
+                row.boundaries.same_generation,
+                row.boundaries.older_generation,
+                row.boundaries.newer_generation,
+                row.boundaries.generation_unknown,
                 row.items_new,
                 row.rows_committed
             )?;

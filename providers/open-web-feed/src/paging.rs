@@ -2,6 +2,7 @@
 //! is asked only while page N holds no key of the previous poll, and a poll's pages are complete
 //! only when every boundary it read and its last page share a key.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
@@ -32,7 +33,7 @@ impl Basis {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Continuity {
     Complete,
-    /// Two neighbouring pages shared no key: a later page from an older generation (section 11.6).
+    /// Two neighbouring pages shared no key; `Generation` says what the stamps tell of the gap.
     BoundaryNoSharedKey,
     /// The last page read holds no key of the basis poll, and the walk ran out: no next page was
     /// due, or the one asked answered with no row.
@@ -69,11 +70,57 @@ impl Continuity {
         Self::ALL.into_iter().find(|arm| arm.name() == name)
     }
 
-    /// A poll whose own boundaries all shared a key and whose walk ran out: the next poll anchors
-    /// to it. A broken boundary or an unread next page is not, so the next poll reads back across.
+    /// A poll that read every page it planned, a broken boundary included (owner decision
+    /// 2026-11-17, option B): the next poll anchors to it. An unread page is not, so it is read.
     #[must_use]
     pub const fn is_basis(self) -> bool {
-        !matches!(self, Self::BoundaryNoSharedKey | Self::NextPageUnread)
+        !matches!(self, Self::NextPageUnread)
+    }
+}
+
+/// The response header that stamps a news sitemap page's generation, PRN's and CNW's (§11.6).
+pub const GENERATION_HEADER: &str = "x-sitemap-generated-at";
+
+/// What the stamps of a boundary's two pages that share no key say of the gap between them. It
+/// describes the gap only: neither `Continuity` nor the basis reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Generation {
+    /// Equal stamps: one generation's pages join exactly, so no row fell between them.
+    Same,
+    /// The later page's stamp is older: a real gap.
+    Older,
+    /// The later page's stamp is newer: rows may repeat, and still no key is shared.
+    Newer,
+    /// A stamp absent, or not RFC 3339, on either page.
+    Unknown,
+}
+
+impl Generation {
+    pub const ALL: [Self; 4] = [Self::Same, Self::Older, Self::Newer, Self::Unknown];
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Same => "same_generation",
+            Self::Older => "older_generation",
+            Self::Newer => "newer_generation",
+            Self::Unknown => "generation_unknown",
+        }
+    }
+
+    /// The label of a boundary whose earlier page carried `earlier` and later page `later`.
+    #[must_use]
+    pub fn between(earlier: Option<&str>, later: Option<&str>) -> Self {
+        let stamp =
+            |text: Option<&str>| text.and_then(|raw| DateTime::parse_from_rfc3339(raw).ok());
+        match (stamp(earlier), stamp(later)) {
+            (Some(earlier), Some(later)) => match later.cmp(&earlier) {
+                Ordering::Equal => Self::Same,
+                Ordering::Less => Self::Older,
+                Ordering::Greater => Self::Newer,
+            },
+            _ => Self::Unknown,
+        }
     }
 }
 
@@ -136,8 +183,17 @@ fn keys(rows: &[PageRow]) -> BTreeSet<&str> {
     rows.iter().map(|row| row.key.as_str()).collect()
 }
 
+/// Each `at` whose pages `at` and `at + 1` (0-based) share no key.
+fn broken(pages: &[Vec<PageRow>]) -> impl Iterator<Item = usize> + '_ {
+    pages
+        .windows(2)
+        .enumerate()
+        .filter(|(_, pair)| keys(&pair[0]).is_disjoint(&keys(&pair[1])))
+        .map(|(at, _)| at)
+}
+
 /// `pages` in page order from page 1; `None` when there is none. `ran_out`: the page after the last
-/// one read answered with no row.
+/// one read answered with no row. An unread page wins over a broken boundary: only it is no basis.
 pub(crate) fn continuity(
     pages: &[Vec<PageRow>],
     basis: Option<&Basis>,
@@ -147,18 +203,25 @@ pub(crate) fn continuity(
     let Some(basis) = basis else {
         return Some(Continuity::FirstPoll);
     };
-    let broken = pages
-        .windows(2)
-        .any(|pair| keys(&pair[0]).is_disjoint(&keys(&pair[1])));
-    Some(if broken {
-        Continuity::BoundaryNoSharedKey
-    } else if last.iter().any(|row| basis.keys.contains(&row.key)) {
-        Continuity::Complete
-    } else if !ran_out && next_page_due(pages, basis) {
+    let reached = last.iter().any(|row| basis.keys.contains(&row.key));
+    Some(if !reached && !ran_out && next_page_due(pages, basis) {
         Continuity::NextPageUnread
+    } else if broken(pages).next().is_some() {
+        Continuity::BoundaryNoSharedKey
+    } else if reached {
+        Continuity::Complete
     } else {
         Continuity::NoPreviousKey
     })
+}
+
+/// One label per boundary of `pages` that shares no key, in page order; `stamps[i]` is page
+/// `i + 1`'s `GENERATION_HEADER`, a missing entry read as absent.
+pub(crate) fn generations(pages: &[Vec<PageRow>], stamps: &[Option<&str>]) -> Vec<Generation> {
+    let stamp = |at: usize| stamps.get(at).copied().flatten();
+    broken(pages)
+        .map(|at| Generation::between(stamp(at), stamp(at + 1)))
+        .collect()
 }
 
 /// Whether `next_page` plans a page after the last of `pages`, as the feed asked it.
@@ -248,5 +311,17 @@ impl Paging {
         ran_out: bool,
     ) -> Option<Continuity> {
         continuity(&self.rows_of(index_url, pages)?, basis, ran_out)
+    }
+
+    /// One `Generation` per boundary of `pages` (page order from page 1) that shares no key, read
+    /// from `stamps`, each page's `GENERATION_HEADER`; `None` when a page does not parse.
+    #[must_use]
+    pub fn generations(
+        &self,
+        index_url: &str,
+        pages: &[Vec<u8>],
+        stamps: &[Option<&str>],
+    ) -> Option<Vec<Generation>> {
+        Some(generations(&self.rows_of(index_url, pages)?, stamps))
     }
 }
