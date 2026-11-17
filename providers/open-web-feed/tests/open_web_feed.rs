@@ -188,10 +188,12 @@ const CNW_MINUTES: [&str; 3] = [
     "2026-11-16T06:47:00Z",
     "2026-11-16T06:33:00Z",
 ];
-/// Daylight time's offset and UTC's: each is the instant its own offset names.
-const CNW_OTHER_OFFSETS: [(&str, &str); 2] = [
+/// Daylight time's offset, UTC's, and an evening whose UTC day is the next (13 of 246 keys on
+/// 2026-11-16): each is the instant its own offset names.
+const CNW_OTHER_OFFSETS: [(&str, &str); 3] = [
     ("2026-07-16T03:22:00-04:00", "2026-07-16T07:22:00Z"),
     ("2026-11-16T07:22:00+00:00", "2026-11-16T07:22:00Z"),
+    ("2026-11-16T20:30:00-05:00", "2026-11-17T01:30:00Z"),
 ];
 /// A second inside the minute, `Z` for the offset, no seconds field, a two-digit year.
 const CNW_NOT_A_MINUTE: [&str; 4] = [
@@ -1540,14 +1542,64 @@ fn a_sitemap_element_named_like_a_field_in_another_namespace_is_never_read() -> 
     Ok(())
 }
 
+/// A `loc` and a date wrapped in whitespace are read trimmed; a date outside `news:news` is never
+/// read; a `url` inside a `url` is no row. Mutations 2026-11-17: `.trim()` dropped, the field read
+/// anywhere under `url`, `children()` read as `descendants()`: each red.
+#[test]
+fn a_sitemap_row_is_a_top_level_url_with_its_trimmed_loc_and_its_news_child_only() -> Outcome {
+    let provider = provider()?;
+    let nested = "https://www.newswire.ca/news-releases/a-nested-url-100000001.html";
+    let index = format!(
+        "<?xml version=\"1.0\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\" \
+         xmlns:news=\"http://www.google.com/schemas/sitemap-news/0.9\">\
+         <url><loc>\n  {}  \n</loc><news:news><news:publication_date>\n {} \n\
+         </news:publication_date></news:news></url>\
+         <url><loc>{}</loc><news:publication_date>{}</news:publication_date></url>\
+         <url><loc>{}</loc><url><loc>{nested}</loc><news:news><news:publication_date>{}\
+         </news:publication_date></news:news></url></url></urlset>",
+        CNW_LINKS[0],
+        CNW_PUBLICATION_DATES[0],
+        CNW_LINKS[1],
+        CNW_PUBLICATION_DATES[1],
+        CNW_LINKS[2],
+        CNW_PUBLICATION_DATES[2],
+    );
+    let extracted = provider.extract(&cnw_index_request(&provider)?, &blob(index.into_bytes()));
+    let kept: Vec<(&str, Option<&str>)> = extracted
+        .follow_ups
+        .iter()
+        .map(|request| (request.url.as_str(), request.listed_date.as_deref()))
+        .collect();
+    assert_eq!(
+        (kept, extracted.vendor_rows, extracted.filtered_out),
+        (
+            vec![
+                (CNW_LINKS[0], Some(CNW_PUBLICATION_DATES[0])),
+                (CNW_LINKS[1], None),
+                (CNW_LINKS[2], None),
+            ],
+            3,
+            0
+        )
+    );
+    Ok(())
+}
+
 /// Section 11.1: CNW's valid time is the sitemap's `news:publication_date`, so its index is the
-/// sitemap and RSS is a permanent failure there; the sitemap is one on an RSS host. Mutation
-/// 2026-11-17, the `cnw` rule reading `rss`: red.
+/// sitemap and RSS is a permanent failure there; the sitemap is one on an RSS host, and so is a
+/// sitemap index or a `urlset` outside the sitemaps.org namespace. Mutations 2026-11-17: the `cnw`
+/// rule reading `rss`, red; the root check reading only "not `rss`", red.
 #[test]
 fn the_canada_newswire_index_is_its_news_sitemap_and_an_rss_answer_is_permanent() -> Outcome {
     let provider = provider()?;
     let request = cnw_index_request(&provider)?;
     let empty = cnw_sitemap(&[]);
+    let sitemap_index = format!(
+        "<?xml version=\"1.0\"?><sitemapindex xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\
+         <sitemap><loc>{CNW_INDEX}</loc></sitemap></sitemapindex>"
+    );
+    let no_namespace =
+        format!("<?xml version=\"1.0\"?><urlset><url><loc>{CNW_ARTICLE_URL}</loc></url></urlset>");
     assert_eq!(
         (
             verdict(&provider, &request, OK, &cnw(CNW_REAL_INDEX))?,
@@ -1559,10 +1611,14 @@ fn the_canada_newswire_index_is_its_news_sitemap_and_an_rss_answer_is_permanent(
                 OK,
                 &cnw(CNW_REAL_INDEX)
             )?,
+            verdict(&provider, &request, OK, sitemap_index.as_bytes())?,
+            verdict(&provider, &request, OK, no_namespace.as_bytes())?,
         ),
         (
             Verdict::Usable,
             Verdict::Empty,
+            Verdict::PermanentFailure,
+            Verdict::PermanentFailure,
             Verdict::PermanentFailure,
             Verdict::PermanentFailure
         )
