@@ -534,6 +534,15 @@ pub struct PayloadRow {
     pub truncated: bool,
 }
 
+/// One index payload as `Committer::index_payloads` lists it; `received_at` is the attempt's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexPayload {
+    pub attempt_id: String,
+    pub url: String,
+    pub raw_blob: String,
+    pub received_at: String,
+}
+
 impl PayloadRow {
     #[must_use]
     pub fn of(payload: &Payload) -> Self {
@@ -1446,6 +1455,28 @@ impl Committer {
                 },
             )
             .optional()?)
+    }
+
+    /// Every index payload a `source` attempt filed, earliest answer first: the cross-check's
+    /// input (architecture.md section 11.2, option C). Metadata only; `blob_bytes` reads one.
+    pub fn index_payloads(&self, source: &SourceId) -> Result<Vec<IndexPayload>, StoreError> {
+        let mut statement = self.db.prepare(
+            "SELECT p.attempt_id, p.url, p.raw_blob, a.received_at
+               FROM payloads p JOIN attempts a ON a.attempt_id = p.attempt_id
+              WHERE a.source = ?1 AND p.phase = 'index' AND a.received_at IS NOT NULL
+              ORDER BY a.received_at, p.attempt_id",
+        )?;
+        let rows = statement
+            .query_map(params![source.as_str()], |row| {
+                Ok(IndexPayload {
+                    attempt_id: row.get(0)?,
+                    url: row.get(1)?,
+                    raw_blob: row.get(2)?,
+                    received_at: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<IndexPayload>, _>>()?;
+        Ok(rows)
     }
 
     /// The checks every door makes: the attempt was opened here, closed here, and an abandoned

@@ -46,6 +46,10 @@ const CNW_PIN: &str = "ab9873af0f8c94c48918cd75345a8fc609665602dfcd96aa1e574881a
 const CNW_HOST: &str = "www.newswire.ca";
 const FED_ROBOTS: &str = "https://www.federalreserve.gov/robots.txt";
 const FED_HOST: &str = "www.federalreserve.gov";
+const YAHOO_ROBOTS: &str = "https://finance.yahoo.com/robots.txt";
+/// The committed hosts file's Yahoo pin: `robots_finance_yahoo_com.txt`'s sha256.
+const YAHOO_PIN: &str = "a01715ceceb6faead3058d083abc97bdec68c7e4c6f522f3211dd0819ce38eb2";
+const YAHOO_HOST: &str = "finance.yahoo.com";
 const PRN_BODY: &[u8] = b"User-agent: *\nDisallow: /search/\n";
 const CHANGED_BODY: &[u8] = b"User-agent: *\nDisallow: /\n";
 const OK: u16 = 200;
@@ -90,6 +94,10 @@ fn prn_body() -> Result<Vec<u8>, std::io::Error> {
 
 fn cnw_body() -> Result<Vec<u8>, std::io::Error> {
     std::fs::read(provider_dir().join("tests/fixtures/cnw/robots_www_newswire_ca.txt"))
+}
+
+fn yahoo_body() -> Result<Vec<u8>, std::io::Error> {
+    std::fs::read(provider_dir().join("tests/fixtures/yahoo/robots_finance_yahoo_com.txt"))
 }
 
 /// The Fed's 404 page at its robots path, trimmed; never parsed.
@@ -658,21 +666,23 @@ fn a_fetched_robots_digest_other_than_the_pin_exits_one_and_names_both() -> Test
     Ok(())
 }
 
-/// Section 11.2: the production file's four admitted rows, each answered with its committed
+/// Section 11.2: the production file's five admitted rows, each answered with its committed
 /// body, the Fed's with its 404 page. Mutations 2026-11-16 and 2026-11-17, one character of the
-/// PRN pin and of the CNW pin changed, and the Fed pin a digest: each red (exit 1).
+/// PRN, CNW and Yahoo pins changed, and the Fed pin a digest: each red (exit 1).
 #[test]
 fn the_committed_hosts_file_refreshed_with_its_committed_bodies_matches_every_pin() -> TestResult {
     let root = TempDir::new()?;
     let (gnw, prn, cnw, fed) = (gnw_body()?, prn_body()?, cnw_body()?, fed_404_body()?);
+    let yahoo = yahoo_body()?;
     let exchange = Robots::of(&[
         (GNW_ROBOTS, OK, &gnw),
         (PRN_ROBOTS, OK, &prn),
         (CNW_ROBOTS, OK, &cnw),
         (FED_ROBOTS, NOT_FOUND, &fed),
+        (YAHOO_ROBOTS, OK, &yahoo),
     ]);
     let answer = refreshed(root.path(), committed_hosts(), &exchange)?;
-    let matched: Vec<(Option<bool>, Option<&str>)> = (0..4)
+    let matched: Vec<(Option<bool>, Option<&str>)> = (0..5)
         .map(|nth| {
             let row = &answer.report["rows"][nth];
             (row["matches_pin"].as_bool(), row["parse_verdict"].as_str())
@@ -687,9 +697,15 @@ fn the_committed_hosts_file_refreshed_with_its_committed_bodies_matches_every_pi
                 (Some(true), Some("rules")),
                 (Some(true), Some("rules")),
                 (Some(true), Some("no_rules_absent")),
+                (Some(true), Some("rules")),
             ],
             // `robots_rows` orders by host.
             vec![
+                (
+                    YAHOO_HOST.to_owned(),
+                    "present".to_owned(),
+                    Some(YAHOO_PIN.to_owned())
+                ),
                 (
                     GNW_HOST.to_owned(),
                     "present".to_owned(),

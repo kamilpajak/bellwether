@@ -146,10 +146,24 @@ const FED_RELEASES: [(&str, &str); 3] = [
         "article_orders20261109a.html",
     ),
 ];
-/// Monday 2026-11-16, after the CNW fixtures' publication minutes (07:22Z newest), so no CNW item
-/// is observed before it was published; one second before it, the stub's `received_at`.
-const MONDAY_AT: &str = "2026-11-16T08:05:30Z";
-const MONDAY_RECEIVED_AT: &str = "2026-11-16T08:05:29.000000Z";
+const YAHOO_INDEX: &str = "https://finance.yahoo.com/news-sitemap.xml";
+/// `yahoo/news_sitemap_8_urls.xml`'s two followed links, `business-wire.com` then
+/// `accesswire.ca`, with the page each is answered with. No `accesswire.ca` page was fetched, so
+/// that row is answered with the synthetic page that has no article body.
+const YAHOO_RELEASES: [(&str, &str); 2] = [
+    (
+        "finance.yahoo.com/healthcare/articles/laverock-therapeutics-appoints-parker-moss-091700844.html",
+        "article_laverock_091700844.html",
+    ),
+    (
+        "finance.yahoo.com/technology/ai/articles/reo-dev-launches-100-ai-084000068.html",
+        "synthetic_no_article_body.html",
+    ),
+];
+/// Monday 2026-11-16, after every fixture's publication minute (Yahoo's 09:17Z newest) and at the
+/// Yahoo fixture's own poll; one second before it, the stub's `received_at`.
+const MONDAY_AT: &str = "2026-11-16T09:30:30Z";
+const MONDAY_RECEIVED_AT: &str = "2026-11-16T09:30:29.000000Z";
 
 fn provider_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../providers/open-web-feed")
@@ -267,6 +281,19 @@ impl Gnw {
         all.pages
             .insert(FED_INDEX.to_owned(), fixture("press_all_3_items.xml")?);
         for (key, page) in FED_RELEASES {
+            all.pages.insert(format!("https://{key}"), fixture(page)?);
+        }
+        Ok(all)
+    }
+
+    /// `four_hosts`, and Yahoo's sitemap and `YAHOO_RELEASES` answered from `fixtures/yahoo`.
+    fn five_hosts() -> Result<Self, Box<dyn Error>> {
+        let mut all = Self::four_hosts()?;
+        let fixture =
+            |name: &str| std::fs::read(provider_dir().join("tests/fixtures/yahoo").join(name));
+        all.pages
+            .insert(YAHOO_INDEX.to_owned(), fixture("news_sitemap_8_urls.xml")?);
+        for (key, page) in YAHOO_RELEASES {
             all.pages.insert(format!("https://{key}"), fixture(page)?);
         }
         Ok(all)
@@ -503,6 +530,16 @@ fn fed_item(
     own_link_item(key, "pubDate", dated, received)
 }
 
+/// The committed row of `YAHOO_RELEASES[release]`, whose canonical is its own link.
+fn yahoo_item(
+    release: usize,
+    dated: (&str, &str),
+    received: &str,
+) -> Result<(String, Row), Box<dyn Error>> {
+    let (key, _) = YAHOO_RELEASES.get(release).ok_or("no such release")?;
+    own_link_item(key, "news:publication_date", dated, received)
+}
+
 fn visible(store: &Path, at: &str) -> Result<usize, Box<dyn Error>> {
     let report = cmd_items::read(
         store,
@@ -685,11 +722,11 @@ fn every_body_an_open_web_run_stores_is_indexed_and_linked_to_its_attempt() -> T
     Ok(())
 }
 
-/// Section 11.2, the committed hosts file: the GNW, PRN, CNW and Fed indexes, then each host's
-/// three pages, on Monday 2026-11-16. The mutations that turn it red are §11.5 step 6's tables.
+/// Section 11.2, the committed hosts file: the GNW, PRN, CNW, Fed and Yahoo indexes, then each
+/// host's pages, on Monday 2026-11-16. The mutations that turn it red are §11.5 step 6's tables.
 #[test]
-fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_and_a_fed_day_end_to_end() -> TestResult {
-    const ATTEMPTS: usize = 16;
+fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end() -> TestResult {
+    const ATTEMPTS: usize = 19;
     let root = TempDir::new()?;
     seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
     let ask = Ask {
@@ -698,12 +735,14 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_and_a_fed_day_end_to_end() -> Test
         ..ask(root.path(), cmd_collect::TODAY)
     };
     let opened = cmd_collect::open_provider(&ask)?;
-    let answer = cmd_collect::run(&ask, &opened, &Gnw::four_hosts()?, &Monday)?;
+    let answer = cmd_collect::run(&ask, &opened, &Gnw::five_hosts()?, &Monday)?;
     let envelope = &answer.envelope;
     let attempts = envelope["attempts"].as_array().ok_or("attempts")?;
     let hosts_version = canon::FileDigest::of(&std::fs::read(seed::committed_hosts())?);
     // Every index is asked before any page.
-    let indexes: Vec<Option<&str>> = [0, 1, 2, 3].map(|nth| attempts[nth]["url"].as_str()).into();
+    let indexes: Vec<Option<&str>> = [0, 1, 2, 3, 4]
+        .map(|nth| attempts[nth]["url"].as_str())
+        .into();
     assert_eq!(
         (
             answer.exit,
@@ -722,9 +761,10 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_and_a_fed_day_end_to_end() -> Test
                 Some(INDEX),
                 Some(PRN_INDEX),
                 Some(CNW_INDEX),
-                Some(FED_INDEX)
+                Some(FED_INDEX),
+                Some(YAHOO_INDEX)
             ],
-            Some(8)
+            Some(9)
         ),
         "{envelope:#}"
     );
@@ -747,6 +787,7 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_and_a_fed_day_end_to_end() -> Test
     for index in [INDEX, PRN_INDEX, CNW_INDEX, FED_INDEX] {
         expected_counts.insert(index.to_owned(), (Some(3), Some(0), Some(0)));
     }
+    expected_counts.insert(YAHOO_INDEX.to_owned(), (Some(8), Some(0), Some(0)));
     let gnw_pages = RELEASES
         .iter()
         .map(|(key, _, _, canonical)| (*key, canonical.is_some()));
@@ -762,7 +803,16 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_and_a_fed_day_end_to_end() -> Test
         .iter()
         .enumerate()
         .map(|(nth, (key, _))| (*key, nth != 1));
-    for (key, committed) in gnw_pages.chain(prn_pages).chain(cnw_pages).chain(fed_pages) {
+    let yahoo_pages = YAHOO_RELEASES
+        .iter()
+        .enumerate()
+        .map(|(nth, (key, _))| (*key, nth != 1));
+    for (key, committed) in gnw_pages
+        .chain(prn_pages)
+        .chain(cnw_pages)
+        .chain(fed_pages)
+        .chain(yahoo_pages)
+    {
         let (unusable, items) = if committed { (0, 1) } else { (1, 0) };
         expected_counts.insert(
             format!("https://{key}"),
@@ -845,6 +895,11 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_and_a_fed_day_end_to_end() -> Test
             ),
             MONDAY_RECEIVED_AT,
         )?,
+        yahoo_item(
+            0,
+            ("2026-11-16T09:17:00.000000Z", "2026-11-16T09:17:00Z"),
+            MONDAY_RECEIVED_AT,
+        )?,
     ]);
     let stored = stored_items(&db)?;
     assert_eq!(stored, expected);
@@ -903,25 +958,132 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_and_a_fed_day_end_to_end() -> Test
             "article_orders20261109a.html",
             "Federal Reserve Board announces approval of two applications by Mutual Federal Bancorp, MHC, and MFB Bancorp, Inc.",
         ),
+        (
+            "yahoo",
+            YAHOO_RELEASES[0].0,
+            "article_laverock_091700844.html",
+            "Laverock Therapeutics Appoints Parker Moss as Chief Executive Officer and Paul J. Sekhri as Executive Chairman",
+        ),
     ];
     let expected_content = committed_pages
         .into_iter()
         .map(|page| committed_content(page, &golden, &stored))
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     assert_eq!(stored_content(&db)?, expected_content);
-    // Nothing is visible before the run observed it, and all eight after.
+    // Nothing is visible before the run observed it, and all nine after.
     assert_eq!(
         (
-            visible(root.path(), "2026-11-16T08:05:00Z")?,
-            visible(root.path(), "2026-11-16T08:06:00Z")?
+            visible(root.path(), "2026-11-16T09:30:00Z")?,
+            visible(root.path(), "2026-11-16T09:31:00Z")?
         ),
-        (0, 8)
+        (0, 9)
+    );
+    // Option C on a fresh store: the first direct answer is this run's, after every keyed row's
+    // minute, so the three cross-check rows are counted and none is compared.
+    let checked = &envelope["cross_check"];
+    assert_eq!(
+        (
+            checked["index_url"].as_str(),
+            checked["watched_from"].as_str(),
+            checked["direct_payloads_read"].as_u64(),
+            &checked["result"]["rows"],
+            checked["result"]["not_compared"].as_u64(),
+            checked["result"]["unlisted_count"].as_u64(),
+        ),
+        (
+            Some(YAHOO_INDEX),
+            Some(MONDAY_RECEIVED_AT),
+            Some(4),
+            &serde_json::json!({"followed": 2, "cross_checked": 3, "other_key": 2, "no_key": 1}),
+            Some(3),
+            Some(0),
+        ),
+        "{checked:#}"
     );
     Ok(())
 }
 
-/// The committed four-host file on Monday, on a fresh store: each attempt's url and id, in order.
-fn four_host_attempts(exchange: &Gnw) -> Result<Vec<(String, String)>, Box<dyn Error>> {
+/// Two runs over CNW and Yahoo, Yahoo 503 in the first and retried in the second: two wire-key
+/// rows no CNW sitemap listed are named and one is counted. Mutations 2026-11-17: the `since` bound
+/// removed, `watched_from` the newest direct answer, the first keyed attempt read: each red.
+#[test]
+fn a_yahoo_row_under_a_wire_key_no_direct_index_listed_is_named_in_the_run_envelope() -> TestResult
+{
+    const EARLY_AT: &str = "2026-11-16T07:20:30Z";
+    let root = TempDir::new()?;
+    let hosts = hosts_fixture("cnw_and_yahoo_admitted.json");
+    seed::refresh_answering(
+        root.path(),
+        &hosts,
+        ROBOTS_EARLIER,
+        &[
+            (seed::CNW_ROBOTS, OK, &seed::cnw_robots()?),
+            (seed::YAHOO_ROBOTS, OK, &seed::yahoo_robots()?),
+        ],
+    )?;
+    struct FixedAt(DateTime<Utc>);
+    impl Clock for FixedAt {
+        fn now(&self) -> DateTime<Utc> {
+            self.0
+        }
+    }
+    let run_at = |at: &str, exchange: &Gnw| -> Result<Value, Box<dyn Error>> {
+        let ask = Ask {
+            hosts: Some(hosts.clone()),
+            at: instant(at),
+            ..ask(root.path(), cmd_collect::TODAY)
+        };
+        let opened = cmd_collect::open_provider(&ask)?;
+        let answer = cmd_collect::run(&ask, &opened, exchange, &FixedAt(instant(at)))?;
+        Ok(answer.envelope["cross_check"].clone())
+    };
+    let early = run_at(
+        EARLY_AT,
+        &Gnw::five_hosts()?.answering(YAHOO_INDEX, &[UNAVAILABLE; 3]),
+    )?;
+    let checked = run_at(
+        MONDAY_AT,
+        &Gnw::five_hosts()?.answering(YAHOO_INDEX, &[UNAVAILABLE]),
+    )?;
+    let unlisted: Vec<(Option<&str>, Option<&str>)> = checked["result"]["unlisted"]
+        .as_array()
+        .ok_or("unlisted")?
+        .iter()
+        .map(|row| (row["key"].as_str(), row["url"].as_str()))
+        .collect();
+    assert_eq!(
+        (
+            early["result"].is_null(),
+            checked["watched_from"].as_str(),
+            checked["direct_payloads_read"].as_u64(),
+            checked["result"]["not_compared"].as_u64(),
+            checked["result"]["listed_directly"].as_u64(),
+            unlisted,
+        ),
+        (
+            true,
+            Some("2026-11-16T07:20:29.000000Z"),
+            Some(1),
+            Some(0),
+            Some(1),
+            vec![
+                (
+                    Some("globenewswire.com"),
+                    Some("https://finance.yahoo.com/energy/articles/geely-holding-announces-evsa-global-090500744.html")
+                ),
+                (
+                    Some("prnewswire.com"),
+                    Some("https://finance.yahoo.com/economy/articles/kyiv-based-horizon-capital-reaches-090000908.html")
+                ),
+            ],
+        ),
+        "{checked:#}"
+    );
+    Ok(())
+}
+
+/// The committed five-host file on Monday, on a fresh store: each attempt's url and id, in order.
+fn five_host_attempts(exchange: &Gnw) -> Result<Vec<(String, String)>, Box<dyn Error>> {
     let root = TempDir::new()?;
     seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
     let ask = Ask {
@@ -943,24 +1105,24 @@ fn four_host_attempts(exchange: &Gnw) -> Result<Vec<(String, String)>, Box<dyn E
         .collect()
 }
 
-/// The four indexes, then one release of GNW, PRN, CNW and the Fed per turn; and GNW's first
-/// release.
-fn round_robin_of_four_hosts() -> (Vec<String>, String) {
-    let [(gnw, gnw_pages), (prn, prn_pages), (cnw, cnw_pages), (fed, fed_pages)] = four_host_urls();
-    let mut order = vec![gnw, prn, cnw, fed];
+/// The five indexes, then one release of GNW, PRN, CNW, the Fed and Yahoo per turn, a host whose
+/// releases ran out skipped; and GNW's first release.
+fn round_robin_of_five_hosts() -> (Vec<String>, String) {
+    let hosts = five_host_urls();
+    let mut order: Vec<String> = hosts.iter().map(|(index, _)| index.clone()).collect();
     for nth in 0..RELEASES.len() {
-        order.extend([
-            gnw_pages[nth].clone(),
-            prn_pages[nth].clone(),
-            cnw_pages[nth].clone(),
-            fed_pages[nth].clone(),
-        ]);
+        order.extend(
+            hosts
+                .iter()
+                .filter_map(|(_, pages)| pages.get(nth).cloned()),
+        );
     }
-    (order, gnw_pages[0].clone())
+    let first = hosts[0].1.first().cloned().unwrap_or_default();
+    (order, first)
 }
 
-/// `(host's index, host's releases)` as urls, GNW, PRN, CNW, Fed.
-fn four_host_urls() -> [(String, Vec<String>); 4] {
+/// `(host's index, host's releases)` as urls, GNW, PRN, CNW, Fed, Yahoo.
+fn five_host_urls() -> [(String, Vec<String>); 5] {
     let pages = |keys: Vec<&str>| keys.iter().map(|key| format!("https://{key}")).collect();
     [
         (
@@ -979,15 +1141,19 @@ fn four_host_urls() -> [(String, Vec<String>); 4] {
             FED_INDEX.to_owned(),
             pages(FED_RELEASES.iter().map(|(key, _)| *key).collect()),
         ),
+        (
+            YAHOO_INDEX.to_owned(),
+            pages(YAHOO_RELEASES.iter().map(|(key, _)| *key).collect()),
+        ),
     ]
 }
 
 /// Owner decision 2026-11-17 (§10): `collect` serves its hosts round-robin, in first-appearance
-/// order, so the four indexes, then one release of each host per turn.
+/// order, so the five indexes, then one release of each host per turn; Yahoo's two run out first.
 #[test]
-fn a_four_host_run_asks_its_hosts_round_robin() -> TestResult {
-    let (expected, _) = round_robin_of_four_hosts();
-    let attempts = four_host_attempts(&Gnw::four_hosts()?)?;
+fn a_five_host_run_asks_its_hosts_round_robin() -> TestResult {
+    let (expected, _) = round_robin_of_five_hosts();
+    let attempts = five_host_attempts(&Gnw::five_hosts()?)?;
     let urls: Vec<String> = attempts.into_iter().map(|(url, _)| url).collect();
     assert_eq!(urls, expected);
     Ok(())
@@ -997,10 +1163,10 @@ fn a_four_host_run_asks_its_hosts_round_robin() -> TestResult {
 /// GNW's lane, after every request already queued, and stops at `MAX_TRANSIENT_RETRIES`.
 #[test]
 fn a_retried_release_waits_behind_the_other_hosts_and_stops_at_the_cap() -> TestResult {
-    let (mut expected, failing) = round_robin_of_four_hosts();
+    let (mut expected, failing) = round_robin_of_five_hosts();
     expected.extend([failing.clone(), failing.clone()]);
-    let exchange = Gnw::four_hosts()?.answering(&failing, &[UNAVAILABLE; 3]);
-    let attempts = four_host_attempts(&exchange)?;
+    let exchange = Gnw::five_hosts()?.answering(&failing, &[UNAVAILABLE; 3]);
+    let attempts = five_host_attempts(&exchange)?;
     let urls: Vec<String> = attempts.into_iter().map(|(url, _)| url).collect();
     assert_eq!(urls, expected);
     Ok(())
@@ -1010,26 +1176,30 @@ fn a_retried_release_waits_behind_the_other_hosts_and_stops_at_the_cap() -> Test
 /// retry, which is asked on PRN's next turn and never waits for the other hosts' releases to drain.
 #[test]
 fn a_retried_index_keeps_its_host_turn_while_the_other_hosts_releases_are_served() -> TestResult {
-    let [(gnw, gnw_pages), (prn, _), (cnw, cnw_pages), (fed, fed_pages)] = four_host_urls();
+    let [(gnw, gnw_pages), (prn, _), (cnw, cnw_pages), (fed, fed_pages), (yahoo, yahoo_pages)] =
+        five_host_urls();
     let expected = [
         &gnw,
         &prn,
         &cnw,
         &fed,
+        &yahoo,
         &gnw_pages[0],
         &prn,
         &cnw_pages[0],
         &fed_pages[0],
+        &yahoo_pages[0],
         &gnw_pages[1],
         &prn,
         &cnw_pages[1],
         &fed_pages[1],
+        &yahoo_pages[1],
         &gnw_pages[2],
         &cnw_pages[2],
         &fed_pages[2],
     ];
-    let exchange = Gnw::four_hosts()?.answering(PRN_INDEX, &[UNAVAILABLE; 3]);
-    let attempts = four_host_attempts(&exchange)?;
+    let exchange = Gnw::five_hosts()?.answering(PRN_INDEX, &[UNAVAILABLE; 3]);
+    let attempts = five_host_attempts(&exchange)?;
     let urls: Vec<&String> = attempts.iter().map(|(url, _)| url).collect();
     assert_eq!(urls, expected);
     Ok(())
@@ -1038,11 +1208,11 @@ fn a_retried_index_keeps_its_host_turn_while_the_other_hosts_releases_are_served
 /// An attempt id hashes (run, source, window, ordinal), and the ordinal is the position in the
 /// round-robin order: the same plan and answers on two fresh stores give the same ids, url by url.
 #[test]
-fn a_replayed_four_host_run_gives_every_attempt_the_same_id_and_url() -> TestResult {
-    let first = four_host_attempts(&Gnw::four_hosts()?)?;
-    let second = four_host_attempts(&Gnw::four_hosts()?)?;
+fn a_replayed_five_host_run_gives_every_attempt_the_same_id_and_url() -> TestResult {
+    let first = five_host_attempts(&Gnw::five_hosts()?)?;
+    let second = five_host_attempts(&Gnw::five_hosts()?)?;
     let distinct: std::collections::BTreeSet<&String> = first.iter().map(|(_, id)| id).collect();
-    assert_eq!((first.len(), distinct.len(), &first), (16, 16, &second));
+    assert_eq!((first.len(), distinct.len(), &first), (19, 19, &second));
     Ok(())
 }
 

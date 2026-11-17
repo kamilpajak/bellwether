@@ -15,6 +15,7 @@ pub const GNW_ROBOTS: &str = "https://rss.globenewswire.com/robots.txt";
 pub const PRN_ROBOTS: &str = "https://www.prnewswire.com/robots.txt";
 pub const CNW_ROBOTS: &str = "https://www.newswire.ca/robots.txt";
 pub const FED_ROBOTS: &str = "https://www.federalreserve.gov/robots.txt";
+pub const YAHOO_ROBOTS: &str = "https://finance.yahoo.com/robots.txt";
 const CONTACT: &str = "bellwether collector contact@example.test";
 const OK: u16 = 200;
 const NOT_FOUND: u16 = 404;
@@ -43,6 +44,11 @@ pub fn fed_robots_404() -> Result<Vec<u8>, std::io::Error> {
     std::fs::read(provider_dir().join("tests/fixtures/fed/robots_404_www_federalreserve_gov.html"))
 }
 
+/// The committed Yahoo body, which the committed hosts file's Yahoo row pins.
+pub fn yahoo_robots() -> Result<Vec<u8>, std::io::Error> {
+    std::fs::read(provider_dir().join("tests/fixtures/yahoo/robots_finance_yahoo_com.txt"))
+}
+
 /// The committed hosts file.
 pub fn committed_hosts() -> PathBuf {
     provider_dir().join("hosts/open_web_wires.hosts.json")
@@ -60,6 +66,7 @@ pub fn refresh_committed(store: &Path, at: &str) -> Result<cmd_robots::Answer, B
             (PRN_ROBOTS, OK, &prn_robots()?),
             (CNW_ROBOTS, OK, &cnw_robots()?),
             (FED_ROBOTS, NOT_FOUND, &fed_robots_404()?),
+            (YAHOO_ROBOTS, OK, &yahoo_robots()?),
         ],
     )
 }

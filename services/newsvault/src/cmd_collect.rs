@@ -13,18 +13,19 @@ use chrono::{DateTime, NaiveDate, Utc};
 use edgar_press::EdgarPress;
 use news_provider::lag_policy::{LagPolicy, LagPolicyError};
 use news_provider::provider::{Cadence, Calendar, CalendarError, Listing, PlanRefusal, Provenance};
+use news_provider::request::RequestPhase;
 use news_provider::{
     stamp_of, Archive, ArchiveError, AttemptReceipt, Clock, CollectError, Collected, CollectedItem,
     Committed, Credentials, Exchange, Exit, Payload, Provider, Relisted, Run, RunId, SourceId,
     TargetWindow, Wire,
 };
-use open_web_feed::{OpenWebFeed, RobotsPin};
+use open_web_feed::{CrossChecker, OpenWebFeed, RobotsPin};
 use pit::{MeasuredLag, ObservationTime};
 use serde_json::{json, Value};
 
 use crate::cmd_ledger::{Envelope, RunKind, RUN_ENVELOPE_SCHEMA};
 use crate::robots::{Robots, RobotsError};
-use crate::store::{Committer, ItemRow, StoreError, POLICY_DIR, RUNS_DIR};
+use crate::store::{Committer, IndexPayload, ItemRow, StoreError, POLICY_DIR, RUNS_DIR};
 
 /// `/2` since 2026-11-15: `calendar_version` became nullable, a type change, and `window`,
 /// `source` and `hosts_version` were added.
@@ -39,6 +40,8 @@ pub const TODAY: &str = "today";
 /// Section 11.1's 10 s, held apart from `open-web-feed`'s own interval so the floor check does not
 /// move when the profile it checks does.
 const PACE_FLOOR: Duration = Duration::from_secs(10);
+/// Section 11.2's option C match: `open_web_feed::normalised` titles, equal.
+const CROSS_CHECK_MATCH: &str = "normalised_title";
 
 /// What a caller asked `collect` for. `calendar` and `listing` are files for the same reason the
 /// rules file is one: a hashed input a second reader can reproduce. Which of the four optional
@@ -252,6 +255,8 @@ pub struct Driven {
     pub collected: Collected,
     /// `None` when the provider's cadence takes no calendar and none was read.
     pub calendar_version: Option<String>,
+    /// Section 11.2's option C for this run, or null: no cross-checker, or a dry run.
+    pub cross_check: Value,
 }
 
 /// The table of registered providers: per source, its credential and the files it takes beside
@@ -337,6 +342,8 @@ pub struct Opened {
     /// Every admitted hosts-file row as `collect` checks it; empty for a provider with none.
     pub admitted_robots: Vec<AdmittedRobots>,
     pub lag: Option<AppliedLag>,
+    /// The keyed index's cross-check against the direct indexes (section 11.2, option C).
+    pub cross_checker: Option<CrossChecker>,
 }
 
 /// One admitted hosts row (section 11.2): its pin, its pinned robots body as read when the
@@ -442,6 +449,7 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
             source_id: registered.source(),
         });
     }
+    let mut cross_checker = None;
     let (provider, file_versions, admitted_robots, lag): (Box<dyn Provider>, _, _, _) =
         match registered {
             Registered::EdgarPress => {
@@ -470,6 +478,7 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
                 let version = provider.hosts_version().hex().to_owned();
                 let extraction = provider.extract_version().hex().to_owned();
                 let admitted = admitted_robots(&ask.store, &provider)?;
+                cross_checker = provider.cross_checker();
                 (
                     Box::new(provider),
                     (Some(version), Some(extraction)),
@@ -486,6 +495,7 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
         extract_version,
         admitted_robots,
         lag,
+        cross_checker,
     })
 }
 
@@ -649,6 +659,7 @@ pub fn drive<A: Archive>(
     Ok(Driven {
         collected,
         calendar_version: version_of(calendar.as_ref()),
+        cross_check: Value::Null,
     })
 }
 
@@ -702,7 +713,10 @@ pub fn run(
     // Before the lease, so a run that never gets one is a record rather than a hole.
     write_envelope(&ask.store, &envelope)?;
     let mut store = Committer::open(&ask.store, &run)?;
-    let driven = drive(ask, provider, &mut store, exchange, clock, &run)?;
+    let mut driven = drive(ask, provider, &mut store, exchange, clock, &run)?;
+    if let Some(checker) = opened.cross_checker.as_ref() {
+        driven.cross_check = cross_check_of(&store, checker, &driven.collected)?;
+    }
     let finished = Envelope {
         finished_at: Some(clock.now()),
         ..envelope
@@ -712,6 +726,86 @@ pub fn run(
         exit: driven.collected.exit(),
         envelope: envelope_of(ask, opened, &run_id, run_date, &driven, true),
     })
+}
+
+/// Section 11.2's option C: this run's keyed index answer against every direct index answer the
+/// store holds from the keyed `cross_check` rows' earliest minute on. `result` is null when this
+/// run filed no readable keyed payload, so "not looked" stays apart from "nothing unlisted".
+fn cross_check_of(
+    store: &Committer,
+    checker: &CrossChecker,
+    collected: &Collected,
+) -> Result<Value, CollectRunError> {
+    // The last attempt: a retried index's earlier answers are the failures it was retried for.
+    let keyed = collected
+        .attempts
+        .iter()
+        .rev()
+        .find(|row| row.phase == RequestPhase::Index.name() && row.url == checker.index_url());
+    let keyed_bytes = match keyed {
+        Some(row) => match store.payload_of(&row.attempt_id)? {
+            Some(payload) => crate::store::blob_bytes(store.root(), &payload.raw_blob)?,
+            None => None,
+        },
+        None => None,
+    };
+    let direct: Vec<IndexPayload> = match keyed {
+        Some(row) => store
+            .index_payloads(&SourceId::new(row.source.clone()))?
+            .into_iter()
+            .filter(|payload| checker.is_direct_index(&payload.url))
+            .collect(),
+        None => Vec::new(),
+    };
+    let watched_from = direct.first().and_then(|first| instant(&first.received_at));
+    let since = keyed_bytes
+        .as_deref()
+        .and_then(|bytes| checker.earliest_cross_checked(bytes));
+    let mut read = Vec::new();
+    for payload in &direct {
+        if since.is_some_and(|since| instant(&payload.received_at).is_some_and(|at| at >= since)) {
+            if let Some(bytes) = crate::store::blob_bytes(store.root(), &payload.raw_blob)? {
+                read.push((payload.url.clone(), bytes));
+            }
+        }
+    }
+    let result = keyed_bytes
+        .as_deref()
+        .and_then(|bytes| checker.check(bytes, &read, watched_from))
+        .map(|checked| {
+            json!({
+                "rows": {
+                    "followed": checked.followed,
+                    "cross_checked": checked.cross_checked,
+                    "other_key": checked.other_key,
+                    "no_key": checked.no_key,
+                },
+                "not_compared": checked.not_compared,
+                "listed_directly": checked.listed_directly,
+                "unlisted_count": checked.unlisted.len(),
+                "unlisted": checked.unlisted.iter().map(|row| json!({
+                    "key": row.key,
+                    "url": row.url,
+                    "title": row.title,
+                    "listed_raw": row.listed_raw,
+                })).collect::<Vec<Value>>(),
+                "direct_titles": checked.direct_titles,
+            })
+        });
+    Ok(json!({
+        "index_url": checker.index_url(),
+        "attempt_id": keyed.map(|row| row.attempt_id.clone()),
+        "matching_rule": CROSS_CHECK_MATCH,
+        "watched_from": watched_from.map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)),
+        "direct_payloads_read": read.len(),
+        "result": result,
+    }))
+}
+
+fn instant(stamp: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(stamp)
+        .ok()
+        .map(|at| at.with_timezone(&Utc))
 }
 
 /// A driven run's window refusal before the store, the lock or an envelope exists (section 5.1).
@@ -881,6 +975,7 @@ fn planned(
     let driven = Driven {
         collected: Collected::of_plan(&plan, &provider.source()),
         calendar_version: version_of(calendar_in),
+        cross_check: Value::Null,
     };
     Ok(Answer {
         // A dry run answers the plan question and nothing else, so its exit is the plan's.
@@ -997,6 +1092,7 @@ fn envelope_of(
         "blobs_indexed": collected.blobs_indexed,
         "bytes_indexed": collected.bytes_indexed,
         "seq_high_water": collected.seq_high_water,
+        "cross_check": driven.cross_check,
         "changed": changed && collected.tally.committed > 0,
         "exit": {
             "code": exit.code(),
@@ -1041,6 +1137,14 @@ pub fn render_human(envelope: &Value, out: &mut impl std::io::Write) -> std::io:
         )?;
     }
     writeln!(out, "items committed  {}", envelope["items_committed"])?;
+    let checked = &envelope["cross_check"]["result"];
+    if !envelope["cross_check"].is_null() {
+        writeln!(
+            out,
+            "cross-check      {} unlisted directly, {} listed, {} not compared",
+            checked["unlisted_count"], checked["listed_directly"], checked["not_compared"]
+        )?;
+    }
     writeln!(
         out,
         "blobs            {} written, {} indexed",
