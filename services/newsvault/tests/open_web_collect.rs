@@ -1162,12 +1162,11 @@ fn a_cross_check_row_no_direct_index_answered_after_is_not_looked() -> TestResul
 }
 
 type Damage = fn(&Path, &[u8]) -> std::io::Result<()>;
+/// How many blobs were damaged, the run's exit, its cross-check, and (envelopes, any unfinished).
+type DamagedRun = (usize, Exit, Value, (usize, bool));
 
-/// A second run after the first run's CNW sitemap blob was `damage`d on disk: how many blobs were
-/// damaged, the run's exit, its cross-check, and (envelopes, any without `finished_at`).
-fn run_over_a_damaged_sitemap(
-    damage: Damage,
-) -> Result<(usize, Exit, Value, (usize, bool)), Box<dyn Error>> {
+/// A second run after the first run's CNW sitemap blob was `damage`d on disk.
+fn run_over_a_damaged_sitemap(damage: Damage) -> Result<DamagedRun, Box<dyn Error>> {
     let (root, hosts) = cnw_and_yahoo_store()?;
     cross_checked_at(
         root.path(),
