@@ -2334,8 +2334,8 @@ mod tests {
     use super::{
         first_observed, fs, newest_visible_publication, params, stamp, user_version, BTreeMap,
         BlobDigest, Committer, ItemRow, LedgerError, MigrationStep, ObservationTime, Payload,
-        PayloadRow, RobotsAnswer, RobotsLedger, RunId, Sink, StoreError, COMMIT_LOG, MIGRATIONS,
-        SCHEMA_V0, SCHEMA_VERSION,
+        PayloadRow, RobotsAnswer, RobotsLedger, RunId, Sink, StoreError, WalkRecord, COMMIT_LOG,
+        MIGRATIONS, SCHEMA_V0, SCHEMA_VERSION,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -4455,6 +4455,141 @@ mod tests {
         assert_eq!(
             (refused, read_only, user_version(&db)?),
             (expected.clone(), expected, 10)
+        );
+        Ok(())
+    }
+
+    /// A v11 store: the v10 fixture and `MIGRATIONS[10]`, with boundary counts on the v1 attempt.
+    fn a_store_at_user_version_eleven(temp: &TempDir) -> TestResult {
+        a_store_at_user_version_ten(temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch(MIGRATIONS[10])?;
+        db.pragma_update(None, "user_version", 11)?;
+        db.execute_batch(
+            "UPDATE attempts SET boundary_same_generation = 1, boundary_older_generation = 2,
+                    boundary_newer_generation = 3, boundary_generation_unknown = 4
+              WHERE attempt_id = 'a v1 attempt';",
+        )?;
+        Ok(())
+    }
+
+    const WALK_COLUMNS: [&str; 4] = [
+        "walk_through",
+        "walk_gone",
+        "walk_other_language",
+        "walk_unread",
+    ];
+
+    fn walk_on(store: &Committer, attempt: &str) -> Result<Vec<Option<i64>>, StoreError> {
+        WALK_COLUMNS
+            .iter()
+            .map(|column| {
+                Ok(store.db.query_row(
+                    &format!("SELECT {column} FROM attempts WHERE attempt_id = ?1"),
+                    params![attempt],
+                    |row| row.get(0),
+                )?)
+            })
+            .collect()
+    }
+
+    /// §8 row M1 from user_version 11: the step to 12 rebuilds `attempts`, whose `continuity`
+    /// then takes `id_unread`, and adds the four walk columns, each an `INTEGER` none negative.
+    #[test]
+    fn a_store_at_user_version_eleven_opens_migrates_to_twelve_and_takes_a_walk() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_eleven(&temp)?;
+        let mut store = open(&temp)?;
+        store.record_walk(
+            "a v1 attempt",
+            WalkRecord {
+                continuity: "id_unread",
+                through: Some(3_404_422),
+                gone: 1,
+                other_language: 2,
+                unread: 3,
+            },
+        )?;
+        let taken = (
+            continuity_on(&store, "a v1 attempt")?,
+            walk_on(&store, "a v1 attempt")?,
+        );
+        let refused: Vec<bool> = WALK_COLUMNS
+            .iter()
+            .map(|column| {
+                store
+                    .db
+                    .execute(
+                        &format!(
+                            "UPDATE attempts SET {column} = -1 WHERE attempt_id = 'a v1 attempt'"
+                        ),
+                        [],
+                    )
+                    .is_err()
+            })
+            .collect();
+        let columns = super::columns_of(&store.db, "attempts")?;
+        let shapes: Vec<Option<&super::ColumnShape>> = WALK_COLUMNS
+            .iter()
+            .map(|column| columns.get(*column))
+            .collect();
+        let integer = ("INTEGER".to_owned(), false, None, 0);
+        assert_eq!(
+            (user_version(&store.db)?, taken, refused, shapes),
+            (
+                SCHEMA_VERSION,
+                (
+                    Some("id_unread".to_owned()),
+                    vec![Some(3_404_422), Some(1), Some(2), Some(3)]
+                ),
+                vec![true; 4],
+                vec![Some(&integer); 4]
+            )
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the carried half from user_version 11 across the rebuild of `attempts`: every
+    /// column of every row of every v11 table, compared by `quote()`; the four walk columns NULL.
+    #[test]
+    fn a_v11_store_keeps_every_v11_column_of_every_row() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_eleven(&temp)?;
+        let v11 = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let before = quoted_rows(&v11, 11, &V7_TABLES)?;
+        drop(v11);
+        assert!(super::refuse_an_unreadable_version(temp.path()).is_ok());
+        let store = open(&temp)?;
+        let after = quoted_rows(&store.db, 11, &V7_TABLES)?;
+        assert_eq!(before.len(), V7_TABLES.len() + 1);
+        assert_eq!(
+            (after, walk_on(&store, "a v1 attempt")?),
+            (before, vec![None; 4])
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the per-version shape check at user_version 11.
+    #[test]
+    fn a_v11_store_whose_columns_differ_is_refused_and_left_at_user_version_eleven() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_eleven(&temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch("ALTER TABLE attempts DROP COLUMN boundary_generation_unknown;")?;
+        drop(db);
+        let read_only = match super::refuse_an_unreadable_version(temp.path()) {
+            Err(StoreError::ShapeDiffers { found: 11, columns }) => columns,
+            other => vec![format!("{other:?}")],
+        };
+        let refused = match open(&temp) {
+            Err(StoreError::ShapeDiffers { found: 11, columns }) => columns,
+            other => vec![format!("{other:?}")],
+        };
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let expected = vec!["attempts.boundary_generation_unknown".to_owned()];
+        assert_eq!(
+            (refused, read_only, user_version(&db)?),
+            (expected.clone(), expected, 11)
         );
         Ok(())
     }

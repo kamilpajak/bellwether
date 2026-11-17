@@ -4528,11 +4528,14 @@ fn a_poll_after_a_complete_walk_starts_at_the_id_it_walked_through() -> TestResu
 }
 
 /// An id still failing after its retries leaves the poll `id_unread`, no basis, so the next poll
-/// walks from the first poll again and asks that id once more and no id already answered.
+/// walks from the first poll again and asks that id once more and no id already answered: a 301
+/// to no other language included, which is permanent and not held (§10) yet answered.
 #[test]
 fn an_id_unread_after_its_retries_is_walked_again_by_the_next_poll() -> TestResult {
     let root = after_a_first_walked_poll()?;
-    let failing = Gnw::walked(RSS_1205)?.answering(&walk_url(3_404_420), &[UNAVAILABLE; 3]);
+    let failing = Gnw::walked(RSS_1205)?
+        .answering(&walk_url(3_404_420), &[UNAVAILABLE; 3])
+        .moved(&walk_url(3_404_421), "/elsewhere");
     let second = walked_poll(
         root.path(),
         hosts_fixture(WALK_HOSTS),
