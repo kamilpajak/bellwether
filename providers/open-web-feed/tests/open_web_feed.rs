@@ -233,6 +233,84 @@ const CNW_OUTSIDE_THE_SECTION: [&str; 4] = [
     "Searching for your content",
 ];
 const GOLDEN_CNW_PAGES: [&str; 2] = [CNW_ARTICLE, CNW_SECOND_ARTICLE];
+const FED_INDEX: &str = "https://www.federalreserve.gov/feeds/press_all.xml";
+const FED_HOST: &str = "www.federalreserve.gov";
+/// Items 1, 3 and 5 of the 20 in the 2026-11-16 08:04:39Z feed (§11.6 weekday probe, p0800),
+/// byte for byte: a byte order mark first, CRLF line ends, `link` and `pubDate` in CDATA.
+const FED_REAL_INDEX: &str = "press_all_3_items.xml";
+const FED_LINKS: [&str; 3] = [
+    FED_ARTICLE_URL,
+    "https://www.federalreserve.gov/newsevents/pressreleases/monetary20261112a.htm",
+    FED_SECOND_ARTICLE_URL,
+];
+/// A day before the 10th is printed with no leading zero (9 of 20 items, 2026-11-16).
+const FED_PUB_DATES: [&str; 3] = [
+    "Fri, 13 Nov 2026 21:15:00 GMT",
+    "Thu, 12 Nov 2026 17:45:00 GMT",
+    "Mon, 9 Nov 2026 21:00:00 GMT",
+];
+const FED_MINUTES: [&str; 3] = [
+    "2026-11-13T21:15:00Z",
+    "2026-11-12T17:45:00Z",
+    "2026-11-09T21:00:00Z",
+];
+/// A zero-padded day, a second inside the minute, no seconds field, another zone spelling, a
+/// two-digit year: none is a Fed minute.
+const FED_NOT_A_MINUTE: [&str; 5] = [
+    "Mon, 09 Nov 2026 21:00:00 GMT",
+    "Fri, 13 Nov 2026 21:15:30 GMT",
+    "Fri, 13 Nov 2026 21:15 GMT",
+    "Fri, 13 Nov 2026 21:15:00 +0000",
+    "Fri, 13 Nov 26 21:15:00 GMT",
+];
+/// Release bcreg20261113a (p0800 fetch) cut to its head, one `nav` paragraph, the breadcrumb and
+/// `div#article`; the four media contacts' names and phone numbers are replaced.
+const FED_ARTICLE: &str = "article_bcreg20261113a.html";
+const FED_ARTICLE_URL: &str =
+    "https://www.federalreserve.gov/newsevents/pressreleases/bcreg20261113a.htm";
+const FED_ARTICLE_KEY: &str = "www.federalreserve.gov/newsevents/pressreleases/bcreg20261113a.htm";
+const FED_ARTICLE_TITLE: &str =
+    "Agencies extend comment period for proposed third-party risk management guidance";
+/// Release orders20261109a (p0800 fetch) cut the same way; it names no person.
+const FED_SECOND_ARTICLE: &str = "article_orders20261109a.html";
+const FED_SECOND_ARTICLE_URL: &str =
+    "https://www.federalreserve.gov/newsevents/pressreleases/orders20261109a.htm";
+const FED_SECOND_ARTICLE_TITLE: &str = "Federal Reserve Board announces approval of two applications by Mutual Federal Bancorp, MHC, and MFB Bancorp, Inc.";
+const FED_NO_ARTICLE_BLOCK_PAGE: &str = "synthetic_no_article_block.html";
+const FED_OFF_PREFIX_URL: &str =
+    "https://www.federalreserve.gov/newsevents/speech/a-speech-20261113a.htm";
+/// The trimmed bcreg20261113a body: four release paragraphs, then the two attachment links.
+const FED_ARTICLE_LINES: [&str; 6] = [
+    "The Federal Deposit Insurance Corporation, the Federal Reserve Board, the National Credit",
+    "The proposed guidance reflects the agencies' supervisory experience",
+    "When finalized, the federal bank regulatory agencies plan to rescind",
+    "Also today, the Federal Reserve Board separately announced",
+    "Federal Register notice: Proposed Third-Party Risk Management Guidance; Extension of Comment Period (PDF)",
+    "Federal Register notice: Proposed Third-Party Risk Management Guide for Traditional Community Banking Organizations (PDF)",
+];
+/// What the trimmed bcreg20261113a holds outside the release column: the heading block (date,
+/// issuing agencies, release time, share), the Related Information panel, the nav, the
+/// breadcrumb, the page title and the media contacts' cells.
+const FED_OUTSIDE_THE_COLUMN: [&str; 10] = [
+    "November 13, 2026",
+    "Board of Governors of the Federal Reserve System",
+    "For release at",
+    "Share",
+    "Agencies seek comment on proposed third-party risk management guidance",
+    "Federal Open Market Committee",
+    "Press Releases",
+    "Joint Press Release",
+    "Media Contacts",
+    "Jane Example",
+];
+/// The trimmed orders20261109a body, whole; its address is a Cloudflare placeholder (P1).
+const FED_SECOND_ARTICLE_BODY: [&str; 4] = [
+    "The Federal Reserve Board on Monday announced its approval of two applications by Mutual Federal Bancorp, MHC, and MFB Bancorp, Inc., both of Chicago, Illinois.",
+    "These approvals allow the banking organization to have a new top-tier holding company, MFB Bancorp, Inc., which would become a savings and loan holding company by acquiring Mutual Federal Bank, of Chicago, Illinois.",
+    "For media inquiries, please email or call (202) 452-2955.",
+    "Order (PDF)",
+];
+const GOLDEN_FED_PAGES: [&str; 2] = [FED_ARTICLE, FED_SECOND_ARTICLE];
 const FIRST_ATTEMPT: u32 = 0;
 const OK: u16 = 200;
 const REQUEST_TIMEOUT: u16 = 408;
@@ -258,6 +336,10 @@ fn prn(name: &str) -> Vec<u8> {
 
 fn cnw(name: &str) -> Vec<u8> {
     std::fs::read(fixtures().join("cnw").join(name)).unwrap_or_default()
+}
+
+fn fed(name: &str) -> Vec<u8> {
+    std::fs::read(fixtures().join("fed").join(name)).unwrap_or_default()
 }
 
 fn hosts_path() -> PathBuf {
@@ -384,6 +466,37 @@ fn cnw_sitemap(rows: &[(&str, &str)]) -> Vec<u8> {
     .into_bytes()
 }
 
+fn fed_index_request(provider: &OpenWebFeed) -> Result<Request, Box<dyn std::error::Error>> {
+    let plan = provider.plan(&TargetWindow::new(RUN_DAY), None, None, at(RUN_AT))?;
+    plan.requests
+        .into_iter()
+        .find(|request| request.url == FED_INDEX)
+        .ok_or_else(|| "the run day planned no Federal Reserve index".into())
+}
+
+/// The follow-up the real Fed feed names at `position`, with its real `pubDate`.
+fn fed_follow_up(
+    provider: &OpenWebFeed,
+    position: usize,
+) -> Result<Request, Box<dyn std::error::Error>> {
+    let index = provider.extract(&fed_index_request(provider)?, &blob(fed(FED_REAL_INDEX)));
+    index
+        .follow_ups
+        .get(position)
+        .cloned()
+        .ok_or_else(|| format!("the real Fed feed yielded no follow-up {position}").into())
+}
+
+/// One synthetic RSS feed holding each `(link, pubDate)` as one `item`.
+fn fed_rss(rows: &[(&str, &str)]) -> Vec<u8> {
+    let items: String = rows
+        .iter()
+        .map(|(link, date)| format!("<item><link>{link}</link><pubDate>{date}</pubDate></item>"))
+        .collect();
+    format!("<?xml version=\"1.0\"?><rss version=\"2.0\"><channel>{items}</channel></rss>")
+        .into_bytes()
+}
+
 fn only_item(extracted: &Extracted) -> Result<CollectedItem, Box<dyn std::error::Error>> {
     match extracted.items.as_slice() {
         [item] => Ok(item.clone()),
@@ -449,23 +562,23 @@ fn a_target_other_than_the_run_day_is_refused_before_any_request() -> Outcome {
         );
     }
     let plan = provider.plan(&TargetWindow::new(RUN_DAY), None, None, at(RUN_AT))?;
-    assert_eq!(plan.requests.len(), 3);
+    assert_eq!(plan.requests.len(), 4);
     assert_eq!(plan.not_planned, Vec::new());
     Ok(())
 }
 
-/// Section 11.2's host order: GNW, then PR Newswire, then Canada Newswire, one index each.
+/// Section 11.2's host order: GNW, then PR Newswire, Canada Newswire and the Fed, one index each.
 /// Mutations 2026-11-16, the PRN row made `candidate` and the two rows swapped: each red; 2026-11-17,
-/// the CNW row made `candidate`, and its index the RSS feed: each red.
+/// the CNW row made `candidate`, and its index the RSS feed: each red; the Fed row `candidate`: red.
 #[test]
-fn the_committed_hosts_file_plans_globenewswire_then_pr_newswire_then_canada_newswire() -> Outcome {
+fn the_committed_hosts_file_plans_gnw_then_prn_then_cnw_then_the_fed() -> Outcome {
     let plan = provider()?.plan(&TargetWindow::new(RUN_DAY), None, None, at(RUN_AT))?;
     let urls: Vec<&str> = plan
         .requests
         .iter()
         .map(|request| request.url.as_str())
         .collect();
-    assert_eq!(urls, vec![GNW_INDEX, PRN_INDEX, CNW_INDEX]);
+    assert_eq!(urls, vec![GNW_INDEX, PRN_INDEX, CNW_INDEX, FED_INDEX]);
     Ok(())
 }
 
@@ -1817,6 +1930,231 @@ fn an_unknown_index_or_a_sitemap_field_outside_news_is_refused() {
     }
 }
 
+// ---- Federal Reserve ----
+
+/// The real feed's `link` and `pubDate`, no rewrite, `/newsevents/pressreleases/`; its byte order
+/// mark, CRLF line ends and CDATA are read. Mutation 2026-11-17, the prefix PRN's `/news-releases/`:
+/// red, all 3 filtered out.
+#[test]
+fn the_real_federal_reserve_feed_yields_one_follow_up_per_release_with_its_raw_pub_date() -> Outcome
+{
+    let provider = provider()?;
+    let extracted = provider.extract(&fed_index_request(&provider)?, &blob(fed(FED_REAL_INDEX)));
+    assert_eq!(
+        (extracted.vendor_rows, extracted.filtered_out),
+        (REAL_ROWS, 0)
+    );
+    let kept: Vec<(&str, Option<&str>, RequestPhase)> = extracted
+        .follow_ups
+        .iter()
+        .map(|request| {
+            (
+                request.url.as_str(),
+                request.listed_date.as_deref(),
+                request.phase,
+            )
+        })
+        .collect();
+    let expected: Vec<(&str, Option<&str>, RequestPhase)> = FED_LINKS
+        .iter()
+        .zip(FED_PUB_DATES)
+        .map(|(link, date)| (*link, Some(date), RequestPhase::Document))
+        .collect();
+    assert_eq!(kept, expected);
+    Ok(())
+}
+
+/// The 20 real links of 2026-11-16 are all under `/newsevents/pressreleases/`, so only a
+/// synthetic link tests the prefix from the wide side. Mutation 2026-11-17, the prefix `/`: red.
+#[test]
+fn a_federal_reserve_link_outside_press_releases_is_filtered_out_and_counted() -> Outcome {
+    let provider = provider()?;
+    let index = fed_rss(&[
+        (FED_ARTICLE_URL, FED_PUB_DATES[0]),
+        (FED_OFF_PREFIX_URL, FED_PUB_DATES[0]),
+    ]);
+    let extracted = provider.extract(&fed_index_request(&provider)?, &blob(index));
+    let kept: Vec<&str> = extracted
+        .follow_ups
+        .iter()
+        .map(|request| request.url.as_str())
+        .collect();
+    assert_eq!(
+        (extracted.vendor_rows, kept, extracted.filtered_out),
+        (2, vec![FED_ARTICLE_URL], 1)
+    );
+    Ok(())
+}
+
+/// Section 11.1: every observed Fed `pubDate` is `GMT` with second `00`, its day unpadded below
+/// the 10th (20 of 20 items; one body in all 26 polls of 2026-11-16). Mutations 2026-11-17: `%d`
+/// for `%-d`, red (the real `9 Nov` refused); the round trip removed, red (`09 Nov` read).
+#[test]
+fn a_federal_reserve_pubdate_is_a_minute_with_an_unpadded_day_and_never_an_instant() -> Outcome {
+    let provider = provider()?;
+    let request = fed_follow_up(&provider, 0)?;
+    let extract = |raw: &str| {
+        let dated = Request {
+            listed_date: Some(raw.to_owned()),
+            ..request.clone()
+        };
+        provider.extract(&dated, &blob(fed(FED_ARTICLE)))
+    };
+    for (raw, minute) in FED_PUB_DATES.iter().copied().zip(FED_MINUTES) {
+        let item = only_item(&extract(raw))?;
+        assert_eq!(
+            (
+                &item.valid,
+                precision_of(&item.valid),
+                item.valid_source,
+                item.valid_raw.as_str(),
+                item.valid_field.as_str()
+            ),
+            (
+                &Published::AtMinute(Minute::new(minute.parse()?)?),
+                ValidPrecision::Minute,
+                ValidSource::VendorPublished,
+                raw,
+                "pubDate"
+            ),
+            "{raw}"
+        );
+    }
+    for raw in FED_NOT_A_MINUTE {
+        let row = only_unusable(&extract(raw))?;
+        assert_eq!(
+            (row.reason, row.decided_by, &row.item.valid),
+            (
+                UnusableReason::NoParseableValidTime,
+                DecidedBy::IndexRow,
+                &Published::Unknown
+            ),
+            "{raw}"
+        );
+    }
+    Ok(())
+}
+
+/// §8 row R17 for the Fed: `p, li, figcaption` in the release column, the direct child of
+/// `div#article` that is not its heading block. Mutations 2026-11-17, the container `body`,
+/// `div#article`, the column without `:not(.heading)`, and without `div#article >`: each red.
+#[test]
+fn the_extracted_body_is_article_text_and_never_page_html_on_a_federal_reserve_page() -> Outcome {
+    let provider = provider()?;
+    let item =
+        only_item(&provider.extract(&fed_follow_up(&provider, 0)?, &blob(fed(FED_ARTICLE))))?;
+    let body = item.body.ok_or("no body")?.text;
+    let opened: Vec<bool> = body
+        .lines()
+        .zip(FED_ARTICLE_LINES)
+        .map(|(line, opens)| line.starts_with(opens))
+        .collect();
+    assert_eq!(opened, vec![true; FED_ARTICLE_LINES.len()], "{body}");
+    assert_eq!(body.lines().count(), FED_ARTICLE_LINES.len(), "{body}");
+    assert!(!body.contains('<'), "{body}");
+    for outside in FED_OUTSIDE_THE_COLUMN {
+        assert!(
+            !body.contains(outside),
+            "{outside} reached the body: {body}"
+        );
+    }
+    let second = only_item(&provider.extract(
+        &fed_follow_up(&provider, 2)?,
+        &blob(fed(FED_SECOND_ARTICLE)),
+    ))?;
+    assert_eq!(
+        second.body.ok_or("no body")?.text,
+        FED_SECOND_ARTICLE_BODY.join("\n")
+    );
+    Ok(())
+}
+
+/// A page with no release column under `div#article` is the page's fault, so it is held (section
+/// 11.1). The synthetic page holds the heading and the column under another `div`. Mutation
+/// 2026-11-17, the container without `div#article >`: red.
+#[test]
+fn a_federal_reserve_page_with_no_article_block_is_unusable_as_no_article_body() -> Outcome {
+    let provider = provider()?;
+    let page = blob(fed(FED_NO_ARTICLE_BLOCK_PAGE));
+    let row = only_unusable(&provider.extract(&fed_follow_up(&provider, 1)?, &page))?;
+    assert_eq!(
+        (
+            row.reason,
+            row.decided_by,
+            row.raw_blob.as_str(),
+            row.item.body.as_ref(),
+            row.item.title.as_str()
+        ),
+        (
+            UnusableReason::NoArticleBody,
+            DecidedBy::Page,
+            page.digest.as_str(),
+            None,
+            "A release with no article block"
+        )
+    );
+    Ok(())
+}
+
+/// The key is the link's own host and path. No Fed page names a canonical link (9 of 9 files,
+/// 2026-11-16), so `doc_id` is the requested url, which `og:url` equals on all 9. Mutation
+/// 2026-11-17, a rewrite `www.federalreserve.gov` to `federalreserve.gov`: red.
+#[test]
+fn the_real_federal_reserve_release_carries_its_title_its_own_url_and_its_item_key() -> Outcome {
+    let provider = provider()?;
+    assert_eq!(
+        provider.item_key(FED_ARTICLE_URL).as_deref(),
+        Some(FED_ARTICLE_KEY)
+    );
+    let mut read = Vec::new();
+    for (position, page) in [(0, FED_ARTICLE), (2, FED_SECOND_ARTICLE)] {
+        let request = fed_follow_up(&provider, position)?;
+        let item = only_item(&provider.extract(&request, &blob(fed(page))))?;
+        read.push((
+            item.title,
+            item.canonical_url,
+            item.source_item_id,
+            item.observed,
+        ));
+    }
+    let key_of = |url: &str| url.trim_start_matches("https://").to_owned();
+    assert_eq!(
+        read,
+        vec![
+            (
+                FED_ARTICLE_TITLE.to_owned(),
+                FED_ARTICLE_URL.to_owned(),
+                FED_ARTICLE_KEY.to_owned(),
+                None
+            ),
+            (
+                FED_SECOND_ARTICLE_TITLE.to_owned(),
+                FED_SECOND_ARTICLE_URL.to_owned(),
+                key_of(FED_SECOND_ARTICLE_URL),
+                None
+            ),
+        ]
+    );
+    Ok(())
+}
+
+/// Section 11.2: what the committed Fed row asks of `www.federalreserve.gov`; its robots.txt is a
+/// 404, so no rule forbids either path.
+#[test]
+fn the_committed_federal_reserve_row_asks_its_feed_and_its_prefix() -> Outcome {
+    let asked: Vec<String> = provider()?
+        .admitted_paths()
+        .into_iter()
+        .filter(|path| path.host == FED_HOST)
+        .map(|path| path.path)
+        .collect();
+    assert_eq!(
+        asked,
+        vec!["/feeds/press_all.xml", "/newsevents/pressreleases/"]
+    );
+    Ok(())
+}
+
 // ---- transport ----
 
 /// Owner decision 1, 2026-11-17: each host its own 10 s queue, and no per-IP queue across hosts.
@@ -1998,9 +2336,9 @@ fn a_robots_pin_that_is_neither_64_lowercase_hex_nor_absent_is_refused() -> Outc
     Ok(())
 }
 
-/// Each committed pin is its committed robots body's sha256, so a refresh answered with that body
-/// matches it (`newsvault`'s `tests/robots_refresh.rs`). Mutations 2026-11-16 and 2026-11-17, one
-/// hex digit of the PRN pin and of the CNW pin changed: each red.
+/// Each pin is its committed robots body's sha256 (`newsvault`'s `tests/robots_refresh.rs`), or
+/// `absent` for the Fed's 404. Mutations 2026-11-16 and 2026-11-17, one hex digit of the PRN pin
+/// and of the CNW pin changed, and the Fed pin a digest: each red.
 #[test]
 fn the_committed_hosts_file_pins_the_committed_robots_body() -> Outcome {
     let pin = |body: Vec<u8>| Some(RobotsPin::Sha256(FileDigest::of(&body).hex().to_owned()));
@@ -2021,6 +2359,11 @@ fn the_committed_hosts_file_pins_the_committed_robots_body() -> Outcome {
                 host: CNW_HOST.to_owned(),
                 admitted: true,
                 robots: pin(cnw("robots_www_newswire_ca.txt")),
+            },
+            HostPin {
+                host: FED_HOST.to_owned(),
+                admitted: true,
+                robots: Some(RobotsPin::Absent),
             },
         ]
     );
@@ -2192,6 +2535,13 @@ fn the_open_web_feed_breaks_no_claim_of_the_seam() -> Outcome {
             cnw_follow_up(&provider, 2)?,
             blob(cnw(CNW_NO_RELEASE_BODY_PAGE)),
         ),
+        (fed_index_request(&provider)?, blob(fed(FED_REAL_INDEX))),
+        (fed_follow_up(&provider, 0)?, blob(fed(FED_ARTICLE))),
+        (
+            fed_follow_up(&provider, 1)?,
+            blob(fed(FED_NO_ARTICLE_BLOCK_PAGE)),
+        ),
+        (fed_follow_up(&provider, 2)?, blob(fed(FED_SECOND_ARTICLE))),
     ];
     let subject = Subject {
         target: TargetWindow::new(RUN_DAY),
@@ -2208,7 +2558,7 @@ fn the_open_web_feed_breaks_no_claim_of_the_seam() -> Outcome {
         .flat_map(|(request, raw)| provider.extract(request, raw).items)
         .map(|item| precision_of(&item.valid))
         .collect();
-    assert_eq!(produced.len(), 6);
+    assert_eq!(produced.len(), 8);
     assert!(
         produced.iter().all(|precision| *precision == ceiling),
         "{produced:?} under {ceiling:?}"
@@ -2366,6 +2716,7 @@ fn golden_bodies() -> Result<(serde_json::Value, serde_json::Value), Box<dyn std
     let gnw_request = article_request(&provider)?;
     let prn_request = prn_article_request(&provider)?;
     let cnw_request = cnw_follow_up(&provider, 0)?;
+    let fed_request = fed_follow_up(&provider, 0)?;
     let pages = GOLDEN_GNW_PAGES
         .iter()
         .map(|page| ("gnw", *page, gnw(page), &gnw_request))
@@ -2378,6 +2729,11 @@ fn golden_bodies() -> Result<(serde_json::Value, serde_json::Value), Box<dyn std
             GOLDEN_CNW_PAGES
                 .iter()
                 .map(|page| ("cnw", *page, cnw(page), &cnw_request)),
+        )
+        .chain(
+            GOLDEN_FED_PAGES
+                .iter()
+                .map(|page| ("fed", *page, fed(page), &fed_request)),
         );
     for (host, page, bytes, request) in pages {
         let item = only_item(&provider.extract(request, &blob(bytes)))?;

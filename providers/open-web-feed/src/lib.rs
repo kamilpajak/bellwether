@@ -1,7 +1,7 @@
 //! Our own forward news feed: dated indexes and article pages from admitted hosts, collected live
 //! for the run's UTC day only. The design is `docs/design/architecture.md` section 11; GNW, PR
-//! Newswire and Canada Newswire are the admitted hosts (section 11.5 steps 2 and 6). It declares
-//! no HTTP dependency and holds no clock and no `Sink`.
+//! Newswire, Canada Newswire and the Federal Reserve are the admitted hosts (section 11.5 steps 2
+//! and 6). It declares no HTTP dependency and holds no clock and no `Sink`.
 
 mod depth;
 mod hosts;

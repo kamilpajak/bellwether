@@ -2,6 +2,8 @@
   "bodies": {
     "cnw/article_805423040.html": "faacdde06774638f7d369776a087e82703fdc326081ed6d52e0e0729dfa29db7",
     "cnw/article_823884942.html": "15904e8d37201515c6b35de1918aa183278e86e2531a01080b821871f16e3300",
+    "fed/article_bcreg20261113a.html": "41d8e98f5df8e8cf12a98ada0a3cd482249b47ac4017e36452de0a5b10232fab",
+    "fed/article_orders20261109a.html": "0786495bd56bc567a8802585be70d7e5599f0e3fd49d4ac4fcdcead86f4c65dc",
     "gnw/article_3403075.html": "702c4e7023122be9aca0773503948c876f81d42db7f04a384d43d4867d220e91",
     "gnw/article_3403177.html": "c6c1940e197f75ed76f313c21489af88d12f45fa7915051a8e0fcdb11411ef45",
     "gnw/article_3403225.html": "8c7ec6530f366327b116308097398ab8ca70548ad7d8d1c54893c68ce40ed5a8",
@@ -17,5 +19,5 @@
     "prn/synthetic_lists.html": "4200e33d8e922413c9271d0fdceb43f8815a210d18f8b596ecea7efde9dde01d",
     "prn/synthetic_tables.html": "13fe1e5d451f5aadc5a093d0c407ed4750aa9923a25bee6cef0e9297897326ac"
   },
-  "extract_version": "4c6fc7a4b6441edd5dfb1987eedce278ec88685eef19a81784aa208d311e75d8"
+  "extract_version": "30de18237584c0f00b7505a346a58a271cdb2ccc83f330a1ca78b2a4d0c95e1b"
 }
