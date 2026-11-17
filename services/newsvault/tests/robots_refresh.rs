@@ -530,6 +530,96 @@ fn a_robots_redirect_whose_body_is_over_the_limit_keeps_its_status() -> TestResu
     Ok(())
 }
 
+/// The second refresh's clock: an hour after `NOW`, so its `Wire` owes no wait on `NOW`'s grant.
+const AN_HOUR_LATER: &str = "2026-11-15T11:00:00Z";
+const LOOPBACK_HOST_PACE_FILE: &str = "127.0.0.1.per-host";
+const PACE_DIR: &str = "pace";
+
+struct At(&'static str);
+
+impl Clock for At {
+    fn now(&self) -> DateTime<Utc> {
+        self.0.parse().unwrap_or(DateTime::UNIX_EPOCH)
+    }
+}
+
+/// A pace file's name and the instant it holds.
+type Grant = (String, DateTime<Utc>);
+
+/// Every `<store>/pace/` file with the instant it holds, sorted by name.
+fn pace_grants(store: &Path) -> Result<Vec<Grant>, Box<dyn Error>> {
+    let mut grants = Vec::new();
+    for entry in std::fs::read_dir(store.join(PACE_DIR))? {
+        let path = entry?.path();
+        let held = std::fs::read_to_string(&path)?;
+        let name = path.file_name().ok_or("no file name")?;
+        grants.push((
+            name.to_string_lossy().into_owned(),
+            DateTime::parse_from_rfc3339(held.trim())?.with_timezone(&Utc),
+        ));
+    }
+    grants.sort();
+    Ok(grants)
+}
+
+/// Section 8 row R19 holes 11 and 12: a refresh and a collect on one store reserve the same
+/// `pace/<host>.per-host` file, and open-web writes no per-IP file (owner decision 1, 2026-11-17).
+#[test]
+fn a_robots_refresh_and_a_collect_on_one_store_reserve_one_pace_file_per_host() -> TestResult {
+    let root = TempDir::new()?;
+    let ask = ask(root.path(), gnw_hosts());
+    let feed = cmd_robots::open(&ask)?;
+    let server = loopback::Loopback::redirecting(REDIRECT_NOWHERE, gnw_body()?)?;
+    let relayed = BTreeMap::from([(GNW_ROBOTS.to_owned(), server.url(ROBOTS_PATH))]);
+    let unanswered = Robots::of(&[]);
+    let by_robots = loopback::Relay {
+        stub: &unanswered,
+        wire: cmd_robots::wire_for(&ask, &feed),
+        relayed: relayed.clone(),
+        asked: RefCell::default(),
+    };
+    cmd_robots::run(&ask, &feed, &by_robots, &Fixed)?;
+    let after_refresh = pace_grants(root.path())?;
+    let collect_ask = newsvault::cmd_collect::Ask {
+        sources: vec![SOURCE.to_owned()],
+        window: newsvault::cmd_collect::TODAY.to_owned(),
+        schedule: None,
+        expected_runs: 1,
+        store: root.path().to_path_buf(),
+        calendar: None,
+        listing: None,
+        roster: None,
+        hosts: Some(gnw_hosts()),
+        rules: ask.rules.clone(),
+        lag_policy: None,
+        contact: CONTACT.to_owned(),
+        at: At(AN_HOUR_LATER).now(),
+        dry_run: false,
+    };
+    let opened = newsvault::cmd_collect::open_provider(&collect_ask)?;
+    let by_collect = loopback::Relay {
+        stub: &unanswered,
+        wire: newsvault::cmd_collect::wire_for(&collect_ask, &opened),
+        relayed,
+        asked: RefCell::default(),
+    };
+    cmd_robots::run(&ask, &feed, &by_collect, &At(AN_HOUR_LATER))?;
+    let after_collect_wire = pace_grants(root.path())?;
+    server.finish()?;
+    let file = LOOPBACK_HOST_PACE_FILE.to_owned();
+    assert_eq!(
+        (after_refresh, after_collect_wire),
+        (
+            vec![(file.clone(), Fixed.now())],
+            vec![(file, At(AN_HOUR_LATER).now())]
+        )
+    );
+    Ok(())
+}
+
+/// A path the server answers 301 and nothing here asks for, so every other path is a 200.
+const REDIRECT_NOWHERE: &str = "/never-asked";
+
 /// Decision D1: a changed robots.txt is "the answer is no", reported with both digests, and the
 /// hosts file is left as it was. Mutation 2026-11-15, `matches_pin` always true: red.
 #[test]
