@@ -520,7 +520,8 @@ fn every_continuity_value_is_counted_under_its_own_name_in_json_and_human() -> T
     let root = fixture()?;
     let db = Connection::open(root.path().join(COMMIT_LOG))?;
     db.execute_batch(
-        "UPDATE attempts SET continuity = 'complete' WHERE attempt_id = 'a-0701-edgar-0';
+        "UPDATE attempts SET continuity = 'complete'
+          WHERE attempt_id IN ('a-0701-edgar-0', 'a-0701-edgar-2');
          UPDATE attempts SET continuity = 'boundary_no_shared_key'
           WHERE attempt_id = 'a-0701-edgar-1';
          UPDATE attempts SET continuity = 'first_poll' WHERE attempt_id = 'a-0701-edgar-3';",
@@ -566,7 +567,7 @@ fn every_continuity_value_is_counted_under_its_own_name_in_json_and_human() -> T
                 .and_then(|word| word.parse().ok())
         })
         .collect();
-    let expected = vec![Some(1), Some(1), Some(0), Some(1)];
+    let expected = vec![Some(2), Some(1), Some(0), Some(1)];
     assert_eq!((counted, shown), (expected.clone(), expected));
     Ok(())
 }
