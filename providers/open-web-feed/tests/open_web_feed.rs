@@ -2,8 +2,9 @@
 //! 2026-11-14 and 2026-11-16 probes, the CNW, Fed and Yahoo files from the 2026-11-16 probes
 //! (architecture.md section 11.6); every `synthetic_` file says so in its head.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use canon::digest::story_id;
 use canon::FileDigest;
@@ -19,8 +20,8 @@ use news_provider::{
     Verdict,
 };
 use open_web_feed::{
-    AdmittedPath, CrossChecker, DirectAnswer, HostPin, OpenWebFeed, Refusal, RobotsPin,
-    CONTACT_CREDENTIAL, DIRECT_LEAD, LONGEST_POLL_PERIOD, SOURCE,
+    AdmittedPath, CrossChecker, DirectAnswer, HostPin, HostRobots, OpenWebFeed, Refusal, RobotsPin,
+    RobotsRules, CONTACT_CREDENTIAL, DIRECT_LEAD, LONGEST_POLL_PERIOD, SOURCE,
 };
 use pit::datedness::{Minute, Published};
 use pit::ObservationTime;
@@ -437,8 +438,69 @@ fn rules_fixture(name: &str) -> PathBuf {
     fixtures().join("rules").join(name)
 }
 
+/// The committed feed, every admitted host's robots handed as `Absent`, so none disallows a path.
 fn provider() -> Result<OpenWebFeed, Refusal> {
-    OpenWebFeed::open(&hosts_path(), &rules_path(), CONTACT)
+    Ok(handed(
+        OpenWebFeed::open(&hosts_path(), &rules_path(), CONTACT)?,
+        |_| HostRobots::Absent,
+    ))
+}
+
+fn handed(feed: OpenWebFeed, robots: impl Fn(&str) -> HostRobots) -> OpenWebFeed {
+    let handed: BTreeMap<String, HostRobots> = feed
+        .host_pins()
+        .into_iter()
+        .filter(|row| row.admitted)
+        .map(|row| {
+            let one = robots(&row.host);
+            (row.host, one)
+        })
+        .collect();
+    feed.with_robots(handed)
+}
+
+/// Disallows every path under `prefix` and records each path it was asked about.
+#[derive(Debug)]
+struct Disallowing {
+    prefix: String,
+    asked: Mutex<Vec<String>>,
+}
+
+impl RobotsRules for Disallowing {
+    fn allows(&self, path: &str) -> bool {
+        if let Ok(mut asked) = self.asked.lock() {
+            asked.push(path.to_owned());
+        }
+        !path.starts_with(&self.prefix)
+    }
+}
+
+/// The committed feed, GNW's robots disallowing `prefix`; the rules, to read what they were asked.
+fn gnw_disallowing(prefix: &str) -> Result<(OpenWebFeed, Arc<Disallowing>), Refusal> {
+    let rules = Arc::new(Disallowing {
+        prefix: prefix.to_owned(),
+        asked: Mutex::new(Vec::new()),
+    });
+    let shared: Arc<dyn RobotsRules> = rules.clone();
+    let feed = handed(
+        OpenWebFeed::open(&hosts_path(), &rules_path(), CONTACT)?,
+        |host| {
+            if host == GNW_HOST {
+                HostRobots::Rules(shared.clone())
+            } else {
+                HostRobots::Absent
+            }
+        },
+    );
+    Ok((feed, rules))
+}
+
+fn asked(rules: &Disallowing) -> Vec<String> {
+    rules
+        .asked
+        .lock()
+        .map(|asked| asked.clone())
+        .unwrap_or_default()
 }
 
 fn refusal_of(hosts: &Path, rules: &Path, contact: &str) -> Option<Refusal> {
@@ -950,11 +1012,14 @@ fn an_index_is_usable_with_rows_empty_without_and_permanent_when_it_is_not_rss()
 /// matching any row: green before the candidate case.
 #[test]
 fn an_answer_from_a_host_no_row_admits_is_permanent() -> Outcome {
-    let with_a_candidate = OpenWebFeed::open(
-        &hosts_fixture("one_admitted_one_candidate.json"),
-        &rules_path(),
-        CONTACT,
-    )?;
+    let with_a_candidate = handed(
+        OpenWebFeed::open(
+            &hosts_fixture("one_admitted_one_candidate.json"),
+            &rules_path(),
+            CONTACT,
+        )?,
+        |_| HostRobots::Absent,
+    );
     for (provider, url) in [
         (provider()?, "https://www.businesswire.com/news/home/a.html"),
         (
@@ -1035,6 +1100,142 @@ fn a_link_off_the_path_filter_off_the_host_or_absent_is_filtered_out_and_counted
         ),
         (6, 1, 5)
     );
+    Ok(())
+}
+
+/// Owner decision 2026-11-17 (section 11.5 step 7): a row whose url the host's robots.txt
+/// disallows is not followed and is counted apart from `filtered_out`; its siblings are followed.
+#[test]
+fn a_follow_up_whose_url_the_robots_disallows_is_not_planned_and_counted_apart() -> Outcome {
+    let (feed, rules) = gnw_disallowing("/news-release/2026/11/14/3403075/")?;
+    let extracted = follow_ups(&feed, &gnw(REAL_INDEX))?;
+    let kept: Vec<&str> = extracted
+        .follow_ups
+        .iter()
+        .map(|request| request.url.as_str())
+        .collect();
+    assert_eq!(
+        (
+            extracted.vendor_rows,
+            extracted.filtered_out,
+            extracted.robots_disallowed,
+            kept.len(),
+            kept.contains(&ARTICLE_URL),
+            asked(&rules).len(),
+        ),
+        (REAL_ROWS, 0, 1, 2, false, 3)
+    );
+    Ok(())
+}
+
+/// Decision 4: robots.txt is asked about the fetched url's path as written: percent escapes
+/// untouched in either case, and no query, because the fetched url carries none.
+#[test]
+fn the_path_handed_to_robots_is_the_fetched_urls_path_as_written() -> Outcome {
+    let item = |link: &str| {
+        format!("<item><link>{link}</link><pubDate>Sat, 14 Nov 2026 19:00 GMT</pubDate></item>")
+    };
+    let index = format!(
+        "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel>{}{}{}</channel></rss>",
+        item("https://rss.globenewswire.com/news-release/1/caf%C3%A9.html"),
+        item("https://rss.globenewswire.com/news-release/2/caf%c3%a9.html"),
+        item("https://rss.globenewswire.com/news-release/3/x.html?pdf=1"),
+    );
+    let (feed, rules) = gnw_disallowing("/news-release/1/")?;
+    let extracted = follow_ups(&feed, index.as_bytes())?;
+    let kept: Vec<&str> = extracted
+        .follow_ups
+        .iter()
+        .map(|request| request.url.as_str())
+        .collect();
+    assert_eq!(
+        (asked(&rules), kept, extracted.robots_disallowed),
+        (
+            vec![
+                "/news-release/1/caf%C3%A9.html".to_owned(),
+                "/news-release/2/caf%c3%a9.html".to_owned(),
+                "/news-release/3/x.html".to_owned(),
+            ],
+            vec![
+                "https://rss.globenewswire.com/news-release/2/caf%c3%a9.html",
+                "https://rss.globenewswire.com/news-release/3/x.html",
+            ],
+            1
+        )
+    );
+    Ok(())
+}
+
+/// robots.cc reads a url only %-encoded (robots.h:153) and matches it as written, so a raw
+/// non-ASCII, space or control byte would be checked unescaped; `%2e` segments would walk.
+#[test]
+fn a_document_path_robots_cannot_read_as_written_is_filtered_out_and_never_asked() -> Outcome {
+    let item = |link: &str| {
+        format!("<item><link>{link}</link><pubDate>Sat, 14 Nov 2026 19:00 GMT</pubDate></item>")
+    };
+    let index = format!(
+        "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel>{}{}{}{}{}{}</channel></rss>",
+        item("https://rss.globenewswire.com/news-release/1/caf\u{e9}.html"),
+        item("https://rss.globenewswire.com/news-release/2/a b.html"),
+        item("https://rss.globenewswire.com/news-release/3/%2e%2e/x.html"),
+        item("https://rss.globenewswire.com/news-release/4/.%2E/x.html"),
+        item("https://rss.globenewswire.com/news-release/5/%2E/x.html"),
+        item("https://rss.globenewswire.com/news-release/6/%2e%2e.html"),
+    );
+    let (feed, rules) = gnw_disallowing("/never/")?;
+    let extracted = follow_ups(&feed, index.as_bytes())?;
+    let kept: Vec<&str> = extracted
+        .follow_ups
+        .iter()
+        .map(|request| request.url.as_str())
+        .collect();
+    assert_eq!(
+        (
+            asked(&rules),
+            kept,
+            extracted.filtered_out,
+            extracted.robots_disallowed
+        ),
+        (
+            vec!["/news-release/6/%2e%2e.html".to_owned()],
+            vec!["https://rss.globenewswire.com/news-release/6/%2e%2e.html"],
+            5,
+            0
+        )
+    );
+    Ok(())
+}
+
+/// Fail closed: a host whose robots were never handed over follows nothing, and every row it
+/// would have followed is counted as disallowed rather than dropped.
+#[test]
+fn a_host_whose_robots_were_never_handed_over_follows_nothing() -> Outcome {
+    let feed = OpenWebFeed::open(&hosts_path(), &rules_path(), CONTACT)?;
+    let extracted = follow_ups(&feed, &gnw(REAL_INDEX))?;
+    assert_eq!(
+        (
+            extracted.follow_ups.len(),
+            extracted.filtered_out,
+            extracted.robots_disallowed
+        ),
+        (0, 0, REAL_ROWS)
+    );
+    Ok(())
+}
+
+/// The seam's counts add up with a disallowed row: it is one of the five, not a lost row.
+#[test]
+fn an_index_with_a_disallowed_row_breaks_no_claim_of_the_seam() -> Outcome {
+    let (feed, _) = gnw_disallowing("/news-release/2026/11/14/3403075/")?;
+    let payloads = [(index_request(&feed)?, blob(gnw(REAL_INDEX)))];
+    let subject = Subject {
+        target: TargetWindow::new(RUN_DAY),
+        calendar: None,
+        listing: None,
+        at: at(RUN_AT),
+        payloads: &payloads,
+    };
+    assert_eq!(breaches(&feed, &subject), Vec::new());
     Ok(())
 }
 

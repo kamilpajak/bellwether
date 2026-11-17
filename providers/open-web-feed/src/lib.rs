@@ -14,6 +14,7 @@ mod version;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use canon::{Digest, FileDigest};
@@ -176,6 +177,20 @@ pub struct AdmittedPath {
     pub path: String,
 }
 
+/// A host's pinned robots.txt as the driver parsed it (section 11.1), asked about a url's path
+/// with its params and query, as robots.cc's `GetPathParamsQuery` cuts it.
+pub trait RobotsRules: std::fmt::Debug + Send + Sync {
+    fn allows(&self, path: &str) -> bool;
+}
+
+/// What the driver hands the feed for one admitted host.
+#[derive(Debug, Clone)]
+pub enum HostRobots {
+    /// Pinned `absent`, a 404: every path allowed.
+    Absent,
+    Rules(Arc<dyn RobotsRules>),
+}
+
 #[derive(Debug)]
 pub struct OpenWebFeed {
     hosts: Hosts,
@@ -184,6 +199,8 @@ pub struct OpenWebFeed {
     extract_version: Digest,
     /// Every rule's host rewrite, which `item_key` applies whatever host a url names.
     rewrites: BTreeMap<String, String>,
+    /// Keyed by lowercased host; a host absent here allows no follow-up.
+    robots: BTreeMap<String, HostRobots>,
 }
 
 impl OpenWebFeed {
@@ -223,7 +240,27 @@ impl OpenWebFeed {
             rules_version,
             extract_version,
             rewrites,
+            robots: BTreeMap::new(),
         })
+    }
+
+    /// Hands over each host's pinned robots, keyed by lowercased host, replacing any handed before.
+    #[must_use]
+    pub fn with_robots(self, robots: BTreeMap<String, HostRobots>) -> Self {
+        Self { robots, ..self }
+    }
+
+    /// Whether `url`'s host's handed robots allow its path with params and query, the same
+    /// `host_and_target` the index target is checked through; a host never handed: no.
+    fn robots_allow(&self, url: &str) -> bool {
+        let Some((host, target)) = host_and_target(url) else {
+            return false;
+        };
+        match self.robots.get(&host) {
+            Some(HostRobots::Absent) => true,
+            Some(HostRobots::Rules(rules)) => rules.allows(&target),
+            None => false,
+        }
     }
 
     /// Every path an admitted row asks of its host (section 11.2), in hosts-file order.
@@ -344,7 +381,8 @@ impl OpenWebFeed {
 
     /// Each index row whose rewritten link stays on the index's own host, passes the path filter
     /// and the provider key filter, and keys a story no earlier row of this index keyed is one
-    /// follow-up; the raw publication value rides `listed_date`, never sent.
+    /// follow-up unless the host's robots disallow its url (`robots_disallowed`); the raw
+    /// publication value rides `listed_date`, never sent.
     fn index_rows_of(&self, request: &Request, raw: &RawBlob) -> Extracted {
         let (Some(rule), Some((host, _))) =
             (self.rule_for(&request.url), host_and_path(&request.url))
@@ -355,11 +393,12 @@ impl OpenWebFeed {
         let rows = parse::index_rows(&raw.bytes, rule).unwrap_or_default();
         let mut follow_ups = Vec::new();
         let mut filtered_out = 0;
+        let mut robots_disallowed = 0;
         let mut keyed = BTreeSet::new();
         for row in &rows {
             let kept = row.link.as_deref().and_then(|link| {
                 let (at, path) = self.rewritten(link)?;
-                let walks = path.split('/').any(|segment| matches!(segment, "." | ".."));
+                let readable = followable_path(&path);
                 let followed = rule.provider_keys.as_ref().is_none_or(|keys| {
                     row.image
                         .as_deref()
@@ -368,12 +407,13 @@ impl OpenWebFeed {
                 });
                 (at == host
                     && path.starts_with(&rule.path_prefix)
-                    && !walks
+                    && readable
                     && followed
                     && keyed.insert(format!("{at}{path}")))
                 .then(|| format!("https://{at}{path}"))
             });
             match kept {
+                Some(url) if !self.robots_allow(&url) => robots_disallowed += 1,
                 Some(url) => follow_ups.push(Request {
                     source: SourceId::new(SOURCE),
                     target_window: request.target_window.clone(),
@@ -396,6 +436,7 @@ impl OpenWebFeed {
             unusable: Vec::new(),
             vendor_rows: u32::try_from(rows.len()).unwrap_or(u32::MAX),
             filtered_out,
+            robots_disallowed,
         }
     }
 
@@ -457,6 +498,7 @@ impl OpenWebFeed {
             unusable,
             vendor_rows: 1,
             filtered_out: 0,
+            robots_disallowed: 0,
         }
     }
 }
@@ -629,6 +671,16 @@ pub(crate) fn plain_path(path: &str) -> bool {
         .all(|byte| !NOT_PLAIN.contains(&byte) && byte.is_ascii() && !byte.is_ascii_control())
 }
 
+/// A document path robots.cc reads as fetched (robots.h:153 wants it %-encoded): printable ASCII
+/// with no space, and no segment that is `.` or `..`, written or as `%2e`, which servers walk.
+fn followable_path(path: &str) -> bool {
+    path.bytes().all(|byte| byte.is_ascii_graphic())
+        && path.split('/').all(|segment| {
+            let dots = segment.replace("%2e", ".").replace("%2E", ".");
+            !matches!(dots.as_str(), "." | "..")
+        })
+}
+
 /// `host_and_path` with the query kept: the path robots.txt rules are matched against.
 pub(crate) fn host_and_target(url: &str) -> Option<(String, String)> {
     let (authority, tail) = authority_and_tail(url)?;
@@ -705,6 +757,7 @@ fn nothing() -> Extracted {
         unusable: Vec::new(),
         vendor_rows: 0,
         filtered_out: 0,
+        robots_disallowed: 0,
     }
 }
 

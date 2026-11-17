@@ -200,8 +200,9 @@ pub struct UnusableRow {
     pub raw_blob: String,
 }
 
-/// What one payload held. The four counts add up: `vendor_rows` is what the payload carried and
-/// every row of it is an item, a follow-up, an unusable row or a row one of our filters removed.
+/// What one payload held. The five counts add up: `vendor_rows` is what the payload carried and
+/// every row of it is an item, a follow-up, an unusable row, a row one of our filters removed or a
+/// row whose page the host's robots.txt disallows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extracted {
     pub items: Vec<CollectedItem>,
@@ -212,6 +213,9 @@ pub struct Extracted {
     /// Rows our own filters removed - the roster and the form list, both hashed. The roster digest
     /// travels in `filter_params` (`Request::universe_version`).
     pub filtered_out: u32,
+    /// Rows we would have followed whose url the host's pinned robots.txt disallows: never asked,
+    /// and no attempt row (architecture.md section 11.1).
+    pub robots_disallowed: u32,
 }
 
 /// Why a target the window names was not asked for. Every target appears in a [`Plan`] as a

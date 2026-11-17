@@ -233,6 +233,12 @@ impl Robots {
     }
 }
 
+impl open_web_feed::RobotsRules for Robots {
+    fn allows(&self, path: &str) -> bool {
+        Self::allows(self, path)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Key {
     UserAgent,

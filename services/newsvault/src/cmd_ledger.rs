@@ -141,6 +141,10 @@ pub struct SourceRow {
     /// from `attempts.relisted_compared`; `relisted_disputed` of them disagreed. 0 also for an
     /// attempt closed before user_version 8.
     pub relisted_compared: i64,
+    /// Owner decision 2026-11-17 (section 11.1): index rows not followed because the host's
+    /// pinned robots.txt disallows their url, from `attempts.robots_disallowed`; never asked, so
+    /// no attempt row. 0 also for an attempt closed before user_version 9.
+    pub robots_disallowed: i64,
     pub items_new: i64,
     pub rows_committed: i64,
 }
@@ -262,6 +266,7 @@ struct Grouped {
     bodies_truncated: i64,
     relisted_disputed: i64,
     relisted_compared: i64,
+    robots_disallowed: i64,
     items_new: i64,
 }
 
@@ -427,7 +432,8 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
                 SUM(COALESCE((SELECT p.truncated FROM payloads p
                                WHERE p.attempt_id = attempts.attempt_id), 0)),
                 SUM((SELECT COUNT(*) FROM relisted r WHERE r.attempt_id = attempts.attempt_id)),
-                SUM(COALESCE(relisted_compared, 0))
+                SUM(COALESCE(relisted_compared, 0)),
+                SUM(COALESCE(robots_disallowed, 0))
          FROM attempts WHERE opened_at <= ?1
          GROUP BY run_id, source, state
          ORDER BY run_id, source, state"
@@ -446,6 +452,7 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
                 bodies_truncated: row.get(8)?,
                 relisted_disputed: row.get(9)?,
                 relisted_compared: row.get(10)?,
+                robots_disallowed: row.get(11)?,
             })
         })?
         .collect::<Result<Vec<Grouped>, _>>()?;
@@ -619,6 +626,7 @@ fn day_row(
         row.bodies_truncated += entry.bodies_truncated;
         row.relisted_disputed += entry.relisted_disputed;
         row.relisted_compared += entry.relisted_compared;
+        row.robots_disallowed += entry.robots_disallowed;
         row.items_new += entry.items_new;
         match entry.state.as_str() {
             OUTCOME_OK => row.ok += entry.attempts,
@@ -689,6 +697,7 @@ impl SourceRow {
             bodies_truncated: 0,
             relisted_disputed: 0,
             relisted_compared: 0,
+            robots_disallowed: 0,
             items_new: 0,
             rows_committed: 0,
         }
@@ -790,7 +799,8 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 out,
                 "  {:<14} ok {} empty {} failed {} interrupted {} in-flight {} \
                  vendor_rows {} held {} listing_unusable {} bodies_truncated {} \
-                 relisted_disputed {} relisted_compared {} items_new {} rows {}",
+                 relisted_disputed {} relisted_compared {} robots_disallowed {} items_new {} \
+                 rows {}",
                 row.source,
                 row.ok,
                 row.empty,
@@ -803,6 +813,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 row.bodies_truncated,
                 row.relisted_disputed,
                 row.relisted_compared,
+                row.robots_disallowed,
                 row.items_new,
                 row.rows_committed
             )?;

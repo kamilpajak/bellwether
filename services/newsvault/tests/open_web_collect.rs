@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
+use news_provider::provider::RawBlob;
 use news_provider::{
     Archive, ArchiveError, AttemptEvent, AttemptReceipt, Clock, CollectedItem, Committed, Exchange,
     Exit, Headers, LedgerError, PlanRefusal, RawResponse, Request, RunId, SendFailure, SendPermit,
@@ -1926,12 +1927,21 @@ fn collected_under_robots(
 
 /// The store and the hosts file of `collected_under_robots`, before any collect.
 fn pinned_to(dir: &Path, body: &[u8]) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    pinned_to_index(dir, body, INDEX)
+}
+
+/// `pinned_to`, the GNW row reading its index from `index`.
+fn pinned_to_index(
+    dir: &Path,
+    body: &[u8],
+    index: &str,
+) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
     let hosts = dir.join("hosts.json");
     let store = dir.join("store");
     let pin = canon::FileDigest::of(body);
     let file = serde_json::json!({
         "schema": "open-web-feed.hosts/2",
-        "hosts": [{"host": "rss.globenewswire.com", "status": "admitted", "index_url": INDEX,
+        "hosts": [{"host": "rss.globenewswire.com", "status": "admitted", "index_url": index,
                    "rule": "gnw", "robots": pin.hex()}],
     });
     std::fs::write(&hosts, serde_json::to_vec(&file)?)?;
@@ -1948,8 +1958,9 @@ fn robots_fixture(name: &str) -> Result<Vec<u8>, std::io::Error> {
 }
 
 /// Section 11.2: the index path with its query and the rule's `path_prefix` must both be allowed.
-/// A narrower Disallow under the prefix passes: documents are not checked per request. Mutation
-/// 2026-11-15, the path check removed: red.
+/// A narrower Disallow under the prefix passes; its documents are refused one by one
+/// (`a_gnw_release_under_a_narrower_disallow_is_not_fetched_and_counted`). Mutation 2026-11-15,
+/// the path check removed: red.
 #[test]
 fn an_admitted_row_whose_index_or_path_prefix_robots_disallows_is_refused() -> TestResult {
     let mut said = Vec::new();
@@ -1968,6 +1979,286 @@ fn an_admitted_row_whose_index_or_path_prefix_robots_disallows_is_refused() -> T
             "disallows /news-release/",
             "admitted"
         ]
+    );
+    Ok(())
+}
+
+/// The index url is checked with its query, before every run, as robots.cc reads the url.
+#[test]
+fn an_index_whose_query_the_robots_disallows_is_refused_and_a_sibling_query_admitted() -> TestResult
+{
+    let mut said = Vec::new();
+    for body in [
+        "User-agent: *\nDisallow: /rssfeed/?page=\n",
+        "User-agent: *\nDisallow: /rssfeed/?page=2\n",
+    ] {
+        let dir = TempDir::new()?;
+        let (store, hosts) = pinned_to_index(
+            dir.path(),
+            body.as_bytes(),
+            "https://rss.globenewswire.com/rssfeed/?page=1",
+        )?;
+        said.push(collected(&store, hosts, true)?);
+    }
+    assert_eq!(said, ["disallows /rssfeed/?page=1", "admitted"]);
+    Ok(())
+}
+
+/// Owner decision 2026-11-17 (section 11.5 step 7): one release under a Disallow narrower than
+/// the path prefix is not asked and is counted on its index attempt, in the envelope, the store
+/// and the ledger; its two siblings are fetched.
+#[test]
+fn a_gnw_release_under_a_narrower_disallow_is_not_fetched_and_counted() -> TestResult {
+    let dir = TempDir::new()?;
+    let body = "User-agent: *\nDisallow: /news-release/2026/11/14/3403074/\n";
+    let (store, hosts) = pinned_to(dir.path(), body.as_bytes())?;
+    let ask = Ask {
+        hosts: Some(hosts),
+        ..ask(&store, cmd_collect::TODAY)
+    };
+    let exchange = Gnw::day()?;
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, &exchange, &Fixed)?;
+    let (sent, _) = exchange.sent();
+    let index = &answer.envelope["attempts"][0];
+    let mut human = Vec::new();
+    cmd_collect::render_human(&answer.envelope, &mut human)?;
+    let human = String::from_utf8(human)?;
+    assert_eq!(
+        (
+            sent,
+            index["vendor_rows"].as_u64(),
+            index["filtered_out"].as_u64(),
+            index["robots_disallowed"].as_u64(),
+            answer.envelope["per_source"][0]["robots_disallowed"].as_u64(),
+            human.lines().nth(3).map(str::to_owned),
+            stored_robots_disallowed(&store)?,
+            ledgered_robots_disallowed(&store, "2026-11-14")?,
+        ),
+        (
+            vec![
+                INDEX.to_owned(),
+                format!("https://{}", RELEASES[0].0),
+                format!("https://{}", RELEASES[2].0),
+            ],
+            Some(3),
+            Some(0),
+            Some(1),
+            Some(1),
+            Some("  index     ok       rows 3 filtered 0 robots 1 items 0".to_owned()),
+            BTreeMap::from([(INDEX.to_owned(), Some(1))]),
+            vec![1],
+        ),
+        "{human}"
+    );
+    Ok(())
+}
+
+/// A disallowed row is never held, so every poll counts it again, and the ledger sums the polls
+/// of one day. Mutation 2026-11-17, the ledger's per-source `+=` made `=`: green before this test.
+#[test]
+fn a_disallowed_row_is_counted_by_every_poll_and_the_ledger_sums_the_polls() -> TestResult {
+    let dir = TempDir::new()?;
+    let body = "User-agent: *\nDisallow: /news-release/2026/11/14/3403074/\n";
+    let (store, hosts) = pinned_to(dir.path(), body.as_bytes())?;
+    let exchange = Gnw::day()?;
+    for (at, schedule) in [(RUN_AT, "first"), (LATER_THE_SAME_DAY, "second")] {
+        let ask = Ask {
+            hosts: Some(hosts.clone()),
+            at: instant(at),
+            schedule: Some(schedule.to_owned()),
+            ..ask(&store, cmd_collect::TODAY)
+        };
+        let opened = cmd_collect::open_provider(&ask)?;
+        cmd_collect::run(&ask, &opened, &exchange, &At(instant(at)))?;
+    }
+    let (sent, _) = exchange.sent();
+    assert_eq!(
+        (
+            sent.iter().filter(|url| url.contains("/3403074/")).count(),
+            ledgered_robots_disallowed(&store, "2026-11-14")?,
+        ),
+        (0, vec![2])
+    );
+    Ok(())
+}
+
+/// Each collect index attempt's url and `attempts.robots_disallowed`; robots fetches left out.
+fn stored_robots_disallowed(store: &Path) -> Result<BTreeMap<String, Option<i64>>, Box<dyn Error>> {
+    let db = Connection::open_with_flags(store.join(COMMIT_LOG), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut rows = db.prepare(
+        "SELECT p.url, a.robots_disallowed FROM attempts a
+           JOIN payloads p ON p.attempt_id = a.attempt_id
+          WHERE p.phase = 'index' AND p.url NOT LIKE '%/robots.txt'",
+    )?;
+    let rows = rows
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// The ledger's `robots_disallowed` for each source row of `day`, read after the day ended.
+fn ledgered_robots_disallowed(store: &Path, day: &str) -> Result<Vec<i64>, Box<dyn Error>> {
+    let day: chrono::NaiveDate = day.parse()?;
+    let after = day
+        .succ_opt()
+        .ok_or("no next day")?
+        .and_time(chrono::NaiveTime::MIN);
+    let report = newsvault::cmd_ledger::read(
+        store,
+        &newsvault::cmd_ledger::Ask {
+            at: after.and_utc(),
+            from: day,
+            to: day,
+            source: None,
+            expected_runs: None,
+            limit: None,
+            check: false,
+        },
+    )?;
+    Ok(report
+        .days
+        .iter()
+        .flat_map(|one| &one.per_source)
+        .map(|row| row.robots_disallowed)
+        .collect())
+}
+
+/// Decision 4 through the real hand-off: robots is asked about the fetched url, whose path keeps
+/// its percent escapes as written and carries no query. Verdicts from robots.cc 50a0dac compiled
+/// with clang++, 2026-11-17: `%C3%A9` disallowed and `%c3%a9` allowed by `Disallow: /…/café`;
+/// GNW's `*/news-release/*.html?pdf=1` allows `/…/x.html`.
+#[test]
+fn a_document_path_is_checked_as_googles_parser_reads_the_fetched_url() -> TestResult {
+    const UPPER: &str = "https://rss.globenewswire.com/news-release/2026/11/14/1/caf%C3%A9.html";
+    const LOWER: &str = "https://rss.globenewswire.com/news-release/2026/11/14/1/caf%c3%a9.html";
+    const PDF: &str = "https://rss.globenewswire.com/news-release/2026/11/14/2/x.html";
+    let item = |link: &str| {
+        format!("<item><link>{link}</link><pubDate>Sat, 14 Nov 2026 19:00 GMT</pubDate></item>")
+    };
+    let index = format!(
+        "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel>{}{}{}</channel></rss>",
+        item(UPPER),
+        item(LOWER),
+        item(&format!("{PDF}?pdf=1")),
+    );
+    let mut followed = Vec::new();
+    for body in [
+        "User-agent: *\nDisallow: /news-release/2026/11/14/1/café\n"
+            .as_bytes()
+            .to_vec(),
+        seed::gnw_robots()?,
+    ] {
+        let dir = TempDir::new()?;
+        let (store, hosts) = pinned_to(dir.path(), &body)?;
+        let ask = Ask {
+            hosts: Some(hosts),
+            ..ask(&store, cmd_collect::TODAY)
+        };
+        let opened = cmd_collect::open_provider(&ask)?;
+        let provider = opened.provider.as_ref();
+        let plan = provider.plan(
+            &TargetWindow::new("2026-11-14"),
+            None,
+            None,
+            ObservationTime::new(instant(RUN_AT)),
+        )?;
+        let request = plan.requests.first().ok_or("no index planned")?;
+        let extracted = provider.extract(
+            request,
+            &RawBlob {
+                digest: canon::FileDigest::of(index.as_bytes()).hex().to_owned(),
+                bytes: index.as_bytes().to_vec(),
+            },
+        );
+        let urls: Vec<String> = extracted
+            .follow_ups
+            .iter()
+            .map(|follow_up| follow_up.url.clone())
+            .collect();
+        followed.push((urls, extracted.robots_disallowed));
+    }
+    let owned = |urls: &[&str]| urls.iter().map(|url| (*url).to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        followed,
+        [(owned(&[LOWER, PDF]), 1), (owned(&[UPPER, LOWER, PDF]), 0)]
+    );
+    Ok(())
+}
+
+/// Owner decision 2026-11-17 on the five-host stub: Yahoo's Laverock row moved under its real
+/// `Disallow: /m/` is not asked and is counted on Yahoo's index only; its sibling is asked, and
+/// the Fed, pinned `absent` (a 404), has every release asked.
+#[test]
+fn a_yahoo_row_under_a_robots_disallow_is_not_fetched_and_its_siblings_are() -> TestResult {
+    const MOVED: &str =
+        "https://finance.yahoo.com/m/laverock-therapeutics-appoints-parker-moss-091700844.html";
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    let ask = Ask {
+        hosts: Some(seed::committed_hosts()),
+        at: instant(MONDAY_AT),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let mut exchange = Gnw::five_hosts()?;
+    let sitemap = String::from_utf8(exchange.pages.get(YAHOO_INDEX).cloned().unwrap_or_default())?
+        .replace(
+            "finance.yahoo.com/healthcare/articles/laverock",
+            "finance.yahoo.com/m/laverock",
+        );
+    exchange
+        .pages
+        .insert(YAHOO_INDEX.to_owned(), sitemap.into_bytes());
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, &exchange, &Monday)?;
+    let (sent, _) = exchange.sent();
+    let fed_asked = FED_RELEASES
+        .iter()
+        .filter(|(key, _)| sent.contains(&format!("https://{key}")))
+        .count();
+    let indexes: Vec<(Option<&str>, Option<u64>, Option<u64>)> = answer.envelope["attempts"]
+        .as_array()
+        .ok_or("attempts")?
+        .iter()
+        .filter(|row| row["phase"] == "index")
+        .map(|row| {
+            (
+                row["url"].as_str(),
+                row["filtered_out"].as_u64(),
+                row["robots_disallowed"].as_u64(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        (
+            sent.iter().any(|url| url == MOVED),
+            sent.contains(&format!("https://{}", YAHOO_RELEASES[1].0)),
+            fed_asked,
+            indexes,
+            stored_robots_disallowed(root.path())?
+                .get(YAHOO_INDEX)
+                .copied(),
+            stored_robots_disallowed(root.path())?
+                .values()
+                .flatten()
+                .sum::<i64>(),
+            ledgered_robots_disallowed(root.path(), "2026-11-16")?,
+        ),
+        (
+            false,
+            true,
+            FED_RELEASES.len(),
+            vec![
+                (Some(INDEX), Some(0), Some(0)),
+                (Some(PRN_INDEX), Some(0), Some(0)),
+                (Some(CNW_INDEX), Some(0), Some(0)),
+                (Some(FED_INDEX), Some(0), Some(0)),
+                (Some(YAHOO_INDEX), Some(6), Some(1)),
+            ],
+            Some(Some(1)),
+            1,
+            vec![1],
+        )
     );
     Ok(())
 }

@@ -595,6 +595,7 @@ pub(crate) mod tests {
             Counts {
                 vendor_rows: VENDOR_ROWS,
                 listing_unusable: 0,
+                robots_disallowed: 0,
             },
             &Baseline::from_trailing_ok(&TRAILING_OK),
         );

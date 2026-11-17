@@ -89,7 +89,8 @@ pub fn breaches(provider: &dyn Provider, subject: &Subject) -> Vec<Breach> {
         let accounted =
             u32::try_from(once.items.len() + once.follow_ups.len() + once.unusable.len())
                 .unwrap_or(u32::MAX)
-                .saturating_add(once.filtered_out);
+                .saturating_add(once.filtered_out)
+                .saturating_add(once.robots_disallowed);
         if accounted != once.vendor_rows {
             found.push(Breach {
                 check: THE_COUNTS_ADD_UP,
@@ -461,6 +462,7 @@ mod tests {
                     _ => ONE_ROW,
                 },
                 filtered_out: 0,
+                robots_disallowed: 0,
             }
         }
 

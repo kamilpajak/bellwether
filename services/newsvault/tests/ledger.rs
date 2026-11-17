@@ -474,6 +474,74 @@ fn the_human_ledger_states_the_listing_unusable_count_of_the_json_row() -> TestR
     Ok(())
 }
 
+/// The human renderer carries `robots_disallowed` as the JSON row does. Mutation 2026-11-17, the
+/// field printed as 0 in `render_human`: red.
+#[test]
+fn the_human_ledger_states_the_robots_disallowed_count_of_the_json_row() -> TestResult {
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    db.execute(
+        "UPDATE attempts SET robots_disallowed = 5 WHERE attempt_id = 'a-0704-edgar-0'",
+        [],
+    )?;
+    drop(db);
+    let json = over(&root, ZERO_ITEM_DAY, ZERO_ITEM_DAY)?.json()?;
+    let counted = per_source(&json, ZERO_ITEM_DAY, EDGAR)
+        .and_then(|edgar| edgar.get("robots_disallowed"))
+        .and_then(Value::as_i64)
+        .ok_or("the JSON row has no robots_disallowed")?;
+    let human = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .arg("ledger")
+        .args(["--store", &root.path().to_string_lossy()])
+        .args(["--at", AT, "--format", "human"])
+        .args(["--from", ZERO_ITEM_DAY, "--to", ZERO_ITEM_DAY])
+        .output()?
+        .stdout;
+    let line = String::from_utf8(human)?
+        .lines()
+        .find(|line| line.trim_start().starts_with(EDGAR))
+        .map(str::to_owned)
+        .ok_or("no human line names the source")?;
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let shown = words
+        .iter()
+        .position(|word| *word == "robots_disallowed")
+        .and_then(|at| words.get(at + 1))
+        .map(|word| (*word).to_owned());
+    assert_eq!((shown, counted), (Some("5".to_owned()), 5));
+    Ok(())
+}
+
+/// Section 10: `--check` does not subtract `robots_disallowed`, so a day whose every vendor row
+/// robots refused still exits 1. Mutation 2026-11-17, the count subtracted: green to exit 0.
+#[test]
+fn check_still_flags_zero_rows_when_robots_disallowed_every_vendor_row() -> TestResult {
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    db.execute(
+        "UPDATE attempts SET robots_disallowed = 59 WHERE attempt_id = 'a-0704-edgar-0'",
+        [],
+    )?;
+    drop(db);
+    let answer = run(
+        &root,
+        &["--from", ZERO_ITEM_DAY, "--to", ZERO_ITEM_DAY, "--check"],
+    )?;
+    let report = answer.json()?;
+    let counted = per_source(&report, ZERO_ITEM_DAY, EDGAR)
+        .and_then(|edgar| edgar.get("robots_disallowed"))
+        .and_then(Value::as_i64);
+    assert_eq!(
+        (answer.code, codes(&report), counted),
+        (
+            EXIT_NO,
+            vec!["rows_committed_zero_against_vendor_rows".to_owned()],
+            Some(59)
+        )
+    );
+    Ok(())
+}
+
 /// P10 (section 3.9): a body stored cut at the limit is counted for its source and day, in the
 /// JSON row and on the human line, and an attempt with no link or an uncut one counts nothing.
 /// Mutations 2026-11-16, the `SUM` made constant 0: red; the field dropped from `render_human`: red.
