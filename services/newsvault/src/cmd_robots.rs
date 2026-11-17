@@ -25,8 +25,8 @@ use crate::cmd_ledger::{Envelope, RunKind, RUN_ENVELOPE_SCHEMA};
 use crate::robots::{Reading, Robots, RobotsError as ParseError};
 use crate::store::{Committer, RobotsAnswer, StoreError};
 
-/// Major 2 since 2026-11-16: `parse_verdict` lost `refused_no_user_agent` (architecture.md §10).
-pub const SCHEMA: &str = "newsvault.robots/2";
+/// Major 3 since 2026-11-17: `parse_verdict` lost `refused_not_utf8` (architecture.md §10).
+pub const SCHEMA: &str = "newsvault.robots/3";
 /// The `attempts.source` of every robots fetch: robots is a fact about a host, not about one
 /// source, and no registered source carries this name.
 pub const ROBOTS_SOURCE: &str = "robots";
@@ -42,7 +42,7 @@ const NO_RULES_ABSENT: &str = "no_rules_absent";
 const CRAWL_DELAY_OVER_INTERVAL: &str = "crawl_delay_over_interval";
 /// Every `parse_verdict` a report row can carry besides `null`, as `newsvault schema` lists them.
 #[must_use]
-pub fn parse_verdicts() -> [&'static str; 9] {
+pub fn parse_verdicts() -> [&'static str; 8] {
     [
         Reading::Rules.name(),
         Reading::NoRulesEmpty.name(),
@@ -50,7 +50,6 @@ pub fn parse_verdicts() -> [&'static str; 9] {
         Reading::OrphanRulesIgnored.name(),
         NO_RULES_ABSENT,
         CRAWL_DELAY_OVER_INTERVAL,
-        ParseError::NotUtf8.verdict(),
         ParseError::HtmlPage.verdict(),
         ParseError::CrawlDelayNotANumber(String::new()).verdict(),
     ]
