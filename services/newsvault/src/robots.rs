@@ -30,8 +30,7 @@ const WILDCARD: char = '*';
 const END_ANCHOR: char = '$';
 const COMMENT: u8 = b'#';
 const BYTE_ORDER_MARK: [u8; 3] = *b"\xef\xbb\xbf";
-const BYTE_ORDER_MARK_CHAR: char = '\u{feff}';
-const MARKUP: char = '<';
+const MARKUP: u8 = b'<';
 /// RFC 9309 section 2.2's EOL is CR, LF or CRLF; `str::lines` splits on LF alone.
 const LINE_ENDS: [u8; 2] = *b"\r\n";
 /// robots.cc 418-447: a line buffer of 2083 × 8 bytes whose last byte holds the terminator.
@@ -49,7 +48,8 @@ const NANOS_DIGITS: usize = 9;
 pub enum RobotsError {
     #[error("the body is an HTML page: its first non-whitespace character is <")]
     HtmlPage,
-    #[error("the * group's Crawl-delay {0:?} is not a non-negative number of seconds")]
+    /// The value's bytes as `<[u8]>::escape_ascii` writes them, so `5\xe4` stays `5\xe4`.
+    #[error("the * group's Crawl-delay \"{0}\" is not a non-negative number of seconds")]
     CrawlDelayNotANumber(String),
 }
 
@@ -161,9 +161,7 @@ impl Robots {
             if let Some(value) = crawl_delay_value(raw) {
                 content = true;
                 orphan |= !named_an_agent && !value.is_empty();
-                group
-                    .delays
-                    .push(String::from_utf8_lossy(value).into_owned());
+                group.delays.push(value.escape_ascii().to_string());
                 continue;
             }
             let line = read_line(raw);
@@ -295,12 +293,12 @@ fn skip_byte_order_mark(body: &[u8]) -> &[u8] {
     body.get(skipped..).unwrap_or(body)
 }
 
-/// Owner decision 3b, read over the body's leading valid UTF-8, BOM characters skipped as space.
+/// Owner decision 3b over bytes: past ASCII whitespace, NUL and every byte at or above 0x80 (any
+/// BOM, UTF-8 or Latin-1 whitespace, a UTF-16 unit's zero half), the first byte is `<`.
 fn starts_with_markup(body: &[u8]) -> bool {
-    let valid = body.utf8_chunks().next().map_or("", |chunk| chunk.valid());
-    valid
-        .trim_start_matches(|c: char| c.is_whitespace() || c == BYTE_ORDER_MARK_CHAR)
-        .starts_with(MARKUP)
+    body.iter()
+        .find(|byte| !(ASCII_SPACE.contains(byte) || **byte == NUL || !byte.is_ascii()))
+        == Some(&MARKUP)
 }
 
 /// One physical line as robots.cc 50a0dac reads it: its first `MAX_LINE_BYTES` bytes, up to its
@@ -630,17 +628,43 @@ mod tests {
         .iter()
         .map(|body| Robots::parse(body).map(|robots| robots.reading()))
         .collect::<Vec<_>>();
-        assert_eq!(
-            refused,
-            [
-                Err(RobotsError::HtmlPage),
-                Err(RobotsError::HtmlPage),
-                Err(RobotsError::HtmlPage),
-                Err(RobotsError::HtmlPage),
-                Ok(Reading::NoRulesNoGroup),
-            ]
-        );
+        assert_eq!(refused, vec![Err(RobotsError::HtmlPage); 5]);
         Ok(())
+    }
+
+    fn utf16(text: &str, little_endian: bool) -> Vec<u8> {
+        text.encode_utf16()
+            .flat_map(|unit| {
+                if little_endian {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                }
+            })
+            .collect()
+    }
+
+    /// Review of 2026-11-17: an HTML page that is not UTF-8 was read for rules, so every path was
+    /// allowed; Unicode whitespace before `<` is skipped too. Each body stands as a soft-404 page.
+    #[test]
+    fn an_html_body_that_is_not_utf8_or_starts_with_unicode_space_is_refused() {
+        let page = "<!doctype html>\n<html><body>Not found</body></html>\n";
+        let refused = [
+            [&b"\xff\xfe"[..], &utf16(page, true)].concat(),
+            [&b"\xfe\xff"[..], &utf16(page, false)].concat(),
+            utf16(page, false),
+            utf16(page, true),
+            [&b"\xa0"[..], page.as_bytes()].concat(),
+            format!("\u{a0}\u{2003}\u{3000}\u{85}\u{feff}{page}").into_bytes(),
+        ]
+        .map(|body| Robots::parse(&body).map(|robots| robots.reading()));
+        assert_eq!(refused.to_vec(), vec![Err(RobotsError::HtmlPage); 6]);
+        let read = [
+            &b"\xa0User-agent: *\nDisallow: /x\n"[..],
+            "\u{3000}\nUser-agent: *\nDisallow: /x # <y>\n".as_bytes(),
+        ]
+        .map(|body| Robots::parse(body).map(|robots| robots.allows("/x")));
+        assert_eq!(read, [Ok(true), Ok(false)]);
     }
 
     /// Owner decision 3a: an empty or comment-only 200 is no rules, every path allowed, no delay.
@@ -1281,8 +1305,17 @@ mod tests {
             [
                 Err(RobotsError::HtmlPage),
                 Err(RobotsError::CrawlDelayNotANumber("soon".to_owned())),
-                Err(RobotsError::CrawlDelayNotANumber("5\u{fffd}".to_owned())),
+                Err(RobotsError::CrawlDelayNotANumber(r"5\xe4".to_owned())),
             ]
+        );
+        assert_eq!(
+            refused
+                .get(2)
+                .map(|verdict| verdict.as_ref().err().map(ToString::to_string)),
+            Some(Some(
+                r#"the * group's Crawl-delay "5\xe4" is not a non-negative number of seconds"#
+                    .to_owned()
+            ))
         );
     }
 
