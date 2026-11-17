@@ -741,6 +741,97 @@ fn an_open_web_run_collects_a_gnw_a_prn_and_a_cnw_day_end_to_end() -> TestResult
     Ok(())
 }
 
+/// The committed three-host file on Monday, on a fresh store: each attempt's url and id, in order.
+fn three_host_attempts(exchange: &Gnw) -> Result<Vec<(String, String)>, Box<dyn Error>> {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    let ask = Ask {
+        hosts: Some(seed::committed_hosts()),
+        at: instant(MONDAY_AT),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, exchange, &Monday)?;
+    let attempts = answer.envelope["attempts"].as_array().ok_or("attempts")?;
+    attempts
+        .iter()
+        .map(
+            |row| match (row["url"].as_str(), row["attempt_id"].as_str()) {
+                (Some(url), Some(id)) => Ok((url.to_owned(), id.to_owned())),
+                _ => Err(format!("no url or attempt_id in {row}").into()),
+            },
+        )
+        .collect()
+}
+
+/// The three indexes, then one release of GNW, PRN and CNW per turn; and GNW's first release.
+fn round_robin_of_three_hosts() -> (Vec<String>, String) {
+    let [(gnw, gnw_pages), (prn, prn_pages), (cnw, cnw_pages)] = three_host_urls();
+    let mut order = vec![gnw, prn, cnw];
+    for nth in 0..RELEASES.len() {
+        order.extend([
+            gnw_pages[nth].clone(),
+            prn_pages[nth].clone(),
+            cnw_pages[nth].clone(),
+        ]);
+    }
+    (order, gnw_pages[0].clone())
+}
+
+/// `(host's index, host's releases)` as urls, GNW, PRN, CNW.
+fn three_host_urls() -> [(String, Vec<String>); 3] {
+    let pages = |keys: Vec<&str>| keys.iter().map(|key| format!("https://{key}")).collect();
+    [
+        (
+            INDEX.to_owned(),
+            pages(RELEASES.iter().map(|(key, ..)| *key).collect()),
+        ),
+        (
+            PRN_INDEX.to_owned(),
+            pages(PRN_RELEASES.iter().map(|(key, _)| *key).collect()),
+        ),
+        (
+            CNW_INDEX.to_owned(),
+            pages(CNW_RELEASES.iter().map(|(key, _)| *key).collect()),
+        ),
+    ]
+}
+
+/// Owner decision 2026-11-17 (§10): `collect` serves its hosts round-robin, in first-appearance
+/// order, so the three indexes, then one release of each host per turn.
+#[test]
+fn a_three_host_run_asks_its_hosts_round_robin() -> TestResult {
+    let (expected, _) = round_robin_of_three_hosts();
+    let attempts = three_host_attempts(&Gnw::three_hosts()?)?;
+    let urls: Vec<String> = attempts.into_iter().map(|(url, _)| url).collect();
+    assert_eq!(urls, expected);
+    Ok(())
+}
+
+/// §8 R21 under round-robin: GNW's first release fails every time; each retry goes to the back of
+/// GNW's lane, after every request already queued, and stops at `MAX_TRANSIENT_RETRIES`.
+#[test]
+fn a_retried_release_waits_behind_the_other_hosts_and_stops_at_the_cap() -> TestResult {
+    let (mut expected, failing) = round_robin_of_three_hosts();
+    expected.extend([failing.clone(), failing.clone()]);
+    let exchange = Gnw::three_hosts()?.answering(&failing, &[UNAVAILABLE; 3]);
+    let attempts = three_host_attempts(&exchange)?;
+    let urls: Vec<String> = attempts.into_iter().map(|(url, _)| url).collect();
+    assert_eq!(urls, expected);
+    Ok(())
+}
+
+/// An attempt id hashes (run, source, window, ordinal), and the ordinal is the position in the
+/// round-robin order: the same plan and answers on two fresh stores give the same ids, url by url.
+#[test]
+fn a_replayed_three_host_run_gives_every_attempt_the_same_id_and_url() -> TestResult {
+    let first = three_host_attempts(&Gnw::three_hosts()?)?;
+    let second = three_host_attempts(&Gnw::three_hosts()?)?;
+    let distinct: std::collections::BTreeSet<&String> = first.iter().map(|(_, id)| id).collect();
+    assert_eq!((first.len(), distinct.len(), &first), (12, 12, &second));
+    Ok(())
+}
+
 /// Section 5.1 `invalid_argument`: the driven path refuses the window before `commit.sqlite3`, the
 /// lock or a run envelope exist. Mutation 2026-11-15, `refuse_the_window` removed: red.
 #[test]

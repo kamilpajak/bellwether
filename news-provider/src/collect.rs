@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use pit::datedness::Published;
 use pit::ObservationTime;
 
+use crate::budget::{host_of, HostKey};
 use crate::clock::Clock;
 use crate::ledger::{
     abandon, AttemptId, AttemptReceipt, AttemptSlot, Baseline, Counts, LedgerError, Outcome,
@@ -433,22 +434,20 @@ pub fn collect<A: Archive>(
         run: run.run,
         baseline: &baseline,
     };
-    let mut queue: VecDeque<Queued> = plan
-        .requests
-        .into_iter()
-        .map(Queued::first_attempt)
-        .collect();
+    let mut queue = HostQueue::of(plan.requests);
     let mut ordinal = 0;
-    while let Some(Queued { request, retries }) = queue.pop_front() {
+    while let Some(Queued { request, retries }) = queue.pop() {
         let attempted = attempt_once(&driving, archive, &request, ordinal)?;
         ordinal += 1;
-        // Re-queue a transient failure under the cap to the BACK, so the pace limiter (R19) spaces
-        // the retry; it is just another `attempt_once`, so it cannot bypass the send seam. §8 R21.
+        // Re-queue a transient failure under the cap to the BACK of its host's lane, so the pace
+        // limiter (R19) spaces the retry; it is just another `attempt_once`. §8 R21.
         let retrying = attempted.is_transient() && retries < MAX_TRANSIENT_RETRIES;
         collected.absorb(&attempted, retrying);
-        queue.extend(attempted.follow_ups.into_iter().map(Queued::first_attempt));
+        for follow_up in attempted.follow_ups {
+            queue.push(Queued::first_attempt(follow_up));
+        }
         if retrying {
-            queue.push_back(Queued {
+            queue.push(Queued {
                 request,
                 retries: retries + 1,
             });
@@ -463,19 +462,61 @@ pub fn collect<A: Archive>(
 /// `Request` is hashed into the ledger (`filter_params`) and a retry asks the identical question —
 /// the row must keep saying what was asked, and the fresh ordinal alone makes the retry's
 /// `attempt_id` distinct.
-struct Queued {
-    request: Request,
-    retries: u32,
+pub(crate) struct Queued {
+    pub(crate) request: Request,
+    pub(crate) retries: u32,
 }
 
 impl Queued {
     /// A request that has not yet been attempted. Both the plan's own requests and every follow-up
     /// enter the queue this way; only a re-queue after a transient failure carries a non-zero count.
-    const fn first_attempt(request: Request) -> Self {
+    pub(crate) const fn first_attempt(request: Request) -> Self {
         Self {
             request,
             retries: 0,
         }
+    }
+}
+
+/// The driver's queue: one FIFO lane per url host (`host_of`, the key `Wire` paces by), served
+/// round-robin in the order each host first entered, so a wait owed to one host does not stand in
+/// front of another host's due request. One host is one lane, which is a plain FIFO (§10).
+pub(crate) struct HostQueue {
+    /// `None` keys every url `host_of` cannot key; `Wire` refuses or fails those itself.
+    lanes: Vec<(Option<HostKey>, VecDeque<Queued>)>,
+    next: usize,
+}
+
+impl HostQueue {
+    pub(crate) fn of(requests: Vec<Request>) -> Self {
+        let mut queue = Self {
+            lanes: Vec::new(),
+            next: 0,
+        };
+        for request in requests {
+            queue.push(Queued::first_attempt(request));
+        }
+        queue
+    }
+
+    /// To the back of its host's lane; a host not seen before opens a lane after every other.
+    pub(crate) fn push(&mut self, queued: Queued) {
+        let host = host_of(&queued.request.url).ok().flatten();
+        match self.lanes.iter_mut().find(|(key, _)| *key == host) {
+            Some((_, lane)) => lane.push_back(queued),
+            None => self.lanes.push((host, VecDeque::from([queued]))),
+        }
+    }
+
+    /// The front of the first non-empty lane at or after the one after the last served.
+    pub(crate) fn pop(&mut self) -> Option<Queued> {
+        let lanes = self.lanes.len();
+        (0..lanes).find_map(|step| {
+            let at = (self.next + step) % lanes;
+            let queued = self.lanes.get_mut(at)?.1.pop_front()?;
+            self.next = at + 1;
+            Some(queued)
+        })
     }
 }
 
@@ -771,8 +812,115 @@ fn count(of: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Exit, Tally, EXITS};
+    use super::{Exit, HostQueue, Queued, Tally, EXITS};
+    use crate::provider::Provenance;
+    use crate::request::{Request, RequestPhase, SourceId, TargetWindow};
+    use canon::FileDigest;
     use std::collections::BTreeSet;
+
+    const GNW: &str = "https://rss.globenewswire.com/";
+    const PRN: &str = "https://www.prnewswire.com/";
+    const CNW: &str = "https://www.newswire.ca/";
+    const SEC: &str = "https://www.sec.gov/";
+
+    fn asking(base: &str, path: &str) -> Request {
+        Request {
+            source: SourceId::new("open_web_wires"),
+            target_window: TargetWindow::new("2026-11-16"),
+            phase: RequestPhase::Document,
+            provenance: Provenance::LiveIngest,
+            url: format!("{base}{path}"),
+            headers: Vec::new(),
+            params: Vec::new(),
+            universe_version: FileDigest::of(b"{}"),
+            listed_date: None,
+            hosts_version: None,
+            extract_version: None,
+        }
+    }
+
+    /// `collect`'s loop without the socket: each index answers `pages` follow-ups on its own host,
+    /// and `failing` fails transiently on every attempt. Every url popped, in order.
+    fn driven(plan: &[&str], pages: usize, failing: &str) -> Vec<String> {
+        let mut queue = HostQueue::of(plan.iter().map(|base| asking(base, "index")).collect());
+        let mut popped = Vec::new();
+        while let Some(Queued { request, retries }) = queue.pop() {
+            popped.push(request.url.clone());
+            if request.url.ends_with("index") {
+                let base = request.url.trim_end_matches("index");
+                for page in 0..pages {
+                    queue.push(Queued::first_attempt(asking(base, &format!("p{page}"))));
+                }
+            }
+            if request.url == failing && retries < super::MAX_TRANSIENT_RETRIES {
+                queue.push(Queued {
+                    request,
+                    retries: retries + 1,
+                });
+            }
+        }
+        popped
+    }
+
+    fn urls(of: &[(&str, &str)]) -> Vec<String> {
+        of.iter()
+            .map(|(base, path)| format!("{base}{path}"))
+            .collect()
+    }
+
+    /// Owner decision 2026-11-17 (§10): hosts in first-appearance order, one request each per turn.
+    #[test]
+    fn the_queue_serves_three_hosts_round_robin_in_the_order_each_host_first_appeared() {
+        assert_eq!(
+            driven(&[GNW, PRN, CNW], 2, ""),
+            urls(&[
+                (GNW, "index"),
+                (PRN, "index"),
+                (CNW, "index"),
+                (GNW, "p0"),
+                (PRN, "p0"),
+                (CNW, "p0"),
+                (GNW, "p1"),
+                (PRN, "p1"),
+                (CNW, "p1"),
+            ])
+        );
+    }
+
+    /// §8 R21: a retry goes to the back of its own host's lane, and stops at the cap.
+    #[test]
+    fn a_retry_goes_to_the_back_of_its_host_lane_and_stops_at_the_cap() {
+        let failing = format!("{PRN}p0");
+        assert_eq!(
+            driven(&[GNW, PRN], 2, &failing),
+            urls(&[
+                (GNW, "index"),
+                (PRN, "index"),
+                (GNW, "p0"),
+                (PRN, "p0"),
+                (GNW, "p1"),
+                (PRN, "p1"),
+                (PRN, "p0"),
+                (PRN, "p0"),
+            ])
+        );
+    }
+
+    /// EDGAR asks one host, so its order is the FIFO it was before round-robin.
+    #[test]
+    fn one_host_is_one_lane_and_keeps_the_fifo_order() {
+        let failing = format!("{SEC}p0");
+        assert_eq!(
+            driven(&[SEC], 2, &failing),
+            urls(&[
+                (SEC, "index"),
+                (SEC, "p0"),
+                (SEC, "p1"),
+                (SEC, "p0"),
+                (SEC, "p0"),
+            ])
+        );
+    }
 
     /// One row per bucket of architecture.md section 5.1's table, each stating the counts that reach
     /// it.

@@ -697,7 +697,7 @@ mod tests {
     use crate::budget::{BudgetError, RequestBudget};
     use crate::clock::testing::{StepClock, WaitRecorder, WaitedClock};
     use crate::clock::Clock;
-    use crate::collect::Payload;
+    use crate::collect::{HostQueue, Payload, Queued, MAX_TRANSIENT_RETRIES};
     use crate::ledger::tests::{at, Recorder};
     use crate::ledger::{AttemptSlot, SendPermit};
     use crate::provider::Provenance;
@@ -2315,6 +2315,94 @@ mod tests {
                     NO_WAIT
                 ],
                 true
+            )
+        );
+        Ok(())
+    }
+
+    /// `inet_aton`'s short form of `127.0.0.1`: a third loopback host name, so a third pace file.
+    const LOOPBACK_SHORT: &str = "127.1";
+    const TIMEOUT_HEAD: &str = "408 Request Timeout";
+    const TIMEOUT_STATUS: u16 = 408;
+    const PAGES_PER_INDEX: usize = 2;
+    /// Three `FLOOR` waits: host A's second page, its third send, and its retry.
+    const ROUND_ROBIN_WAITED: Duration = Duration::from_secs(30);
+
+    /// `collect`'s loop over `HostQueue` and a real `Wire`, no time between sends: indexes on A, B
+    /// and C, each answering `PAGES_PER_INDEX` pages on its host; A's first page answers 408 once
+    /// and is retried. Every wait in order, and how many sends each host's server answered.
+    fn three_hosts_driven() -> Result<(Vec<Duration>, [usize; 3]), Box<dyn std::error::Error>> {
+        let store = tempfile::tempdir()?;
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let wire = Wire::with_sleeper(
+            hosts_only_profile(),
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        let heads = |first: &[&str]| first.iter().map(|head| (*head).to_owned()).collect();
+        let (host_a, served_a) = serve_answers(heads(&[OK_HEAD, TIMEOUT_HEAD, OK_HEAD, OK_HEAD]))?;
+        let (on_b, served_b) = serve_answers(heads(&[OK_HEAD; 3]))?;
+        let (on_c, served_c) = serve_answers(heads(&[OK_HEAD; 3]))?;
+        let host_b = on_b.replacen(LOOPBACK_IP, LOOPBACK_NAME, 1);
+        let host_c = on_c.replacen(LOOPBACK_IP, LOOPBACK_SHORT, 1);
+        let index = |url: &String| Request {
+            url: url.clone(),
+            ..request()
+        };
+        let mut queue = HostQueue::of(vec![index(&host_a), index(&host_b), index(&host_c)]);
+        let mut ordinal = FIRST_ATTEMPT;
+        while let Some(Queued { request, retries }) = queue.pop() {
+            let mut sink = Recorder::default();
+            let Some(permit) = permit(&mut sink, ordinal) else {
+                return Err("no permit".into());
+            };
+            ordinal += 1;
+            let status = match wire.send(permit, &request, &clock) {
+                Ok(answer) => Some(answer.status()),
+                Err(SendFailure::Transport(failed)) => failed.status(),
+                Err(other) => return Err(format!("{other:?}").into()),
+            };
+            if request.phase == RequestPhase::Index {
+                for _ in 0..PAGES_PER_INDEX {
+                    let page = Request {
+                        phase: RequestPhase::Document,
+                        ..request.clone()
+                    };
+                    queue.push(Queued::first_attempt(page));
+                }
+            }
+            if status == Some(TIMEOUT_STATUS) && retries < MAX_TRANSIENT_RETRIES {
+                queue.push(Queued {
+                    request,
+                    retries: retries + 1,
+                });
+            }
+        }
+        let served = [
+            answered_by(served_a)?,
+            answered_by(served_b)?,
+            answered_by(served_c)?,
+        ];
+        Ok((clock.waits(), served))
+    }
+
+    /// Owner decision 2026-11-17 (§10): round-robin lets each host's floor run while the others
+    /// are asked; block order (A, B, C, A, A, B, B, C, C, A), the former FIFO, waited 40 s here.
+    #[test]
+    fn round_robin_by_host_overlaps_the_host_floors_through_a_real_wire() -> Checked {
+        let (waits, served) = three_hosts_driven()?;
+        let waited: Duration = waits.iter().sum();
+        assert_eq!(
+            (waits, waited, served),
+            (
+                vec![
+                    NO_WAIT, NO_WAIT, NO_WAIT, FLOOR, NO_WAIT, NO_WAIT, FLOOR, NO_WAIT, NO_WAIT,
+                    FLOOR
+                ],
+                ROUND_ROBIN_WAITED,
+                [4, 3, 3]
             )
         );
         Ok(())

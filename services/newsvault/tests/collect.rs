@@ -1711,6 +1711,30 @@ fn a_request_that_fails_transiently_every_time_is_bounded_to_n_plus_one_attempts
     Ok(())
 }
 
+/// EDGAR asks one host, `www.sec.gov`, so round-robin by host (§10, 2026-11-17) is its FIFO: the
+/// index, its filings in index order, then each retry at the back.
+#[test]
+fn an_edgar_run_on_its_one_host_keeps_the_fifo_order_retries_last() -> TestResult {
+    let root = TempDir::new()?;
+    let always = Payloads::of(&[
+        (INDEX_URL, OK, "form.20261110.idx"),
+        (APPLE_URL, OK, "filing_8k_apple.txt"),
+        (MICROSOFT_URL, SERVICE_UNAVAILABLE, "error_403_traffic.html"),
+    ])?;
+    collected(root.path(), A_LISTED_SESSION, &always)?;
+    assert_eq!(
+        asked(&always),
+        [
+            INDEX_URL,
+            APPLE_URL,
+            MICROSOFT_URL,
+            MICROSOFT_URL,
+            MICROSOFT_URL
+        ]
+    );
+    Ok(())
+}
+
 const OPEN_WEB: &str = "open_web_wires";
 /// Inside Saturday 2026-11-14, the day the GNW probes ran (architecture.md section 11.6).
 const SATURDAY_AT: &str = "2026-11-14T19:30:00Z";
