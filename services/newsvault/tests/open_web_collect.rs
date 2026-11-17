@@ -1040,20 +1040,11 @@ impl Clock for FixedAt {
     }
 }
 
-/// A store over CNW and Yahoo with both robots fetches ledgered.
-fn cnw_and_yahoo_store() -> Result<(TempDir, PathBuf), Box<dyn Error>> {
+/// A store over the committed five hosts with every robots fetch ledgered.
+fn five_host_store() -> Result<(TempDir, PathBuf), Box<dyn Error>> {
     let root = TempDir::new()?;
-    let hosts = hosts_fixture("cnw_and_yahoo_admitted.json");
-    seed::refresh_answering(
-        root.path(),
-        &hosts,
-        ROBOTS_EARLIER,
-        &[
-            (seed::CNW_ROBOTS, OK, &seed::cnw_robots()?),
-            (seed::YAHOO_ROBOTS, OK, &seed::yahoo_robots()?),
-        ],
-    )?;
-    Ok((root, hosts))
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    Ok((root, seed::committed_hosts()))
 }
 
 /// One collect at `at` over `hosts`: its exit and its envelope's `cross_check`.
@@ -1073,15 +1064,15 @@ fn cross_checked_at(
     Ok((answer.exit, answer.envelope["cross_check"].clone()))
 }
 
-/// Two runs over CNW and Yahoo, Yahoo 503 in the first and retried in the second: two wire-key
-/// rows no CNW sitemap listed are named and one is counted. The first run's CNW answer is older
-/// than `read_from` and is not read. Mutations 2026-11-17: the `since` bound removed,
+/// Two runs over the five hosts, Yahoo 503 in the first and retried in the second: two wire-key
+/// rows no direct index listed are named and one is counted. The first run's four direct answers
+/// are older than `read_from` and are not read. Mutations 2026-11-17: the `since` bound removed,
 /// `watched_from` the newest direct answer, the first keyed attempt read: each red.
 #[test]
 fn a_yahoo_row_under_a_wire_key_no_direct_index_listed_is_named_in_the_run_envelope() -> TestResult
 {
     const EARLY_AT: &str = "2026-11-16T05:00:30Z";
-    let (root, hosts) = cnw_and_yahoo_store()?;
+    let (root, hosts) = five_host_store()?;
     let run_at = |at: &str, exchange: &Gnw| {
         cross_checked_at(root.path(), &hosts, at, exchange).map(|(_, checked)| checked)
     };
@@ -1111,7 +1102,7 @@ fn a_yahoo_row_under_a_wire_key_no_direct_index_listed_is_named_in_the_run_envel
         (
             true,
             Some("2026-11-16T05:00:29.000000Z"),
-            Some(1),
+            Some(4),
             Some(0),
             Some(1),
             vec![
@@ -1130,12 +1121,12 @@ fn a_yahoo_row_under_a_wire_key_no_direct_index_listed_is_named_in_the_run_envel
     Ok(())
 }
 
-/// A direct index that did not answer after a row's minute has not looked for it: CNW 503 in the
-/// second run names nothing unlisted, and a 503 body is read but never parsed. Review 2026-11-17:
-/// three rows were named unlisted, and `direct_payloads_read` counted the 503 bodies as read.
+/// A row's own index that did not answer after its minute has not looked for it: PRN 503 in the
+/// second run leaves both PRN rows `not_looked`, the GNW row is still compared and named, and a
+/// 503 body is read but never parsed. Review 2026-11-17: a CNW 503 named three rows unlisted.
 #[test]
-fn a_cross_check_row_no_direct_index_answered_after_is_not_looked() -> TestResult {
-    let (root, hosts) = cnw_and_yahoo_store()?;
+fn a_cross_check_row_whose_own_index_did_not_answer_after_is_not_looked() -> TestResult {
+    let (root, hosts) = five_host_store()?;
     cross_checked_at(
         root.path(),
         &hosts,
@@ -1146,18 +1137,52 @@ fn a_cross_check_row_no_direct_index_answered_after_is_not_looked() -> TestResul
         root.path(),
         &hosts,
         MONDAY_AT,
-        &Gnw::five_hosts()?.answering(CNW_INDEX, &[UNAVAILABLE; 3]),
+        &Gnw::five_hosts()?.answering(PRN_INDEX, &[UNAVAILABLE; 3]),
     )?;
+    let unlisted: Vec<Option<&str>> = checked["result"]["unlisted"]
+        .as_array()
+        .ok_or("unlisted")?
+        .iter()
+        .map(|row| row["key"].as_str())
+        .collect();
     assert_eq!(
         (
             checked["direct_payloads_read"].as_u64(),
             checked["direct_payloads_parsed"].as_u64(),
             checked["result"]["not_looked"].as_u64(),
-            checked["result"]["unlisted_count"].as_u64(),
+            checked["result"]["listed_directly"].as_u64(),
+            unlisted,
         ),
-        (Some(3), Some(0), Some(3), Some(0)),
+        (
+            Some(6),
+            Some(3),
+            Some(2),
+            Some(0),
+            vec![Some("globenewswire.com")]
+        ),
         "{checked:#}"
     );
+    Ok(())
+}
+
+/// The lead through collect: a direct answer received exactly `DIRECT_LEAD` (90 min) before the
+/// earliest `cross_check` minute (07:22Z, so 05:52:00Z) is read, one a second earlier is not.
+/// Mutations 2026-11-17, the lead 89 or 91 min and `>=` as `>` in `read_answers`: each red.
+#[test]
+fn a_direct_answer_received_exactly_one_lead_before_the_earliest_row_is_read() -> TestResult {
+    let mut read = Vec::new();
+    for early in ["2026-11-16T05:52:01Z", "2026-11-16T05:52:00Z"] {
+        let (root, hosts) = five_host_store()?;
+        cross_checked_at(
+            root.path(),
+            &hosts,
+            early,
+            &Gnw::five_hosts()?.answering(YAHOO_INDEX, &[UNAVAILABLE; 3]),
+        )?;
+        let (_, checked) = cross_checked_at(root.path(), &hosts, MONDAY_AT, &Gnw::five_hosts()?)?;
+        read.push(checked["direct_payloads_read"].as_u64());
+    }
+    assert_eq!(read, [Some(8), Some(4)]);
     Ok(())
 }
 
@@ -1167,7 +1192,7 @@ type DamagedRun = (usize, Exit, Value, (usize, bool));
 
 /// A second run after the first run's CNW sitemap blob was `damage`d on disk.
 fn run_over_a_damaged_sitemap(damage: Damage) -> Result<DamagedRun, Box<dyn Error>> {
-    let (root, hosts) = cnw_and_yahoo_store()?;
+    let (root, hosts) = five_host_store()?;
     cross_checked_at(
         root.path(),
         &hosts,

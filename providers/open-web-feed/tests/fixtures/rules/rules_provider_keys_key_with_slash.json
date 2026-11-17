@@ -12,11 +12,11 @@
         "follow": [
           "business-wire.com/x"
         ],
-        "cross_check": [
-          "prnewswire.com",
-          "globenewswire.com",
-          "cnwgroup.com"
-        ]
+        "cross_check": {
+          "prnewswire.com": "www.prnewswire.com",
+          "globenewswire.com": "rss.globenewswire.com",
+          "cnwgroup.com": "www.newswire.ca"
+        }
       },
       "title": {
         "selector": "meta[property=\"og:title\"]",
