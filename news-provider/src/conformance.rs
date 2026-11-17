@@ -4,7 +4,7 @@
 //!
 //! It is not a gate over the provider's own vendor behaviour - that is the adapter's test suite.
 //! It checks the claims the seam makes about ANY provider: a plan accounts for every day its window
-//! names and asks each (day, host) at most once, a session-bound plan asks only for days both the
+//! names and asks each (day, url) at most once, a session-bound plan asks only for days both the
 //! calendar and the listing allow, extraction is pure over (bytes, rules), and a payload's counts
 //! add up.
 
@@ -15,7 +15,7 @@ use pit::ObservationTime;
 use crate::budget::host_of;
 use crate::ledger::{AttemptEvent, LedgerError, Sink};
 use crate::provider::{precision_of, Cadence, Calendar, Listing, Provider, RawBlob};
-use crate::request::{days_of, Request, TargetWindow};
+use crate::request::{days_of, Request, RequestPhase, TargetWindow};
 use chrono::NaiveDate;
 
 /// The days a window names, or none when it names none and when nothing can read it: this harness
@@ -86,11 +86,16 @@ pub fn breaches(provider: &dyn Provider, subject: &Subject) -> Vec<Breach> {
                 ),
             });
         }
-        let accounted =
-            u32::try_from(once.items.len() + once.follow_ups.len() + once.unusable.len())
-                .unwrap_or(u32::MAX)
-                .saturating_add(once.filtered_out)
-                .saturating_add(once.robots_disallowed);
+        // An `Index` follow-up is a next page of the listing, not one of its rows.
+        let documents = once
+            .follow_ups
+            .iter()
+            .filter(|follow_up| follow_up.phase == RequestPhase::Document)
+            .count();
+        let accounted = u32::try_from(once.items.len() + documents + once.unusable.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(once.filtered_out)
+            .saturating_add(once.robots_disallowed);
         if accounted != once.vendor_rows {
             found.push(Breach {
                 check: THE_COUNTS_ADD_UP,
@@ -119,8 +124,9 @@ pub fn breaches(provider: &dyn Provider, subject: &Subject) -> Vec<Breach> {
 }
 
 /// Every day the window names is asked for by at least one request or named by exactly one
-/// `NotPlanned` row, never both, and no (day, host) pair is asked twice. A whole-window row (an
-/// unreadable or empty window) accounts for the window instead, when it is the plan's only content.
+/// `NotPlanned` row, never both, no (day, url) pair is asked twice, and every url names a host this
+/// seam keys. A whole-window row (an unreadable or empty window) accounts for the window instead,
+/// when it is the plan's only content.
 fn plan_accounts_for_every_day(target: &TargetWindow, plan: &crate::Plan) -> Vec<Breach> {
     if let ([], [(window, _)]) = (plan.requests.as_slice(), plan.not_planned.as_slice()) {
         if window.as_str() == target.as_str() {
@@ -135,9 +141,9 @@ fn plan_accounts_for_every_day(target: &TargetWindow, plan: &crate::Plan) -> Vec
     let mut asked: BTreeMap<(String, String), usize> = BTreeMap::new();
     for request in &plan.requests {
         match host_of(&request.url) {
-            Ok(Some(host)) => {
+            Ok(Some(_)) => {
                 let day = request.target_window.as_str().to_owned();
-                *asked.entry((day, host.as_str().to_owned())).or_default() += 1;
+                *asked.entry((day, request.url.clone())).or_default() += 1;
             }
             Ok(None) | Err(_) => found.push(breach(format!(
                 "{} names no host this seam can key",
@@ -145,9 +151,9 @@ fn plan_accounts_for_every_day(target: &TargetWindow, plan: &crate::Plan) -> Vec
             ))),
         }
     }
-    for ((day, host), times) in &asked {
+    for ((day, url), times) in &asked {
         if *times > 1 {
-            found.push(breach(format!("{day} at {host} is asked {times} times")));
+            found.push(breach(format!("{day} at {url} is asked {times} times")));
         }
     }
     let mut not_planned: BTreeMap<String, usize> = BTreeMap::new();
@@ -240,6 +246,7 @@ mod tests {
     const ONE_DAY: &str = "2026-11-14";
     const INDEX_URL: &str = "https://example.test/index";
     const SECOND_HOST_URL: &str = "https://second.example.test/index";
+    const SECOND_URL_OF_THE_HOST: &str = "https://example.test/index?page=2";
     /// `HostKey::new` refuses the underscore.
     const UNKEYABLE_HOST_URL: &str = "https://exa_mple.test/index";
     const AT: &str = "2026-11-10T18:00:00Z";
@@ -256,8 +263,12 @@ mod tests {
         ExtractDifferentlyEachTime,
         MiscountVendorRows,
         ClaimAnInstantUnderADayCeiling,
-        /// Not a breach: one day from two hosts is two (day, host) pairs.
+        /// Not a breach: one day from two hosts is two (day, url) pairs.
         AskOneDayFromTwoHosts,
+        /// Not a breach: a host's index and its paged index are two (day, url) pairs.
+        AskOneDayFromTwoUrlsOfOneHost,
+        /// Not a breach: a next index page beside the one row is no vendor row.
+        FollowANextPage,
         AskOneDayAndHostTwice,
         AskAHostThisSeamCannotKey,
         AskForADayAndAlsoNotPlanIt,
@@ -395,6 +406,11 @@ mod tests {
                     self.request("2026-11-10"),
                     self.request_at("2026-11-10", SECOND_HOST_URL),
                 ],
+                Break::AskOneDayFromTwoUrlsOfOneHost => vec![
+                    self.request("2026-11-09"),
+                    self.request("2026-11-10"),
+                    self.request_at("2026-11-10", SECOND_URL_OF_THE_HOST),
+                ],
                 Break::AskOneDayAndHostTwice => vec![
                     self.request("2026-11-09"),
                     self.request("2026-11-10"),
@@ -455,7 +471,12 @@ mod tests {
                     source_item_id,
                     ..self.item(valid)
                 }],
-                follow_ups: Vec::new(),
+                follow_ups: match self.how {
+                    Break::FollowANextPage => {
+                        vec![self.request_at("2026-11-09", SECOND_URL_OF_THE_HOST)]
+                    }
+                    _ => Vec::new(),
+                },
                 unusable: Vec::new(),
                 vendor_rows: match self.how {
                     Break::MiscountVendorRows => ONE_ROW + 1,
@@ -586,11 +607,26 @@ mod tests {
         );
     }
 
-    /// Architecture.md section 11.2: accounting is per (day, host), so an open-web plan asking one
+    /// Architecture.md section 11.2: accounting is per (day, url), so an open-web plan asking one
     /// day of two wires is not a day asked twice.
     #[test]
     fn two_hosts_on_one_day_account_once_each() {
         assert_eq!(found(Break::AskOneDayFromTwoHosts), Vec::<&str>::new());
+    }
+
+    /// Section 11.2: PRN's RSS and its paged sitemap are two urls of one host on one day.
+    #[test]
+    fn two_index_urls_of_one_host_on_one_day_account_once_each() {
+        assert_eq!(
+            found(Break::AskOneDayFromTwoUrlsOfOneHost),
+            Vec::<&str>::new()
+        );
+    }
+
+    /// Section 11.2: a next page follow-up is not a row of the page that planned it.
+    #[test]
+    fn a_next_index_page_is_not_counted_as_a_vendor_row() {
+        assert_eq!(found(Break::FollowANextPage), Vec::<&str>::new());
     }
 
     /// Handed no calendar and no listing, as its cadence requires, an every-day plan is not a
