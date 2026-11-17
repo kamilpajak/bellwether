@@ -216,6 +216,10 @@ pub struct Extracted {
     /// Rows we would have followed whose url the host's pinned robots.txt disallows: never asked,
     /// and no attempt row (architecture.md section 11.1).
     pub robots_disallowed: u32,
+    /// Document follow-ups no row of this payload lists: GNW's id walk (architecture.md section
+    /// 11.2). Issued after `follow_ups` unless held or issued earlier in the run; never counted
+    /// as matched, held or re-listed, and no vendor row.
+    pub walk: Vec<Request>,
 }
 
 /// Why a target the window names was not asked for. Every target appears in a [`Plan`] as a

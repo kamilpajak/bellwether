@@ -484,6 +484,7 @@ mod tests {
                 },
                 filtered_out: 0,
                 robots_disallowed: 0,
+                walk: Vec::new(),
             }
         }
 

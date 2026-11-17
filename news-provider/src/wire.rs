@@ -87,7 +87,7 @@ pub enum SendFailure {
 }
 
 /// The response headers P9 keeps beside the raw blob (architecture.md section 3.9), lowercase.
-pub const KEPT_HEADERS: [&str; 9] = [
+pub const KEPT_HEADERS: [&str; 10] = [
     "content-type",
     "last-modified",
     "etag",
@@ -97,7 +97,12 @@ pub const KEPT_HEADERS: [&str; 9] = [
     "content-encoding",
     RETRY_AFTER,
     "x-sitemap-generated-at",
+    LOCATION,
 ];
+
+/// A 3xx's target, which `MAX_REDIRECTS` 0 never follows: GNW's walk reads a language from it
+/// (owner decision PG-D4, 2026-11-17, section 11.2).
+pub const LOCATION: &str = "location";
 
 const RETRY_AFTER: &str = "retry-after";
 /// RFC 9110 §5.6.7's HTTP-date forms: IMF-fixdate, then the obsolete RFC 850 and asctime ones.
@@ -1743,7 +1748,7 @@ mod tests {
         Ok(())
     }
 
-    /// `Server`, `Set-Cookie`, `Location` and `X-Other` are not kept; a repeated `Vary` is.
+    /// `Server`, `Set-Cookie` and `X-Other` are not kept; a repeated `Vary` is.
     const MIXED_HEAD: &[u8] = b"Date: Mon, 16 Nov 2026 09:42:00 GMT\r\nServer: nginx\r\n\
         Content-Type: text/html; charset=utf-8\r\nSet-Cookie: a=b\r\nVary: Accept-Encoding\r\n\
         ETag: \"caf\xe9\"\r\nVARY: User-Agent\r\nLast-Modified: Sun, 15 Nov 2026 10:00:00 GMT\r\n\
@@ -1765,6 +1770,7 @@ mod tests {
                 ("etag", "\"caf\u{e9}\""),
                 ("last-modified", "Sun, 15 Nov 2026 10:00:00 GMT"),
                 ("cache-control", "max-age=60"),
+                ("location", "/elsewhere"),
                 ("retry-after", "120"),
                 ("x-sitemap-generated-at", "2026-11-17T08:02:54.800Z"),
             ])

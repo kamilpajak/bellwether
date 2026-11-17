@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss 
+  version="2.0">
+  <channel xmlns:dc="http://dublincore.org/documents/dcmi-namespace/" xmlns:media="http://search.yahoo.com/mrss/">
+    <title>GlobeNewswire RSS Feed</title>
+    <link>https://rss.globenewswire.com/rssfeed/</link>
+    <description>Contains the last 20 releases</description>
+    <managingEditor>newsdesk@globenewswire.com (NewsDesk)</managingEditor>
+    <lastBuildDate>Tue, 17 Nov 2026 11:57:00 GMT</lastBuildDate>
+    <webMaster>webmaster@globenewswire.com (Webmaster)</webMaster>
+<item>
+      <guid
+        isPermaLink="true">https://www.globenewswire.com/news-release/2026/11/17/3404422/32719/en/interested-in-leading-the-compass-inc-class-action-lawsuit-contact-robbins-llp-for-information-about-the-process.html</guid>
+      <link>https://www.globenewswire.com/news-release/2026/11/17/3404422/32719/en/interested-in-leading-the-compass-inc-class-action-lawsuit-contact-robbins-llp-for-information-about-the-process.html</link>
+      <title>Interested in Leading the Compass, Inc. Class Action Lawsuit? Contact Robbins LLP for Information About the Process  </title>
+      <description><![CDATA[Compass, Inc. (COMP) faces allegations it issued misleading statements in connection with its January 2026 merger with Anywhere Real Estate Inc.]]></description>
+      <pubDate>Tue, 17 Nov 2026 11:57 GMT</pubDate>
+      <dc:identifier>3404422</dc:identifier>
+      <dc:language>en</dc:language>
+      <dc:publisher>GlobeNewswire Inc.</dc:publisher>
+      <dc:contributor>Robbins LLP</dc:contributor>
+      <dc:modified>Tue, 17 Nov 2026 11:57 GMT</dc:modified>
+      <dc:subject>Class Action</dc:subject>
+      <dc:subject>Law &amp; Legal Issues</dc:subject>
+      <dc:keyword>$COMP</dc:keyword>
+      <dc:keyword>#Compass Inc.</dc:keyword>
+      <dc:keyword>#class action</dc:keyword>
+      <dc:keyword>#lawsuit</dc:keyword>
+      <dc:keyword>#investor rights</dc:keyword>
+      <dc:keyword>#securities fraud violations</dc:keyword>
+      <dc:keyword>#stockholder alert</dc:keyword>
+      <dc:keyword>$HOUS</dc:keyword>
+      <dc:keyword>Class Action</dc:keyword>
+    </item>
+    <item>
+      <guid
+        isPermaLink="true">https://www.globenewswire.com/news-release/2026/11/17/3404421/0/en/man-group-plc-form-8-3-rhi-magnesita-n-v.html</guid>
+      <link>https://www.globenewswire.com/news-release/2026/11/17/3404421/0/en/man-group-plc-form-8-3-rhi-magnesita-n-v.html</link>
+      <category
+        domain="https://www.globenewswire.com/rss/stock">LSE:EMG</category>
+      <category
+        domain="https://www.globenewswire.com/rss/ISIN">GB00B83VD954</category>
+      <title>Man Group PLC : Form 8.3 - RHI Magnesita N.V.</title>
+      <description><![CDATA[<p align="right" style="text-align:right;"><b>FORM 8.3</b></p>]]></description>
+      <pubDate>Tue, 17 Nov 2026 11:55 GMT</pubDate>
+      <dc:identifier>3404421</dc:identifier>
+      <dc:language>en</dc:language>
+      <dc:publisher>GlobeNewswire Inc.</dc:publisher>
+      <dc:contributor>Man Group PLC</dc:contributor>
+      <dc:modified>Tue, 17 Nov 2026 11:56 GMT</dc:modified>
+      <dc:subject>Mergers and Acquisitions</dc:subject>
+      <dc:subject>European Regulatory News</dc:subject>
+    </item>
+  </channel>
+</rss>

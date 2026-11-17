@@ -16,13 +16,13 @@ use news_provider::provider::{
 };
 use news_provider::request::{HeaderValue, Request, RequestPhase};
 use news_provider::{
-    AttemptSlot, CredentialRef, RawResponse, RunId, TargetWindow, TransportError, TransportKind,
-    Verdict,
+    AttemptId, AttemptSlot, CredentialRef, Headers, RawResponse, RunId, TargetWindow,
+    TransportError, TransportKind, Verdict,
 };
 use open_web_feed::{
     AdmittedPath, Basis, Continuity, CrossChecker, DirectAnswer, Generation, HostPin, HostRobots,
-    OpenWebFeed, Refusal, RobotsPin, RobotsRules, CONTACT_CREDENTIAL, DIRECT_LEAD,
-    GENERATION_HEADER, LONGEST_POLL_PERIOD, SOURCE,
+    OpenWebFeed, Refusal, RobotsPin, RobotsRules, Walk, WalkBasis, WalkPlan, WalkRange,
+    CONTACT_CREDENTIAL, DIRECT_LEAD, GENERATION_HEADER, LONGEST_POLL_PERIOD, SOURCE,
 };
 use pit::datedness::{Minute, Published};
 use pit::ObservationTime;
@@ -43,7 +43,8 @@ const REAL_ARTICLE: &str = "article_3403075.html";
 const ARTICLE_URL: &str = "https://rss.globenewswire.com/news-release/2026/11/14/3403075/0/en/usta-florida-releases-2026-state-of-florida-tennis-report.html";
 const ARTICLE_WWW_URL: &str = "https://www.globenewswire.com/news-release/2026/11/14/3403075/0/en/usta-florida-releases-2026-state-of-florida-tennis-report.html";
 const ARTICLE_UPPER_CASE_URL: &str = "https://WWW.GlobeNewswire.com/news-release/2026/11/14/3403075/0/en/usta-florida-releases-2026-state-of-florida-tennis-report.html";
-const ARTICLE_KEY: &str = "rss.globenewswire.com/news-release/2026/11/14/3403075/0/en/usta-florida-releases-2026-state-of-florida-tennis-report.html";
+/// The release key (id, language) since the id walk (section 11.2); the url path key before it.
+const ARTICLE_KEY: &str = "rss.globenewswire.com/news-release/3403075/en";
 const ARTICLE_TITLE: &str = "USTA FLORIDA RELEASES 2026 STATE OF FLORIDA TENNIS REPORT";
 /// The three real `pubDate` values, minutes only, as the 2026-11-14 19:22:19Z feed spelled them.
 const REAL_PUB_DATES: [&str; 3] = [
@@ -1171,11 +1172,11 @@ fn the_path_handed_to_robots_is_the_fetched_urls_path_as_written() -> Outcome {
     };
     let index = format!(
         "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel>{}{}{}</channel></rss>",
-        item("https://rss.globenewswire.com/news-release/1/caf%C3%A9.html"),
-        item("https://rss.globenewswire.com/news-release/2/caf%c3%a9.html"),
-        item("https://rss.globenewswire.com/news-release/3/x.html?pdf=1"),
+        item("https://rss.globenewswire.com/news-release/2026/11/14/1/0/en/caf%C3%A9.html"),
+        item("https://rss.globenewswire.com/news-release/2026/11/14/2/0/en/caf%c3%a9.html"),
+        item("https://rss.globenewswire.com/news-release/2026/11/14/3/0/en/x.html?pdf=1"),
     );
-    let (feed, rules) = gnw_disallowing("/news-release/1/")?;
+    let (feed, rules) = gnw_disallowing("/news-release/2026/11/14/1/")?;
     let extracted = follow_ups(&feed, index.as_bytes())?;
     let kept: Vec<&str> = extracted
         .follow_ups
@@ -1186,13 +1187,13 @@ fn the_path_handed_to_robots_is_the_fetched_urls_path_as_written() -> Outcome {
         (asked(&rules), kept, extracted.robots_disallowed),
         (
             vec![
-                "/news-release/1/caf%C3%A9.html".to_owned(),
-                "/news-release/2/caf%c3%a9.html".to_owned(),
-                "/news-release/3/x.html".to_owned(),
+                "/news-release/2026/11/14/1/0/en/caf%C3%A9.html".to_owned(),
+                "/news-release/2026/11/14/2/0/en/caf%c3%a9.html".to_owned(),
+                "/news-release/2026/11/14/3/0/en/x.html".to_owned(),
             ],
             vec![
-                "https://rss.globenewswire.com/news-release/2/caf%c3%a9.html",
-                "https://rss.globenewswire.com/news-release/3/x.html",
+                "https://rss.globenewswire.com/news-release/2026/11/14/2/0/en/caf%c3%a9.html",
+                "https://rss.globenewswire.com/news-release/2026/11/14/3/0/en/x.html",
             ],
             1
         )
@@ -1209,12 +1210,12 @@ fn a_document_path_robots_cannot_read_as_written_is_filtered_out_and_never_asked
     };
     let index = format!(
         "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel>{}{}{}{}{}{}</channel></rss>",
-        item("https://rss.globenewswire.com/news-release/1/caf\u{e9}.html"),
-        item("https://rss.globenewswire.com/news-release/2/a b.html"),
-        item("https://rss.globenewswire.com/news-release/3/%2e%2e/x.html"),
-        item("https://rss.globenewswire.com/news-release/4/.%2E/x.html"),
-        item("https://rss.globenewswire.com/news-release/5/%2E/x.html"),
-        item("https://rss.globenewswire.com/news-release/6/%2e%2e.html"),
+        item("https://rss.globenewswire.com/news-release/2026/11/14/1/0/en/caf\u{e9}.html"),
+        item("https://rss.globenewswire.com/news-release/2026/11/14/2/0/en/a b.html"),
+        item("https://rss.globenewswire.com/news-release/2026/11/14/3/0/en/%2e%2e"),
+        item("https://rss.globenewswire.com/news-release/2026/11/14/4/0/en/.%2E"),
+        item("https://rss.globenewswire.com/news-release/2026/11/14/5/0/en/%2E"),
+        item("https://rss.globenewswire.com/news-release/2026/11/14/6/0/en/%2e%2e.html"),
     );
     let (feed, rules) = gnw_disallowing("/never/")?;
     let extracted = follow_ups(&feed, index.as_bytes())?;
@@ -1231,8 +1232,8 @@ fn a_document_path_robots_cannot_read_as_written_is_filtered_out_and_never_asked
             extracted.robots_disallowed
         ),
         (
-            vec!["/news-release/6/%2e%2e.html".to_owned()],
-            vec!["https://rss.globenewswire.com/news-release/6/%2e%2e.html"],
+            vec!["/news-release/2026/11/14/6/0/en/%2e%2e.html".to_owned()],
+            vec!["https://rss.globenewswire.com/news-release/2026/11/14/6/0/en/%2e%2e.html"],
             5,
             0
         )
@@ -3529,10 +3530,11 @@ fn the_1410_poll_reads_page_two_and_records_its_broken_boundary() -> Outcome {
     Ok(())
 }
 
-/// Owner decision 2026-11-17 (option B): every poll that read all the pages it planned is a
-/// basis, a broken boundary included; only `next_page_unread` is not.
+/// Owner decision 2026-11-17 (option B): every poll that read all the pages or ids it planned is
+/// a basis, a broken boundary included; only `next_page_unread`, `id_unread` and `range_unread`
+/// are not.
 #[test]
-fn every_continuity_but_next_page_unread_is_a_basis() {
+fn every_continuity_but_an_unread_page_id_or_range_is_a_basis() {
     let basis: Vec<(&str, bool)> = Continuity::ALL
         .into_iter()
         .map(|arm| (arm.name(), arm.is_basis()))
@@ -3545,6 +3547,8 @@ fn every_continuity_but_next_page_unread_is_a_basis() {
             ("no_previous_key", true),
             ("first_poll", true),
             ("next_page_unread", false),
+            ("id_unread", false),
+            ("range_unread", false),
         ]
     );
 }
@@ -4538,6 +4542,525 @@ fn golden_bodies() -> Result<(serde_json::Value, serde_json::Value), Box<dyn std
     });
     let committed = serde_json::from_slice(&std::fs::read(fixtures().join(GOLDEN_BODIES))?)?;
     Ok((committed, computed))
+}
+
+// ---- GNW id walk (section 11.2, owner decisions PG-D2 and PG-D4, 2026-11-17) ----
+
+/// Probe10's GNW polls of 2026-11-17 cut to a few items (section 11.6): 12:00Z's 3404422 (en, the
+/// frontier), 3404419 (en), 3404417 (he), 3404415 (en); 12:05Z's 3404462 (en, fr), 3404424 (en).
+const RSS_1200: &str = "rssfeed_1200_4_items.xml";
+const RSS_1205: &str = "rssfeed_1205_3_items.xml";
+/// Probe10's walked pages: `og:article:published_time` 11:59:24Z and 12:00:00Z.
+const WALKED_3404423: &str = "walked_3404423.html";
+const WALKED_3404438: &str = "walked_3404438.html";
+/// The research's 301 of 3403200 asked in English (fetch #9, 2026-11-17), body and `Location`.
+const MOVED_3403200: &str = "moved_3403200.html";
+const MOVED_TO_DANISH: &str =
+    "/news-release/2026/11/16/3403200/0/da/Suspension-i-forbindelse-med-fusion.html";
+const WALK_DAY: &str = "2026-11-17";
+const WALK_AT: &str = "2026-11-17T12:05:30Z";
+const BELOW_THE_FIRST_POLL: u64 = 3_404_414;
+const FIRST_FRONTIER: u64 = 3_404_422;
+
+fn walk_url(date: &str, id: u64) -> String {
+    format!("https://rss.globenewswire.com/news-release/{date}/{id}/0/en/x.html")
+}
+
+/// The committed feed with every host `Absent`, handed `range` for GNW's index.
+fn walking(range: Option<WalkRange>) -> Result<OpenWebFeed, Refusal> {
+    let feed = provider()?;
+    let walks = range
+        .map(|range| BTreeMap::from([(GNW_INDEX.to_owned(), range)]))
+        .unwrap_or_default();
+    Ok(feed.with_walks(walks))
+}
+
+/// The range a poll walks after a first poll that read `RSS_1200` and walked nothing.
+fn after_the_first_poll(answered: &[u64]) -> Result<Option<WalkRange>, Refusal> {
+    let first = gnw(RSS_1200);
+    Ok(provider()?
+        .walk()
+        .range(
+            GNW_INDEX,
+            Some(&first),
+            Some(WalkBasis {
+                walked_through: None,
+                index: &first,
+            }),
+            answered.iter().copied().collect(),
+        )
+        .range()
+        .cloned())
+}
+
+fn gnw_index_on(
+    feed: &OpenWebFeed,
+    day: &str,
+    at: &str,
+) -> Result<Request, Box<dyn std::error::Error>> {
+    let plan = feed.plan(&TargetWindow::new(day), None, None, self::at(at))?;
+    plan.requests
+        .into_iter()
+        .find(|request| request.url == GNW_INDEX)
+        .ok_or_else(|| "no GNW index planned".into())
+}
+
+/// One walked request as `(url, phase, listed_date)`.
+type Walked = (String, RequestPhase, Option<String>);
+
+/// The walk of one extraction of `rss` under `feed`.
+fn walked(feed: &OpenWebFeed, rss: &str) -> Result<Vec<Walked>, Box<dyn std::error::Error>> {
+    let request = gnw_index_on(feed, WALK_DAY, WALK_AT)?;
+    Ok(feed
+        .extract(&request, &blob(gnw(rss)))
+        .walk
+        .into_iter()
+        .map(|walked| (walked.url, walked.phase, walked.listed_date))
+        .collect())
+}
+
+fn walked_urls(ids: &[u64]) -> Vec<Walked> {
+    ids.iter()
+        .map(|id| (walk_url("2026/11/17", *id), RequestPhase::Document, None))
+        .collect()
+}
+
+/// GNW serves one release under any slug, date and middle number (research 2026-11-17), so its
+/// story key is `(id, language)`. Mutation 2026-11-17, `Keys::key` reverted to host plus path:
+/// red.
+#[test]
+fn a_release_is_keyed_by_its_id_and_language_whatever_its_slug_date_or_number() -> Outcome {
+    let feed = provider()?;
+    let listed = "https://www.globenewswire.com/news-release/2026/11/17/3404422/32719/en/interested-in-leading-the-compass-inc-class-action-lawsuit-contact-robbins-llp-for-information-about-the-process.html";
+    let keys: Vec<Option<String>> = [
+        listed,
+        &walk_url("2026/11/17", 3_404_422),
+        &walk_url("2026/11/18", 3_404_422),
+        "https://rss.globenewswire.com/news-release/2026/11/17/3404422/0/FR/x.html",
+        "https://rss.globenewswire.com/news-release/2026/11/17/3404422/en/x.html",
+    ]
+    .iter()
+    .map(|url| feed.item_key(url))
+    .collect();
+    let key = Some("rss.globenewswire.com/news-release/3404422/en".to_owned());
+    assert_eq!(
+        keys,
+        vec![
+            key.clone(),
+            key.clone(),
+            key,
+            Some("rss.globenewswire.com/news-release/3404422/fr".to_owned()),
+            None,
+        ]
+    );
+    Ok(())
+}
+
+/// 960 of 960 rows of probe10's 48 GNW polls name their `dc:identifier` and `dc:language` in the
+/// link (section 11.6), so the link alone keys the RSS row; one id is listed in two languages.
+#[test]
+fn an_id_listed_in_two_languages_is_two_stories() -> Outcome {
+    let feed = walking(None)?;
+    let request = gnw_index_on(&feed, WALK_DAY, WALK_AT)?;
+    let stories: BTreeSet<String> = feed
+        .extract(&request, &blob(gnw(RSS_1205)))
+        .follow_ups
+        .iter()
+        .filter_map(|follow_up| feed.story_of(follow_up))
+        .map(|story| story.hex().to_owned())
+        .collect();
+    assert_eq!(stories.len(), 3);
+    Ok(())
+}
+
+/// PG-D2: a poll walks every id above its basis through the highest id the PREVIOUS poll listed,
+/// never an id the current index lists above it, each a `Document` with no listed value, under
+/// the frontier row's own date. Mutation 2026-11-17, `range` through the current poll: red.
+#[test]
+fn a_walk_runs_above_the_basis_through_the_previous_frontier_only() -> Outcome {
+    let range = after_the_first_poll(&[])?.ok_or("no range")?;
+    let feed = walking(Some(range.clone()))?;
+    assert_eq!(
+        (
+            range.after(),
+            range.through(),
+            range.date(),
+            walked(&feed, RSS_1205)?,
+        ),
+        (
+            BELOW_THE_FIRST_POLL,
+            FIRST_FRONTIER,
+            "2026/11/17",
+            walked_urls(&(BELOW_THE_FIRST_POLL + 1..=FIRST_FRONTIER).collect::<Vec<u64>>()),
+        )
+    );
+    Ok(())
+}
+
+/// An id the store answered in the walk's language, or the index lists in it, is not walked; an
+/// id listed only in Hebrew is, since its English page is unknown. Mutation 2026-11-17, the
+/// language filter on the listed ids dropped: red.
+#[test]
+fn an_id_answered_or_listed_in_the_walks_language_is_not_walked() -> Outcome {
+    let feed = walking(after_the_first_poll(&[3_404_416, 3_404_420])?)?;
+    assert_eq!(
+        walked(&feed, RSS_1200)?,
+        walked_urls(&[3_404_417, 3_404_418, 3_404_421])
+    );
+    Ok(())
+}
+
+/// No previous answer, or no basis, is a first poll: no range and no walk.
+#[test]
+fn a_first_poll_has_no_range_and_walks_nothing() -> Outcome {
+    let walk = provider()?.walk();
+    let first = gnw(RSS_1200);
+    let basis = WalkBasis {
+        walked_through: None,
+        index: &first,
+    };
+    assert_eq!(
+        (
+            walk.range(GNW_INDEX, None, Some(basis), BTreeSet::new()),
+            walk.range(GNW_INDEX, Some(&first), None, BTreeSet::new()),
+            walked(&walking(None)?, RSS_1200)?,
+        ),
+        (WalkPlan::FirstPoll, WalkPlan::FirstPoll, Vec::new())
+    );
+    Ok(())
+}
+
+/// A basis that walked continues from the id it walked through, not from its own index.
+#[test]
+fn a_basis_that_walked_is_walked_from_the_id_it_walked_through() -> Outcome {
+    let walk = provider()?.walk();
+    let (first, second) = (gnw(RSS_1200), gnw(RSS_1205));
+    let range = walk
+        .range(
+            GNW_INDEX,
+            Some(&second),
+            Some(WalkBasis {
+                walked_through: Some(FIRST_FRONTIER),
+                index: &first,
+            }),
+            BTreeSet::new(),
+        )
+        .range()
+        .cloned()
+        .ok_or("no range")?;
+    assert_eq!(
+        (range.after(), range.through()),
+        (FIRST_FRONTIER, 3_404_462)
+    );
+    Ok(())
+}
+
+/// `rss` with every release link moved under `/en/`, a shape no release is read from.
+fn shifted(rss: &str) -> Vec<u8> {
+    String::from_utf8_lossy(&gnw(rss))
+        .replace(
+            "globenewswire.com/news-release/",
+            "globenewswire.com/en/news-release/",
+        )
+        .into_bytes()
+}
+
+/// A previous answer or a basis that lists no release leaves the range unknown: `range_unread`,
+/// never a `first_poll` that would drop the basis's `walk_through` (PR #49 review, 2026-11-18).
+#[test]
+fn a_poll_whose_previous_or_basis_answer_lists_no_release_is_range_unread() -> Outcome {
+    let walk = provider()?.walk();
+    let (listing, moved) = (gnw(RSS_1200), shifted(RSS_1200));
+    let walked = WalkBasis {
+        walked_through: Some(FIRST_FRONTIER),
+        index: &listing,
+    };
+    let unwalked = WalkBasis {
+        walked_through: None,
+        index: &moved,
+    };
+    assert_eq!(
+        (
+            walk.range(GNW_INDEX, Some(&moved), Some(walked), BTreeSet::new()),
+            walk.range(GNW_INDEX, Some(&listing), Some(unwalked), BTreeSet::new()),
+        ),
+        (WalkPlan::RangeUnread, WalkPlan::RangeUnread)
+    );
+    Ok(())
+}
+
+/// The per-document robots check (owner decision 2026-11-17) holds for a walked url.
+#[test]
+fn a_walked_id_robots_disallow_is_not_asked() -> Outcome {
+    let (feed, _) = gnw_disallowing("/news-release/2026/11/17/3404420/")?;
+    let feed = feed.with_walks(BTreeMap::from([(
+        GNW_INDEX.to_owned(),
+        after_the_first_poll(&[])?.ok_or("no range")?,
+    )]));
+    let ids: Vec<u64> = (BELOW_THE_FIRST_POLL + 1..=FIRST_FRONTIER)
+        .filter(|id| *id != 3_404_420)
+        .collect();
+    assert_eq!(walked(&feed, RSS_1205)?, walked_urls(&ids));
+    Ok(())
+}
+
+/// No index row dated a walked id, so its page does: the minute holding `og:article:published_time`,
+/// which held the RSS `pubDate`'s minute on 16 of 16 GNW pages (section 11.6).
+#[test]
+fn a_walked_page_is_dated_by_the_minute_holding_its_published_time() -> Outcome {
+    let feed = provider()?;
+    let mut dated = Vec::new();
+    for (id, page) in [(3_404_423, WALKED_3404423), (3_404_438, WALKED_3404438)] {
+        let request = Request {
+            url: walk_url("2026/11/17", id),
+            phase: RequestPhase::Document,
+            listed_date: None,
+            ..gnw_index_on(&feed, WALK_DAY, WALK_AT)?
+        };
+        let item = only_item(&feed.extract(&request, &blob(gnw(page))))?;
+        dated.push((
+            item.source_item_id,
+            item.valid,
+            item.valid_raw,
+            item.valid_field,
+            item.observed,
+        ));
+    }
+    let minute = |text: &str| -> Result<Published, Box<dyn std::error::Error>> {
+        Ok(Published::AtMinute(Minute::new(text.parse()?)?))
+    };
+    assert_eq!(
+        dated,
+        vec![
+            (
+                "rss.globenewswire.com/news-release/3404423/en".to_owned(),
+                minute("2026-11-17T11:59:00Z")?,
+                "2026-11-17T11:59:24Z".to_owned(),
+                "og:article:published_time".to_owned(),
+                None,
+            ),
+            (
+                "rss.globenewswire.com/news-release/3404438/en".to_owned(),
+                minute("2026-11-17T12:00:00Z")?,
+                "2026-11-17T12:00:00Z".to_owned(),
+                "og:article:published_time".to_owned(),
+                None,
+            ),
+        ]
+    );
+    Ok(())
+}
+
+/// A walked page with no readable time is unusable, decided by the page, so its id is answered
+/// and the walk does not ask it again; `article_3403075.html` was cut above that meta.
+#[test]
+fn a_walked_page_with_no_readable_time_is_unusable_decided_by_the_page() -> Outcome {
+    let feed = provider()?;
+    let request = Request {
+        url: walk_url("2026/11/14", 3_403_075),
+        phase: RequestPhase::Document,
+        listed_date: None,
+        ..index_request(&feed)?
+    };
+    let unusable = only_unusable(&feed.extract(&request, &blob(gnw(REAL_ARTICLE))))?;
+    assert_eq!(
+        (unusable.reason, unusable.decided_by),
+        (UnusableReason::NoParseableValidTime, DecidedBy::Page)
+    );
+    Ok(())
+}
+
+/// Only the walk's own url is dated by its page: a listed spelling of the same release with no
+/// listed value is undated, decided by its index row (PR #49 review, 2026-11-18: it was dated).
+#[test]
+fn a_listed_url_with_no_listed_value_is_not_dated_by_its_page() -> Outcome {
+    let feed = provider()?;
+    let request = Request {
+        url:
+            "https://rss.globenewswire.com/news-release/2026/11/17/3404423/0/en/Some-Real-Slug.html"
+                .to_owned(),
+        phase: RequestPhase::Document,
+        listed_date: None,
+        ..gnw_index_on(&feed, WALK_DAY, WALK_AT)?
+    };
+    let unusable = only_unusable(&feed.extract(&request, &blob(gnw(WALKED_3404423))))?;
+    assert_eq!(
+        (unusable.reason, unusable.decided_by),
+        (UnusableReason::NoParseableValidTime, DecidedBy::IndexRow)
+    );
+    Ok(())
+}
+
+/// A walked id is the walk's own url inside the range: a listed spelling of an id in the range,
+/// or the walk's url of an id outside it, is not one.
+#[test]
+fn only_the_walks_own_url_inside_the_range_is_a_walked_id() -> Outcome {
+    let walk = provider()?.walk();
+    let range = after_the_first_poll(&[])?.ok_or("no range")?;
+    let listed = "https://rss.globenewswire.com/news-release/2026/11/17/3404416/0/en/a-slug.html";
+    assert_eq!(
+        [
+            walk.walked_id(GNW_INDEX, &range, &walk_url("2026/11/17", 3_404_416)),
+            walk.walked_id(GNW_INDEX, &range, listed),
+            walk.walked_id(GNW_INDEX, &range, &walk_url("2026/11/18", 3_404_416)),
+            walk.walked_id(GNW_INDEX, &range, &walk_url("2026/11/17", 3_404_423)),
+        ],
+        [Some(3_404_416), None, None, None]
+    );
+    Ok(())
+}
+
+fn moved_verdict(url: &str, location: Option<&str>) -> Result<Verdict, Box<dyn std::error::Error>> {
+    let feed = provider()?;
+    let request = Request {
+        url: url.to_owned(),
+        phase: RequestPhase::Document,
+        listed_date: None,
+        ..index_request(&feed)?
+    };
+    let headers = location
+        .map(|target| vec![("location".to_owned(), target.to_owned())])
+        .unwrap_or_default();
+    let answer = Ok(RawResponse::new(
+        AttemptId::recorded("a".repeat(64)),
+        301,
+        gnw(MOVED_3403200),
+        at(RUN_AT),
+        at(RUN_AT),
+    )
+    .with_headers(Headers::new(headers)));
+    Ok(feed.classify(&request, &answer))
+}
+
+/// PG-D4: a 301 naming the same id in another language is "id exists, language X, not fetched",
+/// an answer with no row (`Empty`), never followed; any other 3xx stays permanent (§10).
+/// Mutation 2026-11-17, `moved_to` comparing no id: red.
+#[test]
+fn a_301_to_the_same_id_in_another_language_is_empty_and_any_other_permanent() -> Outcome {
+    let asked = walk_url("2026/11/16", 3_403_200);
+    let other_id = "/news-release/2026/11/16/3403201/0/da/x.html";
+    let other_host = "https://example.test/news-release/2026/11/16/3403200/0/da/x.html";
+    let same_language = "/news-release/2026/11/16/3403200/0/en/another-slug.html";
+    assert_eq!(
+        [
+            moved_verdict(&asked, Some(MOVED_TO_DANISH))?,
+            moved_verdict(&asked, Some(other_id))?,
+            moved_verdict(&asked, Some(other_host))?,
+            moved_verdict(&asked, Some(same_language))?,
+            moved_verdict(&asked, None)?,
+        ],
+        [
+            Verdict::Empty,
+            Verdict::PermanentFailure,
+            Verdict::PermanentFailure,
+            Verdict::PermanentFailure,
+            Verdict::PermanentFailure,
+        ]
+    );
+    assert_eq!(
+        provider()?
+            .walk()
+            .moved_to(GNW_INDEX, &asked, MOVED_TO_DANISH),
+        Some("da".to_owned())
+    );
+    Ok(())
+}
+
+/// Owner decision 2026-11-17: a walked id answered 410 is a 4xx like any other, permanent.
+#[test]
+fn a_walked_id_answered_410_is_permanent() -> Outcome {
+    let feed = provider()?;
+    let request = Request {
+        url: walk_url("2026/11/17", 3_405_305),
+        phase: RequestPhase::Document,
+        listed_date: None,
+        ..index_request(&feed)?
+    };
+    assert_eq!(
+        verdict(&feed, &request, 410, b"")?,
+        Verdict::PermanentFailure
+    );
+    Ok(())
+}
+
+/// `first_poll` and `range_unread` as planned; `complete` when every id of the range is answered;
+/// `id_unread` with the ids that are not, which makes the poll no basis.
+#[test]
+fn a_walk_is_complete_only_when_every_id_of_its_range_is_answered() -> Outcome {
+    let range = after_the_first_poll(&[])?.ok_or("no range")?;
+    let every: BTreeSet<u64> = range.ids().collect();
+    let all_but_one: BTreeSet<u64> = range.ids().filter(|id| *id != 3_404_420).collect();
+    assert_eq!(
+        (
+            Walk::continuity(&WalkPlan::FirstPoll, &every),
+            Walk::continuity(&WalkPlan::RangeUnread, &every),
+            Walk::continuity(&WalkPlan::Range(range.clone()), &every),
+            Walk::continuity(&WalkPlan::Range(range), &all_but_one),
+        ),
+        (
+            (Continuity::FirstPoll, Vec::new()),
+            (Continuity::RangeUnread, Vec::new()),
+            (Continuity::Complete, Vec::new()),
+            (Continuity::IdUnread, vec![3_404_420]),
+        )
+    );
+    Ok(())
+}
+
+/// The walk's requests are no vendor row: an index with a walk still adds up (§8's seam claims).
+#[test]
+fn an_index_with_a_walk_breaks_no_claim_of_the_seam() -> Outcome {
+    let feed = walking(after_the_first_poll(&[])?)?;
+    let request = gnw_index_on(&feed, WALK_DAY, WALK_AT)?;
+    let found = breaches(
+        &feed,
+        &Subject {
+            target: TargetWindow::new(WALK_DAY),
+            calendar: None,
+            listing: None,
+            at: at(WALK_AT),
+            payloads: &[(request, blob(gnw(RSS_1205)))],
+        },
+    );
+    assert_eq!(found, Vec::new());
+    Ok(())
+}
+
+/// A hosts row's `id_walk` names one release on the row's host, under a rule that keys by release
+/// and reads a page's time; a rule's `story_key` is `release` or absent, and `page_valid` reads a
+/// second. Mutations 2026-11-17, each check removed: each red.
+#[test]
+fn an_id_walk_or_its_rule_that_cannot_walk_is_refused() {
+    let refused = |hosts: &str| refusal_of(&hosts_fixture(hosts), &rules_path(), CONTACT);
+    assert!(matches!(
+        refused("id_walk_not_a_release.json"),
+        Some(Refusal::IdWalkNotARelease { .. })
+    ));
+    assert!(matches!(
+        refused("id_walk_off_host.json"),
+        Some(Refusal::IdWalkNotARelease { .. })
+    ));
+    assert!(matches!(
+        refused("id_walk_rule_not_release_keyed.json"),
+        Some(Refusal::IdWalkRuleNotReleaseKeyed { .. })
+    ));
+    assert!(refused("gnw_walked.json").is_none());
+    for rules in [
+        "rules_story_key_unknown.json",
+        "rules_page_valid_reads_no_second.json",
+    ] {
+        assert!(
+            matches!(
+                refusal_of(
+                    &hosts_fixture("gnw_admitted.json"),
+                    &rules_fixture(rules),
+                    CONTACT
+                ),
+                Some(Refusal::RulesUnparseable { .. })
+            ),
+            "{rules}"
+        );
+    }
 }
 
 /// P5 (section 11.1): a change to the extraction code, the rules file or any body moves this

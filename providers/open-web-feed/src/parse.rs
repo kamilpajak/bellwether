@@ -178,6 +178,8 @@ fn is_rss(node: roxmltree::Node, name: &str) -> bool {
 pub(crate) struct Page {
     pub(crate) title: Option<String>,
     pub(crate) canonical: Option<String>,
+    /// The rule's `page_valid` text, when it names one.
+    pub(crate) valid: Option<String>,
     /// Whitespace-collapsed text, one line per paragraph or table row holding a letter or a digit.
     pub(crate) body: Result<String, UnusableReason>,
 }
@@ -186,6 +188,7 @@ pub(crate) fn page(payload: &[u8], rule: &Rule) -> Page {
     let unread = |reason| Page {
         title: None,
         canonical: None,
+        valid: None,
         body: Err(reason),
     };
     let Ok(text) = std::str::from_utf8(payload) else {
@@ -213,6 +216,10 @@ pub(crate) fn page(payload: &[u8], rule: &Rule) -> Page {
     Page {
         title: picked(&html, &rule.title),
         canonical: picked(&html, &rule.canonical),
+        valid: rule
+            .page_valid
+            .as_ref()
+            .and_then(|valid| picked(&html, &valid.pick)),
         body,
     }
 }

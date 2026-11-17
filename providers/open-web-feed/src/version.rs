@@ -5,7 +5,7 @@ use canon::{CanonError, Digest, FileDigest};
 
 /// Every file under `src/`, as compiled. A file missing here is caught by
 /// `every_source_file_is_in_the_extraction_version`, which reads the directory.
-const SOURCES: [(&str, &str); 9] = [
+const SOURCES: [(&str, &str); 10] = [
     ("crosscheck.rs", include_str!("crosscheck.rs")),
     ("depth.rs", include_str!("depth.rs")),
     ("hosts.rs", include_str!("hosts.rs")),
@@ -15,6 +15,7 @@ const SOURCES: [(&str, &str); 9] = [
     ("rules.rs", include_str!("rules.rs")),
     ("strict.rs", include_str!("strict.rs")),
     ("version.rs", include_str!("version.rs")),
+    ("walk.rs", include_str!("walk.rs")),
 ];
 
 pub(crate) fn extract_version(rules: &FileDigest) -> Result<Digest, CanonError> {

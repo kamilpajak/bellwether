@@ -114,11 +114,11 @@ PRAGMA synchronous = FULL;
 ";
 
 /// The `PRAGMA user_version` this build writes, and the only one a read-only reader accepts.
-pub const SCHEMA_VERSION: i32 = 11;
+pub const SCHEMA_VERSION: i32 = 12;
 
 /// Version `i + 1` is reached from version `i` by `MIGRATIONS[i]`, run by [`migrate`] with
 /// foreign keys off, as SQLite's twelve-step table rebuild (lang_altertable.html) requires.
-const MIGRATIONS: [&str; 11] = [
+const MIGRATIONS: [&str; 12] = [
     "
 -- The hosts file a run was admitted under: architecture.md section 2's `hosts_version` row. NULL
 -- for a provider that reads no hosts file.
@@ -257,6 +257,76 @@ ALTER TABLE attempts ADD COLUMN boundary_newer_generation INTEGER
     CHECK (boundary_newer_generation >= 0);
 ALTER TABLE attempts ADD COLUMN boundary_generation_unknown INTEGER
     CHECK (boundary_generation_unknown >= 0);
+",
+    "
+-- GNW's id walk (section 11.2): `continuity` takes `id_unread` and `range_unread`, and a CHECK
+-- cannot be altered in place, so `attempts` is rebuilt, every column and row carried. The walk
+-- columns (section 3.2) sit on the walked index's usable attempt, NULL on every other row and on
+-- every row before user_version 12. No `--` comment inside the column list: with one there, CI's
+-- SQLite (Ubuntu 24.04) failed a test's DROP COLUMN, `incomplete input` (run 44192197582).
+CREATE TABLE attempts_v12 (
+    attempt_id                  TEXT PRIMARY KEY,
+    run_id                      TEXT NOT NULL,
+    source                      TEXT NOT NULL,
+    target_window               TEXT NOT NULL,
+    filter_params               TEXT NOT NULL,
+    universe_version            TEXT NOT NULL,
+    opened_at                   TEXT NOT NULL,
+    requested_at                TEXT,
+    received_at                 TEXT,
+    transport_status            INTEGER,
+    clock_nonmonotonic          INTEGER,
+    outcome                     TEXT,
+    vendor_rows                 INTEGER,
+    items_new                   INTEGER,
+    matched                     INTEGER,
+    baseline_count              INTEGER,
+    baseline_window             INTEGER,
+    baseline_construction       TEXT,
+    baseline_ratio              REAL,
+    slots                       INTEGER,
+    closed_at                   TEXT,
+    noticed_at                  TEXT,
+    noticed_by                  TEXT,
+    hosts_version               TEXT,
+    verdict                     TEXT
+        CHECK (verdict IN ('usable', 'empty', 'permanent_failure', 'transient_failure')),
+    story_id                    TEXT,
+    held                        INTEGER,
+    listing_unusable            INTEGER,
+    extract_version             TEXT,
+    relisted_compared           INTEGER,
+    robots_disallowed           INTEGER,
+    continuity                  TEXT
+        CHECK (continuity IN ('complete', 'boundary_no_shared_key', 'no_previous_key',
+                              'first_poll', 'next_page_unread', 'id_unread', 'range_unread')),
+    boundary_same_generation    INTEGER CHECK (boundary_same_generation >= 0),
+    boundary_older_generation   INTEGER CHECK (boundary_older_generation >= 0),
+    boundary_newer_generation   INTEGER CHECK (boundary_newer_generation >= 0),
+    boundary_generation_unknown INTEGER CHECK (boundary_generation_unknown >= 0),
+    walk_through                INTEGER CHECK (walk_through >= 0),
+    walk_gone                   INTEGER CHECK (walk_gone >= 0),
+    walk_other_language         INTEGER CHECK (walk_other_language >= 0),
+    walk_unread                 INTEGER CHECK (walk_unread >= 0)
+);
+INSERT INTO attempts_v12
+    (attempt_id, run_id, source, target_window, filter_params, universe_version, opened_at,
+     requested_at, received_at, transport_status, clock_nonmonotonic, outcome, vendor_rows,
+     items_new, matched, baseline_count, baseline_window, baseline_construction, baseline_ratio,
+     slots, closed_at, noticed_at, noticed_by, hosts_version, verdict, story_id, held,
+     listing_unusable, extract_version, relisted_compared, robots_disallowed, continuity,
+     boundary_same_generation, boundary_older_generation, boundary_newer_generation,
+     boundary_generation_unknown)
+SELECT attempt_id, run_id, source, target_window, filter_params, universe_version, opened_at,
+       requested_at, received_at, transport_status, clock_nonmonotonic, outcome, vendor_rows,
+       items_new, matched, baseline_count, baseline_window, baseline_construction, baseline_ratio,
+       slots, closed_at, noticed_at, noticed_by, hosts_version, verdict, story_id, held,
+       listing_unusable, extract_version, relisted_compared, robots_disallowed, continuity,
+       boundary_same_generation, boundary_older_generation, boundary_newer_generation,
+       boundary_generation_unknown
+FROM attempts;
+DROP TABLE attempts;
+ALTER TABLE attempts_v12 RENAME TO attempts;
 ",
 ];
 
@@ -793,6 +863,112 @@ pub fn basis_pages(
         Some(run) => index_pages(&db, &run, source, Verdict::Usable),
         None => Ok(Vec::new()),
     }
+}
+
+/// The first `PRAGMA user_version` whose attempts record a walk: `MIGRATIONS[11]`.
+const WALK_VERSION: i32 = 12;
+
+/// What a walked index's next poll reads before the lease (section 11.2): the newest usable
+/// answer of the index, the newest poll of it whose continuity is in `kept` with the id it walked
+/// through and its answer, and the url of every answered document attempt of `source`.
+#[derive(Debug, Default)]
+pub struct WalkRead {
+    pub previous: Option<String>,
+    pub basis: Option<(Option<u64>, String)>,
+    pub answered: Vec<String>,
+}
+
+/// `WalkRead` from the store at `root`, read-only. Empty with no commit log and below
+/// user_version 12, where no poll walked: the run then records `first_poll`.
+pub fn walk_read(
+    root: &Path,
+    source: &SourceId,
+    index_url: &str,
+    kept: &[&str],
+) -> Result<WalkRead, StoreError> {
+    let log = root.join(COMMIT_LOG);
+    if !log.exists() {
+        return Ok(WalkRead::default());
+    }
+    let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    if !(WALK_VERSION..=SCHEMA_VERSION).contains(&user_version(&db)?) {
+        return Ok(WalkRead::default());
+    }
+    let previous = db
+        .query_row(
+            "SELECT p.raw_blob FROM attempts a JOIN payloads p ON p.attempt_id = a.attempt_id
+              WHERE a.source = ?1 AND p.url = ?2 AND p.phase = 'index' AND a.verdict = ?3
+              ORDER BY a.received_at DESC, a.attempt_id DESC LIMIT 1",
+            params![source.as_str(), index_url, Verdict::Usable.name()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let marks = vec!["?"; kept.len()].join(", ");
+    let basis = db
+        .query_row(
+            &format!(
+                "SELECT a.walk_through, p.raw_blob FROM attempts a
+                   JOIN payloads p ON p.attempt_id = a.attempt_id
+                  WHERE a.source = ? AND p.url = ? AND a.continuity IN ({marks})
+                  ORDER BY a.received_at DESC, a.attempt_id DESC LIMIT 1"
+            ),
+            rusqlite::params_from_iter(
+                [source.as_str(), index_url]
+                    .into_iter()
+                    .chain(kept.iter().copied()),
+            ),
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let basis = basis
+        .map(|(through, blob): (Option<i64>, String)| {
+            let through = through
+                .map(|value| {
+                    u64::try_from(value)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, value))
+                })
+                .transpose()?;
+            Ok::<_, StoreError>((through, blob))
+        })
+        .transpose()?;
+    Ok(WalkRead {
+        previous,
+        basis,
+        answered: answered_urls(&db, source)?,
+    })
+}
+
+/// The url of every document attempt of `source` closed usable, empty or permanent: an id
+/// answered in any language, a 3xx included, which a walk never asks again (section 11.2).
+fn answered_urls(db: &Connection, source: &SourceId) -> Result<Vec<String>, StoreError> {
+    let mut statement = db.prepare(
+        "SELECT DISTINCT p.url FROM payloads p JOIN attempts a ON a.attempt_id = p.attempt_id
+          WHERE a.source = ?1 AND p.phase = 'document' AND a.closed_at IS NOT NULL
+            AND a.verdict IN (?2, ?3, ?4)
+          ORDER BY p.url",
+    )?;
+    let urls = statement
+        .query_map(
+            params![
+                source.as_str(),
+                Verdict::Usable.name(),
+                Verdict::Empty.name(),
+                Verdict::PermanentFailure.name()
+            ],
+            |row| row.get(0),
+        )?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(urls)
+}
+
+/// One walked poll as `Committer::record_walk` writes it on the index's usable attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalkRecord<'a> {
+    pub continuity: &'a str,
+    pub through: Option<u64>,
+    pub gone: u32,
+    pub other_language: u32,
+    pub unread: u32,
 }
 
 /// Every index payload one run of `source` filed under `verdict`, earliest answer first.
@@ -1586,6 +1762,35 @@ impl Committer {
         Ok(())
     }
 
+    /// `walk_read`'s answered urls over this store, after this run's own attempts closed.
+    pub fn answered_document_urls(&self, source: &SourceId) -> Result<Vec<String>, StoreError> {
+        answered_urls(&self.db, source)
+    }
+
+    /// Records a walked poll on its index attempt: its own `UPDATE` after the commit, as
+    /// [`Committer::record_continuity`].
+    pub fn record_walk(&mut self, attempt_id: &str, walk: WalkRecord) -> Result<(), StoreError> {
+        let through = walk
+            .through
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|failure| rusqlite::Error::ToSqlConversionFailure(Box::new(failure)))?;
+        self.db.execute(
+            "UPDATE attempts SET continuity = ?2, walk_through = ?3, walk_gone = ?4,
+                    walk_other_language = ?5, walk_unread = ?6
+              WHERE attempt_id = ?1",
+            params![
+                attempt_id,
+                walk.continuity,
+                through,
+                walk.gone,
+                walk.other_language,
+                walk.unread
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Every index payload a `source` attempt filed, earliest answer first: the cross-check's
     /// input (architecture.md section 11.2, option C). Metadata only; `blob_bytes` reads one.
     pub fn index_payloads(&self, source: &SourceId) -> Result<Vec<IndexPayload>, StoreError> {
@@ -2127,8 +2332,8 @@ mod tests {
     use super::{
         first_observed, fs, newest_visible_publication, params, stamp, user_version, BTreeMap,
         BlobDigest, Committer, ItemRow, LedgerError, MigrationStep, ObservationTime, Payload,
-        PayloadRow, RobotsAnswer, RobotsLedger, RunId, Sink, StoreError, COMMIT_LOG, MIGRATIONS,
-        SCHEMA_V0, SCHEMA_VERSION,
+        PayloadRow, RobotsAnswer, RobotsLedger, RunId, Sink, StoreError, WalkRecord, COMMIT_LOG,
+        MIGRATIONS, SCHEMA_V0, SCHEMA_VERSION,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -4248,6 +4453,141 @@ mod tests {
         assert_eq!(
             (refused, read_only, user_version(&db)?),
             (expected.clone(), expected, 10)
+        );
+        Ok(())
+    }
+
+    /// A v11 store: the v10 fixture and `MIGRATIONS[10]`, with boundary counts on the v1 attempt.
+    fn a_store_at_user_version_eleven(temp: &TempDir) -> TestResult {
+        a_store_at_user_version_ten(temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch(MIGRATIONS[10])?;
+        db.pragma_update(None, "user_version", 11)?;
+        db.execute_batch(
+            "UPDATE attempts SET boundary_same_generation = 1, boundary_older_generation = 2,
+                    boundary_newer_generation = 3, boundary_generation_unknown = 4
+              WHERE attempt_id = 'a v1 attempt';",
+        )?;
+        Ok(())
+    }
+
+    const WALK_COLUMNS: [&str; 4] = [
+        "walk_through",
+        "walk_gone",
+        "walk_other_language",
+        "walk_unread",
+    ];
+
+    fn walk_on(store: &Committer, attempt: &str) -> Result<Vec<Option<i64>>, StoreError> {
+        WALK_COLUMNS
+            .iter()
+            .map(|column| {
+                Ok(store.db.query_row(
+                    &format!("SELECT {column} FROM attempts WHERE attempt_id = ?1"),
+                    params![attempt],
+                    |row| row.get(0),
+                )?)
+            })
+            .collect()
+    }
+
+    /// §8 row M1 from user_version 11: the step to 12 rebuilds `attempts`, whose `continuity`
+    /// then takes `id_unread`, and adds the four walk columns, each an `INTEGER` none negative.
+    #[test]
+    fn a_store_at_user_version_eleven_opens_migrates_to_twelve_and_takes_a_walk() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_eleven(&temp)?;
+        let mut store = open(&temp)?;
+        store.record_walk(
+            "a v1 attempt",
+            WalkRecord {
+                continuity: "id_unread",
+                through: Some(3_404_422),
+                gone: 1,
+                other_language: 2,
+                unread: 3,
+            },
+        )?;
+        let taken = (
+            continuity_on(&store, "a v1 attempt")?,
+            walk_on(&store, "a v1 attempt")?,
+        );
+        let refused: Vec<bool> = WALK_COLUMNS
+            .iter()
+            .map(|column| {
+                store
+                    .db
+                    .execute(
+                        &format!(
+                            "UPDATE attempts SET {column} = -1 WHERE attempt_id = 'a v1 attempt'"
+                        ),
+                        [],
+                    )
+                    .is_err()
+            })
+            .collect();
+        let columns = super::columns_of(&store.db, "attempts")?;
+        let shapes: Vec<Option<&super::ColumnShape>> = WALK_COLUMNS
+            .iter()
+            .map(|column| columns.get(*column))
+            .collect();
+        let integer = ("INTEGER".to_owned(), false, None, 0);
+        assert_eq!(
+            (user_version(&store.db)?, taken, refused, shapes),
+            (
+                SCHEMA_VERSION,
+                (
+                    Some("id_unread".to_owned()),
+                    vec![Some(3_404_422), Some(1), Some(2), Some(3)]
+                ),
+                vec![true; 4],
+                vec![Some(&integer); 4]
+            )
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the carried half from user_version 11 across the rebuild of `attempts`: every
+    /// column of every row of every v11 table, compared by `quote()`; the four walk columns NULL.
+    #[test]
+    fn a_v11_store_keeps_every_v11_column_of_every_row() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_eleven(&temp)?;
+        let v11 = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let before = quoted_rows(&v11, 11, &V7_TABLES)?;
+        drop(v11);
+        assert!(super::refuse_an_unreadable_version(temp.path()).is_ok());
+        let store = open(&temp)?;
+        let after = quoted_rows(&store.db, 11, &V7_TABLES)?;
+        assert_eq!(before.len(), V7_TABLES.len() + 1);
+        assert_eq!(
+            (after, walk_on(&store, "a v1 attempt")?),
+            (before, vec![None; 4])
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the per-version shape check at user_version 11.
+    #[test]
+    fn a_v11_store_whose_columns_differ_is_refused_and_left_at_user_version_eleven() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_eleven(&temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch("ALTER TABLE attempts DROP COLUMN boundary_generation_unknown;")?;
+        drop(db);
+        let read_only = match super::refuse_an_unreadable_version(temp.path()) {
+            Err(StoreError::ShapeDiffers { found: 11, columns }) => columns,
+            other => vec![format!("{other:?}")],
+        };
+        let refused = match open(&temp) {
+            Err(StoreError::ShapeDiffers { found: 11, columns }) => columns,
+            other => vec![format!("{other:?}")],
+        };
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let expected = vec!["attempts.boundary_generation_unknown".to_owned()];
+        assert_eq!(
+            (refused, read_only, user_version(&db)?),
+            (expected.clone(), expected, 11)
         );
         Ok(())
     }

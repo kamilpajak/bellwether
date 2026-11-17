@@ -3,7 +3,7 @@
 //! only when every boundary it read and its last page share a key.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
 use pit::datedness::Minute;
@@ -11,7 +11,7 @@ use pit::datedness::Minute;
 use crate::hosts::PagedIndex;
 use crate::parse::index_rows;
 use crate::rules::Rule;
-use crate::{item_key_under, minute_of};
+use crate::{minute_of, Keys};
 
 /// The keys one earlier poll read across its pages, and the oldest minute they listed: what the
 /// next poll anchors to (`Continuity::is_basis`).
@@ -43,15 +43,23 @@ pub enum Continuity {
     /// The last page read holds no key of the basis poll and a next page was due but not read:
     /// it failed, or robots disallow it. That stretch is still listed, so the poll is no basis.
     NextPageUnread,
+    /// An id walk left an id of its range with no answer in the store: a transient failure left
+    /// after its retries, or robots disallow its url. The next poll walks the range again.
+    IdUnread,
+    /// An id walk with a basis could not read its range: its previous answer or its basis's
+    /// lists no release on the walked host. The next poll walks from the same basis.
+    RangeUnread,
 }
 
 impl Continuity {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Complete,
         Self::BoundaryNoSharedKey,
         Self::NoPreviousKey,
         Self::FirstPoll,
         Self::NextPageUnread,
+        Self::IdUnread,
+        Self::RangeUnread,
     ];
 
     #[must_use]
@@ -62,6 +70,8 @@ impl Continuity {
             Self::NoPreviousKey => "no_previous_key",
             Self::FirstPoll => "first_poll",
             Self::NextPageUnread => "next_page_unread",
+            Self::IdUnread => "id_unread",
+            Self::RangeUnread => "range_unread",
         }
     }
 
@@ -70,11 +80,14 @@ impl Continuity {
         Self::ALL.into_iter().find(|arm| arm.name() == name)
     }
 
-    /// A poll that read every page it planned, a broken boundary included (owner decision
-    /// 2026-11-17, option B): the next poll anchors to it. An unread page is not, so it is read.
+    /// A poll that read every page or id it planned, a broken boundary included (owner decision
+    /// 2026-11-17, option B): the next poll anchors to it. An unread one is not, so it is read.
     #[must_use]
     pub const fn is_basis(self) -> bool {
-        !matches!(self, Self::NextPageUnread)
+        !matches!(
+            self,
+            Self::NextPageUnread | Self::IdUnread | Self::RangeUnread
+        )
     }
 }
 
@@ -133,16 +146,12 @@ pub(crate) struct PageRow {
 
 /// Every row of a page that names a link `item_key` reads, or `None` when the page is not the
 /// rule's index shape.
-pub(crate) fn page_rows(
-    bytes: &[u8],
-    rule: &Rule,
-    rewrites: &BTreeMap<String, String>,
-) -> Option<Vec<PageRow>> {
+pub(crate) fn page_rows(bytes: &[u8], rule: &Rule, keys: &Keys) -> Option<Vec<PageRow>> {
     Some(
         index_rows(bytes, rule)?
             .into_iter()
             .filter_map(|row| {
-                let key = item_key_under(rewrites, row.link.as_deref()?)?;
+                let key = keys.key(row.link.as_deref()?)?;
                 let listed = row.valid_raw.and_then(|raw| {
                     minute_of(&raw, &rule.valid_format).map(|minute| (minute, raw))
                 });
@@ -256,15 +265,12 @@ pub(crate) fn basis_of(pages: &[Vec<PageRow>]) -> Basis {
 #[derive(Debug, Clone)]
 pub struct Paging {
     indexes: Vec<(PagedIndex, Rule)>,
-    rewrites: BTreeMap<String, String>,
+    keys: Keys,
 }
 
 impl Paging {
-    pub(crate) const fn new(
-        indexes: Vec<(PagedIndex, Rule)>,
-        rewrites: BTreeMap<String, String>,
-    ) -> Self {
-        Self { indexes, rewrites }
+    pub(crate) const fn new(indexes: Vec<(PagedIndex, Rule)>, keys: Keys) -> Self {
+        Self { indexes, keys }
     }
 
     /// Each paged index's page-1 url, in hosts-file order.
@@ -290,7 +296,7 @@ impl Paging {
         let (_, rule) = self.index(index_url)?;
         pages
             .iter()
-            .map(|bytes| page_rows(bytes, rule, &self.rewrites))
+            .map(|bytes| page_rows(bytes, rule, &self.keys))
             .collect()
     }
 

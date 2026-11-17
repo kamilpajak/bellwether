@@ -260,6 +260,7 @@ impl EdgarPress {
             vendor_rows: u32::try_from(rows.len()).unwrap_or(u32::MAX),
             filtered_out,
             robots_disallowed: 0,
+            walk: Vec::new(),
         }
     }
 
@@ -309,6 +310,7 @@ impl EdgarPress {
                 vendor_rows: 1,
                 filtered_out: 0,
                 robots_disallowed: 0,
+                walk: Vec::new(),
             },
             None => Extracted {
                 items: vec![item],
@@ -317,6 +319,7 @@ impl EdgarPress {
                 vendor_rows: 1,
                 filtered_out: 0,
                 robots_disallowed: 0,
+                walk: Vec::new(),
             },
         }
     }

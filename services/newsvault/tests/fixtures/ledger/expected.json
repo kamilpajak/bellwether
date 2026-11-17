@@ -51,6 +51,15 @@
             "newer_generation": 0,
             "generation_unknown": 0
           },
+          "walk": {
+            "complete": 0,
+            "first_poll": 0,
+            "id_unread": 0,
+            "range_unread": 0,
+            "gone": 0,
+            "other_language": 0,
+            "unread": 0
+          },
           "items_new": 3,
           "rows_committed": 3
         },
@@ -83,6 +92,15 @@
             "older_generation": 0,
             "newer_generation": 0,
             "generation_unknown": 0
+          },
+          "walk": {
+            "complete": 0,
+            "first_poll": 0,
+            "id_unread": 0,
+            "range_unread": 0,
+            "gone": 0,
+            "other_language": 0,
+            "unread": 0
           },
           "items_new": 1,
           "rows_committed": 1
@@ -127,6 +145,15 @@
             "newer_generation": 0,
             "generation_unknown": 0
           },
+          "walk": {
+            "complete": 0,
+            "first_poll": 0,
+            "id_unread": 0,
+            "range_unread": 0,
+            "gone": 0,
+            "other_language": 0,
+            "unread": 0
+          },
           "items_new": 0,
           "rows_committed": 0
         },
@@ -159,6 +186,15 @@
             "older_generation": 0,
             "newer_generation": 0,
             "generation_unknown": 0
+          },
+          "walk": {
+            "complete": 0,
+            "first_poll": 0,
+            "id_unread": 0,
+            "range_unread": 0,
+            "gone": 0,
+            "other_language": 0,
+            "unread": 0
           },
           "items_new": 0,
           "rows_committed": 0
@@ -203,6 +239,15 @@
             "newer_generation": 0,
             "generation_unknown": 0
           },
+          "walk": {
+            "complete": 0,
+            "first_poll": 0,
+            "id_unread": 0,
+            "range_unread": 0,
+            "gone": 0,
+            "other_language": 0,
+            "unread": 0
+          },
           "items_new": 0,
           "rows_committed": 0
         },
@@ -235,6 +280,15 @@
             "older_generation": 0,
             "newer_generation": 0,
             "generation_unknown": 0
+          },
+          "walk": {
+            "complete": 0,
+            "first_poll": 0,
+            "id_unread": 0,
+            "range_unread": 0,
+            "gone": 0,
+            "other_language": 0,
+            "unread": 0
           },
           "items_new": 0,
           "rows_committed": 0
@@ -279,6 +333,15 @@
             "newer_generation": 0,
             "generation_unknown": 0
           },
+          "walk": {
+            "complete": 0,
+            "first_poll": 0,
+            "id_unread": 0,
+            "range_unread": 0,
+            "gone": 0,
+            "other_language": 0,
+            "unread": 0
+          },
           "items_new": 0,
           "rows_committed": 0
         }
@@ -321,6 +384,15 @@
             "older_generation": 0,
             "newer_generation": 0,
             "generation_unknown": 0
+          },
+          "walk": {
+            "complete": 0,
+            "first_poll": 0,
+            "id_unread": 0,
+            "range_unread": 0,
+            "gone": 0,
+            "other_language": 0,
+            "unread": 0
           },
           "items_new": 1,
           "rows_committed": 1

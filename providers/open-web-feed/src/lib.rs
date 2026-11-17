@@ -12,6 +12,7 @@ mod parse;
 mod rules;
 mod strict;
 mod version;
+mod walk;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -38,7 +39,9 @@ pub use crate::crosscheck::{
 pub use crate::hosts::RobotsPin;
 use crate::hosts::{read_hosts, HostRow, Hosts, Status, HOSTS_SCHEMA};
 pub use crate::paging::{Basis, Continuity, Generation, Paging, GENERATION_HEADER};
-use crate::rules::{parse_rules, Rule, RULES_SCHEMA};
+use crate::rules::{parse_rules, Rule, StoryKey, RULES_SCHEMA};
+use crate::walk::{release_of, WalkedIndex};
+pub use crate::walk::{Walk, WalkBasis, WalkPlan, WalkRange};
 
 pub const SOURCE: &str = "open_web_wires";
 /// The User-Agent, a product token plus a contact address, travels by NAME as SEC's does
@@ -49,6 +52,7 @@ const OK: u16 = 200;
 const REQUEST_TIMEOUT: u16 = 408;
 const TOO_MANY_REQUESTS: u16 = 429;
 const SERVER_ERRORS: std::ops::RangeInclusive<u16> = 500..=599;
+const REDIRECTS: std::ops::RangeInclusive<u16> = 300..=399;
 const SCHEMES: [&str; 2] = ["https://", "http://"];
 const NOT_PLAIN: [u8; 2] = *b"%#";
 /// An ASSUMPTION taken by default, as edgar-press's is: nothing here has timed a GNW response.
@@ -185,6 +189,53 @@ pub enum Refusal {
         host: String,
         rules: String,
     },
+    /// A walked id is one story with its listed release only when both key by release, and its
+    /// page is undated unless the rule reads the page's own time (section 11.2).
+    #[error(
+        "the hosts file at {path} walks {host}'s ids under rule {rule}, which keys no story by release or reads no page time"
+    )]
+    IdWalkRuleNotReleaseKeyed {
+        path: PathBuf,
+        host: String,
+        rule: String,
+    },
+    #[error(
+        "the hosts file at {path} walks {host}'s ids at {url}, which does not name one release on that host"
+    )]
+    IdWalkNotARelease {
+        path: PathBuf,
+        host: String,
+        url: String,
+    },
+}
+
+/// What `item_key` reads: every rule's host rewrite, and each host whose rule keys stories by
+/// release with that rule's path prefix.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Keys {
+    rewrites: BTreeMap<String, String>,
+    released: BTreeMap<String, String>,
+}
+
+impl Keys {
+    /// The rewritten host and the path.
+    pub(crate) fn rewritten(&self, url: &str) -> Option<(String, String)> {
+        let (host, path) = host_and_path(url)?;
+        Some((self.rewrites.get(&host).cloned().unwrap_or(host), path))
+    }
+
+    /// The rewritten host plus the path; on a host keyed by release, the host, the prefix, the
+    /// id and the language, so any slug or date of one release is one key.
+    pub(crate) fn key(&self, url: &str) -> Option<String> {
+        let (host, path) = self.rewritten(url)?;
+        match self.released.get(&host) {
+            Some(prefix) => {
+                let release = release_of(prefix, &path)?;
+                Some(format!("{host}{prefix}{}/{}", release.id, release.language))
+            }
+            None => Some(format!("{host}{path}")),
+        }
+    }
 }
 
 /// One hosts row as `OpenWebFeed::host_pins` hands it out. `host` is lowercased.
@@ -223,12 +274,14 @@ pub struct OpenWebFeed {
     rules: BTreeMap<String, Rule>,
     rules_version: FileDigest,
     extract_version: Digest,
-    /// Every rule's host rewrite, which `item_key` applies whatever host a url names.
-    rewrites: BTreeMap<String, String>,
+    /// What `item_key` applies whatever host a url names.
+    keys: Keys,
     /// Keyed by lowercased host; a host absent here allows no follow-up.
     robots: BTreeMap<String, HostRobots>,
     /// Keyed by a paged index's page-1 url; an index absent here is read at page 1 only.
     basis: BTreeMap<String, Basis>,
+    /// Keyed by a walked index's url; an index absent here walks no id (a first poll).
+    walks: BTreeMap<String, WalkRange>,
 }
 
 impl OpenWebFeed {
@@ -262,15 +315,50 @@ impl OpenWebFeed {
         })?;
         let hosts = read_hosts(hosts, &parsed)?;
         cross_checked_hosts_admitted(&hosts, &parsed, rules)?;
+        let released = hosts
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let rule = parsed.get(&row.rule)?;
+                (rule.story_key == StoryKey::Release)
+                    .then(|| (row.host.clone(), rule.path_prefix.clone()))
+            })
+            .collect();
         Ok(Self {
             hosts,
             rules: parsed,
             rules_version,
             extract_version,
-            rewrites,
+            keys: Keys { rewrites, released },
             robots: BTreeMap::new(),
             basis: BTreeMap::new(),
+            walks: BTreeMap::new(),
         })
+    }
+
+    /// Hands over each walked index's range, keyed by its index url, replacing any handed before.
+    #[must_use]
+    pub fn with_walks(self, walks: BTreeMap<String, WalkRange>) -> Self {
+        Self { walks, ..self }
+    }
+
+    /// Every admitted index with an id walk, for the driver that reads its range from the store.
+    #[must_use]
+    pub fn walk(&self) -> Walk {
+        Walk::new(
+            self.hosts
+                .admitted()
+                .filter_map(|row| {
+                    Some(WalkedIndex {
+                        index_url: row.index_url.clone(),
+                        host: row.host.clone(),
+                        walk: row.walk.clone()?,
+                        rule: self.rules.get(&row.rule)?.clone(),
+                    })
+                })
+                .collect(),
+            self.keys.clone(),
+        )
     }
 
     /// Hands over each host's pinned robots, keyed by lowercased host, replacing any handed before.
@@ -296,7 +384,7 @@ impl OpenWebFeed {
                     Some((paged.clone(), self.rules.get(&paged.rule)?.clone()))
                 })
                 .collect(),
-            self.rewrites.clone(),
+            self.keys.clone(),
         )
     }
 
@@ -393,15 +481,16 @@ impl OpenWebFeed {
     }
 
     /// The one function behind `source_item_id` and `story_of` (section 11.1): the host rewrite,
-    /// then the lowercased host plus the path, with no scheme, query or fragment. `None` for a
-    /// url with no host this crate can read. A page's canonical link never reaches it.
+    /// then the lowercased host plus the path, with no scheme, query or fragment; on a host whose
+    /// rule keys by release, the host, the path prefix, the release id and the language
+    /// (section 11.2). `None` for a url this crate cannot key. A page's canonical never reaches it.
     #[must_use]
     pub fn item_key(&self, url: &str) -> Option<String> {
-        item_key_under(&self.rewrites, url)
+        self.keys.key(url)
     }
 
     fn rewritten(&self, url: &str) -> Option<(String, String)> {
-        rewritten_under(&self.rewrites, url)
+        self.keys.rewritten(url)
     }
 
     fn admitted_row(&self, url: &str) -> Option<&HostRow> {
@@ -461,6 +550,7 @@ impl OpenWebFeed {
         for row in &rows {
             let kept = row.link.as_deref().and_then(|link| {
                 let (at, path) = self.rewritten(link)?;
+                let url = format!("https://{at}{path}");
                 let readable = followable_path(&path);
                 let followed = rule.provider_keys.as_ref().is_none_or(|keys| {
                     row.image
@@ -468,16 +558,14 @@ impl OpenWebFeed {
                         .and_then(|image| keys.key_of(image))
                         .is_some_and(|key| keys.follow.contains(key))
                 });
-                (at == host
-                    && path.starts_with(&rule.path_prefix)
-                    && readable
-                    && followed
-                    && keyed.insert(format!("{at}{path}")))
-                .then(|| format!("https://{at}{path}"))
+                let key = self.item_key(&url)?;
+                (at == host && path.starts_with(&rule.path_prefix) && readable && followed)
+                    .then_some((url, key))
             });
+            // A row robots disallows keys nothing, so another spelling of its release is followed.
             match kept {
-                Some(url) if !self.robots_allow(&url) => robots_disallowed += 1,
-                Some(url) => follow_ups.push(Request {
+                Some((url, _)) if !self.robots_allow(&url) => robots_disallowed += 1,
+                Some((url, key)) if keyed.insert(key.clone()) => follow_ups.push(Request {
                     source: SourceId::new(SOURCE),
                     target_window: request.target_window.clone(),
                     phase: RequestPhase::Document,
@@ -490,7 +578,7 @@ impl OpenWebFeed {
                     hosts_version: request.hosts_version.clone(),
                     extract_version: request.extract_version.clone(),
                 }),
-                None => filtered_out += 1,
+                _ => filtered_out += 1,
             }
         }
         follow_ups.extend(self.next_page_of(request, raw, rule));
@@ -501,7 +589,53 @@ impl OpenWebFeed {
             vendor_rows: u32::try_from(rows.len()).unwrap_or(u32::MAX),
             filtered_out,
             robots_disallowed,
+            walk: self.walk_of(request, rule, &rows),
         }
+    }
+
+    /// The handed range's ids as `Document` requests under its date, leaving out each id the
+    /// store answered and each this answer lists, both in the walk's language (its row asks it),
+    /// and each url robots disallows.
+    fn walk_of(&self, request: &Request, rule: &Rule, rows: &[parse::IndexRow]) -> Vec<Request> {
+        let Some(row) = self.admitted_row(&request.url) else {
+            return Vec::new();
+        };
+        let (Some(walk), Some(range)) = (row.walk.as_ref(), self.walks.get(&request.url)) else {
+            return Vec::new();
+        };
+        if row.index_url != request.url {
+            return Vec::new();
+        }
+        let listed: BTreeSet<u64> = rows
+            .iter()
+            .filter_map(|listed| {
+                let (at, path) = self.rewritten(listed.link.as_deref()?)?;
+                (at == row.host)
+                    .then(|| release_of(&rule.path_prefix, &path))
+                    .flatten()
+            })
+            .filter(|release| release.language == walk.language)
+            .map(|release| release.id)
+            .collect();
+        range
+            .ids()
+            .filter(|id| !range.answered().contains(id) && !listed.contains(id))
+            .map(|id| walk.url_for(range.date(), id))
+            .filter(|url| self.robots_allow(url))
+            .map(|url| Request {
+                source: SourceId::new(SOURCE),
+                target_window: request.target_window.clone(),
+                phase: RequestPhase::Document,
+                provenance: request.provenance,
+                url,
+                headers: Vec::new(),
+                params: Vec::new(),
+                universe_version: empty_roster(),
+                listed_date: None,
+                hosts_version: request.hosts_version.clone(),
+                extract_version: request.extract_version.clone(),
+            })
+            .collect()
     }
 
     /// The next page of a paged index as an `Index` follow-up carrying, as `listed_date`, the
@@ -509,7 +643,7 @@ impl OpenWebFeed {
     fn next_page_of(&self, request: &Request, raw: &RawBlob, rule: &Rule) -> Option<Request> {
         let paged = self.admitted_row(&request.url)?.paged.as_ref()?;
         let page = paged.page_of(&request.url)?;
-        let rows = paging::page_rows(&raw.bytes, rule, &self.rewrites)?;
+        let rows = paging::page_rows(&raw.bytes, rule, &self.keys)?;
         let reached = request
             .listed_date
             .as_deref()
@@ -524,6 +658,20 @@ impl OpenWebFeed {
         })
     }
 
+    /// The walk's own url of one release on the request's host: an index row with no listed value
+    /// is not one, so it is not dated by its page.
+    fn walked(&self, request: &Request, rule: &Rule) -> bool {
+        let Some(walk) = self
+            .admitted_row(&request.url)
+            .and_then(|row| row.walk.as_ref())
+        else {
+            return false;
+        };
+        host_and_path(&request.url)
+            .and_then(|(_, path)| release_of(&rule.path_prefix, &path))
+            .is_some_and(|release| walk.url_for(&release.date, release.id) == request.url)
+    }
+
     /// One article page, which is the one row a document payload holds.
     fn document_of(&self, request: &Request, raw: &RawBlob) -> Extracted {
         let Some(rule) = self.rule_of(request) else {
@@ -531,8 +679,22 @@ impl OpenWebFeed {
         };
         let page = parse::page(&raw.bytes, rule);
         let source_item_id = self.item_key(&request.url).unwrap_or_default();
-        let valid_raw = request.listed_date.clone().unwrap_or_default();
-        let valid = self.listed_publication(request);
+        // No index row listed a walked id, so its own page dates it (section 11.2).
+        let (valid, valid_raw, valid_field, dated_by) =
+            match (&request.listed_date, &rule.page_valid) {
+                (None, Some(page_valid)) if self.walked(request, rule) => {
+                    let text = page.valid.clone().unwrap_or_default();
+                    let valid = minute_containing(&text, &page_valid.format)
+                        .map_or(Published::Unknown, Published::AtMinute);
+                    (valid, text, page_valid.field.clone(), DecidedBy::Page)
+                }
+                (listed, _) => (
+                    self.listed_publication(request),
+                    listed.clone().unwrap_or_default(),
+                    rule.valid_field.clone(),
+                    DecidedBy::IndexRow,
+                ),
+            };
         let body = page
             .body
             .as_ref()
@@ -550,17 +712,17 @@ impl OpenWebFeed {
             title: page.title.unwrap_or_default(),
             valid,
             valid_raw,
-            valid_field: rule.valid_field.clone(),
+            valid_field,
             valid_source: ValidSource::VendorPublished,
             provenance: request.provenance,
             observed: None,
             body,
         };
-        // The url and the listed time both came from the index row; only the body is the page's.
+        // The url came from the index row or the walk; the time from the row unless the page dated it.
         let unusable = if item.source_item_id.is_empty() {
             Some((UnusableReason::BlankSourceItemId, DecidedBy::IndexRow))
         } else if item.valid == Published::Unknown {
-            Some((UnusableReason::NoParseableValidTime, DecidedBy::IndexRow))
+            Some((UnusableReason::NoParseableValidTime, dated_by))
         } else {
             page.body.err().map(|reason| (reason, DecidedBy::Page))
         };
@@ -583,7 +745,32 @@ impl OpenWebFeed {
             vendor_rows: 1,
             filtered_out: 0,
             robots_disallowed: 0,
+            walk: Vec::new(),
         }
+    }
+
+    /// Whether a document's 3xx moves its release to another language on its own host: GNW's
+    /// "id exists, language X, not fetched" (owner decision PG-D4, 2026-11-17).
+    fn moved_to_another_language(&self, request: &Request, response: &RawResponse) -> bool {
+        let (Some(row), Some(location)) = (
+            self.admitted_row(&request.url),
+            response.headers().first(news_provider::wire::LOCATION),
+        ) else {
+            return false;
+        };
+        self.rules
+            .get(&row.rule)
+            .filter(|rule| rule.story_key == StoryKey::Release)
+            .and_then(|rule| {
+                walk::moved_to(
+                    &self.keys,
+                    &row.host,
+                    &rule.path_prefix,
+                    &request.url,
+                    location,
+                )
+            })
+            .is_some()
     }
 }
 
@@ -693,6 +880,13 @@ impl Provider for OpenWebFeed {
                 },
                 RequestPhase::Document => Verdict::Usable,
             },
+            status
+                if REDIRECTS.contains(&status)
+                    && request.phase == RequestPhase::Document
+                    && self.moved_to_another_language(request, response) =>
+            {
+                Verdict::Empty
+            }
             TOO_MANY_REQUESTS | REQUEST_TIMEOUT => Verdict::TransientFailure,
             status if SERVER_ERRORS.contains(&status) => Verdict::TransientFailure,
             _ => Verdict::PermanentFailure,
@@ -744,17 +938,6 @@ impl Provider for OpenWebFeed {
             _ => Published::Unknown,
         }
     }
-}
-
-/// The one function behind `OpenWebFeed::item_key` and a paged index's page keys.
-pub(crate) fn item_key_under(rewrites: &BTreeMap<String, String>, url: &str) -> Option<String> {
-    let (host, path) = rewritten_under(rewrites, url)?;
-    Some(format!("{host}{path}"))
-}
-
-fn rewritten_under(rewrites: &BTreeMap<String, String>, url: &str) -> Option<(String, String)> {
-    let (host, path) = host_and_path(url)?;
-    Some((rewrites.get(&host).cloned().unwrap_or(host), path))
 }
 
 /// A url's lowercased host and its path (`/` when empty), without scheme, port, query or
@@ -827,6 +1010,18 @@ fn absolute(href: &str, base: &str) -> Option<String> {
 /// chrono's `%Y` reads `26` as the year 26 and `%H` reads `9` (review 2026-11-15). A value with
 /// seconds is refused by `Minute::new`. A format with an offset reprints at the value's own one.
 pub(crate) fn minute_of(raw: &str, format: &str) -> Option<Minute> {
+    Minute::new(read_exactly(raw, format)?).ok()
+}
+
+/// The minute holding a value `format` reads to the second, read as exactly as `minute_of` reads:
+/// 16 of 16 GNW pages' `og:article:published_time` fell in their RSS `pubDate`'s minute (§11.6).
+/// A fractional second is refused, by `Minute::new`.
+pub(crate) fn minute_containing(raw: &str, format: &str) -> Option<Minute> {
+    use chrono::Timelike;
+    Minute::new(read_exactly(raw, format)?.with_second(0)?).ok()
+}
+
+fn read_exactly(raw: &str, format: &str) -> Option<DateTime<Utc>> {
     use std::fmt::Write;
     let raw = raw.trim();
     let mut printed = String::new();
@@ -841,8 +1036,7 @@ pub(crate) fn minute_of(raw: &str, format: &str) -> Option<Minute> {
             naive.and_utc()
         }
     };
-    (printed == raw).then_some(())?;
-    Minute::new(instant).ok()
+    (printed == raw).then_some(instant)
 }
 
 fn empty_roster() -> FileDigest {
@@ -859,6 +1053,7 @@ fn nothing() -> Extracted {
         vendor_rows: 0,
         filtered_out: 0,
         robots_disallowed: 0,
+        walk: Vec::new(),
     }
 }
 

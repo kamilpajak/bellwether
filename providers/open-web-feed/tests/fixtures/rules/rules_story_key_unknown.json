@@ -1,0 +1,24 @@
+{
+  "schema": "open-web-feed.rules/1",
+  "rules": {
+    "gnw": {
+      "valid_field": "pubDate",
+      "valid_format": "%a, %d %b %Y %H:%M GMT",
+      "path_prefix": "/news-release/",
+      "story_key": "release_id",
+      "rewrite_hosts": {},
+      "title": {
+        "selector": "meta[property=\"og:title\"]",
+        "attribute": "content"
+      },
+      "canonical": {
+        "selector": "link[rel=\"canonical\"]",
+        "attribute": "href"
+      },
+      "body": {
+        "container": "div.main-body-container",
+        "paragraph": "p, li, figcaption"
+      }
+    }
+  }
+}

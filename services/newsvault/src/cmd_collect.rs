@@ -5,7 +5,7 @@
 //! The run envelope is on disk with `finished_at` null BEFORE the lease is attempted, so a run
 //! that dies holding nothing still left a record that it started (accepted attack A3.13).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,20 +17,22 @@ use news_provider::lag_policy::{LagPolicy, LagPolicyError};
 use news_provider::provider::{Cadence, Calendar, CalendarError, Listing, PlanRefusal, Provenance};
 use news_provider::request::RequestPhase;
 use news_provider::{
-    stamp_of, Archive, ArchiveError, AttemptReceipt, Clock, CollectError, Collected, CollectedItem,
-    Committed, Credentials, Exchange, Exit, Headers, Payload, Provider, Relisted, Run, RunId,
-    SourceId, TargetWindow, Wire,
+    stamp_of, Archive, ArchiveError, AttemptReceipt, AttemptRow, Clock, CollectError, Collected,
+    CollectedItem, Committed, Credentials, Exchange, Exit, Headers, Payload, Provider, Relisted,
+    Run, RunId, SourceId, TargetWindow, Wire,
 };
 use open_web_feed::{
     Basis, Continuity, CrossChecker, DirectAnswer, Generation, HostRobots, OpenWebFeed, Paging,
-    RobotsPin, GENERATION_HEADER,
+    RobotsPin, Walk, WalkBasis, WalkPlan, WalkRange, GENERATION_HEADER,
 };
 use pit::{MeasuredLag, ObservationTime};
 use serde_json::{json, Value};
 
 use crate::cmd_ledger::{Envelope, RunKind, RUN_ENVELOPE_SCHEMA};
 use crate::robots::{Robots, RobotsError};
-use crate::store::{Committer, IndexPayload, ItemRow, StoreError, POLICY_DIR, RUNS_DIR};
+use crate::store::{
+    Committer, IndexPayload, ItemRow, StoreError, WalkRecord, POLICY_DIR, RUNS_DIR,
+};
 
 /// `/2` since 2026-11-15: `calendar_version` became nullable, a type change, and `window`,
 /// `source` and `hosts_version` were added.
@@ -47,6 +49,9 @@ pub const TODAY: &str = "today";
 const PACE_FLOOR: Duration = Duration::from_secs(10);
 /// Section 11.2's option C match: `open_web_feed::normalised` titles, equal.
 const CROSS_CHECK_MATCH: &str = "normalised_title";
+/// A walked id GNW's CDN answers 410 for 30 days (owner decision 2026-11-17, section 11.2).
+const GONE: u16 = 410;
+const REDIRECTED: std::ops::RangeInclusive<u16> = 300..=399;
 
 /// What a caller asked `collect` for. `calendar` and `listing` are files for the same reason the
 /// rules file is one: a hashed input a second reader can reproduce. Which of the four optional
@@ -265,6 +270,9 @@ pub struct Driven {
     /// Each paged index's poll and how it joins its basis (section 11.2), or null: no paged
     /// index, or a dry run.
     pub continuity: Value,
+    /// Each walked index's poll, its range and what its ids answered (section 11.2), or null: no
+    /// walked index, or a dry run.
+    pub walk: Value,
 }
 
 /// The table of registered providers: per source, its credential and the files it takes beside
@@ -354,6 +362,8 @@ pub struct Opened {
     pub cross_checker: Option<CrossChecker>,
     /// The paged indexes and the basis each was handed, read before the lease.
     pub paged: Option<PagedPolls>,
+    /// The walked indexes and the range each was handed, read before the lease.
+    pub walked: Option<WalkedPolls>,
 }
 
 /// Section 11.2's paged indexes and, per page-1 url, the basis poll's keys handed to the feed.
@@ -361,6 +371,14 @@ pub struct Opened {
 pub struct PagedPolls {
     pub paging: Paging,
     pub basis: BTreeMap<String, Basis>,
+}
+
+/// Section 11.2's walked indexes and, per index url, what each poll walks; only a `WalkPlan::Range`
+/// is handed to the feed.
+#[derive(Debug, Clone)]
+pub struct WalkedPolls {
+    pub walk: Walk,
+    pub ranges: BTreeMap<String, WalkPlan>,
 }
 
 /// One admitted hosts row (section 11.2): its pin, its pinned robots body as read when the
@@ -468,6 +486,7 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
     }
     let mut cross_checker = None;
     let mut paged = None;
+    let mut walked = None;
     let (provider, file_versions, admitted_robots, lag): (Box<dyn Provider>, _, _, _) =
         match registered {
             Registered::EdgarPress => {
@@ -498,11 +517,19 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
                 let admitted = admitted_robots(&ask.store, &provider)?;
                 let paging = provider.paging();
                 let basis = basis_of(&ask.store, &paging)?;
+                let walk = provider.walk();
+                let ranges = ranges_of(&ask.store, &walk)?;
+                let handed = ranges
+                    .iter()
+                    .filter_map(|(url, plan)| Some((url.clone(), plan.range()?.clone())))
+                    .collect();
                 let provider = provider
                     .with_robots(handed_robots(&admitted))
-                    .with_basis(basis.clone());
+                    .with_basis(basis.clone())
+                    .with_walks(handed);
                 cross_checker = provider.cross_checker();
                 paged = Some(PagedPolls { paging, basis });
+                walked = Some(WalkedPolls { walk, ranges });
                 (
                     Box::new(provider),
                     (Some(version), Some(extraction)),
@@ -521,17 +548,64 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
         lag,
         cross_checker,
         paged,
+        walked,
     })
+}
+
+/// Each walked index's range (section 11.2): through the highest id the newest usable answer of
+/// the index lists, after the id the newest basis poll walked through. Read before the lease; a
+/// blob the store names and does not hold refuses the run, as a paged basis does.
+fn ranges_of(store: &Path, walk: &Walk) -> Result<BTreeMap<String, WalkPlan>, CollectRunError> {
+    let kept = basis_names();
+    let source = SourceId::new(open_web_feed::SOURCE);
+    let held = |digest: &str| -> Result<Vec<u8>, CollectRunError> {
+        crate::store::blob_bytes(store, digest)?.ok_or_else(|| {
+            StoreError::BlobAbsent {
+                digest: digest.to_owned(),
+            }
+            .into()
+        })
+    };
+    let mut ranges = BTreeMap::new();
+    for index_url in walk.index_urls() {
+        let read = crate::store::walk_read(store, &source, index_url, &kept)?;
+        let previous = read.previous.as_deref().map(held).transpose()?;
+        let basis = match &read.basis {
+            Some((through, digest)) => Some((*through, held(digest)?)),
+            None => None,
+        };
+        let answered = read
+            .answered
+            .iter()
+            .filter_map(|url| walk.release_id(index_url, url))
+            .collect();
+        let range = walk.range(
+            index_url,
+            previous.as_deref(),
+            basis.as_ref().map(|(walked_through, index)| WalkBasis {
+                walked_through: *walked_through,
+                index,
+            }),
+            answered,
+        );
+        ranges.insert(index_url.to_owned(), range);
+    }
+    Ok(ranges)
+}
+
+/// Every `Continuity` a next poll anchors to, by name.
+fn basis_names() -> Vec<&'static str> {
+    Continuity::ALL
+        .into_iter()
+        .filter(|arm| arm.is_basis())
+        .map(Continuity::name)
+        .collect()
 }
 
 /// Each paged index's basis: the pages of the newest poll whose continuity `is_basis`, in page
 /// order from page 1 (section 11.2). An index with none is read at page 1 only (`first_poll`).
 fn basis_of(store: &Path, paging: &Paging) -> Result<BTreeMap<String, Basis>, CollectRunError> {
-    let kept: Vec<&str> = Continuity::ALL
-        .into_iter()
-        .filter(|arm| arm.is_basis())
-        .map(Continuity::name)
-        .collect();
+    let kept = basis_names();
     let source = SourceId::new(open_web_feed::SOURCE);
     let mut basis = BTreeMap::new();
     for index_url in paging.index_urls() {
@@ -760,6 +834,7 @@ pub fn drive<A: Archive>(
         calendar_version: version_of(calendar.as_ref()),
         cross_check: Value::Null,
         continuity: Value::Null,
+        walk: Value::Null,
     })
 }
 
@@ -819,6 +894,9 @@ pub fn run(
     }
     if let Some(paged) = opened.paged.as_ref() {
         driven.continuity = continuity_of(&mut store, paged);
+    }
+    if let Some(walked) = opened.walked.as_ref() {
+        driven.walk = walk_of(&mut store, walked, &driven.collected);
     }
     let finished = Envelope {
         finished_at: Some(clock.now()),
@@ -958,6 +1036,138 @@ fn recorded(
         .record_continuity(&first.attempt_id, continuity.name(), boundaries)
         .map_err(|failure| read_failure("store_unwritable", failure.to_string()))?;
     Ok(Some((continuity, boundaries)))
+}
+
+/// Section 11.2: each walked index's poll in this run, written on its usable attempt. After the
+/// commit, so a store it cannot read or write is `error` here, the walk columns stay NULL ("not
+/// looked") and the run finishes. An index with no usable answer this run walked nothing.
+fn walk_of(store: &mut Committer, walked: &WalkedPolls, collected: &Collected) -> Value {
+    let source = SourceId::new(open_web_feed::SOURCE);
+    let read = store
+        .usable_index_pages(&source)
+        .and_then(|usable| Ok((usable, store.answered_document_urls(&source)?)));
+    let (usable, answered) = match read {
+        Ok(read) => read,
+        Err(failure) => {
+            return json!([{"error": read_failure("store_unreadable", failure.to_string())}])
+        }
+    };
+    let polls: Vec<Value> = walked
+        .walk
+        .index_urls()
+        .map(|index_url| {
+            let plan = walked.ranges.get(index_url);
+            let range = plan.and_then(WalkPlan::range);
+            let attempt = usable.iter().rev().find(|payload| payload.url == index_url);
+            let mut poll = json!({
+                "index_url": index_url,
+                "attempt_id": attempt.map(|payload| payload.attempt_id.clone()),
+                "after": range.map(WalkRange::after),
+                "through": range.map(WalkRange::through),
+                "date": range.map(WalkRange::date),
+                "asked": Value::Null,
+                "continuity": Value::Null,
+                "unread": Value::Null,
+                "gone": Value::Null,
+                "other_language": Value::Null,
+                "error": Value::Null,
+            });
+            let Some(attempt) = attempt else {
+                return poll;
+            };
+            let answered_ids: BTreeSet<u64> = answered
+                .iter()
+                .filter_map(|url| walked.walk.release_id(index_url, url))
+                .collect();
+            let (continuity, unread) = plan.map_or((Continuity::FirstPoll, Vec::new()), |plan| {
+                Walk::continuity(plan, &answered_ids)
+            });
+            let answers = range.map_or_else(BTreeMap::new, |range| {
+                walked_answers(&walked.walk, index_url, range, collected)
+            });
+            let mut gone = Vec::new();
+            let mut moved = Vec::new();
+            for (id, row) in &answers {
+                match row.transport_status {
+                    Some(GONE) => gone.push(*id),
+                    Some(status) if REDIRECTED.contains(&status) => {
+                        match moved_language(store, &walked.walk, index_url, row) {
+                            Ok(Some(language)) => {
+                                moved.push(json!({"id": id, "language": language}))
+                            }
+                            Ok(None) => {}
+                            Err(failure) => {
+                                poll["error"] = failure;
+                                return poll;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let record = WalkRecord {
+                continuity: continuity.name(),
+                through: range.map(|range| range.through().max(range.after())),
+                gone: count(gone.len()),
+                other_language: count(moved.len()),
+                unread: count(unread.len()),
+            };
+            match store.record_walk(&attempt.attempt_id, record) {
+                Ok(()) => {
+                    poll["asked"] = json!(answers.len());
+                    poll["continuity"] = json!(continuity.name());
+                    poll["unread"] = json!(unread);
+                    poll["gone"] = json!(gone);
+                    poll["other_language"] = json!(moved);
+                }
+                Err(failure) => {
+                    poll["error"] = read_failure("store_unwritable", failure.to_string());
+                }
+            }
+            poll
+        })
+        .collect();
+    json!(polls)
+}
+
+/// Each id this run walked under `range`, with its last attempt: a retried id keeps its final one.
+fn walked_answers<'a>(
+    walk: &Walk,
+    index_url: &str,
+    range: &WalkRange,
+    collected: &'a Collected,
+) -> BTreeMap<u64, &'a AttemptRow> {
+    collected
+        .attempts
+        .iter()
+        .filter(|row| row.phase == RequestPhase::Document.name())
+        .filter_map(|row| Some((walk.walked_id(index_url, range, &row.url)?, row)))
+        .collect()
+}
+
+/// The language a walked id's 3xx moved it to, read from its stored `location` (P9).
+fn moved_language(
+    store: &Committer,
+    walk: &Walk,
+    index_url: &str,
+    row: &AttemptRow,
+) -> Result<Option<String>, Value> {
+    let unreadable = |failure: String| read_failure("store_unreadable", failure);
+    let Some(payload) = store
+        .payload_of(&row.attempt_id)
+        .map_err(|failure| unreadable(failure.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let headers =
+        Headers::from_json(&payload.headers).map_err(|failure| unreadable(failure.to_string()))?;
+    Ok(headers
+        .first(news_provider::wire::LOCATION)
+        .and_then(|location| walk.moved_to(index_url, &row.url, location)))
+}
+
+fn count(of: usize) -> u32 {
+    u32::try_from(of).unwrap_or(u32::MAX)
 }
 
 /// What `cross_check_of` read from the store: the keyed bytes and the direct answers it compares.
@@ -1236,6 +1446,7 @@ fn planned(
         calendar_version: version_of(calendar_in),
         cross_check: Value::Null,
         continuity: Value::Null,
+        walk: Value::Null,
     };
     Ok(Answer {
         // A dry run answers the plan question and nothing else, so its exit is the plan's.
@@ -1356,6 +1567,7 @@ fn envelope_of(
         "seq_high_water": collected.seq_high_water,
         "cross_check": driven.cross_check,
         "continuity": driven.continuity,
+        "walk": driven.walk,
         "changed": changed && collected.tally.committed > 0,
         "exit": {
             "code": exit.code(),
@@ -1436,6 +1648,24 @@ pub fn render_human(envelope: &Value, out: &mut impl std::io::Write) -> std::io:
             out,
             "continuity       {} pages {pages} {state}{boundaries}",
             text(poll, "index_url")
+        )?;
+    }
+    for poll in envelope["walk"].as_array().unwrap_or(&none) {
+        let state = poll["continuity"]
+            .as_str()
+            .or_else(|| poll["error"]["code"].as_str())
+            .unwrap_or("no usable answer");
+        let listed = |field: &str| poll[field].as_array().map_or(0, Vec::len);
+        writeln!(
+            out,
+            "walk             {} ids {}..{} asked {} {state} unread {} gone {} other_language {}",
+            text(poll, "index_url"),
+            poll["after"],
+            poll["through"],
+            poll["asked"],
+            listed("unread"),
+            listed("gone"),
+            listed("other_language"),
         )?;
     }
     writeln!(
