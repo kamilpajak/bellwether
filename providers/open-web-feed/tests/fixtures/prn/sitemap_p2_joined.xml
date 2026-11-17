@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:news="http://www.google.com/schemas/sitemap-news/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1" xmlns:video="http://www.google.com/schemas/sitemap-video/1.1">
+  <url>
+    <loc>https://www.prnewswire.com/news-releases/syntax-earns-microsoft-agentic-business-solutions-specialization-302939056.html</loc>
+    <news:news>
+      <news:publication>
+        <news:name>PR Newswire</news:name>
+        <news:language>en</news:language>
+      </news:publication>
+      <news:genres>PressRelease</news:genres>
+      <news:publication_date>2026-11-17T09:00:00-05:00</news:publication_date>
+      <news:title>Syntax Earns Microsoft Agentic Business Solutions Specialization</news:title>
+      <news:keywords>Computer Software,Computer &amp; Electronics,Artificial Intelligence,Cloud Computing Internet of Things,Licensing </news:keywords>
+    </news:news>
+  </url>
+  <url>
+    <loc>https://www.prnewswire.com/news-releases/adp-national-employment-report-preliminary-estimate-for-october-31-2026-302941211.html</loc>
+    <news:news>
+      <news:publication>
+        <news:name>PR Newswire</news:name>
+        <news:language>en</news:language>
+      </news:publication>
+      <news:genres>PressRelease</news:genres>
+      <news:publication_date>2026-11-17T08:15:00-05:00</news:publication_date>
+      <news:title>ADP National Employment Report Preliminary Estimate for October 31, 2026</news:title>
+      <news:keywords>Banking &amp; Financial Services,Computer Software,Computer &amp; Electronics,Data Analytics,Financial Technology,Human Resource &amp; Workforce Management ,Surveys, Polls and Research ,Economic News, Trends, Analysis</news:keywords>
+      <news:stock_tickers>NASDAQ-NMS:ADP,NASDAQ:ADP</news:stock_tickers>
+    </news:news>
+  </url>
+</urlset>

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:news="http://www.google.com/schemas/sitemap-news/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1" xmlns:video="http://www.google.com/schemas/sitemap-video/1.1">
+  <url>
+    <loc>https://www.prnewswire.com/news-releases/a-decade-of-innovation-hope-and-healing-mercy-research-marks-milestone-302941680.html</loc>
+    <news:news>
+      <news:publication>
+        <news:name>PR Newswire</news:name>
+        <news:language>en</news:language>
+      </news:publication>
+      <news:genres>PressRelease</news:genres>
+      <news:publication_date>2026-11-17T09:01:00-05:00</news:publication_date>
+      <news:title>A Decade of Innovation, Hope and Healing: Mercy Research Marks Milestone</news:title>
+      <news:keywords>Medical Pharmaceuticals,Health Care &amp; Hospitals,Clinical Trials &amp; Medical Discoveries</news:keywords>
+    </news:news>
+  </url>
+  <url>
+    <loc>https://www.prnewswire.com/news-releases/txu-energy-commits-100-000-to-help-texas-families-stay-warm-and-supported-this-winter-302940948.html</loc>
+    <news:news>
+      <news:publication>
+        <news:name>PR Newswire</news:name>
+        <news:language>en</news:language>
+      </news:publication>
+      <news:genres>PressRelease</news:genres>
+      <news:publication_date>2026-11-17T09:00:00-05:00</news:publication_date>
+      <news:title>TXU Energy Commits $100,000 to Help Texas Families Stay Warm and Supported This Winter</news:title>
+      <news:keywords>Gas ,Oil &amp; Energy ,Utilities,Corporate Social Responsibility</news:keywords>
+      <news:stock_tickers>NYSE:VST</news:stock_tickers>
+    </news:news>
+  </url>
+  <url>
+    <loc>https://www.prnewswire.com/news-releases/syntax-earns-microsoft-agentic-business-solutions-specialization-302939056.html</loc>
+    <news:news>
+      <news:publication>
+        <news:name>PR Newswire</news:name>
+        <news:language>en</news:language>
+      </news:publication>
+      <news:genres>PressRelease</news:genres>
+      <news:publication_date>2026-11-17T09:00:00-05:00</news:publication_date>
+      <news:title>Syntax Earns Microsoft Agentic Business Solutions Specialization</news:title>
+      <news:keywords>Computer Software,Computer &amp; Electronics,Artificial Intelligence,Cloud Computing Internet of Things,Licensing </news:keywords>
+    </news:news>
+  </url>
+</urlset>

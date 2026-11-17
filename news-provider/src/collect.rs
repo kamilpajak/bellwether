@@ -6,7 +6,7 @@
 //! with no provider: [`Exchange`] is the socket, whose only implementation that opens one is
 //! [`Wire`], and [`Archive`] is the store door.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use pit::datedness::Published;
 use pit::ObservationTime;
@@ -438,8 +438,9 @@ pub fn collect<A: Archive>(
     };
     let mut queue = HostQueue::of(plan.requests);
     let mut ordinal = 0;
+    let mut issued = BTreeSet::new();
     while let Some(Queued { request, retries }) = queue.pop() {
-        let attempted = attempt_once(&driving, archive, &request, ordinal)?;
+        let attempted = attempt_once(&driving, archive, &request, ordinal, &mut issued)?;
         ordinal += 1;
         let retrying = Queued::retried(attempted.is_transient(), retries);
         collected.absorb(&attempted, retrying);
@@ -563,11 +564,14 @@ impl Attempted {
     }
 }
 
+/// `issued` holds the story of every follow-up this run issued: a second index listing one of them
+/// in the same run, PRN's sitemap beside its RSS (section 11.2), counts it as held.
 fn attempt_once<A: Archive>(
     driving: &Driving,
     archive: &mut A,
     request: &Request,
     ordinal: u32,
+    issued: &mut BTreeSet<String>,
 ) -> Result<Attempted, CollectError> {
     let Driving {
         provider,
@@ -653,24 +657,31 @@ fn attempt_once<A: Archive>(
         Some(extracted) if request.phase == RequestPhase::Index => {
             let matched = count(extracted.follow_ups.len());
             let archived = request.provenance == Provenance::VendorArchive;
-            let stories = if archived {
+            let mut stories = if archived {
                 archive.record_planned_coverage(&attempt_id, matched)?;
                 archive.covered_story_ids(&request.source, &request.target_window)?
             } else {
                 archive.held_story_ids(&request.source)?
             };
+            stories.extend(issued.iter().cloned());
             let listed = extracted.follow_ups.clone();
-            let issued = if matched == 0 {
+            let to_issue = if matched == 0 {
                 Vec::new()
             } else {
                 provider.follow_ups_to_issue(extracted.follow_ups, &stories)
             };
+            issued.extend(
+                to_issue
+                    .iter()
+                    .filter_map(|follow_up| provider.story_of(follow_up))
+                    .map(|story| story.hex().to_owned()),
+            );
             if !archived && refusal.is_none() {
-                let held = matched.saturating_sub(count(issued.len()));
+                let held = matched.saturating_sub(count(to_issue.len()));
                 archive.record_held(&attempt_id, held)?;
-                archive.record_relisted(&attempt_id, &relisted_of(provider, listed, &issued))?;
+                archive.record_relisted(&attempt_id, &relisted_of(provider, listed, &to_issue))?;
             }
-            issued
+            to_issue
         }
         _ => Vec::new(),
     };

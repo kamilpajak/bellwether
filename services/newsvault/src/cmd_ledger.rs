@@ -18,6 +18,7 @@ use crate::store::{
     coverage_up_to, newest_visible_publication, require_current_version, unpublished_seq_ranges,
     SeqRange, WindowCoverage, COMMIT_LOG, RUNS_DIR,
 };
+use open_web_feed::Continuity;
 
 pub const SCHEMA: &str = "newsvault.ledger/1";
 pub const RUN_ENVELOPE_SCHEMA: &str = "newsvault.run/1";
@@ -145,8 +146,45 @@ pub struct SourceRow {
     /// pinned robots.txt disallows their url, from `attempts.robots_disallowed`; never asked, so
     /// no attempt row. 0 also for an attempt closed before user_version 9.
     pub robots_disallowed: i64,
+    /// Section 11.2: paged index polls by `attempts.continuity`. Every arm but `complete` left a
+    /// stretch of the index not looked at; a poll that read no usable page is in none.
+    pub continuity: ContinuityCounts,
     pub items_new: i64,
     pub rows_committed: i64,
+}
+
+/// One count per `open_web_feed::Continuity` arm.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct ContinuityCounts {
+    pub complete: i64,
+    pub boundary_no_shared_key: i64,
+    pub no_previous_key: i64,
+    pub first_poll: i64,
+    pub next_page_unread: i64,
+}
+
+impl ContinuityCounts {
+    const fn of(counts: [i64; 5]) -> Self {
+        let [complete, boundary_no_shared_key, no_previous_key, first_poll, next_page_unread] =
+            counts;
+        Self {
+            complete,
+            boundary_no_shared_key,
+            no_previous_key,
+            first_poll,
+            next_page_unread,
+        }
+    }
+
+    const fn add(self, other: Self) -> Self {
+        Self {
+            complete: self.complete + other.complete,
+            boundary_no_shared_key: self.boundary_no_shared_key + other.boundary_no_shared_key,
+            no_previous_key: self.no_previous_key + other.no_previous_key,
+            first_poll: self.first_poll + other.first_poll,
+            next_page_unread: self.next_page_unread + other.next_page_unread,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -267,6 +305,7 @@ struct Grouped {
     relisted_disputed: i64,
     relisted_compared: i64,
     robots_disallowed: i64,
+    continuity: ContinuityCounts,
     items_new: i64,
 }
 
@@ -424,6 +463,7 @@ fn code_of(failure: &serde_json::Error) -> &'static str {
 /// answers with three HTTP calls at decision time: "is this vendor down for every name, or is
 /// this one name quiet?" - one aggregate over rows already on disk answers it for every name.
 fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerReadError> {
+    let [complete, boundary, no_previous, first, unread] = Continuity::ALL.map(Continuity::name);
     let mut statement = db.prepare(&format!(
         "SELECT run_id, source, COALESCE(outcome, '{IN_FLIGHT}') AS state, COUNT(*),
                 SUM(COALESCE(vendor_rows, 0)), SUM(COALESCE(items_new, 0)),
@@ -433,7 +473,10 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
                                WHERE p.attempt_id = attempts.attempt_id), 0)),
                 SUM((SELECT COUNT(*) FROM relisted r WHERE r.attempt_id = attempts.attempt_id)),
                 SUM(COALESCE(relisted_compared, 0)),
-                SUM(COALESCE(robots_disallowed, 0))
+                SUM(COALESCE(robots_disallowed, 0)),
+                SUM(continuity IS '{complete}'), SUM(continuity IS '{boundary}'),
+                SUM(continuity IS '{no_previous}'), SUM(continuity IS '{first}'),
+                SUM(continuity IS '{unread}')
          FROM attempts WHERE opened_at <= ?1
          GROUP BY run_id, source, state
          ORDER BY run_id, source, state"
@@ -453,6 +496,13 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
                 relisted_disputed: row.get(9)?,
                 relisted_compared: row.get(10)?,
                 robots_disallowed: row.get(11)?,
+                continuity: ContinuityCounts::of([
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                    row.get(16)?,
+                ]),
             })
         })?
         .collect::<Result<Vec<Grouped>, _>>()?;
@@ -627,6 +677,7 @@ fn day_row(
         row.relisted_disputed += entry.relisted_disputed;
         row.relisted_compared += entry.relisted_compared;
         row.robots_disallowed += entry.robots_disallowed;
+        row.continuity = row.continuity.add(entry.continuity);
         row.items_new += entry.items_new;
         match entry.state.as_str() {
             OUTCOME_OK => row.ok += entry.attempts,
@@ -698,6 +749,7 @@ impl SourceRow {
             relisted_disputed: 0,
             relisted_compared: 0,
             robots_disallowed: 0,
+            continuity: ContinuityCounts::default(),
             items_new: 0,
             rows_committed: 0,
         }
@@ -799,8 +851,10 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 out,
                 "  {:<14} ok {} empty {} failed {} interrupted {} in-flight {} \
                  vendor_rows {} held {} listing_unusable {} bodies_truncated {} \
-                 relisted_disputed {} relisted_compared {} robots_disallowed {} items_new {} \
-                 rows {}",
+                 relisted_disputed {} relisted_compared {} robots_disallowed {} \
+                 continuity_complete {} continuity_boundary_no_shared_key {} \
+                 continuity_no_previous_key {} continuity_first_poll {} \
+                 continuity_next_page_unread {} items_new {} rows {}",
                 row.source,
                 row.ok,
                 row.empty,
@@ -814,6 +868,11 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 row.relisted_disputed,
                 row.relisted_compared,
                 row.robots_disallowed,
+                row.continuity.complete,
+                row.continuity.boundary_no_shared_key,
+                row.continuity.no_previous_key,
+                row.continuity.first_poll,
+                row.continuity.next_page_unread,
                 row.items_new,
                 row.rows_committed
             )?;

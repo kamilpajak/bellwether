@@ -21,7 +21,9 @@ use news_provider::{
     Committed, Credentials, Exchange, Exit, Payload, Provider, Relisted, Run, RunId, SourceId,
     TargetWindow, Wire,
 };
-use open_web_feed::{CrossChecker, DirectAnswer, HostRobots, OpenWebFeed, RobotsPin};
+use open_web_feed::{
+    Basis, Continuity, CrossChecker, DirectAnswer, HostRobots, OpenWebFeed, Paging, RobotsPin,
+};
 use pit::{MeasuredLag, ObservationTime};
 use serde_json::{json, Value};
 
@@ -259,6 +261,9 @@ pub struct Driven {
     pub calendar_version: Option<String>,
     /// Section 11.2's option C for this run, or null: no cross-checker, or a dry run.
     pub cross_check: Value,
+    /// Each paged index's poll and how it joins its basis (section 11.2), or null: no paged
+    /// index, or a dry run.
+    pub continuity: Value,
 }
 
 /// The table of registered providers: per source, its credential and the files it takes beside
@@ -346,6 +351,15 @@ pub struct Opened {
     pub lag: Option<AppliedLag>,
     /// The keyed index's cross-check against the direct indexes (section 11.2, option C).
     pub cross_checker: Option<CrossChecker>,
+    /// The paged indexes and the basis each was handed, read before the lease.
+    pub paged: Option<PagedPolls>,
+}
+
+/// Section 11.2's paged indexes and, per page-1 url, the basis poll's keys handed to the feed.
+#[derive(Debug, Clone)]
+pub struct PagedPolls {
+    pub paging: Paging,
+    pub basis: BTreeMap<String, Basis>,
 }
 
 /// One admitted hosts row (section 11.2): its pin, its pinned robots body as read when the
@@ -452,6 +466,7 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
         });
     }
     let mut cross_checker = None;
+    let mut paged = None;
     let (provider, file_versions, admitted_robots, lag): (Box<dyn Provider>, _, _, _) =
         match registered {
             Registered::EdgarPress => {
@@ -480,8 +495,13 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
                 let version = provider.hosts_version().hex().to_owned();
                 let extraction = provider.extract_version().hex().to_owned();
                 let admitted = admitted_robots(&ask.store, &provider)?;
-                let provider = provider.with_robots(handed_robots(&admitted));
+                let paging = provider.paging();
+                let basis = basis_of(&ask.store, &paging)?;
+                let provider = provider
+                    .with_robots(handed_robots(&admitted))
+                    .with_basis(basis.clone());
                 cross_checker = provider.cross_checker();
+                paged = Some(PagedPolls { paging, basis });
                 (
                     Box::new(provider),
                     (Some(version), Some(extraction)),
@@ -499,7 +519,63 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
         admitted_robots,
         lag,
         cross_checker,
+        paged,
     })
+}
+
+/// Each paged index's basis: the pages of the newest poll whose continuity `is_basis`, in page
+/// order from page 1 (section 11.2). An index with none is read at page 1 only (`first_poll`).
+fn basis_of(store: &Path, paging: &Paging) -> Result<BTreeMap<String, Basis>, CollectRunError> {
+    let kept: Vec<&str> = Continuity::ALL
+        .into_iter()
+        .filter(|arm| arm.is_basis())
+        .map(Continuity::name)
+        .collect();
+    let source = SourceId::new(open_web_feed::SOURCE);
+    let mut basis = BTreeMap::new();
+    for index_url in paging.index_urls() {
+        let pages = crate::store::basis_pages(store, &source, index_url, &kept)?;
+        let mut bytes = Vec::new();
+        for (_, page) in poll_pages(paging, index_url, &pages) {
+            match crate::store::blob_bytes(store, &page.raw_blob)? {
+                Some(read) => bytes.push(read),
+                None => {
+                    return Err(StoreError::BlobAbsent {
+                        digest: page.raw_blob.clone(),
+                    }
+                    .into())
+                }
+            }
+        }
+        if let Some(read) = (!bytes.is_empty())
+            .then(|| paging.basis_of(index_url, &bytes))
+            .flatten()
+        {
+            basis.insert(index_url.to_owned(), read);
+        }
+    }
+    Ok(basis)
+}
+
+/// One poll's pages of the paged index at `index_url`: pages 1, 2, ... while each is there, the
+/// first payload of a page kept.
+fn poll_pages<'a>(
+    paging: &Paging,
+    index_url: &str,
+    payloads: &'a [IndexPayload],
+) -> Vec<(u32, &'a IndexPayload)> {
+    let mut by_page: BTreeMap<u32, &IndexPayload> = BTreeMap::new();
+    for payload in payloads {
+        if let Some(page) = paging.page_of(index_url, &payload.url) {
+            by_page.entry(page).or_insert(payload);
+        }
+    }
+    by_page
+        .into_iter()
+        .zip(1..)
+        .take_while(|((page, _), expected)| page == expected)
+        .map(|(read, _)| read)
+        .collect()
 }
 
 /// Each admitted row's pinned robots body, read from the store's blobs by digest when the
@@ -682,6 +758,7 @@ pub fn drive<A: Archive>(
         collected,
         calendar_version: version_of(calendar.as_ref()),
         cross_check: Value::Null,
+        continuity: Value::Null,
     })
 }
 
@@ -739,6 +816,9 @@ pub fn run(
     if let Some(checker) = opened.cross_checker.as_ref() {
         driven.cross_check = cross_check_of(&store, checker, &driven.collected);
     }
+    if let Some(paged) = opened.paged.as_ref() {
+        driven.continuity = continuity_of(&mut store, paged);
+    }
     let finished = Envelope {
         finished_at: Some(clock.now()),
         ..envelope
@@ -784,6 +864,74 @@ fn cross_check_of(store: &Committer, checker: &CrossChecker, collected: &Collect
         fields.insert("matching_rule".to_owned(), json!(CROSS_CHECK_MATCH));
     }
     checked
+}
+
+/// Section 11.2: each paged index's poll in this run, its continuity against the basis the feed
+/// was handed, recorded on its page-1 attempt. After the commit, so a store it cannot read or
+/// write is `error` here, the poll's column stays NULL ("not looked") and the run finishes.
+fn continuity_of(store: &mut Committer, paged: &PagedPolls) -> Value {
+    let source = SourceId::new(open_web_feed::SOURCE);
+    let read = store
+        .usable_index_pages(&source)
+        .and_then(|usable| Ok((usable, store.empty_index_pages(&source)?)));
+    let (payloads, empty) = match read {
+        Ok(read) => read,
+        Err(failure) => {
+            return json!([{"error": read_failure("store_unreadable", failure.to_string())}])
+        }
+    };
+    let polls: Vec<Value> = paged
+        .paging
+        .index_urls()
+        .map(|index_url| {
+            let pages = poll_pages(&paged.paging, index_url, &payloads);
+            let basis = paged.basis.get(index_url);
+            let mut poll = json!({
+                "index_url": index_url,
+                "attempt_id": pages.first().map(|(_, page)| page.attempt_id.clone()),
+                "pages_read": pages.iter().map(|(page, _)| *page).collect::<Vec<u32>>(),
+                "basis_keys": basis.map(|basis| basis.keys().len()),
+                "continuity": Value::Null,
+                "error": Value::Null,
+            });
+            let next = pages.last().and_then(|(page, _)| page.checked_add(1));
+            let ran_out = empty
+                .iter()
+                .any(|payload| paged.paging.page_of(index_url, &payload.url) == next);
+            match recorded(store, paged, index_url, &pages, ran_out, basis) {
+                Ok(continuity) => poll["continuity"] = json!(continuity.map(Continuity::name)),
+                Err(failure) => poll["error"] = failure,
+            }
+            poll
+        })
+        .collect();
+    json!(polls)
+}
+
+/// One poll's continuity, written on its page-1 attempt; `None` when it read no usable page.
+/// `ran_out`: the page after the last one read answered with no row.
+fn recorded(
+    store: &mut Committer,
+    paged: &PagedPolls,
+    index_url: &str,
+    pages: &[(u32, &IndexPayload)],
+    ran_out: bool,
+    basis: Option<&Basis>,
+) -> Result<Option<Continuity>, Value> {
+    let Some((_, first)) = pages.first() else {
+        return Ok(None);
+    };
+    let bytes = pages
+        .iter()
+        .map(|(_, page)| read_blob(store, &page.raw_blob))
+        .collect::<Result<Vec<Vec<u8>>, Value>>()?;
+    let continuity = paged.paging.continuity(index_url, &bytes, basis, ran_out);
+    if let Some(continuity) = continuity {
+        store
+            .record_continuity(&first.attempt_id, continuity.name())
+            .map_err(|failure| read_failure("store_unwritable", failure.to_string()))?;
+    }
+    Ok(continuity)
 }
 
 /// What `cross_check_of` read from the store: the keyed bytes and the direct answers it compares.
@@ -1061,6 +1209,7 @@ fn planned(
         collected: Collected::of_plan(&plan, &provider.source()),
         calendar_version: version_of(calendar_in),
         cross_check: Value::Null,
+        continuity: Value::Null,
     };
     Ok(Answer {
         // A dry run answers the plan question and nothing else, so its exit is the plan's.
@@ -1180,6 +1329,7 @@ fn envelope_of(
         "bytes_indexed": collected.bytes_indexed,
         "seq_high_water": collected.seq_high_water,
         "cross_check": driven.cross_check,
+        "continuity": driven.continuity,
         "changed": changed && collected.tally.committed > 0,
         "exit": {
             "code": exit.code(),
@@ -1241,6 +1391,18 @@ pub fn render_human(envelope: &Value, out: &mut impl std::io::Write) -> std::io:
             checked["listed_directly"],
             checked["not_compared"],
             checked["not_looked"]
+        )?;
+    }
+    for poll in envelope["continuity"].as_array().unwrap_or(&none) {
+        let pages = poll["pages_read"].as_array().map_or(0, Vec::len);
+        let state = poll["continuity"]
+            .as_str()
+            .or_else(|| poll["error"]["code"].as_str())
+            .unwrap_or("no usable page");
+        writeln!(
+            out,
+            "continuity       {} pages {pages} {state}",
+            text(poll, "index_url")
         )?;
     }
     writeln!(

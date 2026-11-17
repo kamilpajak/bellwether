@@ -1,0 +1,1 @@
+{"schema":"open-web-feed.hosts/2","hosts":[{"host":"www.newswire.ca","status":"admitted","index_url":"https://www.newswire.ca/sitemap-news.xml?page=1","rule":"cnw","robots":"ab9873af0f8c94c48918cd75345a8fc609665602dfcd96aa1e574881a34fb2a0","paged_index":{"index_url":"https://www.newswire.ca/sitemap-news.xml?page=1","rule":"prn_sitemap"}}]}

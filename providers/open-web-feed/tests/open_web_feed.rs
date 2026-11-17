@@ -20,8 +20,8 @@ use news_provider::{
     Verdict,
 };
 use open_web_feed::{
-    AdmittedPath, CrossChecker, DirectAnswer, HostPin, HostRobots, OpenWebFeed, Refusal, RobotsPin,
-    RobotsRules, CONTACT_CREDENTIAL, DIRECT_LEAD, LONGEST_POLL_PERIOD, SOURCE,
+    AdmittedPath, Basis, Continuity, CrossChecker, DirectAnswer, HostPin, HostRobots, OpenWebFeed,
+    Refusal, RobotsPin, RobotsRules, CONTACT_CREDENTIAL, DIRECT_LEAD, LONGEST_POLL_PERIOD, SOURCE,
 };
 use pit::datedness::{Minute, Published};
 use pit::ObservationTime;
@@ -89,6 +89,31 @@ const OUTSIDE_THE_CONTAINER: [&str; 5] = [
 ];
 const PRN_INDEX: &str = "https://www.prnewswire.com/rss/news-releases-list.rss";
 const PRN_HOST: &str = "www.prnewswire.com";
+/// PRN's paged index (section 11.2's completeness table), page 1 and page 2.
+const PRN_SITEMAP: &str = "https://www.prnewswire.com/sitemap-news.xml?page=1";
+const PRN_SITEMAP_PAGE_2: &str = "https://www.prnewswire.com/sitemap-news.xml?page=2";
+/// Probe10 (§11.6), 2026-11-17: page 1 at 12:00Z, 12:05Z and 14:05Z, pages 1 and 2 at 14:10Z,
+/// each cut to 3 of its 100 rows with every `image:image` dropped. 12:05Z's second row is
+/// 12:00Z's first; 14:10Z's page 2 shares its second row with 14:05Z and no row with its page 1.
+const PROBE10_1200: &str = "sitemap_p1_1200.xml";
+const PROBE10_1205: &str = "sitemap_p1_1205.xml";
+const PROBE10_1405: &str = "sitemap_p1_1405.xml";
+const PROBE10_1410: &str = "sitemap_p1_1410.xml";
+const PROBE10_1410_PAGE_2: &str = "sitemap_p2_1410.xml";
+/// 14:10Z page 1's oldest row, the value its page 2 must reach past.
+const PROBE10_1410_OLDEST: &str = "2026-11-17T09:00:00-05:00";
+/// Two probe10 rows listed at 09:00 ET, keys in no other fixture: a page whose oldest minute ties.
+const PRN_TIE_0900: &str = "sitemap_tie_0900.xml";
+/// Release 302939742 (page 10), then `rss_3_items.xml`'s three releases (page 12), of the
+/// 2026-11-17 08:17-08:21Z research pass, every `image:image` dropped.
+const PRN_SITEMAP_4_URLS: &str = "sitemap_news_4_urls.xml";
+const PRN_SITEMAP_ONLY_URL: &str = "https://www.prnewswire.com/news-releases/stark-future-closes-financing-round-in-excess-of-150-million-in-total-transactional-value-as-its-electric-motorcycles-overtake-combustion-on-the-world-stage-302939742.html";
+const PRN_SITEMAP_DATES: [&str; 4] = [
+    "2026-11-16T03:00:00-05:00",
+    "2026-11-14T12:48:00-05:00",
+    "2026-11-14T12:15:00-05:00",
+    "2026-11-14T12:01:00-05:00",
+];
 /// Items 2-4 of the 20 in the 2026-11-14 19:21:04 GMT feed. The first is a correction notice
 /// listed under release link 302913655 (§8 row R3).
 const PRN_REAL_INDEX: &str = "rss_3_items.xml";
@@ -753,16 +778,17 @@ fn a_target_other_than_the_run_day_is_refused_before_any_request() -> Outcome {
         );
     }
     let plan = provider.plan(&TargetWindow::new(RUN_DAY), None, None, at(RUN_AT))?;
-    assert_eq!(plan.requests.len(), 5);
+    assert_eq!(plan.requests.len(), 6);
     assert_eq!(plan.not_planned, Vec::new());
     Ok(())
 }
 
-/// Section 11.2's host order, one index each. Mutations 2026-11-16, the PRN row `candidate` and
-/// the GNW and PRN rows swapped: each red; 2026-11-17, the CNW, Fed and Yahoo rows `candidate`
-/// and CNW's index the RSS feed: each red.
+/// Section 11.2's host order, PRN's sitemap page 1 after its RSS. Mutations, each red: 2026-11-16
+/// the PRN row `candidate`, the GNW and PRN rows swapped; 2026-11-17 the CNW, Fed and Yahoo rows
+/// `candidate`, CNW's index the RSS feed, PRN's `paged_index` removed.
 #[test]
-fn the_committed_hosts_file_plans_gnw_then_prn_then_cnw_then_the_fed_then_yahoo() -> Outcome {
+fn the_committed_hosts_file_plans_gnw_then_prn_and_its_sitemap_then_cnw_then_the_fed_then_yahoo(
+) -> Outcome {
     let plan = provider()?.plan(&TargetWindow::new(RUN_DAY), None, None, at(RUN_AT))?;
     let urls: Vec<&str> = plan
         .requests
@@ -771,7 +797,14 @@ fn the_committed_hosts_file_plans_gnw_then_prn_then_cnw_then_the_fed_then_yahoo(
         .collect();
     assert_eq!(
         urls,
-        vec![GNW_INDEX, PRN_INDEX, CNW_INDEX, FED_INDEX, YAHOO_INDEX]
+        vec![
+            GNW_INDEX,
+            PRN_INDEX,
+            PRN_SITEMAP,
+            CNW_INDEX,
+            FED_INDEX,
+            YAHOO_INDEX
+        ]
     );
     Ok(())
 }
@@ -3297,6 +3330,470 @@ fn the_admitted_paths_are_each_admitted_index_with_its_query_and_its_rule_prefix
         path: path.to_owned(),
     });
     assert_eq!(paths, expected.to_vec());
+    Ok(())
+}
+
+// ---- PRN's paged sitemap (section 11.2) ----
+
+fn prn_sitemap_request(provider: &OpenWebFeed) -> Result<Request, Box<dyn std::error::Error>> {
+    let plan = provider.plan(&TargetWindow::new(RUN_DAY), None, None, at(RUN_AT))?;
+    plan.requests
+        .into_iter()
+        .find(|request| request.url == PRN_SITEMAP)
+        .ok_or_else(|| "the run day planned no PR Newswire sitemap".into())
+}
+
+/// The committed feed handed, as its PRN sitemap basis, the poll that read `pages`.
+fn based_on(pages: &[&str]) -> Result<OpenWebFeed, Box<dyn std::error::Error>> {
+    let feed = provider()?;
+    let read: Vec<Vec<u8>> = pages.iter().map(|page| prn(page)).collect();
+    let basis = feed
+        .paging()
+        .basis_of(PRN_SITEMAP, &read)
+        .ok_or("the basis pages do not parse")?;
+    Ok(feed.with_basis(BTreeMap::from([(PRN_SITEMAP.to_owned(), basis)])))
+}
+
+/// Each `Index` follow-up's url and `listed_date`.
+fn next_pages(extracted: &Extracted) -> Vec<(String, Option<String>)> {
+    extracted
+        .follow_ups
+        .iter()
+        .filter(|follow_up| follow_up.phase == RequestPhase::Index)
+        .map(|follow_up| (follow_up.url.clone(), follow_up.listed_date.clone()))
+        .collect()
+}
+
+/// How a poll that read `pages` joins the poll that read `basis_pages` (none: no basis), the page
+/// after the last one not answered.
+fn continuity(
+    pages: &[&str],
+    basis_pages: &[&str],
+) -> Result<Option<Continuity>, Box<dyn std::error::Error>> {
+    continuity_ending(pages, basis_pages, false)
+}
+
+/// `continuity`, with `ran_out`: the page after the last one read answered with no row.
+fn continuity_ending(
+    pages: &[&str],
+    basis_pages: &[&str],
+    ran_out: bool,
+) -> Result<Option<Continuity>, Box<dyn std::error::Error>> {
+    let paging = provider()?.paging();
+    let read = |names: &[&str]| -> Vec<Vec<u8>> { names.iter().map(|page| prn(page)).collect() };
+    let basis: Option<Basis> = (!basis_pages.is_empty())
+        .then(|| paging.basis_of(PRN_SITEMAP, &read(basis_pages)))
+        .flatten();
+    Ok(paging.continuity(PRN_SITEMAP, &read(pages), basis.as_ref(), ran_out))
+}
+
+/// Section 11.2: one item key rule for PRN's RSS and its sitemap, so a release both list is one
+/// story. Mutation 2026-11-17, the story keyed by the url as written: red.
+#[test]
+fn a_release_the_prn_rss_and_the_prn_sitemap_both_list_is_one_story() -> Outcome {
+    let provider = provider()?;
+    let stories = |extracted: Extracted| -> Vec<Option<String>> {
+        extracted
+            .follow_ups
+            .iter()
+            .map(|follow_up| {
+                provider
+                    .story_of(follow_up)
+                    .map(|story| story.hex().to_owned())
+            })
+            .collect()
+    };
+    let from_rss =
+        stories(provider.extract(&prn_index_request(&provider)?, &blob(prn(PRN_REAL_INDEX))));
+    let from_sitemap = stories(provider.extract(
+        &prn_sitemap_request(&provider)?,
+        &blob(prn(PRN_SITEMAP_4_URLS)),
+    ));
+    let expected: Vec<Option<String>> = PRN_LINKS
+        .iter()
+        .map(|link| {
+            story_id(SOURCE, link.trim_start_matches("https://"))
+                .ok()
+                .map(|story| story.hex().to_owned())
+        })
+        .collect();
+    assert_eq!(from_rss, expected);
+    assert_eq!(from_sitemap.get(1..), Some(expected.as_slice()));
+    Ok(())
+}
+
+/// A sitemap follow-up is dated and its item read under the sitemap's rule, an RSS follow-up of the
+/// same host under the RSS rule (`rule_of`). Mutation 2026-11-17, every PRN document read under
+/// the row's own rule: red.
+#[test]
+fn a_sitemap_follow_up_is_dated_by_its_publication_date_and_an_rss_one_by_its_pub_date() -> Outcome
+{
+    let provider = provider()?;
+    let listed = provider.extract(
+        &prn_sitemap_request(&provider)?,
+        &blob(prn(PRN_SITEMAP_4_URLS)),
+    );
+    let stark = listed
+        .follow_ups
+        .first()
+        .cloned()
+        .ok_or("the sitemap named no follow-up")?;
+    let item = only_item(&provider.extract(&stark, &blob(prn(PRN_FIGURE_PAGE))))?;
+    let rss_item =
+        only_item(&provider.extract(&prn_article_request(&provider)?, &blob(prn(PRN_ARTICLE))))?;
+    assert_eq!(
+        (
+            stark.url.as_str(),
+            stark.listed_date.as_deref(),
+            item.valid_field.as_str(),
+            item.valid_raw.as_str(),
+            item.valid,
+            rss_item.valid_field.as_str(),
+        ),
+        (
+            PRN_SITEMAP_ONLY_URL,
+            Some(PRN_SITEMAP_DATES[0]),
+            "news:publication_date",
+            PRN_SITEMAP_DATES[0],
+            Published::AtMinute(Minute::new("2026-11-16T08:00:00Z".parse()?)?),
+            "pubDate",
+        )
+    );
+    Ok(())
+}
+
+/// First poll on an empty store: no basis, so page 1 plans no page 2 and is `first_poll`.
+/// Mutation 2026-11-17, `next_page` asking page 2 with no basis: red.
+#[test]
+fn a_first_poll_reads_page_one_only_and_is_a_first_poll() -> Outcome {
+    let provider = provider()?;
+    let extracted = provider.extract(&prn_sitemap_request(&provider)?, &blob(prn(PROBE10_1200)));
+    assert_eq!(
+        (next_pages(&extracted), continuity(&[PROBE10_1200], &[])?),
+        (Vec::new(), Some(Continuity::FirstPoll))
+    );
+    Ok(())
+}
+
+/// Probe10 cycle 1 (12:05Z): page 1 shares a key with 12:00Z's, so the poll ends there complete.
+/// Mutation 2026-11-17, the basis key check dropped from `next_page`: red.
+#[test]
+fn a_page_one_sharing_a_key_with_the_basis_ends_a_complete_poll() -> Outcome {
+    let provider = based_on(&[PROBE10_1200])?;
+    let extracted = provider.extract(&prn_sitemap_request(&provider)?, &blob(prn(PROBE10_1205)));
+    assert_eq!(
+        (
+            next_pages(&extracted),
+            continuity(&[PROBE10_1205], &[PROBE10_1200])?
+        ),
+        (Vec::new(), Some(Continuity::Complete))
+    );
+    Ok(())
+}
+
+/// Probe10 14:10Z (§11.6): page 2 holds a 14:05Z key and shares none with page 1, so the poll is
+/// `boundary_no_shared_key`; page 1 alone is `next_page_unread`, or `no_previous_key` once page 2
+/// answered with no row. Mutations 2026-11-17, the boundary and the next-page checks dropped: red.
+#[test]
+fn the_1410_poll_reads_page_two_and_records_its_broken_boundary() -> Outcome {
+    let provider = based_on(&[PROBE10_1405])?;
+    let page_1 = provider.extract(&prn_sitemap_request(&provider)?, &blob(prn(PROBE10_1410)));
+    let planned = next_pages(&page_1);
+    let page_2_request = page_1
+        .follow_ups
+        .iter()
+        .find(|follow_up| follow_up.phase == RequestPhase::Index)
+        .cloned()
+        .ok_or("page 1 planned no page 2")?;
+    let page_2 = provider.extract(&page_2_request, &blob(prn(PROBE10_1410_PAGE_2)));
+    assert_eq!(
+        (
+            planned,
+            next_pages(&page_2),
+            continuity(&[PROBE10_1410, PROBE10_1410_PAGE_2], &[PROBE10_1405])?,
+            continuity(&[PROBE10_1410], &[PROBE10_1405])?,
+            continuity_ending(&[PROBE10_1410], &[PROBE10_1405], true)?,
+        ),
+        (
+            vec![(
+                PRN_SITEMAP_PAGE_2.to_owned(),
+                Some(PROBE10_1410_OLDEST.to_owned())
+            )],
+            Vec::new(),
+            Some(Continuity::BoundaryNoSharedKey),
+            Some(Continuity::NextPageUnread),
+            Some(Continuity::NoPreviousKey),
+        )
+    );
+    Ok(())
+}
+
+/// A page whose oldest row is older than every basis row cannot lead to one (pages list newest
+/// first), and a page newer than the page before it cannot either. Mutations 2026-11-17, each of
+/// the two stops dropped from `next_page`: each red.
+#[test]
+fn a_page_older_than_the_basis_or_newer_than_the_page_before_ends_the_poll() -> Outcome {
+    let provider = based_on(&[PROBE10_1205])?;
+    let page_1 = provider.extract(&prn_sitemap_request(&provider)?, &blob(prn(PROBE10_1410)));
+    let newer_request = Request {
+        url: PRN_SITEMAP_PAGE_2.to_owned(),
+        listed_date: Some("2026-11-17T08:15:00-05:00".to_owned()),
+        ..prn_sitemap_request(&provider)?
+    };
+    let newer = provider.extract(&newer_request, &blob(prn(PROBE10_1410)));
+    let past_the_basis = based_on(&[PROBE10_1410])?
+        .extract(&prn_sitemap_request(&provider)?, &blob(prn(PROBE10_1405)));
+    assert_eq!(
+        (
+            next_pages(&page_1).len(),
+            next_pages(&newer),
+            next_pages(&past_the_basis)
+        ),
+        (1, Vec::new(), Vec::new())
+    );
+    Ok(())
+}
+
+/// One minute can fill a page (107 releases at 09:00 ET on 2026-11-17, §11.6), so a page whose
+/// oldest minute ties the page before or the basis's oldest still plans the next. Mutations
+/// 2026-11-17, each tie read as a stop (`<` and `<=` swapped in `next_page`): each red.
+#[test]
+fn a_page_whose_oldest_minute_ties_the_page_before_or_the_basis_plans_the_next() -> Outcome {
+    let provider = based_on(&[PROBE10_1405])?;
+    let tied_request = Request {
+        url: PRN_SITEMAP_PAGE_2.to_owned(),
+        listed_date: Some(PROBE10_1410_OLDEST.to_owned()),
+        ..prn_sitemap_request(&provider)?
+    };
+    let tied_page = provider.extract(&tied_request, &blob(prn(PRN_TIE_0900)));
+    let tied_basis = based_on(&[PROBE10_1410])?
+        .extract(&prn_sitemap_request(&provider)?, &blob(prn(PRN_TIE_0900)));
+    assert_eq!(
+        (next_pages(&tied_page), next_pages(&tied_basis)),
+        (
+            vec![(
+                "https://www.prnewswire.com/sitemap-news.xml?page=3".to_owned(),
+                Some(PROBE10_1410_OLDEST.to_owned())
+            )],
+            vec![(
+                PRN_SITEMAP_PAGE_2.to_owned(),
+                Some(PROBE10_1410_OLDEST.to_owned())
+            )],
+        )
+    );
+    Ok(())
+}
+
+/// The per-document robots check (PR #46) reads a next page too. Mutation 2026-11-17, the robots
+/// check dropped from `next_page_of`: red.
+#[test]
+fn a_next_page_the_robots_disallow_is_not_planned() -> Outcome {
+    let rules: Arc<dyn RobotsRules> = Arc::new(Disallowing {
+        prefix: "/sitemap-news.xml?page=2".to_owned(),
+        asked: Mutex::new(Vec::new()),
+    });
+    let feed = based_on(&[PROBE10_1405])?;
+    let disallowing = handed(
+        OpenWebFeed::open(&hosts_path(), &rules_path(), CONTACT)?,
+        |host| {
+            if host == PRN_HOST {
+                HostRobots::Rules(rules.clone())
+            } else {
+                HostRobots::Absent
+            }
+        },
+    );
+    let basis = feed
+        .paging()
+        .basis_of(PRN_SITEMAP, &[prn(PROBE10_1405)])
+        .ok_or("no basis")?;
+    let disallowing = disallowing.with_basis(BTreeMap::from([(PRN_SITEMAP.to_owned(), basis)]));
+    let extracted = disallowing.extract(
+        &prn_sitemap_request(&disallowing)?,
+        &blob(prn(PROBE10_1410)),
+    );
+    assert_eq!(next_pages(&extracted), Vec::new());
+    Ok(())
+}
+
+/// The per-document robots check (PR #46) reads a PRN sitemap row on page 1 and on a next page.
+/// Mutations 2026-11-17, the check skipped for a `sitemap-news` url and for a next page: each red.
+#[test]
+fn a_prn_sitemap_row_the_robots_disallow_is_counted_and_not_fetched_on_any_page() -> Outcome {
+    let rules: Arc<dyn RobotsRules> = Arc::new(Disallowing {
+        prefix: "/news-releases/rapidscale-".to_owned(),
+        asked: Mutex::new(Vec::new()),
+    });
+    let feed = handed(
+        OpenWebFeed::open(&hosts_path(), &rules_path(), CONTACT)?,
+        |host| {
+            if host == PRN_HOST {
+                HostRobots::Rules(rules.clone())
+            } else {
+                HostRobots::Absent
+            }
+        },
+    );
+    let page_1_request = prn_sitemap_request(&feed)?;
+    let page_2_request = Request {
+        url: PRN_SITEMAP_PAGE_2.to_owned(),
+        listed_date: Some(PROBE10_1410_OLDEST.to_owned()),
+        ..page_1_request.clone()
+    };
+    let read = |request: &Request| {
+        let extracted = feed.extract(request, &blob(prn(PRN_TIE_0900)));
+        let followed: Vec<String> = extracted
+            .follow_ups
+            .iter()
+            .filter(|follow_up| follow_up.phase == RequestPhase::Document)
+            .map(|follow_up| follow_up.url.clone())
+            .collect();
+        (extracted.robots_disallowed, followed)
+    };
+    let only_sibling = vec![
+        "https://www.prnewswire.com/news-releases/mo-clamps-new-ownership-invests-to-accelerate-growth-302941569.html"
+            .to_owned(),
+    ];
+    assert_eq!(
+        (read(&page_1_request), read(&page_2_request)),
+        ((1, only_sibling.clone()), (1, only_sibling))
+    );
+    Ok(())
+}
+
+/// A next page is an index request: no story, issued whatever the held set holds, and no vendor
+/// row, so the seam's counts still add up over pages that plan one.
+#[test]
+fn a_next_page_is_never_a_story_nor_a_vendor_row() -> Outcome {
+    let provider = based_on(&[PROBE10_1405])?;
+    let page_1_request = prn_sitemap_request(&provider)?;
+    let page_1 = provider.extract(&page_1_request, &blob(prn(PROBE10_1410)));
+    let next = page_1
+        .follow_ups
+        .iter()
+        .find(|follow_up| follow_up.phase == RequestPhase::Index)
+        .cloned()
+        .ok_or("no next page")?;
+    let every_story: BTreeSet<String> = page_1
+        .follow_ups
+        .iter()
+        .filter_map(|follow_up| provider.story_of(follow_up))
+        .map(|story| story.hex().to_owned())
+        .collect();
+    let issued = provider.follow_ups_to_issue(page_1.follow_ups.clone(), &every_story);
+    let payloads = [
+        (page_1_request, blob(prn(PROBE10_1410))),
+        (next.clone(), blob(prn(PROBE10_1410_PAGE_2))),
+    ];
+    let subject = Subject {
+        target: TargetWindow::new(RUN_DAY),
+        calendar: None,
+        listing: None,
+        at: at(RUN_AT),
+        payloads: &payloads,
+    };
+    assert_eq!(
+        (
+            provider.story_of(&next),
+            issued,
+            breaches(&provider, &subject)
+        ),
+        (None, vec![next], Vec::new())
+    );
+    Ok(())
+}
+
+/// Page N is the stem and a plain decimal: no sign, no leading zero, nothing after it.
+#[test]
+fn a_page_url_names_its_page_only_as_a_plain_decimal_after_the_stem() -> Outcome {
+    let paging = provider()?.paging();
+    let pages: Vec<Option<u32>> = [
+        PRN_SITEMAP,
+        PRN_SITEMAP_PAGE_2,
+        "https://www.prnewswire.com/sitemap-news.xml?page=12",
+        "https://www.prnewswire.com/sitemap-news.xml?page=02",
+        "https://www.prnewswire.com/sitemap-news.xml?page=0",
+        "https://www.prnewswire.com/sitemap-news.xml?page=",
+        "https://www.prnewswire.com/sitemap-news.xml?page=2&x=1",
+        "https://www.prnewswire.com/sitemap-news.xml?page=+2",
+        PRN_INDEX,
+    ]
+    .iter()
+    .map(|url| paging.page_of(PRN_SITEMAP, url))
+    .collect();
+    assert_eq!(
+        pages,
+        vec![
+            Some(1),
+            Some(2),
+            Some(12),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None
+        ]
+    );
+    Ok(())
+}
+
+/// A paged index names page 1, reads a news sitemap, and its rule's format and the row's own read
+/// no value alike. Mutations 2026-11-17, the page=1, sitemap and overlap checks each removed: red.
+#[test]
+fn a_paged_index_not_at_page_one_not_a_sitemap_or_read_alike_with_its_row_is_refused() {
+    let refusals: Vec<Option<String>> = [
+        "paged_index_not_page_one.json",
+        "paged_index_rss_rule.json",
+        "paged_index_formats_overlap.json",
+        "paged_index_off_host.json",
+        "paged_index_unknown_field.json",
+    ]
+    .iter()
+    .map(|name| {
+        refusal_of(&hosts_fixture(name), &rules_path(), CONTACT).map(|refusal| match refusal {
+            Refusal::PagedIndexNotPageOne { .. } => "not_page_one".to_owned(),
+            Refusal::PagedIndexNotASitemap { .. } => "not_a_sitemap".to_owned(),
+            Refusal::IndexFormatsOverlap { .. } => "formats_overlap".to_owned(),
+            Refusal::IndexOffHost { .. } => "off_host".to_owned(),
+            Refusal::UnknownField { field, .. } => format!("unknown_field {field}"),
+            other => format!("{other:?}"),
+        })
+    })
+    .collect();
+    assert_eq!(
+        refusals,
+        [
+            "not_page_one",
+            "not_a_sitemap",
+            "formats_overlap",
+            "off_host",
+            "unknown_field page"
+        ]
+        .map(|named| Some(named.to_owned()))
+        .to_vec()
+    );
+}
+
+/// The committed PRN row's paged index is an admitted path its robots must allow (§11.2).
+#[test]
+fn the_committed_prn_row_asks_its_rss_its_sitemap_page_one_and_its_prefix() -> Outcome {
+    let paths: Vec<String> = provider()?
+        .admitted_paths()
+        .into_iter()
+        .filter(|path| path.host == PRN_HOST)
+        .map(|path| path.path)
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "/rss/news-releases-list.rss",
+            "/sitemap-news.xml?page=1",
+            "/news-releases/"
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    );
     Ok(())
 }
 

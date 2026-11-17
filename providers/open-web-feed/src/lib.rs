@@ -7,6 +7,7 @@
 mod crosscheck;
 mod depth;
 mod hosts;
+mod paging;
 mod parse;
 mod rules;
 mod strict;
@@ -36,6 +37,7 @@ pub use crate::crosscheck::{
 };
 pub use crate::hosts::RobotsPin;
 use crate::hosts::{read_hosts, HostRow, Hosts, Status, HOSTS_SCHEMA};
+pub use crate::paging::{Basis, Continuity, Paging};
 use crate::rules::{parse_rules, Rule, RULES_SCHEMA};
 
 pub const SOURCE: &str = "open_web_wires";
@@ -159,6 +161,30 @@ pub enum Refusal {
         key: String,
         host: String,
     },
+    /// Page N is page 1's url with N in place of its final `page=1` query pair (section 11.2).
+    #[error(
+        "the hosts file at {path} pages {host}'s index from {url}, which does not end in page=1"
+    )]
+    PagedIndexNotPageOne {
+        path: PathBuf,
+        host: String,
+        url: String,
+    },
+    #[error(
+        "the hosts file at {path} pages {host}'s index under rule {rule}, which is no news sitemap"
+    )]
+    PagedIndexNotASitemap {
+        path: PathBuf,
+        host: String,
+        rule: String,
+    },
+    /// A document's rule is the one whose valid format reads its listed value, so only one may.
+    #[error("the hosts file at {path} reads {host} under rules {rules}, whose formats read one value alike")]
+    IndexFormatsOverlap {
+        path: PathBuf,
+        host: String,
+        rules: String,
+    },
 }
 
 /// One hosts row as `OpenWebFeed::host_pins` hands it out. `host` is lowercased.
@@ -201,6 +227,8 @@ pub struct OpenWebFeed {
     rewrites: BTreeMap<String, String>,
     /// Keyed by lowercased host; a host absent here allows no follow-up.
     robots: BTreeMap<String, HostRobots>,
+    /// Keyed by a paged index's page-1 url; an index absent here is read at page 1 only.
+    basis: BTreeMap<String, Basis>,
 }
 
 impl OpenWebFeed {
@@ -241,6 +269,7 @@ impl OpenWebFeed {
             extract_version,
             rewrites,
             robots: BTreeMap::new(),
+            basis: BTreeMap::new(),
         })
     }
 
@@ -248,6 +277,27 @@ impl OpenWebFeed {
     #[must_use]
     pub fn with_robots(self, robots: BTreeMap<String, HostRobots>) -> Self {
         Self { robots, ..self }
+    }
+
+    /// Hands over each paged index's basis, keyed by its page-1 url, replacing any handed before.
+    #[must_use]
+    pub fn with_basis(self, basis: BTreeMap<String, Basis>) -> Self {
+        Self { basis, ..self }
+    }
+
+    /// Every admitted paged index, for the driver that finds its polls in the store.
+    #[must_use]
+    pub fn paging(&self) -> Paging {
+        Paging::new(
+            self.hosts
+                .admitted()
+                .filter_map(|row| {
+                    let paged = row.paged.as_ref()?;
+                    Some((paged.clone(), self.rules.get(&paged.rule)?.clone()))
+                })
+                .collect(),
+            self.rewrites.clone(),
+        )
     }
 
     /// Whether `url`'s host's handed robots allow its path with params and query, the same
@@ -270,7 +320,9 @@ impl OpenWebFeed {
             .admitted()
             .flat_map(|row| {
                 let prefix = self.rules.get(&row.rule).map(|rule| &rule.path_prefix);
+                let paged = row.paged.as_ref().map(|paged| &paged.index_target);
                 std::iter::once(&row.index_target)
+                    .chain(paged)
                     .chain(prefix)
                     .map(|path| AdmittedPath {
                         host: row.host.clone(),
@@ -345,13 +397,11 @@ impl OpenWebFeed {
     /// url with no host this crate can read. A page's canonical link never reaches it.
     #[must_use]
     pub fn item_key(&self, url: &str) -> Option<String> {
-        let (host, path) = self.rewritten(url)?;
-        Some(format!("{host}{path}"))
+        item_key_under(&self.rewrites, url)
     }
 
     fn rewritten(&self, url: &str) -> Option<(String, String)> {
-        let (host, path) = host_and_path(url)?;
-        Some((self.rewrites.get(&host).cloned().unwrap_or(host), path))
+        rewritten_under(&self.rewrites, url)
     }
 
     fn admitted_row(&self, url: &str) -> Option<&HostRow> {
@@ -359,17 +409,31 @@ impl OpenWebFeed {
         self.hosts.admitted().find(|row| row.host == host)
     }
 
-    fn rule_for(&self, url: &str) -> Option<&Rule> {
-        self.rules.get(&self.admitted_row(url)?.rule)
+    /// An index page of a row's paged index is read under its rule; a document whose listed value
+    /// that rule's format reads came from it; anything else is read under the row's own rule.
+    fn rule_of(&self, request: &Request) -> Option<&Rule> {
+        let row = self.admitted_row(&request.url)?;
+        let paged = row.paged.as_ref().and_then(|paged| {
+            let rule = self.rules.get(&paged.rule)?;
+            let listed_by_it = match request.phase {
+                RequestPhase::Index => paged.page_of(&request.url).is_some(),
+                RequestPhase::Document => request
+                    .listed_date
+                    .as_deref()
+                    .is_some_and(|raw| minute_of(raw, &rule.valid_format).is_some()),
+            };
+            listed_by_it.then_some(rule)
+        });
+        paged.or_else(|| self.rules.get(&row.rule))
     }
 
-    fn index_request(&self, row: &HostRow, window: &TargetWindow) -> Request {
+    fn index_request(&self, url: &str, window: &TargetWindow) -> Request {
         Request {
             source: SourceId::new(SOURCE),
             target_window: window.clone(),
             phase: RequestPhase::Index,
             provenance: Provenance::LiveIngest,
-            url: row.index_url.clone(),
+            url: url.to_owned(),
             headers: Vec::new(),
             params: Vec::new(),
             universe_version: empty_roster(),
@@ -384,8 +448,7 @@ impl OpenWebFeed {
     /// follow-up unless the host's robots disallow its url (`robots_disallowed`); the raw
     /// publication value rides `listed_date`, never sent.
     fn index_rows_of(&self, request: &Request, raw: &RawBlob) -> Extracted {
-        let (Some(rule), Some((host, _))) =
-            (self.rule_for(&request.url), host_and_path(&request.url))
+        let (Some(rule), Some((host, _))) = (self.rule_of(request), host_and_path(&request.url))
         else {
             return nothing();
         };
@@ -430,6 +493,7 @@ impl OpenWebFeed {
                 None => filtered_out += 1,
             }
         }
+        follow_ups.extend(self.next_page_of(request, raw, rule));
         Extracted {
             items: Vec::new(),
             follow_ups,
@@ -440,9 +504,29 @@ impl OpenWebFeed {
         }
     }
 
+    /// The next page of a paged index as an `Index` follow-up carrying, as `listed_date`, the
+    /// listed text of this page's oldest row; never a vendor row (section 11.2).
+    fn next_page_of(&self, request: &Request, raw: &RawBlob, rule: &Rule) -> Option<Request> {
+        let paged = self.admitted_row(&request.url)?.paged.as_ref()?;
+        let page = paged.page_of(&request.url)?;
+        let rows = paging::page_rows(&raw.bytes, rule, &self.rewrites)?;
+        let reached = request
+            .listed_date
+            .as_deref()
+            .and_then(|raw| minute_of(raw, &rule.valid_format));
+        let basis = self.basis.get(&paged.index_url);
+        let (next, oldest) = paging::next_page(page, &rows, reached, basis)?;
+        let url = paged.page_url(next);
+        self.robots_allow(&url).then(|| Request {
+            url,
+            listed_date: Some(oldest),
+            ..request.clone()
+        })
+    }
+
     /// One article page, which is the one row a document payload holds.
     fn document_of(&self, request: &Request, raw: &RawBlob) -> Extracted {
-        let Some(rule) = self.rule_for(&request.url) else {
+        let Some(rule) = self.rule_of(request) else {
             return nothing();
         };
         let page = parse::page(&raw.bytes, rule);
@@ -548,8 +632,8 @@ impl Provider for OpenWebFeed {
         Cadence::EveryUtcDay
     }
 
-    /// One `Index` request per admitted host for the run's UTC day; any other window is refused
-    /// before any request (section 11.1, §8 row R10).
+    /// One `Index` request per admitted host's index, and one for page 1 of its paged index, for
+    /// the run's UTC day; any other window is refused before any request (section 11.1, §8 R10).
     fn plan(
         &self,
         target: &TargetWindow,
@@ -576,7 +660,12 @@ impl Provider for OpenWebFeed {
             requests: self
                 .hosts
                 .admitted()
-                .map(|row| self.index_request(row, &window))
+                .flat_map(|row| {
+                    let paged = row.paged.as_ref().map(|paged| &paged.index_url);
+                    std::iter::once(&row.index_url)
+                        .chain(paged)
+                        .map(|url| self.index_request(url, &window))
+                })
                 .collect(),
             not_planned: Vec::new(),
         })
@@ -592,7 +681,7 @@ impl Provider for OpenWebFeed {
             }
             Err(_) => return Verdict::TransientFailure,
         };
-        let Some(rule) = self.rule_for(&request.url) else {
+        let Some(rule) = self.rule_of(request) else {
             return Verdict::PermanentFailure;
         };
         match response.status() {
@@ -622,7 +711,8 @@ impl Provider for OpenWebFeed {
     }
 
     /// Every follow-up is live, and one whose story is in the held set is dropped (section 11.1).
-    /// A follow-up with no `story_of` is always issued: a skip we cannot justify is a hole.
+    /// A follow-up with no `story_of`, a next index page among them, is always issued: a skip we
+    /// cannot justify is a hole.
     fn follow_ups_to_issue(
         &self,
         follow_ups: Vec<Request>,
@@ -637,23 +727,34 @@ impl Provider for OpenWebFeed {
             .collect()
     }
 
+    /// A document's story; an index page names none.
     fn story_of(&self, follow_up: &Request) -> Option<Digest> {
-        canon::digest::story_id(SOURCE, &self.item_key(&follow_up.url)?).ok()
+        (follow_up.phase == RequestPhase::Document)
+            .then(|| canon::digest::story_id(SOURCE, &self.item_key(&follow_up.url)?).ok())
+            .flatten()
     }
 
-    /// The index row's publication text under its host rule's exact minute format (section 11.1),
-    /// which `document_of` dates the item by.
+    /// The index row's publication text under the exact minute format of the rule that listed it
+    /// (section 11.1), which `document_of` dates the item by.
     fn listed_publication(&self, follow_up: &Request) -> Published {
-        match (
-            self.rule_for(&follow_up.url),
-            follow_up.listed_date.as_deref(),
-        ) {
+        match (self.rule_of(follow_up), follow_up.listed_date.as_deref()) {
             (Some(rule), Some(raw)) => {
                 minute_of(raw, &rule.valid_format).map_or(Published::Unknown, Published::AtMinute)
             }
             _ => Published::Unknown,
         }
     }
+}
+
+/// The one function behind `OpenWebFeed::item_key` and a paged index's page keys.
+pub(crate) fn item_key_under(rewrites: &BTreeMap<String, String>, url: &str) -> Option<String> {
+    let (host, path) = rewritten_under(rewrites, url)?;
+    Some(format!("{host}{path}"))
+}
+
+fn rewritten_under(rewrites: &BTreeMap<String, String>, url: &str) -> Option<(String, String)> {
+    let (host, path) = host_and_path(url)?;
+    Some((rewrites.get(&host).cloned().unwrap_or(host), path))
 }
 
 /// A url's lowercased host and its path (`/` when empty), without scheme, port, query or

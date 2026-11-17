@@ -512,6 +512,80 @@ fn the_human_ledger_states_the_robots_disallowed_count_of_the_json_row() -> Test
     Ok(())
 }
 
+/// Section 11.2: each `attempts.continuity` value is counted under its own name, in the JSON row
+/// and on the human line, and an attempt with none counts nowhere; 1 to 5 of each, so a swap shows.
+/// Mutations 2026-11-17, two `SUM`s swapped and the human line printing `complete` twice: each red.
+#[test]
+fn every_continuity_value_is_counted_under_its_own_name_in_json_and_human() -> TestResult {
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    db.execute_batch(
+        "CREATE TEMP TABLE copied AS SELECT * FROM attempts WHERE attempt_id = 'a-0701-edgar-3';",
+    )?;
+    for copy in 4..16 {
+        db.execute(
+            "UPDATE copied SET attempt_id = ?1",
+            [format!("a-0701-edgar-{copy}")],
+        )?;
+        db.execute("INSERT INTO attempts SELECT * FROM copied", [])?;
+    }
+    let names = [
+        "complete",
+        "boundary_no_shared_key",
+        "no_previous_key",
+        "first_poll",
+        "next_page_unread",
+    ];
+    let mut attempt = 0;
+    for (count, name) in (1..).zip(names) {
+        for _ in 0..count {
+            db.execute(
+                "UPDATE attempts SET continuity = ?1 WHERE attempt_id = ?2",
+                [name.to_owned(), format!("a-0701-edgar-{attempt}")],
+            )?;
+            attempt += 1;
+        }
+    }
+    drop(db);
+    let day = "2026-07-01";
+    let json = over(&root, day, day)?.json()?;
+    let counted: Vec<Option<i64>> = names
+        .iter()
+        .map(|name| {
+            per_source(&json, day, EDGAR)
+                .and_then(|edgar| edgar.get("continuity"))
+                .and_then(|counts| counts.get(*name))
+                .and_then(Value::as_i64)
+        })
+        .collect();
+    let human = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .arg("ledger")
+        .args(["--store", &root.path().to_string_lossy()])
+        .args(["--at", AT, "--format", "human"])
+        .args(["--from", day, "--to", day])
+        .output()?
+        .stdout;
+    let line = String::from_utf8(human)?
+        .lines()
+        .find(|line| line.trim_start().starts_with(EDGAR))
+        .map(str::to_owned)
+        .ok_or("no human line names the source")?;
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let shown: Vec<Option<i64>> = names
+        .iter()
+        .map(|name| {
+            words
+                .iter()
+                .position(|word| *word == format!("continuity_{name}"))
+                .and_then(|at| words.get(at + 1))
+                .and_then(|word| word.parse().ok())
+        })
+        .collect();
+    let expected = vec![Some(1), Some(2), Some(3), Some(4), Some(5)];
+    assert_eq!((counted, shown), (expected.clone(), expected));
+    Ok(())
+}
+
 /// Section 10: `--check` does not subtract `robots_disallowed`, so a day whose every vendor row
 /// robots refused still exits 1. Mutation 2026-11-17, the count subtracted: green to exit 0.
 #[test]

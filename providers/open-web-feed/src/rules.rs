@@ -251,6 +251,16 @@ fn reads_a_minute(format: &str) -> bool {
     }
 }
 
+/// Whether `reader`'s format reads the probe minute as `printer`'s format prints it: one host's two
+/// indexes are told apart by the spelling of a listed value, so neither may read the other's.
+pub(crate) fn reads_the_other(printer: &Rule, reader: &Rule) -> bool {
+    let (year, month, day, hour, minute) = PROBE_MINUTE;
+    NaiveDate::from_ymd_opt(year, month, day)
+        .and_then(|date| date.and_hms_opt(hour, minute, 0))
+        .and_then(|probe| printed(probe, &printer.valid_format))
+        .is_some_and(|text| minute_of(&text, &reader.valid_format).is_some())
+}
+
 /// At offset zero, so a format holding `%:z` prints too and reads back as the same instant.
 fn printed(at: NaiveDateTime, format: &str) -> Option<String> {
     use std::fmt::Write;
