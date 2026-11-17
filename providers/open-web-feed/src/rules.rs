@@ -45,7 +45,9 @@ const PROBE_SECOND: u32 = 31;
 pub(crate) struct ProviderKeys {
     pub(crate) image_key_after: String,
     pub(crate) follow: BTreeSet<String>,
-    pub(crate) cross_check: BTreeSet<String>,
+    /// Each key to the lowercased host whose admitted index answers for its rows; `open` refuses
+    /// a host no other admitted row holds.
+    pub(crate) cross_check: BTreeMap<String, String>,
 }
 
 impl ProviderKeys {
@@ -268,26 +270,35 @@ fn provider_keys(
         .and_then(Value::as_str)
         .filter(|mark| mark.len() > 1 && mark.ends_with('/'))
         .ok_or_else(|| unparseable("image_key_after names no mark ending in /".to_owned()))?;
-    let list = |name: &str| -> Result<BTreeSet<String>, Refusal> {
-        let listed = keys
-            .get(name)
-            .and_then(Value::as_array)
-            .ok_or_else(|| unparseable(format!("provider_keys has no {name} list")))?;
-        listed
-            .iter()
-            .map(|key| {
-                key.as_str()
-                    .filter(|key| !key.is_empty() && !key.contains('/'))
-                    .map(str::to_owned)
-                    .ok_or_else(|| unparseable(format!("{name} holds {key}, which is no key")))
-            })
-            .collect()
+    let key = |name: &str, key: &str| {
+        (!key.is_empty() && !key.contains('/'))
+            .then(|| key.to_owned())
+            .ok_or_else(|| unparseable(format!("{name} holds {key}, which is no key")))
     };
-    let (follow, cross_check) = (list("follow")?, list("cross_check")?);
+    let follow = keys
+        .get("follow")
+        .and_then(Value::as_array)
+        .ok_or_else(|| unparseable("provider_keys has no follow list".to_owned()))?
+        .iter()
+        .map(|listed| key("follow", listed.as_str().unwrap_or_default()))
+        .collect::<Result<BTreeSet<String>, Refusal>>()?;
+    let cross_check = keys
+        .get("cross_check")
+        .and_then(Value::as_object)
+        .ok_or_else(|| unparseable("provider_keys has no cross_check object".to_owned()))?
+        .iter()
+        .map(|(named, host)| {
+            let host = host
+                .as_str()
+                .filter(|host| !host.is_empty())
+                .ok_or_else(|| unparseable(format!("cross_check maps {named} to no host")))?;
+            Ok((key("cross_check", named)?, host.to_ascii_lowercase()))
+        })
+        .collect::<Result<BTreeMap<String, String>, Refusal>>()?;
     if follow.is_empty() {
         return Err(unparseable("provider_keys follows no key".to_owned()));
     }
-    if let Some(both) = follow.intersection(&cross_check).next() {
+    if let Some(both) = follow.iter().find(|key| cross_check.contains_key(*key)) {
         return Err(unparseable(format!(
             "{both} is both followed and cross-checked"
         )));

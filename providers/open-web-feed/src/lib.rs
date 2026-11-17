@@ -31,7 +31,7 @@ use pit::ObservationTime;
 use serde_json::{Map, Value};
 
 pub use crate::crosscheck::{
-    normalised, CrossCheck, CrossChecker, DirectAnswer, Unlisted, DIRECT_LEAD,
+    normalised, CrossCheck, CrossChecker, DirectAnswer, Unlisted, DIRECT_LEAD, LONGEST_POLL_PERIOD,
 };
 pub use crate::hosts::RobotsPin;
 use crate::hosts::{read_hosts, HostRow, Hosts, Status, HOSTS_SCHEMA};
@@ -147,6 +147,17 @@ pub enum Refusal {
         rule: String,
         format: String,
     },
+    /// Section 11.2: a `cross_check` key's rows are "not looked" until its host's index answers,
+    /// so a host no other admitted row holds would leave them unlooked forever.
+    #[error(
+        "the rules at {path} map rule {rule}'s cross_check key {key} to {host}, which no other admitted hosts row holds"
+    )]
+    CrossCheckHostNotAdmitted {
+        path: PathBuf,
+        rule: String,
+        key: String,
+        host: String,
+    },
 }
 
 /// One hosts row as `OpenWebFeed::host_pins` hands it out. `host` is lowercased.
@@ -204,8 +215,10 @@ impl OpenWebFeed {
                 why: format!("the extraction version has no canonical form: {error}"),
             }
         })?;
+        let hosts = read_hosts(hosts, &parsed)?;
+        cross_checked_hosts_admitted(&hosts, &parsed, rules)?;
         Ok(Self {
-            hosts: read_hosts(hosts, &parsed)?,
+            hosts,
             rules: parsed,
             rules_version,
             extract_version,
@@ -260,11 +273,20 @@ impl OpenWebFeed {
             .filter(|row| row.host != keyed.host)
             .filter_map(|row| Some((row.index_url.clone(), self.rules.get(&row.rule)?.clone())))
             .collect();
+        let index_of = keys
+            .cross_check
+            .iter()
+            .filter_map(|(key, host)| {
+                let row = self.hosts.admitted().find(|row| row.host == *host)?;
+                Some((key.clone(), row.index_url.clone()))
+            })
+            .collect();
         Some(CrossChecker::new(
             keyed.index_url.clone(),
             rule.clone(),
             keys.clone(),
             direct,
+            index_of,
         ))
     }
 
@@ -699,6 +721,36 @@ pub(crate) fn known_fields(
         }),
         None => Ok(()),
     }
+}
+
+/// Every `cross_check` host of an admitted row's rule is another admitted row's host.
+fn cross_checked_hosts_admitted(
+    hosts: &Hosts,
+    rules: &BTreeMap<String, Rule>,
+    path: &Path,
+) -> Result<(), Refusal> {
+    for keyed in hosts.admitted() {
+        let Some(keys) = rules
+            .get(&keyed.rule)
+            .and_then(|rule| rule.provider_keys.as_ref())
+        else {
+            continue;
+        };
+        for (key, host) in &keys.cross_check {
+            let admitted = hosts
+                .admitted()
+                .any(|row| row.host == *host && row.host != keyed.host);
+            if !admitted {
+                return Err(Refusal::CrossCheckHostNotAdmitted {
+                    path: path.to_path_buf(),
+                    rule: keyed.rule.clone(),
+                    key: key.clone(),
+                    host: host.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A site operator needs somebody to reach before blocking us, so an address is required.
