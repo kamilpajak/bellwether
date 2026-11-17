@@ -11,12 +11,14 @@ use serde_json::{Map, Value};
 use chrono::{NaiveDate, NaiveDateTime};
 use news_provider::HostKey;
 
-use crate::{known_fields, minute_of, plain_path, strict, Refusal};
+use crate::{known_fields, minute_containing, minute_of, plain_path, strict, Refusal};
 
 pub(crate) const RULES_SCHEMA: &str = "open-web-feed.rules/1";
 const TOP: [&str; 2] = ["schema", "rules"];
-const RULE: [&str; 9] = [
+const RULE: [&str; 11] = [
     "index",
+    "story_key",
+    "page_valid",
     "provider_keys",
     "valid_field",
     "valid_format",
@@ -27,6 +29,9 @@ const RULE: [&str; 9] = [
     "body",
 ];
 const PICK: [&str; 2] = ["selector", "attribute"];
+const PAGE_VALID: [&str; 4] = ["selector", "attribute", "field", "format"];
+/// `story_key`'s one value besides the default url path (section 11.2, GNW row).
+const RELEASE: &str = "release";
 const BODY: [&str; 2] = ["container", "paragraph"];
 const PROVIDER_KEYS: [&str; 3] = ["image_key_after", "follow", "cross_check"];
 const RSS: &str = "rss";
@@ -67,6 +72,26 @@ pub(crate) struct Pick {
     pub(crate) attribute: String,
 }
 
+/// What a story is keyed by (section 11.1's `item_key`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoryKey {
+    /// The rewritten host and the url path, as every rule before GNW's walk.
+    UrlPath,
+    /// `(release id, language)` read from `<path_prefix><y>/<m>/<d>/<id>/<n>/<language>/<slug>`:
+    /// GNW serves one release under any slug and any date (owner decision 2026-11-17).
+    Release,
+}
+
+/// A page's own publication time, read when no index row listed one (GNW's id walk).
+#[derive(Debug, Clone)]
+pub(crate) struct PageValid {
+    pub(crate) pick: Pick,
+    /// `CollectedItem.valid_field` for a document dated by it.
+    pub(crate) field: String,
+    /// A chrono format printing seconds; the item is dated by the minute holding the value.
+    pub(crate) format: String,
+}
+
 /// A host's index shape. A rule with no `index` field is `Rss`, as every rule before it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndexFormat {
@@ -88,6 +113,8 @@ pub(crate) struct Rule {
     pub(crate) rewrite_hosts: BTreeMap<String, String>,
     /// Absent: every row the path filter keeps is followed.
     pub(crate) provider_keys: Option<ProviderKeys>,
+    pub(crate) story_key: StoryKey,
+    pub(crate) page_valid: Option<PageValid>,
     pub(crate) title: Pick,
     pub(crate) canonical: Pick,
     /// The article container; its outermost `paragraph` matches and table rows are the body.
@@ -216,6 +243,20 @@ fn parse_rule(name: &str, rule: &Map<String, Value>, path: &Path) -> Result<Rule
             Some(provider_keys(keys, path, &unparseable)?)
         }
     };
+    let story_key = match rule.get("story_key").map(Value::as_str) {
+        None => StoryKey::UrlPath,
+        Some(Some(RELEASE)) if path_prefix.ends_with('/') => StoryKey::Release,
+        Some(other) => return Err(unparseable(format!("story_key {other:?}"))),
+    };
+    let page_valid = match rule.get("page_valid") {
+        None => None,
+        Some(value) => {
+            let object = value
+                .as_object()
+                .ok_or_else(|| unparseable("page_valid is not an object".to_owned()))?;
+            Some(page_valid(object, path, &unparseable)?)
+        }
+    };
     let body = object("body")?;
     known_fields(body, &BODY, path)?;
     Ok(Rule {
@@ -225,6 +266,8 @@ fn parse_rule(name: &str, rule: &Map<String, Value>, path: &Path) -> Result<Rule
         path_prefix,
         rewrite_hosts,
         provider_keys,
+        story_key,
+        page_valid,
         title: pick(object("title")?, path, &unparseable)?,
         canonical: pick(object("canonical")?, path, &unparseable)?,
         container: selector(body.get("container"), &unparseable)?,
@@ -246,6 +289,26 @@ fn reads_a_minute(format: &str) -> bool {
     match (printed(probe, format), printed(inside, format)) {
         (Some(minute_text), Some(second_text)) if minute_text == second_text => {
             minute_of(&minute_text, format).is_some_and(|read| read.start() == probe.and_utc())
+        }
+        _ => false,
+    }
+}
+
+/// `format` prints `PROBE_MINUTE` at `PROBE_SECOND` as text `minute_containing` reads back as
+/// that minute, and prints the second: a minute format reads only values at second 0.
+fn reads_a_second(format: &str) -> bool {
+    let (year, month, day, hour, minute) = PROBE_MINUTE;
+    let at = |second| {
+        NaiveDate::from_ymd_opt(year, month, day)
+            .and_then(|date| date.and_hms_opt(hour, minute, second))
+    };
+    let (Some(probe), Some(inside)) = (at(0), at(PROBE_SECOND)) else {
+        return false;
+    };
+    match (printed(probe, format), printed(inside, format)) {
+        (Some(minute_text), Some(second_text)) if minute_text != second_text => {
+            minute_containing(&second_text, format)
+                .is_some_and(|read| read.start() == probe.and_utc())
         }
         _ => false,
     }
@@ -317,6 +380,36 @@ fn provider_keys(
         image_key_after: image_key_after.to_owned(),
         follow,
         cross_check,
+    })
+}
+
+fn page_valid(
+    object: &Map<String, Value>,
+    path: &Path,
+    unparseable: &dyn Fn(String) -> Refusal,
+) -> Result<PageValid, Refusal> {
+    known_fields(object, &PAGE_VALID, path)?;
+    let text = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| unparseable(format!("page_valid has no {key}")))
+    };
+    let format = text("format")?;
+    if !reads_a_second(&format) {
+        return Err(unparseable(format!(
+            "page_valid format {format} reads no second"
+        )));
+    }
+    Ok(PageValid {
+        pick: Pick {
+            selector: selector(object.get("selector"), unparseable)?,
+            attribute: text("attribute")?,
+        },
+        field: text("field")?,
+        format,
     })
 }
 

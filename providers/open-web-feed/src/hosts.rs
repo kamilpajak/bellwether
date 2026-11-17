@@ -8,20 +8,26 @@ use canon::FileDigest;
 use news_provider::HostKey;
 use serde_json::Value;
 
-use crate::rules::{reads_the_other, IndexFormat, Rule};
+use crate::rules::{reads_the_other, IndexFormat, Rule, StoryKey};
+use crate::walk::{release_of, IdWalk, DATE, ID};
 use crate::{host_and_target, known_fields, plain_path, strict, Refusal};
 
 pub(crate) const HOSTS_SCHEMA: &str = "open-web-feed.hosts/2";
 const TOP: [&str; 2] = ["schema", "hosts"];
-const ROW: [&str; 6] = [
+const ROW: [&str; 7] = [
     "host",
     "status",
     "index_url",
     "rule",
     "robots",
     "paged_index",
+    "id_walk",
 ];
 const PAGED: [&str; 2] = ["index_url", "rule"];
+const WALK: [&str; 1] = ["url"];
+/// The date and id an `id_walk.url` is expanded with to check it names a release.
+const PROBE_DATE: &str = "2026/11/14";
+const PROBE_ID: u64 = 3_403_075;
 /// A paged index is named at its first page; page N is this query pair with N in place of 1.
 const FIRST_PAGE: &str = "page=1";
 const ADMITTED: &str = "admitted";
@@ -81,6 +87,8 @@ pub(crate) struct HostRow {
     pub(crate) robots: Option<RobotsPin>,
     /// A second index on the same host, read page by page (architecture.md section 11.2).
     pub(crate) paged: Option<PagedIndex>,
+    /// The release ids asked below the row's index frontier (architecture.md section 11.2).
+    pub(crate) walk: Option<IdWalk>,
 }
 
 /// A news sitemap whose page N+1 is asked only while page N holds no key of the previous poll.
@@ -220,6 +228,10 @@ pub(crate) fn read_hosts(path: &Path, rules: &BTreeMap<String, Rule>) -> Result<
             None => None,
             Some(paged) => Some(paged_index(paged, &host, &rule, rules, path)?),
         };
+        let walk = match row.get("id_walk") {
+            None => None,
+            Some(walk) => Some(id_walk(walk, &host, &rule, rules, path)?),
+        };
         rows.push(HostRow {
             host,
             status,
@@ -228,6 +240,7 @@ pub(crate) fn read_hosts(path: &Path, rules: &BTreeMap<String, Rule>) -> Result<
             rule,
             robots,
             paged,
+            walk,
         });
     }
     let hosts = Hosts {
@@ -238,6 +251,61 @@ pub(crate) fn read_hosts(path: &Path, rules: &BTreeMap<String, Rule>) -> Result<
         return Err(Refusal::NoHostAdmitted(path.to_path_buf()));
     }
     Ok(hosts)
+}
+
+/// A row's `id_walk`: a plain url on the row's host holding `{date}` and `{id}` once each, which
+/// expanded names a release under the row's rule, a rule keying stories by release and dating a
+/// page by its own time.
+fn id_walk(
+    walk: &Value,
+    host: &str,
+    rule: &str,
+    rules: &BTreeMap<String, Rule>,
+    path: &Path,
+) -> Result<IdWalk, Refusal> {
+    let unparseable = |why: String| Refusal::HostsUnparseable {
+        path: path.to_path_buf(),
+        why: format!("{host}'s id_walk {why}"),
+    };
+    let object = walk
+        .as_object()
+        .ok_or_else(|| unparseable("is not an object".to_owned()))?;
+    known_fields(object, &WALK, path)?;
+    let url = object
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| unparseable("has no url".to_owned()))?
+        .to_owned();
+    let read = rules.get(rule);
+    if !read.is_some_and(|read| read.story_key == StoryKey::Release && read.page_valid.is_some()) {
+        return Err(Refusal::IdWalkRuleNotReleaseKeyed {
+            path: path.to_path_buf(),
+            host: host.to_owned(),
+            rule: rule.to_owned(),
+        });
+    }
+    let once = |mark: &str| url.matches(mark).count() == 1;
+    let probe = url
+        .replace(DATE, PROBE_DATE)
+        .replace(ID, &PROBE_ID.to_string());
+    let named = match (host_and_target(&probe), read) {
+        (Some((at, target)), Some(read)) if at == host && plain_path(&target) => {
+            release_of(&read.path_prefix, &target)
+                .filter(|release| release.id == PROBE_ID && release.date == PROBE_DATE)
+        }
+        _ => None,
+    };
+    match named {
+        Some(release) if once(DATE) && once(ID) => Ok(IdWalk {
+            url,
+            language: release.language,
+        }),
+        _ => Err(Refusal::IdWalkNotARelease {
+            path: path.to_path_buf(),
+            host: host.to_owned(),
+            url,
+        }),
+    }
 }
 
 /// A row's `paged_index`: on the row's host, plain, a news sitemap named at page 1, read under a

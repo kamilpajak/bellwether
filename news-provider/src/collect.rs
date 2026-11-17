@@ -670,18 +670,23 @@ fn attempt_once<A: Archive>(
             } else {
                 provider.follow_ups_to_issue(extracted.follow_ups, &stories)
             };
-            issued.extend(
-                to_issue
+            let stories_of = |issuing: &[Request]| -> Vec<String> {
+                issuing
                     .iter()
                     .filter_map(|follow_up| provider.story_of(follow_up))
-                    .map(|story| story.hex().to_owned()),
-            );
+                    .map(|story| story.hex().to_owned())
+                    .collect()
+            };
+            issued.extend(stories_of(&to_issue));
+            stories.extend(stories_of(&to_issue));
+            let walked = provider.follow_ups_to_issue(extracted.walk, &stories);
+            issued.extend(stories_of(&walked));
             if !archived && refusal.is_none() {
                 let held = matched.saturating_sub(count(to_issue.len()));
                 archive.record_held(&attempt_id, held)?;
                 archive.record_relisted(&attempt_id, &relisted_of(provider, listed, &to_issue))?;
             }
-            to_issue
+            to_issue.into_iter().chain(walked).collect()
         }
         _ => Vec::new(),
     };

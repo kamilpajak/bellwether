@@ -511,7 +511,11 @@ fn refused_robots_redirect(truncated: bool, bytes: i64) -> Refreshed {
         vec![(
             truncated,
             bytes,
-            format!(r#"[["content-type","{}"]]"#, loopback::MOVED_CONTENT_TYPE),
+            format!(
+                r#"[["location","{}"],["content-type","{}"]]"#,
+                loopback::REDIRECT_TARGET,
+                loopback::MOVED_CONTENT_TYPE
+            ),
         )],
     )
 }
