@@ -9,7 +9,7 @@ use news_provider::HostKey;
 use serde_json::Value;
 
 use crate::rules::Rule;
-use crate::{host_and_target, known_fields, strict, Refusal};
+use crate::{host_and_target, known_fields, plain_path, strict, Refusal};
 
 pub(crate) const HOSTS_SCHEMA: &str = "open-web-feed.hosts/2";
 const TOP: [&str; 2] = ["schema", "hosts"];
@@ -158,6 +158,13 @@ pub(crate) fn read_hosts(path: &Path, rules: &BTreeMap<String, Rule>) -> Result<
                 })
             }
         };
+        if !plain_path(&index_target) {
+            return Err(Refusal::IndexTargetNotPlain {
+                path: path.to_path_buf(),
+                host,
+                target: index_target,
+            });
+        }
         let robots = match row.get("robots") {
             None => None,
             Some(pin) => Some(pin.as_str().and_then(RobotsPin::read).ok_or_else(|| {

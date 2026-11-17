@@ -81,6 +81,16 @@ pub enum Refusal {
         host: String,
         url: String,
     },
+    /// Decision 4: robots.txt is matched against the path as written, which such a byte gives a
+    /// second spelling.
+    #[error(
+        "the hosts file at {path} reads the index of {host} at {target:?}, which holds %, a non-ASCII or a control byte"
+    )]
+    IndexTargetNotPlain {
+        path: PathBuf,
+        host: String,
+        target: String,
+    },
     /// R6: zero admitted rows plans zero requests, which reads as a quiet day.
     #[error("the hosts file at {0} admits no host")]
     NoHostAdmitted(PathBuf),
@@ -110,6 +120,15 @@ pub enum Refusal {
     /// A url path starts with `/`, so any other prefix filters out every link.
     #[error("the rules at {path} filter rule {rule} on {prefix}, which does not start with /")]
     PathPrefixNotRooted {
+        path: PathBuf,
+        rule: String,
+        prefix: String,
+    },
+    /// Decision 4, as `IndexTargetNotPlain`.
+    #[error(
+        "the rules at {path} filter rule {rule} on {prefix:?}, which holds %, a non-ASCII or a control byte"
+    )]
+    PathPrefixNotPlain {
         path: PathBuf,
         rule: String,
         prefix: String,
@@ -546,6 +565,13 @@ pub(crate) fn host_and_path(url: &str) -> Option<(String, String)> {
 }
 
 /// `host_and_path` with the query kept: the path robots.txt rules are matched against.
+/// Owner decision 4 (2026-11-17): a path robots.txt is checked against holds no `%`, no non-ASCII
+/// byte and no control byte.
+pub(crate) fn plain_path(path: &str) -> bool {
+    path.bytes()
+        .all(|byte| byte != b'%' && byte.is_ascii() && !byte.is_ascii_control())
+}
+
 pub(crate) fn host_and_target(url: &str) -> Option<(String, String)> {
     let (authority, tail) = authority_and_tail(url)?;
     news_provider::HostKey::new(authority).ok()?;

@@ -11,7 +11,7 @@ use serde_json::{Map, Value};
 use chrono::{NaiveDate, NaiveDateTime};
 use news_provider::HostKey;
 
-use crate::{known_fields, minute_of, strict, Refusal};
+use crate::{known_fields, minute_of, plain_path, strict, Refusal};
 
 pub(crate) const RULES_SCHEMA: &str = "open-web-feed.rules/1";
 const TOP: [&str; 2] = ["schema", "rules"];
@@ -142,6 +142,13 @@ fn parse_rule(name: &str, rule: &Map<String, Value>, path: &Path) -> Result<Rule
     let path_prefix = text("path_prefix")?;
     if !path_prefix.starts_with('/') {
         return Err(Refusal::PathPrefixNotRooted {
+            path: path.to_path_buf(),
+            rule: name.to_owned(),
+            prefix: path_prefix,
+        });
+    }
+    if !plain_path(&path_prefix) {
+        return Err(Refusal::PathPrefixNotPlain {
             path: path.to_path_buf(),
             rule: name.to_owned(),
             prefix: path_prefix,
