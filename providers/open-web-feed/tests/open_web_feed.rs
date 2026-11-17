@@ -279,6 +279,12 @@ const FED_SECOND_ARTICLE_TITLE: &str = "Federal Reserve Board announces approval
 const FED_NO_ARTICLE_BLOCK_PAGE: &str = "synthetic_no_article_block.html";
 const FED_OFF_PREFIX_URL: &str =
     "https://www.federalreserve.gov/newsevents/speech/a-speech-20261113a.htm";
+/// The press-release listing page: it shares the prefix's letters but not its trailing `/`.
+const FED_PREFIX_WITHOUT_SLASH_URL: &str =
+    "https://www.federalreserve.gov/newsevents/pressreleases.htm";
+/// A canonical link that is neither the requested url nor the page's `og:url`.
+const FED_SYNTHETIC_CANONICAL: &str =
+    "https://www.federalreserve.gov/newsevents/pressreleases/bcreg20261113b.htm";
 /// The trimmed bcreg20261113a body: four release paragraphs, then the two attachment links.
 const FED_ARTICLE_LINES: [&str; 6] = [
     "The Federal Deposit Insurance Corporation, the Federal Reserve Board, the National Credit",
@@ -1964,14 +1970,16 @@ fn the_real_federal_reserve_feed_yields_one_follow_up_per_release_with_its_raw_p
     Ok(())
 }
 
-/// The 20 real links of 2026-11-16 are all under `/newsevents/pressreleases/`, so only a
-/// synthetic link tests the prefix from the wide side. Mutation 2026-11-17, the prefix `/`: red.
+/// The 20 real links of 2026-11-16 are all under `/newsevents/pressreleases/`, so only synthetic
+/// links test the prefix from the wide side. Mutations 2026-11-17, the prefix `/`, and the prefix
+/// without its trailing `/`: each red.
 #[test]
 fn a_federal_reserve_link_outside_press_releases_is_filtered_out_and_counted() -> Outcome {
     let provider = provider()?;
     let index = fed_rss(&[
         (FED_ARTICLE_URL, FED_PUB_DATES[0]),
         (FED_OFF_PREFIX_URL, FED_PUB_DATES[0]),
+        (FED_PREFIX_WITHOUT_SLASH_URL, FED_PUB_DATES[0]),
     ]);
     let extracted = provider.extract(&fed_index_request(&provider)?, &blob(index));
     let kept: Vec<&str> = extracted
@@ -1981,7 +1989,7 @@ fn a_federal_reserve_link_outside_press_releases_is_filtered_out_and_counted() -
         .collect();
     assert_eq!(
         (extracted.vendor_rows, kept, extracted.filtered_out),
-        (2, vec![FED_ARTICLE_URL], 1)
+        (3, vec![FED_ARTICLE_URL], 2)
     );
     Ok(())
 }
@@ -2134,6 +2142,36 @@ fn the_real_federal_reserve_release_carries_its_title_its_own_url_and_its_item_k
                 None
             ),
         ]
+    );
+    Ok(())
+}
+
+/// §8 row R3 for the Fed: a page naming `link[rel=canonical]` is stored under that link, never its
+/// requested url or `og:url`. No real Fed page names one, so the real release gets one in its head.
+/// Mutations 2026-11-17, the Fed canonical selector `meta[property="og:url"]` and `link[rel="x"]`: red.
+#[test]
+fn a_federal_reserve_page_naming_a_canonical_link_is_stored_under_it() -> Outcome {
+    let provider = provider()?;
+    let real = String::from_utf8(fed(FED_ARTICLE))?;
+    let named = format!("<link rel=\"canonical\" href=\"{FED_SYNTHETIC_CANONICAL}\" />\n</head>");
+    let page = real.replacen("</head>", &named, 1);
+    let item = only_item(&provider.extract(
+        &fed_follow_up(&provider, 0)?,
+        &blob(page.clone().into_bytes()),
+    ))?;
+    assert_eq!(
+        (
+            page.contains(FED_SYNTHETIC_CANONICAL),
+            item.canonical_url.as_str(),
+            item.url.as_str(),
+            item.source_item_id.as_str(),
+        ),
+        (
+            true,
+            FED_SYNTHETIC_CANONICAL,
+            FED_ARTICLE_URL,
+            FED_ARTICLE_KEY
+        )
     );
     Ok(())
 }
