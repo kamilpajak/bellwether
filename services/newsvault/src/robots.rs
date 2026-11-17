@@ -983,6 +983,7 @@ mod tests {
                 "/foo/$x",
                 false,
             ),
+            star(b"Disallow: /foo/index.html\n", "/foo/", true),
             star(b"Allow: /foo/index.php\nDisallow: /\n", "/foo/", false),
             star(b"Allow: /foo/INDEX.HTML\nDisallow: /\n", "/foo/", false),
             star(
