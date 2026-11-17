@@ -21,7 +21,7 @@ use news_provider::{
 };
 use open_web_feed::{
     AdmittedPath, CrossChecker, DirectAnswer, HostPin, HostRobots, OpenWebFeed, Refusal, RobotsPin,
-    RobotsRules, CONTACT_CREDENTIAL, DIRECT_LEAD, SOURCE,
+    RobotsRules, CONTACT_CREDENTIAL, DIRECT_LEAD, LONGEST_POLL_PERIOD, SOURCE,
 };
 use pit::datedness::{Minute, Published};
 use pit::ObservationTime;
@@ -2722,6 +2722,66 @@ fn a_provider_key_filter_nothing_can_read_whole_is_refused() {
     }
 }
 
+/// A `cross_check` key's host must be another admitted row, or its rows are never looked for:
+/// GNW absent from the CNW-and-Yahoo hosts file, and a key mapped to Yahoo itself. Mutations
+/// 2026-11-17, the check removed and the own-host clause dropped: each red.
+#[test]
+fn a_cross_check_key_whose_host_no_other_admitted_row_holds_is_refused() {
+    let refused = |hosts: PathBuf, rules: PathBuf| match refusal_of(&hosts, &rules, CONTACT) {
+        Some(Refusal::CrossCheckHostNotAdmitted {
+            rule, key, host, ..
+        }) => Some((rule, key, host)),
+        _ => None,
+    };
+    let named = |key: &str, host: &str| Some(("yahoo".to_owned(), key.to_owned(), host.to_owned()));
+    assert_eq!(
+        (
+            refused(hosts_fixture("cnw_and_yahoo_admitted.json"), rules_path()),
+            refused(
+                hosts_path(),
+                rules_fixture("rules_cross_check_to_its_own_host.json")
+            ),
+        ),
+        (
+            named("globenewswire.com", "rss.globenewswire.com"),
+            named("cnwgroup.com", YAHOO_HOST)
+        )
+    );
+}
+
+/// `cross_check` is a key-to-host object: the pre-map list, a key mapped to `""` and one mapped to
+/// `null` are each `RulesUnparseable`. Mutations 2026-11-17, a non-object read as no key and the
+/// empty-host check removed: each red (green before this test).
+#[test]
+fn a_cross_check_that_maps_no_key_to_a_host_is_unparseable() {
+    for name in [
+        "rules_cross_check_a_list.json",
+        "rules_cross_check_to_an_empty_host.json",
+        "rules_cross_check_to_a_non_string.json",
+    ] {
+        assert!(
+            matches!(
+                refusal_of(&hosts_path(), &rules_fixture(name), CONTACT),
+                Some(Refusal::RulesUnparseable { .. })
+            ),
+            "{name}"
+        );
+    }
+}
+
+/// The hosts file's hosts are lowercased, so a `cross_check` host is too: `WWW.PRNEWSWIRE.COM`
+/// names the admitted PRN row. Mutation 2026-11-17, the rules host kept as written: red (green
+/// before this test).
+#[test]
+fn a_cross_check_host_in_upper_case_names_its_admitted_row() {
+    assert!(refusal_of(
+        &hosts_path(),
+        &rules_fixture("rules_cross_check_host_in_upper_case.json"),
+        CONTACT
+    )
+    .is_none());
+}
+
 // ---- Yahoo cross-check (section 11.2, option C) ----
 
 fn checker() -> Result<CrossChecker, Box<dyn std::error::Error>> {
@@ -2913,9 +2973,9 @@ fn titles_match_after_case_and_punctuation_fold_and_never_by_a_prefix() -> Outco
     Ok(())
 }
 
-/// Collect reads direct answers from `DIRECT_LEAD` before the oldest `cross_check` row's minute;
-/// rows of another key, a followed key or none do not move it. Mutations 2026-11-17, `min` as
-/// `max` and the minimum over every row: each red.
+/// Collect reads direct answers from `DIRECT_LEAD`, 90 min, before the oldest `cross_check` row's
+/// minute; rows of another key, a followed key or none do not move it. Mutations 2026-11-17, `min`
+/// as `max`, the minimum over every row, and the lead 89 or 91 min: each red.
 #[test]
 fn the_earliest_cross_check_minute_is_the_oldest_cross_check_row() -> Outcome {
     let index = yahoo_sitemap(&[
@@ -2942,7 +3002,6 @@ fn the_earliest_cross_check_minute_is_the_oldest_cross_check_row() -> Outcome {
         ("https://finance.yahoo.com/e", "2026-11-16T04:00:00Z", None),
     ]);
     let checker = checker()?;
-    let read_from = instant("2026-11-16T07:30:00Z").map(|minute| minute - DIRECT_LEAD);
     assert_eq!(
         (
             checker.earliest_cross_checked(&index),
@@ -2951,11 +3010,21 @@ fn the_earliest_cross_check_minute_is_the_oldest_cross_check_row() -> Outcome {
         ),
         (
             instant("2026-11-16T07:30:00Z"),
-            read_from,
+            instant("2026-11-16T06:00:00Z"),
             instant("2026-11-16T07:22:00Z")
         )
     );
     Ok(())
+}
+
+/// Owner decision 2026-11-17: the lead is section 11.2's longest poll period, not a number fitted
+/// to a measurement. Mutation 2026-11-17, `DIRECT_LEAD` 2 h again: red.
+#[test]
+fn the_direct_lead_is_the_longest_poll_period() {
+    assert_eq!(
+        (DIRECT_LEAD, LONGEST_POLL_PERIOD.num_minutes()),
+        (LONGEST_POLL_PERIOD, 90)
+    );
 }
 
 /// Yahoo dated a PRN row 72 min after a PRN answer listed it (2026-11-16): an answer 72 min before
@@ -2994,11 +3063,12 @@ fn a_direct_answer_received_before_the_keyed_minute_still_lists_the_row() -> Out
     Ok(())
 }
 
-/// A row is compared only when every direct index parsed an answer after its minute closed: a
-/// failed index, a 503 body, or an answer inside the minute (09:05:30Z for 09:05) is "not looked",
-/// never "unlisted". Review 2026-11-17: a CNW 503 run named three rows unlisted.
+/// A row is compared only when its key's own index parsed an answer after the row's minute
+/// closed: PRN absent, a PRN 503 body, or a PRN answer inside the minute (09:00:30Z for Horizon's
+/// 09:00) leaves the PRN rows "not looked", never "unlisted"; one at 09:01:00Z looks. Review
+/// 2026-11-17: a CNW 503 run named three rows unlisted. Mutation 2026-11-17, `>=` as `>`: red.
 #[test]
-fn a_row_no_direct_index_answered_after_is_not_looked_and_never_unlisted() -> Outcome {
+fn a_row_whose_own_index_did_not_answer_after_is_not_looked_and_never_unlisted() -> Outcome {
     let checker = checker()?;
     let index = yahoo(YAHOO_REAL_INDEX);
     let looked = |direct: &[DirectAnswer]| {
@@ -3013,38 +3083,103 @@ fn a_row_no_direct_index_answered_after_is_not_looked_and_never_unlisted() -> Ou
             })
     };
     let all = every_index_at(LOOKED_AT, &[(CNW_INDEX, cnw(CNW_REAL_INDEX))])?;
-    let without_cnw: Vec<DirectAnswer> = all
-        .iter()
-        .filter(|answer| answer.url != CNW_INDEX)
-        .cloned()
-        .collect();
-    let mut cnw_503 = without_cnw.clone();
-    cnw_503.push(answer(
-        CNW_INDEX,
+    let without_prn = all_but(&all, PRN_INDEX);
+    let mut prn_503 = without_prn.clone();
+    prn_503.push(answer(
+        PRN_INDEX,
         LOOKED_AT,
         b"Service Unavailable".to_vec(),
     )?);
-    let mut cnw_early = without_cnw.clone();
-    cnw_early.push(answer(
-        CNW_INDEX,
-        "2026-11-16T09:05:30Z",
-        cnw(CNW_REAL_INDEX),
+    let mut prn_early = without_prn.clone();
+    prn_early.push(answer(
+        PRN_INDEX,
+        "2026-11-16T09:00:30Z",
+        EMPTY_RSS.to_vec(),
+    )?);
+    let mut prn_at_close = without_prn.clone();
+    prn_at_close.push(answer(
+        PRN_INDEX,
+        "2026-11-16T09:01:00Z",
+        EMPTY_RSS.to_vec(),
     )?);
     assert_eq!(
         (
             looked(&all),
-            looked(&without_cnw),
-            looked(&cnw_503),
-            looked(&cnw_early)
+            looked(&without_prn),
+            looked(&prn_503),
+            looked(&prn_early),
+            looked(&prn_at_close)
         ),
         (
             Some((0, 3, 4)),
-            Some((3, 0, 3)),
-            Some((3, 0, 3)),
-            Some((1, 2, 4))
+            Some((2, 1, 3)),
+            Some((2, 1, 3)),
+            Some((1, 2, 4)),
+            Some((0, 3, 4))
         )
     );
     Ok(())
+}
+
+/// Owner decision 2026-11-17: each `cross_check` key waits for its own index only (PRN, GNW, CNW;
+/// the Fed is none's). One row per key, each index absent in turn: only that index's key is not
+/// compared. Mutations 2026-11-17, the map ignored and two hosts swapped in the rules: each red.
+#[test]
+fn each_cross_check_key_waits_for_its_own_index_and_no_other() -> Outcome {
+    let checker = checker()?;
+    let keys = ["prnewswire.com", "globenewswire.com", "cnwgroup.com"];
+    let rows: Vec<(String, String)> = keys
+        .iter()
+        .map(|key| {
+            (
+                format!("https://finance.yahoo.com/{key}"),
+                format!("https://media.zenfs.com/en/{key}/a.jpg"),
+            )
+        })
+        .collect();
+    let listed: Vec<(&str, &str, Option<&str>)> = rows
+        .iter()
+        .map(|(link, image)| (link.as_str(), "2026-11-16T09:00:00Z", Some(image.as_str())))
+        .collect();
+    let index = yahoo_sitemap(&listed);
+    let all = every_index_at(LOOKED_AT, &[])?;
+    let compared = |absent: &str| {
+        checker
+            .check(
+                &index,
+                &all_but(&all, absent),
+                instant("2026-11-16T07:00:00Z"),
+            )
+            .map(|checked| {
+                let keys: Vec<String> = checked.unlisted.into_iter().map(|row| row.key).collect();
+                (checked.not_looked, keys)
+            })
+    };
+    let but = |skipped: &str| -> Option<(u32, Vec<String>)> {
+        let kept = keys.iter().filter(|key| **key != skipped);
+        Some((
+            u32::from(!skipped.is_empty()),
+            kept.map(|key| (*key).to_owned()).collect(),
+        ))
+    };
+    assert_eq!(
+        [PRN_INDEX, GNW_INDEX, CNW_INDEX, FED_INDEX].map(compared),
+        [
+            but("prnewswire.com"),
+            but("globenewswire.com"),
+            but("cnwgroup.com"),
+            but("")
+        ]
+    );
+    Ok(())
+}
+
+fn all_but(answers: &[DirectAnswer], url: &str) -> Vec<DirectAnswer> {
+    answers
+        .iter()
+        .filter(|answer| answer.url != url)
+        .cloned()
+        .collect()
 }
 
 /// A title or a key that folds to nothing matches nothing: an empty title is never "listed", and

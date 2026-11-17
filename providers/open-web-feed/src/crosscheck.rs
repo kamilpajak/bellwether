@@ -9,9 +9,12 @@ use crate::minute_of;
 use crate::parse::index_rows;
 use crate::rules::{ProviderKeys, Rule};
 
-/// How long before a keyed row's minute a direct answer is still read. Yahoo dated a row up to
-/// 72 min after a direct answer listed it: 29 of 4,042 matched row-polls, 26 polls of 2026-11-16.
-pub const DIRECT_LEAD: TimeDelta = TimeDelta::hours(2);
+/// The longest period of architecture.md section 11.2's period table (`outside`, 90 min). No
+/// schedule exists in code (2026-11-17), so this copy and that table change together.
+pub const LONGEST_POLL_PERIOD: TimeDelta = TimeDelta::minutes(90);
+
+/// How long before a keyed row's minute a direct answer is still read (owner decision 2026-11-17).
+pub const DIRECT_LEAD: TimeDelta = LONGEST_POLL_PERIOD;
 
 /// One stored direct index answer: the url it was asked at, when it arrived, its bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +44,7 @@ pub struct CrossCheck {
     pub no_key: u32,
     /// `cross_checked` rows dated before `watched_from`, or with no minute the rule reads.
     pub not_compared: u32,
-    /// `cross_checked` rows some admitted direct index has no parsed answer for after their minute
+    /// `cross_checked` rows whose key's own direct index has no parsed answer after their minute
     /// closed: "we did not look", never "not listed".
     pub not_looked: u32,
     pub listed_directly: u32,
@@ -52,13 +55,15 @@ pub struct CrossCheck {
     pub direct_parsed: u32,
 }
 
-/// The keyed row's rule and every admitted direct row's index url with its rule.
+/// The keyed row's rule, every admitted direct row's index url with its rule, and each
+/// `cross_check` key's own direct index url.
 #[derive(Debug, Clone)]
 pub struct CrossChecker {
     index_url: String,
     rule: Rule,
     keys: ProviderKeys,
     direct: BTreeMap<String, Rule>,
+    index_of: BTreeMap<String, String>,
 }
 
 impl CrossChecker {
@@ -67,12 +72,14 @@ impl CrossChecker {
         rule: Rule,
         keys: ProviderKeys,
         direct: BTreeMap<String, Rule>,
+        index_of: BTreeMap<String, String>,
     ) -> Self {
         Self {
             index_url,
             rule,
             keys,
             direct,
+            index_of,
         }
     }
 
@@ -105,7 +112,7 @@ impl CrossChecker {
                 row.image
                     .as_deref()
                     .and_then(|image| self.keys.key_of(image))
-                    .is_some_and(|key| self.keys.cross_check.contains(key))
+                    .is_some_and(|key| self.keys.cross_check.contains_key(key))
             })
             .filter_map(|row| minute_of(row.valid_raw.as_deref()?, &self.rule.valid_format))
             .map(|minute| minute.start())
@@ -145,12 +152,6 @@ impl CrossChecker {
                     .filter(|title| !title.is_empty()),
             );
         }
-        // The oldest of each direct index's newest answers: every index looked after it.
-        let looked_until = if newest.len() == self.direct.len() {
-            newest.values().min().copied()
-        } else {
-            None
-        };
         let mut checked = CrossCheck {
             followed: 0,
             cross_checked: 0,
@@ -176,7 +177,7 @@ impl CrossChecker {
                 checked.followed += 1;
                 continue;
             }
-            if !self.keys.cross_check.contains(key) {
+            if !self.keys.cross_check.contains_key(key) {
                 checked.other_key += 1;
                 continue;
             }
@@ -187,9 +188,13 @@ impl CrossChecker {
                 .and_then(|raw| minute_of(raw, &self.rule.valid_format));
             let watched = minute
                 .is_some_and(|minute| watched_from.is_some_and(|from| minute.start() >= from));
+            let looked_until = self
+                .index_of
+                .get(key)
+                .and_then(|url| newest.get(url.as_str()));
             let looked = minute
                 .and_then(|minute| minute.closes())
-                .is_some_and(|closes| looked_until.is_some_and(|until| until >= closes));
+                .is_some_and(|closes| looked_until.is_some_and(|until| *until >= closes));
             if !watched {
                 checked.not_compared += 1;
             } else if !looked {

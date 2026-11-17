@@ -13,12 +13,12 @@
           "business-wire.com",
           "accesswire.ca"
         ],
-        "cross_check": [
-          "prnewswire.com",
-          "globenewswire.com",
-          "cnwgroup.com",
-          "business-wire.com"
-        ]
+        "cross_check": {
+          "prnewswire.com": "www.prnewswire.com",
+          "globenewswire.com": "rss.globenewswire.com",
+          "cnwgroup.com": "www.newswire.ca",
+          "business-wire.com": "www.businesswire.com"
+        }
       },
       "title": {
         "selector": "meta[property=\"og:title\"]",

@@ -1,0 +1,108 @@
+{
+  "schema": "open-web-feed.rules/1",
+  "rules": {
+    "gnw": {
+      "valid_field": "pubDate",
+      "valid_format": "%a, %d %b %Y %H:%M GMT",
+      "path_prefix": "/news-release/",
+      "rewrite_hosts": {
+        "www.globenewswire.com": "rss.globenewswire.com"
+      },
+      "title": {
+        "selector": "meta[property=\"og:title\"]",
+        "attribute": "content"
+      },
+      "canonical": {
+        "selector": "link[rel=\"canonical\"]",
+        "attribute": "href"
+      },
+      "body": {
+        "container": "div.main-body-container",
+        "paragraph": "p, li, figcaption"
+      }
+    },
+    "prn": {
+      "valid_field": "pubDate",
+      "valid_format": "%a, %d %b %Y %H:%M:00 +0000",
+      "path_prefix": "/news-releases/",
+      "rewrite_hosts": {},
+      "title": {
+        "selector": "meta[property=\"og:title\"]",
+        "attribute": "content"
+      },
+      "canonical": {
+        "selector": "link[rel=\"canonical\"]",
+        "attribute": "href"
+      },
+      "body": {
+        "container": "section.release-body",
+        "paragraph": "p, li, figcaption"
+      }
+    },
+    "cnw": {
+      "index": "news_sitemap",
+      "valid_field": "news:publication_date",
+      "valid_format": "%Y-%m-%dT%H:%M:00%:z",
+      "path_prefix": "/news-releases/",
+      "rewrite_hosts": {},
+      "title": {
+        "selector": "meta[property=\"og:title\"]",
+        "attribute": "content"
+      },
+      "canonical": {
+        "selector": "link[rel=\"canonical\"]",
+        "attribute": "href"
+      },
+      "body": {
+        "container": "section.release-body",
+        "paragraph": "p, li, figcaption"
+      }
+    },
+    "fed": {
+      "valid_field": "pubDate",
+      "valid_format": "%a, %-d %b %Y %H:%M:00 GMT",
+      "path_prefix": "/newsevents/pressreleases/",
+      "rewrite_hosts": {},
+      "title": {
+        "selector": "meta[property=\"og:title\"]",
+        "attribute": "content"
+      },
+      "canonical": {
+        "selector": "link[rel=\"canonical\"]",
+        "attribute": "href"
+      },
+      "body": {
+        "container": "div#article > div.col-md-8:not(.heading)",
+        "paragraph": "p, li, figcaption"
+      }
+    },
+    "yahoo": {
+      "index": "news_sitemap",
+      "valid_field": "news:publication_date",
+      "valid_format": "%Y-%m-%dT%H:%M:00Z",
+      "path_prefix": "/",
+      "rewrite_hosts": {},
+      "provider_keys": {
+        "image_key_after": "https://media.zenfs.com/en/",
+        "follow": ["business-wire.com", "accesswire.ca"],
+        "cross_check": {
+          "prnewswire.com": "WWW.PRNEWSWIRE.COM",
+          "globenewswire.com": "rss.globenewswire.com",
+          "cnwgroup.com": "www.newswire.ca"
+        }
+      },
+      "title": {
+        "selector": "meta[property=\"og:title\"]",
+        "attribute": "content"
+      },
+      "canonical": {
+        "selector": "link[rel=\"canonical\"]",
+        "attribute": "href"
+      },
+      "body": {
+        "container": "div[data-testid=\"article-body\"]",
+        "paragraph": "p, li, figcaption"
+      }
+    }
+  }
+}
