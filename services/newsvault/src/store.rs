@@ -114,11 +114,11 @@ PRAGMA synchronous = FULL;
 ";
 
 /// The `PRAGMA user_version` this build writes, and the only one a read-only reader accepts.
-pub const SCHEMA_VERSION: i32 = 10;
+pub const SCHEMA_VERSION: i32 = 11;
 
 /// Version `i + 1` is reached from version `i` by `MIGRATIONS[i]`, run by [`migrate`] with
 /// foreign keys off, as SQLite's twelve-step table rebuild (lang_altertable.html) requires.
-const MIGRATIONS: [&str; 10] = [
+const MIGRATIONS: [&str; 11] = [
     "
 -- The hosts file a run was admitted under: architecture.md section 2's `hosts_version` row. NULL
 -- for a provider that reads no hosts file.
@@ -245,6 +245,18 @@ ALTER TABLE attempts ADD COLUMN robots_disallowed INTEGER;
 ALTER TABLE attempts ADD COLUMN continuity TEXT
     CHECK (continuity IN ('complete', 'boundary_no_shared_key', 'no_previous_key', 'first_poll',
                           'next_page_unread'));
+",
+    "
+-- `open_web_feed::Generation`: the poll's page boundaries that shared no key, one count per
+-- label (section 11.2), written with `continuity` and NULL wherever it is.
+ALTER TABLE attempts ADD COLUMN boundary_same_generation INTEGER
+    CHECK (boundary_same_generation >= 0);
+ALTER TABLE attempts ADD COLUMN boundary_older_generation INTEGER
+    CHECK (boundary_older_generation >= 0);
+ALTER TABLE attempts ADD COLUMN boundary_newer_generation INTEGER
+    CHECK (boundary_newer_generation >= 0);
+ALTER TABLE attempts ADD COLUMN boundary_generation_unknown INTEGER
+    CHECK (boundary_generation_unknown >= 0);
 ",
 ];
 
@@ -548,13 +560,15 @@ pub struct PayloadRow {
     pub truncated: bool,
 }
 
-/// One index payload as `Committer::index_payloads` lists it; `received_at` is the attempt's.
+/// One index payload as `Committer::index_payloads` lists it; `received_at` is the attempt's,
+/// `headers` the stored `news_provider::Headers::to_json` text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexPayload {
     pub attempt_id: String,
     pub url: String,
     pub raw_blob: String,
     pub received_at: String,
+    pub headers: String,
 }
 
 impl PayloadRow {
@@ -786,7 +800,7 @@ fn index_pages(
     verdict: Verdict,
 ) -> Result<Vec<IndexPayload>, StoreError> {
     let mut statement = db.prepare(
-        "SELECT p.attempt_id, p.url, p.raw_blob, a.received_at
+        "SELECT p.attempt_id, p.url, p.raw_blob, a.received_at, p.headers
            FROM payloads p JOIN attempts a ON a.attempt_id = p.attempt_id
           WHERE a.run_id = ?1 AND a.source = ?2 AND p.phase = 'index' AND a.verdict = ?3
           ORDER BY a.received_at, p.attempt_id",
@@ -798,6 +812,7 @@ fn index_pages(
                 url: row.get(1)?,
                 raw_blob: row.get(2)?,
                 received_at: row.get(3)?,
+                headers: row.get(4)?,
             })
         })?
         .collect::<Result<Vec<IndexPayload>, _>>()?;
@@ -1548,16 +1563,22 @@ impl Committer {
         index_pages(&self.db, self.run.as_str(), source, Verdict::Empty)
     }
 
-    /// Records how a paged index's poll joins the poll before it, on its page-1 attempt: its own
-    /// `UPDATE` after the commit, as [`Committer::record_held`].
+    /// Records how a paged index's poll joins the poll before it, and its boundaries sharing no
+    /// key by label (`boundaries`, in `open_web_feed::Generation::ALL` order), on its page-1
+    /// attempt: its own `UPDATE` after the commit, as [`Committer::record_held`].
     pub fn record_continuity(
         &mut self,
         attempt_id: &str,
         continuity: &str,
+        boundaries: [u32; 4],
     ) -> Result<(), StoreError> {
+        let [same, older, newer, unknown] = boundaries;
         self.db.execute(
-            "UPDATE attempts SET continuity = ?2 WHERE attempt_id = ?1",
-            params![attempt_id, continuity],
+            "UPDATE attempts SET continuity = ?2, boundary_same_generation = ?3,
+                    boundary_older_generation = ?4, boundary_newer_generation = ?5,
+                    boundary_generation_unknown = ?6
+              WHERE attempt_id = ?1",
+            params![attempt_id, continuity, same, older, newer, unknown],
         )?;
         Ok(())
     }
@@ -1566,7 +1587,7 @@ impl Committer {
     /// input (architecture.md section 11.2, option C). Metadata only; `blob_bytes` reads one.
     pub fn index_payloads(&self, source: &SourceId) -> Result<Vec<IndexPayload>, StoreError> {
         let mut statement = self.db.prepare(
-            "SELECT p.attempt_id, p.url, p.raw_blob, a.received_at
+            "SELECT p.attempt_id, p.url, p.raw_blob, a.received_at, p.headers
                FROM payloads p JOIN attempts a ON a.attempt_id = p.attempt_id
               WHERE a.source = ?1 AND p.phase = 'index' AND a.received_at IS NOT NULL
               ORDER BY a.received_at, p.attempt_id",
@@ -1578,6 +1599,7 @@ impl Committer {
                     url: row.get(1)?,
                     raw_blob: row.get(2)?,
                     received_at: row.get(3)?,
+                    headers: row.get(4)?,
                 })
             })?
             .collect::<Result<Vec<IndexPayload>, _>>()?;
@@ -4044,10 +4066,12 @@ mod tests {
         let mut store = open(&temp)?;
         let mut taken = Vec::new();
         for continuity in open_web_feed::Continuity::ALL {
-            store.record_continuity("a v1 attempt", continuity.name())?;
+            store.record_continuity("a v1 attempt", continuity.name(), [0; 4])?;
             taken.push(continuity_on(&store, "a v1 attempt")?);
         }
-        let refused = store.record_continuity("a v1 attempt", "gap").is_err();
+        let refused = store
+            .record_continuity("a v1 attempt", "gap", [0; 4])
+            .is_err();
         assert_eq!(
             (user_version(&store.db)?, taken, refused),
             (
@@ -4102,6 +4126,118 @@ mod tests {
         assert_eq!(
             (refused, read_only, user_version(&db)?),
             (expected.clone(), expected, 9)
+        );
+        Ok(())
+    }
+
+    /// A v10 store: the v9 fixture and `MIGRATIONS[9]`, with a continuity on the v1 attempt.
+    fn a_store_at_user_version_ten(temp: &TempDir) -> TestResult {
+        a_store_at_user_version_nine(temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch(MIGRATIONS[9])?;
+        db.pragma_update(None, "user_version", 10)?;
+        db.execute_batch(
+            "UPDATE attempts SET continuity = 'complete' WHERE attempt_id = 'a v1 attempt';",
+        )?;
+        Ok(())
+    }
+
+    const BOUNDARY_COLUMNS: [&str; 4] = [
+        "boundary_same_generation",
+        "boundary_older_generation",
+        "boundary_newer_generation",
+        "boundary_generation_unknown",
+    ];
+
+    fn boundaries_on(store: &Committer, attempt: &str) -> Result<Vec<Option<i64>>, StoreError> {
+        BOUNDARY_COLUMNS
+            .iter()
+            .map(|column| {
+                Ok(store.db.query_row(
+                    &format!("SELECT {column} FROM attempts WHERE attempt_id = ?1"),
+                    params![attempt],
+                    |row| row.get(0),
+                )?)
+            })
+            .collect()
+    }
+
+    /// §8 row M1 from user_version 10: the step to 11 adds one boundary count per
+    /// `open_web_feed::Generation`, each landing in its own column, an `INTEGER`, and none negative.
+    #[test]
+    fn a_store_at_user_version_ten_opens_migrates_to_eleven_and_takes_boundary_counts() -> TestResult
+    {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_ten(&temp)?;
+        let mut store = open(&temp)?;
+        store.record_continuity("a v1 attempt", "boundary_no_shared_key", [1, 2, 3, 4])?;
+        let taken = boundaries_on(&store, "a v1 attempt")?;
+        let refused = store
+            .db
+            .execute(
+                "UPDATE attempts SET boundary_older_generation = -1 WHERE attempt_id = 'a v1 attempt'",
+                [],
+            )
+            .is_err();
+        let columns = super::columns_of(&store.db, "attempts")?;
+        let shapes: Vec<Option<&super::ColumnShape>> = BOUNDARY_COLUMNS
+            .iter()
+            .map(|column| columns.get(*column))
+            .collect();
+        let integer = ("INTEGER".to_owned(), false, None, 0);
+        assert_eq!(
+            (user_version(&store.db)?, taken, refused, shapes),
+            (
+                SCHEMA_VERSION,
+                vec![Some(1), Some(2), Some(3), Some(4)],
+                true,
+                vec![Some(&integer); 4]
+            )
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the carried half from user_version 10: every column of every row of every v10
+    /// table, compared by `quote()`; the v10 attempt gains four NULL boundary counts.
+    #[test]
+    fn a_v10_store_keeps_every_v10_column_of_every_row() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_ten(&temp)?;
+        let v10 = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let before = quoted_rows(&v10, 10, &V7_TABLES)?;
+        drop(v10);
+        assert!(super::refuse_an_unreadable_version(temp.path()).is_ok());
+        let store = open(&temp)?;
+        let after = quoted_rows(&store.db, 10, &V7_TABLES)?;
+        assert_eq!(before.len(), V7_TABLES.len() + 1);
+        assert_eq!(
+            (after, boundaries_on(&store, "a v1 attempt")?),
+            (before, vec![None; 4])
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the per-version shape check at user_version 10.
+    #[test]
+    fn a_v10_store_whose_columns_differ_is_refused_and_left_at_user_version_ten() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_ten(&temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch("ALTER TABLE attempts DROP COLUMN continuity;")?;
+        drop(db);
+        let read_only = match super::refuse_an_unreadable_version(temp.path()) {
+            Err(StoreError::ShapeDiffers { found: 10, columns }) => columns,
+            other => vec![format!("{other:?}")],
+        };
+        let refused = match open(&temp) {
+            Err(StoreError::ShapeDiffers { found: 10, columns }) => columns,
+            other => vec![format!("{other:?}")],
+        };
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let expected = vec!["attempts.continuity".to_owned()];
+        assert_eq!(
+            (refused, read_only, user_version(&db)?),
+            (expected.clone(), expected, 10)
         );
         Ok(())
     }

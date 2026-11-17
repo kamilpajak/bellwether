@@ -87,7 +87,7 @@ pub enum SendFailure {
 }
 
 /// The response headers P9 keeps beside the raw blob (architecture.md section 3.9), lowercase.
-pub const KEPT_HEADERS: [&str; 8] = [
+pub const KEPT_HEADERS: [&str; 9] = [
     "content-type",
     "last-modified",
     "etag",
@@ -96,6 +96,7 @@ pub const KEPT_HEADERS: [&str; 8] = [
     "vary",
     "content-encoding",
     RETRY_AFTER,
+    "x-sitemap-generated-at",
 ];
 
 const RETRY_AFTER: &str = "retry-after";
@@ -169,6 +170,23 @@ impl Headers {
                 .collect(),
         )
         .to_string()
+    }
+
+    /// Reads back [`Headers::to_json`]'s stored form.
+    ///
+    /// # Errors
+    /// The text is not one JSON array of `[name, value]` string pairs.
+    pub fn from_json(text: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(text).map(Self)
+    }
+
+    /// The first value kept under `name` (lowercase), as received.
+    #[must_use]
+    pub fn first(&self, name: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(kept, _)| kept == name)
+            .map(|(_, value)| value.as_str())
     }
 }
 
@@ -1729,7 +1747,8 @@ mod tests {
     const MIXED_HEAD: &[u8] = b"Date: Mon, 16 Nov 2026 09:42:00 GMT\r\nServer: nginx\r\n\
         Content-Type: text/html; charset=utf-8\r\nSet-Cookie: a=b\r\nVary: Accept-Encoding\r\n\
         ETag: \"caf\xe9\"\r\nVARY: User-Agent\r\nLast-Modified: Sun, 15 Nov 2026 10:00:00 GMT\r\n\
-        Cache-Control: max-age=60\r\nLocation: /elsewhere\r\nX-Other: 1\r\nRetry-After: 120\r\n";
+        Cache-Control: max-age=60\r\nLocation: /elsewhere\r\nX-Other: 1\r\nRetry-After: 120\r\n\
+        X-Sitemap-Generated-At: 2026-11-17T08:02:54.800Z\r\n";
 
     #[test]
     fn only_the_allowlisted_headers_are_kept_lowercase_with_every_repeat() -> Checked {
@@ -1747,6 +1766,7 @@ mod tests {
                 ("last-modified", "Sun, 15 Nov 2026 10:00:00 GMT"),
                 ("cache-control", "max-age=60"),
                 ("retry-after", "120"),
+                ("x-sitemap-generated-at", "2026-11-17T08:02:54.800Z"),
             ])
             .as_slice()
         );
@@ -1759,6 +1779,23 @@ mod tests {
         assert_eq!(
             headers.to_json(),
             "[[\"etag\",\"\\\"caf\u{e9}\\\"\"],[\"vary\",\"a\"]]"
+        );
+    }
+
+    /// The stored form reads back to the same pairs and `first` names a repeated header's first
+    /// value; text of another shape is an error, never an empty set.
+    #[test]
+    fn the_stored_headers_read_back_and_name_a_first_value() {
+        let headers = Headers::new(pairs(&[("vary", "a"), ("etag", "x"), ("vary", "b")]));
+        assert_eq!(
+            (
+                Headers::from_json(&headers.to_json()).ok(),
+                headers.first("vary"),
+                headers.first("date"),
+                Headers::from_json("[[\"vary\"]]").is_err(),
+                Headers::from_json("{}").is_err(),
+            ),
+            (Some(headers.clone()), Some("a"), None, true, true)
         );
     }
 

@@ -20,8 +20,9 @@ use news_provider::{
     Verdict,
 };
 use open_web_feed::{
-    AdmittedPath, Basis, Continuity, CrossChecker, DirectAnswer, HostPin, HostRobots, OpenWebFeed,
-    Refusal, RobotsPin, RobotsRules, CONTACT_CREDENTIAL, DIRECT_LEAD, LONGEST_POLL_PERIOD, SOURCE,
+    AdmittedPath, Basis, Continuity, CrossChecker, DirectAnswer, Generation, HostPin, HostRobots,
+    OpenWebFeed, Refusal, RobotsPin, RobotsRules, CONTACT_CREDENTIAL, DIRECT_LEAD,
+    GENERATION_HEADER, LONGEST_POLL_PERIOD, SOURCE,
 };
 use pit::datedness::{Minute, Published};
 use pit::ObservationTime;
@@ -3524,6 +3525,98 @@ fn the_1410_poll_reads_page_two_and_records_its_broken_boundary() -> Outcome {
             Some(Continuity::NextPageUnread),
             Some(Continuity::NoPreviousKey),
         )
+    );
+    Ok(())
+}
+
+/// Owner decision 2026-11-17 (option B): every poll that read all the pages it planned is a
+/// basis, a broken boundary included; only `next_page_unread` is not.
+#[test]
+fn every_continuity_but_next_page_unread_is_a_basis() {
+    let basis: Vec<(&str, bool)> = Continuity::ALL
+        .into_iter()
+        .map(|arm| (arm.name(), arm.is_basis()))
+        .collect();
+    assert_eq!(
+        basis,
+        vec![
+            ("complete", true),
+            ("boundary_no_shared_key", true),
+            ("no_previous_key", true),
+            ("first_poll", true),
+            ("next_page_unread", false),
+        ]
+    );
+}
+
+/// A broken boundary whose last page plans a page 3 not read is `next_page_unread`, so the poll
+/// is no basis; once page 3 ran out it is `boundary_no_shared_key`.
+#[test]
+fn a_broken_poll_with_a_planned_page_unread_is_next_page_unread() -> Outcome {
+    let pages = [PRN_TIE_0900, PROBE10_1410_PAGE_2];
+    assert_eq!(
+        (
+            continuity(&pages, &[PROBE10_1205])?,
+            continuity_ending(&pages, &[PROBE10_1205], true)?,
+        ),
+        (
+            Some(Continuity::NextPageUnread),
+            Some(Continuity::BoundaryNoSharedKey)
+        )
+    );
+    Ok(())
+}
+
+/// The label of a boundary's later page against its earlier one: equal, older and newer by the
+/// millisecond, and unknown when either stamp is absent or not RFC 3339.
+#[test]
+fn a_generation_is_read_from_both_stamps_to_the_millisecond() {
+    let earlier = Some("2026-11-17T08:02:54.800Z");
+    let labels = [
+        Generation::between(earlier, Some("2026-11-17T08:02:54.800Z")),
+        Generation::between(earlier, Some("2026-11-17T08:02:54.799Z")),
+        Generation::between(earlier, Some("2026-11-17T08:02:54.801Z")),
+        Generation::between(earlier, None),
+        Generation::between(None, earlier),
+        Generation::between(Some("Tue, 17 Nov 2026 08:02:54 GMT"), earlier),
+    ];
+    assert_eq!(
+        labels.map(Generation::name),
+        [
+            "same_generation",
+            "older_generation",
+            "newer_generation",
+            "generation_unknown",
+            "generation_unknown",
+            "generation_unknown",
+        ]
+    );
+}
+
+/// The header the label reads is one P9 keeps (§3.9), or every label would be unknown.
+#[test]
+fn the_generation_header_is_kept_beside_the_blob() {
+    assert!(news_provider::wire::KEPT_HEADERS.contains(&GENERATION_HEADER));
+}
+
+/// Only a boundary sharing no key is labelled: 14:10Z's pages one label, the joined page 2 none.
+#[test]
+fn only_a_boundary_sharing_no_key_is_labelled() -> Outcome {
+    let paging = provider()?.paging();
+    let stamps = [
+        Some("2026-11-17T14:01:42.474Z"),
+        Some("2026-11-17T13:55:47.638Z"),
+    ];
+    let labels = |pages: [&str; 2]| {
+        let read: Vec<Vec<u8>> = pages.iter().map(|page| prn(page)).collect();
+        paging.generations(PRN_SITEMAP, &read, &stamps)
+    };
+    assert_eq!(
+        (
+            labels([PROBE10_1410, PROBE10_1410_PAGE_2]),
+            labels([PROBE10_1410, "sitemap_p2_joined.xml"]),
+        ),
+        (Some(vec![Generation::Older]), Some(Vec::new()))
     );
     Ok(())
 }
