@@ -2029,6 +2029,35 @@ fn a_gnw_release_under_a_narrower_disallow_is_not_fetched_and_counted() -> TestR
     Ok(())
 }
 
+/// A disallowed row is never held, so every poll counts it again, and the ledger sums the polls
+/// of one day. Mutation 2026-11-17, the ledger's per-source `+=` made `=`: green before this test.
+#[test]
+fn a_disallowed_row_is_counted_by_every_poll_and_the_ledger_sums_the_polls() -> TestResult {
+    let dir = TempDir::new()?;
+    let body = "User-agent: *\nDisallow: /news-release/2026/11/14/3403074/\n";
+    let (store, hosts) = pinned_to(dir.path(), body.as_bytes())?;
+    let exchange = Gnw::day()?;
+    for (at, schedule) in [(RUN_AT, "first"), (LATER_THE_SAME_DAY, "second")] {
+        let ask = Ask {
+            hosts: Some(hosts.clone()),
+            at: instant(at),
+            schedule: Some(schedule.to_owned()),
+            ..ask(&store, cmd_collect::TODAY)
+        };
+        let opened = cmd_collect::open_provider(&ask)?;
+        cmd_collect::run(&ask, &opened, &exchange, &At(instant(at)))?;
+    }
+    let (sent, _) = exchange.sent();
+    assert_eq!(
+        (
+            sent.iter().filter(|url| url.contains("/3403074/")).count(),
+            ledgered_robots_disallowed(&store, "2026-11-14")?,
+        ),
+        (0, vec![2])
+    );
+    Ok(())
+}
+
 /// Each collect index attempt's url and `attempts.robots_disallowed`; robots fetches left out.
 fn stored_robots_disallowed(store: &Path) -> Result<BTreeMap<String, Option<i64>>, Box<dyn Error>> {
     let db = Connection::open_with_flags(store.join(COMMIT_LOG), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
