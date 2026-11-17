@@ -760,10 +760,9 @@ fn every_body_an_open_web_run_stores_is_indexed_and_linked_to_its_attempt() -> T
     Ok(())
 }
 
-/// Section 11.2, the committed hosts file: the GNW, PRN, CNW, Fed and Yahoo indexes, then each
-/// host's pages and PRN's sitemap page 1, on Monday 2026-11-16. The sitemap lists the three RSS
-/// releases, fetched once each from the RSS, and release 302939742, fetched once from the sitemap.
-/// The mutations that turn it red are §11.5 step 6's tables.
+/// Section 11.2, the committed hosts file on Monday 2026-11-16: five indexes, PRN's sitemap page 1
+/// (the RSS releases and 302939742), then each host's pages, each release fetched once. The
+/// mutations that turn it red are §11.5 step 6's tables.
 #[test]
 fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end() -> TestResult {
     const ATTEMPTS: usize = 21;
@@ -1038,10 +1037,9 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
         ),
         (0, ITEMS)
     );
-    // Section 11.2 on a fresh store: no basis, so PRN's sitemap is read at page 1 and recorded
-    // `first_poll` on that attempt; the RSS listed the three shared releases first, so the
-    // sitemap's attempt holds them. Mutation 2026-11-17, the run's issued set left out of `collect`'s
-    // held stories: red (each shared release asked twice).
+    // A fresh store's sitemap poll is `first_poll` at page 1, and holds the three releases the RSS
+    // listed first. Mutation 2026-11-17, the run's issued set left out of `collect`'s held
+    // stories: red (each shared release asked twice).
     let sitemap_attempt = attempts
         .iter()
         .find(|row| row["url"] == PRN_SITEMAP)
@@ -3536,11 +3534,9 @@ fn sends_of(sent: &[String], url: &str) -> usize {
     sent.iter().filter(|asked| *asked == url).count()
 }
 
-/// Probe10's cycles 0 and 1 through `collect`: an empty store's first poll reads page 1 only and is
-/// `first_poll`; the next poll's page 1 shares a key with it, so it reads page 1 only and is
-/// `complete`; the shared release is fetched once, and the RSS releases no sitemap page lists are
-/// committed under their `pubDate`. The ledger counts one of each. Mutation 2026-11-17, the run's
-/// handed basis left empty (`basis_of` returning no entry): red.
+/// Probe10 12:00Z then 12:05Z: `first_poll`, then `complete`, page 1 each; the shared release is
+/// fetched once and RSS-only releases are kept under `pubDate`. Mutation 2026-11-17, `basis_of`'s
+/// map replaced by an empty one: red.
 #[test]
 fn a_poll_whose_page_one_overlaps_the_first_poll_is_complete_and_reads_one_page() -> TestResult {
     let root = TempDir::new()?;
@@ -3594,11 +3590,9 @@ fn a_poll_whose_page_one_overlaps_the_first_poll_is_complete_and_reads_one_page(
     Ok(())
 }
 
-/// Probe10's 14:10Z cycle through `collect` (§11.6): page 1 shares no key with 14:05Z's, so page 2
-/// is asked; it holds a 14:05Z key but shares none with page 1, so the poll is
-/// `boundary_no_shared_key` and not looked across 13:51-13:59Z. Such a poll is no basis: the
-/// 14:15Z poll, whose page 1 is 14:10Z's again, reads back to 14:05Z through page 2 once more.
-/// Mutations 2026-11-17, `is_basis` true for every arm and the boundary check dropped: each red.
+/// Probe10 14:10Z (§11.6): two pages, `boundary_no_shared_key`; being no basis, 14:15Z reads back to
+/// 14:05Z through page 2 again. Mutations 2026-11-17, `is_basis` true for every arm and the
+/// boundary check dropped: each red.
 #[test]
 fn the_1410_poll_reads_two_pages_records_its_gap_and_is_no_basis_for_the_next() -> TestResult {
     let root = TempDir::new()?;

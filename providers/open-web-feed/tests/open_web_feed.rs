@@ -781,10 +781,9 @@ fn a_target_other_than_the_run_day_is_refused_before_any_request() -> Outcome {
     Ok(())
 }
 
-/// Section 11.2's host order, one index each and PRN's sitemap page 1 after its RSS. Mutations
-/// 2026-11-16, the PRN row `candidate` and the GNW and PRN rows swapped: each red; 2026-11-17, the
-/// CNW, Fed and Yahoo rows `candidate`, CNW's index the RSS feed and PRN's `paged_index` removed:
-/// each red.
+/// Section 11.2's host order, PRN's sitemap page 1 after its RSS. Mutations, each red: 2026-11-16
+/// the PRN row `candidate`, the GNW and PRN rows swapped; 2026-11-17 the CNW, Fed and Yahoo rows
+/// `candidate`, CNW's index the RSS feed, PRN's `paged_index` removed.
 #[test]
 fn the_committed_hosts_file_plans_gnw_then_prn_and_its_sitemap_then_cnw_then_the_fed_then_yahoo(
 ) -> Outcome {
@@ -3377,7 +3376,7 @@ fn continuity(
 }
 
 /// Section 11.2: one item key rule for PRN's RSS and its sitemap, so a release both list is one
-/// story. Mutation 2026-11-17, the sitemap's link keyed with its query kept: red.
+/// story. Mutation 2026-11-17, the story keyed by the url as written: red.
 #[test]
 fn a_release_the_prn_rss_and_the_prn_sitemap_both_list_is_one_story() -> Outcome {
     let provider = provider()?;
@@ -3480,10 +3479,9 @@ fn a_page_one_sharing_a_key_with_the_basis_ends_a_complete_poll() -> Outcome {
     Ok(())
 }
 
-/// Probe10 cycle 26 (14:10Z), the gap §11.6 names: page 1 shares no key with 14:05Z, so page 2 is
-/// planned to reach past page 1's oldest row; page 2 holds a 14:05Z key and ends the poll, and the
-/// two pages share none, so the poll is `boundary_no_shared_key`, never complete. Mutations
-/// 2026-11-17, the boundary check dropped from `continuity` and page 2 never planned: each red.
+/// Probe10 14:10Z (§11.6): page 2 is planned past page 1's oldest row and holds a 14:05Z key, and
+/// the two pages share none, so the poll is `boundary_no_shared_key`. Mutation 2026-11-17, the
+/// boundary check dropped from `continuity`: red.
 #[test]
 fn the_1410_poll_reads_page_two_and_records_its_broken_boundary() -> Outcome {
     let provider = based_on(&[PROBE10_1405])?;
@@ -3652,7 +3650,7 @@ fn a_page_url_names_its_page_only_as_a_plain_decimal_after_the_stem() -> Outcome
 }
 
 /// A paged index names page 1, reads a news sitemap, and its rule's format and the row's own read
-/// no value alike; each refused before any request. Mutations 2026-11-17, each check removed: red.
+/// no value alike. Mutations 2026-11-17, the page=1, sitemap and overlap checks each removed: red.
 #[test]
 fn a_paged_index_not_at_page_one_not_a_sitemap_or_read_alike_with_its_row_is_refused() {
     let refusals: Vec<Option<String>> = [

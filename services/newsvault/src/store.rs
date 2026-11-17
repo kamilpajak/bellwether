@@ -4030,7 +4030,8 @@ mod tests {
     }
 
     /// §8 row M1 from user_version 9: the step to 10 adds `attempts.continuity`, which takes every
-    /// `open_web_feed::Continuity` name and refuses any other text.
+    /// `open_web_feed::Continuity` name and refuses any other text. Mutation 2026-11-17, the CHECK
+    /// dropped: red.
     #[test]
     fn a_store_at_user_version_nine_opens_migrates_to_ten_and_takes_a_continuity() -> TestResult {
         let temp = TempDir::new()?;
