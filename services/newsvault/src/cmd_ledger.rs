@@ -23,19 +23,26 @@ use open_web_feed::Continuity;
 
 pub const SCHEMA: &str = "newsvault.ledger/1";
 pub const RUN_ENVELOPE_SCHEMA: &str = "newsvault.run/1";
+/// The `refused` mark of a run file whose run another run's lease kept out (S7-D9).
+pub const LEASE_HELD: &str = "lease_held";
+/// Section 11.1 Pace and section 11.2's stop deadline: at most half a day, per host and per run.
+pub const BUSY_BOUND: f64 = 0.5;
+const SECONDS_A_DAY: f64 = 86_400.0;
 const IN_FLIGHT: &str = "in_flight";
 const OUTCOME_OK: &str = "ok";
 const OUTCOME_EMPTY: &str = "empty";
 const OUTCOME_FAILED: &str = "failed";
 const OUTCOME_INTERRUPTED: &str = "interrupted";
 
-/// The four `--check` answers, each the code of a finding. `coverage_incomplete` joined them on
-/// 2026-11-13 for the backfill arm (§8 row R20). There is no fifth: the asking-clock age needs a
+/// The `--check` answers, each the code of a finding: `coverage_incomplete` since 2026-11-13
+/// (§8 row R20), the two busy bounds since 2026-11-18 (S7-D11). No asking-clock age: it needs a
 /// number from the collect policy, whose first producer is a later commit.
 const RUNS_BELOW_EXPECTED: &str = "runs_below_expected";
 const HOLDS_A_FAILURE: &str = "holds_a_failure";
 const ROWS_ZERO_AGAINST_VENDOR_ROWS: &str = "rows_committed_zero_against_vendor_rows";
 const COVERAGE_INCOMPLETE: &str = "coverage_incomplete";
+const WALL_TIME_OVER_BOUND: &str = "wall_time_over_bound";
+const HOST_BUSY_OVER_BOUND: &str = "host_busy_over_bound";
 
 /// Codes from architecture.md section 5.1, used for a run envelope the reader could not take.
 const INPUT_UNPARSEABLE: &str = "input_unparseable";
@@ -90,6 +97,8 @@ pub struct Report {
     pub attempts_without_a_run_envelope: Vec<Orphan>,
     pub unpublished_seq_ranges: Vec<SeqRange>,
     pub freshness: Freshness,
+    /// The share of a day `wall_share` and each host's `share` are read against.
+    pub busy_bound: f64,
     pub matched: usize,
     pub returned: usize,
     pub truncated: bool,
@@ -106,7 +115,24 @@ pub struct DayRow {
     /// envelope records an attempt to run, so two envelopes for a one-run day is one retry.
     pub runs_over_expected: u32,
     pub runs_unfinished: Vec<String>,
+    /// S7-D9: collect runs another run's lease kept out, left out of `runs_observed`.
+    pub runs_lease_held: u32,
+    /// S7-D11: the observed runs' summed wall time, and its share of 86,400 s against
+    /// `busy_bound`; a run file from before 2026-11-18 adds nothing.
+    pub wall_s: f64,
+    pub wall_share: f64,
+    /// Per host, the observed runs' summed paced waits plus request times, in host order.
+    pub busy: Vec<HostBusyRow>,
+    /// S7-D7: answers whose `Retry-After` the observed runs held to the 24 h ceiling.
+    pub holds_capped: u32,
     pub per_source: Vec<SourceRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HostBusyRow {
+    pub host: Option<String>,
+    pub busy_s: f64,
+    pub share: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -347,6 +373,32 @@ pub struct Envelope {
     /// and a `collect` envelope is written without it.
     #[serde(default, skip_serializing_if = "RunKind::is_collect")]
     pub kind: RunKind,
+    /// S7-D9: `lease_held` on a run that never got the lease; such a run is not observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+    /// S7-D11: the run's wall time by the clock, start to finish; absent before 2026-11-18.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub busy: Vec<RunBusy>,
+    /// S7-D7: each answer whose `Retry-After` was cut to the 24 h ceiling.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holds_capped: Vec<RunHold>,
+}
+
+/// One host's paced waits plus request times in one run (section 11.1 Pace); `host` is `None`
+/// for urls no host keys.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RunBusy {
+    pub host: Option<String>,
+    pub busy_s: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RunHold {
+    pub host: String,
+    pub retry_after: String,
+    pub held_until: DateTime<Utc>,
 }
 
 /// Which command wrote a run envelope. Only `collect` runs are due, counted and reported per day;
@@ -470,6 +522,7 @@ pub fn read(root: &Path, ask: &Ask) -> Result<Report, LedgerReadError> {
         attempts_without_a_run_envelope,
         unpublished_seq_ranges: unpublished_seq_ranges(&db)?,
         freshness: freshness(&db, &at, ask.at)?,
+        busy_bound: BUSY_BOUND,
         matched,
         returned,
         truncated: returned < matched,
@@ -798,14 +851,29 @@ struct Read<'a> {
 }
 
 fn day_row(date: NaiveDate, envelopes: &[Envelope], read: &Read, ask: &Ask) -> DayRow {
-    let today: Vec<&Envelope> = envelopes
+    let (held_out, today): (Vec<&Envelope>, Vec<&Envelope>) = envelopes
         .iter()
         .filter(|envelope| envelope.run_date == date && envelope.kind.is_collect())
-        .collect();
+        .partition(|envelope| envelope.refused.as_deref() == Some(LEASE_HELD));
+    // `sum` of no f64 is -0.0, printed `-0.0` (measured 2026-11-18 on the golden ledger file).
+    let wall_s = today
+        .iter()
+        .filter_map(|envelope| envelope.wall_s)
+        .fold(0.0, |total, run| total + run);
+    let mut busy: BTreeMap<Option<String>, f64> = BTreeMap::new();
+    for lane in today.iter().flat_map(|envelope| &envelope.busy) {
+        *busy.entry(lane.host.clone()).or_default() += lane.busy_s;
+    }
+    let holds_capped = today
+        .iter()
+        .map(|envelope| envelope.holds_capped.len())
+        .sum::<usize>();
     let runs: BTreeSet<&str> = today.iter().map(|run| run.run_id.as_str()).collect();
     let observed = u32::try_from(today.len()).unwrap_or(u32::MAX);
+    // A run the lease kept out still states how many runs its day is due.
     let expected = today
         .iter()
+        .chain(&held_out)
         .map(|envelope| envelope.expected_runs)
         .chain(ask.expected_runs)
         .max()
@@ -880,6 +948,18 @@ fn day_row(date: NaiveDate, envelopes: &[Envelope], read: &Read, ask: &Ask) -> D
             .filter(|envelope| envelope.finished_at.is_none())
             .map(|envelope| envelope.run_id.clone())
             .collect(),
+        runs_lease_held: u32::try_from(held_out.len()).unwrap_or(u32::MAX),
+        wall_s,
+        wall_share: wall_s / SECONDS_A_DAY,
+        busy: busy
+            .into_iter()
+            .map(|(host, busy_s)| HostBusyRow {
+                host,
+                busy_s,
+                share: busy_s / SECONDS_A_DAY,
+            })
+            .collect(),
+        holds_capped: u32::try_from(holds_capped).unwrap_or(u32::MAX),
         per_source: by_source.into_values().collect(),
     }
 }
@@ -929,6 +1009,27 @@ fn findings_for(day: &DayRow) -> Vec<Finding> {
             detail: format!(
                 "{} runs observed against {} expected",
                 day.runs_observed, day.runs_expected
+            ),
+        });
+    }
+    if day.wall_share > BUSY_BOUND {
+        findings.push(Finding {
+            code: WALL_TIME_OVER_BOUND,
+            run_date: day.run_date.clone(),
+            source: None,
+            detail: format!("{} s of wall time, {} of a day", day.wall_s, day.wall_share),
+        });
+    }
+    for lane in day.busy.iter().filter(|lane| lane.share > BUSY_BOUND) {
+        findings.push(Finding {
+            code: HOST_BUSY_OVER_BOUND,
+            run_date: day.run_date.clone(),
+            source: None,
+            detail: format!(
+                "host {} busy {} s, {} of a day",
+                lane.host.as_deref().unwrap_or("-"),
+                lane.busy_s,
+                lane.share
             ),
         });
     }
@@ -1009,6 +1110,20 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
             day.runs_over_expected,
             day.runs_unfinished.len()
         )?;
+        writeln!(
+            out,
+            "busy             lease_held {} wall_s {} wall_share {} bound {} holds_capped {}",
+            day.runs_lease_held, day.wall_s, day.wall_share, report.busy_bound, day.holds_capped
+        )?;
+        for lane in &day.busy {
+            writeln!(
+                out,
+                "busy_host        {} busy_s {} share {}",
+                lane.host.as_deref().unwrap_or("-"),
+                lane.busy_s,
+                lane.share
+            )?;
+        }
         for row in &day.per_source {
             writeln!(
                 out,

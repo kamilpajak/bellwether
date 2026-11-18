@@ -15,10 +15,10 @@ use news_provider::{
     Request, RequestPhase, RunId, SendFailure, SendPermit, Sink, SourceId, TargetWindow,
 };
 use news_provider::{CollectError, PlanRefusal, Run};
-use newsvault::cmd_collect::{self, Ask};
+use newsvault::cmd_collect::{self, Ask, CollectRunError};
 use newsvault::cmd_items::{self, PerStory};
 use newsvault::cmd_ledger;
-use newsvault::store::{Committer, COMMIT_LOG};
+use newsvault::store::{Committer, StoreError, COMMIT_LOG};
 use pit::ObservationTime;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
@@ -130,6 +130,8 @@ impl Clock for Fixed {
 struct Payloads {
     answers: BTreeMap<String, (u16, Vec<u8>)>,
     asked: RefCell<Vec<String>>,
+    /// The deadline each `reserve` was handed, in order.
+    reserved: RefCell<Vec<Option<DateTime<Utc>>>>,
 }
 
 impl Payloads {
@@ -141,6 +143,7 @@ impl Payloads {
         Ok(Self {
             answers: held,
             asked: RefCell::new(Vec::new()),
+            reserved: RefCell::new(Vec::new()),
         })
     }
 
@@ -159,6 +162,16 @@ impl Payloads {
 }
 
 impl Exchange for Payloads {
+    fn reserve(
+        &self,
+        _request: &Request,
+        _clock: &dyn Clock,
+        deadline: Option<DateTime<Utc>>,
+    ) -> Result<news_provider::Reservation, news_provider::Unreserved> {
+        self.reserved.borrow_mut().push(deadline);
+        Ok(news_provider::Reservation::Go)
+    }
+
     fn send(
         &self,
         permit: SendPermit,
@@ -581,15 +594,48 @@ fn with_stdin_not_a_tty_the_binary_never_reads_dev_tty_and_never_blocks() -> Tes
     Ok(())
 }
 
+/// EDGAR is not on section 11.2's schedule: with no `--deadline` its run has none and no slot,
+/// at 23:00Z, which the schedule would put past the 22:00 slot's 22:14:30 deadline. Each send is
+/// still reserved once first, with no deadline.
 #[test]
-fn the_run_envelope_exists_on_disk_before_the_first_send_and_before_the_lease() -> TestResult {
+fn an_edgar_run_with_no_deadline_takes_none_from_the_schedule() -> TestResult {
+    let root = TempDir::new()?;
+    let exchange = Payloads::a_good_day()?;
+    let answer = collected(root.path(), A_LISTED_SESSION, &exchange)?;
+    assert_eq!(
+        (
+            answer.envelope["deadline"].clone(),
+            answer.envelope["slot"].clone(),
+            answer.exit,
+            exchange.reserved.borrow().clone(),
+        ),
+        (
+            Value::Null,
+            Value::Null,
+            Exit::Ok,
+            vec![None; exchange.sends()]
+        )
+    );
+    Ok(())
+}
+
+/// S7-D9: the run file written before the lease is finished and marked `lease_held` when another
+/// run holds it, with nothing sent.
+#[test]
+fn a_run_the_lease_kept_out_finishes_its_run_file_refused_lease_held() -> TestResult {
     let root = TempDir::new()?;
     let held = Committer::open(root.path(), &RunId::new("the-holder"))?;
     let exchange = Payloads::a_good_day()?;
     let ask = ask(root.path(), A_LISTED_SESSION);
     let provider = cmd_collect::open_provider(&ask)?;
     let blocked = cmd_collect::run(&ask, &provider, &exchange, &Fixed);
-    assert!(blocked.is_err(), "the lease was not held");
+    assert!(
+        matches!(
+            blocked,
+            Err(CollectRunError::Store(StoreError::LeaseHeld(_)))
+        ),
+        "{blocked:?}"
+    );
     assert_eq!(exchange.sends(), 0);
     let envelopes = tree(&root.path().join("runs"));
     let written: Vec<Value> = envelopes
@@ -600,11 +646,41 @@ fn the_run_envelope_exists_on_disk_before_the_first_send_and_before_the_lease() 
     assert_eq!(
         (
             written[0]["schema"].as_str(),
-            written[0]["finished_at"].is_null()
+            written[0]["finished_at"].as_str(),
+            written[0]["refused"].as_str()
         ),
-        (Some("newsvault.run/1"), true)
+        (
+            Some("newsvault.run/1"),
+            Some("2026-11-10T23:00:00Z"),
+            Some("lease_held")
+        )
     );
     drop(held);
+    Ok(())
+}
+
+/// A lease-held run whose run id a finished run already has puts that run's file back byte for
+/// byte, so the ledger keeps the finished run observed and never reads it as `lease_held`.
+#[test]
+fn a_lease_held_run_puts_back_the_run_file_its_run_id_already_had() -> TestResult {
+    let root = TempDir::new()?;
+    let ask = ask(root.path(), A_LISTED_SESSION);
+    let provider = cmd_collect::open_provider(&ask)?;
+    let finished = cmd_collect::run(&ask, &provider, &Payloads::a_good_day()?, &Fixed)?;
+    let run_id = finished.envelope["run_id"].as_str().ok_or("run_id")?;
+    let run_file = root.path().join("runs").join(format!("{run_id}.json"));
+    let before = std::fs::read(&run_file)?;
+    let held = Committer::open(root.path(), &RunId::new("the-holder"))?;
+    let blocked = cmd_collect::run(&ask, &provider, &Payloads::a_good_day()?, &Fixed);
+    drop(held);
+    assert!(
+        matches!(
+            blocked,
+            Err(CollectRunError::Store(StoreError::LeaseHeld(_)))
+        ),
+        "{blocked:?}"
+    );
+    assert_eq!(std::fs::read(&run_file)?, before);
     Ok(())
 }
 
@@ -1895,6 +1971,7 @@ fn gnw_payloads(answers: &[(&str, u16, &str)]) -> Result<Payloads, Box<dyn Error
     Ok(Payloads {
         answers: held,
         asked: RefCell::new(Vec::new()),
+        reserved: RefCell::new(Vec::new()),
     })
 }
 
@@ -2343,7 +2420,37 @@ fn every_collect_usage_error_is_written_as_a_usage_error() -> TestResult {
         args
     };
     let calendar = path(&fixture("calendar.json"));
+    let a_minute_ahead = (Utc::now() + chrono::TimeDelta::minutes(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let after_the_clock: Vec<String> = open_web_args(root.path(), &[])
+        .into_iter()
+        .filter(|arg| arg != "--dry-run")
+        .map(|arg| {
+            if arg == SATURDAY_AT {
+                a_minute_ahead.clone()
+            } else {
+                arg
+            }
+        })
+        .collect();
     let rows = [
+        (
+            "deadline not after at",
+            collect_args(
+                root.path(),
+                A_LISTED_SESSION,
+                &["--deadline", AT, "--dry-run"],
+            ),
+        ),
+        (
+            "deadline not after now",
+            collect_args(
+                root.path(),
+                A_LISTED_SESSION,
+                &["--deadline", "2026-11-10T23:30:00Z"],
+            ),
+        ),
+        ("at after the clock", after_the_clock),
         ("window unreadable", with_window("garbage")),
         ("window not the run day", with_window("2026-11-13")),
         (

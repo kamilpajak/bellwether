@@ -1,11 +1,12 @@
 //! `newsvault collect --source open_web_wires` from plan to committed items, over the GNW fixtures
 //! in `providers/open-web-feed/tests/fixtures/gnw` (architecture.md section 11.5 step 2).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -4296,8 +4297,8 @@ const RELEASE_PREFIX: &str = "https://rss.globenewswire.com/news-release/";
 const LOCATION: &str = "location";
 const GONE: u16 = 410;
 const WALK_FIRST: &str = "2026-11-17T12:00:30Z";
-const WALK_SECOND: &str = "2026-11-17T12:05:30Z";
-const WALK_THIRD: &str = "2026-11-17T12:10:30Z";
+const WALK_SECOND: &str = "2026-11-17T12:30:30Z";
+const WALK_THIRD: &str = "2026-11-17T13:00:30Z";
 /// 3404415, the lowest id `RSS_1200` lists, less one; and its highest.
 const BELOW_THE_FIRST_POLL: u64 = 3_404_414;
 const FIRST_FRONTIER: u64 = 3_404_422;
@@ -4560,8 +4561,8 @@ fn a_second_poll_walks_below_the_previous_frontier_only_and_records_each_answer(
             "2026-11-17T12:00:00.000000Z".to_owned(),
             "2026-11-17T12:00:00Z".to_owned(),
             "og:article:published_time".to_owned(),
-            "2026-11-17T12:05:29.000000Z".to_owned(),
-            "2026-11-17T12:05:29.000000Z".to_owned(),
+            "2026-11-17T12:30:29.000000Z".to_owned(),
+            "2026-11-17T12:30:29.000000Z".to_owned(),
         )
     );
     // The RSS index's `held` counts its own rows only: none of its 3 was held.
@@ -4736,7 +4737,7 @@ fn a_walked_id_robots_disallow_leaves_the_poll_no_basis() -> TestResult {
     Ok(())
 }
 
-const WALK_FOURTH: &str = "2026-11-17T12:15:30Z";
+const WALK_FOURTH: &str = "2026-11-17T13:30:30Z";
 
 /// `RSS_1205` with every release link moved under `/en/`, a shape no release is read from.
 fn shifted_index() -> Result<Gnw, Box<dyn Error>> {
@@ -5507,10 +5508,11 @@ fn deferred_requests_open_no_attempt_and_every_reader_counts_each_reason_apart()
     Ok(())
 }
 
-/// No deadline: every request is still reserved once through `reserve`, with `None`, nothing is
-/// refused, and the run asks every request it did before condition A.
+/// S7-D3 by default: with no `--deadline` an open-web run at 09:30:30 belongs to the 09:30 slot
+/// (90 min, next 11:00) and every reservation, one per send and PRN's stopped one, carries its
+/// deadline, 10:14:30; PRN, held to 11:30:30, is stopped `host_held` with its lane.
 #[test]
-fn with_no_deadline_every_request_is_asked_and_nothing_is_deferred() -> TestResult {
+fn with_no_deadline_an_open_web_run_stops_at_its_schedule_slots_deadline() -> TestResult {
     let root = TempDir::new()?;
     seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
     let mut exchange = Gnw::five_hosts()?;
@@ -5527,21 +5529,67 @@ fn with_no_deadline_every_request_is_asked_and_nothing_is_deferred() -> TestResu
         .paced
         .as_ref()
         .map(|paced| paced.deadlines.borrow().clone());
+    let reasons: BTreeSet<String> = deferred_of(&answer.envelope)
+        .into_iter()
+        .map(|row| format!("{} {}", row.0, row.2))
+        .collect();
     assert_eq!(
         (
             sent.len(),
-            deferred_of(&answer.envelope).len(),
+            reasons,
             deadlines,
             answer.envelope["deadline"].clone(),
-            answer.exit,
+            answer.envelope["slot"].clone(),
         ),
         (
-            FIVE_HOST_FOLLOW_UPS + 6,
-            0,
-            Some(vec![None; FIVE_HOST_FOLLOW_UPS + 6]),
-            Value::Null,
-            Exit::Ok
+            FIVE_HOST_FOLLOW_UPS + 1,
+            BTreeSet::from([format!("{PRN_HOST} host_held")]),
+            Some(vec![
+                Some(instant(SLOT_0930_DEADLINE));
+                FIVE_HOST_FOLLOW_UPS + 2
+            ]),
+            Value::from("2026-11-16T10:14:30.000000Z"),
+            serde_json::json!({
+                "start": "2026-11-16T09:30:00.000000Z",
+                "period_s": 5_400,
+                "next": "2026-11-16T11:00:00.000000Z",
+            }),
         )
+    );
+    Ok(())
+}
+
+const SLOT_0930_DEADLINE: &str = "2026-11-16T10:14:30Z";
+
+/// S7-D3's late start: a run 45 min into the 09:30 slot, past its 10:14:30 deadline, asks
+/// nothing; each planned index is a `run_deadline` row and the run exits 8.
+#[test]
+fn a_run_started_past_its_slots_deadline_asks_nothing_and_defers_every_index() -> TestResult {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    let mut exchange = Gnw::five_hosts()?;
+    exchange.paced = Some(paced(&[], Vec::new()));
+    let late = "2026-11-16T10:15:00Z";
+    let ask = Ask {
+        hosts: Some(seed::committed_hosts()),
+        at: instant(late),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, &exchange, &At(instant(late)))?;
+    let (sent, _) = exchange.sent();
+    let deferred = deferred_of(&answer.envelope);
+    let stored = stored_deferred(root.path())?.len();
+    assert_eq!(
+        (
+            sent.len(),
+            deferred.len(),
+            stored,
+            deferred.iter().all(|row| row.2 == "run_deadline"),
+            answer.envelope["plan"]["requests"].as_u64(),
+            answer.exit.error_code(),
+        ),
+        (0, 6, 6, true, Some(6), Some("partial_collect"))
     );
     Ok(())
 }
@@ -5588,5 +5636,325 @@ fn walk_ids_the_deadline_cuts_are_deferred_and_the_walk_is_not_complete() -> Tes
 }
 
 /// `WALK_SECOND` plus 45 s: the walk's host gets five slots under `PACE`; the sixth opens at 50 s.
-const WALK_SECOND_PLUS_45_S: &str = "2026-11-17T12:06:15Z";
-const SIXTH_WALK_SLOT: &str = "2026-11-17T12:06:20.000000Z";
+const WALK_SECOND_PLUS_45_S: &str = "2026-11-17T12:31:15Z";
+const SIXTH_WALK_SLOT: &str = "2026-11-17T12:31:20.000000Z";
+
+// ---- Step 7 PR 4: the frontier's age, the clock, S7-D11's busy fields ----
+
+/// The first poll's answer is received 1 s before `WALK_FIRST`, at 12:00:29: exactly the shortest
+/// period, 30 min, before 12:30:29, and 29:59 before 12:30:28.
+const FRONTIER_30_00_OLD: &str = "2026-11-17T12:30:29Z";
+const FRONTIER_29_59_OLD: &str = "2026-11-17T12:30:28Z";
+
+/// Owner decision 2026-11-18: the answer setting the walk's top must be at least the schedule's
+/// shortest period old. At exactly 30:00 it is read and the poll walks to its frontier; at 29:59
+/// no older answer exists, so the poll is `range_unread`, asks no id and stays no basis.
+#[test]
+fn the_walks_frontier_answer_must_be_a_shortest_period_old() -> TestResult {
+    let mut seen = Vec::new();
+    for at in [FRONTIER_30_00_OLD, FRONTIER_29_59_OLD] {
+        let root = after_a_first_walked_poll()?;
+        let exchange = Gnw::walked(RSS_1205)?;
+        let poll = walked_poll(root.path(), hosts_fixture(WALK_HOSTS), at, &exchange)?;
+        let (sent, _) = exchange.sent();
+        seen.push((
+            walked_ids(&sent).len(),
+            poll.envelope["walk"][0]["through"].clone(),
+            poll.envelope["walk"][0]["continuity"].clone(),
+        ));
+    }
+    assert_eq!(
+        seen,
+        vec![
+            (5, Value::from(FIRST_FRONTIER), Value::from("complete")),
+            (0, Value::Null, Value::from("range_unread")),
+        ]
+    );
+    Ok(())
+}
+
+/// The real time order: a live poll's answer arrives after its own `--at` (here 1 s after, the
+/// clock 2 s after). The 12:30:30 poll finds the 12:00:30 answer 29:59 old, so it is
+/// `range_unread`; the 13:00:30 poll walks to the 12:00:30 answer, two 30-min slots back.
+#[test]
+fn in_real_time_order_a_walk_reads_the_answer_of_two_busy_slots_back() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts_fixture(WALK_HOSTS), ROBOTS_EARLIER)?;
+    let mut seen = Vec::new();
+    for (at, feed) in [
+        (WALK_FIRST, RSS_1200),
+        (WALK_SECOND, RSS_1205),
+        (WALK_THIRD, RSS_1205),
+    ] {
+        let exchange = Gnw::walked(feed)?;
+        let ask = Ask {
+            hosts: Some(hosts_fixture(WALK_HOSTS)),
+            at: instant(at),
+            schedule: Some("walk".to_owned()),
+            ..ask(root.path(), cmd_collect::TODAY)
+        };
+        let opened = cmd_collect::open_provider(&ask)?;
+        let clock = At(instant(at) + TimeDelta::seconds(ANSWER_AFTER_AT_S + 1));
+        let poll = cmd_collect::run(&ask, &opened, &exchange, &clock)?;
+        let (sent, _) = exchange.sent();
+        let walk = &poll.envelope["walk"][0];
+        seen.push((
+            walked_ids(&sent).len(),
+            walk["through"].clone(),
+            walk["continuity"].clone(),
+        ));
+    }
+    assert_eq!(
+        seen,
+        vec![
+            (0, Value::Null, Value::from("first_poll")),
+            (0, Value::Null, Value::from("range_unread")),
+            (5, Value::from(FIRST_FRONTIER), Value::from("complete")),
+        ]
+    );
+    Ok(())
+}
+
+/// How long after its `--at` a live poll's answer is received in
+/// `in_real_time_order_a_walk_reads_the_answer_of_two_busy_slots_back`.
+const ANSWER_AFTER_AT_S: i64 = 1;
+
+/// S7-D3 and S7-D11 read the clock, not `--at`: a run planned at 18:59:30 (the 18:30 slot) and
+/// started at 19:00:30 takes the 19:00 slot's 19:14:30 stop, and its wall time starts at 19:00:30.
+#[test]
+fn the_slot_and_the_wall_time_come_from_the_clock_not_from_at() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let clock = Rc::new(Cell::new(instant(RUN_AT)));
+    let exchange = Ticked {
+        inner: Gnw::day()?,
+        clock: clock.clone(),
+    };
+    let ask = Ask {
+        at: instant("2026-11-14T18:59:30Z"),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, &exchange, &Ticking(clock.clone()))?;
+    let ran = (clock.get() - instant(RUN_AT)).num_seconds();
+    assert_eq!(
+        (
+            answer.envelope["deadline"].clone(),
+            answer.envelope["slot"]["start"].clone(),
+            answer.envelope["busy"]["wall_s"].as_f64(),
+        ),
+        (
+            Value::from("2026-11-14T19:14:30.000000Z"),
+            Value::from("2026-11-14T19:00:00.000000Z"),
+            Some(ran as f64),
+        )
+    );
+    Ok(())
+}
+
+/// The frontier's age is read against `--at`, so a live open-web run may not plan after the
+/// clock: 1 µs later is a usage error with nothing sent.
+#[test]
+fn an_open_web_run_whose_at_is_after_the_clock_is_refused() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let exchange = Gnw::day()?;
+    let ask = Ask {
+        at: instant("2026-11-14T19:00:30.000001Z"),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let refused = cmd_collect::run(&ask, &opened, &exchange, &Fixed);
+    assert!(
+        matches!(refused, Err(CollectRunError::AtAfterTheClock { .. })),
+        "{refused:?}"
+    );
+    assert!(exchange.sent().0.is_empty());
+    Ok(())
+}
+
+/// A clock only [`Ticked`] moves.
+struct Ticking(Rc<Cell<DateTime<Utc>>>);
+
+impl Clock for Ticking {
+    fn now(&self) -> DateTime<Utc> {
+        self.0.get()
+    }
+}
+
+/// `Gnw` whose granted reservation waits `WAIT`, whose request takes `TOOK` by its own instants
+/// and `TOOK` + `AFTER` by the clock, and which reports GNW slowed (S7-D11).
+struct Ticked {
+    inner: Gnw,
+    clock: Rc<Cell<DateTime<Utc>>>,
+}
+
+const WAIT: TimeDelta = TimeDelta::seconds(7);
+const TOOK: TimeDelta = TimeDelta::seconds(3);
+const AFTER: TimeDelta = TimeDelta::seconds(2);
+const GNW_HOST: &str = "rss.globenewswire.com";
+const GNW_HELD_UNTIL: &str = "2026-11-14T21:00:30Z";
+
+impl Ticked {
+    fn tick(&self, by: TimeDelta) {
+        self.clock.set(self.clock.get() + by);
+    }
+}
+
+impl Exchange for Ticked {
+    fn reserve(
+        &self,
+        request: &Request,
+        clock: &dyn Clock,
+        deadline: Option<DateTime<Utc>>,
+    ) -> Result<news_provider::Reservation, news_provider::Unreserved> {
+        let reserved = self.inner.reserve(request, clock, deadline)?;
+        if reserved == news_provider::Reservation::Go {
+            self.tick(WAIT);
+        }
+        Ok(reserved)
+    }
+
+    fn capped_holds(&self) -> Vec<news_provider::CappedHold> {
+        self.inner.capped_holds()
+    }
+
+    fn slowed(&self, host: &str) -> news_provider::Slowed {
+        match host {
+            GNW_HOST => news_provider::Slowed {
+                doublings: 2,
+                held_until: Some(instant(GNW_HELD_UNTIL)),
+            },
+            _ => news_provider::Slowed::default(),
+        }
+    }
+
+    fn send(
+        &self,
+        permit: SendPermit,
+        request: &Request,
+        clock: &dyn Clock,
+    ) -> Result<RawResponse, SendFailure> {
+        let sent = ObservationTime::new(clock.now());
+        self.tick(TOOK);
+        let received = ObservationTime::new(clock.now());
+        self.tick(AFTER);
+        let answer = self.inner.send(permit, request, clock)?;
+        Ok(RawResponse::new(
+            answer.attempt_id().clone(),
+            answer.status(),
+            answer.body().to_vec(),
+            sent,
+            received,
+        )
+        .with_headers(answer.headers().clone()))
+    }
+}
+
+/// A ledger day's wall time, its busy hosts and its capped holds.
+type LedgeredBusy = (f64, Vec<(Option<String>, f64)>, u32);
+
+/// GNW's index and two releases are asked; the third's slot opens past the deadline (50 s on).
+/// Each S7-D11 field differs from every other, so a swap is red: waited 21 s (3 × 7), requesting
+/// 9 s (3 × 3), busy 30 s, 3 requests, stopped, 1 not looked, held, 2 doublings; wall 36 s.
+#[test]
+fn every_busy_field_reaches_the_envelope_the_run_file_and_the_ledger() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let capped = news_provider::CappedHold {
+        host: GNW_HOST.to_owned(),
+        retry_after: "315360000".to_owned(),
+        held_until: instant(GNW_HELD_UNTIL),
+    };
+    let mut inner = Gnw::day()?;
+    inner.paced = Some(paced(&[], vec![capped]));
+    let clock = Rc::new(Cell::new(instant(RUN_AT)));
+    let exchange = Ticked {
+        inner,
+        clock: clock.clone(),
+    };
+    let ask = Ask {
+        deadline: Some(instant(RUN_AT) + TimeDelta::seconds(50)),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, &exchange, &Ticking(clock))?;
+    assert_eq!(
+        answer.envelope["busy"].clone(),
+        serde_json::json!({
+            "wall_s": 36.0,
+            "hosts": [{
+                "host": GNW_HOST,
+                "waited_s": 21.0,
+                "requesting_s": 9.0,
+                "busy_s": 30.0,
+                "requests": 3,
+                "stopped": true,
+                "not_looked": 1,
+                "held_until": "2026-11-14T21:00:30.000000Z",
+                "doublings": 2,
+            }],
+        })
+    );
+    let run_id = answer.envelope["run_id"].as_str().ok_or("run_id")?;
+    let file: Value = serde_json::from_slice(&std::fs::read(
+        root.path().join(RUNS_DIR).join(format!("{run_id}.json")),
+    )?)?;
+    let report = newsvault::cmd_ledger::read(
+        root.path(),
+        &newsvault::cmd_ledger::Ask {
+            at: instant("2026-11-15T00:00:00Z"),
+            from: "2026-11-14".parse()?,
+            to: "2026-11-14".parse()?,
+            source: None,
+            expected_runs: None,
+            limit: None,
+            check: false,
+        },
+    )?;
+    let ledgered: Vec<LedgeredBusy> = report
+        .days
+        .iter()
+        .map(|day| {
+            let hosts = day
+                .busy
+                .iter()
+                .map(|lane| (lane.host.clone(), lane.busy_s))
+                .collect();
+            (day.wall_s, hosts, day.holds_capped)
+        })
+        .collect();
+    assert_eq!(
+        (
+            file["wall_s"].clone(),
+            file["busy"].clone(),
+            file["holds_capped"].clone(),
+            ledgered,
+        ),
+        (
+            Value::from(36.0),
+            serde_json::json!([{"host": GNW_HOST, "busy_s": 30.0}]),
+            serde_json::json!([{"host": GNW_HOST, "retry_after": "315360000",
+                                "held_until": "2026-11-14T21:00:30Z"}]),
+            vec![(36.0, vec![(Some(GNW_HOST.to_owned()), 30.0)], 1)],
+        )
+    );
+    let mut human = Vec::new();
+    cmd_collect::render_human(&answer.envelope, &mut human)?;
+    let lines: Vec<String> = String::from_utf8(human)?
+        .lines()
+        .filter(|line| line.starts_with("busy") || line.starts_with("  rss."))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            "busy             wall_s 36.0".to_owned(),
+            format!(
+                "  {GNW_HOST} waited_s 21.0 requesting_s 9.0 busy_s 30.0 requests 3 stopped true \
+                 not_looked 1 held_until 2026-11-14T21:00:30.000000Z doublings 2"
+            ),
+        ]
+    );
+    Ok(())
+}

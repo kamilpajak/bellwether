@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use canon::digest::{doc_id, item_id, story_id, ItemFields};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use edgar_press::EdgarPress;
 use news_provider::lag_policy::{LagPolicy, LagPolicyError};
 use news_provider::provider::{Cadence, Calendar, CalendarError, Listing, PlanRefusal, Provenance};
@@ -28,8 +28,9 @@ use open_web_feed::{
 use pit::{MeasuredLag, ObservationTime};
 use serde_json::{json, Value};
 
-use crate::cmd_ledger::{Envelope, RunKind, RUN_ENVELOPE_SCHEMA};
+use crate::cmd_ledger::{Envelope, RunBusy, RunHold, RunKind, LEASE_HELD, RUN_ENVELOPE_SCHEMA};
 use crate::robots::{Robots, RobotsError};
+use crate::schedule::{self, ScheduleRefusal, SlotAt};
 use crate::store::{
     Committer, IndexPayload, ItemRow, StoreError, WalkRecord, POLICY_DIR, RUNS_DIR,
 };
@@ -75,8 +76,8 @@ pub struct Ask {
     pub lag_policy: Option<PathBuf>,
     pub contact: String,
     pub at: DateTime<Utc>,
-    /// The last instant a request may be sent at (condition A); `None` sends every request.
-    /// Given by the caller until architecture.md section 11.5 step 7 PR 4 computes it (S7-D3).
+    /// The last instant a request may be sent at (condition A), overriding the schedule's (S7-D3).
+    /// `None`: the schedule's for a source on it, and no deadline for one that is not.
     pub deadline: Option<DateTime<Utc>>,
     pub dry_run: bool,
 }
@@ -125,6 +126,16 @@ pub enum CollectRunError {
         deadline: DateTime<Utc>,
         now: DateTime<Utc>,
     },
+    /// The GNW walk's frontier must be a shortest period old by the clock and is read against
+    /// `--at`, so a live every-day run may not plan after the clock (section 11.2).
+    #[error("--at {at} is after the clock's {now}")]
+    AtAfterTheClock {
+        at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    },
+    /// The committed schedule (section 11.2) is not one; `cargo test` reaches this first.
+    #[error("the poll schedule is unusable: {0}")]
+    ScheduleUnusable(#[from] ScheduleRefusal),
     #[error("no {what} at {path}")]
     InputAbsent { what: &'static str, path: PathBuf },
     #[error("the calendar at {path} is unusable: {why}")]
@@ -231,12 +242,14 @@ impl CollectRunError {
             | Self::TodayRefused { .. }
             | Self::DeadlineNotAfterAt { .. }
             | Self::DeadlineNotAfterNow { .. }
+            | Self::AtAfterTheClock { .. }
             | Self::WindowRefused(_) => true,
             Self::InputAbsent { .. }
             | Self::UnusableCalendar { .. }
             | Self::PlanRefused(_)
             | Self::Refused(_)
             | Self::OpenWebRefused(_)
+            | Self::ScheduleUnusable(_)
             | Self::UnusableLagPolicy(_)
             | Self::RobotsUnverified { .. }
             | Self::RobotsRefused { .. }
@@ -353,6 +366,13 @@ impl Registered {
             Self::EdgarPress => Cadence::SessionBound,
             Self::OpenWebWires => Cadence::EveryUtcDay,
         }
+    }
+
+    /// Whether section 11.2's schedule sets the run's deadline: EDGAR's session-bound runs are
+    /// not on it.
+    #[must_use]
+    pub const fn on_schedule(self) -> bool {
+        matches!(self, Self::OpenWebWires)
     }
 
     /// (flag, taken): `roster` is `edgar-press`'s universe, `hosts` is `open-web-feed`'s.
@@ -536,7 +556,8 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
                 let paging = provider.paging();
                 let basis = basis_of(&ask.store, &paging)?;
                 let walk = provider.walk();
-                let ranges = ranges_of(&ask.store, &walk)?;
+                let youngest = schedule::committed(patience_of(&provider))?.shortest_period();
+                let ranges = ranges_of(&ask.store, &walk, ask.at - youngest)?;
                 let handed = ranges
                     .iter()
                     .filter_map(|(url, plan)| Some((url.clone(), plan.range()?.clone())))
@@ -570,10 +591,19 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
     })
 }
 
-/// Each walked index's range (section 11.2): through the highest id the newest usable answer of
-/// the index lists, after the id the newest basis poll walked through. Read before the lease; a
-/// blob the store names and does not hold refuses the run, as a paged basis does.
-fn ranges_of(store: &Path, walk: &Walk) -> Result<BTreeMap<String, WalkPlan>, CollectRunError> {
+/// The provider's patience for one request, S7-D3's `VENDOR_PATIENCE`: its global timeout.
+fn patience_of(provider: &dyn Provider) -> TimeDelta {
+    TimeDelta::from_std(provider.transport().timeouts.global).unwrap_or(TimeDelta::MAX)
+}
+
+/// Each walked index's range (section 11.2): through the highest id the newest usable answer
+/// received by `frontier_by` lists, after the id the newest basis poll walked through. Only
+/// younger answers and a basis: `range_unread`, no basis. A blob the store lacks refuses the run.
+fn ranges_of(
+    store: &Path,
+    walk: &Walk,
+    frontier_by: DateTime<Utc>,
+) -> Result<BTreeMap<String, WalkPlan>, CollectRunError> {
     let kept = basis_names();
     let source = SourceId::new(open_web_feed::SOURCE);
     let held = |digest: &str| -> Result<Vec<u8>, CollectRunError> {
@@ -586,7 +616,11 @@ fn ranges_of(store: &Path, walk: &Walk) -> Result<BTreeMap<String, WalkPlan>, Co
     };
     let mut ranges = BTreeMap::new();
     for index_url in walk.index_urls() {
-        let read = crate::store::walk_read(store, &source, index_url, &kept)?;
+        let read = crate::store::walk_read(store, &source, index_url, &kept, frontier_by)?;
+        if read.previous.is_none() && read.younger && read.basis.is_some() {
+            ranges.insert(index_url.to_owned(), WalkPlan::RangeUnread);
+            continue;
+        }
         let previous = read.previous.as_deref().map(held).transpose()?;
         let basis = match &read.basis {
             Some((through, digest)) => Some((*through, held(digest)?)),
@@ -878,11 +912,21 @@ pub fn run(
             at: ask.at,
         });
     }
-    if ask.dry_run {
-        return planned(ask, opened, &run_id, run_date);
-    }
     let now = clock.now();
-    if let Some(deadline) = ask.deadline.filter(|deadline| *deadline <= now) {
+    let stop = stop_of(ask, opened, now)?;
+    let ask = &Ask {
+        deadline: stop.deadline,
+        ..ask.clone()
+    };
+    if ask.dry_run {
+        return planned(ask, opened, &run_id, run_date, &stop);
+    }
+    if let Some(deadline) = stop
+        .given
+        .then_some(ask.deadline)
+        .flatten()
+        .filter(|deadline| *deadline <= now)
+    {
         return Err(CollectRunError::DeadlineNotAfterNow { deadline, now });
     }
     // A dry run may name another day, which tests and plans need; a fetch may not.
@@ -893,6 +937,9 @@ pub fn run(
             at: run_date,
             today,
         });
+    }
+    if provider.cadence() == Cadence::EveryUtcDay && ask.at > now {
+        return Err(CollectRunError::AtAfterTheClock { at: ask.at, now });
     }
     refuse_the_window(ask, provider)?;
     refuse_an_unverified_robots(ask, opened)?;
@@ -913,10 +960,34 @@ pub fn run(
         started_at: ask.at,
         finished_at: None,
         kind: RunKind::Collect,
+        refused: None,
+        wall_s: None,
+        busy: Vec::new(),
+        holds_capped: Vec::new(),
     };
+    let prior = prior_run_file(&ask.store, &run_id)?;
     // Before the lease, so a run that never gets one is a record rather than a hole.
     write_envelope(&ask.store, &envelope)?;
-    let mut store = Committer::open(&ask.store, &run)?;
+    let mut store = match Committer::open(&ask.store, &run) {
+        Ok(store) => store,
+        // S7-D9: finished and marked, so the ledger counts it apart from the runs it observes.
+        // A file of the same run id that was there first is put back, never marked.
+        Err(StoreError::LeaseHeld(lock)) => {
+            match prior {
+                Some(bytes) => write_run_file(&ask.store, &run_id, &bytes)?,
+                None => write_envelope(
+                    &ask.store,
+                    &Envelope {
+                        finished_at: Some(clock.now()),
+                        refused: Some(LEASE_HELD.to_owned()),
+                        ..envelope
+                    },
+                )?,
+            }
+            return Err(StoreError::LeaseHeld(lock).into());
+        }
+        Err(other) => return Err(other.into()),
+    };
     let mut driven = drive(ask, provider, &mut store, exchange, clock, &run)?;
     if let Some(checker) = opened.cross_checker.as_ref() {
         driven.cross_check = cross_check_of(&store, checker, &driven.collected);
@@ -927,15 +998,80 @@ pub fn run(
     if let Some(walked) = opened.walked.as_ref() {
         driven.walk = walk_of(&mut store, walked, &driven.collected);
     }
+    let finished_at = clock.now();
+    let wall = finished_at - now;
     let finished = Envelope {
-        finished_at: Some(clock.now()),
+        finished_at: Some(finished_at),
+        wall_s: Some(seconds(wall)),
+        busy: driven
+            .collected
+            .busy
+            .iter()
+            .map(|lane| RunBusy {
+                host: lane.host.clone(),
+                busy_s: seconds(lane.busy()),
+            })
+            .collect(),
+        holds_capped: driven
+            .collected
+            .capped_holds
+            .iter()
+            .map(|hold| RunHold {
+                host: hold.host.clone(),
+                retry_after: hold.retry_after.clone(),
+                held_until: hold.held_until,
+            })
+            .collect(),
         ..envelope
     };
     write_envelope(&ask.store, &finished)?;
+    let timing = Timing {
+        stop,
+        wall: Some(wall),
+    };
     Ok(Answer {
         exit: driven.collected.exit(),
-        envelope: envelope_of(ask, opened, &run_id, run_date, &driven, true),
+        envelope: envelope_of(ask, opened, &run_id, run_date, &driven, &timing),
     })
+}
+
+/// Where a run stops asking (S7-D3): the caller's `--deadline`, else the schedule's for a source
+/// on it, else none. `slot` is the schedule slot the clock's `now` belongs to when it decided.
+#[derive(Debug, Clone, Copy)]
+pub struct Stop {
+    pub deadline: Option<DateTime<Utc>>,
+    pub given: bool,
+    pub slot: Option<SlotAt>,
+}
+
+/// A run started more than half a period late gets a deadline already passed and is not
+/// refused: every request is then a `run_deadline` row, so "we did not look" is in the store.
+fn stop_of(ask: &Ask, opened: &Opened, now: DateTime<Utc>) -> Result<Stop, CollectRunError> {
+    if ask.deadline.is_some() || !opened.registered.on_schedule() {
+        return Ok(Stop {
+            deadline: ask.deadline,
+            given: ask.deadline.is_some(),
+            slot: None,
+        });
+    }
+    let patience = patience_of(opened.provider.as_ref());
+    let slot = schedule::committed(patience)?.slot_at(now);
+    Ok(Stop {
+        deadline: slot.map(|slot| slot.deadline(patience)),
+        given: false,
+        slot,
+    })
+}
+
+/// What the envelope reports of a run's clock: its stop and, once it ran, its wall time.
+struct Timing {
+    stop: Stop,
+    wall: Option<TimeDelta>,
+}
+
+fn seconds(span: TimeDelta) -> f64 {
+    span.num_microseconds()
+        .map_or(f64::MAX, |micros| micros as f64 / 1e6)
 }
 
 /// Section 11.2's option C: this run's keyed index answer against every direct index answer the
@@ -1451,6 +1587,7 @@ fn planned(
     opened: &Opened,
     run_id: &str,
     run_date: NaiveDate,
+    stop: &Stop,
 ) -> Result<Answer, CollectRunError> {
     let provider = opened.provider.as_ref();
     let (calendar, listing) = inputs(ask)?;
@@ -1480,7 +1617,17 @@ fn planned(
     Ok(Answer {
         // A dry run answers the plan question and nothing else, so its exit is the plan's.
         exit: driven.collected.exit(),
-        envelope: envelope_of(ask, opened, run_id, run_date, &driven, false),
+        envelope: envelope_of(
+            ask,
+            opened,
+            run_id,
+            run_date,
+            &driven,
+            &Timing {
+                stop: *stop,
+                wall: None,
+            },
+        ),
     })
 }
 
@@ -1495,17 +1642,34 @@ fn run_id(ask: &Ask) -> String {
 /// tmp + rename, like every other file in the layout: a run killed while its envelope is rewritten
 /// otherwise leaves unparseable JSON and disables the command whose job is to report the kill.
 pub(crate) fn write_envelope(root: &Path, envelope: &Envelope) -> Result<(), CollectRunError> {
+    write_run_file(
+        root,
+        &envelope.run_id,
+        &serde_json::to_vec_pretty(envelope)?,
+    )
+}
+
+/// The bytes of `runs/<run_id>.json` as found, `None` when there is no such file.
+fn prior_run_file(root: &Path, run_id: &str) -> Result<Option<Vec<u8>>, CollectRunError> {
+    match std::fs::read(root.join(RUNS_DIR).join(format!("{run_id}.json"))) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(other) => Err(other.into()),
+    }
+}
+
+fn write_run_file(root: &Path, run_id: &str, bytes: &[u8]) -> Result<(), CollectRunError> {
     let runs = root.join(RUNS_DIR);
     std::fs::create_dir_all(&runs)?;
-    let staging = runs.join(format!("{STAGING_PREFIX}{}.json", envelope.run_id));
+    let staging = runs.join(format!("{STAGING_PREFIX}{run_id}.json"));
     // `File::create` TRUNCATES, which is right HERE and wrong for a blob or a segment: one run
     // writes its envelope twice by design, and refusing a staged file a crash left behind would
     // wedge that run id for good. The archive's content files keep `create_new`.
     let mut staged = std::fs::File::create(&staging)?;
-    std::io::Write::write_all(&mut staged, &serde_json::to_vec_pretty(envelope)?)?;
+    std::io::Write::write_all(&mut staged, bytes)?;
     staged.sync_all()?;
     drop(staged);
-    std::fs::rename(&staging, runs.join(format!("{}.json", envelope.run_id)))?;
+    std::fs::rename(&staging, runs.join(format!("{run_id}.json")))?;
     // A rename is durable only once the directory holding the new name is fsynced, which is the
     // pair `blobs.rs` and `publish.rs` already keep.
     std::fs::File::open(&runs)?.sync_all()?;
@@ -1518,8 +1682,9 @@ fn envelope_of(
     run_id: &str,
     run_date: NaiveDate,
     driven: &Driven,
-    changed: bool,
+    timing: &Timing,
 ) -> Value {
+    let changed = timing.wall.is_some();
     let provider = opened.provider.as_ref();
     let collected = &driven.collected;
     let exit = collected.exit();
@@ -1548,6 +1713,12 @@ fn envelope_of(
         "observation_lag_seconds": opened.lag.as_ref().map(|lag| lag.seconds),
         "at": ask.at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
         "deadline": ask.deadline.map(micros),
+        // S7-D3: the schedule slot the deadline was computed from; null when given or none.
+        "slot": timing.stop.slot.map(|slot| json!({
+            "start": micros(slot.start),
+            "period_s": slot.period.num_seconds(),
+            "next": micros(slot.next),
+        })),
         "dry_run": ask.dry_run,
         "plan": {
             "requests": collected.planned_requests,
@@ -1576,6 +1747,21 @@ fn envelope_of(
             "retry_after": hold.retry_after,
             "held_until": micros(hold.held_until),
         })).collect::<Vec<Value>>(),
+        // S7-D11, null for a dry run: the run's wall time and each host's share of it.
+        "busy": timing.wall.map(|wall| json!({
+            "wall_s": seconds(wall),
+            "hosts": collected.busy.iter().map(|lane| json!({
+                "host": lane.host,
+                "waited_s": seconds(lane.waited),
+                "requesting_s": seconds(lane.requesting),
+                "busy_s": seconds(lane.busy()),
+                "requests": lane.requests,
+                "stopped": lane.stopped,
+                "not_looked": lane.not_looked,
+                "held_until": lane.held_until.map(micros),
+                "doublings": lane.doublings,
+            })).collect::<Vec<Value>>(),
+        })),
         "attempts": collected.attempts.iter().map(|row| json!({
             "attempt_id": row.attempt_id,
             "source": row.source,
@@ -1748,6 +1934,32 @@ pub fn render_human(envelope: &Value, out: &mut impl std::io::Write) -> std::io:
         "holds capped     {}",
         envelope["holds_capped"].as_array().map_or(0, Vec::len)
     )?;
+    writeln!(
+        out,
+        "deadline         {} slot {}",
+        envelope["deadline"].as_str().unwrap_or("-"),
+        envelope["slot"]["start"].as_str().unwrap_or("-")
+    )?;
+    let busy = &envelope["busy"];
+    if !busy.is_null() {
+        writeln!(out, "busy             wall_s {}", busy["wall_s"])?;
+        for lane in busy["hosts"].as_array().unwrap_or(&none) {
+            writeln!(
+                out,
+                "  {} waited_s {} requesting_s {} busy_s {} requests {} stopped {} \
+                 not_looked {} held_until {} doublings {}",
+                lane["host"].as_str().unwrap_or("-"),
+                lane["waited_s"],
+                lane["requesting_s"],
+                lane["busy_s"],
+                lane["requests"],
+                lane["stopped"],
+                lane["not_looked"],
+                lane["held_until"].as_str().unwrap_or("-"),
+                lane["doublings"],
+            )?;
+        }
+    }
     writeln!(out, "exit             {}", envelope["exit"]["code"])?;
     Ok(())
 }

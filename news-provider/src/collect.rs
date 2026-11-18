@@ -6,9 +6,9 @@
 //! with no provider: [`Exchange`] is the socket, whose only implementation that opens one is
 //! [`Wire`], and [`Archive`] is the store door.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use pit::datedness::Published;
 use pit::ObservationTime;
 
@@ -21,7 +21,8 @@ use crate::ledger::{
 use crate::provider::{CollectedItem, DecidedBy, Plan, Provenance, Provider, RawBlob};
 use crate::request::{Request, RequestPhase, RunId, SourceId, TargetWindow};
 use crate::wire::{
-    CappedHold, Headers, RawResponse, Reservation, SendFailure, TransportError, Unreserved, Wire,
+    CappedHold, Headers, RawResponse, Reservation, SendFailure, Slowed, TransportError, Unreserved,
+    Wire,
 };
 use crate::{Calendar, Listing, PlanRefusal};
 
@@ -51,6 +52,11 @@ pub trait Exchange {
     fn capped_holds(&self) -> Vec<CappedHold> {
         Vec::new()
     }
+
+    /// What servers asked of `host` this run (S7-D11), read once a run ends.
+    fn slowed(&self, _host: &str) -> Slowed {
+        Slowed::default()
+    }
 }
 
 // Each method calls the inherent one by path, so this impl cannot recurse into itself.
@@ -75,6 +81,35 @@ impl Exchange for Wire {
 
     fn capped_holds(&self) -> Vec<CappedHold> {
         Wire::capped_holds(self)
+    }
+
+    fn slowed(&self, host: &str) -> Slowed {
+        Wire::slowed(self, host)
+    }
+}
+
+/// One host's share of a run (S7-D11). `waited` is the clock inside [`Exchange::reserve`],
+/// `requesting` each answer's own `received_at - requested_at`; the host is `None` for a url
+/// `host_of` cannot key.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostBusy {
+    pub host: Option<String>,
+    pub waited: TimeDelta,
+    pub requesting: TimeDelta,
+    pub requests: u32,
+    /// The deadline stopped its lane.
+    pub stopped: bool,
+    /// Its `deferred` rows, every reason.
+    pub not_looked: u32,
+    pub held_until: Option<DateTime<Utc>>,
+    pub doublings: u32,
+}
+
+impl HostBusy {
+    /// Section 11.1 Pace: a host's busy time is its paced waits plus its request times.
+    #[must_use]
+    pub fn busy(&self) -> TimeDelta {
+        self.waited + self.requesting
     }
 }
 
@@ -475,6 +510,8 @@ pub struct Collected {
     pub deferred: Vec<Deferred>,
     /// [`Exchange::capped_holds`] once the run ends.
     pub capped_holds: Vec<CappedHold>,
+    /// Per host, in host order: S7-D11's busy fields.
+    pub busy: Vec<HostBusy>,
     pub tally: Tally,
     pub blobs_written: u32,
     pub bytes_written: u64,
@@ -504,6 +541,7 @@ impl Collected {
             swept: Vec::new(),
             deferred: Vec::new(),
             capped_holds: Vec::new(),
+            busy: Vec::new(),
             tally: Tally {
                 unclean_not_planned: count(
                     plan.not_planned
@@ -561,6 +599,7 @@ pub fn collect<A: Archive>(
     let mut queue = HostQueue::of(plan.requests, provider.follow_up_cap());
     let mut ordinal = 0;
     let mut issued = BTreeSet::new();
+    let mut busy: BTreeMap<Option<String>, HostBusy> = BTreeMap::new();
     while let Some(popped) = queue.pop() {
         let queued = match popped {
             Popped::Ask(queued) => queued,
@@ -571,8 +610,12 @@ pub fn collect<A: Archive>(
                 continue;
             }
         };
+        let host = busy_key(&queued.request.url);
+        let asked_at = clock.now();
         // Before the attempt row: a request past the deadline gets none (condition A).
-        let (go_at, by_server) = match exchange.reserve(&queued.request, clock, run.deadline) {
+        let reserved = exchange.reserve(&queued.request, clock, run.deadline);
+        busy.entry(host.clone()).or_default().waited += elapsed(asked_at, clock.now());
+        let (go_at, by_server) = match reserved {
             Ok(Reservation::Go) => (None, false),
             Ok(Reservation::PastDeadline { go_at, by_server }) => (Some(go_at), by_server),
             Err(Unreserved::CredentialMissing(name)) => return Err(CollectError::Credential(name)),
@@ -585,6 +628,7 @@ pub fn collect<A: Archive>(
                 DeferReason::RunDeadline
             };
             let at = ObservationTime::new(clock.now());
+            busy.entry(host).or_default().stopped = true;
             let lane = queue.stop(&queued);
             let mut first = Deferred::of(provider, queued.request, reason, at);
             first.go_at = Some(go_at);
@@ -599,6 +643,9 @@ pub fn collect<A: Archive>(
         } = queued;
         let attempted = attempt_once(&driving, archive, &request, ordinal, &mut issued)?;
         ordinal += 1;
+        let lane = busy.entry(host).or_default();
+        lane.requesting += attempted.requesting;
+        lane.requests += 1;
         let retrying = Queued::retried(attempted.is_transient(), retries);
         collected.absorb(&attempted, retrying);
         let asked = Queued {
@@ -609,8 +656,35 @@ pub fn collect<A: Archive>(
         queue.requeue(attempted.follow_ups, attempted.walked, asked, retrying);
     }
     collected.capped_holds = exchange.capped_holds();
+    for row in &collected.deferred {
+        busy.entry(row.host.clone()).or_default().not_looked += 1;
+    }
+    collected.busy = busy
+        .into_iter()
+        .map(|(host, mut lane)| {
+            let slowed = host
+                .as_deref()
+                .map_or_else(Slowed::default, |host| exchange.slowed(host));
+            lane.host = host;
+            lane.doublings = slowed.doublings;
+            lane.held_until = slowed.held_until;
+            lane
+        })
+        .collect();
     collected.per_source = vec![tally_of(&source, &collected)];
     Ok(collected)
+}
+
+fn busy_key(url: &str) -> Option<String> {
+    host_of(url)
+        .ok()
+        .flatten()
+        .map(|host| host.as_str().to_owned())
+}
+
+/// Clock time from `from` to `to`, none when the clock stepped back.
+fn elapsed(from: DateTime<Utc>, to: DateTime<Utc>) -> TimeDelta {
+    (to - from).max(TimeDelta::zero())
 }
 
 /// A request waiting in the driver's queue and how many times it has already been re-attempted
@@ -771,6 +845,8 @@ struct Attempted {
     walked: Vec<Request>,
     kind: OutcomeKind,
     permanent: bool,
+    /// The answer's own `received_at` (or `failed_at`) less its `requested_at`.
+    requesting: TimeDelta,
     bytes_written: u64,
     blob_written: bool,
     committed: Committed,
@@ -934,6 +1010,10 @@ fn attempt_once<A: Archive>(
         walked,
         kind,
         permanent: matches!(verdict, Verdict::PermanentFailure),
+        requesting: match &answer {
+            Ok(response) => elapsed(response.requested_at().inner(), observed.inner()),
+            Err(failed) => elapsed(failed.requested_at().inner(), observed.inner()),
+        },
         bytes_written: match &answer {
             Ok(response) => u64::try_from(response.body().len()).unwrap_or(u64::MAX),
             Err(failed) => failed

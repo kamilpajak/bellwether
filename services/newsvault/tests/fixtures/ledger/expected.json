@@ -16,6 +16,11 @@
       "runs_unfinished": [
         "run-0701-1230"
       ],
+      "runs_lease_held": 0,
+      "wall_s": 0.0,
+      "wall_share": 0.0,
+      "busy": [],
+      "holds_capped": 0,
       "per_source": [
         {
           "source": "edgar_press",
@@ -124,6 +129,11 @@
       "runs_shortfall": 0,
       "runs_over_expected": 1,
       "runs_unfinished": [],
+      "runs_lease_held": 0,
+      "wall_s": 0.0,
+      "wall_share": 0.0,
+      "busy": [],
+      "holds_capped": 0,
       "per_source": [
         {
           "source": "edgar_press",
@@ -228,6 +238,11 @@
       "runs_shortfall": 0,
       "runs_over_expected": 0,
       "runs_unfinished": [],
+      "runs_lease_held": 0,
+      "wall_s": 0.0,
+      "wall_share": 0.0,
+      "busy": [],
+      "holds_capped": 0,
       "per_source": [
         {
           "source": "edgar_press",
@@ -332,6 +347,11 @@
       "runs_shortfall": 0,
       "runs_over_expected": 0,
       "runs_unfinished": [],
+      "runs_lease_held": 0,
+      "wall_s": 0.0,
+      "wall_share": 0.0,
+      "busy": [],
+      "holds_capped": 0,
       "per_source": [
         {
           "source": "edgar_press",
@@ -389,6 +409,11 @@
       "runs_shortfall": 0,
       "runs_over_expected": 0,
       "runs_unfinished": [],
+      "runs_lease_held": 0,
+      "wall_s": 0.0,
+      "wall_share": 0.0,
+      "busy": [],
+      "holds_capped": 0,
       "per_source": [
         {
           "source": "edgar_press",
@@ -480,6 +505,7 @@
       "age_seconds": 41400
     }
   },
+  "busy_bound": 0.5,
   "matched": 8,
   "returned": 8,
   "truncated": false,
