@@ -660,8 +660,19 @@ impl Wire {
         clock: &dyn Clock,
         deadline: Option<DateTime<Utc>>,
     ) -> Result<Option<Reservation>, BudgetError> {
-        let (Some(ordinary), Some(host)) = (self.profile.budget.per_host, host) else {
+        let Some(ordinary) = self.profile.budget.per_host else {
             return Ok(None);
+        };
+        // A url no host keys owes no host wait, and past the deadline it is stopped all the same.
+        let Some(host) = host else {
+            let Some(deadline) = deadline else {
+                return Ok(None);
+            };
+            let now = clock.now();
+            return Ok((now > deadline).then_some(Reservation::PastDeadline {
+                go_at: now,
+                by_server: false,
+            }));
         };
         let backoff = self.backoff.borrow().get(host).copied().unwrap_or_default();
         let interval = ordinary.saturating_mul(2_u32.saturating_pow(backoff.doublings));
@@ -859,7 +870,7 @@ struct Failed {
 mod tests {
     use super::{
         retry_after, CappedHold, Credentials, Headers, RawResponse, Reservation, SendFailure,
-        Timeouts, TransportError, TransportKind, TransportProfile, Wire, USER_AGENT,
+        Timeouts, TransportError, TransportKind, TransportProfile, Unreserved, Wire, USER_AGENT,
     };
     use crate::budget::{BudgetError, RequestBudget};
     use crate::clock::testing::{StepClock, WaitRecorder, WaitedClock};
@@ -2910,6 +2921,89 @@ mod tests {
         assert_eq!(
             (wire.capped_holds(), clock.waits()),
             (Vec::new(), vec![NO_WAIT, CEILING])
+        );
+        Ok(())
+    }
+
+    /// The split's boundary: A's own 10 s opens exactly at the deadline, so the 120 s hold is
+    /// what moved the slot past it, and the stop is `host_held`.
+    #[test]
+    fn a_hold_past_a_deadline_the_profiles_own_pace_meets_exactly_is_host_held() -> Checked {
+        let (_store, clock, wire) = after_one_answer(Some(RETRY_AFTER_SECONDS))?;
+        assert_eq!(
+            reserved(&wire, &clock, REFUSED, FLOOR_LATER)?,
+            past(HOLD_LATER, true)?
+        );
+        Ok(())
+    }
+
+    /// edgar's shape, a per-IP pace and no host one: the per-IP slot past the deadline stops the
+    /// request as `run_deadline` with the pace file left as it was; one at the deadline is asked.
+    #[test]
+    fn a_per_ip_slot_past_the_deadline_is_run_deadline_and_writes_nothing() -> Checked {
+        let mut stopped = Vec::new();
+        for deadline in [RESERVED_AT, RESERVED_UNTIL] {
+            let store = tempfile::tempdir()?;
+            let clock = WaitedClock::at(RESERVED_AT)?;
+            let wire = Wire::with_sleeper(
+                profile(),
+                held(),
+                store.path(),
+                &SourceId::new(SOURCE),
+                Box::new(clock.clone()),
+            );
+            send_to(&wire, &clock, FIRST_ATTEMPT, REFUSED)?;
+            let before = pace_bytes(store.path())?;
+            let reservation = reserved(&wire, &clock, REFUSED, deadline)?;
+            stopped.push((reservation, before == pace_bytes(store.path())?));
+        }
+        assert_eq!(
+            stopped,
+            vec![
+                (past(RESERVED_UNTIL, false)?, true),
+                (Reservation::Go, false)
+            ]
+        );
+        Ok(())
+    }
+
+    /// `reserve` checks credentials before the pace: a call that cannot be made reads no clock,
+    /// reserves no slot and waits nothing, so `collect` opens no attempt row for it.
+    #[test]
+    fn a_reservation_whose_credential_is_absent_is_refused_before_any_pace() -> Checked {
+        let store = tempfile::tempdir()?;
+        let clock = clock_over(&[RESERVED_AT]);
+        let waits = WaitRecorder::default();
+        let wire = wire(Credentials::default(), store.path(), &waits);
+        let exchange: &dyn Exchange = &wire;
+        let refused = exchange.reserve(&request(), &clock, Some(FIVE_S_LATER.parse()?));
+        assert_eq!(
+            (
+                refused,
+                clock.reads(),
+                waits.waits(),
+                store.path().join(PACE_FILE).exists()
+            ),
+            (
+                Err(Unreserved::CredentialMissing(CONTACT.to_owned())),
+                NO_READS,
+                Vec::new(),
+                false
+            )
+        );
+        Ok(())
+    }
+
+    /// A url no host keys owes no host wait, but past the deadline it is stopped like any other;
+    /// at the deadline it is still asked (and ureq refuses it before any socket).
+    #[test]
+    fn a_url_no_host_keys_is_stopped_past_the_deadline() -> Checked {
+        let (_store, clock, wire) = after_one_answer(None)?;
+        let past_it = reserved(&wire, &clock, UNPARSEABLE, BEFORE_IT_WAS_REQUESTED)?;
+        let at_it = reserved(&wire, &clock, UNPARSEABLE, RESERVED_AT)?;
+        assert_eq!(
+            (past_it, at_it),
+            (past(RESERVED_AT, false)?, Reservation::Go)
         );
         Ok(())
     }
