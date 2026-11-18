@@ -17,9 +17,9 @@ use news_provider::lag_policy::{LagPolicy, LagPolicyError};
 use news_provider::provider::{Cadence, Calendar, CalendarError, Listing, PlanRefusal, Provenance};
 use news_provider::request::RequestPhase;
 use news_provider::{
-    stamp_of, Archive, ArchiveError, AttemptReceipt, AttemptRow, Clock, CollectError, Collected,
-    CollectedItem, Committed, Credentials, DeferReason, Deferred, Exchange, Exit, Headers, Payload,
-    Provider, Relisted, Run, RunId, SourceId, TargetWindow, Wire,
+    stamp_of, Archive, ArchiveError, AttemptReceipt, AttemptRow, Clock, Closing, CollectError,
+    Collected, CollectedItem, Committed, Credentials, DeferReason, Deferred, Exchange, Exit,
+    Headers, OpenDeferred, Payload, Provider, Relisted, Run, RunId, SourceId, TargetWindow, Wire,
 };
 use open_web_feed::{
     Basis, Continuity, CrossChecker, DirectAnswer, Generation, HostRobots, OpenWebFeed, Paging,
@@ -126,8 +126,8 @@ pub enum CollectRunError {
         deadline: DateTime<Utc>,
         now: DateTime<Utc>,
     },
-    /// The GNW walk's frontier must be a shortest period old by the clock and is read against
-    /// `--at`, so a live every-day run may not plan after the clock (section 11.2).
+    /// The GNW walk's frontier must be received before the start of `--at`'s slot, so a live
+    /// every-day run may not plan after the clock (section 11.2).
     #[error("--at {at} is after the clock's {now}")]
     AtAfterTheClock {
         at: DateTime<Utc>,
@@ -556,8 +556,10 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
                 let paging = provider.paging();
                 let basis = basis_of(&ask.store, &paging)?;
                 let walk = provider.walk();
-                let youngest = schedule::committed(patience_of(&provider))?.shortest_period();
-                let ranges = ranges_of(&ask.store, &walk, ask.at - youngest)?;
+                let slot = schedule::committed(patience_of(&provider))?
+                    .slot_at(ask.at)
+                    .ok_or(ScheduleRefusal::NoSlotAt { at: ask.at })?;
+                let ranges = ranges_of(&ask.store, &walk, slot.start)?;
                 let handed = ranges
                     .iter()
                     .filter_map(|(url, plan)| Some((url.clone(), plan.range()?.clone())))
@@ -597,8 +599,8 @@ fn patience_of(provider: &dyn Provider) -> TimeDelta {
 }
 
 /// Each walked index's range (section 11.2): through the highest id the newest usable answer
-/// received by `frontier_by` lists, after the id the newest basis poll walked through. Only
-/// younger answers and a basis: `range_unread`, no basis. A blob the store lacks refuses the run.
+/// received before `frontier_by`, the start of `--at`'s slot, lists, after the id the newest basis
+/// poll walked through. Only younger answers and a basis: `range_unread`, no basis.
 fn ranges_of(
     store: &Path,
     walk: &Walk,
@@ -956,6 +958,7 @@ pub fn run(
         schema: RUN_ENVELOPE_SCHEMA.to_owned(),
         run_id: run_id.clone(),
         run_date,
+        source: Some(opened.registered.source().to_owned()),
         expected_runs: ask.expected_runs,
         started_at: ask.at,
         finished_at: None,
@@ -1688,7 +1691,7 @@ fn envelope_of(
     let provider = opened.provider.as_ref();
     let collected = &driven.collected;
     let exit = collected.exit();
-    json!({
+    let mut envelope = json!({
         "schema": SCHEMA,
         "run_id": run_id,
         "run_date": run_date.to_string(),
@@ -1730,17 +1733,7 @@ fn envelope_of(
         },
         "swept": collected.swept,
         // S7-D4: requests this run did not ask, in the order the queue reached them.
-        "deferred": collected.deferred.iter().map(|row| json!({
-            "source": row.source,
-            "target_window": row.target_window,
-            "host": row.host,
-            "url": row.url,
-            "phase": row.phase.name(),
-            "story_id": row.story_id,
-            "listed_date": row.listed_date,
-            "reason": row.reason.name(),
-            "go_at": row.go_at.map(micros),
-        })).collect::<Vec<Value>>(),
+        "deferred": deferred_json(collected),
         // S7-D7: answers whose Retry-After was past the 24 h ceiling, each host held to it.
         "holds_capped": collected.capped_holds.iter().map(|hold| json!({
             "host": hold.host,
@@ -1778,21 +1771,7 @@ fn envelope_of(
             "items_committed": row.items_committed,
             "commit_refused": row.commit_refused,
         })).collect::<Vec<Value>>(),
-        "per_source": collected.per_source.iter().map(|row| json!({
-            "source": row.source,
-            "planned_requests": row.planned_requests,
-            "not_planned": row.not_planned,
-            "attempts": row.attempts,
-            "ok": row.ok,
-            "empty": row.empty,
-            "failed": row.failed,
-            "vendor_rows": row.vendor_rows,
-            "filtered_out": row.filtered_out,
-            "robots_disallowed": row.robots_disallowed,
-            "unusable_rows": row.unusable_rows,
-            "items_committed": row.items_committed,
-            "deferred": row.deferred,
-        })).collect::<Vec<Value>>(),
+        "per_source": per_source_json(collected),
         "provenance_counts": provenance_counts(collected),
         "items_committed": collected.tally.committed,
         "blobs_written": collected.blobs_written,
@@ -1809,7 +1788,82 @@ fn envelope_of(
             "error_code": exit.error_code(),
             "retryable": exit.retryable(),
         },
-    })
+    });
+    // S7-D5, outside the literal, which is at `json!`'s recursion limit: the open `deferred` rows
+    // this run read, one item per url, oldest first.
+    envelope["carried"] = carried_json(collected);
+    envelope
+}
+
+fn deferred_json(collected: &Collected) -> Value {
+    collected
+        .deferred
+        .iter()
+        .map(|row| {
+            json!({
+                "source": row.source,
+                "target_window": row.target_window,
+                "host": row.host,
+                "url": row.url,
+                "phase": row.phase.name(),
+                "story_id": row.story_id,
+                "listed_date": row.listed_date,
+                "reason": row.reason.name(),
+                "go_at": row.go_at.map(micros),
+            })
+        })
+        .collect()
+}
+
+fn carried_json(collected: &Collected) -> Value {
+    collected
+        .carried
+        .iter()
+        .map(|item| {
+            json!({
+                "source": item.source,
+                "target_window": item.target_window,
+                "host": item.host,
+                "url": item.url,
+                "story_id": item.story_id,
+                "deferred_ids": item.deferred_ids,
+                "first_deferred_at": micros(item.first_deferred_at),
+                "queued": item.queued,
+                "closed_as": item.closed.as_ref().map(Closing::name),
+                "attempt_id": item.closed.as_ref().and_then(Closing::attempt_id),
+            })
+        })
+        .collect()
+}
+
+fn per_source_json(collected: &Collected) -> Value {
+    collected
+        .per_source
+        .iter()
+        .map(|row| {
+            json!({
+                "source": row.source,
+                "planned_requests": row.planned_requests,
+                "not_planned": row.not_planned,
+                "attempts": row.attempts,
+                "ok": row.ok,
+                "empty": row.empty,
+                "failed": row.failed,
+                "vendor_rows": row.vendor_rows,
+                "filtered_out": row.filtered_out,
+                "robots_disallowed": row.robots_disallowed,
+                "unusable_rows": row.unusable_rows,
+                "items_committed": row.items_committed,
+                "deferred": row.deferred,
+                "carried": {
+                    "queued": row.carried.queued,
+                    "answered": row.carried.answered,
+                    "held": row.carried.held,
+                    "expired": row.carried.expired,
+                },
+            })
+        })
+        .collect()
 }
 
 fn micros(at: DateTime<Utc>) -> String {
@@ -1929,6 +1983,26 @@ pub fn render_human(envelope: &Value, out: &mut impl std::io::Write) -> std::io:
         })
         .collect();
     writeln!(out, "deferred         {}{by_reason}", deferred.len())?;
+    let carried = envelope["carried"].as_array().unwrap_or(&none);
+    let by_closing: String = Closing::NAMES
+        .iter()
+        .map(|name| {
+            let items = carried
+                .iter()
+                .filter(|item| item["closed_as"].as_str() == Some(name))
+                .count();
+            format!(" {name} {items}")
+        })
+        .collect();
+    let queued = carried
+        .iter()
+        .filter(|item| item["queued"].as_bool() == Some(true))
+        .count();
+    writeln!(
+        out,
+        "carried          {} queued {queued}{by_closing}",
+        carried.len()
+    )?;
     writeln!(
         out,
         "holds capped     {}",
@@ -2052,6 +2126,21 @@ impl Archive for Committer {
     fn record_deferred(&mut self, deferred: &Deferred) -> Result<(), ArchiveError> {
         Committer::record_deferred(self, deferred)
             .map_err(|why| refused("record a deferred request", &why))
+    }
+
+    fn open_deferred(&self, source: &SourceId) -> Result<Vec<OpenDeferred>, ArchiveError> {
+        Committer::open_deferred(self, source)
+            .map_err(|why| refused("read the deferred rows", &why))
+    }
+
+    fn close_deferred(
+        &mut self,
+        deferred_ids: &[i64],
+        closing: &Closing,
+        at: ObservationTime,
+    ) -> Result<(), ArchiveError> {
+        Committer::close_deferred(self, deferred_ids, closing, at)
+            .map_err(|why| refused("close a deferred request", &why))
     }
 }
 

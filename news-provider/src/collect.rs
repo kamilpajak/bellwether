@@ -191,6 +191,72 @@ impl Deferred {
     }
 }
 
+/// S7-D5's age limit: an item whose oldest open row is this old at the run's start, or older,
+/// is not carried, and is closed `expired` at the run's end unless the run asked its story.
+pub const CARRY_LIMIT: TimeDelta = TimeDelta::hours(24);
+
+/// One open `deferred` row of a `Document` request, one no `deferred_closed` row names (S7-D5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenDeferred {
+    pub deferred_id: i64,
+    pub target_window: String,
+    pub url: String,
+    pub story_id: Option<String>,
+    pub listed_date: Option<String>,
+    pub deferred_at: DateTime<Utc>,
+}
+
+/// How an open `deferred` row is closed (S7-D5), stored by its [`Closing::name`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Closing {
+    /// Asked by this run, whatever the answer: carried, or listed again by its own index.
+    Answered { attempt_id: String },
+    /// The archive held its story at the run's start, so it was not asked.
+    Held,
+    /// Its oldest open row was [`CARRY_LIMIT`] old or older at the run's start, and the run did
+    /// not ask its url or its story.
+    Expired,
+}
+
+impl Closing {
+    /// Every name, in the order the envelope's and the ledger's human lines print them.
+    pub const NAMES: [&'static str; 3] = ["answered", "held", "expired"];
+
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Answered { .. } => "answered",
+            Self::Held => "held",
+            Self::Expired => "expired",
+        }
+    }
+
+    #[must_use]
+    pub fn attempt_id(&self) -> Option<&str> {
+        match self {
+            Self::Answered { attempt_id } => Some(attempt_id),
+            Self::Held | Self::Expired => None,
+        }
+    }
+}
+
+/// One carried item: every open row of one url, oldest first (S7-D5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Carried {
+    pub source: String,
+    /// The oldest row's, which the rebuilt request is asked under.
+    pub target_window: String,
+    pub host: Option<String>,
+    pub url: String,
+    pub story_id: Option<String>,
+    pub deferred_ids: Vec<i64>,
+    pub first_deferred_at: DateTime<Utc>,
+    /// Put at the front of its host's lane; false when closed `held`, over 24 h, or not rebuilt.
+    pub queued: bool,
+    /// `None`: still open, asked by no attempt of this run or never rebuilt.
+    pub closed: Option<Closing>,
+}
+
 /// What the archive refused, and which act asked. The act is what the exit table reads: a refused
 /// commit is `commit_failed` and a refused read is not.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
@@ -304,6 +370,17 @@ pub trait Archive: Sink {
     /// Records a request this run did not ask, before the run moves on: "we did not look" is a
     /// row, apart from every attempt row (S7-D4).
     fn record_deferred(&mut self, deferred: &Deferred) -> Result<(), ArchiveError>;
+
+    /// S7-D5's reader: the source's open `Document` rows, oldest `deferred_at` first.
+    fn open_deferred(&self, source: &SourceId) -> Result<Vec<OpenDeferred>, ArchiveError>;
+
+    /// Closes each of `deferred_ids` as `closing` at `at`; a row is closed once, never updated.
+    fn close_deferred(
+        &mut self,
+        deferred_ids: &[i64],
+        closing: &Closing,
+        at: ObservationTime,
+    ) -> Result<(), ArchiveError>;
 }
 
 /// Why a run could not be driven at all. A vendor's own answer is never one of these: it is a
@@ -495,6 +572,16 @@ pub struct SourceTally {
     pub unusable_rows: u32,
     pub items_committed: u32,
     pub deferred: u32,
+    pub carried: CarryTally,
+}
+
+/// S7-D5's carried items of one source, one per url: queued, and closed by each [`Closing`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CarryTally {
+    pub queued: u32,
+    pub answered: u32,
+    pub held: u32,
+    pub expired: u32,
 }
 
 /// What one run did.
@@ -508,6 +595,8 @@ pub struct Collected {
     pub swept: Vec<String>,
     /// Requests this run did not ask, in the order the queue reached them.
     pub deferred: Vec<Deferred>,
+    /// Open `deferred` rows read at the start, one item per url, oldest first (S7-D5).
+    pub carried: Vec<Carried>,
     /// [`Exchange::capped_holds`] once the run ends.
     pub capped_holds: Vec<CappedHold>,
     /// Per host, in host order: S7-D11's busy fields.
@@ -540,6 +629,7 @@ impl Collected {
             per_source: Vec::new(),
             swept: Vec::new(),
             deferred: Vec::new(),
+            carried: Vec::new(),
             capped_holds: Vec::new(),
             busy: Vec::new(),
             tally: Tally {
@@ -596,9 +686,20 @@ pub fn collect<A: Archive>(
         run: run.run,
         baseline: &baseline,
     };
+    let started = clock.now();
+    let (carried, carrying) = carry(provider, archive, started)?;
+    let mut issued: BTreeSet<String> = carried
+        .iter()
+        .filter(|item| item.queued)
+        .filter_map(|item| item.story_id.clone())
+        .collect();
+    collected.carried = carried;
     let mut queue = HostQueue::of(plan.requests, provider.follow_up_cap());
+    queue.carry(carrying);
     let mut ordinal = 0;
-    let mut issued = BTreeSet::new();
+    let mut asked = BTreeSet::new();
+    let mut asked_by: BTreeMap<String, String> = BTreeMap::new();
+    let mut pending_held = Vec::new();
     let mut busy: BTreeMap<Option<String>, HostBusy> = BTreeMap::new();
     while let Some(popped) = queue.pop() {
         let queued = match popped {
@@ -639,22 +740,53 @@ pub fn collect<A: Archive>(
             continue;
         }
         let Queued {
-            request, retries, ..
+            request,
+            retries,
+            carried,
+            ..
         } = queued;
-        let attempted = attempt_once(&driving, archive, &request, ordinal, &mut issued)?;
+        let mut attempted = attempt_once(&driving, archive, &request, ordinal, &mut issued)?;
         ordinal += 1;
+        asked.extend(attempted.story.clone());
+        for key in attempted.story.iter().chain([&request.url]) {
+            asked_by
+                .entry(key.clone())
+                .or_insert_with(|| attempted.row.attempt_id.clone());
+        }
+        pending_held.extend(attempted.held.take());
+        if !carried.is_empty() {
+            let closing = Closing::Answered {
+                attempt_id: attempted.row.attempt_id.clone(),
+            };
+            archive.close_deferred(&carried, &closing, ObservationTime::new(clock.now()))?;
+            collected.close_carried(&carried, closing);
+        }
         let lane = busy.entry(host).or_default();
         lane.requesting += attempted.requesting;
         lane.requests += 1;
         let retrying = Queued::retried(attempted.is_transient(), retries);
         collected.absorb(&attempted, retrying);
-        let asked = Queued {
+        let again = Queued {
             request,
             retries,
             counted: false,
+            carried: Vec::new(),
         };
-        queue.requeue(attempted.follow_ups, attempted.walked, asked, retrying);
+        queue.requeue(attempted.follow_ups, attempted.walked, again, retrying);
     }
+    // Once the queue is empty: a story this run had queued counts as held only if it was asked.
+    for pending in pending_held {
+        let queued_and_asked = pending
+            .queued
+            .iter()
+            .filter(|story| asked.contains(*story))
+            .count();
+        if queued_and_asked > 0 {
+            let held = pending.held.saturating_add(count(queued_and_asked));
+            archive.record_held(&pending.attempt_id, held)?;
+        }
+    }
+    close_uncarried(archive, &mut collected.carried, &asked_by, started, clock)?;
     collected.capped_holds = exchange.capped_holds();
     for row in &collected.deferred {
         busy.entry(row.host.clone()).or_default().not_looked += 1;
@@ -673,6 +805,112 @@ pub fn collect<A: Archive>(
         .collect();
     collected.per_source = vec![tally_of(&source, &collected)];
     Ok(collected)
+}
+
+/// S7-D5: the source's open `Document` rows, one item per url in the order of its oldest row. An
+/// item whose story the archive holds is closed `held`; the provider rebuilds each other item
+/// younger than [`CARRY_LIMIT`], and [`close_uncarried`] decides the rest at the run's end.
+fn carry<A: Archive>(
+    provider: &dyn Provider,
+    archive: &mut A,
+    now: DateTime<Utc>,
+) -> Result<(Vec<Carried>, Vec<Queued>), CollectError> {
+    let source = provider.source();
+    let open = archive.open_deferred(&source)?;
+    if open.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let held = archive.held_story_ids(&source)?;
+    let mut items: Vec<(String, Vec<OpenDeferred>)> = Vec::new();
+    for row in open {
+        match items.iter_mut().find(|(url, _)| *url == row.url) {
+            Some((_, rows)) => rows.push(row),
+            None => items.push((row.url.clone(), vec![row])),
+        }
+    }
+    let (mut carried, mut queued) = (Vec::new(), Vec::new());
+    for (url, rows) in items {
+        let Some(oldest) = rows.first() else {
+            continue;
+        };
+        let ids: Vec<i64> = rows.iter().map(|row| row.deferred_id).collect();
+        let story_id = rows.iter().find_map(|row| row.story_id.clone());
+        let over_age = now - oldest.deferred_at >= CARRY_LIMIT;
+        let closing = story_id
+            .as_ref()
+            .is_some_and(|story| held.contains(story))
+            .then_some(Closing::Held);
+        let mut item = Carried {
+            source: source.as_str().to_owned(),
+            target_window: oldest.target_window.clone(),
+            host: busy_key(&url),
+            url: url.clone(),
+            story_id,
+            deferred_ids: ids.clone(),
+            first_deferred_at: oldest.deferred_at,
+            queued: false,
+            closed: None,
+        };
+        if let Some(closing) = closing {
+            archive.close_deferred(&ids, &closing, ObservationTime::new(now))?;
+            item.closed = Some(closing);
+        } else if let Some(request) = (!over_age)
+            .then(|| {
+                provider.carried(
+                    &TargetWindow::new(&oldest.target_window),
+                    &url,
+                    oldest.listed_date.as_deref(),
+                )
+            })
+            .flatten()
+        {
+            item.queued = true;
+            queued.push(Queued {
+                counted: !provider.is_walk_id(&request),
+                request,
+                retries: 0,
+                carried: ids,
+            });
+        }
+        carried.push(item);
+    }
+    Ok((carried, queued))
+}
+
+/// Once the queue is empty, each open item the run did not carry: closed `answered` by the first
+/// attempt that asked its url or its story (PR #53 review F1), else `expired` when it was over
+/// [`CARRY_LIMIT`] at `started`, else left open.
+fn close_uncarried<A: Archive>(
+    archive: &mut A,
+    carried: &mut [Carried],
+    asked_by: &BTreeMap<String, String>,
+    started: DateTime<Utc>,
+    clock: &dyn Clock,
+) -> Result<(), CollectError> {
+    for item in carried
+        .iter_mut()
+        .filter(|item| !item.queued && item.closed.is_none())
+    {
+        let asked = item
+            .story_id
+            .iter()
+            .chain([&item.url])
+            .find_map(|key| asked_by.get(key));
+        let closing = match asked {
+            Some(attempt_id) => Closing::Answered {
+                attempt_id: attempt_id.clone(),
+            },
+            None if started - item.first_deferred_at >= CARRY_LIMIT => Closing::Expired,
+            None => continue,
+        };
+        archive.close_deferred(
+            &item.deferred_ids,
+            &closing,
+            ObservationTime::new(clock.now()),
+        )?;
+        item.closed = Some(closing);
+    }
+    Ok(())
 }
 
 fn busy_key(url: &str) -> Option<String> {
@@ -696,8 +934,11 @@ pub(crate) struct Queued {
     pub(crate) request: Request,
     pub(crate) retries: u32,
     /// Counted against the follow-up cap when first popped: a `Document` follow-up an index
-    /// listed. A planned request, an `Index` follow-up, a walk id and a retry are not.
+    /// listed, or a carried one that is no walk id. A planned request, an `Index` follow-up, a
+    /// walk id and a retry are not.
     pub(crate) counted: bool,
+    /// The open `deferred` rows a carried request closes once asked (S7-D5); empty otherwise.
+    pub(crate) carried: Vec<i64>,
 }
 
 impl Queued {
@@ -707,6 +948,7 @@ impl Queued {
             request,
             retries: 0,
             counted: false,
+            carried: Vec::new(),
         }
     }
 
@@ -786,7 +1028,20 @@ impl HostQueue {
                 request: asked.request,
                 retries: asked.retries + 1,
                 counted: false,
+                carried: Vec::new(),
             });
+        }
+    }
+
+    /// S7-D5: each carried request at the front of its host's lane, in the order given, so ahead
+    /// of the host's planned index and of every follow-up; a host with no lane opens one last.
+    pub(crate) fn carry(&mut self, carried: Vec<Queued>) {
+        for queued in carried.into_iter().rev() {
+            let host = host_of(&queued.request.url).ok().flatten();
+            match self.lanes.iter_mut().find(|(key, _)| *key == host) {
+                Some((_, lane)) => lane.push_front(queued),
+                None => self.lanes.push((host, VecDeque::from([queued]))),
+            }
         }
     }
 
@@ -850,6 +1105,19 @@ struct Attempted {
     bytes_written: u64,
     blob_written: bool,
     committed: Committed,
+    /// The story a `Document` attempt asked for.
+    story: Option<String>,
+    /// A live index's `held`: its archive-held part is written at the attempt, the rest once the
+    /// run's queue is empty.
+    held: Option<PendingHeld>,
+}
+
+/// A live index's `held` (section 11.1) before the run ends: `held` follow-ups the archive held,
+/// and the stories of `queued` ones this run had queued, which count only if asked.
+struct PendingHeld {
+    attempt_id: String,
+    held: u32,
+    queued: Vec<String>,
 }
 
 impl Attempted {
@@ -863,8 +1131,9 @@ impl Attempted {
     }
 }
 
-/// `issued` holds the story of every follow-up this run issued: a second index listing one of them
-/// in the same run, PRN's sitemap beside its RSS (section 11.2), counts it as held.
+/// `issued` holds the story of every request this run queued: a second index listing one of them
+/// in the same run, PRN's sitemap beside its RSS (section 11.2), drops it, and counts it held once
+/// the run has asked it (PR #50's question 1).
 fn attempt_once<A: Archive>(
     driving: &Driving,
     archive: &mut A,
@@ -952,6 +1221,7 @@ fn attempt_once<A: Archive>(
     };
     // A vendor_archive index records `matched` and hands over one window's covered set (R20); a
     // live index records `held` and hands over the held set of every window (§11.1, R16).
+    let mut held = None;
     let (follow_ups, walked) = match extracted {
         Some(extracted) if request.phase == RequestPhase::Index => {
             let matched = count(extracted.follow_ups.len());
@@ -962,6 +1232,7 @@ fn attempt_once<A: Archive>(
             } else {
                 archive.held_story_ids(&request.source)?
             };
+            let in_run: BTreeSet<String> = issued.difference(&stories).cloned().collect();
             stories.extend(issued.iter().cloned());
             let listed = extracted.follow_ups.clone();
             let to_issue = if matched == 0 {
@@ -981,8 +1252,19 @@ fn attempt_once<A: Archive>(
             let walked = provider.follow_ups_to_issue(extracted.walk, &stories);
             issued.extend(stories_of(&walked));
             if !archived && refusal.is_none() {
-                let held = matched.saturating_sub(count(to_issue.len()));
-                archive.record_held(&attempt_id, held)?;
+                let queued: Vec<String> = stories_of(&listed)
+                    .into_iter()
+                    .filter(|story| in_run.contains(story))
+                    .collect();
+                let dropped = matched.saturating_sub(count(to_issue.len()));
+                let pending = PendingHeld {
+                    attempt_id: attempt_id.clone(),
+                    held: dropped.saturating_sub(count(queued.len())),
+                    queued,
+                };
+                // The final part now, so a run that aborts leaves no NULL beside `vendor_rows`.
+                archive.record_held(&attempt_id, pending.held)?;
+                held = Some(pending);
                 archive.record_relisted(&attempt_id, &relisted_of(provider, listed, &to_issue))?;
             }
             (to_issue, walked)
@@ -1022,6 +1304,8 @@ fn attempt_once<A: Archive>(
         },
         blob_written: payload.is_some(),
         committed,
+        story: story.map(|story| story.hex().to_owned()),
+        held,
     })
 }
 
@@ -1085,6 +1369,17 @@ fn sweep<A: Archive>(
 }
 
 impl Collected {
+    /// The carried item whose rows are `deferred_ids`, closed as `closing`.
+    fn close_carried(&mut self, deferred_ids: &[i64], closing: Closing) {
+        if let Some(item) = self
+            .carried
+            .iter_mut()
+            .find(|item| item.deferred_ids == deferred_ids)
+        {
+            item.closed = Some(closing);
+        }
+    }
+
     /// Writes the `deferred` row before the run moves on, then counts it.
     fn defer<A: Archive>(
         &mut self,
@@ -1158,6 +1453,24 @@ fn tally_of(source: &SourceId, collected: &Collected) -> SourceTally {
                 .filter(|row| row.source == source.as_str())
                 .count(),
         ),
+        carried: carry_tally(source, &collected.carried),
+    }
+}
+
+fn carry_tally(source: &SourceId, carried: &[Carried]) -> CarryTally {
+    let mine = || carried.iter().filter(|item| item.source == source.as_str());
+    let closed = |name: &str| -> u32 {
+        count(
+            mine()
+                .filter(|item| item.closed.as_ref().map(Closing::name) == Some(name))
+                .count(),
+        )
+    };
+    CarryTally {
+        queued: count(mine().filter(|item| item.queued).count()),
+        answered: closed("answered"),
+        held: closed("held"),
+        expired: closed("expired"),
     }
 }
 
@@ -1274,6 +1587,7 @@ mod tests {
                 request,
                 retries,
                 counted: false,
+                carried: Vec::new(),
             };
             queue.requeue(follow_ups, named("w", lane.walked), again, retrying);
         }
@@ -1710,6 +2024,65 @@ mod tests {
                 (Some("vendor_unreachable"), true),
                 (Some("vendor_refused_all"), false),
                 (Some("commit_failed"), false),
+            ]
+        );
+    }
+
+    /// S7-D5: carried requests go to the front of their host's lane in the order given, ahead
+    /// of the planned index; a counted one spends a cap slot and a walk id does not (S7-D6).
+    #[test]
+    fn carried_requests_are_asked_first_in_their_lane_and_only_counted_ones_spend_the_cap() {
+        let mut queue = HostQueue::of(vec![asking(GNW, "index"), asking(PRN, "index")], Some(1));
+        let carried = |path: &str, counted: bool, id: i64| Queued {
+            counted,
+            carried: vec![id],
+            ..Queued::first_attempt(asking(GNW, path))
+        };
+        queue.carry(vec![
+            carried("c1", true, 1),
+            carried("w1", false, 2),
+            carried("c2", true, 3),
+        ]);
+        let (mut asked, mut deferred) = (Vec::new(), Vec::new());
+        while let Some(popped) = queue.pop() {
+            match popped {
+                Popped::Ask(queued) => asked.push((queued.request.url, queued.carried)),
+                Popped::Defer(request) => deferred.push(request.url),
+            }
+        }
+        assert_eq!(
+            (asked, deferred),
+            (
+                vec![
+                    (format!("{GNW}c1"), vec![1]),
+                    (format!("{PRN}index"), Vec::new()),
+                    (format!("{GNW}w1"), vec![2]),
+                    (format!("{GNW}index"), Vec::new()),
+                ],
+                vec![format!("{GNW}c2")]
+            )
+        );
+    }
+
+    /// S7-D5: a carried request whose host has no planned lane opens one and is asked.
+    #[test]
+    fn a_carried_request_on_a_host_with_no_lane_opens_one_and_is_asked() {
+        let mut queue = HostQueue::of(vec![asking(PRN, "index")], None);
+        queue.carry(vec![Queued {
+            carried: vec![1],
+            ..Queued::first_attempt(asking(GNW, "c1"))
+        }]);
+        let mut asked = Vec::new();
+        while let Some(popped) = queue.pop() {
+            if let Popped::Ask(queued) = popped {
+                asked.push((queued.request.url, queued.carried));
+            }
+        }
+        assert_eq!(
+            asked,
+            vec![
+                (format!("{PRN}index"), Vec::new()),
+                (format!("{GNW}c1"), vec![1]),
             ]
         );
     }

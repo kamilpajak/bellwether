@@ -512,6 +512,19 @@ mod tests {
         fn listed_publication(&self, _follow_up: &Request) -> Published {
             Published::Unknown
         }
+
+        fn carried(
+            &self,
+            _target: &TargetWindow,
+            _url: &str,
+            _listed_date: Option<&str>,
+        ) -> Option<Request> {
+            None
+        }
+
+        fn is_walk_id(&self, _request: &Request) -> bool {
+            false
+        }
     }
 
     fn found(how: Break) -> Vec<&'static str> {

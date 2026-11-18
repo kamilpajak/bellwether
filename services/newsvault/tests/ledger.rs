@@ -1287,3 +1287,208 @@ fn the_ledger_sums_busy_time_against_half_a_day_and_leaves_lease_held_runs_unobs
     );
     Ok(())
 }
+
+// ---- S7-D5 and PR #52 answer 6 (architecture.md section 11.5 step 7 PR 5) ----
+
+/// `many` `deferred` rows of `source`, each closed `closed_as` by `run` at `closed_at`.
+fn closed(
+    db: &Connection,
+    run: &str,
+    source: &str,
+    (closed_as, many): (&str, usize),
+    closed_at: &str,
+) -> TestResult {
+    for _ in 0..many {
+        db.execute(
+            "INSERT INTO deferred (run_id, source, target_window, url, phase, reason, deferred_at)
+             VALUES ('an earlier run', ?1, '2026-06-30', 'https://example.test/', 'document',
+                     'run_deadline', '2026-06-30T23:00:00.000000Z')",
+            [source],
+        )?;
+        let attempt = (closed_as == "answered").then_some("an attempt");
+        db.execute(
+            "INSERT INTO deferred_closed (deferred_id, run_id, closed_as, attempt_id, closed_at)
+             VALUES (last_insert_rowid(), ?1, ?2, ?3, ?4)",
+            rusqlite::params![run, closed_as, attempt, closed_at],
+        )?;
+    }
+    Ok(())
+}
+
+/// S7-D5, S7-D8: closed rows count per closing for the source and day of the closing run (1, 2, 3
+/// for EDGAR, 5 expired for the other), not after `--at`; any expired count is a
+/// `deferred_expired` finding, a day with none has none, and the human line agrees.
+#[test]
+fn closed_deferred_rows_are_counted_per_closing_and_an_expired_one_is_a_finding() -> TestResult {
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    let first = "2026-07-01T00:40:00.000000Z";
+    closed(&db, "run-0701-0034", EDGAR, ("answered", 1), first)?;
+    closed(&db, "run-0701-0034", EDGAR, ("held", 2), first)?;
+    closed(&db, "run-0701-0630", EDGAR, ("expired", 3), first)?;
+    closed(&db, "run-0701-0034", POLYGON, ("expired", 5), first)?;
+    closed(
+        &db,
+        "run-0702-a",
+        EDGAR,
+        ("answered", 7),
+        "2026-07-02T09:40:00.000000Z",
+    )?;
+    closed(
+        &db,
+        "run-0701-1230",
+        EDGAR,
+        ("expired", 1),
+        "2026-08-01T00:00:00.000000Z",
+    )?;
+    drop(db);
+    let answer = run(&root, &["--from", FIRST_DAY, "--to", EMPTY_DAY, "--check"])?;
+    let report = answer.json()?;
+    let counted = |day: &str, source: &str| {
+        per_source(&report, day, source).map(|row| row["carried"].clone())
+    };
+    let expired_of = |report: &Value| -> Vec<(String, String)> {
+        report["check"]["findings"]
+            .as_array()
+            .map_or_else(Vec::new, |findings| {
+                findings
+                    .iter()
+                    .filter(|finding| finding["code"] == "deferred_expired")
+                    .map(|finding| {
+                        (
+                            finding["run_date"].as_str().unwrap_or_default().to_owned(),
+                            finding["source"].as_str().unwrap_or_default().to_owned(),
+                        )
+                    })
+                    .collect()
+            })
+    };
+    let expired = expired_of(&report);
+    let edgar_only = run(
+        &root,
+        &[
+            "--from", FIRST_DAY, "--to", FIRST_DAY, "--source", EDGAR, "--check",
+        ],
+    )?
+    .json()?;
+    let human = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .arg("ledger")
+        .args(["--store", &root.path().to_string_lossy()])
+        .args(["--at", AT, "--format", "human"])
+        .args(["--from", FIRST_DAY, "--to", FIRST_DAY, "--source", EDGAR])
+        .output()?
+        .stdout;
+    let shown = String::from_utf8(human)?
+        .lines()
+        .find_map(|line| line.split_once("carried_answered"))
+        .and_then(|(_, rest)| rest.split_once(" items_new"))
+        .map(|(counts, _)| counts.to_owned());
+    assert_eq!(
+        (
+            counted(FIRST_DAY, EDGAR),
+            counted(FIRST_DAY, POLYGON),
+            counted(EMPTY_DAY, EDGAR),
+            expired,
+            shown,
+            per_source(&edgar_only, FIRST_DAY, POLYGON).is_some(),
+            expired_of(&edgar_only),
+        ),
+        (
+            Some(serde_json::json!({"answered": 1, "held": 2, "expired": 3})),
+            Some(serde_json::json!({"answered": 0, "held": 0, "expired": 5})),
+            Some(serde_json::json!({"answered": 7, "held": 0, "expired": 0})),
+            vec![
+                (FIRST_DAY.to_owned(), EDGAR.to_owned()),
+                (FIRST_DAY.to_owned(), POLYGON.to_owned())
+            ],
+            Some(" 1 carried_held 2 carried_expired 3".to_owned()),
+            false,
+            vec![(FIRST_DAY.to_owned(), EDGAR.to_owned())],
+        )
+    );
+    Ok(())
+}
+
+const SOURCED_DAY: &str = "2026-07-12";
+
+/// PR #52 answer 6: run files name their source, so `--source` sums only that source's runs'
+/// wall and busy time and capped holds; a file naming none counts only with no `--source`.
+#[test]
+fn the_ledger_filters_busy_time_by_the_run_files_source() -> TestResult {
+    let root = fixture()?;
+    let runs = root.path().join(RUNS_DIR);
+    let hold = serde_json::json!({"host": "b.test", "retry_after": "315360000",
+                                  "held_until": "2026-07-13T11:00:00Z"});
+    let files = [
+        (
+            "run-0712-a.json",
+            serde_json::json!({"schema": "newsvault.run/1", "run_id": "run-0712-a",
+                "run_date": SOURCED_DAY, "source": EDGAR, "expected_runs": 3,
+                "started_at": "2026-07-12T11:00:00Z", "finished_at": "2026-07-12T11:14:00Z",
+                "wall_s": 11.0, "busy": [{"host": "a.test", "busy_s": 3.0}]}),
+        ),
+        (
+            "run-0712-b.json",
+            serde_json::json!({"schema": "newsvault.run/1", "run_id": "run-0712-b",
+                "run_date": SOURCED_DAY, "source": POLYGON, "expected_runs": 3,
+                "started_at": "2026-07-12T12:00:00Z", "finished_at": "2026-07-12T12:14:00Z",
+                "wall_s": 13.0, "busy": [{"host": "b.test", "busy_s": 5.0}],
+                "holds_capped": [hold]}),
+        ),
+        (
+            "run-0712-c.json",
+            serde_json::json!({"schema": "newsvault.run/1", "run_id": "run-0712-c",
+                "run_date": SOURCED_DAY, "expected_runs": 3,
+                "started_at": "2026-07-12T13:00:00Z", "finished_at": "2026-07-12T13:14:00Z",
+                "wall_s": 17.0, "busy": [{"host": "a.test", "busy_s": 7.0}]}),
+        ),
+    ];
+    for (name, body) in files {
+        fs::write(runs.join(name), serde_json::to_vec(&body)?)?;
+    }
+    let mut seen = Vec::new();
+    for source in [None, Some(EDGAR), Some(POLYGON)] {
+        let mut args = vec!["--from", SOURCED_DAY, "--to", SOURCED_DAY];
+        args.extend(source.map(|one| ["--source", one]).into_iter().flatten());
+        let report = run(&root, &args)?.json()?;
+        let sourced = day(&report, SOURCED_DAY).ok_or("the day is missing")?;
+        let lanes: Vec<(Value, Value)> =
+            sourced["busy"].as_array().map_or_else(Vec::new, |lanes| {
+                lanes
+                    .iter()
+                    .map(|lane| (lane["host"].clone(), lane["busy_s"].clone()))
+                    .collect()
+            });
+        seen.push((
+            sourced["wall_s"].clone(),
+            lanes,
+            sourced["holds_capped"].clone(),
+            sourced["runs_observed"].clone(),
+        ));
+    }
+    let lane = |host: &str, busy_s: f64| (Value::from(host), Value::from(busy_s));
+    assert_eq!(
+        seen,
+        vec![
+            (
+                Value::from(41.0),
+                vec![lane("a.test", 10.0), lane("b.test", 5.0)],
+                Value::from(1),
+                Value::from(3)
+            ),
+            (
+                Value::from(11.0),
+                vec![lane("a.test", 3.0)],
+                Value::from(0),
+                Value::from(3)
+            ),
+            (
+                Value::from(13.0),
+                vec![lane("b.test", 5.0)],
+                Value::from(1),
+                Value::from(3)
+            ),
+        ]
+    );
+    Ok(())
+}

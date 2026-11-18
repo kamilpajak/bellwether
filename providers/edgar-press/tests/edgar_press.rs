@@ -1283,6 +1283,18 @@ fn edgar_press_declares_no_follow_up_cap() -> Outcome {
     Ok(())
 }
 
+/// S7-D5's carry is open-web's: a deferred EDGAR document is rebuilt as nothing.
+#[test]
+fn edgar_press_carries_no_deferred_document() -> Outcome {
+    let carried = provider()?.carried(
+        &TargetWindow::new(A_LISTED_SESSION),
+        "https://www.sec.gov/Archives/edgar/data/320193/0000320193-26-000071.txt",
+        None,
+    );
+    assert_eq!(carried, None);
+    Ok(())
+}
+
 #[test]
 fn a_plan_with_no_calendar_is_refused_and_names_what_is_missing() -> Outcome {
     let refused = provider()?.plan(

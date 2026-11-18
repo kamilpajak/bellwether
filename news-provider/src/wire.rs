@@ -2712,6 +2712,7 @@ mod tests {
                 request,
                 retries,
                 counted: false,
+                carried: Vec::new(),
             };
             queue.requeue(follow_ups, Vec::new(), asked, retrying);
         }
