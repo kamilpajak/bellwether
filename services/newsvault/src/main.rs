@@ -144,9 +144,9 @@ enum Command {
         /// when its fetch returns, so this option cannot backdate what we knew. Defaults to now.
         #[arg(long)]
         at: Option<String>,
-        /// The last instant a request may be sent at (RFC 3339), after --at. A request whose
-        /// pace slot opens later is not asked and is recorded as deferred, with its host's
-        /// remaining requests. Absent: every request is asked.
+        /// The last instant a request may be sent at (RFC 3339), after --at and, unless a dry
+        /// run, after the clock's now. A request whose pace slot opens later is not asked and is
+        /// recorded as deferred, with its host's remaining requests. Absent: every request is asked.
         #[arg(long)]
         deadline: Option<String>,
         /// Plans, validates and resolves every target, and mutates nothing.
@@ -985,8 +985,8 @@ fn print_schema(format: Format) {
                      "doc": "the instant the run plans against; defaults to now; for open_web_wires \
                              a run (not a dry run) whose at is not the clock's UTC day is refused"},
                     {"name": "deadline", "type": "rfc3339",
-                     "doc": "the last instant a request may be sent at, after at (else \
-                             invalid_argument); a request whose pace slot opens later is not \
+                     "doc": "the last instant a request may be sent at, after at and, unless \
+                             dry_run, after the clock's now (else invalid_argument); a request whose pace slot opens later is not \
                              asked and is a deferred row (run_deadline, or host_held when a \
                              server's hold or slow-down moved it), with the rest of its host's \
                              queue; absent, every request is asked"},
