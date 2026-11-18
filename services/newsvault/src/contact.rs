@@ -3,7 +3,7 @@
 //! and never the value: the address is the one thing in a request that is a person.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Why no contact was read. Each maps to one section 5.1 code through [`ContactError::code`].
 #[derive(Debug, thiserror::Error)]
@@ -14,29 +14,38 @@ pub enum ContactError {
         variable: &'static str,
         file_variable: &'static str,
     },
-    #[error("{file_variable} names {path}, and no file is there")]
+    #[error("{file_variable} names {}, and no file is there", shown(.path))]
     FileAbsent {
         file_variable: &'static str,
         path: PathBuf,
     },
     /// `why` is the io error's own text or "not UTF-8"; neither carries the file's bytes.
-    #[error("{file_variable} names {path}, which could not be read: {why}")]
+    #[error("{file_variable} names {}, which could not be read: {why}", shown(.path))]
     FileUnreadable {
         file_variable: &'static str,
         path: PathBuf,
         why: String,
     },
-    #[error("{file_variable} names {path}, which holds no contact")]
+    #[error("{file_variable} names {}, which holds no contact", shown(.path))]
     FileEmpty {
         file_variable: &'static str,
         path: PathBuf,
     },
     /// A second line or a carriage return would reach the User-Agent header.
-    #[error("{file_variable} names {path}, whose contact holds a control character")]
+    #[error("{file_variable} names {}, whose contact holds a control character", shown(.path))]
     ControlCharacter {
         file_variable: &'static str,
         path: PathBuf,
     },
+}
+
+/// A `_FILE` value that is no absolute path may be the address itself, set in the wrong variable.
+fn shown(path: &Path) -> String {
+    if path.is_absolute() {
+        path.display().to_string()
+    } else {
+        "a value that is not an absolute path (not shown)".to_owned()
+    }
 }
 
 impl ContactError {
@@ -254,6 +263,23 @@ mod tests {
             (Some("input_absent"), Some("io_failed"), Some("io_failed"))
         );
         Ok(())
+    }
+
+    /// The address set in the `_FILE` variable by mistake is refused without being printed.
+    #[test]
+    fn a_file_variable_holding_no_absolute_path_is_not_printed() {
+        let refused = read(VARIABLE, FILE_VARIABLE, env(&[(FILE_VARIABLE, CONTACT)]));
+        let shown = refused.as_ref().err().map(ToString::to_string);
+        assert_eq!(
+            (code(&refused), shown),
+            (
+                Some("input_absent"),
+                Some(format!(
+                    "{FILE_VARIABLE} names a value that is not an absolute path (not shown), \
+                     and no file is there"
+                ))
+            )
+        );
     }
 
     /// Every refusal's text, the file's bytes being the contact: none carries it.
