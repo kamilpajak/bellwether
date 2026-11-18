@@ -1033,15 +1033,11 @@ impl HostQueue {
         }
     }
 
-    /// S7-D5: each carried request at the front of its host's lane, in the order given, so ahead
-    /// of the host's planned index and of every follow-up; a host with no lane opens one last.
+    /// S7-D5 as amended 2026-11-18: called before the first `pop`, so each carried request goes
+    /// behind its host's planned index and ahead of every follow-up that index will list.
     pub(crate) fn carry(&mut self, carried: Vec<Queued>) {
-        for queued in carried.into_iter().rev() {
-            let host = host_of(&queued.request.url).ok().flatten();
-            match self.lanes.iter_mut().find(|(key, _)| *key == host) {
-                Some((_, lane)) => lane.push_front(queued),
-                None => self.lanes.push((host, VecDeque::from([queued]))),
-            }
+        for queued in carried {
+            self.push(queued);
         }
     }
 
@@ -2028,10 +2024,36 @@ mod tests {
         );
     }
 
-    /// S7-D5: carried requests go to the front of their host's lane in the order given, ahead
-    /// of the planned index; a counted one spends a cap slot and a walk id does not (S7-D6).
+    /// S7-D5 (amended 2026-11-18): a host's planned index first, then its carried requests in the
+    /// order given, then the follow-ups that index lists.
     #[test]
-    fn carried_requests_are_asked_first_in_their_lane_and_only_counted_ones_spend_the_cap() {
+    fn a_lane_asks_its_planned_index_then_carried_requests_then_new_follow_ups() {
+        let mut queue = HostQueue::of(vec![asking(GNW, "index")], None);
+        let carried = |path: &str, id: i64| Queued {
+            carried: vec![id],
+            ..Queued::first_attempt(asking(GNW, path))
+        };
+        queue.carry(vec![carried("c1", 1), carried("c2", 2)]);
+        let mut asked = Vec::new();
+        if let Some(Popped::Ask(index)) = queue.pop() {
+            asked.push(index.request.url.clone());
+            queue.requeue(vec![asking(GNW, "f1")], Vec::new(), index, false);
+        }
+        while let Some(popped) = queue.pop() {
+            if let Popped::Ask(queued) = popped {
+                asked.push(queued.request.url);
+            }
+        }
+        assert_eq!(
+            asked,
+            ["index", "c1", "c2", "f1"].map(|path| format!("{GNW}{path}"))
+        );
+    }
+
+    /// S7-D5: carried requests go behind the planned index of their host's lane; a counted one
+    /// spends a cap slot and a walk id does not (S7-D6).
+    #[test]
+    fn carried_requests_follow_their_lanes_index_and_only_counted_ones_spend_the_cap() {
         let mut queue = HostQueue::of(vec![asking(GNW, "index"), asking(PRN, "index")], Some(1));
         let carried = |path: &str, counted: bool, id: i64| Queued {
             counted,
@@ -2054,10 +2076,10 @@ mod tests {
             (asked, deferred),
             (
                 vec![
-                    (format!("{GNW}c1"), vec![1]),
-                    (format!("{PRN}index"), Vec::new()),
-                    (format!("{GNW}w1"), vec![2]),
                     (format!("{GNW}index"), Vec::new()),
+                    (format!("{PRN}index"), Vec::new()),
+                    (format!("{GNW}c1"), vec![1]),
+                    (format!("{GNW}w1"), vec![2]),
                 ],
                 vec![format!("{GNW}c2")]
             )
