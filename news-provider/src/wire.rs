@@ -13,10 +13,12 @@ use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::{DateTime, Datelike, NaiveDateTime, TimeDelta, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
 use pit::ObservationTime;
 
-use crate::budget::{host_of, BudgetError, BudgetScope, HostKey, Pace, RequestBudget};
+use crate::budget::{
+    host_of, BudgetError, BudgetScope, Hold, HostKey, Pace, RequestBudget, Reserved,
+};
 use crate::clock::{Clock, Sleeper, ThreadSleeper};
 use crate::ledger::{AttemptId, SendPermit};
 use crate::request::{CredentialRef, HeaderValue, Request, SourceId};
@@ -71,6 +73,49 @@ impl Credentials {
     }
 }
 
+/// Why no slot could be reserved: both arms are raised before any socket and any attempt row.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum Unreserved {
+    /// A header names a credential this process does not hold (architecture.md section 5.1).
+    #[error("no credential named {0} is held")]
+    CredentialMissing(String),
+    #[error(transparent)]
+    Budget(#[from] BudgetError),
+}
+
+impl From<Unreserved> for SendFailure {
+    fn from(refused: Unreserved) -> Self {
+        match refused {
+            Unreserved::CredentialMissing(name) => Self::CredentialMissing(name),
+            Unreserved::Budget(why) => Self::Budget(why),
+        }
+    }
+}
+
+/// What [`Wire::reserve`] answered for one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reservation {
+    /// The pace is waited out and the slot reserved: the next `send` of this url goes at once.
+    Go,
+    /// Nothing written: the slot would open at `go_at`, after the run's deadline. `by_server` is
+    /// true when the profile's own interval would have opened it by the deadline, so a server's
+    /// hold or doubling moved it past (S7-D4's `host_held`); false is `run_deadline`.
+    PastDeadline {
+        go_at: DateTime<Utc>,
+        by_server: bool,
+    },
+}
+
+/// A `Retry-After` past [`HOLD_CEILING`]: the host is held to the ceiling and this is recorded
+/// (S7-D7), the fact architecture.md section 11.5 step 7 PR 6's alert is to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CappedHold {
+    pub host: String,
+    /// The header's value as received.
+    pub retry_after: String,
+    pub held_until: DateTime<Utc>,
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SendFailure {
     /// Before the socket: a header names a credential this process does not hold. A startup
@@ -115,17 +160,16 @@ const HTTP_DATE_FORMATS: [&str; 3] = [
 /// never SEC's 403 (architecture.md section 10, server back-off).
 const TOO_MANY_REQUESTS: u16 = 429;
 const SERVER_ERRORS: RangeInclusive<u16> = 500..=599;
-/// The last year `Pace::prior` reads back: a later instant is stamped `+YYYYY-…`, which RFC 3339
-/// cannot hold, so the host pace file it reaches is refused on every later run (row R19).
-const LAST_STAMPED_YEAR: i32 = 9999;
+/// S7-D7 (owner, 2026-11-17): the longest a server's `Retry-After` holds a host. Rejected:
+/// uncapped, where `Retry-After: 315360000` silenced a host for 10 years (probe 2026-11-16).
+pub const HOLD_CEILING: TimeDelta = TimeDelta::hours(24);
 
-/// What the slow-down answers of one host asked of this `Wire`, for the rest of its run.
+/// What the slow-down answers of one host asked of this `Wire`, for the rest of its run; a held
+/// host is in its [`Hold`] file instead, so later runs see it too.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Backoff {
     /// Slow-down answers with no usable `Retry-After`; the host interval is `per_host` × 2^this.
     doublings: u32,
-    /// The instant the last usable `Retry-After` named; no host slot is granted before it.
-    not_before: Option<DateTime<Utc>>,
 }
 
 /// The one `Content-Encoding` value ureq 3.5.2's `gzip` feature decodes (`ContentEncoding::from`
@@ -408,6 +452,10 @@ pub struct Wire {
     sleeper: Box<dyn Sleeper>,
     /// Held in memory: one `Wire` is one run, and a second process sees only the host slot granted.
     backoff: RefCell<BTreeMap<HostKey, Backoff>>,
+    /// The url [`Wire::reserve`] last answered `Go` for, which the next `send` of it does not
+    /// pace again.
+    reserved: RefCell<Option<String>>,
+    capped: RefCell<Vec<CappedHold>>,
 }
 
 const USER_AGENT: &str = "User-Agent";
@@ -470,12 +518,14 @@ impl Wire {
             store: store.to_path_buf(),
             sleeper,
             backoff: RefCell::default(),
+            reserved: RefCell::default(),
+            capped: RefCell::default(),
         }
     }
 
     /// The profile's User-Agent first, then the request's own headers, with every credential
     /// reference replaced by its value. The only assembly of outgoing headers in the crate.
-    fn headers_for(&self, request: &Request) -> Result<Vec<(String, String)>, SendFailure> {
+    fn headers_for(&self, request: &Request) -> Result<Vec<(String, String)>, Unreserved> {
         let mut named = vec![(USER_AGENT.to_owned(), &self.profile.user_agent)];
         named.extend(
             request
@@ -491,13 +541,38 @@ impl Wire {
                     .credentials
                     .value(credential)
                     .map(|held| (name, held.to_owned()))
-                    .ok_or_else(|| SendFailure::CredentialMissing(credential.as_str().to_owned())),
+                    .ok_or_else(|| Unreserved::CredentialMissing(credential.as_str().to_owned())),
             })
             .collect()
     }
 
+    /// Waits out the vendor's pace for `request` and reserves its slot, or, when the slot would
+    /// open after `deadline`, answers `PastDeadline` having written and waited nothing. `collect`
+    /// asks this BEFORE it opens the attempt row, so a request past the deadline has none
+    /// (condition A, architecture.md section 11.5 step 7).
+    pub fn reserve(
+        &self,
+        request: &Request,
+        clock: &dyn Clock,
+        deadline: Option<DateTime<Utc>>,
+    ) -> Result<Reservation, Unreserved> {
+        self.headers_for(request)?;
+        let reserved = self.pace(request, clock, deadline)?;
+        if reserved == Reservation::Go {
+            *self.reserved.borrow_mut() = Some(request.url.clone());
+        }
+        Ok(reserved)
+    }
+
+    /// Every answer this `Wire` read whose `Retry-After` was past [`HOLD_CEILING`], in order.
+    #[must_use]
+    pub fn capped_holds(&self) -> Vec<CappedHold> {
+        self.capped.borrow().clone()
+    }
+
     /// Consumes the permit, so one HTTP call needs one written ledger row, and waits out the
-    /// vendor's pace first, so one process cannot be the whole bucket.
+    /// vendor's pace first, so one process cannot be the whole bucket: here, unless
+    /// [`Wire::reserve`] already did for this url.
     pub fn send(
         &self,
         permit: SendPermit,
@@ -506,16 +581,14 @@ impl Wire {
     ) -> Result<RawResponse, SendFailure> {
         let attempt_id = permit.into_attempt_id();
         let headers = self.headers_for(request)?;
-        if self.pace.is_none() && self.profile.budget.per_host.is_none() {
-            return Err(BudgetError::NoPace.into());
+        let reserved = self.reserved.borrow_mut().take();
+        if reserved.as_deref() != Some(request.url.as_str()) {
+            // With no deadline every slot is granted, so `PastDeadline` cannot come back.
+            match self.pace(request, clock, None)? {
+                Reservation::Go | Reservation::PastDeadline { .. } => {}
+            }
         }
-        // The pace wait is owed only by a call that is going to be made, so it comes after the
-        // credential check. Unconditional, with no zero-wait branch for a test to leave uncovered.
         let host = self.paced_host(&request.url)?;
-        self.wait_out_the_host(host.as_ref(), clock)?;
-        if let Some(pace) = &self.pace {
-            self.sleeper.sleep(pace.reserve(clock.now())?);
-        }
         let requested_at = ObservationTime::new(clock.now());
         let answered = self.exchange(&request.url, &headers);
         let received_at = ObservationTime::new(clock.now());
@@ -524,7 +597,7 @@ impl Wire {
                 Ok((status, kept, _)) => (Some(*status), kept),
                 Err(failed) => (failed.status, &failed.headers),
             };
-            self.heed(host, status, kept, received_at.inner());
+            self.heed(&host, status, kept, received_at.inner())?;
         }
         match answered {
             Ok((status, headers, body)) => {
@@ -549,23 +622,65 @@ impl Wire {
         }
     }
 
+    /// The host wait, then the per-IP one. Owed only by a call that is going to be made, so the
+    /// caller checks credentials first. Unconditional, with no zero-wait branch for a test to
+    /// leave uncovered.
+    fn pace(
+        &self,
+        request: &Request,
+        clock: &dyn Clock,
+        deadline: Option<DateTime<Utc>>,
+    ) -> Result<Reservation, BudgetError> {
+        if self.pace.is_none() && self.profile.budget.per_host.is_none() {
+            return Err(BudgetError::NoPace);
+        }
+        let host = self.paced_host(&request.url)?;
+        if let Some(late) = self.wait_out_the_host(host.as_ref(), clock, deadline)? {
+            return Ok(late);
+        }
+        if let (Some(pace), Some(interval)) = (&self.pace, self.profile.budget.min_interval) {
+            match pace.reserve_within(clock.now(), None, deadline, interval)? {
+                Reserved::Wait(wait) => self.sleeper.sleep(wait),
+                Reserved::PastDeadline { go_at, .. } => {
+                    return Ok(Reservation::PastDeadline {
+                        go_at,
+                        by_server: false,
+                    })
+                }
+            }
+        }
+        Ok(Reservation::Go)
+    }
+
     /// Taken BEFORE the per-IP slot is reserved: an IP slot reserved and then held through a long
-    /// host wait would push every other host's call behind it (row R19).
+    /// host wait would push every other host's call behind it (row R19). `Some` is a slot past
+    /// `deadline`, with nothing written.
     fn wait_out_the_host(
         &self,
         host: Option<&HostKey>,
         clock: &dyn Clock,
-    ) -> Result<(), BudgetError> {
-        let (Some(interval), Some(host)) = (self.profile.budget.per_host, host) else {
-            return Ok(());
+        deadline: Option<DateTime<Utc>>,
+    ) -> Result<Option<Reservation>, BudgetError> {
+        let (Some(ordinary), Some(host)) = (self.profile.budget.per_host, host) else {
+            return Ok(None);
         };
         let backoff = self.backoff.borrow().get(host).copied().unwrap_or_default();
-        let interval = interval.saturating_mul(2_u32.saturating_pow(backoff.doublings));
+        let interval = ordinary.saturating_mul(2_u32.saturating_pow(backoff.doublings));
         let scope = BudgetScope::PerHost(host.clone());
         let pace = Pace::beside_the_store(&self.store, &scope, interval);
-        self.sleeper
-            .sleep(pace.reserve_not_before(clock.now(), backoff.not_before)?);
-        Ok(())
+        let held = Hold::beside_the_store(&self.store, host).until()?;
+        match pace.reserve_within(clock.now(), held, deadline, ordinary)? {
+            Reserved::Wait(wait) => {
+                self.sleeper.sleep(wait);
+                Ok(None)
+            }
+            Reserved::PastDeadline {
+                go_at, ordinary_at, ..
+            } => Ok(Some(Reservation::PastDeadline {
+                go_at,
+                by_server: deadline.is_some_and(|deadline| ordinary_at <= deadline),
+            })),
+        }
     }
 
     /// The url's host when the profile paces hosts. ureq 3.5.2 parses a url with this same
@@ -578,18 +693,35 @@ impl Wire {
         }
     }
 
-    /// An answer [`asks_to_slow_down`] names holds its host until its `Retry-After`, or without a usable one
-    /// doubles the host interval; either lasts for the rest of this `Wire`'s run (row R19).
-    fn heed(&self, host: HostKey, status: Option<u16>, kept: &Headers, received: DateTime<Utc>) {
+    /// An answer [`asks_to_slow_down`] names holds its host until its `Retry-After`, capped at
+    /// [`HOLD_CEILING`] and written to the host's [`Hold`] file; without a usable one it doubles
+    /// the host interval for the rest of this `Wire`'s run (row R19).
+    fn heed(
+        &self,
+        host: &HostKey,
+        status: Option<u16>,
+        kept: &Headers,
+        received: DateTime<Utc>,
+    ) -> Result<(), BudgetError> {
         if !status.is_some_and(asks_to_slow_down) {
-            return;
+            return Ok(());
         }
-        let mut held = self.backoff.borrow_mut();
-        let backoff = held.entry(host).or_default();
-        match retry_after(kept, received) {
-            Some(until) => backoff.not_before = Some(until),
-            None => backoff.doublings = backoff.doublings.saturating_add(1),
+        let asked = retry_after(kept, received);
+        let Some((asked, ceiling)) = asked.zip(received.checked_add_signed(HOLD_CEILING)) else {
+            let mut held = self.backoff.borrow_mut();
+            let backoff = held.entry(host.clone()).or_default();
+            backoff.doublings = backoff.doublings.saturating_add(1);
+            return Ok(());
+        };
+        let held_until = asked.until.map_or(ceiling, |until| until.min(ceiling));
+        if asked.until.is_none_or(|until| until > ceiling) {
+            self.capped.borrow_mut().push(CappedHold {
+                host: host.as_str().to_owned(),
+                retry_after: asked.value,
+                held_until,
+            });
         }
+        Hold::beside_the_store(&self.store, host).raise(held_until)
     }
 
     /// The socket, and the only call to the agent. Between the two clock reads in [`Wire::send`],
@@ -677,13 +809,17 @@ fn asks_to_slow_down(status: u16) -> bool {
     status == TOO_MANY_REQUESTS || SERVER_ERRORS.contains(&status)
 }
 
-/// RFC 9110 §10.2.3: the instant a `Retry-After` names, never before `received`. `None` when absent,
-/// repeated or unparseable, a negative value included, or past [`LAST_STAMPED_YEAR`].
-fn retry_after(headers: &Headers, received: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    named_instant(headers, received).filter(|until| until.year() <= LAST_STAMPED_YEAR)
+/// A usable `Retry-After`: its value as received and the instant it names, `None` when that is
+/// past every instant `DateTime` holds (delta-seconds past `u64`, `i64` or chrono's range).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Asked {
+    value: String,
+    until: Option<DateTime<Utc>>,
 }
 
-fn named_instant(headers: &Headers, received: DateTime<Utc>) -> Option<DateTime<Utc>> {
+/// RFC 9110 §10.2.3: the instant a `Retry-After` names, never before `received`. `None` when absent,
+/// repeated or unparseable, a negative value included.
+fn retry_after(headers: &Headers, received: DateTime<Utc>) -> Option<Asked> {
     let mut values = headers
         .pairs()
         .iter()
@@ -692,14 +828,23 @@ fn named_instant(headers: &Headers, received: DateTime<Utc>) -> Option<DateTime<
     let (Some(value), None) = (values.next(), values.next()) else {
         return None;
     };
-    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
-        let seconds = i64::try_from(value.parse::<u64>().ok()?).ok()?;
-        return received.checked_add_signed(TimeDelta::try_seconds(seconds)?);
-    }
-    HTTP_DATE_FORMATS
-        .iter()
-        .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok())
-        .map(|date| date.and_utc().max(received))
+    let until = if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        value
+            .parse::<u64>()
+            .ok()
+            .and_then(|seconds| i64::try_from(seconds).ok())
+            .and_then(TimeDelta::try_seconds)
+            .and_then(|delta| received.checked_add_signed(delta))
+    } else {
+        let date = HTTP_DATE_FORMATS
+            .iter()
+            .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok())?;
+        Some(date.and_utc().max(received))
+    };
+    Some(Asked {
+        value: value.to_owned(),
+        until,
+    })
 }
 
 /// What [`Wire::exchange`] knew when the conversation failed.
@@ -714,8 +859,8 @@ struct Failed {
 #[cfg(test)]
 mod tests {
     use super::{
-        retry_after, Credentials, Headers, RawResponse, SendFailure, Timeouts, TransportError,
-        TransportKind, TransportProfile, Wire, USER_AGENT,
+        retry_after, CappedHold, Credentials, Headers, RawResponse, Reservation, SendFailure,
+        Timeouts, TransportError, TransportKind, TransportProfile, Wire, USER_AGENT,
     };
     use crate::budget::{BudgetError, RequestBudget};
     use crate::clock::testing::{StepClock, WaitRecorder, WaitedClock};
@@ -1983,15 +2128,13 @@ mod tests {
     const RETRY_AFTER_PAST: &str =
         "503 Service Unavailable\r\nRetry-After: Tue, 10 Nov 2026 12:00:00 GMT";
     const NO_RETRY_AFTER: &str = "429 Too Many Requests";
-    /// Negative, a word, a fraction, delta-seconds past `u64` and past year 9999, two values, which
-    /// RFC 9110's singleton field cannot hold, and a weekday chrono 0.4.45 finds off the calendar.
-    const UNUSABLE_RETRY_AFTERS: [&str; 7] = [
+    /// Negative, a word, a fraction, two values, which RFC 9110's singleton field cannot hold, and
+    /// a weekday chrono 0.4.45 finds off the calendar.
+    const UNUSABLE_RETRY_AFTERS: [&str; 5] = [
         "429 Too Many Requests\r\nRetry-After: 120\r\nRetry-After: 60",
         "429 Too Many Requests\r\nRetry-After: -5",
         "429 Too Many Requests\r\nRetry-After: soon",
         "429 Too Many Requests\r\nRetry-After: 1.5",
-        "429 Too Many Requests\r\nRetry-After: 99999999999999999999999",
-        PAST_YEAR_9999,
         "429 Too Many Requests\r\nRetry-After: Mon, 10 Nov 2026 13:05:00 GMT",
     ];
     /// About 253,500 years: an instant `DateTime` holds and the pace file's RFC 3339 cannot.
@@ -2157,7 +2300,10 @@ mod tests {
     fn a_retry_after_in_each_http_date_form_is_read_as_one_instant() -> Checked {
         let received: chrono::DateTime<chrono::Utc> = RESERVED_AT.parse()?;
         let expected: chrono::DateTime<chrono::Utc> = "1994-11-06T08:49:37Z".parse()?;
-        let of = |value: &str, at| retry_after(&Headers::new(pairs(&[("retry-after", value)])), at);
+        let of = |value: &str, at| {
+            retry_after(&Headers::new(pairs(&[("retry-after", value)])), at)
+                .and_then(|asked| asked.until)
+        };
         let read: Vec<_> = [
             "Sun, 06 Nov 1994 08:49:37 GMT",
             "Sunday, 06-Nov-94 08:49:37 GMT",
@@ -2253,6 +2399,8 @@ mod tests {
     const LOOPBACK_IP: &str = "127.0.0.1";
     const LOOPBACK_NAME: &str = "localhost";
     const LOOPBACK_HOST_PACE_FILE: &str = "127.0.0.1.per-host";
+    /// Where host A's 120 s `Retry-After` is held, beside its pace file (S7-D7).
+    const LOOPBACK_HOLD_FILE: &str = "127.0.0.1.hold";
 
     /// Every file under `<store>/pace/`, sorted.
     fn pace_files(store: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -2313,6 +2461,7 @@ mod tests {
         assert_eq!(
             files,
             vec![
+                LOOPBACK_HOLD_FILE.to_owned(),
                 LOOPBACK_HOST_PACE_FILE.to_owned(),
                 HOST_PACE_FILE.to_owned()
             ]
@@ -2517,6 +2666,248 @@ mod tests {
                 Vec::new(),
                 NO_READS
             )
+        );
+        Ok(())
+    }
+
+    /// Instants after `RESERVED_AT`, where host A's one answer was received and its slot granted.
+    const FIVE_S_LATER: &str = "2026-11-10T13:00:05Z";
+    /// `FLOOR` after the grant: where A's ordinary next slot opens.
+    const FLOOR_LATER: &str = "2026-11-10T13:00:10Z";
+    const JUST_BEFORE_FLOOR_LATER: &str = "2026-11-10T13:00:09.999999Z";
+    const FIFTEEN_S_LATER: &str = "2026-11-10T13:00:15Z";
+    /// `FLOOR` doubled once after the grant.
+    const DOUBLED_FLOOR_LATER: &str = "2026-11-10T13:00:20Z";
+    const A_MINUTE_LATER: &str = "2026-11-10T13:01:00Z";
+    /// `RETRY_AFTER_SECONDS`' 120 s after the answer.
+    const HOLD_LATER: &str = "2026-11-10T13:02:00Z";
+    /// `RESERVED_AT` plus `HOLD_CEILING`, as the hold file writes it.
+    const CEILING_LATER: &str = "2026-11-11T13:00:00.000000Z";
+    const CEILING: Duration = Duration::from_secs(86_400);
+    const TEN_YEARS: &str = "315360000";
+    /// Delta-seconds past `u64`, and past year 9999 (about 253,500 years), both past the ceiling.
+    const PAST_ANY_STAMP: [&str; 2] = ["99999999999999999999999", "8000000000000"];
+    const LOOPBACK_HOST: &str = "127.0.0.1";
+
+    /// A hosts-only `Wire` over `WaitedClock` at `RESERVED_AT`, after one send to host A,
+    /// `127.0.0.1`: to a loopback server answering `head`, or to `REFUSED` when `head` is `None`.
+    fn after_one_answer(
+        head: Option<&str>,
+    ) -> Result<(tempfile::TempDir, WaitedClock, Wire), Box<dyn std::error::Error>> {
+        let store = tempfile::tempdir()?;
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let wire = Wire::with_sleeper(
+            hosts_only_profile(),
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        match head {
+            Some(head) => {
+                let (url, served) = serve_answers(vec![head.to_owned()])?;
+                status_of(&wire, &clock, FIRST_ATTEMPT, &url)?;
+                answered_by(served)?;
+            }
+            None => send_to(&wire, &clock, FIRST_ATTEMPT, REFUSED)?,
+        }
+        Ok((store, clock, wire))
+    }
+
+    /// `url` reserved under `deadline`, then sent when the answer is `Go`.
+    fn reserved(
+        wire: &Wire,
+        clock: &WaitedClock,
+        url: &str,
+        deadline: &str,
+    ) -> Result<Reservation, Box<dyn std::error::Error>> {
+        let asked = Request {
+            url: url.to_owned(),
+            ..request()
+        };
+        let reservation = wire.reserve(&asked, clock, Some(deadline.parse()?))?;
+        if reservation == Reservation::Go {
+            send_to(wire, clock, SECOND_ATTEMPT, url)?;
+        }
+        Ok(reservation)
+    }
+
+    fn past(go_at: &str, by_server: bool) -> Result<Reservation, Box<dyn std::error::Error>> {
+        Ok(Reservation::PastDeadline {
+            go_at: go_at.parse()?,
+            by_server,
+        })
+    }
+
+    /// Condition A (owner, 2026-11-16): a 120 s hold ending past the deadline stops host A, as
+    /// `host_held` because A's own 10 s would have opened by then; host B still goes.
+    #[test]
+    fn a_retry_after_past_the_deadline_stops_its_host_as_held_and_another_host_still_goes(
+    ) -> Checked {
+        let (_store, clock, wire) = after_one_answer(Some(RETRY_AFTER_SECONDS))?;
+        let a = reserved(&wire, &clock, REFUSED, A_MINUTE_LATER)?;
+        let b = reserved(&wire, &clock, LOCALHOST, A_MINUTE_LATER)?;
+        assert_eq!((a, b), (past(HOLD_LATER, true)?, Reservation::Go));
+        Ok(())
+    }
+
+    /// Condition A: a 429 with no `Retry-After` doubles A's 10 s to 20 s, past a deadline 15 s on.
+    #[test]
+    fn a_doubled_wait_past_the_deadline_stops_its_host_as_held() -> Checked {
+        let (_store, clock, wire) = after_one_answer(Some(NO_RETRY_AFTER))?;
+        let a = reserved(&wire, &clock, REFUSED, FIFTEEN_S_LATER)?;
+        let b = reserved(&wire, &clock, LOCALHOST, FIFTEEN_S_LATER)?;
+        assert_eq!((a, b), (past(DOUBLED_FLOOR_LATER, true)?, Reservation::Go));
+        Ok(())
+    }
+
+    /// The split of S7-D4's two reasons: when A's own 10 s already opens after the deadline, the
+    /// stop is `run_deadline` whatever the server asked, a plain answer, a doubling or a hold.
+    #[test]
+    fn a_slot_the_profiles_own_pace_opens_after_the_deadline_is_run_deadline() -> Checked {
+        let mut stopped = Vec::new();
+        for head in [None, Some(NO_RETRY_AFTER), Some(RETRY_AFTER_SECONDS)] {
+            let (_store, clock, wire) = after_one_answer(head)?;
+            stopped.push(reserved(&wire, &clock, REFUSED, FIVE_S_LATER)?);
+        }
+        assert_eq!(
+            stopped,
+            vec![
+                past(FLOOR_LATER, false)?,
+                past(DOUBLED_FLOOR_LATER, false)?,
+                past(HOLD_LATER, false)?
+            ]
+        );
+        Ok(())
+    }
+
+    /// The deadline is inclusive: a slot opening at it is asked, one opening 1 µs after is not.
+    #[test]
+    fn a_slot_opening_exactly_at_the_deadline_is_asked_and_one_microsecond_later_is_not() -> Checked
+    {
+        let (_store, clock, wire) = after_one_answer(None)?;
+        let at = reserved(&wire, &clock, REFUSED, FLOOR_LATER)?;
+        let (_store, clock, wire) = after_one_answer(None)?;
+        let after = reserved(&wire, &clock, REFUSED, JUST_BEFORE_FLOOR_LATER)?;
+        assert_eq!(
+            (at, after, clock.waits()),
+            (Reservation::Go, past(FLOOR_LATER, false)?, vec![NO_WAIT])
+        );
+        Ok(())
+    }
+
+    /// Every file under `<store>/pace/` with its bytes.
+    fn pace_bytes(
+        store: &Path,
+    ) -> Result<std::collections::BTreeMap<String, Vec<u8>>, Box<dyn std::error::Error>> {
+        pace_files(store)?
+            .into_iter()
+            .map(|name| {
+                Ok((
+                    name.clone(),
+                    std::fs::read(store.join(PACE_DIR).join(name))?,
+                ))
+            })
+            .collect()
+    }
+
+    /// `PastDeadline` reserves no slot, stamps no pace or hold file and waits nothing.
+    #[test]
+    fn past_the_deadline_nothing_is_written_and_nothing_waited() -> Checked {
+        let (store, clock, wire) = after_one_answer(Some(RETRY_AFTER_SECONDS))?;
+        let (files, waits) = (pace_bytes(store.path())?, clock.waits());
+        let stopped = reserved(&wire, &clock, REFUSED, A_MINUTE_LATER)?;
+        assert_eq!(
+            (stopped, pace_bytes(store.path())?, clock.waits()),
+            (past(HOLD_LATER, true)?, files, waits)
+        );
+        Ok(())
+    }
+
+    /// S7-D7: the hold outlives the `Wire` that read it, so the next run on the store is stopped
+    /// as held too, where a hold kept in memory would ask A again.
+    #[test]
+    fn a_hold_is_read_by_the_next_run_on_the_store() -> Checked {
+        let (store, clock, _first_run) = after_one_answer(Some(RETRY_AFTER_SECONDS))?;
+        let next_run = Wire::with_sleeper(
+            hosts_only_profile(),
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        assert_eq!(
+            reserved(&next_run, &clock, REFUSED, A_MINUTE_LATER)?,
+            past(HOLD_LATER, true)?
+        );
+        Ok(())
+    }
+
+    /// `collect` reserves, then opens the attempt row, then sends: the send pays no second slot.
+    #[test]
+    fn a_reserved_send_is_not_paced_a_second_time() -> Checked {
+        let (_store, clock, wire) = after_one_answer(None)?;
+        let asked = Request {
+            url: LOCALHOST.to_owned(),
+            ..request()
+        };
+        let reservation = wire.reserve(&asked, &clock, None)?;
+        send_to(&wire, &clock, SECOND_ATTEMPT, LOCALHOST)?;
+        send_to(&wire, &clock, SECOND_ATTEMPT + 1, LOCALHOST)?;
+        assert_eq!(
+            (reservation, clock.waits()),
+            (Reservation::Go, vec![NO_WAIT, NO_WAIT, FLOOR])
+        );
+        Ok(())
+    }
+
+    /// S7-D7: `Retry-After: 315360000` holds A 24 h, not 10 years, and is recorded; a value past
+    /// what `DateTime` or the hold file can hold is held and recorded the same way.
+    #[test]
+    fn a_retry_after_past_the_ceiling_holds_its_host_24_hours_and_is_recorded() -> Checked {
+        let mut recorded = Vec::new();
+        for value in std::iter::once(TEN_YEARS).chain(PAST_ANY_STAMP) {
+            let head = format!("429 Too Many Requests\r\nRetry-After: {value}");
+            let (store, clock, wire) = after_one_answer(Some(&head))?;
+            send_to(&wire, &clock, SECOND_ATTEMPT, REFUSED)?;
+            let hold =
+                std::fs::read_to_string(store.path().join(PACE_DIR).join(LOOPBACK_HOLD_FILE))?;
+            recorded.push((wire.capped_holds(), hold, clock.waits()));
+        }
+        let expected = |value: &str| -> Result<_, Box<dyn std::error::Error>> {
+            Ok((
+                vec![CappedHold {
+                    host: LOOPBACK_HOST.to_owned(),
+                    retry_after: value.to_owned(),
+                    held_until: CEILING_LATER.parse()?,
+                }],
+                CEILING_LATER.to_owned(),
+                vec![NO_WAIT, CEILING],
+            ))
+        };
+        assert_eq!(
+            recorded,
+            vec![
+                expected(TEN_YEARS)?,
+                expected(PAST_ANY_STAMP[0])?,
+                expected(PAST_ANY_STAMP[1])?
+            ]
+        );
+        Ok(())
+    }
+
+    /// The ceiling's boundary: a `Retry-After` of exactly 24 h is held in full and not recorded.
+    #[test]
+    fn a_retry_after_of_exactly_the_ceiling_is_held_and_not_recorded() -> Checked {
+        let head = format!(
+            "429 Too Many Requests\r\nRetry-After: {}",
+            CEILING.as_secs()
+        );
+        let (_store, clock, wire) = after_one_answer(Some(&head))?;
+        send_to(&wire, &clock, SECOND_ATTEMPT, REFUSED)?;
+        assert_eq!(
+            (wire.capped_holds(), clock.waits()),
+            (Vec::new(), vec![NO_WAIT, CEILING])
         );
         Ok(())
     }

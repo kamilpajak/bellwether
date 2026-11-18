@@ -112,6 +112,7 @@ fn ask(store: &Path, window: &str) -> Ask {
         lag_policy: None,
         contact: CONTACT.to_owned(),
         at: at(),
+        deadline: None,
         dry_run: false,
     }
 }
@@ -481,6 +482,72 @@ fn a_dry_run_leaves_the_store_byte_identical_and_calls_nothing() -> TestResult {
     Ok(())
 }
 
+/// `AT` plus an hour, as the envelope writes an instant.
+const AN_HOUR_AFTER_AT: &str = "2026-11-11T00:00:00Z";
+const AN_HOUR_AFTER_AT_MICROS: &str = "2026-11-11T00:00:00.000000Z";
+
+/// Condition A's input: `--deadline` at `--at`, or unparseable, is a usage error, exit 2 with
+/// nothing on stdout and the store as found; one after `--at` reaches a dry run's envelope.
+#[test]
+fn a_deadline_not_after_at_is_a_usage_error_and_a_later_one_reaches_the_envelope() -> TestResult {
+    let root = TempDir::new()?;
+    let before = tree(root.path());
+    let at_at = run_collect(root.path(), A_CLOSED_DAY, &["--deadline", AT])?;
+    let unparseable = run_collect(root.path(), A_CLOSED_DAY, &["--deadline", "soon"])?;
+    let after = tree(root.path());
+    let later = run_collect(
+        root.path(),
+        A_CLOSED_DAY,
+        &["--dry-run", "--deadline", AN_HOUR_AFTER_AT],
+    )?;
+    let envelope: Value = serde_json::from_slice(&later.stdout)?;
+    let refused = |answered: &Answered| {
+        (
+            answered.code,
+            answered.stdout.is_empty(),
+            String::from_utf8_lossy(&answered.stderr).starts_with("usage error"),
+        )
+    };
+    assert_eq!(
+        (
+            refused(&at_at),
+            refused(&unparseable),
+            after == before,
+            later.code,
+            envelope["deadline"].as_str(),
+        ),
+        (
+            (EXIT_USAGE, true, true),
+            (EXIT_USAGE, true, true),
+            true,
+            EXIT_OK,
+            Some(AN_HOUR_AFTER_AT_MICROS)
+        )
+    );
+    Ok(())
+}
+
+/// The CLI rules' manifest: `schema` names `--deadline` among collect's options.
+#[test]
+fn the_schema_lists_the_collect_deadline_as_an_rfc3339_option() -> TestResult {
+    let answered = binary(&["schema", "--format", "json"])?;
+    let schema: Value = serde_json::from_slice(&answered.stdout)?;
+    let collect = schema["commands"]
+        .as_array()
+        .and_then(|commands| {
+            commands
+                .iter()
+                .find(|command| command["path"][0] == "collect")
+        })
+        .ok_or("no collect command")?;
+    let deadline = collect["options"]
+        .as_array()
+        .and_then(|options| options.iter().find(|option| option["name"] == "deadline"))
+        .map(|option| option["type"].clone());
+    assert_eq!(deadline, Some(Value::from("rfc3339")));
+    Ok(())
+}
+
 #[test]
 fn stdout_parses_as_exactly_one_json_value_and_the_parse_consumes_the_stream() -> TestResult {
     let root = TempDir::new()?;
@@ -743,6 +810,7 @@ fn a_session_bound_run_with_no_calendar_is_refused_before_any_request() -> TestR
             calendar: None,
             listing: Some(&listing),
             at: ObservationTime::new(at()),
+            deadline: None,
         },
     );
     let named = matches!(
@@ -1805,6 +1873,7 @@ fn open_web_ask(store: &Path, at: &str) -> Ask {
         lag_policy: None,
         contact: CONTACT.to_owned(),
         at: instant(at),
+        deadline: None,
         dry_run: false,
     }
 }

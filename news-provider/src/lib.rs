@@ -47,7 +47,7 @@ pub mod provider;
 pub mod request;
 pub mod wire;
 
-pub use budget::{BudgetError, BudgetScope, HostKey, Pace, RequestBudget};
+pub use budget::{BudgetError, BudgetScope, Hold, HostKey, Pace, RequestBudget, Reserved};
 pub use clock::{Clock, Sleeper, SystemClock, ThreadSleeper};
 pub use collect::{
     collect, Archive, ArchiveError, AttemptRow, CollectError, Collected, Committed, DeferReason,
@@ -70,8 +70,8 @@ pub use request::{
     TargetWindow,
 };
 pub use wire::{
-    Credentials, Headers, RawResponse, SendFailure, Timeouts, TransportError, TransportKind,
-    TransportProfile, Wire,
+    CappedHold, Credentials, Headers, RawResponse, Reservation, SendFailure, Timeouts,
+    TransportError, TransportKind, TransportProfile, Unreserved, Wire, HOLD_CEILING,
 };
 
 #[cfg(test)]

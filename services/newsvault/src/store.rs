@@ -4685,6 +4685,7 @@ mod tests {
             listed_date: Some("2026-11-16T02:22:00-05:00".to_owned()),
             reason: news_provider::DeferReason::FollowUpCap,
             at: at(9),
+            go_at: None,
         })?;
         let written = deferred_rows(&store)?;
         let insert = |reason: &str, phase: &str| {

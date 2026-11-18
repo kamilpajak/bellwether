@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
+use chrono::{DateTime, Utc};
 use pit::datedness::Published;
 use pit::ObservationTime;
 
@@ -19,30 +20,61 @@ use crate::ledger::{
 };
 use crate::provider::{CollectedItem, DecidedBy, Plan, Provenance, Provider, RawBlob};
 use crate::request::{Request, RequestPhase, RunId, SourceId, TargetWindow};
-use crate::wire::{Headers, RawResponse, SendFailure, TransportError, Wire};
+use crate::wire::{
+    CappedHold, Headers, RawResponse, Reservation, SendFailure, TransportError, Unreserved, Wire,
+};
 use crate::{Calendar, Listing, PlanRefusal};
 
 /// One vendor conversation. Behind a trait because the driver is the thing under test and a test
 /// may not touch a network; [`Wire`] is the only implementation in the workspace that opens a
 /// socket, and `send` consumes the permit either way.
 pub trait Exchange {
+    /// Asked before the attempt row opens: `Go`, or the slot opens after `deadline` and nothing
+    /// was written. An exchange that paces nothing answers `Go`, as a stub does.
+    fn reserve(
+        &self,
+        _request: &Request,
+        _clock: &dyn Clock,
+        _deadline: Option<DateTime<Utc>>,
+    ) -> Result<Reservation, Unreserved> {
+        Ok(Reservation::Go)
+    }
+
     fn send(
         &self,
         permit: SendPermit,
         request: &Request,
         clock: &dyn Clock,
     ) -> Result<RawResponse, SendFailure>;
+
+    /// The answers this exchange held to [`crate::wire::HOLD_CEILING`] (S7-D7), read once a run ends.
+    fn capped_holds(&self) -> Vec<CappedHold> {
+        Vec::new()
+    }
 }
 
+// Each method calls the inherent one by path, so this impl cannot recurse into itself.
 impl Exchange for Wire {
+    fn reserve(
+        &self,
+        request: &Request,
+        clock: &dyn Clock,
+        deadline: Option<DateTime<Utc>>,
+    ) -> Result<Reservation, Unreserved> {
+        Wire::reserve(self, request, clock, deadline)
+    }
+
     fn send(
         &self,
         permit: SendPermit,
         request: &Request,
         clock: &dyn Clock,
     ) -> Result<RawResponse, SendFailure> {
-        // The inherent method by path, so this impl cannot recurse into itself.
         Wire::send(self, permit, request, clock)
+    }
+
+    fn capped_holds(&self) -> Vec<CappedHold> {
+        Wire::capped_holds(self)
     }
 }
 
@@ -51,16 +83,26 @@ impl Exchange for Wire {
 pub const MAX_TRANSIENT_RETRIES: u32 = 2;
 
 /// Why a request was recorded as not looked at instead of asked: a `deferred` row (architecture.md
-/// section 3.2, S7-D4). `run_deadline` and `host_held` join with their producer, step 7 PR 3.
+/// section 3.2, S7-D4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeferReason {
+    /// Its slot opens after the run's deadline under the profile's own pace, or the deadline
+    /// has passed.
+    RunDeadline,
+    /// Its slot opens after the deadline only because a server held or slowed its host.
+    HostHeld,
     FollowUpCap,
 }
 
 impl DeferReason {
+    /// Every arm, in the order the envelope's and the ledger's human lines print them.
+    pub const ALL: [Self; 3] = [Self::RunDeadline, Self::HostHeld, Self::FollowUpCap];
+
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::RunDeadline => "run_deadline",
+            Self::HostHeld => "host_held",
             Self::FollowUpCap => "follow_up_cap",
         }
     }
@@ -80,6 +122,9 @@ pub struct Deferred {
     pub listed_date: Option<String>,
     pub reason: DeferReason,
     pub at: ObservationTime,
+    /// When the pace would have sent it: set on the one request whose reservation came back
+    /// past the deadline, `None` for the rest of its lane and for a follow-up past the cap.
+    pub go_at: Option<DateTime<Utc>>,
 }
 
 impl Deferred {
@@ -106,6 +151,7 @@ impl Deferred {
             url: request.url,
             reason,
             at,
+            go_at: None,
         }
     }
 }
@@ -256,6 +302,8 @@ pub struct Run<'a> {
     /// The run's own observation instant, which decides each request's provenance. Injected,
     /// because a provider may not read a clock.
     pub at: ObservationTime,
+    /// The last instant a request may be sent at (S7-D2, wall time); `None` sends every request.
+    pub deadline: Option<DateTime<Utc>>,
 }
 
 /// Every state the exit table reads, counted. The table is a total function over these, so a new
@@ -425,6 +473,8 @@ pub struct Collected {
     pub swept: Vec<String>,
     /// Requests this run did not ask, in the order the queue reached them.
     pub deferred: Vec<Deferred>,
+    /// [`Exchange::capped_holds`] once the run ends.
+    pub capped_holds: Vec<CappedHold>,
     pub tally: Tally,
     pub blobs_written: u32,
     pub bytes_written: u64,
@@ -453,6 +503,7 @@ impl Collected {
             per_source: Vec::new(),
             swept: Vec::new(),
             deferred: Vec::new(),
+            capped_holds: Vec::new(),
             tally: Tally {
                 unclean_not_planned: count(
                     plan.not_planned
@@ -518,12 +569,33 @@ pub fn collect<A: Archive>(
             Popped::Defer(request) => {
                 let at = ObservationTime::new(clock.now());
                 let deferred = Deferred::of(provider, request, DeferReason::FollowUpCap, at);
-                archive.record_deferred(&deferred)?;
-                collected.tally.deferred += 1;
-                collected.deferred.push(deferred);
+                collected.defer(archive, deferred)?;
                 continue;
             }
         };
+        // Before the attempt row: a request past the deadline gets none (condition A).
+        let (go_at, by_server) = match exchange.reserve(&request, clock, run.deadline) {
+            Ok(Reservation::Go) => (None, false),
+            Ok(Reservation::PastDeadline { go_at, by_server }) => (Some(go_at), by_server),
+            Err(Unreserved::CredentialMissing(name)) => return Err(CollectError::Credential(name)),
+            Err(Unreserved::Budget(why)) => return Err(CollectError::Budget(why)),
+        };
+        if let Some(go_at) = go_at {
+            let reason = if by_server {
+                DeferReason::HostHeld
+            } else {
+                DeferReason::RunDeadline
+            };
+            let at = ObservationTime::new(clock.now());
+            let lane = queue.drain_lane_of(&request.url);
+            let mut first = Deferred::of(provider, request, reason, at);
+            first.go_at = Some(go_at);
+            collected.defer(archive, first)?;
+            for rest in lane {
+                collected.defer(archive, Deferred::of(provider, rest, reason, at))?;
+            }
+            continue;
+        }
         let attempted = attempt_once(&driving, archive, &request, ordinal, &mut issued)?;
         ordinal += 1;
         let retrying = Queued::retried(attempted.is_transient(), retries);
@@ -535,6 +607,7 @@ pub fn collect<A: Archive>(
         };
         queue.requeue(attempted.follow_ups, attempted.walked, asked, retrying);
     }
+    collected.capped_holds = exchange.capped_holds();
     collected.per_source = vec![tally_of(&source, &collected)];
     Ok(collected)
 }
@@ -640,6 +713,17 @@ impl HostQueue {
                 counted: false,
             });
         }
+    }
+
+    /// Empties the lane `url`'s host keys, front first: what a host stopped at the deadline
+    /// leaves, its follow-ups, walk ids and retries included. Other lanes keep their turns.
+    pub(crate) fn drain_lane_of(&mut self, url: &str) -> Vec<Request> {
+        let host = host_of(url).ok().flatten();
+        self.lanes
+            .iter_mut()
+            .find(|(key, _)| *key == host)
+            .map(|(_, lane)| lane.drain(..).map(|queued| queued.request).collect())
+            .unwrap_or_default()
     }
 
     /// The front of the first non-empty lane at or after the one after the last served; a counted
@@ -917,6 +1001,18 @@ fn sweep<A: Archive>(
 }
 
 impl Collected {
+    /// Writes the `deferred` row before the run moves on, then counts it.
+    fn defer<A: Archive>(
+        &mut self,
+        archive: &mut A,
+        deferred: Deferred,
+    ) -> Result<(), CollectError> {
+        archive.record_deferred(&deferred)?;
+        self.tally.deferred += 1;
+        self.deferred.push(deferred);
+        Ok(())
+    }
+
     /// `retrying` true = the driver will re-queue this transient failure, so its outcome is held
     /// out of the exit tally (the request's final disposition is still pending); the attempt ROW
     /// is recorded either way — "we looked and failed" holds whatever the retry does (R4). §8 R21.
@@ -1038,6 +1134,17 @@ mod tests {
         cap: Option<u32>,
         failing: &str,
     ) -> (Vec<String>, Vec<String>) {
+        stopped(plan, cap, failing, "")
+    }
+
+    /// [`capped`], with `stop` reserved past the deadline as `collect` handles it: deferred with
+    /// the rest of its host's lane.
+    fn stopped(
+        plan: &[(&str, Lane)],
+        cap: Option<u32>,
+        failing: &str,
+        stop: &str,
+    ) -> (Vec<String>, Vec<String>) {
         let indexes = plan.iter().map(|(base, _)| asking(base, "index")).collect();
         let mut queue = HostQueue::of(indexes, cap);
         let (mut asked, mut deferred) = (Vec::new(), Vec::new());
@@ -1051,6 +1158,12 @@ mod tests {
                     continue;
                 }
             };
+            if request.url == stop {
+                let lane = queue.drain_lane_of(&request.url);
+                deferred.push(request.url);
+                deferred.extend(lane.into_iter().map(|rest| rest.url));
+                continue;
+            }
             asked.push(request.url.clone());
             let base = request.url.trim_end_matches("index").to_owned();
             let base = base.as_str();
@@ -1229,6 +1342,38 @@ mod tests {
             (
                 urls(&[(PRN, "index"), (PRN, "p0"), (PRN, "page0"), (PRN, "page1")]),
                 urls(&[(PRN, "p1")])
+            )
+        );
+    }
+
+    /// Condition A: a host stopped at the deadline leaves its whole lane deferred in queue order,
+    /// walk ids and an `Index` page included, while the other hosts keep their turns.
+    #[test]
+    fn a_stopped_host_defers_its_whole_lane_and_the_other_hosts_keep_their_turns() {
+        let lane = Lane {
+            documents: 2,
+            walked: 2,
+            pages: 1,
+        };
+        let plan = [(GNW, lane), (PRN, documents(3))];
+        let (asked, deferred) = stopped(&plan, None, "", &format!("{GNW}p0"));
+        assert_eq!(
+            (asked, deferred),
+            (
+                urls(&[
+                    (GNW, "index"),
+                    (PRN, "index"),
+                    (PRN, "p0"),
+                    (PRN, "p1"),
+                    (PRN, "p2")
+                ]),
+                urls(&[
+                    (GNW, "p0"),
+                    (GNW, "p1"),
+                    (GNW, "page0"),
+                    (GNW, "w0"),
+                    (GNW, "w1")
+                ])
             )
         );
     }

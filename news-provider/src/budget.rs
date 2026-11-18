@@ -164,39 +164,48 @@ impl Pace {
     /// Reserves this caller's slot and answers how long it must wait before the socket. The lock
     /// is released before the answer comes back, so the wait is outside the critical section.
     pub fn reserve(&self, now: DateTime<Utc>) -> Result<Duration, BudgetError> {
-        self.reserve_not_before(now, None)
+        match self.reserve_within(now, None, None, self.min_interval)? {
+            Reserved::Wait(wait) | Reserved::PastDeadline { wait, .. } => Ok(wait),
+        }
     }
 
-    /// As [`Pace::reserve`], with no slot granted before `floor`: a server's `Retry-After` (row R19).
-    pub fn reserve_not_before(
+    /// As [`Pace::reserve`], with no slot granted before `floor` (a server's hold, row R19), and
+    /// nothing written when the slot opens after `deadline` (S7-D3, condition A). `ordinary` is
+    /// the interval the profile states, so the answer can say when the slot would open without
+    /// the floor or a doubled `min_interval`.
+    pub fn reserve_within(
         &self,
         now: DateTime<Utc>,
         floor: Option<DateTime<Utc>>,
-    ) -> Result<Duration, BudgetError> {
-        let interval = TimeDelta::from_std(self.min_interval)
-            .map_err(|why| self.unusable("read as an interval", &why))?;
+        deadline: Option<DateTime<Utc>>,
+        ordinary: Duration,
+    ) -> Result<Reserved, BudgetError> {
+        let interval = self.delta(self.min_interval)?;
+        let ordinary = self.delta(ordinary)?;
         let file = self.open()?;
         file.lock().map_err(|why| self.unusable("locked", &why))?;
-        let reserved = self.read_reserve_write(&file, now.max(floor.unwrap_or(now)), interval);
+        let reserved = self.read_reserve_write(&file, now, floor, interval, ordinary, deadline);
         let unlocked = file.unlock().map_err(|why| self.unusable("unlocked", &why));
-        let go_at = reserved?;
+        let reserved = reserved?;
         unlocked?;
         // Non-negative by the `max` in `read_reserve_write`; a negative delta has no `std` form.
-        Ok((go_at - now).to_std().unwrap_or(Duration::ZERO))
+        let wait = |at: DateTime<Utc>| (at - now).to_std().unwrap_or(Duration::ZERO);
+        Ok(match reserved {
+            Slot::Granted(go_at) => Reserved::Wait(wait(go_at)),
+            Slot::Late { go_at, ordinary_at } => Reserved::PastDeadline {
+                go_at,
+                ordinary_at,
+                wait: wait(go_at),
+            },
+        })
+    }
+
+    fn delta(&self, interval: Duration) -> Result<TimeDelta, BudgetError> {
+        TimeDelta::from_std(interval).map_err(|why| self.unusable("read as an interval", &why))
     }
 
     fn open(&self) -> Result<File, BudgetError> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|why| self.unusable("created with its directory", &why))?;
-        }
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.path)
-            .map_err(|why| self.unusable("opened", &why))
+        open_for_update(&self.path)
     }
 
     /// The critical section, and the only thing the lock is held for. No `fsync`: the predecessor
@@ -206,18 +215,26 @@ impl Pace {
         &self,
         mut file: &File,
         now: DateTime<Utc>,
+        floor: Option<DateTime<Utc>>,
         interval: TimeDelta,
-    ) -> Result<DateTime<Utc>, BudgetError> {
+        ordinary: TimeDelta,
+        deadline: Option<DateTime<Utc>>,
+    ) -> Result<Slot, BudgetError> {
         let mut held = String::new();
         file.read_to_string(&mut held)
             .map_err(|why| self.unusable("read", &why))?;
-        let next_allowed = match (self.prior(&held)?, self.held) {
-            (Some(prior), Held::NextAllowed) => Some(prior),
-            (Some(granted), Held::LastGranted) => Some(self.advanced(granted, interval)?),
-            (None, _) => None,
-        };
+        let prior = self.prior(&held)?;
         // A reservation already in the past is owed nothing: nobody used that slot.
-        let go_at = next_allowed.map_or(now, |next| next.max(now));
+        let go_at = self
+            .next_allowed(prior, interval)?
+            .map_or(now, |next| next.max(now))
+            .max(floor.unwrap_or(now));
+        if deadline.is_some_and(|deadline| go_at > deadline) {
+            let ordinary_at = self
+                .next_allowed(prior, ordinary)?
+                .map_or(now, |next| next.max(now));
+            return Ok(Slot::Late { go_at, ordinary_at });
+        }
         let written = match self.held {
             Held::NextAllowed => self.advanced(go_at, interval)?,
             Held::LastGranted => go_at,
@@ -228,21 +245,24 @@ impl Pace {
             .map_err(|why| self.unusable("rewound", &why))?;
         file.write_all(stamp(written).as_bytes())
             .map_err(|why| self.unusable("written", &why))?;
-        Ok(go_at)
+        Ok(Slot::Granted(go_at))
+    }
+
+    fn next_allowed(
+        &self,
+        prior: Option<DateTime<Utc>>,
+        interval: TimeDelta,
+    ) -> Result<Option<DateTime<Utc>>, BudgetError> {
+        Ok(match (prior, self.held) {
+            (Some(prior), Held::NextAllowed) => Some(prior),
+            (Some(granted), Held::LastGranted) => Some(self.advanced(granted, interval)?),
+            (None, _) => None,
+        })
     }
 
     /// `None` only for an empty file, which is the first call through a freshly created one.
     fn prior(&self, held: &str) -> Result<Option<DateTime<Utc>>, BudgetError> {
-        let held = held.trim();
-        if held.is_empty() {
-            return Ok(None);
-        }
-        DateTime::parse_from_rfc3339(held)
-            .map(|at| Some(at.with_timezone(&Utc)))
-            .map_err(|_| BudgetError::Unreadable {
-                path: self.path.clone(),
-                held: held.to_owned(),
-            })
+        read_stamp(&self.path, held)
     }
 
     /// A robots Crawl-delay of 9,000,000,000,000 s panicked here before 2026-11-15 (PR #23 review).
@@ -252,11 +272,131 @@ impl Pace {
     }
 
     fn unusable(&self, act: &'static str, why: &impl std::fmt::Display) -> BudgetError {
-        BudgetError::Unusable {
-            path: self.path.clone(),
-            act,
-            why: why.to_string(),
+        unusable(&self.path, act, why)
+    }
+}
+
+/// What a bounded reservation answered. `wait` is how long the caller would owe either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reserved {
+    /// Reserved and written: wait this long, then call.
+    Wait(Duration),
+    /// Nothing written: the slot opens at `go_at`, after the deadline; `ordinary_at` is when it
+    /// would open under the profile's own interval with no server hold.
+    PastDeadline {
+        go_at: DateTime<Utc>,
+        ordinary_at: DateTime<Utc>,
+        wait: Duration,
+    },
+}
+
+/// The critical section's answer, before it is turned into a wait.
+enum Slot {
+    Granted(DateTime<Utc>),
+    Late {
+        go_at: DateTime<Utc>,
+        ordinary_at: DateTime<Utc>,
+    },
+}
+
+/// `<store>/pace/<host>.hold`: the instant a server's `Retry-After` holds one host until, read by
+/// every later run and process on the store (S7-D7). Raised by an answer, never lowered; the
+/// caller caps what it writes, so the file holds no instant past that cap.
+#[derive(Debug)]
+pub struct Hold {
+    path: PathBuf,
+}
+
+impl Hold {
+    #[must_use]
+    pub fn beside_the_store(store: &Path, host: &HostKey) -> Self {
+        Self {
+            path: store.join(PACE_DIR).join(format!("{}.hold", host.0)),
         }
+    }
+
+    /// `None` when no server ever held the host on this store.
+    pub fn until(&self) -> Result<Option<DateTime<Utc>>, BudgetError> {
+        let mut file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(why) if why.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(why) => return Err(unusable(&self.path, "opened", &why)),
+        };
+        file.lock_shared()
+            .map_err(|why| unusable(&self.path, "locked", &why))?;
+        let mut held = String::new();
+        let read = file
+            .read_to_string(&mut held)
+            .map_err(|why| unusable(&self.path, "read", &why));
+        let unlocked = file
+            .unlock()
+            .map_err(|why| unusable(&self.path, "unlocked", &why));
+        read?;
+        unlocked?;
+        read_stamp(&self.path, &held)
+    }
+
+    /// Writes `until` unless the file already holds a later instant.
+    pub fn raise(&self, until: DateTime<Utc>) -> Result<(), BudgetError> {
+        let file = open_for_update(&self.path)?;
+        file.lock()
+            .map_err(|why| unusable(&self.path, "locked", &why))?;
+        let raised = self.raise_locked(&file, until);
+        let unlocked = file
+            .unlock()
+            .map_err(|why| unusable(&self.path, "unlocked", &why));
+        raised?;
+        unlocked
+    }
+
+    fn raise_locked(&self, mut file: &File, until: DateTime<Utc>) -> Result<(), BudgetError> {
+        let mut held = String::new();
+        file.read_to_string(&mut held)
+            .map_err(|why| unusable(&self.path, "read", &why))?;
+        let written = read_stamp(&self.path, &held)?.map_or(until, |prior| prior.max(until));
+        file.set_len(0)
+            .map_err(|why| unusable(&self.path, "truncated", &why))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|why| unusable(&self.path, "rewound", &why))?;
+        file.write_all(stamp(written).as_bytes())
+            .map_err(|why| unusable(&self.path, "written", &why))
+    }
+}
+
+/// Opened read-write, created with its directory when absent, never truncated on open.
+fn open_for_update(path: &Path) -> Result<File, BudgetError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|why| unusable(path, "created with its directory", &why))?;
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|why| unusable(path, "opened", &why))
+}
+
+/// `None` only for an empty file. Anything else this crate did not write is refused, not reset.
+fn read_stamp(path: &Path, held: &str) -> Result<Option<DateTime<Utc>>, BudgetError> {
+    let held = held.trim();
+    if held.is_empty() {
+        return Ok(None);
+    }
+    DateTime::parse_from_rfc3339(held)
+        .map(|at| Some(at.with_timezone(&Utc)))
+        .map_err(|_| BudgetError::Unreadable {
+            path: path.to_path_buf(),
+            held: held.to_owned(),
+        })
+}
+
+fn unusable(path: &Path, act: &'static str, why: &impl std::fmt::Display) -> BudgetError {
+    BudgetError::Unusable {
+        path: path.to_path_buf(),
+        act,
+        why: why.to_string(),
     }
 }
 

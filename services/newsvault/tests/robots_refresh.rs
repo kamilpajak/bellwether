@@ -613,6 +613,7 @@ fn a_robots_refresh_and_a_collect_on_one_store_reserve_one_pace_file_per_host() 
         lag_policy: None,
         contact: CONTACT.to_owned(),
         at: At(AN_HOUR_LATER).now(),
+        deadline: None,
         dry_run: false,
     };
     let opened = newsvault::cmd_collect::open_provider(&collect_ask)?;

@@ -223,16 +223,19 @@ impl WalkCounts {
     }
 }
 
-/// One count per `news_provider::DeferReason`; `run_deadline` and `host_held` join with their
-/// producer (architecture.md section 11.5 step 7, PR 3).
+/// One count per `news_provider::DeferReason`.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct DeferredCounts {
+    pub run_deadline: i64,
+    pub host_held: i64,
     pub follow_up_cap: i64,
 }
 
 impl DeferredCounts {
     const fn add(self, other: Self) -> Self {
         Self {
+            run_deadline: self.run_deadline + other.run_deadline,
+            host_held: self.host_held + other.host_held,
             follow_up_cap: self.follow_up_cap + other.follow_up_cap,
         }
     }
@@ -628,16 +631,25 @@ struct DeferredGroup {
 
 fn deferred_per_run(db: &Connection, at: &str) -> Result<Vec<DeferredGroup>, LedgerReadError> {
     let mut statement = db.prepare(
-        "SELECT run_id, source, SUM(reason = ?2) FROM deferred WHERE deferred_at <= ?1
-         GROUP BY run_id, source ORDER BY run_id, source",
+        "SELECT run_id, source, SUM(reason = ?2), SUM(reason = ?3), SUM(reason = ?4)
+           FROM deferred WHERE deferred_at <= ?1
+          GROUP BY run_id, source ORDER BY run_id, source",
     )?;
+    let reasons = params![
+        at,
+        DeferReason::RunDeadline.name(),
+        DeferReason::HostHeld.name(),
+        DeferReason::FollowUpCap.name()
+    ];
     let rows = statement
-        .query_map(params![at, DeferReason::FollowUpCap.name()], |row| {
+        .query_map(reasons, |row| {
             Ok(DeferredGroup {
                 run_id: row.get(0)?,
                 source: row.get(1)?,
                 counts: DeferredCounts {
-                    follow_up_cap: row.get(2)?,
+                    run_deadline: row.get(2)?,
+                    host_held: row.get(3)?,
+                    follow_up_cap: row.get(4)?,
                 },
             })
         })?
@@ -1009,7 +1021,8 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                  boundary_older_generation {} boundary_newer_generation {} \
                  boundary_generation_unknown {} walk_complete {} walk_first_poll {} \
                  walk_id_unread {} walk_range_unread {} walk_gone {} walk_other_language {} walk_unread {} \
-                 deferred_follow_up_cap {} items_new {} rows {}",
+                 deferred_run_deadline {} deferred_host_held {} deferred_follow_up_cap {} \
+                 items_new {} rows {}",
                 row.source,
                 row.ok,
                 row.empty,
@@ -1039,6 +1052,8 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 row.walk.gone,
                 row.walk.other_language,
                 row.walk.unread,
+                row.deferred.run_deadline,
+                row.deferred.host_held,
                 row.deferred.follow_up_cap,
                 row.items_new,
                 row.rows_committed

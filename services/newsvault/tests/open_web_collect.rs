@@ -2,7 +2,7 @@
 //! in `providers/open-web-feed/tests/fixtures/gnw` (architecture.md section 11.5 step 2).
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -211,6 +211,7 @@ fn ask(store: &Path, window: &str) -> Ask {
         lag_policy: None,
         contact: CONTACT.to_owned(),
         at: instant(RUN_AT),
+        deadline: None,
         dry_run: false,
     }
 }
@@ -244,6 +245,56 @@ struct Gnw {
     stamps: BTreeMap<String, String>,
     /// The `location` a url's scripted 3xx carries, with `MOVED_BODY` as its body.
     locations: BTreeMap<String, String>,
+    /// How `reserve` answers; `None` answers `Go`, as every stub before condition A did.
+    paced: Option<Paced>,
+}
+
+/// `Wire::reserve`'s rule over the clock's one instant instead of a pace file: a host's `n`th
+/// slot opens `PACE` × `n` after it; a host in `held` opens no slot before its instant once it
+/// answered once; a slot after the deadline is refused, `by_server` when the pace alone opens
+/// by then. Every deadline `collect` handed over is kept, so the test reads what reached it.
+struct Paced {
+    held: BTreeMap<String, DateTime<Utc>>,
+    capped: Vec<news_provider::CappedHold>,
+    granted: RefCell<BTreeMap<String, i32>>,
+    deadlines: RefCell<Vec<Option<DateTime<Utc>>>>,
+}
+
+const PACE: TimeDelta = TimeDelta::seconds(10);
+
+impl Paced {
+    fn reserve(
+        &self,
+        request: &Request,
+        clock: &dyn Clock,
+        deadline: Option<DateTime<Utc>>,
+    ) -> news_provider::Reservation {
+        self.deadlines.borrow_mut().push(deadline);
+        let host = host_of(&request.url);
+        let mut granted = self.granted.borrow_mut();
+        let slots = granted.entry(host.clone()).or_default();
+        let ordinary = clock.now() + PACE * *slots;
+        let held = self.held.get(&host).filter(|_| *slots > 0);
+        let go_at = held.map_or(ordinary, |until| ordinary.max(*until));
+        match deadline {
+            Some(deadline) if go_at > deadline => news_provider::Reservation::PastDeadline {
+                go_at,
+                by_server: ordinary <= deadline,
+            },
+            _ => {
+                *slots += 1;
+                news_provider::Reservation::Go
+            }
+        }
+    }
+}
+
+fn host_of(url: &str) -> String {
+    url.trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_owned()
 }
 
 impl Gnw {
@@ -261,6 +312,7 @@ impl Gnw {
             fallback: None,
             stamps: BTreeMap::new(),
             locations: BTreeMap::new(),
+            paced: None,
         })
     }
 
@@ -276,6 +328,7 @@ impl Gnw {
             fallback: Some((RELEASE_PREFIX.to_owned(), fixture(WALKED_PAGE)?)),
             stamps: BTreeMap::new(),
             locations: BTreeMap::new(),
+            paced: None,
         })
     }
 
@@ -384,6 +437,26 @@ impl Gnw {
 }
 
 impl Exchange for Gnw {
+    fn reserve(
+        &self,
+        request: &Request,
+        clock: &dyn Clock,
+        deadline: Option<DateTime<Utc>>,
+    ) -> Result<news_provider::Reservation, news_provider::Unreserved> {
+        Ok(self
+            .paced
+            .as_ref()
+            .map_or(news_provider::Reservation::Go, |paced| {
+                paced.reserve(request, clock, deadline)
+            }))
+    }
+
+    fn capped_holds(&self) -> Vec<news_provider::CappedHold> {
+        self.paced
+            .as_ref()
+            .map_or_else(Vec::new, |paced| paced.capped.clone())
+    }
+
     fn send(
         &self,
         permit: SendPermit,
@@ -5053,6 +5126,7 @@ fn the_151st_follow_up_is_deferred_recorded_and_never_sent_and_the_run_exits_8()
                 "story_id": story,
                 "listed_date": listed,
                 "reason": "follow_up_cap",
+                "go_at": null,
             }]),
             Some(1)
         )
@@ -5083,7 +5157,10 @@ fn the_151st_follow_up_is_deferred_recorded_and_never_sent_and_the_run_exits_8()
         .collect();
     assert_eq!(
         (line.as_deref(), ledgered),
-        (Some("deferred         1 follow_up_cap 1"), vec![1])
+        (
+            Some("deferred         1 run_deadline 0 host_held 0 follow_up_cap 1"),
+            vec![1]
+        )
     );
     Ok(())
 }
@@ -5158,3 +5235,317 @@ fn a_walked_poll_past_the_cap_sends_every_walk_id_and_defers_listed_releases_onl
     assert_eq!(ids, dense);
     Ok(())
 }
+
+// ---- Condition A, the run deadline (architecture.md section 11.5 step 7 PR 3) ----
+
+/// `MONDAY_AT` plus 25 s: a host's fourth slot under `PACE`, at 30 s, opens after it.
+const DEADLINE_25_S: &str = "2026-11-16T09:30:55Z";
+const PRN_HOST: &str = "www.prnewswire.com";
+/// Two hours after `MONDAY_AT`: PRN's hold once its first request answered.
+const PRN_HELD_UNTIL: &str = "2026-11-16T11:30:30Z";
+const PRN_HELD_UNTIL_MICROS: &str = "2026-11-16T11:30:30.000000Z";
+/// A host's fourth slot under `PACE`.
+const FOURTH_SLOT: &str = "2026-11-16T09:31:00.000000Z";
+
+fn paced(held: &[(&str, &str)], capped: Vec<news_provider::CappedHold>) -> Paced {
+    Paced {
+        held: held
+            .iter()
+            .map(|(host, until)| ((*host).to_owned(), instant(until)))
+            .collect(),
+        capped,
+        granted: RefCell::new(BTreeMap::new()),
+        deadlines: RefCell::new(Vec::new()),
+    }
+}
+
+/// The committed five hosts on Monday on a fresh store, under `deadline`.
+fn deadline_run(
+    exchange: &Gnw,
+    deadline: &str,
+) -> Result<(TempDir, cmd_collect::Answer), Box<dyn Error>> {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    let ask = Ask {
+        hosts: Some(seed::committed_hosts()),
+        at: instant(MONDAY_AT),
+        deadline: Some(instant(deadline)),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, exchange, &Monday)?;
+    Ok((root, answer))
+}
+
+/// PRN held for 2 h once its RSS answered, every other host at its ordinary pace, and the
+/// deadline 25 s after the run's instant.
+fn held_and_paced_run() -> Result<(TempDir, cmd_collect::Answer, Gnw), Box<dyn Error>> {
+    let mut exchange = Gnw::five_hosts()?;
+    let capped = news_provider::CappedHold {
+        host: PRN_HOST.to_owned(),
+        retry_after: "315360000".to_owned(),
+        held_until: instant(PRN_HELD_UNTIL),
+    };
+    exchange.paced = Some(paced(&[(PRN_HOST, PRN_HELD_UNTIL)], vec![capped]));
+    let (root, answer) = deadline_run(&exchange, DEADLINE_25_S)?;
+    Ok((root, answer, exchange))
+}
+
+type DeferredSeen = (String, String, String, Value);
+
+/// `(host, url, reason, go_at)` of each envelope `deferred` row.
+fn deferred_of(envelope: &Value) -> Vec<DeferredSeen> {
+    envelope["deferred"]
+        .as_array()
+        .map_or_else(Vec::new, |rows| {
+            rows.iter()
+                .map(|row| {
+                    let field = |name: &str| row[name].as_str().unwrap_or_default().to_owned();
+                    (
+                        field("host"),
+                        field("url"),
+                        field("reason"),
+                        row["go_at"].clone(),
+                    )
+                })
+                .collect()
+        })
+}
+
+/// Condition A (owner, 2026-11-16): PRN, held past the deadline once its RSS answered, is
+/// stopped with its sitemap and the releases its RSS listed deferred `host_held`, the first
+/// carrying the hold's end; GNW, CNW and the Fed lose their fourth request to the ordinary
+/// pace as `run_deadline`; Yahoo's three requests all go. `reserve` was handed the deadline
+/// asked for, and the run exits 8.
+#[test]
+fn a_held_host_past_the_deadline_is_stopped_with_its_lane_while_the_other_hosts_are_asked(
+) -> TestResult {
+    let (_root, answer, exchange) = held_and_paced_run()?;
+    let (sent, _) = exchange.sent();
+    let deferred = deferred_of(&answer.envelope);
+    let held: Vec<&DeferredSeen> = deferred.iter().filter(|row| row.2 == "host_held").collect();
+    let late: Vec<(String, Value)> = deferred
+        .iter()
+        .filter(|row| row.2 == "run_deadline")
+        .map(|row| (row.0.clone(), row.3.clone()))
+        .collect();
+    let prn_sent: Vec<&String> = sent.iter().filter(|url| url.contains(PRN_HOST)).collect();
+    let deadlines: Option<Vec<Option<DateTime<Utc>>>> = exchange.paced.as_ref().map(|paced| {
+        let mut seen = paced.deadlines.borrow().clone();
+        seen.dedup();
+        seen
+    });
+    assert_eq!(
+        (
+            prn_sent,
+            held.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+            held.first().map(|row| (row.1.clone(), row.3.clone())),
+            held.iter().skip(1).all(|row| row.3.is_null()),
+        ),
+        (
+            vec![&PRN_INDEX.to_owned()],
+            vec![PRN_HOST; 4],
+            Some((PRN_SITEMAP.to_owned(), Value::from(PRN_HELD_UNTIL_MICROS))),
+            true
+        )
+    );
+    assert_eq!(
+        (
+            late,
+            sent.iter()
+                .filter(|url| url.contains("finance.yahoo.com"))
+                .count(),
+            deadlines,
+            answer.exit.error_code(),
+        ),
+        (
+            vec![
+                ("rss.globenewswire.com".to_owned(), Value::from(FOURTH_SLOT)),
+                ("www.newswire.ca".to_owned(), Value::from(FOURTH_SLOT)),
+                (
+                    "www.federalreserve.gov".to_owned(),
+                    Value::from(FOURTH_SLOT)
+                ),
+            ],
+            3,
+            Some(vec![Some(instant(DEADLINE_25_S))]),
+            Some("partial_collect")
+        )
+    );
+    Ok(())
+}
+
+/// The envelope's attempt urls, once the store's attempt rows are counted equal to them.
+fn attempted_urls(store: &Path, envelope: &Value) -> Result<BTreeSet<String>, Box<dyn Error>> {
+    let db = Connection::open_with_flags(store.join(COMMIT_LOG), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let run = envelope["run_id"].as_str().ok_or("run_id")?;
+    let rows: i64 = db.query_row(
+        "SELECT COUNT(*) FROM attempts WHERE run_id = ?1",
+        [run],
+        |row| row.get(0),
+    )?;
+    let urls: Vec<String> = envelope["attempts"]
+        .as_array()
+        .ok_or("attempts")?
+        .iter()
+        .filter_map(|row| row["url"].as_str().map(str::to_owned))
+        .collect();
+    if usize::try_from(rows)? != urls.len() {
+        return Err(format!("{rows} attempt rows, {} in the envelope", urls.len()).into());
+    }
+    Ok(urls.into_iter().collect())
+}
+
+/// A request past the deadline opens no attempt row and is one `deferred` row; each reader
+/// counts the two reasons apart, with counts that differ, so a reader swapping them is red:
+/// the envelope's rows, its per-source total and human line, and the ledger. The capped hold
+/// the exchange reported reaches the envelope and its human line (S7-D7).
+#[test]
+fn deferred_requests_open_no_attempt_and_every_reader_counts_each_reason_apart() -> TestResult {
+    let (root, answer, _) = held_and_paced_run()?;
+    let envelope = &answer.envelope;
+    let stored: Vec<(String, String)> = stored_deferred(root.path())?
+        .into_iter()
+        .map(|row| (row.4, row.8))
+        .collect();
+    let seen: Vec<(String, String)> = deferred_of(envelope)
+        .into_iter()
+        .map(|row| (row.1, row.2))
+        .collect();
+    let attempted = attempted_urls(root.path(), envelope)?;
+    assert_eq!(
+        (
+            stored == seen,
+            seen.iter().filter(|row| attempted.contains(&row.0)).count(),
+            envelope["per_source"][0]["deferred"].as_u64(),
+        ),
+        (true, 0, Some(7))
+    );
+    let mut human = Vec::new();
+    cmd_collect::render_human(envelope, &mut human)?;
+    let human = String::from_utf8(human)?;
+    let lines: Vec<&str> = human
+        .lines()
+        .filter(|line| line.starts_with("deferred") || line.starts_with("holds capped"))
+        .collect();
+    let report = newsvault::cmd_ledger::read(
+        root.path(),
+        &newsvault::cmd_ledger::Ask {
+            at: instant("2026-11-17T00:00:00Z"),
+            from: "2026-11-16".parse()?,
+            to: "2026-11-16".parse()?,
+            source: None,
+            expected_runs: None,
+            limit: None,
+            check: false,
+        },
+    )?;
+    let ledgered: Vec<(i64, i64, i64)> = report
+        .days
+        .iter()
+        .flat_map(|day| &day.per_source)
+        .map(|row| {
+            let counts = row.deferred;
+            (counts.run_deadline, counts.host_held, counts.follow_up_cap)
+        })
+        .collect();
+    assert_eq!(
+        (lines, ledgered, envelope["holds_capped"].clone()),
+        (
+            vec![
+                "deferred         7 run_deadline 3 host_held 4 follow_up_cap 0",
+                "holds capped     1"
+            ],
+            vec![(3, 4, 0)],
+            serde_json::json!([{
+                "host": PRN_HOST,
+                "retry_after": "315360000",
+                "held_until": PRN_HELD_UNTIL_MICROS,
+            }])
+        )
+    );
+    Ok(())
+}
+
+/// No deadline, today's behaviour: a reserving exchange is still handed `None`, refuses
+/// nothing, and the run asks every request it did before condition A.
+#[test]
+fn with_no_deadline_every_request_is_asked_and_nothing_is_deferred() -> TestResult {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    let mut exchange = Gnw::five_hosts()?;
+    exchange.paced = Some(paced(&[(PRN_HOST, PRN_HELD_UNTIL)], Vec::new()));
+    let ask = Ask {
+        hosts: Some(seed::committed_hosts()),
+        at: instant(MONDAY_AT),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, &exchange, &Monday)?;
+    let (sent, _) = exchange.sent();
+    let deadlines = exchange
+        .paced
+        .as_ref()
+        .map(|paced| paced.deadlines.borrow().iter().all(Option::is_none));
+    assert_eq!(
+        (
+            sent.len(),
+            deferred_of(&answer.envelope).len(),
+            deadlines,
+            answer.envelope["deadline"].clone(),
+            answer.exit,
+        ),
+        (
+            FIVE_HOST_FOLLOW_UPS + 6,
+            0,
+            Some(true),
+            Value::Null,
+            Exit::Ok
+        )
+    );
+    Ok(())
+}
+
+/// S7-D6's exception meets the deadline (owner decision 2026-11-18): walk ids are outside the
+/// cap but not outside the deadline, so ids the pace reaches after it are deferred
+/// `run_deadline`, never asked, and the walk is not `complete`, so the next poll walks them.
+#[test]
+fn walk_ids_the_deadline_cuts_are_deferred_and_the_walk_is_not_complete() -> TestResult {
+    let root = after_a_first_walked_poll()?;
+    let mut exchange = Gnw::walked(RSS_1205)?;
+    exchange.paced = Some(paced(&[], Vec::new()));
+    let ask = Ask {
+        hosts: Some(hosts_fixture(WALK_HOSTS)),
+        at: instant(WALK_SECOND),
+        deadline: Some(instant(WALK_SECOND_PLUS_25_S)),
+        schedule: Some("walk".to_owned()),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, &exchange, &At(instant(WALK_SECOND)))?;
+    let (sent, _) = exchange.sent();
+    let deferred = deferred_of(&answer.envelope);
+    let deferred_walk_ids = walked_ids(
+        &deferred
+            .iter()
+            .map(|row| row.1.clone())
+            .collect::<Vec<String>>(),
+    );
+    assert_eq!(
+        (
+            sent.len(),
+            deferred.iter().all(|row| row.2 == "run_deadline"),
+            deferred_walk_ids.is_empty(),
+            walked_ids(&sent)
+                .iter()
+                .any(|id| deferred_walk_ids.contains(id)),
+            answer.envelope["walk"][0]["continuity"].as_str() == Some("complete"),
+            answer.exit.error_code(),
+        ),
+        (3, true, false, false, false, Some("partial_collect"))
+    );
+    Ok(())
+}
+
+/// `WALK_SECOND` plus 25 s: the walk's host gets three slots under `PACE`.
+const WALK_SECOND_PLUS_25_S: &str = "2026-11-17T12:05:55Z";
