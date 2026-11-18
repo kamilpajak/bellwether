@@ -2,9 +2,9 @@
 # The daily copy of the store into Nextcloud (architecture.md section 10, N1), run by
 # newsvault-backup.service under the store lock: `newsvault snapshot` of the commit log plus every
 # other store file in one .tar.gz, written into the data directory through the AIO container as
-# www-data, registered with `occ files:scan`, then all but the 7 newest copies deleted.
-# Exits: 2 setup or an unsafe setting, 4 an absent input, 7 the write, rename or scan, 8 the copy
-# is in and the retention failed; the snapshot's own exit when it refuses.
+# www-data, registered with `occ files:scan` and found by `occ info:file`, then all but the 7 newest
+# copies deleted. Exits: 2 setup or an unsafe setting, 4 an absent input, 7 the write, rename, scan
+# or lookup, 8 the copy is in and the retention failed; the snapshot's own exit when it refuses.
 set -u
 export LC_ALL=C
 : "${NEWSVAULT_IMAGE:?set in newsvault.env}" "${NEWSVAULT_TEXTFILE_DIR:?set in newsvault.env}"
@@ -74,8 +74,9 @@ tar -czf "$work/$name" -C "$work" commit.sqlite3 -C "$vault" "$@" || exit 2
 bytes=$(wc -c <"$work/$name" | tr -d ' ')
 
 as_www mkdir -p -- "$dir" || { echo "creating $dir in $container failed" >&2; exit 7; }
-# Written under a hidden name and renamed, so the final name never holds part of a copy.
-staged="$dir/.$name.partial"
+# Written under a hidden name and renamed, so the final name never holds part of a copy. Nextcloud's
+# scanner skips the `.part` extension (Scanner::isPartialFile, 30 to 32 source, read 2026-11-18).
+staged="$dir/.$name.part"
 written=$(docker exec -i -u www-data "$container" sh -c 'cat >"$1" && wc -c <"$1"' sh "$staged" \
     <"$work/$name") || { echo "writing $staged in $container failed" >&2; exit 7; }
 written=$(printf '%s' "$written" | tr -d ' \n')
@@ -86,6 +87,13 @@ fi
 as_www mv -- "$staged" "$dir/$name" || { echo "renaming $staged failed" >&2; exit 7; }
 staged=''
 as_www php occ files:scan "--path=$scanned" || { echo "occ files:scan $scanned failed" >&2; exit 7; }
+# files:scan exits 0 on an unknown user or a path it cannot find; info:file exits 1 on a file it
+# does not know (Nextcloud 30 to 32 source, read 2026-11-18).
+known=$(as_www php occ info:file "/$scanned/$name") || {
+    printf '%s\n' "$known" >&2
+    echo "Nextcloud does not know $scanned/$name after the scan" >&2
+    exit 7
+}
 
 tmp="$NEWSVAULT_TEXTFILE_DIR/.newsvault-backup.prom.$$"
 if ! {
@@ -99,11 +107,12 @@ if ! {
 fi
 
 # Deletes only names of the copy's shape and a killed run's staging files, and nothing unless the
-# listing holds the copy just written.
+# copy just written is the newest the listing holds: otherwise it would be among the oldest.
 listing=$(as_www ls -1A -- "$dir") || { echo "listing $dir failed; nothing deleted" >&2; exit 8; }
 names=$(printf '%s\n' "$listing" | grep -x "$copy" | sort -u)
-if ! printf '%s\n' "$names" | grep -qxF "$name"; then
-    echo "the listing of $dir lacks $name; nothing deleted" >&2
+newest=$(printf '%s\n' "$names" | tail -n 1)
+if [ "$newest" != "$name" ]; then
+    echo "$dir does not end with $name: its newest copy is '$newest'; nothing deleted" >&2
     exit 8
 fi
 set --
@@ -113,7 +122,7 @@ if [ "$excess" -gt 0 ]; then
         set -- "$@" "$dir/$old"
     done
 fi
-for left in $(printf '%s\n' "$listing" | grep -x "\\.$copy\\.partial"); do
+for left in $(printf '%s\n' "$listing" | grep -x "\\.$copy\\.part"); do
     set -- "$@" "$dir/$left"
 done
 if [ "$#" -gt 0 ]; then

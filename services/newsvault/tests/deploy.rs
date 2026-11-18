@@ -1045,7 +1045,8 @@ fn the_backup_runs_once_a_day_inside_the_longest_gap_the_collect_runs_leave() ->
 }
 
 /// Two daily intervals plus one run's bound: the stamp is the run's start and appears only after
-/// its upload, so at two intervals alone one missed day fired while the next run uploaded.
+/// its copy is written and scanned, so at two intervals alone one missed day fired while the next
+/// run wrote its copy.
 #[test]
 fn the_backup_staleness_threshold_is_two_daily_intervals_plus_one_runs_bound() -> TestResult {
     let rules = read("deploy/prometheus/newsvault.rules.yml")?;
@@ -1173,6 +1174,7 @@ const NC_SETTINGS: [&str; 4] = [
 const NC_DATA: &str = "/mnt/ncdata";
 const NC_DIR: &str = "/mnt/ncdata/admin/files/Backups/bellwether";
 const NC_SCAN: &str = "php occ files:scan --path=admin/files/Backups/bellwether";
+const NC_KNOWN: &str = "php occ info:file /admin/files/Backups/bellwether";
 const EXEC: &str = "exec -u www-data nextcloud-aio-nextcloud";
 const EXEC_STDIN: &str = "exec -i -u www-data nextcloud-aio-nextcloud";
 const WRITE: &str = "sh -c cat >\"$1\" && wc -c <\"$1\" sh";
@@ -1187,10 +1189,23 @@ const COPIES: [&str; 8] = [
     "bellwether-vault-20000107T225500Z.tar.gz",
     "bellwether-vault-20000108T225500Z.tar.gz",
 ];
-/// Files of another shape, which no run deletes.
-const OTHERS: [&str; 2] = ["bellwether-vault-20000101T225500Z.tar.gz.bak", "notes.txt"];
+/// Files of another shape, which no run deletes; the last three are near misses of a staging name.
+const OTHERS: [&str; 5] = [
+    "bellwether-vault-20000101T225500Z.tar.gz.bak",
+    "notes.txt",
+    ".notes.part",
+    "x.bellwether-vault-20000101T225500Z.tar.gz.part",
+    ".bellwether-vault-20000101T225500Z.tar.gz.part.keep",
+];
 /// A staging file a killed run left, which the next run's retention removes.
-const STALE_PARTIAL: &str = ".bellwether-vault-20000101T225500Z.tar.gz.partial";
+const STALE_PARTIAL: &str = ".bellwether-vault-20000101T225500Z.tar.gz.part";
+/// How long `terminate_during_write` waits for the write to start: 200 × 50 ms.
+const TERM_POLLS: u32 = 200;
+const TERM_POLL_MS: u64 = 50;
+/// The shell the unit runs the script with: Ubuntu's `/bin/sh`.
+const UNIT_SHELL: &str = "/bin/dash";
+/// A copy whose name sorts after any copy a run writes today.
+const FUTURE_COPY: &str = "bellwether-vault-20990101T225500Z.tar.gz";
 /// Stands in for docker. `run`: records its argv, then writes a snapshot into the directory
 /// mounted on `/out`. `exec`: records its argv on one line, fails the step `STUB_FAIL` names,
 /// and runs the command on the host with `/mnt/ncdata` mapped to `$STUB_DIR/ncdata`.
@@ -1215,7 +1230,8 @@ case $1 in
     sh) step=write ;;
     mv) step=rename ;;
     ls) step=list ;;
-    php) if [ -e "$STUB_DIR/scanned" ]; then step=rescan; else step=scan; : >"$STUB_DIR/scanned"; fi ;;
+    php) if [ "$3" = info:file ]; then step=known
+         elif [ -e "$STUB_DIR/scanned" ]; then step=rescan; else step=scan; : >"$STUB_DIR/scanned"; fi ;;
     *) step=$1 ;;
 esac
 [ "$step" = "${STUB_FAIL:-}" ] && exit 1
@@ -1228,10 +1244,12 @@ shift "$n"
 case $step in
     write)
         if [ "${STUB_SHORT_WRITE:-}" = yes ]; then head -c 5 >"$5"; wc -c <"$5"; exit; fi
+        if [ "${STUB_SLOW_WRITE:-}" = yes ]; then exec sleep 30; fi
         shift; exec /bin/sh "$@" ;;
     list) [ "${STUB_LISTING_LACKS_NEW:-}" = yes ] && exec cat "$STUB_DIR/listed"; shift; exec /bin/ls "$@" ;;
     mkdir | rm | rename) cmd=$1; shift; exec "/bin/$cmd" "$@" ;;
     scan | rescan) exit 0 ;;
+    known) [ -f "$STUB_DIR/ncdata$4" ] && exit 0; echo "file $4 not found"; exit 1 ;;
 esac
 exit 127
 "#;
@@ -1249,10 +1267,15 @@ fn executable(path: &Path, text: &str) -> TestResult {
 /// How one backup run is set up to go wrong, if at all.
 #[derive(Default, Clone, Copy)]
 struct Trouble {
-    /// The container step that exits 1: mkdir, write, rename, scan, list, rm or rescan.
+    /// The container step that exits 1: mkdir, write, rename, scan, known (`occ info:file`), list,
+    /// rm or rescan.
     fail: Option<&'static str>,
     short_write: bool,
+    /// The write sleeps and the run's process group gets SIGTERM once the write has started.
+    terminated: bool,
     listing_lacks_new: bool,
+    /// The folder also holds `FUTURE_COPY`.
+    future_copy: bool,
     docker_exit: Option<i32>,
     /// A Nextcloud setting replacing the template's, `None` unsetting it.
     setting: Option<(&'static str, Option<&'static str>)>,
@@ -1309,7 +1332,7 @@ fn env_template() -> Result<Vec<(String, String)>, Box<dyn Error>> {
 
 /// The names a folder is seeded with for `trouble`.
 fn seeded(trouble: Trouble) -> Vec<&'static str> {
-    match trouble.copies {
+    let mut names: Vec<&'static str> = match trouble.copies {
         Some(count) => COPIES.iter().take(count).copied().collect(),
         None => COPIES
             .iter()
@@ -1317,7 +1340,38 @@ fn seeded(trouble: Trouble) -> Vec<&'static str> {
             .chain(&[STALE_PARTIAL])
             .copied()
             .collect(),
+    };
+    if trouble.future_copy {
+        names.push(FUTURE_COPY);
     }
+    names
+}
+
+/// Runs `command` in its own process group and, once `execs` records the write, sends the group
+/// SIGTERM, as systemd's stop does to the unit's cgroup.
+fn terminate_during_write(
+    command: &mut Command,
+    execs: &Path,
+) -> Result<std::process::Output, Box<dyn Error>> {
+    use std::os::unix::process::CommandExt;
+    let child = command
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    for _ in 0..TERM_POLLS {
+        if lines_of(execs)
+            .iter()
+            .any(|call| call.starts_with(EXEC_STDIN))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(TERM_POLL_MS));
+    }
+    Command::new("/bin/sh")
+        .args(["-c", "kill -TERM -- \"-$1\"", "sh", &child.id().to_string()])
+        .status()?;
+    Ok(child.wait_with_output()?)
 }
 
 fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
@@ -1359,10 +1413,14 @@ fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
     std::fs::hard_link(textfile.join(BACKUP_PROM), work.path().join("old-link"))?;
     executable(&stub.join("bin/docker"), BACKUP_DOCKER_STUB)?;
     executable(&stub.join("bin/mv"), MV_STUB)?;
+    // `bx` matches the glob in an unsafe test value, so a check that expands globs admits it.
+    let cwd = work.path().join("cwd");
+    std::fs::create_dir_all(cwd.join("bx"))?;
     let flag = |set: bool| if set { "yes" } else { "no" };
-    let mut command = Command::new("/bin/sh");
+    let mut command = Command::new(UNIT_SHELL);
     command
         .arg(repo().join("deploy/systemd/newsvault-backup"))
+        .current_dir(&cwd)
         .env_clear()
         .env("HOME", &home)
         .env(
@@ -1374,6 +1432,7 @@ fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
         .env("STUB_DIR", &stub)
         .env("STUB_FAIL", trouble.fail.unwrap_or("none"))
         .env("STUB_SHORT_WRITE", flag(trouble.short_write))
+        .env("STUB_SLOW_WRITE", flag(trouble.terminated))
         .env("STUB_LISTING_LACKS_NEW", flag(trouble.listing_lacks_new))
         .env(
             "STUB_DOCKER_EXIT",
@@ -1390,14 +1449,18 @@ fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
         Some((key, None)) => command.env_remove(key),
         None => &mut command,
     };
-    let output = command.output()?;
+    let output = if trouble.terminated {
+        terminate_during_write(&mut command, &stub.join("execs"))?
+    } else {
+        command.output()?
+    };
     let execs = lines_of(&stub.join("execs"));
     let name = execs
         .iter()
         .find(|call| call.starts_with(EXEC_STDIN))
         .and_then(|call| call.rsplit('/').next())
         .and_then(|staged| staged.strip_prefix('.'))
-        .and_then(|staged| staged.strip_suffix(".partial"))
+        .and_then(|staged| staged.strip_suffix(".part"))
         .unwrap_or_default()
         .to_owned();
     Ok(Backed {
@@ -1471,9 +1534,10 @@ fn the_backup_writes_through_the_container_renames_scans_then_keeps_the_seven_ne
             Some(0),
             vec![
                 format!("{EXEC} mkdir -p -- {dir}"),
-                format!("{EXEC_STDIN} {WRITE} {dir}/.{name}.partial"),
-                format!("{EXEC} mv -- {dir}/.{name}.partial {dir}/{name}"),
+                format!("{EXEC_STDIN} {WRITE} {dir}/.{name}.part"),
+                format!("{EXEC} mv -- {dir}/.{name}.part {dir}/{name}"),
                 format!("{EXEC} {NC_SCAN}"),
+                format!("{EXEC} {NC_KNOWN}/{name}"),
                 format!("{EXEC} ls -1A -- {dir}"),
                 format!(
                     "{EXEC} rm -f -- {dir}/{} {dir}/{} {dir}/{STALE_PARTIAL}",
@@ -1562,7 +1626,7 @@ fn every_container_call_runs_as_www_data_and_only_the_write_reads_stdin() -> Tes
         (backed.exit, as_www, with_stdin, forbidden),
         (
             Some(0),
-            vec![true, false, true, true, true, true, true],
+            vec![true, false, true, true, true, true, true, true],
             1,
             0
         )
@@ -1578,7 +1642,7 @@ fn a_short_write_is_never_renamed_and_its_staging_file_is_removed() -> TestResul
         short_write: true,
         ..Trouble::default()
     })?;
-    let partial = format!(".{}.partial", backed.name);
+    let partial = format!(".{}.part", backed.name);
     let renames = backed
         .execs
         .iter()
@@ -1609,8 +1673,8 @@ fn a_short_write_is_never_renamed_and_its_staging_file_is_removed() -> TestResul
     Ok(())
 }
 
-/// A failed mkdir, write, rename or scan exits 7 naming its step, deletes no copy, leaves no
-/// staging file and keeps the last metric.
+/// A failed mkdir, write, rename or scan, or a scan after which `occ info:file` does not find the
+/// copy, exits 7 naming its step, deletes no copy, leaves no staging file and keeps the last metric.
 #[test]
 fn a_failed_mkdir_write_rename_or_scan_exits_7_by_name_and_deletes_nothing() -> TestResult {
     let mut got = Vec::new();
@@ -1619,12 +1683,13 @@ fn a_failed_mkdir_write_rename_or_scan_exits_7_by_name_and_deletes_nothing() -> 
         ("write", "writing"),
         ("rename", "renaming"),
         ("scan", "files:scan"),
+        ("known", "does not know"),
     ] {
         let backed = backup(Trouble {
             fail: Some(step),
             ..Trouble::default()
         })?;
-        let partial = format!(".{}.partial", backed.name);
+        let partial = format!(".{}.part", backed.name);
         let copies_left = COPIES
             .iter()
             .filter(|copy| backed.folder.contains(&(**copy).to_owned()))
@@ -1645,6 +1710,7 @@ fn a_failed_mkdir_write_rename_or_scan_exits_7_by_name_and_deletes_nothing() -> 
             ("write", Some(7), 8, false, true, true),
             ("rename", Some(7), 8, false, true, true),
             ("scan", Some(7), 8, false, true, true),
+            ("known", Some(7), 8, false, true, true),
         ]
     );
     Ok(())
@@ -1669,7 +1735,7 @@ fn a_failed_retention_exits_8_after_the_metric_and_a_bad_listing_deletes_nothing
                 listing_lacks_new: true,
                 ..Trouble::default()
             },
-            "lacks",
+            "does not end with",
         ),
         (
             Trouble {
@@ -1707,6 +1773,58 @@ fn a_failed_retention_exits_8_after_the_metric_and_a_bad_listing_deletes_nothing
             (Some(8), 8, true, false, true),
             (Some(8), 6, true, false, true),
         ]
+    );
+    Ok(())
+}
+
+/// A copy whose name sorts after the new one (a clock that ran ahead, a file put there by hand)
+/// would make the new copy the oldest: the run exits 8 naming it and deletes nothing.
+#[test]
+fn a_copy_sorting_after_the_new_one_stops_the_retention_and_deletes_nothing() -> TestResult {
+    let backed = backup(Trouble {
+        future_copy: true,
+        ..Trouble::default()
+    })?;
+    let mut held: Vec<&str> = seeded(Trouble {
+        future_copy: true,
+        ..Trouble::default()
+    });
+    held.push(&backed.name);
+    assert_eq!(
+        (
+            backed.exit,
+            backed.folder,
+            backed.metric == OLD_BACKUP_METRICS,
+            backed
+                .output
+                .contains(&format!("its newest copy is '{FUTURE_COPY}'")),
+        ),
+        (Some(8), sorted(&held), false, true),
+        "{}",
+        backed.output
+    );
+    Ok(())
+}
+
+/// SIGTERM during the write, as systemd's `TimeoutStartSec` sends it, still runs the `EXIT` trap
+/// under dash: exit 130, the work directory gone, the staging file deleted in the container.
+#[test]
+fn a_terminated_run_exits_130_and_removes_its_work_directory_and_staging_file() -> TestResult {
+    let backed = backup(Trouble {
+        terminated: true,
+        ..Trouble::default()
+    })?;
+    let removed = format!("{EXEC} rm -f -- {NC_DIR}/.{}.part", backed.name);
+    assert_eq!(
+        (
+            backed.exit,
+            backed.staging,
+            backed.name.is_empty(),
+            backed.execs.last() == Some(&removed),
+        ),
+        (Some(130), Vec::<String>::new(), false, true),
+        "{:?}",
+        backed.execs
     );
     Ok(())
 }
