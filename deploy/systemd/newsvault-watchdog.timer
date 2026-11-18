@@ -1,0 +1,12 @@
+# Hourly; the staleness alert's 7,200 s is two of these intervals (services/newsvault/tests/deploy.rs).
+[Unit]
+Description=newsvault watchdog, hourly
+Documentation=https://github.com/kamilpajak/bellwether/blob/main/docs/design/architecture.md
+
+[Timer]
+OnCalendar=*-*-* *:50:00 UTC
+AccuracySec=1s
+Unit=newsvault-watchdog.service
+
+[Install]
+WantedBy=timers.target

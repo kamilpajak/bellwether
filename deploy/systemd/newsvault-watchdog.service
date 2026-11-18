@@ -1,0 +1,11 @@
+# The ledger's answer as metrics; Prometheus alerts on them (deploy/prometheus/newsvault.rules.yml).
+# Read-only on the store and takes no lock: a read never changes what a collect writes.
+[Unit]
+Description=newsvault ledger --check as node-exporter textfile metrics
+Documentation=https://github.com/kamilpajak/bellwether/blob/main/docs/design/architecture.md
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/bellwether/newsvault.env
+ExecStart=%h/.local/lib/bellwether/newsvault-watchdog
+TimeoutStartSec=300

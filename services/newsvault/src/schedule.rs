@@ -185,6 +185,23 @@ impl Schedule {
         TimeDelta::minutes(longest.unwrap_or_default())
     }
 
+    /// The longest time any slot's run may ask for, its deadline less its start (S7-D3), read
+    /// through [`Self::slot_at`] on one day so the deadline has one home; S7-D9's unit timeout.
+    #[must_use]
+    pub fn longest_window(&self, patience: TimeDelta) -> TimeDelta {
+        let day = DateTime::UNIX_EPOCH.date_naive();
+        self.slots
+            .iter()
+            .filter_map(|slot| {
+                let start = day
+                    .and_time(NaiveTime::from_hms_opt(slot.hour, slot.minute, 0)?)
+                    .and_utc();
+                Some(self.slot_at(start)?.deadline(patience) - start)
+            })
+            .max()
+            .unwrap_or_default()
+    }
+
     /// The slot `now` belongs to: the latest slot start at or before it, the previous UTC day's
     /// last slot before the day's first one.
     #[must_use]
@@ -450,6 +467,21 @@ mod tests {
             })
             .unwrap_or_default();
         assert_eq!(replayed, STOPS);
+    }
+
+    /// Section 11.2's replay: every 90-min slot stops at +44:30, the longest window, 2,670 s; a
+    /// 30-min table's longest is its 870 s.
+    #[test]
+    fn the_longest_window_is_the_longest_slots_deadline_less_its_start() {
+        const BUSY_ONLY: [Slot; 2] = [at(11, 0, 30), at(11, 30, 30)];
+        assert_eq!(
+            (
+                committed(PATIENCE).map(|schedule| schedule.longest_window(PATIENCE)),
+                Schedule::new(&BUSY_ONLY, PATIENCE)
+                    .map(|schedule| schedule.longest_window(PATIENCE)),
+            ),
+            (Ok(TimeDelta::seconds(2_670)), Ok(TimeDelta::seconds(870)))
+        );
     }
 
     /// The cross-check lead is the committed schedule's longest period, so a change to `SLOTS`

@@ -1,0 +1,21 @@
+#!/bin/sh
+# S7-D8's hourly watchdog: `ledger --check` over yesterday and today (UTC) as node-exporter textfile
+# metrics (newsvault.prom/1). Written to a dot-file beside the target and renamed, so the collector,
+# which reads only *.prom, never sees half a file. The ledger's answers 0, 1 and 8 all carry metrics.
+set -u
+: "${NEWSVAULT_IMAGE:?set in newsvault.env}" "${NEWSVAULT_TEXTFILE_DIR:?set in newsvault.env}"
+at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+today=$(date -u -d "$at" +%Y-%m-%d)
+yesterday=$(date -u -d "$today -1 day" +%Y-%m-%d)
+tmp="$NEWSVAULT_TEXTFILE_DIR/.newsvault.prom.$$"
+/usr/bin/docker run --rm --name newsvault-watchdog --pull never \
+    --user "$(id -u):$(id -g)" --read-only --network none \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --volume "$HOME/.bellwether/vault:/vault:ro" \
+    "$NEWSVAULT_IMAGE" \
+    ledger --at "$at" --from "$yesterday" --to "$today" --check --format prometheus >"$tmp"
+status=$?
+case $status in
+    0 | 1 | 8) exec mv -f "$tmp" "$NEWSVAULT_TEXTFILE_DIR/newsvault.prom" ;;
+    *) rm -f "$tmp"; exit "$status" ;;
+esac

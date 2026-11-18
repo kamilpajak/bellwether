@@ -1350,6 +1350,18 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
 /// The version of [`render_prometheus`]'s exposition, carried as the `schema` label of
 /// `newsvault_ledger_at_timestamp_seconds`, which the staleness alert selects on.
 pub const PROMETHEUS_SCHEMA: &str = "newsvault.prom/1";
+/// Every family [`render_prometheus`] writes, in its order: the list a deploy test holds the alert
+/// rules to, so a family with no rule reading it, or a rule reading none, is red.
+pub const PROMETHEUS_FAMILIES: [&str; 8] = [
+    "newsvault_ledger_at_timestamp_seconds",
+    "newsvault_ledger_complete",
+    "newsvault_collect_last_asked_age_seconds",
+    "newsvault_deferred_host_held",
+    "newsvault_carried_expired",
+    "newsvault_walk_range_unread_polls",
+    "newsvault_holds_capped",
+    "newsvault_check_findings",
+];
 
 /// A day's metrics are labelled by how many UTC days before `at`'s it is, so an alert can tell
 /// today, still running, from yesterday, closed; a run date that is not a date is `unknown`.
@@ -1493,7 +1505,7 @@ pub fn render_prometheus(
 mod tests {
     use super::{
         render_prometheus, CarriedCounts, Check, ClockAge, DayRow, DeferredCounts, Finding,
-        Freshness, Report, SourceRow, WalkCounts, BUSY_BOUND, SCHEMA,
+        Freshness, Report, SourceRow, WalkCounts, BUSY_BOUND, PROMETHEUS_FAMILIES, SCHEMA,
     };
     use chrono::{DateTime, Utc};
 
@@ -1591,7 +1603,14 @@ mod tests {
         };
         let mut out = Vec::new();
         render_prometheus(&report, at, &mut out)?;
-        let samples: Vec<String> = String::from_utf8(out)?
+        let text = String::from_utf8(out)?;
+        let families: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("# TYPE "))
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        assert_eq!(families, PROMETHEUS_FAMILIES);
+        let samples: Vec<String> = text
             .lines()
             .filter(|line| !line.starts_with('#'))
             .map(str::to_owned)
