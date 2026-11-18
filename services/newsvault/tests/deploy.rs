@@ -52,7 +52,8 @@ const VALIDATORS: [(&str, &str); 5] = [
     ),
     (
         "systemd-units",
-        "run: shellcheck deploy/systemd/newsvault-watchdog",
+        "run: shellcheck deploy/systemd/newsvault-watchdog deploy/systemd/newsvault-backup \
+         deploy/systemd/newsvault-unit-result",
     ),
     (
         "systemd-units",
@@ -63,10 +64,11 @@ const IMAGE_IDENTITY: &str =
     "docker inspect --format '{{.Config.User}} {{json .Config.Entrypoint}}'";
 const IMAGE_IDENTITY_EXPECTED: &str =
     "| grep -Fx '10001 [\"/usr/bin/tini\",\"--\",\"/usr/local/bin/newsvault\"]'";
-const SERVICES: [&str; 3] = [
+const SERVICES: [&str; 4] = [
     "newsvault-collect.service",
     "newsvault-robots-refresh.service",
     "newsvault-watchdog.service",
+    "newsvault-backup.service",
 ];
 const ENV_FILE: &str = "%h/.config/bellwether/newsvault.env";
 /// systemd's `DefaultTimeoutStopSec`: the stop a start past its timeout is given before SIGKILL.
@@ -87,6 +89,22 @@ exit "$STUB_EXIT"
 /// UTC+14, so a `date` without `-u` is 14 h from the UTC now.
 const FAR_ZONE: &str = "Pacific/Kiritimati";
 const AT_TOLERANCE_S: i64 = 600;
+const UNIT_RESULT_FAMILIES: [&str; 3] = [
+    "newsvault_unit_result_timestamp_seconds",
+    "newsvault_unit_result_success",
+    "newsvault_unit_exit_status",
+];
+const BACKUP_FAMILIES: [&str; 2] = [
+    "newsvault_backup_last_success_timestamp_seconds",
+    "newsvault_backup_last_success_bytes",
+];
+/// Written for a person reading the textfile or a dashboard; no alert reads them.
+const UNREAD_FAMILIES: [&str; 2] = [
+    "newsvault_unit_result_timestamp_seconds",
+    "newsvault_backup_last_success_bytes",
+];
+const DAY_S: i64 = 86_400;
+const SCRIPTS: &str = "%h/.local/lib/bellwether";
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -293,21 +311,37 @@ fn read_families(rules: &str) -> BTreeSet<String> {
     found
 }
 
-/// Each family the watchdog writes has a rule reading it, and each rule reads one it writes.
+/// Each family the watchdog and the scripts write has a rule reading it, but those written for a
+/// person only, and each rule reads one of them; each script writes exactly its own families.
 #[test]
-fn every_metric_the_watchdog_writes_has_an_alert_rule_and_no_rule_reads_another() -> TestResult {
+fn every_metric_written_has_an_alert_rule_and_no_rule_reads_another() -> TestResult {
     let rules = read("deploy/prometheus/newsvault.rules.yml")?;
     let exprs: String = rules
         .split("- alert: ")
         .skip(1)
         .filter_map(|rule| rule.split("labels:").next())
         .collect();
+    let owned = |families: &[&str]| -> BTreeSet<String> {
+        families.iter().map(|family| (*family).to_owned()).collect()
+    };
+    let read_by_rules: BTreeSet<String> = PROMETHEUS_FAMILIES
+        .iter()
+        .chain(&UNIT_RESULT_FAMILIES)
+        .chain(&BACKUP_FAMILIES)
+        .filter(|family| !UNREAD_FAMILIES.contains(family))
+        .map(|family| (*family).to_owned())
+        .collect();
     assert_eq!(
-        read_families(&exprs),
-        PROMETHEUS_FAMILIES
-            .iter()
-            .map(|family| (*family).to_owned())
-            .collect::<BTreeSet<String>>()
+        (
+            read_families(&exprs),
+            read_families(&read("deploy/systemd/newsvault-unit-result")?),
+            read_families(&read("deploy/systemd/newsvault-backup")?),
+        ),
+        (
+            read_by_rules,
+            owned(&UNIT_RESULT_FAMILIES),
+            owned(&BACKUP_FAMILIES)
+        )
     );
     Ok(())
 }
@@ -428,6 +462,7 @@ fn no_unit_or_script_mounts_a_host_path_with_volume() -> TestResult {
         "deploy/systemd/newsvault-collect.service",
         "deploy/systemd/newsvault-robots-refresh.service",
         "deploy/systemd/newsvault-watchdog",
+        "deploy/systemd/newsvault-backup",
     ] {
         let text = read(file)?;
         volumes.extend(
@@ -640,7 +675,11 @@ fn a_hung_watchdog_is_stopped_before_its_next_firing() -> TestResult {
 #[test]
 fn each_timer_starts_its_own_service() -> TestResult {
     let mut started = Vec::new();
-    for timer in ["newsvault-collect.timer", "newsvault-watchdog.timer"] {
+    for timer in [
+        "newsvault-collect.timer",
+        "newsvault-watchdog.timer",
+        "newsvault-backup.timer",
+    ] {
         let unit = read(&format!("deploy/systemd/{timer}"))?;
         started.push((timer, unit_values(&unit, "Unit")));
     }
@@ -654,6 +693,10 @@ fn each_timer_starts_its_own_service() -> TestResult {
             (
                 "newsvault-watchdog.timer",
                 vec!["newsvault-watchdog.service".to_owned()]
+            ),
+            (
+                "newsvault-backup.timer",
+                vec!["newsvault-backup.service".to_owned()]
             ),
         ]
     );
@@ -675,26 +718,40 @@ fn the_collect_container_is_removed_read_only_unprivileged_and_never_pulled() ->
     Ok(())
 }
 
-/// A timed-out run's container is removed by the name it runs under, and a collect starts only
-/// on an NTP-synchronised clock.
+/// The `ExecStopPost` that removes a timed-out run's container by `name`.
+fn removal(name: &str) -> String {
+    format!(
+        "/bin/sh -c 'if [ \"$$SERVICE_RESULT\" = timeout ]; then /usr/bin/docker rm --force \
+         {name}; fi'"
+    )
+}
+
+/// The `ExecStopPost` that writes a unit's result as metrics; `-`, so it never changes the result.
+fn result_line(label: &str) -> String {
+    format!("-{SCRIPTS}/newsvault-unit-result {label}")
+}
+
+/// A timed-out run's container is removed by the name it runs under, a collect's result is
+/// written first, and a collect starts only on an NTP-synchronised clock.
 #[test]
 fn a_timed_out_container_is_removed_by_its_own_name_and_a_collect_needs_a_synced_clock(
 ) -> TestResult {
     let mut removals = Vec::new();
     let mut expected = Vec::new();
-    for service in [
-        "newsvault-collect.service",
-        "newsvault-robots-refresh.service",
+    for (service, result) in [
+        ("newsvault-collect.service", Some("collect")),
+        ("newsvault-robots-refresh.service", None),
     ] {
         let unit = read(&format!("deploy/systemd/{service}"))?;
         let name = container_shape(&unit).1.unwrap_or_default();
         removals.push((service, unit_values(&unit, "ExecStopPost")));
         expected.push((
             service,
-            vec![format!(
-                "/bin/sh -c 'if [ \"$$SERVICE_RESULT\" = timeout ]; then /usr/bin/docker rm \
-                 --force {name}; fi'"
-            )],
+            result
+                .map(result_line)
+                .into_iter()
+                .chain([removal(&name)])
+                .collect::<Vec<String>>(),
         ));
     }
     let collect = read("deploy/systemd/newsvault-collect.service")?;
@@ -912,6 +969,731 @@ fn the_watchdog_reads_at_the_utc_now_whatever_the_hosts_zone() -> TestResult {
         off.is_some_and(|off| off < AT_TOLERANCE_S),
         "{:?}",
         watched.at
+    );
+    Ok(())
+}
+
+/// One daily `OnCalendar=*-*-* HH:MM:00 UTC` per line, as seconds after 00:00 UTC.
+fn daily_times(timer: &str) -> Vec<Option<i64>> {
+    unit_values(timer, "OnCalendar")
+        .iter()
+        .map(|line| {
+            let time = line.strip_prefix("*-*-* ")?.strip_suffix(":00 UTC")?;
+            let (hour, minute) = time.split_once(':')?;
+            Some(hour.parse::<i64>().ok()? * 3_600 + minute.parse::<i64>().ok()? * 60)
+        })
+        .collect()
+}
+
+/// Each slot's `(free from, next slot)`: a collect is done at its start plus `TimeoutStartSec`
+/// plus systemd's stop timeout; the last slot's next is the first one a day later.
+fn gaps(collect_bound: i64) -> Vec<(i64, i64)> {
+    let starts: Vec<i64> = SLOTS
+        .iter()
+        .map(|slot| i64::from(slot.hour) * 3_600 + i64::from(slot.minute) * 60)
+        .collect();
+    let first = starts.first().copied().unwrap_or_default();
+    starts
+        .iter()
+        .enumerate()
+        .map(|(index, start)| {
+            let next = starts.get(index + 1).copied().unwrap_or(first + DAY_S);
+            (start + collect_bound, next)
+        })
+        .collect()
+}
+
+/// The backup and a collect never meet: the backup starts after one slot's hard bound and its own
+/// bound ends before the next slot, in a gap as long as the longest (2,520 s: 90 min less 2,790 s
+/// less 90 s), once a day, never run late.
+#[test]
+fn the_backup_runs_once_a_day_inside_the_longest_gap_the_collect_runs_leave() -> TestResult {
+    let timer = read("deploy/systemd/newsvault-backup.timer")?;
+    let service = read("deploy/systemd/newsvault-backup.service")?;
+    let gaps = gaps(derived_timeout()? + DEFAULT_TIMEOUT_STOP_S);
+    let longest = gaps.iter().map(|(from, next)| next - from).max();
+    let bound: Vec<i64> = integers(&unit_values(&service, "TimeoutStartSec"));
+    let mut fitting = Vec::new();
+    for (at, bound) in daily_times(&timer).iter().flatten().zip(&bound) {
+        for (from, next) in &gaps {
+            let fits =
+                |start: i64| *from <= start && start + bound + DEFAULT_TIMEOUT_STOP_S <= *next;
+            if fits(*at) || fits(at + DAY_S) {
+                fitting.push(next - from);
+            }
+        }
+    }
+    assert_eq!(
+        (
+            fitting,
+            longest,
+            unit_values(&timer, "AccuracySec"),
+            unit_values(&timer, "RandomizedDelaySec").len(),
+            unit_values(&timer, "Persistent").len(),
+            daily_times(&timer).len(),
+        ),
+        (
+            longest.into_iter().collect::<Vec<i64>>(),
+            Some(2_520),
+            vec!["1s".to_owned()],
+            0,
+            0,
+            1
+        )
+    );
+    Ok(())
+}
+
+/// Two daily intervals with no copy on Nextcloud, as the watchdog's staleness is two of its own.
+#[test]
+fn the_backup_staleness_threshold_is_two_of_its_daily_intervals() -> TestResult {
+    let rules = read("deploy/prometheus/newsvault.rules.yml")?;
+    let timer = read("deploy/systemd/newsvault-backup.timer")?;
+    assert_eq!(
+        (
+            threshold(&rules, "NewsvaultBackupStale"),
+            daily_times(&timer).iter().flatten().count()
+        ),
+        (Some(2 * DAY_S), 1)
+    );
+    Ok(())
+}
+
+/// The collect's own store lock, `--nonblock`: a backup that meets a run exits 7 and never holds
+/// a slot back; its result is written first, and a timed-out snapshot's container is removed.
+#[test]
+fn the_backup_unit_takes_the_store_lock_without_waiting_and_records_its_result() -> TestResult {
+    let unit = read("deploy/systemd/newsvault-backup.service")?;
+    assert_eq!(
+        (
+            unit_values(&unit, "ExecStart"),
+            unit_values(&unit, "ExecStopPost"),
+            unit_values(&unit, "Restart").len(),
+            unit_values(&unit, "SuccessExitStatus").len(),
+        ),
+        (
+            vec![format!("{STORE_LOCK} {SCRIPTS}/newsvault-backup")],
+            vec![
+                result_line("backup"),
+                format!("-{}", removal("newsvault-backup"))
+            ],
+            0,
+            0
+        )
+    );
+    Ok(())
+}
+
+/// `rust-toolchain.toml` is the one home of the toolchain: the Dockerfile and `ci.yml` install it
+/// from that file and name no version, override or toolchain variable of their own.
+#[test]
+fn one_rust_toolchain_is_named_only_in_rust_toolchain_toml() -> TestResult {
+    let pin = read("rust-toolchain.toml")?;
+    let channel = pin
+        .lines()
+        .find_map(|line| line.strip_prefix("channel = \"")?.strip_suffix('"'))
+        .unwrap_or_default()
+        .to_owned();
+    let numeric = channel
+        .split('.')
+        .filter(|part| part.parse::<u32>().is_ok())
+        .count();
+    let dockerfile = trimmed(&read("Dockerfile")?);
+    let ci = read(".github/workflows/ci.yml")?;
+    let check = job(&ci, "check");
+    let mut named_elsewhere = Vec::new();
+    for (file, text) in [
+        ("Dockerfile", dockerfile.join("\n")),
+        ("ci.yml", trimmed(&ci).join("\n")),
+    ] {
+        for word in [
+            channel.as_str(),
+            "RUST_TOOLCHAIN",
+            "RUSTUP_TOOLCHAIN",
+            "rustup default",
+            "rustup override",
+            "toolchain:",
+            "cargo +",
+        ] {
+            if text.contains(word) {
+                named_elsewhere.push(format!("{file}: {word}"));
+            }
+        }
+    }
+    let installs = |lines: &[String]| {
+        lines
+            .iter()
+            .any(|line| line.ends_with("rustup toolchain install"))
+    };
+    assert_eq!(
+        (
+            numeric,
+            pin.contains("components = [\"clippy\", \"rustfmt\"]"),
+            named_elsewhere,
+            dockerfile
+                .iter()
+                .any(|line| line.contains("--default-toolchain none")),
+            dockerfile.contains(&"COPY rust-toolchain.toml .".to_owned()),
+            installs(&dockerfile),
+            installs(&check),
+        ),
+        (3, true, Vec::<String>::new(), true, true, true, true)
+    );
+    Ok(())
+}
+
+const PASSWORD: &str = "nc-app-PASSWORD-7f3k";
+/// The stored password: the secret, then a quote and a backslash curl's config must escape.
+const PASSWORD_FILE_TEXT: &str = "nc-app-PASSWORD-7f3k\"q\\b\n";
+const PASSWORD_IN_CONFIG: &str = "user = \"bellwether:nc-app-PASSWORD-7f3k\\\"q\\\\b\"";
+const NEXTCLOUD: &str = "https://cloud.example.test/";
+const DAV: &str = "https://cloud.example.test/remote.php/dav/files/bellwether";
+const OLD_BACKUP_METRICS: &str = "newsvault_backup_last_success_bytes 1\n";
+const BACKUP_PROM: &str = "newsvault-backup.prom";
+const SNAPSHOT_BYTES: &str = "the snapshot";
+/// Copies already on Nextcloud, oldest first, and a file of another shape that is never deleted.
+const LISTED: [&str; 9] = [
+    "bellwether-vault-20000101T225500Z.tar.gz",
+    "bellwether-vault-20000102T225500Z.tar.gz",
+    "bellwether-vault-20000103T225500Z.tar.gz",
+    "bellwether-vault-20000104T225500Z.tar.gz",
+    "bellwether-vault-20000105T225500Z.tar.gz",
+    "bellwether-vault-20000106T225500Z.tar.gz",
+    "bellwether-vault-20000107T225500Z.tar.gz",
+    "bellwether-vault-20000108T225500Z.tar.gz",
+    "notes.txt",
+];
+/// Records its argv, then writes a snapshot into the directory mounted on `/out`.
+const BACKUP_DOCKER_STUB: &str = r#"#!/bin/sh
+printf '%s\n' "$@" >>"$STUB_DIR/docker-args"
+for arg; do
+    case $arg in type=bind,src=*,dst=/out) out=${arg#type=bind,src=}; out=${out%,dst=/out} ;; esac
+done
+[ "${STUB_DOCKER_EXIT:-0}" = 0 ] || exit "$STUB_DOCKER_EXIT"
+printf 'the snapshot' >"$out/commit.sqlite3"
+echo '{"schema": "newsvault.snapshot/1"}'
+"#;
+/// A WebDAV server in one file: records each call's argv, stdin and environment, answers MKCOL
+/// with a status, keeps each PUT and lists them after `listed` on PROPFIND.
+const CURL_STUB: &str = r#"#!/bin/sh
+{ echo '-- call'; printf '%s\n' "$@"; } >>"$STUB_DIR/curl-args"
+{ echo '-- call'; cat; } >>"$STUB_DIR/curl-config"
+env >>"$STUB_DIR/curl-env"
+method=GET; upload=''; url=''; prev=''
+for arg; do
+    case $prev in --request) method=$arg ;; --upload-file) method=PUT; upload=$arg ;; esac
+    case $arg in https://*) url=$arg ;; esac
+    prev=$arg
+done
+echo "$method $url" >>"$STUB_DIR/calls"
+case $method in
+    MKCOL) printf '%s' "${STUB_MKCOL_CODE:-201}" ;;
+    PUT) [ "${STUB_PUT_FAILS:-}" = yes ] && exit 22; cp "$upload" "$STUB_DIR/uploads/" ;;
+    PROPFIND)
+        printf '<d:multistatus>'
+        while read -r name; do printf '<d:href>/x/%s</d:href>' "$name"; done <"$STUB_DIR/listed"
+        if [ "${STUB_LISTING_LACKS_NEW:-}" != yes ]; then
+            for put in "$STUB_DIR"/uploads/*; do printf '<d:href>/x/%s</d:href>' "${put##*/}"; done
+        fi
+        printf '</d:multistatus>' ;;
+esac
+"#;
+/// Records its argv, then moves.
+const MV_STUB: &str =
+    "#!/bin/sh\nprintf '%s\\n' \"$@\" >>\"$STUB_DIR/mv-args\"\nexec /bin/mv \"$@\"\n";
+
+fn executable(path: &Path, text: &str) -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, text)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+/// How one backup run is set up to go wrong, if at all.
+#[derive(Default, Clone, Copy)]
+struct Trouble {
+    password_mode: Option<u32>,
+    put_fails: bool,
+    listing_lacks_new: bool,
+    docker_exit: Option<i32>,
+    plain_http: bool,
+}
+
+/// One run of `deploy/systemd/newsvault-backup` against a stub docker, curl and mv.
+struct Backed {
+    exit: Option<i32>,
+    output: String,
+    calls: Vec<String>,
+    curl_args: Vec<Vec<String>>,
+    curl_config: String,
+    curl_env: String,
+    docker_args: Vec<String>,
+    mv_args: Vec<String>,
+    uploads: Vec<(String, Vec<u8>)>,
+    metric: String,
+    old_link: String,
+    textfile: Vec<String>,
+}
+
+fn sorted_names(dir: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        names.push(entry?.file_name().to_string_lossy().into_owned());
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn read_or_empty(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+fn lines_of(path: &Path) -> Vec<String> {
+    read_or_empty(path).lines().map(str::to_owned).collect()
+}
+
+fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    let work = tempfile::TempDir::new()?;
+    let (home, stub, textfile) = (
+        work.path().join("home"),
+        work.path().join("stub"),
+        work.path().join("textfile"),
+    );
+    let vault = home.join(".bellwether/vault");
+    for dir in [
+        vault.join("blobs/sha256/ab"),
+        vault.join("runs"),
+        home.join(".config/bellwether"),
+        stub.join("bin"),
+        stub.join("uploads"),
+        textfile.clone(),
+    ] {
+        std::fs::create_dir_all(dir)?;
+    }
+    for (file, text) in [
+        ("commit.sqlite3", "the live log"),
+        ("commit.sqlite3-journal", "a journal"),
+        ("LOCK", ""),
+        ("blobs/sha256/ab/abcd", "a blob"),
+        ("runs/20261118T225500Z.json", "a run file"),
+        (".kept", "a hidden file"),
+    ] {
+        std::fs::write(vault.join(file), text)?;
+    }
+    let password = home.join(".config/bellwether/nextcloud-app-password");
+    std::fs::write(&password, PASSWORD_FILE_TEXT)?;
+    std::fs::set_permissions(
+        &password,
+        std::fs::Permissions::from_mode(trouble.password_mode.unwrap_or(0o600)),
+    )?;
+    std::fs::write(textfile.join(BACKUP_PROM), OLD_BACKUP_METRICS)?;
+    std::fs::hard_link(textfile.join(BACKUP_PROM), work.path().join("old-link"))?;
+    std::fs::write(stub.join("listed"), LISTED.join("\n") + "\n")?;
+    executable(&stub.join("bin/docker"), BACKUP_DOCKER_STUB)?;
+    executable(&stub.join("bin/curl"), CURL_STUB)?;
+    executable(&stub.join("bin/mv"), MV_STUB)?;
+    let flag = |set: bool| if set { "yes" } else { "no" };
+    let url = if trouble.plain_http {
+        "http://cloud.example.test/"
+    } else {
+        NEXTCLOUD
+    };
+    let output = Command::new("/bin/sh")
+        .arg(repo().join("deploy/systemd/newsvault-backup"))
+        .env_clear()
+        .env("HOME", &home)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", stub.join("bin").display()),
+        )
+        .env("NEWSVAULT_IMAGE", "newsvault:test")
+        .env("NEWSVAULT_TEXTFILE_DIR", &textfile)
+        .env("NEXTCLOUD_URL", url)
+        .env("NEXTCLOUD_USER", "bellwether")
+        .env("STUB_DIR", &stub)
+        .env("STUB_PUT_FAILS", flag(trouble.put_fails))
+        .env("STUB_LISTING_LACKS_NEW", flag(trouble.listing_lacks_new))
+        .env(
+            "STUB_DOCKER_EXIT",
+            trouble.docker_exit.unwrap_or(0).to_string(),
+        )
+        .stdin(Stdio::null())
+        .output()?;
+    let mut uploads = Vec::new();
+    for name in sorted_names(&stub.join("uploads"))? {
+        let bytes = std::fs::read(stub.join("uploads").join(&name))?;
+        uploads.push((name, bytes));
+    }
+    let curl_args = read_or_empty(&stub.join("curl-args"))
+        .split("-- call\n")
+        .filter(|call| !call.is_empty())
+        .map(|call| call.lines().map(str::to_owned).collect())
+        .collect();
+    Ok(Backed {
+        exit: output.status.code(),
+        output: format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        calls: lines_of(&stub.join("calls")),
+        curl_args,
+        curl_config: read_or_empty(&stub.join("curl-config")),
+        curl_env: read_or_empty(&stub.join("curl-env")),
+        docker_args: lines_of(&stub.join("docker-args")),
+        mv_args: lines_of(&stub.join("mv-args")),
+        uploads,
+        metric: read_or_empty(&textfile.join(BACKUP_PROM)),
+        old_link: read_or_empty(&work.path().join("old-link")),
+        textfile: sorted_names(&textfile)?,
+    })
+}
+
+/// The uploaded archive's file members and the bytes of its `commit.sqlite3`, read with `tar`.
+fn members(archive: &[u8]) -> Result<(Vec<String>, String), Box<dyn Error>> {
+    let work = tempfile::TempDir::new()?;
+    let (file, into) = (work.path().join("a.tar.gz"), work.path().join("into"));
+    std::fs::create_dir(&into)?;
+    std::fs::write(&file, archive)?;
+    let listed = Command::new("tar").arg("-tzf").arg(&file).output()?;
+    let unpacked = Command::new("tar")
+        .arg("-xzf")
+        .arg(&file)
+        .arg("-C")
+        .arg(&into)
+        .status()?;
+    let mut names: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .map(|name| name.trim_start_matches("./").to_owned())
+        .filter(|name| !name.ends_with('/'))
+        .collect();
+    names.sort();
+    let log = if unpacked.success() {
+        read_or_empty(&into.join("commit.sqlite3"))
+    } else {
+        String::new()
+    };
+    Ok((names, log))
+}
+
+/// MKCOL each folder, PUT one archive holding the snapshot as `commit.sqlite3` and every other
+/// store file but the live log, its journal and `LOCK`, then PROPFIND and DELETE all but the 7
+/// newest copies; a file of another shape stays.
+#[test]
+fn the_backup_uploads_the_snapshot_and_the_store_then_keeps_the_seven_newest() -> TestResult {
+    let backed = backup(Trouble::default())?;
+    let (name, archive) = backed.uploads.first().cloned().unwrap_or_default();
+    let (names, log) = members(&archive)?;
+    let folder = format!("{DAV}/Backups/bellwether");
+    assert_eq!(
+        (backed.exit, backed.calls, names, log),
+        (
+            Some(0),
+            vec![
+                format!("MKCOL {DAV}/Backups/"),
+                format!("MKCOL {folder}/"),
+                format!("PUT {folder}/{name}"),
+                format!("PROPFIND {folder}/"),
+                format!("DELETE {folder}/{}", LISTED[0]),
+                format!("DELETE {folder}/{}", LISTED[1]),
+            ],
+            vec![
+                ".kept".to_owned(),
+                "blobs/sha256/ab/abcd".to_owned(),
+                "commit.sqlite3".to_owned(),
+                "runs/20261118T225500Z.json".to_owned(),
+            ],
+            SNAPSHOT_BYTES.to_owned(),
+        ),
+        "{}",
+        backed.output
+    );
+    Ok(())
+}
+
+/// The app password reaches curl only as its escaped config on stdin: never in any argv, any
+/// environment, or the script's own output.
+#[test]
+fn the_app_password_reaches_curl_only_as_its_config_on_stdin() -> TestResult {
+    let backed = backup(Trouble::default())?;
+    let in_argv = backed
+        .curl_args
+        .iter()
+        .flatten()
+        .chain(&backed.docker_args)
+        .chain(&backed.mv_args)
+        .filter(|word| word.contains(PASSWORD))
+        .count();
+    let configured = backed
+        .curl_args
+        .iter()
+        .all(|call| call.windows(2).any(|pair| pair == ["--config", "-"]));
+    assert_eq!(
+        (
+            backed.exit,
+            in_argv,
+            backed.curl_env.contains(PASSWORD),
+            backed.output.contains(PASSWORD),
+            backed.curl_config.matches(PASSWORD_IN_CONFIG).count(),
+            configured,
+        ),
+        (Some(0), 0, false, false, 6, true)
+    );
+    Ok(())
+}
+
+/// Every request is `--proto =https`, none turns certificate checks off, and an `http://` URL is
+/// refused before any request.
+#[test]
+fn every_backup_request_is_https_only_and_verifies_tls() -> TestResult {
+    let backed = backup(Trouble::default())?;
+    let unsafe_calls: Vec<String> = backed
+        .curl_args
+        .iter()
+        .filter(|call| {
+            !call.windows(2).any(|pair| pair == ["--proto", "=https"])
+                || call.iter().any(|word| word == "-k" || word == "--insecure")
+        })
+        .map(|call| call.join(" "))
+        .collect();
+    let refused = backup(Trouble {
+        plain_http: true,
+        ..Trouble::default()
+    })?;
+    assert_eq!(
+        (
+            backed.curl_args.len(),
+            unsafe_calls,
+            backed.curl_config.contains("insecure"),
+            refused.exit,
+            refused.calls.len()
+        ),
+        (6, Vec::<String>::new(), false, Some(2), 0)
+    );
+    Ok(())
+}
+
+/// The metric is the archive's size and the snapshot's time, written to a hidden non-`.prom` file
+/// beside `newsvault-backup.prom` and renamed onto it: the old file's inode keeps the old text.
+#[test]
+fn the_backup_writes_its_metric_through_a_hidden_file_renamed_after_the_upload() -> TestResult {
+    let backed = backup(Trouble::default())?;
+    let size = backed.uploads.first().map_or(0, |(_, bytes)| bytes.len());
+    let at: Option<i64> = backed
+        .metric
+        .lines()
+        .find_map(|line| line.strip_prefix("newsvault_backup_last_success_timestamp_seconds "))
+        .and_then(|value| value.parse().ok());
+    let hidden = moved_beside(&backed.mv_args, BACKUP_PROM);
+    assert_eq!(
+        (
+            backed
+                .metric
+                .contains(&format!("newsvault_backup_last_success_bytes {size}\n")),
+            at.is_some_and(|at| (Utc::now().timestamp() - at).abs() < AT_TOLERANCE_S),
+            backed.old_link,
+            hidden,
+            backed.textfile,
+        ),
+        (
+            true,
+            true,
+            OLD_BACKUP_METRICS.to_owned(),
+            true,
+            vec![BACKUP_PROM.to_owned()]
+        ),
+        "{}",
+        backed.metric
+    );
+    Ok(())
+}
+
+/// Whether `mv`'s one move put a dot-file beside `target`, named for it plus a suffix the
+/// collector skips, onto `target`.
+fn moved_beside(args: &[String], target: &str) -> bool {
+    let paths: Vec<&Path> = args
+        .iter()
+        .filter(|word| !word.starts_with('-'))
+        .map(Path::new)
+        .collect();
+    let name = |path: &Path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    };
+    let [from, to] = paths.as_slice() else {
+        return false;
+    };
+    from.parent() == to.parent()
+        && name(to).as_deref() == Some(target)
+        && name(from).is_some_and(|from| {
+            from.starts_with(&format!(".{target}.")) && !from.ends_with(".prom")
+        })
+}
+
+/// A failed PUT exits 7 and keeps the last metric; a listing without the new copy exits 8 after
+/// its metric. Neither deletes anything.
+#[test]
+fn a_failed_upload_or_a_listing_without_the_copy_deletes_nothing_and_exits_by_name() -> TestResult {
+    let put = backup(Trouble {
+        put_fails: true,
+        ..Trouble::default()
+    })?;
+    let listing = backup(Trouble {
+        listing_lacks_new: true,
+        ..Trouble::default()
+    })?;
+    let deletes = |calls: &[String]| {
+        calls
+            .iter()
+            .filter(|call| call.starts_with("DELETE "))
+            .count()
+    };
+    assert_eq!(
+        (
+            put.exit,
+            deletes(&put.calls),
+            put.metric,
+            listing.exit,
+            deletes(&listing.calls),
+            listing.metric == OLD_BACKUP_METRICS,
+        ),
+        (Some(7), 0, OLD_BACKUP_METRICS.to_owned(), Some(8), 0, false)
+    );
+    Ok(())
+}
+
+/// A password file others can read refuses the run before any request; a refused snapshot ends it
+/// with the snapshot's exit and no request.
+#[test]
+fn a_shared_password_file_or_a_refused_snapshot_stops_before_any_request() -> TestResult {
+    let shared = backup(Trouble {
+        password_mode: Some(0o644),
+        ..Trouble::default()
+    })?;
+    let refused = backup(Trouble {
+        docker_exit: Some(7),
+        ..Trouble::default()
+    })?;
+    assert_eq!(
+        (
+            shared.exit,
+            shared.calls.len(),
+            shared.docker_args.len(),
+            refused.exit,
+            refused.calls.len()
+        ),
+        (Some(2), 0, 0, Some(7), 0)
+    );
+    Ok(())
+}
+
+/// The snapshot container: removed, never pulled, read-only, no network, no capability, the store
+/// mounted read-only and only the work directory writable.
+#[test]
+fn the_backup_container_reads_the_store_read_only_with_no_network() -> TestResult {
+    let backed = backup(Trouble::default())?;
+    let args = backed.docker_args.join(" ");
+    let (flags, command) = args.split_at(args.find(" newsvault:test ").unwrap_or_default());
+    let mounts: Vec<&str> = flags
+        .split(' ')
+        .filter_map(|word| word.strip_prefix("type=bind,src="))
+        .map(|mount| mount.split_once(",dst=").map_or(mount, |(_, dst)| dst))
+        .collect();
+    let flags = flags
+        .split(' ')
+        .filter(|word| !word.starts_with("type=bind,src=") && !word.contains(':'))
+        .collect::<Vec<&str>>()
+        .join(" ");
+    assert_eq!(
+        (flags, mounts, command.trim()),
+        (
+            "run --rm --name newsvault-backup --pull never --user --read-only --network none \
+             --cap-drop ALL --security-opt no-new-privileges --mount --mount"
+                .to_owned(),
+            vec!["/vault,readonly", "/out"],
+            "newsvault:test snapshot --out /out/commit.sqlite3 --non-interactive --format json"
+        )
+    );
+    Ok(())
+}
+
+/// One `newsvault-unit-result collect` run with systemd's three variables, as `(value lines, the
+/// old inode's text, whether mv moved a hidden file beside the target)`.
+fn unit_result(
+    service: &str,
+    code: &str,
+    status: &str,
+) -> Result<(String, String, bool), Box<dyn Error>> {
+    let work = tempfile::TempDir::new()?;
+    let (stub, textfile) = (work.path().join("stub"), work.path().join("textfile"));
+    std::fs::create_dir_all(stub.join("bin"))?;
+    std::fs::create_dir(&textfile)?;
+    let target = textfile.join("newsvault-collect-result.prom");
+    std::fs::write(&target, OLD_METRICS)?;
+    std::fs::hard_link(&target, work.path().join("old-link"))?;
+    executable(&stub.join("bin/mv"), MV_STUB)?;
+    let output = Command::new("/bin/sh")
+        .arg(repo().join("deploy/systemd/newsvault-unit-result"))
+        .arg("collect")
+        .env_clear()
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", stub.join("bin").display()),
+        )
+        .env("NEWSVAULT_TEXTFILE_DIR", &textfile)
+        .env("SERVICE_RESULT", service)
+        .env("EXIT_CODE", code)
+        .env("EXIT_STATUS", status)
+        .env("STUB_DIR", &stub)
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
+    }
+    let hidden = moved_beside(
+        &lines_of(&stub.join("mv-args")),
+        "newsvault-collect-result.prom",
+    );
+    let values = read_or_empty(&target)
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.contains("_timestamp_seconds"))
+        .collect::<Vec<&str>>()
+        .join(" ");
+    Ok((values, read_or_empty(&work.path().join("old-link")), hidden))
+}
+
+/// systemd's `SERVICE_RESULT` as success, its `EXIT_STATUS` as the status for an exited process and
+/// -1 for a signalled one, through a hidden file renamed onto the target.
+#[test]
+fn the_unit_result_names_success_and_the_exit_status_through_a_renamed_hidden_file() -> TestResult {
+    let mut got = Vec::new();
+    for (service, code, status) in [
+        ("success", "exited", "0"),
+        ("success", "exited", "8"),
+        ("exit-code", "exited", "2"),
+        ("timeout", "killed", "TERM"),
+    ] {
+        got.push(unit_result(service, code, status)?);
+    }
+    let expected = |success: u8, status: &str| {
+        (
+            format!(
+                "newsvault_unit_result_success{{unit=\"collect\"}} {success} \
+                 newsvault_unit_exit_status{{unit=\"collect\"}} {status}"
+            ),
+            OLD_METRICS.to_owned(),
+            true,
+        )
+    };
+    assert_eq!(
+        got,
+        vec![
+            expected(1, "0"),
+            expected(1, "8"),
+            expected(0, "2"),
+            expected(0, "-1"),
+        ]
     );
     Ok(())
 }

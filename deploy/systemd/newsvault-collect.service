@@ -26,11 +26,14 @@ ExecStart=/usr/bin/flock --nonblock --conflict-exit-code 7 %t/bellwether-store.l
     --hosts /usr/share/bellwether/open_web_wires.hosts.json \
     --rules /usr/share/bellwether/open-web-feed.rules.json \
     --non-interactive --format json
+# The run's result as metrics, NewsvaultCollectFailed's input; first, as a failed line stops the
+# lines after it, and `-`, so a metric write never changes the unit's result.
+ExecStopPost=-%h/.local/lib/bellwether/newsvault-unit-result collect
 # A timeout's SIGTERM reaches the container through docker's signal proxy; one that outlives it is
 # removed here. A container a killed client leaves otherwise stays and blocks the next start by name.
 ExecStopPost=/bin/sh -c 'if [ "$$SERVICE_RESULT" = timeout ]; then /usr/bin/docker rm --force newsvault-collect; fi'
 # S7-D8: exit 8 is a partial run. A failed unit is newsvault's 2, 4 or 7, the lock's 7, the NTP
-# check's 1 or docker's 125; no rule reads the unit's state (architecture.md S7-D8).
+# check's 1 or docker's 125, which NewsvaultCollectFailed reads (architecture.md S7-D8).
 SuccessExitStatus=8
 # S7-D9: the longest slot window (2,670 s) plus 120 s, which the deploy test derives; no Restart=.
 TimeoutStartSec=2790

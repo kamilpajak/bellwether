@@ -1,0 +1,6 @@
+# The one Rust toolchain: ci.yml and the Dockerfile both install it from this file, and
+# services/newsvault/tests/deploy.rs holds that neither names a version of its own.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

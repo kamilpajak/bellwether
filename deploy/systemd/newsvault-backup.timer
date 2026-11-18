@@ -1,0 +1,14 @@
+# Daily, after the 22:00 slot's hard bound (22:48) and before 23:30: the longest gap SLOTS leaves,
+# first after the US session. services/newsvault/tests/deploy.rs derives the gap. No Persistent=:
+# a backup run late at boot could hold the lock over a slot; NewsvaultBackupStale names a miss.
+[Unit]
+Description=newsvault backup, daily (UTC)
+Documentation=https://github.com/kamilpajak/bellwether/blob/main/docs/design/architecture.md
+
+[Timer]
+OnCalendar=*-*-* 22:55:00 UTC
+AccuracySec=1s
+Unit=newsvault-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -3,12 +3,9 @@
 # that section's own table. The
 # commands must stay the ones README.md names - CONTRIBUTING.md, "Everything else".
 #
-# No toolchain setup step: the GitHub ubuntu runner image installs cargo, rustfmt and clippy
-# (images/ubuntu/scripts/build/install-rust.sh in actions/runner-images runs
-# `rustup component add rustfmt clippy`; the image readme lists rustfmt but not clippy, so the
-# build script is the authority), so the compiler floats with the image and a new clippy lint can
-# turn this red with no commit here. No dependency cache: measured 2026-11-12 over the five runs
-# on this runner, the whole job wall clock was 71-93 s, so a cache would save less than it costs.
+# The toolchain is rust-toolchain.toml's, the one the Dockerfile builds the image with, installed
+# by the runner's own rustup. No dependency cache: measured 2026-11-12 over the five runs on this
+# runner, the whole job wall clock was 71-93 s, so a cache would save less than it costs.
 
 name: ci
 
@@ -33,6 +30,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: the linked SQLite is 3.45, the image's
         run: dpkg-query --showformat '${Version}' --show libsqlite3-0 | grep -E '^3\.45\.'
+      # rustup 1.28 and later install the file's toolchain and components with no argument.
+      - name: the toolchain is rust-toolchain.toml's
+        run: |
+          rustup toolchain install
+          rustc --version | grep -F "rustc $(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml) "
       - if: ${{ !cancelled() }}
         run: cargo fmt --check
       # "!cancelled()" keeps the step running after an earlier step failed while still skipping it

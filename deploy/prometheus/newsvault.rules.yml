@@ -1,6 +1,6 @@
-# Readers of the newsvault.prom/1 textfile the hourly watchdog writes (deploy/systemd/). A per-day
-# count is aggregated without days_ago, so one day's alert keeps its labels (run_date) across UTC
-# midnight. Thresholds and their construction: architecture.md S7-D8.
+# Readers of the textfiles deploy/systemd/ writes: the hourly watchdog's newsvault.prom/1, the units'
+# results and the backup's last copy. A per-day count is aggregated without days_ago, so one day's
+# alert keeps its labels (run_date) across UTC midnight. Thresholds: architecture.md S7-D8 and N1.
 groups:
   - name: newsvault
     rules:
@@ -99,3 +99,31 @@ groups:
           severity: warning
         annotations:
           summary: a source listed vendor rows and committed no item, run date {{ $labels.run_date }}.
+
+      # The collect unit's last ExecStopPost (deploy/systemd/newsvault-unit-result): a failed unit, or
+      # an exit other than 0 and 8 (S7-D8), at the next evaluation instead of 3 h later.
+      - alert: NewsvaultCollectFailed
+        expr: |
+          max by (unit) (newsvault_unit_result_success{unit="collect"} == 0)
+          or max by (unit) (newsvault_unit_exit_status{unit="collect"} != 0 and newsvault_unit_exit_status{unit="collect"} != 8)
+        labels:
+          severity: critical
+        annotations:
+          summary: newsvault's last collect run failed, or exited other than 0 and 8.
+
+      # Two daily backup intervals (2 x 86,400 s) with no copy on Nextcloud, or none yet (N1).
+      - alert: NewsvaultBackupStale
+        expr: |
+          (time() - max(newsvault_backup_last_success_timestamp_seconds)) > 172800
+          or absent(newsvault_backup_last_success_timestamp_seconds)
+        labels:
+          severity: critical
+        annotations:
+          summary: no newsvault backup has reached Nextcloud for over 2 days, or none ever.
+
+      - alert: NewsvaultBackupFailed
+        expr: max by (unit) (newsvault_unit_result_success{unit="backup"} == 0)
+        labels:
+          severity: warning
+        annotations:
+          summary: the last newsvault backup run failed; the newest copy on Nextcloud is older than a day.
