@@ -1,0 +1,15 @@
+# The daily copy to Nextcloud (architecture.md section 10, N1). The store lock the collect unit
+# takes, without waiting: a backup that meets a run exits 7 and alerts, and never delays a slot.
+# services/newsvault/tests/deploy.rs holds TimeoutStartSec inside the schedule's gap.
+[Unit]
+Description=newsvault daily backup of the store to Nextcloud
+Documentation=https://github.com/kamilpajak/bellwether/blob/main/docs/design/architecture.md
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/bellwether/newsvault.env
+ExecStart=/usr/bin/flock --nonblock --conflict-exit-code 7 %t/bellwether-store.lock \
+    %h/.local/lib/bellwether/newsvault-backup
+ExecStopPost=-%h/.local/lib/bellwether/newsvault-unit-result backup
+ExecStopPost=-/bin/sh -c 'if [ "$$SERVICE_RESULT" = timeout ]; then /usr/bin/docker rm --force newsvault-backup; fi'
+TimeoutStartSec=1800

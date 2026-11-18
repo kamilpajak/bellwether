@@ -1,0 +1,28 @@
+#!/bin/sh
+# ExecStopPost of a newsvault unit: systemd's SERVICE_RESULT, EXIT_CODE and EXIT_STATUS as
+# node-exporter textfile metrics in newsvault-<label>-result.prom, which the rules in
+# deploy/prometheus/newsvault.rules.yml read. Written to a dot-file beside the target and renamed.
+set -u
+: "${NEWSVAULT_TEXTFILE_DIR:?set in newsvault.env}"
+label=${1:?usage: newsvault-unit-result <label>}
+case $label in
+    *[!a-z]*) echo "the label $label is not lowercase letters" >&2; exit 2 ;;
+esac
+success=0
+if [ "${SERVICE_RESULT:-}" = success ]; then success=1; fi
+# A run a signal ended has no exit status: -1, which no alert reads as a success.
+case ${EXIT_CODE:-}:${EXIT_STATUS:-} in
+    exited:[0-9] | exited:[0-9][0-9] | exited:[0-9][0-9][0-9]) status=$EXIT_STATUS ;;
+    *) status=-1 ;;
+esac
+tmp="$NEWSVAULT_TEXTFILE_DIR/.newsvault-$label-result.prom.$$"
+{
+    echo '# TYPE newsvault_unit_result_timestamp_seconds gauge'
+    printf 'newsvault_unit_result_timestamp_seconds{unit="%s"} %s\n' "$label" "$(date -u +%s)"
+    echo '# TYPE newsvault_unit_result_success gauge'
+    printf 'newsvault_unit_result_success{unit="%s"} %s\n' "$label" "$success"
+    echo '# TYPE newsvault_unit_exit_status gauge'
+    printf 'newsvault_unit_exit_status{unit="%s"} %s\n' "$label" "$status"
+} >"$tmp" && exec mv -f "$tmp" "$NEWSVAULT_TEXTFILE_DIR/newsvault-$label-result.prom"
+rm -f "$tmp"
+exit 2

@@ -5,7 +5,6 @@ ARG UBUNTU=ubuntu:noble-20261024.1@sha256:fe81560990fae86dc4743202b2cb4d3df98d0b
 
 FROM ${UBUNTU} AS build
 ARG RUSTUP_VERSION=1.29.3
-ARG RUST_TOOLCHAIN=1.99.1
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl gcc libc6-dev libsqlite3-dev pkg-config \
  && rm -rf /var/lib/apt/lists/*
@@ -21,10 +20,13 @@ RUN set -eu; \
       "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${target}/rustup-init"; \
     echo "$sum  /tmp/rustup-init" | sha256sum -c -; \
     chmod +x /tmp/rustup-init; \
-    /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain "$RUST_TOOLCHAIN"; \
+    /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain none; \
     rm /tmp/rustup-init
 ENV PATH=/root/.cargo/bin:$PATH
 WORKDIR /src
+# The toolchain ci.yml installs, from its one home; its own layer, so a source change reuses it.
+COPY rust-toolchain.toml .
+RUN rustup toolchain install
 COPY . .
 RUN cargo build --locked --release -p newsvault
 

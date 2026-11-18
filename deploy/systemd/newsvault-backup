@@ -1,0 +1,102 @@
+#!/bin/sh
+# The daily copy of the store to Nextcloud over WebDAV (architecture.md section 10, N1), run by
+# newsvault-backup.service under the store lock: `newsvault snapshot` of the commit log plus every
+# other store file in one .tar.gz, uploaded, then all but the 7 newest copies deleted. The app
+# password goes to curl as a config on stdin, never in argv, the environment or a file of ours.
+# Exits: 2 setup, 4 an absent input, 7 the upload, 8 the copy is up and the retention failed;
+# the snapshot's own exit when it refuses.
+set -u
+: "${NEWSVAULT_IMAGE:?set in newsvault.env}" "${NEWSVAULT_TEXTFILE_DIR:?set in newsvault.env}"
+: "${NEXTCLOUD_URL:?set in newsvault.env}" "${NEXTCLOUD_USER:?set in newsvault.env}"
+keep=7
+folder=Backups/bellwether
+vault="$HOME/.bellwether/vault"
+password_file="$HOME/.config/bellwether/nextcloud-app-password"
+
+case $NEXTCLOUD_URL in
+    https://*) ;;
+    *) echo "NEXTCLOUD_URL must start with https://" >&2; exit 2 ;;
+esac
+if [ ! -f "$password_file" ]; then
+    echo "no Nextcloud app password at $password_file" >&2
+    exit 4
+fi
+if [ -n "$(find "$password_file" -prune \( -perm -040 -o -perm -004 -o -perm -020 -o -perm -002 \))" ]; then
+    echo "$password_file is readable or writable by others; install it with mode 0600" >&2
+    exit 2
+fi
+[ -d "$vault" ] || { echo "no store at $vault" >&2; exit 4; }
+
+mkdir -p "$HOME/.cache/bellwether" || exit 2
+work=$(mktemp -d "$HOME/.cache/bellwether/backup.XXXXXX") || exit 2
+trap 'rm -rf "$work"' EXIT
+trap 'exit 130' INT TERM
+
+at=$(date -u +%s)
+name="bellwether-vault-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+docker run --rm --name newsvault-backup --pull never \
+    --user "$(id -u):$(id -g)" --read-only --network none \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --mount "type=bind,src=$vault,dst=/vault,readonly" \
+    --mount "type=bind,src=$work,dst=/out" \
+    "$NEWSVAULT_IMAGE" \
+    snapshot --out /out/commit.sqlite3 --non-interactive --format json || exit
+
+# The live log and its lock stay out: the snapshot is the archive's commit.sqlite3.
+cd "$vault" || exit 4
+set --
+for entry in * .[!.]* ..?*; do
+    [ -e "$entry" ] || continue
+    case $entry in
+        commit.sqlite3 | commit.sqlite3-* | LOCK) ;;
+        *) set -- "$@" "$entry" ;;
+    esac
+done
+tar -czf "$work/$name" -C "$work" commit.sqlite3 -C "$vault" "$@" || exit 2
+bytes=$(wc -c <"$work/$name" | tr -d ' ')
+
+credentials() {
+    printf 'user = "%s:' "$(printf '%s' "$NEXTCLOUD_USER" | sed 's/[\\"]/\\&/g')"
+    sed 's/[\\"]/\\&/g' <"$password_file" | tr -d '\r\n'
+    printf '"\n'
+}
+dav_curl() {
+    credentials | curl --config - --silent --show-error --proto =https --tlsv1.2 --retry 2 "$@"
+}
+dav="${NEXTCLOUD_URL%/}/remote.php/dav/files/$NEXTCLOUD_USER"
+
+# MKCOL answers 405 for a folder that exists.
+for path in "${folder%%/*}" "$folder"; do
+    code=$(dav_curl --request MKCOL --output /dev/null --write-out '%{http_code}' "$dav/$path/") || exit 7
+    case $code in
+        201 | 405) ;;
+        *) echo "MKCOL $path answered $code" >&2; exit 7 ;;
+    esac
+done
+dav_curl --fail --upload-file "$work/$name" --output /dev/null "$dav/$folder/$name" || exit 7
+
+tmp="$NEWSVAULT_TEXTFILE_DIR/.newsvault-backup.prom.$$"
+if ! {
+    echo '# TYPE newsvault_backup_last_success_timestamp_seconds gauge'
+    echo "newsvault_backup_last_success_timestamp_seconds $at"
+    echo '# TYPE newsvault_backup_last_success_bytes gauge'
+    echo "newsvault_backup_last_success_bytes $bytes"
+} >"$tmp" || ! mv -f "$tmp" "$NEWSVAULT_TEXTFILE_DIR/newsvault-backup.prom"; then
+    rm -f "$tmp"
+    exit 2
+fi
+
+# Deletes only names of this shape, and nothing unless the listing holds the copy just put.
+listing=$(dav_curl --fail --request PROPFIND --header 'Depth: 1' "$dav/$folder/") || exit 8
+names=$(printf '%s\n' "$listing" | grep -o 'bellwether-vault-[0-9]\{8\}T[0-9]\{6\}Z\.tar\.gz' | sort -u)
+if ! printf '%s\n' "$names" | grep -qxF "$name"; then
+    echo "the listing of $folder lacks $name; nothing deleted" >&2
+    exit 8
+fi
+excess=$(($(printf '%s\n' "$names" | wc -l) - keep))
+if [ "$excess" -gt 0 ]; then
+    for old in $(printf '%s\n' "$names" | head -n "$excess"); do
+        dav_curl --fail --request DELETE --output /dev/null "$dav/$folder/$old" || exit 8
+    done
+fi
+echo "uploaded $name, $bytes bytes, to $folder; kept the $keep newest"

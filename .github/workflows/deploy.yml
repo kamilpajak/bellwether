@@ -40,11 +40,13 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: shellcheck deploy/systemd/newsvault-watchdog
-      # verify resolves %h and checks each ExecStart program exists, so the watchdog script and
-      # the env file are put where the units name them, as the install does.
+      - run: shellcheck deploy/systemd/newsvault-watchdog deploy/systemd/newsvault-backup deploy/systemd/newsvault-unit-result
+      # verify resolves %h and checks each Exec program exists, so the scripts and the env file
+      # are put where the units name them, as the install does.
       - if: ${{ !cancelled() }}
         run: |
           install -D -m 0755 deploy/systemd/newsvault-watchdog "$HOME/.local/lib/bellwether/newsvault-watchdog"
+          install -D -m 0755 deploy/systemd/newsvault-backup "$HOME/.local/lib/bellwether/newsvault-backup"
+          install -D -m 0755 deploy/systemd/newsvault-unit-result "$HOME/.local/lib/bellwether/newsvault-unit-result"
           install -D -m 0600 deploy/systemd/newsvault.env "$HOME/.config/bellwether/newsvault.env"
           systemd-analyze --user --man=no verify deploy/systemd/*.service deploy/systemd/*.timer
