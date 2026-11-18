@@ -1170,11 +1170,12 @@ const NC_SETTINGS: [&str; 4] = [
     "NEXTCLOUD_USER",
     "NEXTCLOUD_FOLDER",
 ];
-/// The template's values (owner decisions 2026-11-18) as the container sees them.
+/// The template's values as the container sees them, with the test's Nextcloud user.
 const NC_DATA: &str = "/mnt/ncdata";
-const NC_DIR: &str = "/mnt/ncdata/admin/files/Backups/bellwether";
-const NC_SCAN: &str = "php occ files:scan --path=admin/files/Backups/bellwether";
-const NC_KNOWN: &str = "php occ info:file /admin/files/Backups/bellwether";
+const NC_USER: &str = "ncuser";
+const NC_DIR: &str = "/mnt/ncdata/ncuser/files/Backups/bellwether";
+const NC_SCAN: &str = "php occ files:scan --path=ncuser/files/Backups/bellwether";
+const NC_KNOWN: &str = "php occ info:file /ncuser/files/Backups/bellwether";
 const EXEC: &str = "exec -u www-data nextcloud-aio-nextcloud";
 const EXEC_STDIN: &str = "exec -i -u www-data nextcloud-aio-nextcloud";
 const WRITE: &str = "sh -c cat >\"$1\" && wc -c <\"$1\" sh";
@@ -1392,12 +1393,12 @@ fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
         work.path().join("textfile"),
     );
     let vault = home.join(".bellwether/vault");
-    let folder = stub.join("ncdata/admin/files/Backups/bellwether");
+    let folder = stub.join("ncdata/ncuser/files/Backups/bellwether");
     for dir in [
         vault.join("blobs/sha256/ab"),
         vault.join("runs"),
         stub.join("bin"),
-        stub.join("ncdata/admin/files"),
+        stub.join("ncdata/ncuser/files"),
         textfile.clone(),
     ] {
         std::fs::create_dir_all(dir)?;
@@ -1454,6 +1455,7 @@ fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
             command.env(key, value);
         }
     }
+    command.env("NEXTCLOUD_USER", NC_USER);
     match trouble.setting {
         Some((key, Some(value))) => command.env(key, value),
         Some((key, None)) => command.env_remove(key),
@@ -1844,7 +1846,7 @@ fn a_terminated_run_exits_130_and_removes_its_work_directory_and_staging_file() 
 /// a character outside letters, digits, `.`, `_` and `-`; a safe value of another shape runs.
 #[test]
 fn an_unsafe_nextcloud_setting_is_refused_by_name_before_any_docker_call() -> TestResult {
-    let unsafe_values: [(&str, Option<&str>); 18] = [
+    let unsafe_values: [(&str, Option<&str>); 19] = [
         ("NEXTCLOUD_CONTAINER", None),
         ("NEXTCLOUD_CONTAINER", Some("")),
         ("NEXTCLOUD_CONTAINER", Some("--privileged")),
@@ -1854,7 +1856,8 @@ fn an_unsafe_nextcloud_setting_is_refused_by_name_before_any_docker_call() -> Te
         ("NEXTCLOUD_DATA", Some("/")),
         ("NEXTCLOUD_DATA", Some("/mnt/ncdata/")),
         ("NEXTCLOUD_USER", Some("..")),
-        ("NEXTCLOUD_USER", Some("admin/files")),
+        ("NEXTCLOUD_USER", Some("ncuser/files")),
+        ("NEXTCLOUD_USER", Some("<nextcloud-user-id>")),
         ("NEXTCLOUD_FOLDER", Some("/Backups")),
         ("NEXTCLOUD_FOLDER", Some("Backups/../../etc")),
         ("NEXTCLOUD_FOLDER", Some("Backups//bellwether")),
@@ -1894,7 +1897,7 @@ fn an_unsafe_nextcloud_setting_is_refused_by_name_before_any_docker_call() -> Te
                 .first()
                 .cloned()
                 .unwrap_or_default()
-                .ends_with(&format!("{NC_DATA}/admin/files/Backups/bell_wether-2.x"))
+                .ends_with(&format!("{NC_DATA}/ncuser/files/Backups/bell_wether-2.x"))
         ),
         (expected, Some(0), true)
     );
