@@ -5276,6 +5276,36 @@ fn deadline_run(
     Ok((root, answer))
 }
 
+/// Half an hour before `MONDAY_AT`, the same UTC day, so `--at` passes its own checks.
+const MONDAY_EARLIER: &str = "2026-11-16T09:00:00Z";
+const JUST_AFTER_MONDAY_AT: &str = "2026-11-16T09:30:30.000001Z";
+
+/// S7-D2: the deadline bounds the wall time, so one after a past `--at` but at the clock's own
+/// instant is a usage error with nothing sent; 1 µs later the run goes.
+#[test]
+fn a_deadline_the_clock_has_reached_is_refused_even_after_at() -> TestResult {
+    let mut answered = Vec::new();
+    for deadline in [MONDAY_AT, JUST_AFTER_MONDAY_AT] {
+        let root = TempDir::new()?;
+        seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+        let exchange = Gnw::five_hosts()?;
+        let ask = Ask {
+            hosts: Some(seed::committed_hosts()),
+            at: instant(MONDAY_EARLIER),
+            deadline: Some(instant(deadline)),
+            ..ask(root.path(), cmd_collect::TODAY)
+        };
+        let opened = cmd_collect::open_provider(&ask)?;
+        let refused = matches!(
+            cmd_collect::run(&ask, &opened, &exchange, &Monday),
+            Err(CollectRunError::DeadlineNotAfterNow { .. })
+        );
+        answered.push((refused, exchange.sent().0.is_empty()));
+    }
+    assert_eq!(answered, vec![(true, true), (false, false)]);
+    Ok(())
+}
+
 /// PRN held for 2 h once its RSS answered, every other host at its ordinary pace, and the
 /// deadline 25 s after the run's instant.
 fn held_and_paced_run() -> Result<(TempDir, cmd_collect::Answer, Gnw), Box<dyn Error>> {
@@ -5477,8 +5507,8 @@ fn deferred_requests_open_no_attempt_and_every_reader_counts_each_reason_apart()
     Ok(())
 }
 
-/// No deadline, today's behaviour: a reserving exchange is still handed `None`, refuses
-/// nothing, and the run asks every request it did before condition A.
+/// No deadline: every request is still reserved once through `reserve`, with `None`, nothing is
+/// refused, and the run asks every request it did before condition A.
 #[test]
 fn with_no_deadline_every_request_is_asked_and_nothing_is_deferred() -> TestResult {
     let root = TempDir::new()?;
@@ -5496,7 +5526,7 @@ fn with_no_deadline_every_request_is_asked_and_nothing_is_deferred() -> TestResu
     let deadlines = exchange
         .paced
         .as_ref()
-        .map(|paced| paced.deadlines.borrow().iter().all(Option::is_none));
+        .map(|paced| paced.deadlines.borrow().clone());
     assert_eq!(
         (
             sent.len(),
@@ -5508,7 +5538,7 @@ fn with_no_deadline_every_request_is_asked_and_nothing_is_deferred() -> TestResu
         (
             FIVE_HOST_FOLLOW_UPS + 6,
             0,
-            Some(true),
+            Some(vec![None; FIVE_HOST_FOLLOW_UPS + 6]),
             Value::Null,
             Exit::Ok
         )

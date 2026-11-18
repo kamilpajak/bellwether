@@ -118,6 +118,13 @@ pub enum CollectRunError {
         deadline: DateTime<Utc>,
         at: DateTime<Utc>,
     },
+    /// S7-D2: the deadline bounds the run's wall time, so one the clock has reached would defer
+    /// every request too; `--at` may lie in the past, so the check above does not catch it.
+    #[error("--deadline {deadline} is not after the clock's {now}")]
+    DeadlineNotAfterNow {
+        deadline: DateTime<Utc>,
+        now: DateTime<Utc>,
+    },
     #[error("no {what} at {path}")]
     InputAbsent { what: &'static str, path: PathBuf },
     #[error("the calendar at {path} is unusable: {why}")]
@@ -223,6 +230,7 @@ impl CollectRunError {
             | Self::AtIsNotTheClockDay { .. }
             | Self::TodayRefused { .. }
             | Self::DeadlineNotAfterAt { .. }
+            | Self::DeadlineNotAfterNow { .. }
             | Self::WindowRefused(_) => true,
             Self::InputAbsent { .. }
             | Self::UnusableCalendar { .. }
@@ -873,8 +881,12 @@ pub fn run(
     if ask.dry_run {
         return planned(ask, opened, &run_id, run_date);
     }
+    let now = clock.now();
+    if let Some(deadline) = ask.deadline.filter(|deadline| *deadline <= now) {
+        return Err(CollectRunError::DeadlineNotAfterNow { deadline, now });
+    }
     // A dry run may name another day, which tests and plans need; a fetch may not.
-    let today = clock.now().date_naive();
+    let today = now.date_naive();
     if provider.cadence() == Cadence::EveryUtcDay && run_date != today {
         return Err(CollectRunError::AtIsNotTheClockDay {
             source_id: opened.registered.source(),
