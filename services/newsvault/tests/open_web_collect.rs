@@ -5087,3 +5087,74 @@ fn the_151st_follow_up_is_deferred_recorded_and_never_sent_and_the_run_exits_8()
     );
     Ok(())
 }
+
+/// `RSS_1205` with `extra` synthetic English releases after its three, ids from 3405000 up.
+fn gnw_rss_with(extra: u64) -> Result<Vec<u8>, Box<dyn Error>> {
+    let fixture =
+        std::fs::read_to_string(provider_dir().join("tests/fixtures/gnw").join(RSS_1205))?;
+    let items: String = (0..extra)
+        .map(|nth| {
+            let id = 3_405_000 + nth;
+            let url = format!(
+                "https://www.globenewswire.com/news-release/2026/11/17/{id}/0/en/capped.html"
+            );
+            format!(
+                "<item><guid isPermaLink=\"true\">{url}</guid><link>{url}</link>\
+                 <title>A capped release</title><pubDate>Tue, 17 Nov 2026 12:03 GMT</pubDate>\
+                 <dc:identifier>{id}</dc:identifier><dc:language>en</dc:language></item>\n"
+            )
+        })
+        .collect();
+    Ok(fixture
+        .replacen("</channel>", &format!("{items}</channel>"), 1)
+        .into_bytes())
+}
+
+/// S7-D6's exception on the real path: a walked poll whose listed follow-ups pass the cap still
+/// sends every walk id and defers listed releases only; a deferral takes no ordinal, so the walk
+/// ids asked after it keep dense `attempt_id`s.
+#[test]
+fn a_walked_poll_past_the_cap_sends_every_walk_id_and_defers_listed_releases_only() -> TestResult {
+    let root = after_a_first_walked_poll()?;
+    let mut exchange = Gnw::walked(RSS_1205)?;
+    exchange.pages.insert(
+        INDEX.to_owned(),
+        gnw_rss_with(u64::try_from(FOLLOW_UP_CAP)?)?,
+    );
+    let second = walked_poll(
+        root.path(),
+        hosts_fixture(WALK_HOSTS),
+        WALK_SECOND,
+        &exchange,
+    )?;
+    let (sent, _) = exchange.sent();
+    let deferred: Vec<String> = stored_deferred(root.path())?
+        .into_iter()
+        .map(|row| row.4)
+        .collect();
+    let walked = [3_404_416, 3_404_417, 3_404_418, 3_404_420, 3_404_421];
+    assert_eq!(
+        (
+            walked_ids(&sent),
+            deferred.len(),
+            deferred
+                .iter()
+                .all(|url| url.ends_with("/0/en/capped.html")),
+            second.exit.error_code(),
+        ),
+        (walked.to_vec(), 3, true, Some("partial_collect"))
+    );
+    let run = second.envelope["run_id"].as_str().ok_or("run_id")?;
+    let window = second.envelope["window"].as_str().ok_or("window")?;
+    let ids: Vec<Option<String>> = second.envelope["attempts"]
+        .as_array()
+        .ok_or("attempts")?
+        .iter()
+        .map(|row| row["attempt_id"].as_str().map(str::to_owned))
+        .collect();
+    let dense: Vec<Option<String>> = (0..u32::try_from(ids.len())?)
+        .map(|ordinal| digest(canon::digest::attempt_id(run, SOURCE, window, ordinal)))
+        .collect();
+    assert_eq!(ids, dense);
+    Ok(())
+}

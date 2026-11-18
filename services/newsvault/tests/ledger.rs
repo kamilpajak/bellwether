@@ -1151,5 +1151,14 @@ fn deferred_rows_are_counted_per_reason_for_the_source_and_day_of_their_run() ->
         ),
         (Some(5), Some(7), Some(11), Some(0), vec![Some(5), Some(7)])
     );
+    let edgar = run(
+        &root,
+        &["--from", FIRST_DAY, "--to", FIRST_DAY, "--source", EDGAR],
+    )?
+    .json()?;
+    let filtered = |source: &str| {
+        per_source(&edgar, FIRST_DAY, source).map(|row| row["deferred"]["follow_up_cap"].as_i64())
+    };
+    assert_eq!((filtered(EDGAR), filtered(POLYGON)), (Some(Some(5)), None));
     Ok(())
 }
