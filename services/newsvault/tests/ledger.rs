@@ -1190,7 +1190,7 @@ fn busy_runs(root: &TempDir) -> TestResult {
         (
             "run-0710-b.json",
             serde_json::json!({"schema": "newsvault.run/1", "run_id": "run-0710-b",
-                "run_date": BUSY_DAY, "expected_runs": 2,
+                "run_date": BUSY_DAY, "expected_runs": 3,
                 "started_at": "2026-07-10T11:00:01Z", "finished_at": "2026-07-10T11:00:01Z",
                 "refused": "lease_held"}),
         ),
@@ -1208,9 +1208,9 @@ fn busy_runs(root: &TempDir) -> TestResult {
     Ok(())
 }
 
-/// The lease-held run is left out of the runs observed, so its day is one run short; its
-/// day's wall time and busy hosts are the observed run's; past half a day, never at it, each
-/// bound is a `--check` finding; the human lines state the same numbers.
+/// The lease-held run is left out of the runs observed and still sets its day's runs expected
+/// (3, above the observed run's 2); its day's wall time and busy hosts are the observed run's;
+/// past half a day, never at it, each bound is a `--check` finding; the human lines agree.
 #[test]
 fn the_ledger_sums_busy_time_against_half_a_day_and_leaves_lease_held_runs_unobserved() -> TestResult
 {
@@ -1247,7 +1247,7 @@ fn the_ledger_sums_busy_time_against_half_a_day_and_leaves_lease_held_runs_unobs
             ],
             [
                 Value::from(1),
-                Value::from(2),
+                Value::from(3),
                 Value::from(1),
                 Value::from(43_200.0),
                 Value::from(0.5),

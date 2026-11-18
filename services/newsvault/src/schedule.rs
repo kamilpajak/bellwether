@@ -251,6 +251,7 @@ mod tests {
     fn each_broken_table_is_refused_by_name() {
         const EMPTY: [Slot; 0] = [];
         const OFF_DAY: [Slot; 2] = [at(11, 0, 30), at(24, 0, 30)];
+        const OFF_HOUR: [Slot; 2] = [at(11, 0, 30), at(11, 60, 30)];
         const TWICE: [Slot; 3] = [at(11, 0, 30), at(11, 0, 30), at(11, 30, 30)];
         const BACKWARDS: [Slot; 2] = [at(11, 30, 30), at(11, 0, 30)];
         const SHORT: [Slot; 2] = [at(11, 0, 1), at(11, 1, 1)];
@@ -259,6 +260,7 @@ mod tests {
             [
                 refusal(&EMPTY),
                 refusal(&OFF_DAY),
+                refusal(&OFF_HOUR),
                 refusal(&TWICE),
                 refusal(&BACKWARDS),
                 refusal(&SHORT),
@@ -269,6 +271,10 @@ mod tests {
                 Some(ScheduleRefusal::NotATimeOfDay {
                     hour: 24,
                     minute: 0
+                }),
+                Some(ScheduleRefusal::NotATimeOfDay {
+                    hour: 11,
+                    minute: 60
                 }),
                 Some(ScheduleRefusal::DuplicateSlot {
                     slot: "11:00".to_owned()
@@ -389,6 +395,64 @@ mod tests {
             at_eleven.map(|at: SlotAt| at.deadline(PATIENCE)),
             Some(instant("2026-11-17T11:29:30Z"))
         );
+    }
+
+    const STOPS: [&str; 31] = [
+        "18 00:30:00 18 02:00:00 18 01:14:30",
+        "18 02:00:00 18 03:30:00 18 02:44:30",
+        "18 03:30:00 18 05:00:00 18 04:14:30",
+        "18 05:00:00 18 06:30:00 18 05:44:30",
+        "18 06:30:00 18 08:00:00 18 07:14:30",
+        "18 08:00:00 18 09:30:00 18 08:44:30",
+        "18 09:30:00 18 11:00:00 18 10:14:30",
+        "18 11:00:00 18 11:30:00 18 11:14:30",
+        "18 11:30:00 18 12:00:00 18 11:44:30",
+        "18 12:00:00 18 12:30:00 18 12:14:30",
+        "18 12:30:00 18 13:00:00 18 12:44:30",
+        "18 13:00:00 18 13:30:00 18 13:14:30",
+        "18 13:30:00 18 14:00:00 18 13:44:30",
+        "18 14:00:00 18 14:30:00 18 14:14:30",
+        "18 14:30:00 18 15:00:00 18 14:44:30",
+        "18 15:00:00 18 15:30:00 18 15:14:30",
+        "18 15:30:00 18 16:00:00 18 15:44:30",
+        "18 16:00:00 18 16:30:00 18 16:14:30",
+        "18 16:30:00 18 17:00:00 18 16:44:30",
+        "18 17:00:00 18 17:30:00 18 17:14:30",
+        "18 17:30:00 18 18:00:00 18 17:44:30",
+        "18 18:00:00 18 18:30:00 18 18:14:30",
+        "18 18:30:00 18 19:00:00 18 18:44:30",
+        "18 19:00:00 18 19:30:00 18 19:14:30",
+        "18 19:30:00 18 20:00:00 18 19:44:30",
+        "18 20:00:00 18 20:30:00 18 20:14:30",
+        "18 20:30:00 18 21:00:00 18 20:44:30",
+        "18 21:00:00 18 21:30:00 18 21:14:30",
+        "18 21:30:00 18 22:00:00 18 21:44:30",
+        "18 22:00:00 18 23:30:00 18 22:14:30",
+        "18 23:30:00 19 00:30:00 19 00:14:30",
+    ];
+
+    /// Architecture.md section 11.2's stop column: each committed slot run at its own start on
+    /// 2026-11-18, as `start next stop`. A dropped, moved or re-periodised slot is red here.
+    #[test]
+    fn every_committed_slot_stops_where_section_11_2_says() {
+        let shown = |instant: DateTime<Utc>| instant.format("%d %H:%M:%S").to_string();
+        let replayed: Vec<String> = committed(PATIENCE)
+            .ok()
+            .map(|schedule| {
+                SLOTS
+                    .iter()
+                    .filter_map(|slot| {
+                        let start = format!("2026-11-18T{:02}:{:02}:00Z", slot.hour, slot.minute);
+                        schedule.slot_at(instant(&start))
+                    })
+                    .map(|at| {
+                        let stop = at.deadline(PATIENCE);
+                        format!("{} {} {}", shown(at.start), shown(at.next), shown(stop))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(replayed, STOPS);
     }
 
     /// The cross-check lead and the GNW frontier age are the committed schedule's periods, so a

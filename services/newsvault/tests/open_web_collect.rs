@@ -5673,6 +5673,85 @@ fn the_walks_frontier_answer_must_be_a_shortest_period_old() -> TestResult {
     Ok(())
 }
 
+/// The real time order: a live poll's answer arrives after its own `--at` (here 1 s after, the
+/// clock 2 s after). The 12:30:30 poll finds the 12:00:30 answer 29:59 old, so it is
+/// `range_unread`; the 13:00:30 poll walks to the 12:00:30 answer, two 30-min slots back.
+#[test]
+fn in_real_time_order_a_walk_reads_the_answer_of_two_busy_slots_back() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts_fixture(WALK_HOSTS), ROBOTS_EARLIER)?;
+    let mut seen = Vec::new();
+    for (at, feed) in [
+        (WALK_FIRST, RSS_1200),
+        (WALK_SECOND, RSS_1205),
+        (WALK_THIRD, RSS_1205),
+    ] {
+        let exchange = Gnw::walked(feed)?;
+        let ask = Ask {
+            hosts: Some(hosts_fixture(WALK_HOSTS)),
+            at: instant(at),
+            schedule: Some("walk".to_owned()),
+            ..ask(root.path(), cmd_collect::TODAY)
+        };
+        let opened = cmd_collect::open_provider(&ask)?;
+        let clock = At(instant(at) + TimeDelta::seconds(ANSWER_AFTER_AT_S + 1));
+        let poll = cmd_collect::run(&ask, &opened, &exchange, &clock)?;
+        let (sent, _) = exchange.sent();
+        let walk = &poll.envelope["walk"][0];
+        seen.push((
+            walked_ids(&sent).len(),
+            walk["through"].clone(),
+            walk["continuity"].clone(),
+        ));
+    }
+    assert_eq!(
+        seen,
+        vec![
+            (0, Value::Null, Value::from("first_poll")),
+            (0, Value::Null, Value::from("range_unread")),
+            (5, Value::from(FIRST_FRONTIER), Value::from("complete")),
+        ]
+    );
+    Ok(())
+}
+
+/// How long after its `--at` a live poll's answer is received in
+/// `in_real_time_order_a_walk_reads_the_answer_of_two_busy_slots_back`.
+const ANSWER_AFTER_AT_S: i64 = 1;
+
+/// S7-D3 and S7-D11 read the clock, not `--at`: a run planned at 18:59:30 (the 18:30 slot) and
+/// started at 19:00:30 takes the 19:00 slot's 19:14:30 stop, and its wall time starts at 19:00:30.
+#[test]
+fn the_slot_and_the_wall_time_come_from_the_clock_not_from_at() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let clock = Rc::new(Cell::new(instant(RUN_AT)));
+    let exchange = Ticked {
+        inner: Gnw::day()?,
+        clock: clock.clone(),
+    };
+    let ask = Ask {
+        at: instant("2026-11-14T18:59:30Z"),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, &exchange, &Ticking(clock.clone()))?;
+    let ran = (clock.get() - instant(RUN_AT)).num_seconds();
+    assert_eq!(
+        (
+            answer.envelope["deadline"].clone(),
+            answer.envelope["slot"]["start"].clone(),
+            answer.envelope["busy"]["wall_s"].as_f64(),
+        ),
+        (
+            Value::from("2026-11-14T19:14:30.000000Z"),
+            Value::from("2026-11-14T19:00:00.000000Z"),
+            Some(ran as f64),
+        )
+    );
+    Ok(())
+}
+
 /// The frontier's age is read against `--at`, so a live open-web run may not plan after the
 /// clock: 1 µs later is a usage error with nothing sent.
 #[test]

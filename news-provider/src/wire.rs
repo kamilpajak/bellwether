@@ -2260,6 +2260,33 @@ mod tests {
         Ok(())
     }
 
+    /// The read half of `held_until`: a hold an earlier run left in `pace/<host>.hold`, with no
+    /// 429 in this run, is still the hold this run reports for that host.
+    #[test]
+    fn a_wire_reports_a_hold_an_earlier_run_left_beside_the_store() -> Checked {
+        let store = tempfile::tempdir()?;
+        let held_until = instant_of("2026-11-10T13:05:00Z")?;
+        let host = crate::budget::HostKey::new("localhost")?;
+        crate::budget::Hold::beside_the_store(store.path(), &host).raise(held_until)?;
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let wire = Wire::with_sleeper(
+            polite_profile(),
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        status_of(&wire, &clock, 0, LOCALHOST)?;
+        assert_eq!(
+            wire.slowed("localhost"),
+            Slowed {
+                doublings: 0,
+                held_until: Some(held_until)
+            }
+        );
+        Ok(())
+    }
+
     fn instant_of(text: &str) -> Result<DateTime<Utc>, chrono::ParseError> {
         text.parse()
     }
