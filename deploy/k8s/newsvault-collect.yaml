@@ -1,6 +1,7 @@
 # Kept for a later move to Kubernetes (S7-D10, option C); validated in CI, not deployed. Two
 # CronJobs because one cron line cannot hold the 31 slots; the deploy test holds their union equal
-# to SLOTS and their job templates equal. The Secret is created by hand, never committed.
+# to SLOTS and their job templates equal. The Secret is created by hand, never committed:
+# kubectl create secret generic bellwether-feed-contact --from-file=contact=<file>
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -86,6 +87,9 @@ spec:
               secret:
                 secretName: bellwether-feed-contact
                 defaultMode: 0440
+                items:
+                  - key: contact
+                    path: contact
             - name: tmp
               emptyDir:
                 sizeLimit: 16Mi
@@ -165,6 +169,9 @@ spec:
               secret:
                 secretName: bellwether-feed-contact
                 defaultMode: 0440
+                items:
+                  - key: contact
+                    path: contact
             - name: tmp
               emptyDir:
                 sizeLimit: 16Mi
