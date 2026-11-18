@@ -1,0 +1,26 @@
+# Started by hand only: before go-live and after a hosts-file change (S7-D10). It takes the store
+# lock the collect unit takes, so the two never overlap; a refresh started during a collect exits 7
+# at once and is started again after it.
+[Unit]
+Description=newsvault robots refresh of every hosts-file row
+Documentation=https://github.com/kamilpajak/bellwether/blob/main/docs/design/architecture.md
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/bellwether/newsvault.env
+ExecStart=/usr/bin/flock --nonblock --conflict-exit-code 7 %t/bellwether-store.lock \
+    /usr/bin/docker run --rm --name newsvault-robots-refresh --pull never \
+    --user %U:%G --read-only --tmpfs /tmp:rw,size=16m \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --mount type=bind,src=%h/.bellwether/vault,dst=/vault \
+    --mount type=bind,src=%h/.config/bellwether/feed-contact,dst=/run/secrets/feed-contact,readonly \
+    --env BELLWETHER_FEED_CONTACT_FILE=/run/secrets/feed-contact \
+    ${NEWSVAULT_IMAGE} \
+    robots refresh --source open_web_wires \
+    --hosts /usr/share/bellwether/open_web_wires.hosts.json \
+    --rules /usr/share/bellwether/open-web-feed.rules.json \
+    --non-interactive --format json
+ExecStopPost=/bin/sh -c 'if [ "$$SERVICE_RESULT" = timeout ]; then /usr/bin/docker rm --force newsvault-robots-refresh; fi'
+# The collect unit's bound, which the deploy test holds equal: a hung refresh holds the lock no
+# longer than a hung collect would.
+TimeoutStartSec=2790

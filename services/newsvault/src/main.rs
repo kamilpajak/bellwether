@@ -15,6 +15,7 @@ use newsvault::cmd_collect::{self, CollectRunError};
 use newsvault::cmd_items;
 use newsvault::cmd_ledger::{self, Ask, LedgerReadError, Report};
 use newsvault::cmd_robots::{self, RobotsError};
+use newsvault::contact::{self, ContactError};
 use newsvault::lake::{Day, LakeError, LakeReader};
 use newsvault::publish::{publish_run, Fsync, PublishError};
 use newsvault::store::{Committer, StoreError};
@@ -84,8 +85,9 @@ enum Command {
         /// Answer one question - is the coverage shortfall over its bound - and exit 1 for no.
         #[arg(long)]
         check: bool,
-        #[arg(long, value_enum, default_value_t = Format::Human)]
-        format: Format,
+        /// `prometheus` writes node-exporter textfile metrics (newsvault.prom/1) for the watchdog.
+        #[arg(long, value_enum, default_value_t = LedgerFormat::Human)]
+        format: LedgerFormat,
     },
     /// Exports every committed row no segment carries yet, one segment per publication day.
     Publish {
@@ -230,6 +232,14 @@ enum Format {
     Json,
 }
 
+/// The ledger alone has a third rendering: its counts as Prometheus textfile metrics.
+#[derive(Clone, Copy, ValueEnum)]
+enum LedgerFormat {
+    Human,
+    Json,
+    Prometheus,
+}
+
 /// `all` is the default on purpose: a default that silently collapses rows is R1's defect moved
 /// into the view (architecture.md section 8 row R1).
 #[derive(Clone, Copy, ValueEnum)]
@@ -272,6 +282,9 @@ fn prefix_of(failure: &anyhow::Error) -> &'static str {
         || failure
             .downcast_ref::<RobotsError>()
             .is_some_and(RobotsError::is_usage)
+        || failure
+            .downcast_ref::<ContactError>()
+            .is_some_and(ContactError::is_usage)
     {
         "usage error"
     } else {
@@ -328,6 +341,12 @@ fn exit_code(failure: &anyhow::Error) -> u8 {
                 | open_web_feed::Refusal::NoHostAdmitted(_),
             ) => EXIT_NOT_FOUND,
             RobotsError::Store(StoreError::LeaseHeld(_)) => EXIT_LEASE_HELD,
+            _ => EXIT_USAGE,
+        };
+    }
+    if let Some(refused) = failure.downcast_ref::<ContactError>() {
+        return match refused {
+            ContactError::FileAbsent { .. } => EXIT_NOT_FOUND,
             _ => EXIT_USAGE,
         };
     }
@@ -404,7 +423,7 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 check,
             };
             let report = cmd_ledger::read(&vault_root(store), &ask)?;
-            emit_ledger(&report, format)?;
+            emit_ledger(&report, ask.at, format)?;
             Ok(if !report.is_complete() {
                 Verdict::No(EXIT_INCOMPLETE)
             } else if report.answer_is_no() {
@@ -445,7 +464,7 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 hosts,
                 rules,
                 lag_policy,
-                contact: contact(registered),
+                contact: contact(registered)?,
                 at: match at {
                     Some(raw) => instant(&raw, "--at"),
                     None => clock.now(),
@@ -493,7 +512,7 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 hosts,
                 rules,
                 store: vault_root(store),
-                contact: contact(registered),
+                contact: contact(registered)?,
                 dry_run,
             };
             let feed = cmd_robots::open(&ask)?;
@@ -571,11 +590,15 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
     }
 }
 
-/// The User-Agent's contact address, from the chosen provider's own variable. It comes from the
-/// environment and never from a flag, so it is not in a process listing; an unset variable reads
-/// as empty and the provider refuses it at startup as `credential_contact_missing`.
-fn contact(registered: cmd_collect::Registered) -> String {
-    std::env::var(registered.contact_variable()).unwrap_or_default()
+/// The User-Agent's contact address, from the chosen provider's own variable or the file its
+/// `_FILE` twin names; never from a flag, so it is not in a process listing. Neither set reads as
+/// empty, which the provider refuses at startup as `credential_contact_missing`.
+fn contact(registered: cmd_collect::Registered) -> Result<String, ContactError> {
+    contact::read(
+        registered.contact_variable(),
+        registered.contact_file_variable(),
+        |name| std::env::var_os(name),
+    )
 }
 
 fn emit_collect(envelope: &serde_json::Value, format: Format) -> anyhow::Result<()> {
@@ -781,15 +804,16 @@ fn stamped(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
-fn emit_ledger(report: &Report, format: Format) -> anyhow::Result<()> {
+fn emit_ledger(report: &Report, at: DateTime<Utc>, format: LedgerFormat) -> anyhow::Result<()> {
     let out = std::io::stdout();
     let mut out = out.lock();
     match format {
-        Format::Json => {
+        LedgerFormat::Json => {
             serde_json::to_writer_pretty(&mut out, report)?;
             writeln!(out)?;
         }
-        Format::Human => cmd_ledger::render_human(report, &mut out)?,
+        LedgerFormat::Human => cmd_ledger::render_human(report, &mut out)?,
+        LedgerFormat::Prometheus => cmd_ledger::render_prometheus(report, at, &mut out)?,
     }
     Ok(())
 }
@@ -910,6 +934,12 @@ fn emit(day: &Day, before_cutoff: usize, format: Format) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One text for both `_FILE` variables, so the two cannot describe one rule two ways.
+const CONTACT_FILE_DOC: &str = "a file holding the contact instead, one trailing newline removed; \
+    set with its variable: invalid_argument (2); absent: input_absent (4); unreadable or not UTF-8: \
+    io_failed (2); empty: credential_contact_missing (2); a control character left: \
+    input_unparseable (2)";
+
 fn print_schema(format: Format) {
     let doc = serde_json::json!({
         "schema": "newsvault.schema/1",
@@ -951,9 +981,12 @@ fn print_schema(format: Format) {
                      "doc": "caps the rows within a day, never the number of days"},
                     {"name": "check", "type": "flag",
                      "doc": "exit 1 when the answer is no"},
-                    {"name": "format", "type": "enum", "values": ["human", "json"]}
+                    {"name": "format", "type": "enum", "values": ["human", "json", "prometheus"],
+                     "doc": "prometheus: node-exporter textfile metrics, schema newsvault.prom/1, \
+                             on stdout for the same exits 0, 1 and 8"}
                 ],
                 "output": cmd_ledger::SCHEMA,
+                "outputs": {"json": cmd_ledger::SCHEMA, "prometheus": cmd_ledger::PROMETHEUS_SCHEMA},
                 "mutates": false
             },
             {
@@ -1003,8 +1036,12 @@ fn print_schema(format: Format) {
                 ],
                 "env": [{"name": "BELLWETHER_SEC_CONTACT", "source": "edgar_press",
                          "doc": "the contact address SEC requires in the User-Agent"},
+                        {"name": "BELLWETHER_SEC_CONTACT_FILE", "source": "edgar_press",
+                         "doc": CONTACT_FILE_DOC},
                         {"name": "BELLWETHER_FEED_CONTACT", "source": "open_web_wires",
-                         "doc": "the contact address the open-web User-Agent carries"}],
+                         "doc": "the contact address the open-web User-Agent carries"},
+                        {"name": "BELLWETHER_FEED_CONTACT_FILE", "source": "open_web_wires",
+                         "doc": CONTACT_FILE_DOC}],
                 "output": cmd_collect::SCHEMA,
                 "mutates": true
             },
@@ -1058,6 +1095,8 @@ fn print_schema(format: Format) {
                 ],
                 "env": [{"name": "BELLWETHER_FEED_CONTACT", "source": "open_web_wires",
                          "doc": "the contact address the open-web User-Agent carries"},
+                        {"name": "BELLWETHER_FEED_CONTACT_FILE", "source": "open_web_wires",
+                         "doc": CONTACT_FILE_DOC},
                         {"name": "BELLWETHER_VAULT",
                          "doc": "the store when --store is not given, then ~/.bellwether/vault"}],
                 "output": cmd_robots::SCHEMA,

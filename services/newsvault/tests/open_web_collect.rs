@@ -6219,11 +6219,11 @@ fn carried_line(envelope: &Value) -> Result<Option<String>, Box<dyn Error>> {
         .map(str::to_owned))
 }
 
-/// S7-D5: the four walk ids the 12:30:30 poll's deadline cut are asked first by the 13:00:30 poll,
-/// ahead of GNW's index, and each row is closed `answered` by its first attempt. The first answers
+/// S7-D5: the four walk ids the 12:30:30 poll's deadline cut are asked by the 13:00:30 poll right
+/// behind GNW's index (lane order amended 2026-11-18), each row closed `answered` by its first attempt. The first answers
 /// 503 and is asked once more, never by the walk too. The run file names its source (answer 6).
 #[test]
-fn deferred_walk_ids_are_carried_to_the_front_of_their_lane_and_closed_answered() -> TestResult {
+fn deferred_walk_ids_are_carried_behind_their_lanes_index_and_closed_answered() -> TestResult {
     let root = after_a_first_walked_poll()?;
     let mut cut = Gnw::walked(RSS_1205)?;
     cut.paced = Some(paced(&[], Vec::new()));
@@ -6275,7 +6275,12 @@ fn deferred_walk_ids_are_carried_to_the_front_of_their_lane_and_closed_answered(
         ),
         (
             vec![3_404_417, 3_404_418, 3_404_420, 3_404_421],
-            Some(deferred.iter().cloned().chain([INDEX.to_owned()]).collect()),
+            Some(
+                [INDEX.to_owned()]
+                    .into_iter()
+                    .chain(deferred.iter().cloned())
+                    .collect()
+            ),
             vec![2, 1, 1, 1],
         )
     );
@@ -6411,7 +6416,7 @@ fn a_deferred_item_is_carried_at_23_59_59_and_closed_expired_at_24_hours() -> Te
             .filter(|finding| finding.code == "deferred_expired")
             .count();
         seen.push((
-            sent.first() == Some(&url),
+            sent.get(1) == Some(&url),
             carried_of(&second.envelope),
             closed_rows(root.path())?
                 .into_iter()
@@ -6575,8 +6580,9 @@ fn a_young_item_the_provider_cannot_rebuild_is_not_asked_and_stays_open() -> Tes
 }
 
 /// S7-D5's age is read at the run's start: an unrebuildable item 23:59:50 old stays open though the
-/// clock passes 24 h during the run. A carried row closes at the clock of its closing attempt,
-/// 12 s on (`WAIT` + `TOOK` + `AFTER`). Mutations: age at the close, `closed_at` at the start: red.
+/// clock passes 24 h during the run. A carried row closes at the clock of its closing attempt, the
+/// second after GNW's index, 2 × 12 s on (`WAIT` + `TOOK` + `AFTER`). Mutations: age at the close,
+/// `closed_at` at the start: red.
 #[test]
 fn age_is_read_at_the_runs_start_and_a_row_closes_at_its_attempts_clock() -> TestResult {
     let root = after_a_first_walked_poll()?;
@@ -6629,7 +6635,7 @@ fn age_is_read_at_the_runs_start_and_a_row_closes_at_its_attempts_clock() -> Tes
                 (unrebuildable.to_owned(), false, Value::Null, 1),
                 (carried, true, Value::from("answered"), 1),
             ],
-            vec![(1, micros(start + WAIT + TOOK + AFTER))],
+            vec![(1, micros(start + (WAIT + TOOK + AFTER) * 2))],
         )
     );
     Ok(())
@@ -6658,8 +6664,12 @@ fn an_at_with_no_schedule_slot_before_it_is_refused_by_name() -> TestResult {
     Ok(())
 }
 
-/// `WALK_SECOND` plus 5 s: GNW's first slot goes, its second, at 10 s, is past it.
-const WALK_SECOND_PLUS_5_S: &str = "2026-11-17T12:30:35Z";
+/// `WALK_SECOND` plus 15 s: GNW's slots at 0 s (its index) and 10 s go, its third, at 20 s, is
+/// past it.
+const WALK_SECOND_PLUS_15_S: &str = "2026-11-17T12:30:45Z";
+/// Above the highest id `RSS_1205` lists, so the walk of a run that asked GNW's index never
+/// reaches it.
+const ABOVE_EVERY_WALK: u64 = 3_404_530;
 
 /// S7-D5: a carried request the deadline stops again gets a new `deferred` row and keeps its old
 /// one open, so the next run carries one item over both rows and ages it from the older: exactly
@@ -6668,18 +6678,18 @@ const WALK_SECOND_PLUS_5_S: &str = "2026-11-17T12:30:35Z";
 fn a_carried_request_deferred_again_keeps_its_rows_open_and_ages_from_its_first() -> TestResult {
     let root = after_a_first_walked_poll()?;
     let first = instant(WALK_SECOND) - TimeDelta::hours(1);
-    let (asked, again) = (walk_url(UNLISTED_ID + 1), walk_url(UNLISTED_ID));
+    let (asked, again) = (walk_url(ABOVE_EVERY_WALK + 1), walk_url(ABOVE_EVERY_WALK));
     an_open_row(
         root.path(),
         &asked,
-        walk_story(UNLISTED_ID + 1).as_deref(),
+        walk_story(ABOVE_EVERY_WALK + 1).as_deref(),
         None,
         first,
     )?;
     an_open_row(
         root.path(),
         &again,
-        walk_story(UNLISTED_ID).as_deref(),
+        walk_story(ABOVE_EVERY_WALK).as_deref(),
         None,
         first + TimeDelta::seconds(1),
     )?;
@@ -6688,7 +6698,7 @@ fn a_carried_request_deferred_again_keeps_its_rows_open_and_ages_from_its_first(
     let ask = Ask {
         hosts: Some(hosts_fixture(WALK_HOSTS)),
         at: instant(WALK_SECOND),
-        deadline: Some(instant(WALK_SECOND_PLUS_5_S)),
+        deadline: Some(instant(WALK_SECOND_PLUS_15_S)),
         schedule: Some("walk".to_owned()),
         ..ask(root.path(), cmd_collect::TODAY)
     };
@@ -6719,7 +6729,7 @@ fn a_carried_request_deferred_again_keeps_its_rows_open_and_ages_from_its_first(
             second.exit.error_code(),
         ),
         (
-            vec![asked.clone()],
+            vec![INDEX.to_owned(), asked.clone()],
             vec![
                 (asked, true, Value::from("answered"), 1),
                 (again.clone(), true, Value::Null, 1),
@@ -6729,13 +6739,22 @@ fn a_carried_request_deferred_again_keeps_its_rows_open_and_ages_from_its_first(
             Some("partial_collect"),
         )
     );
+    let again_ids: Vec<i64> = stored_deferred(root.path())?
+        .into_iter()
+        .zip(1..)
+        .filter(|(row, _)| row.4 == again)
+        .map(|(_, id)| id)
+        .collect();
     assert_eq!(
         (
             late_sent.contains(&again),
-            carried_of(&third.envelope),
+            carried_of(&third.envelope)
+                .into_iter()
+                .filter(|item| item.0 == again)
+                .collect::<Vec<_>>(),
             closed_rows(root.path())?
                 .into_iter()
-                .skip(1)
+                .filter(|row| again_ids.contains(&row.0))
                 .map(|row| row.1)
                 .collect::<Vec<String>>(),
         ),

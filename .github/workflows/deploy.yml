@@ -1,0 +1,50 @@
+# The files under deploy/ checked by the tool that will read them: promtool for the alert rules,
+# kubeconform for the Kubernetes manifest, systemd-analyze for the user units. What `cargo test`
+# holds them to (the schedule, the timeout, the metric families) is services/newsvault/tests/deploy.rs.
+
+name: deploy
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  prometheus-rules:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # prom/prometheus v3.15.1, published 2026-10-21.
+      PROMETHEUS: prom/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: docker run --rm --volume "$PWD/deploy/prometheus:/rules:ro" --workdir /rules --entrypoint /bin/promtool "$PROMETHEUS" check rules newsvault.rules.yml
+      - if: ${{ !cancelled() }}
+        run: docker run --rm --volume "$PWD/deploy/prometheus:/rules:ro" --workdir /rules --entrypoint /bin/promtool "$PROMETHEUS" test rules newsvault.rules.test.yml
+
+  kubernetes-manifests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # kubeconform v0.8.0; the checksum is the release's CHECKSUMS line. Schemas of Kubernetes
+      # 1.34.12, the newest kubernetes-json-schema held on 2026-11-18.
+      - run: |
+          curl -sSfL -o kubeconform.tar.gz https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz
+          echo "9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883  kubeconform.tar.gz" | sha256sum -c -
+          tar xzf kubeconform.tar.gz kubeconform
+          ./kubeconform -strict -summary -kubernetes-version 1.34.12 deploy/k8s/
+
+  systemd-units:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: shellcheck deploy/systemd/newsvault-watchdog
+      # verify resolves %h and checks each ExecStart program exists, so the watchdog script and
+      # the env file are put where the units name them, as the install does.
+      - if: ${{ !cancelled() }}
+        run: |
+          install -D -m 0755 deploy/systemd/newsvault-watchdog "$HOME/.local/lib/bellwether/newsvault-watchdog"
+          install -D -m 0600 deploy/systemd/newsvault.env "$HOME/.config/bellwether/newsvault.env"
+          systemd-analyze --user --man=no verify deploy/systemd/*.service deploy/systemd/*.timer

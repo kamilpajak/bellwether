@@ -356,6 +356,40 @@ fn check_exits_one_when_a_source_returns_zero_items_against_a_non_zero_vendor_ro
     Ok(())
 }
 
+/// The watchdog's rendering (`--format prometheus`) exits as the JSON one does and carries the
+/// same finding, on stdout, under its schema line.
+#[test]
+fn the_prometheus_rendering_exits_as_json_does_and_counts_the_same_finding() -> TestResult {
+    let root = fixture()?;
+    let output = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .arg("ledger")
+        .args(["--store", &root.path().to_string_lossy()])
+        .args(["--at", AT, "--format", "prometheus", "--check"])
+        .args(["--from", ZERO_ITEM_DAY, "--to", ZERO_ITEM_DAY])
+        .output()?;
+    let text = String::from_utf8(output.stdout)?;
+    let finding = text
+        .lines()
+        .find(|line| line.starts_with("newsvault_check_findings{"))
+        .map(str::to_owned);
+    assert_eq!(
+        (
+            output.status.code(),
+            text.lines().next().map(str::to_owned),
+            finding.map(
+                |line| line.contains("code=\"rows_committed_zero_against_vendor_rows\"")
+                    && line.ends_with(" 1")
+            ),
+        ),
+        (
+            Some(EXIT_NO),
+            Some(format!("# {}", newsvault::cmd_ledger::PROMETHEUS_SCHEMA)),
+            Some(true),
+        )
+    );
+    Ok(())
+}
+
 /// Section 11.1: `held` is subtracted, so 58 of 59 held still leaves one row nothing answered, and
 /// the finding names both numbers. Mutation 2026-11-15, any non-zero `held` suppressing the
 /// finding: red.

@@ -1,0 +1,69 @@
+# The newsvault image (S7-D10, option C; docs/design/architecture.md section 11.5 step 7): built
+# and smoke-run on every pull request; built, smoke-run and pushed to GHCR on a version tag. No
+# third-party action: the runner's own docker builds, logs in and pushes.
+
+name: image
+
+on:
+  pull_request:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/kamilpajak/bellwether-newsvault
+
+jobs:
+  build:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: docker build --tag newsvault:ci .
+      - name: smoke (read-only root, a non-root user, the schema)
+        run: docker run --rm --read-only --user 1000:1000 newsvault:ci schema --format json | jq -e '.schema == "newsvault.schema/1"'
+      - name: the runtime SQLite is 3.45, the one CI's tests link
+        run: docker run --rm --entrypoint dpkg-query newsvault:ci --showformat '${Version}' --show libsqlite3-0 | grep -E '^3\.45\.'
+      - name: the image runs as user 10001 under tini
+        run: docker inspect --format '{{.Config.User}} {{json .Config.Entrypoint}}' newsvault:ci | grep -Fx '10001 ["/usr/bin/tini","--","/usr/local/bin/newsvault"]'
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # The only job holding a write token, and only for packages; `actions: read` lists ci's runs.
+    permissions:
+      contents: read
+      packages: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # A workflow cannot `needs:` another, so the tag's commit must be on main and green in ci.
+      - name: the tagged commit is on main and passed the gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          green=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&status=success" --jq '.total_count')
+          test "$green" -gt 0
+      - run: |
+          docker build \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=$GITHUB_REF_NAME" \
+            --tag "$IMAGE:$GITHUB_REF_NAME" .
+      - run: docker run --rm --read-only --user 1000:1000 "$IMAGE:$GITHUB_REF_NAME" schema --format json | jq -e '.schema == "newsvault.schema/1"'
+      - run: docker run --rm --entrypoint dpkg-query "$IMAGE:$GITHUB_REF_NAME" --showformat '${Version}' --show libsqlite3-0 | grep -E '^3\.45\.'
+      - run: docker inspect --format '{{.Config.User}} {{json .Config.Entrypoint}}' "$IMAGE:$GITHUB_REF_NAME" | grep -Fx '10001 ["/usr/bin/tini","--","/usr/local/bin/newsvault"]'
+      - env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      # The digest is what newsvault.env names on the VPS.
+      - run: |
+          docker push "$IMAGE:$GITHUB_REF_NAME"
+          docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$GITHUB_REF_NAME" | tee -a "$GITHUB_STEP_SUMMARY"

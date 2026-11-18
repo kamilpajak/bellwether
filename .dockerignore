@@ -1,0 +1,8 @@
+.git
+.github
+.claude
+target
+**/target
+docs
+probes
+deploy

@@ -1,0 +1,235 @@
+# `promtool test rules`, run by .github/workflows/deploy.yml: each alert fires on one side of its
+# threshold and not on the other.
+rule_files:
+  - newsvault.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Scraped each minute, as node-exporter re-reads the file: a read at t=0, a fresh one at 1 h, then
+  # the same file until 5 h; stale once more than 2 h have passed since that read.
+  - interval: 1m
+    input_series:
+      - series: 'newsvault_ledger_at_timestamp_seconds{schema="newsvault.prom/1"}'
+        values: '0x59 3600x240'
+      - series: 'newsvault_collect_last_asked_age_seconds'
+        values: '10800x59 10801x60'
+    alert_rule_test:
+      - eval_time: 3h
+        alertname: NewsvaultWatchdogStale
+        exp_alerts: []
+      - eval_time: 3h1m
+        alertname: NewsvaultWatchdogStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: newsvault's watchdog has written no ledger read for over 2 h, or none of this schema.
+      - eval_time: 0m
+        alertname: NewsvaultCollectStale
+        exp_alerts: []
+      - eval_time: 1h
+        alertname: NewsvaultCollectStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: newsvault has sent no vendor request for 10801 s.
+      - eval_time: 1h
+        alertname: NewsvaultNeverAsked
+        exp_alerts: []
+
+  # A schema other than newsvault.prom/1 is no read; a read with no age is a store never asked.
+  - interval: 1h
+    input_series:
+      - series: 'newsvault_ledger_at_timestamp_seconds{schema="newsvault.prom/2"}'
+        values: '0'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: NewsvaultWatchdogStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              schema: newsvault.prom/1
+            exp_annotations:
+              summary: newsvault's watchdog has written no ledger read for over 2 h, or none of this schema.
+
+  # No watchdog file at all is the stale alert's to name, not the never-asked one's.
+  - interval: 1h
+    input_series:
+      - series: 'up{job="node"}'
+        values: '1'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: NewsvaultNeverAsked
+        exp_alerts: []
+
+  - interval: 1h
+    input_series:
+      - series: 'newsvault_ledger_at_timestamp_seconds{schema="newsvault.prom/1"}'
+        values: '0'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: NewsvaultNeverAsked
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: the watchdog reads a store no vendor request has reached.
+
+  - interval: 1h
+    input_series:
+      - series: 'newsvault_ledger_complete'
+        values: '1 0'
+      - series: 'newsvault_deferred_host_held{source="open_web_wires",run_date="2026-11-18",days_ago="0"}'
+        values: '0 2'
+      - series: 'newsvault_carried_expired{source="open_web_wires",run_date="2026-11-17",days_ago="1"}'
+        values: '0 3'
+      - series: 'newsvault_walk_range_unread_polls{source="open_web_wires",run_date="2026-11-18",days_ago="0"}'
+        values: '1 2'
+      - series: 'newsvault_holds_capped{run_date="2026-11-18",days_ago="0"}'
+        values: '0 1'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: NewsvaultLedgerIncomplete
+        exp_alerts: []
+      - eval_time: 1h
+        alertname: NewsvaultLedgerIncomplete
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: the ledger could not read a run file, or an attempt has none (ledger exit 8).
+      - eval_time: 0m
+        alertname: NewsvaultHostHeld
+        exp_alerts: []
+      - eval_time: 1h
+        alertname: NewsvaultHostHeld
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              source: open_web_wires
+              run_date: "2026-11-18"
+            exp_annotations:
+              summary: "open_web_wires: 2 request(s) deferred host_held, run date 2026-11-18."
+      - eval_time: 0m
+        alertname: NewsvaultDeferredExpired
+        exp_alerts: []
+      - eval_time: 1h
+        alertname: NewsvaultDeferredExpired
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              source: open_web_wires
+              run_date: "2026-11-17"
+            exp_annotations:
+              summary: "open_web_wires: 3 deferred row(s) expired, run date 2026-11-17."
+      - eval_time: 0m
+        alertname: NewsvaultWalkRangeUnreadPersistent
+        exp_alerts: []
+      - eval_time: 1h
+        alertname: NewsvaultWalkRangeUnreadPersistent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              source: open_web_wires
+              run_date: "2026-11-18"
+            exp_annotations:
+              summary: "open_web_wires: 2 walked poll(s) read no range, run date 2026-11-18."
+      - eval_time: 0m
+        alertname: NewsvaultHoldsCapped
+        exp_alerts: []
+      - eval_time: 1h
+        alertname: NewsvaultHoldsCapped
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              run_date: "2026-11-18"
+            exp_annotations:
+              summary: "1 Retry-After value(s) held to the 24 h ceiling, run date 2026-11-18."
+
+  # Findings: today's run shortfall is no alert, yesterday's is; each WARN code on its own.
+  - interval: 1h
+    input_series:
+      - series: 'newsvault_check_findings{code="runs_below_expected",run_date="2026-11-18",days_ago="0"}'
+        values: '1'
+      - series: 'newsvault_check_findings{code="wall_time_over_bound",run_date="2026-11-18",days_ago="0"}'
+        values: '1'
+      - series: 'newsvault_check_findings{code="host_busy_over_bound",run_date="2026-11-17",days_ago="1"}'
+        values: '2'
+      - series: 'newsvault_check_findings{code="rows_committed_zero_against_vendor_rows",run_date="2026-11-18",days_ago="0"}'
+        values: '1'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: NewsvaultRunsMissed
+        exp_alerts: []
+      - eval_time: 0m
+        alertname: NewsvaultWallTimeOverBound
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              code: wall_time_over_bound
+              run_date: "2026-11-18"
+            exp_annotations:
+              summary: newsvault's runs took more than half a day of wall time, run date 2026-11-18.
+      - eval_time: 0m
+        alertname: NewsvaultHostBusyOverBound
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              code: host_busy_over_bound
+              run_date: "2026-11-17"
+            exp_annotations:
+              summary: "2 host(s) busy more than half a day, run date 2026-11-17."
+      - eval_time: 0m
+        alertname: NewsvaultRowsZero
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              code: rows_committed_zero_against_vendor_rows
+              run_date: "2026-11-18"
+            exp_annotations:
+              summary: a source listed vendor rows and committed no item, run date 2026-11-18.
+
+  - interval: 1h
+    input_series:
+      - series: 'newsvault_check_findings{code="runs_below_expected",run_date="2026-11-17",days_ago="1"}'
+        values: '1'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: NewsvaultRunsMissed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              code: runs_below_expected
+              run_date: "2026-11-17"
+            exp_annotations:
+              summary: "2026-11-17 saw fewer collect runs than its 31 slots."
+
+  # One day's count read at 23:50 (days_ago 0), then at 00:50 (days_ago 1): one alert, whose labels
+  # do not change at midnight, so it neither notifies again nor escapes its silence.
+  - interval: 1m
+    input_series:
+      - series: 'newsvault_deferred_host_held{source="open_web_wires",run_date="2026-11-17",days_ago="0"}'
+        values: '3x59'
+      - series: 'newsvault_deferred_host_held{source="open_web_wires",run_date="2026-11-17",days_ago="1"}'
+        values: '_x59 3x59'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: NewsvaultHostHeld
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              source: open_web_wires
+              run_date: "2026-11-17"
+            exp_annotations:
+              summary: "open_web_wires: 3 request(s) deferred host_held, run date 2026-11-17."
+      - eval_time: 90m
+        alertname: NewsvaultHostHeld
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              source: open_web_wires
+              run_date: "2026-11-17"
+            exp_annotations:
+              summary: "open_web_wires: 3 request(s) deferred host_held, run date 2026-11-17."

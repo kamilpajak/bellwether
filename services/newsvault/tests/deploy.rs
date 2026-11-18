@@ -1,0 +1,917 @@
+//! The files under `deploy/` against the code they schedule and the metrics they read
+//! (architecture.md section 11.5 step 7, PR 6): a unit, a cron line or an alert rule that drifts
+//! from `schedule::SLOTS` or from the watchdog's metric families is red here, not on the VPS.
+
+use std::collections::BTreeSet;
+use std::error::Error;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use chrono::{DateTime, TimeDelta, Utc};
+use news_provider::Provider;
+use newsvault::cmd_ledger::PROMETHEUS_FAMILIES;
+use newsvault::schedule::{self, SLOTS};
+use open_web_feed::OpenWebFeed;
+
+type TestResult = Result<(), Box<dyn Error>>;
+
+/// S7-D9: `TimeoutStartSec` is the longest window plus 2 min.
+const TIMEOUT_MARGIN: TimeDelta = TimeDelta::seconds(120);
+/// The watchdog timer's interval, an `OnCalendar` firing once an hour.
+const WATCHDOG_INTERVAL_S: i64 = 3_600;
+const CONTACT: &str = "bellwether collector contact@example.test";
+/// A bind `--mount`, which refuses a missing source where `--volume` creates it as root's directory.
+const CONTACT_MOUNT: &str =
+    "--mount type=bind,src=%h/.config/bellwether/feed-contact,dst=/run/secrets/feed-contact,readonly";
+const STORE_LOCK: &str =
+    "/usr/bin/flock --nonblock --conflict-exit-code 7 %t/bellwether-store.lock";
+/// The Dockerfile's base image and the runner of every workflow job: one Ubuntu release.
+const UBUNTU_IMAGE: &str = "ARG UBUNTU=ubuntu:noble-";
+const UBUNTU_RUNNER: &str = "ubuntu-24.04";
+const WORKFLOWS: [&str; 3] = ["ci.yml", "image.yml", "deploy.yml"];
+/// Each workflow job that links or ships SQLite, and so checks it is 3.45.
+const SQLITE_JOBS: [(&str, &str); 3] = [
+    ("ci.yml", "check"),
+    ("image.yml", "build"),
+    ("image.yml", "publish"),
+];
+const SQLITE_CHECK: &str = r"--show libsqlite3-0 | grep -E '^3\.45\.'";
+/// Each validator `deploy.yml` runs, by job, as the tail of its `run` line.
+const VALIDATORS: [(&str, &str); 5] = [
+    (
+        "prometheus-rules",
+        "--entrypoint /bin/promtool \"$PROMETHEUS\" check rules newsvault.rules.yml",
+    ),
+    (
+        "prometheus-rules",
+        "--entrypoint /bin/promtool \"$PROMETHEUS\" test rules newsvault.rules.test.yml",
+    ),
+    (
+        "kubernetes-manifests",
+        "./kubeconform -strict -summary -kubernetes-version 1.34.12 deploy/k8s/",
+    ),
+    (
+        "systemd-units",
+        "run: shellcheck deploy/systemd/newsvault-watchdog",
+    ),
+    (
+        "systemd-units",
+        "systemd-analyze --user --man=no verify deploy/systemd/*.service deploy/systemd/*.timer",
+    ),
+];
+const IMAGE_IDENTITY: &str =
+    "docker inspect --format '{{.Config.User}} {{json .Config.Entrypoint}}'";
+const IMAGE_IDENTITY_EXPECTED: &str =
+    "| grep -Fx '10001 [\"/usr/bin/tini\",\"--\",\"/usr/local/bin/newsvault\"]'";
+const SERVICES: [&str; 3] = [
+    "newsvault-collect.service",
+    "newsvault-robots-refresh.service",
+    "newsvault-watchdog.service",
+];
+const ENV_FILE: &str = "%h/.config/bellwether/newsvault.env";
+/// systemd's `DefaultTimeoutStopSec`: the stop a start past its timeout is given before SIGKILL.
+const DEFAULT_TIMEOUT_STOP_S: i64 = 90;
+const NTP_CHECK: &str = "/bin/sh -c 'test \"$$(timedatectl show --property=NTPSynchronized \
+     --value)\" = yes || { echo \"the clock is not NTP-synchronised\" >&2; exit 1; }'";
+const TINI_COMMAND: &str = "command: [\"/usr/bin/tini\", \"-g\", \"--\", \"/bin/sh\", \"-c\"]";
+const WATCHDOG_DOCKER: &str = "/usr/bin/docker run";
+const PROM: &str = "newsvault.prom";
+const OLD_METRICS: &str = "newsvault_old 1\n";
+/// Stands in for docker: lists the textfile directory while its stdout is open, records its
+/// arguments one per line, and prints one sample naming its exit.
+const DOCKER_STUB: &str = r#"ls -a "$NEWSVAULT_TEXTFILE_DIR" >"$STUB_SEEN"
+printf '%s\n' "$@" >"$STUB_ARGS"
+printf 'newsvault_stub{exit="%s"} 1\n' "$STUB_EXIT"
+exit "$STUB_EXIT"
+"#;
+/// UTC+14, so a `date` without `-u` is 14 h from the UTC now.
+const FAR_ZONE: &str = "Pacific/Kiritimati";
+const AT_TOLERANCE_S: i64 = 600;
+
+fn repo() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn read(relative: &str) -> Result<String, Box<dyn Error>> {
+    Ok(std::fs::read_to_string(repo().join(relative))?)
+}
+
+/// Every value of `key` in a unit file, comment lines skipped and `\` continuations joined.
+fn unit_values(text: &str, key: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut open = String::new();
+    for line in text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+    {
+        match line.strip_suffix('\\') {
+            Some(head) => open.push_str(head),
+            None => {
+                open.push_str(line);
+                lines.push(std::mem::take(&mut open));
+            }
+        }
+    }
+    let prefix = format!("{key}=");
+    lines
+        .iter()
+        .filter_map(|line| line.strip_prefix(&prefix))
+        .map(|value| value.split_whitespace().collect::<Vec<&str>>().join(" "))
+        .collect()
+}
+
+fn slots() -> Vec<(u32, u32)> {
+    SLOTS.iter().map(|slot| (slot.hour, slot.minute)).collect()
+}
+
+fn patience() -> Result<TimeDelta, Box<dyn Error>> {
+    let feed = OpenWebFeed::open(
+        &repo().join("providers/open-web-feed/hosts/open_web_wires.hosts.json"),
+        &repo().join("providers/open-web-feed/rules/open-web-feed.rules.json"),
+        CONTACT,
+    )?;
+    Ok(TimeDelta::from_std(feed.transport().timeouts.global)?)
+}
+
+/// `TimeoutStartSec` derived, never fitted: section 11.2's longest window plus the margin.
+fn derived_timeout() -> Result<i64, Box<dyn Error>> {
+    let patience = patience()?;
+    let schedule = schedule::committed(patience)?;
+    Ok((schedule.longest_window(patience) + TIMEOUT_MARGIN).num_seconds())
+}
+
+fn integers(values: &[String]) -> Vec<i64> {
+    values
+        .iter()
+        .filter_map(|value| value.parse().ok())
+        .collect()
+}
+
+#[test]
+fn the_collect_timer_fires_at_exactly_the_schedules_slots_in_utc() -> TestResult {
+    let timer = read("deploy/systemd/newsvault-collect.timer")?;
+    let fired: Vec<Option<(u32, u32)>> = unit_values(&timer, "OnCalendar")
+        .iter()
+        .map(|line| {
+            let time = line.strip_prefix("*-*-* ")?.strip_suffix(":00 UTC")?;
+            let (hour, minute) = time.split_once(':')?;
+            Some((hour.parse().ok()?, minute.parse().ok()?))
+        })
+        .collect();
+    assert_eq!(
+        (
+            fired,
+            unit_values(&timer, "AccuracySec"),
+            unit_values(&timer, "RandomizedDelaySec").len(),
+            unit_values(&timer, "Persistent").len(),
+        ),
+        (
+            slots().into_iter().map(Some).collect(),
+            vec!["1s".to_owned()],
+            0,
+            0
+        )
+    );
+    Ok(())
+}
+
+/// 2,670 s + 120 s = 2,790 s on the committed schedule; the refresh unit and the Kubernetes
+/// jobs are held to the same bound.
+#[test]
+fn every_run_bound_is_the_longest_window_plus_two_minutes() -> TestResult {
+    let timeout = derived_timeout()?;
+    let collect = read("deploy/systemd/newsvault-collect.service")?;
+    let refresh = read("deploy/systemd/newsvault-robots-refresh.service")?;
+    let jobs = read("deploy/k8s/newsvault-collect.yaml")?;
+    let deadlines: Vec<i64> = jobs
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("activeDeadlineSeconds: "))
+        .filter_map(|value| value.parse().ok())
+        .collect();
+    assert_eq!(
+        (
+            timeout,
+            integers(&unit_values(&collect, "TimeoutStartSec")),
+            integers(&unit_values(&refresh, "TimeoutStartSec")),
+            deadlines,
+        ),
+        (2_790, vec![timeout], vec![timeout], vec![timeout, timeout])
+    );
+    Ok(())
+}
+
+/// S7-D8 and S7-D9: exit 8 succeeds, nothing restarts, the run is expected once per slot, and the
+/// contact reaches the container as a file, never as a value.
+#[test]
+fn the_collect_unit_succeeds_on_exit_8_never_restarts_and_mounts_the_contact() -> TestResult {
+    let collect = read("deploy/systemd/newsvault-collect.service")?;
+    let start = unit_values(&collect, "ExecStart").join(" ");
+    let expected_runs = format!("--expected-runs {}", SLOTS.len());
+    assert_eq!(
+        (
+            unit_values(&collect, "SuccessExitStatus"),
+            unit_values(&collect, "Restart").len(),
+            start.contains(&expected_runs),
+            start.contains("--name newsvault-collect"),
+            start.contains("--env BELLWETHER_FEED_CONTACT_FILE=/run/secrets/feed-contact"),
+            start.contains("BELLWETHER_FEED_CONTACT="),
+            start.contains(CONTACT_MOUNT),
+        ),
+        (vec!["8".to_owned()], 0, true, true, true, false, true)
+    );
+    Ok(())
+}
+
+/// One cron field of plain numbers, ranges and commas, as the two committed lines write it.
+fn expand(field: &str) -> Option<Vec<u32>> {
+    let mut values = Vec::new();
+    for part in field.split(',') {
+        match part.split_once('-') {
+            Some((from, to)) => values.extend(from.parse::<u32>().ok()?..=to.parse().ok()?),
+            None => values.push(part.parse().ok()?),
+        }
+    }
+    Some(values)
+}
+
+/// Text from `jobTemplate:` to the end of its YAML document.
+fn job_templates(jobs: &str) -> Vec<String> {
+    jobs.split("\n---\n")
+        .filter_map(|document| {
+            let at = document.find("  jobTemplate:")?;
+            document
+                .get(at..)
+                .map(|template| template.trim_end().to_owned())
+        })
+        .collect()
+}
+
+#[test]
+fn the_kubernetes_cron_lines_cover_exactly_the_slots_and_share_one_job() -> TestResult {
+    let jobs = read("deploy/k8s/newsvault-collect.yaml")?;
+    let mut fired: Vec<(u32, u32)> = Vec::new();
+    for line in jobs.lines() {
+        let Some(cron) = line.trim().strip_prefix("schedule: ") else {
+            continue;
+        };
+        let fields: Vec<&str> = cron.trim_matches('"').split(' ').collect();
+        let [minute, hour, "*", "*", "*"] = fields.as_slice() else {
+            return Err(format!("not a daily cron line: {line}").into());
+        };
+        let (minutes, hours) = (expand(minute).ok_or(line)?, expand(hour).ok_or(line)?);
+        for hour in &hours {
+            fired.extend(minutes.iter().map(|minute| (*hour, *minute)));
+        }
+    }
+    fired.sort_unstable();
+    let templates = job_templates(&jobs);
+    let zones: Vec<&str> = jobs
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("timeZone: "))
+        .collect();
+    assert_eq!(
+        (
+            fired,
+            zones,
+            templates.len(),
+            templates.windows(2).all(|pair| pair[0] == pair[1]),
+            jobs.contains(&format!("--expected-runs {}", SLOTS.len())),
+        ),
+        (slots(), vec!["Etc/UTC"; 2], 2, true, true)
+    );
+    Ok(())
+}
+
+/// Every `newsvault_` name an alert rule's `expr` reads.
+fn read_families(rules: &str) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    for word in rules.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+        if word.starts_with("newsvault_") {
+            found.insert(word.to_owned());
+        }
+    }
+    found
+}
+
+/// Each family the watchdog writes has a rule reading it, and each rule reads one it writes.
+#[test]
+fn every_metric_the_watchdog_writes_has_an_alert_rule_and_no_rule_reads_another() -> TestResult {
+    let rules = read("deploy/prometheus/newsvault.rules.yml")?;
+    let exprs: String = rules
+        .split("- alert: ")
+        .skip(1)
+        .filter_map(|rule| rule.split("labels:").next())
+        .collect();
+    assert_eq!(
+        read_families(&exprs),
+        PROMETHEUS_FAMILIES
+            .iter()
+            .map(|family| (*family).to_owned())
+            .collect::<BTreeSet<String>>()
+    );
+    Ok(())
+}
+
+/// The first `> N` threshold of one alert's `expr`.
+fn threshold(rules: &str, alert: &str) -> Option<i64> {
+    let rule = rules.split(&format!("- alert: {alert}\n")).nth(1)?;
+    let expr = rule.split("labels:").next()?;
+    let after = expr.split("> ").nth(1)?;
+    after.split_whitespace().next()?.parse().ok()
+}
+
+/// Collect stale = two longest poll periods with no request (more than one slot missed); watchdog
+/// stale = two of its hourly intervals with no fresh read.
+#[test]
+fn each_staleness_threshold_is_two_of_the_intervals_it_watches() -> TestResult {
+    let rules = read("deploy/prometheus/newsvault.rules.yml")?;
+    let timer = read("deploy/systemd/newsvault-watchdog.timer")?;
+    let longest = schedule::committed(patience()?)?
+        .longest_period()
+        .num_seconds();
+    let hourly = unit_values(&timer, "OnCalendar").iter().all(|line| {
+        line.strip_prefix("*-*-* *:")
+            .and_then(|rest| rest.strip_suffix(":00 UTC"))
+            .is_some_and(|minute| minute.parse::<u32>().is_ok_and(|minute| minute < 60))
+    });
+    assert_eq!(
+        (
+            threshold(&rules, "NewsvaultCollectStale"),
+            threshold(&rules, "NewsvaultWatchdogStale"),
+            hourly,
+            unit_values(&timer, "OnCalendar").len(),
+        ),
+        (Some(2 * longest), Some(2 * WATCHDOG_INTERVAL_S), true, 1)
+    );
+    Ok(())
+}
+
+/// The words of a unit's `ExecStart` before the image, the container's `--name` value replaced.
+fn container_shape(unit: &str) -> (Vec<String>, Option<String>) {
+    let start = unit_values(unit, "ExecStart").join(" ");
+    let mut words = start
+        .split(' ')
+        .take_while(|word| *word != "${NEWSVAULT_IMAGE}");
+    let mut shape = Vec::new();
+    let mut name = None;
+    while let Some(word) = words.next() {
+        shape.push(word.to_owned());
+        if word == "--name" {
+            name = words.next().map(str::to_owned);
+            shape.push("<name>".to_owned());
+        }
+    }
+    (shape, name)
+}
+
+/// S7-D10's scheduler lock: a refresh and a collect take one lock and run one container shape, so
+/// neither writes the store while the other does.
+#[test]
+fn the_collect_and_refresh_units_share_one_lock_and_one_container_shape() -> TestResult {
+    let (collect, collect_name) =
+        container_shape(&read("deploy/systemd/newsvault-collect.service")?);
+    let (refresh, refresh_name) =
+        container_shape(&read("deploy/systemd/newsvault-robots-refresh.service")?);
+    let shape = collect.join(" ");
+    assert_eq!(
+        (
+            collect == refresh,
+            collect_name,
+            refresh_name,
+            shape.starts_with(STORE_LOCK),
+            shape.contains(CONTACT_MOUNT),
+        ),
+        (
+            true,
+            Some("newsvault-collect".to_owned()),
+            Some("newsvault-robots-refresh".to_owned()),
+            true,
+            true
+        )
+    );
+    Ok(())
+}
+
+/// S7-D8's watchdog reads yesterday, which `NewsvaultRunsMissed` alerts on, with every slot due, so
+/// a day no run reached is a shortfall of 31; `--check` gives the findings the rules read.
+#[test]
+fn the_watchdog_checks_yesterday_and_today_with_every_slot_expected() -> TestResult {
+    let script = read("deploy/systemd/newsvault-watchdog")?.replace("\\\n", " ");
+    let call = script
+        .lines()
+        .find(|line| line.contains(" ledger "))
+        .map(|line| line.split_whitespace().collect::<Vec<&str>>().join(" "))
+        .unwrap_or_default();
+    let ask = format!(
+        "ledger --at \"$at\" --from \"$yesterday\" --to \"$today\" --expected-runs {} --check \
+         --format prometheus",
+        SLOTS.len()
+    );
+    assert_eq!(
+        (
+            call.contains(&ask),
+            call.contains("--network none"),
+            call.contains("--mount \"type=bind,src=$HOME/.bellwether/vault,dst=/vault,readonly\""),
+            script.contains("yesterday=$(date -u -d \"$today -1 day\" +%Y-%m-%d)"),
+        ),
+        (true, true, true, true),
+        "{call}"
+    );
+    Ok(())
+}
+
+/// No host path reaches a container through `--volume`, which creates a missing one as root's.
+#[test]
+fn no_unit_or_script_mounts_a_host_path_with_volume() -> TestResult {
+    let mut volumes = Vec::new();
+    for file in [
+        "deploy/systemd/newsvault-collect.service",
+        "deploy/systemd/newsvault-robots-refresh.service",
+        "deploy/systemd/newsvault-watchdog",
+    ] {
+        let text = read(file)?;
+        volumes.extend(
+            text.lines()
+                .filter(|line| !line.trim_start().starts_with('#'))
+                .filter(|line| line.contains("--volume") || line.contains(" -v "))
+                .map(|line| format!("{file}: {line}")),
+        );
+    }
+    assert_eq!(volumes, Vec::<String>::new());
+    Ok(())
+}
+
+/// The gate links the system SQLite of the release the image is built on (3.45 on 24.04);
+/// measured 2026-11-18, `ubuntu-latest` was 26.04, whose SQLite is 3.46.1.
+#[test]
+fn every_workflow_job_runs_on_the_images_ubuntu_release() -> TestResult {
+    let mut runners = Vec::new();
+    for workflow in WORKFLOWS {
+        let text = read(&format!(".github/workflows/{workflow}"))?;
+        let used: BTreeSet<String> = text
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("runs-on: "))
+            .map(str::to_owned)
+            .collect();
+        runners.push((workflow, used.into_iter().collect::<Vec<String>>()));
+    }
+    let mut unchecked = Vec::new();
+    for (workflow, name) in SQLITE_JOBS {
+        let lines = job(&read(&format!(".github/workflows/{workflow}"))?, name);
+        if !lines.iter().any(|line| line.ends_with(SQLITE_CHECK)) {
+            unchecked.push(format!("{workflow} {name}"));
+        }
+    }
+    assert_eq!(
+        (
+            runners,
+            read("Dockerfile")?.contains(UBUNTU_IMAGE),
+            unchecked
+        ),
+        (
+            WORKFLOWS
+                .iter()
+                .map(|workflow| (*workflow, vec![UBUNTU_RUNNER.to_owned()]))
+                .collect::<Vec<_>>(),
+            true,
+            Vec::<String>::new()
+        )
+    );
+    Ok(())
+}
+
+/// Each line trimmed, comment lines dropped.
+fn trimmed(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether `lines` holds `run` as consecutive lines.
+fn holds(lines: &[String], run: &[&str]) -> bool {
+    lines.windows(run.len()).any(|window| window == run)
+}
+
+/// One workflow job's lines, trimmed, from its `  name:` header to the next job.
+fn job(workflow: &str, name: &str) -> Vec<String> {
+    let header = format!("  {name}:");
+    let body: Vec<&str> = workflow
+        .lines()
+        .skip_while(|line| *line != header)
+        .skip(1)
+        .take_while(|line| line.is_empty() || line.starts_with("   "))
+        .collect();
+    trimmed(&body.join("\n"))
+}
+
+/// The lines under one top-level key of a workflow, trimmed.
+fn top_level(workflow: &str, key: &str) -> Vec<String> {
+    let header = format!("{key}:");
+    workflow
+        .lines()
+        .skip_while(|line| *line != header)
+        .skip(1)
+        .take_while(|line| line.starts_with(' '))
+        .map(|line| line.trim().to_owned())
+        .collect()
+}
+
+/// `deploy.yml` runs each tool on the file it checks; a dropped step or flag is red here.
+#[test]
+fn the_deploy_workflow_runs_each_validator_on_its_file() -> TestResult {
+    let deploy = read(".github/workflows/deploy.yml")?;
+    let missing: Vec<&str> = VALIDATORS
+        .iter()
+        .filter(|(name, command)| {
+            !job(&deploy, name)
+                .iter()
+                .any(|line| line.ends_with(command))
+        })
+        .map(|(_, command)| *command)
+        .collect();
+    assert_eq!(missing, Vec::<&str>::new());
+    Ok(())
+}
+
+/// Only a `v*` tag on a commit of main with a green `ci.yml` run publishes, and only that job
+/// holds `packages: write`.
+#[test]
+fn only_a_tag_on_a_green_main_commit_publishes_and_only_that_job_writes_packages() -> TestResult {
+    let image = read(".github/workflows/image.yml")?;
+    let publish = job(&image, "publish");
+    assert_eq!(
+        (
+            top_level(&image, "permissions"),
+            publish.first().cloned(),
+            image.matches("packages: write").count(),
+            publish.contains(&"packages: write".to_owned()),
+            holds(
+                &publish,
+                &[
+                    "run: |",
+                    "git merge-base --is-ancestor \"$GITHUB_SHA\" origin/main",
+                    "green=$(gh api \"repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?\
+                     head_sha=$GITHUB_SHA&status=success\" --jq '.total_count')",
+                    "test \"$green\" -gt 0",
+                ]
+            ),
+            trimmed(&image).contains(&"tags: [\"v*\"]".to_owned()),
+        ),
+        (
+            vec!["contents: read".to_owned()],
+            Some("if: startsWith(github.ref, 'refs/tags/v')".to_owned()),
+            1,
+            true,
+            true,
+            true
+        )
+    );
+    Ok(())
+}
+
+/// The Dockerfile's user and entrypoint, and each image job reading both back from the built
+/// image; that reading runs only in CI.
+#[test]
+fn the_image_runs_as_user_10001_under_tini() -> TestResult {
+    let dockerfile = trimmed(&read("Dockerfile")?);
+    let image = read(".github/workflows/image.yml")?;
+    let read_back: Vec<bool> = ["build", "publish"]
+        .iter()
+        .map(|name| {
+            job(&image, name).iter().any(|line| {
+                line.contains(IMAGE_IDENTITY) && line.ends_with(IMAGE_IDENTITY_EXPECTED)
+            })
+        })
+        .collect();
+    assert_eq!(
+        (
+            dockerfile.contains(&"USER 10001".to_owned()),
+            dockerfile.contains(
+                &"ENTRYPOINT [\"/usr/bin/tini\", \"--\", \"/usr/local/bin/newsvault\"]".to_owned()
+            ),
+            read_back,
+        ),
+        (true, true, vec![true, true])
+    );
+    Ok(())
+}
+
+/// A `simple` unit counts as started once its process forks, so `TimeoutStartSec` would bound
+/// nothing; each unit reads the one env file.
+#[test]
+fn every_service_is_a_oneshot_reading_the_env_file() -> TestResult {
+    let mut seen = Vec::new();
+    for service in SERVICES {
+        let unit = read(&format!("deploy/systemd/{service}"))?;
+        seen.push((
+            service,
+            unit_values(&unit, "Type"),
+            unit_values(&unit, "EnvironmentFile"),
+        ));
+    }
+    assert_eq!(
+        seen,
+        SERVICES
+            .map(|service| (
+                service,
+                vec!["oneshot".to_owned()],
+                vec![ENV_FILE.to_owned()]
+            ))
+            .to_vec()
+    );
+    Ok(())
+}
+
+/// A hung read is stopped, its stop timeout included, before the next hourly firing, which a
+/// still-active unit would swallow.
+#[test]
+fn a_hung_watchdog_is_stopped_before_its_next_firing() -> TestResult {
+    let unit = read("deploy/systemd/newsvault-watchdog.service")?;
+    let bounded: Vec<bool> = integers(&unit_values(&unit, "TimeoutStartSec"))
+        .iter()
+        .map(|start| start + DEFAULT_TIMEOUT_STOP_S < WATCHDOG_INTERVAL_S)
+        .collect();
+    assert_eq!(bounded, vec![true]);
+    Ok(())
+}
+
+#[test]
+fn each_timer_starts_its_own_service() -> TestResult {
+    let mut started = Vec::new();
+    for timer in ["newsvault-collect.timer", "newsvault-watchdog.timer"] {
+        let unit = read(&format!("deploy/systemd/{timer}"))?;
+        started.push((timer, unit_values(&unit, "Unit")));
+    }
+    assert_eq!(
+        started,
+        vec![
+            (
+                "newsvault-collect.timer",
+                vec!["newsvault-collect.service".to_owned()]
+            ),
+            (
+                "newsvault-watchdog.timer",
+                vec!["newsvault-watchdog.service".to_owned()]
+            ),
+        ]
+    );
+    Ok(())
+}
+
+/// The container's flags word for word; the refresh unit is held to the same words by
+/// `the_collect_and_refresh_units_share_one_lock_and_one_container_shape`.
+#[test]
+fn the_collect_container_is_removed_read_only_unprivileged_and_never_pulled() -> TestResult {
+    let (shape, _) = container_shape(&read("deploy/systemd/newsvault-collect.service")?);
+    let expected = format!(
+        "{STORE_LOCK} /usr/bin/docker run --rm --name <name> --pull never --user %U:%G \
+         --read-only --tmpfs /tmp:rw,size=16m --cap-drop ALL --security-opt no-new-privileges \
+         --mount type=bind,src=%h/.bellwether/vault,dst=/vault {CONTACT_MOUNT} \
+         --env BELLWETHER_FEED_CONTACT_FILE=/run/secrets/feed-contact"
+    );
+    assert_eq!(shape.join(" "), expected);
+    Ok(())
+}
+
+/// A timed-out run's container is removed by the name it runs under, and a collect starts only
+/// on an NTP-synchronised clock.
+#[test]
+fn a_timed_out_container_is_removed_by_its_own_name_and_a_collect_needs_a_synced_clock(
+) -> TestResult {
+    let mut removals = Vec::new();
+    let mut expected = Vec::new();
+    for service in [
+        "newsvault-collect.service",
+        "newsvault-robots-refresh.service",
+    ] {
+        let unit = read(&format!("deploy/systemd/{service}"))?;
+        let name = container_shape(&unit).1.unwrap_or_default();
+        removals.push((service, unit_values(&unit, "ExecStopPost")));
+        expected.push((
+            service,
+            vec![format!(
+                "/bin/sh -c 'if [ \"$$SERVICE_RESULT\" = timeout ]; then /usr/bin/docker rm \
+                 --force {name}; fi'"
+            )],
+        ));
+    }
+    let collect = read("deploy/systemd/newsvault-collect.service")?;
+    assert_eq!(
+        (removals, unit_values(&collect, "ExecStartPre")),
+        (expected, vec![NTP_CHECK.to_owned()])
+    );
+    Ok(())
+}
+
+/// The words after `${NEWSVAULT_IMAGE}` in a unit's `ExecStart`.
+fn container_args(unit: &str) -> Vec<String> {
+    unit_values(unit, "ExecStart")
+        .join(" ")
+        .split(' ')
+        .skip_while(|word| *word != "${NEWSVAULT_IMAGE}")
+        .skip(1)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Each Kubernetes job's `newsvault` arguments, the binary's path dropped.
+fn job_args(jobs: &str) -> Vec<Vec<String>> {
+    job_templates(jobs)
+        .iter()
+        .map(|template| {
+            let mut words = Vec::new();
+            let mut open = false;
+            for line in template.lines().map(str::trim) {
+                open = open || line.starts_with("/usr/local/bin/newsvault ");
+                if open {
+                    words.extend(
+                        line.trim_end_matches('\\')
+                            .split_whitespace()
+                            .map(str::to_owned),
+                    );
+                    if !line.ends_with('\\') {
+                        break;
+                    }
+                }
+            }
+            words.into_iter().skip(1).collect()
+        })
+        .collect()
+}
+
+/// The systemd collect and both Kubernetes jobs ask one `collect`, from one env file.
+#[test]
+fn the_collect_unit_asks_what_each_kubernetes_job_asks() -> TestResult {
+    let args = container_args(&read("deploy/systemd/newsvault-collect.service")?);
+    assert_eq!(
+        (
+            args.first().cloned(),
+            job_args(&read("deploy/k8s/newsvault-collect.yaml")?)
+        ),
+        (Some("collect".to_owned()), vec![args.clone(); 2])
+    );
+    Ok(())
+}
+
+/// Each CronJob by value: no overlap, no retry, no restart, exit 8 mapped to 0 under `tini -g`,
+/// exits 2, 4 and 7 named on the container that runs, a read-only root and secret, no capability.
+#[test]
+fn each_kubernetes_job_maps_exit_8_to_0_and_holds_its_limits() -> TestResult {
+    let jobs = read("deploy/k8s/newsvault-collect.yaml")?;
+    let mut missing = Vec::new();
+    for document in jobs
+        .split("\n---\n")
+        .filter(|document| document.contains("kind: CronJob"))
+    {
+        let lines = trimmed(document);
+        let container = lines
+            .iter()
+            .skip_while(|line| *line != "containers:")
+            .nth(1)
+            .and_then(|line| line.strip_prefix("- name: "))
+            .unwrap_or_default();
+        let named = format!("containerName: {container}");
+        let runs: [&[&str]; 10] = [
+            &["concurrencyPolicy: Forbid"],
+            &["startingDeadlineSeconds: 60"],
+            &["backoffLimit: 0"],
+            &["restartPolicy: Never"],
+            &[TINI_COMMAND],
+            &[
+                "status=$?",
+                "if [ \"$status\" -eq 8 ]; then exit 0; fi",
+                "exit \"$status\"",
+            ],
+            &[
+                "podFailurePolicy:",
+                "rules:",
+                "- action: FailJob",
+                "onExitCodes:",
+                &named,
+                "operator: In",
+                "values: [2, 4, 7]",
+            ],
+            &["readOnlyRootFilesystem: true"],
+            &["capabilities:", "drop: [ALL]"],
+            &[
+                "- name: feed-contact",
+                "mountPath: /run/secrets/bellwether",
+                "readOnly: true",
+            ],
+        ];
+        missing.push(
+            runs.iter()
+                .filter(|run| !holds(&lines, run))
+                .map(|run| run.join(" / "))
+                .collect::<Vec<String>>(),
+        );
+    }
+    assert_eq!(missing, vec![Vec::<String>::new(); 2]);
+    Ok(())
+}
+
+/// One run of the watchdog script, its docker replaced by `DOCKER_STUB` exiting `status`.
+struct Watched {
+    exit: Option<i32>,
+    files: Vec<String>,
+    prom: String,
+    tmp: Vec<String>,
+    at: Option<String>,
+}
+
+fn watch(status: i32) -> Result<Watched, Box<dyn Error>> {
+    let work = tempfile::TempDir::new()?;
+    let textfile = work.path().join("textfile");
+    std::fs::create_dir(&textfile)?;
+    std::fs::write(textfile.join(PROM), OLD_METRICS)?;
+    let stub = work.path().join("docker");
+    let (seen, args, script) = (
+        work.path().join("seen"),
+        work.path().join("args"),
+        work.path().join("watchdog"),
+    );
+    std::fs::write(&stub, DOCKER_STUB)?;
+    let text = read("deploy/systemd/newsvault-watchdog")?;
+    if text.matches(WATCHDOG_DOCKER).count() != 1 {
+        return Err(format!("the watchdog runs `{WATCHDOG_DOCKER}` once").into());
+    }
+    let stubbed = format!("/bin/sh '{}' run", stub.display());
+    std::fs::write(&script, text.replace(WATCHDOG_DOCKER, &stubbed))?;
+    let output = Command::new("/bin/sh")
+        .arg(&script)
+        .env("NEWSVAULT_IMAGE", "newsvault:test")
+        .env("NEWSVAULT_TEXTFILE_DIR", &textfile)
+        .env("STUB_EXIT", status.to_string())
+        .env("STUB_SEEN", &seen)
+        .env("STUB_ARGS", &args)
+        .env("TZ", FAR_ZONE)
+        .stdin(Stdio::null())
+        .output()?;
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&textfile)? {
+        files.push(entry?.file_name().to_string_lossy().into_owned());
+    }
+    files.sort();
+    let tmp = std::fs::read_to_string(&seen)?
+        .lines()
+        .filter(|name| ![".", "..", PROM].contains(name))
+        .map(str::to_owned)
+        .collect();
+    let at = std::fs::read_to_string(&args)?
+        .lines()
+        .skip_while(|word| *word != "--at")
+        .nth(1)
+        .map(str::to_owned);
+    Ok(Watched {
+        exit: output.status.code(),
+        files,
+        prom: std::fs::read_to_string(textfile.join(PROM))?,
+        tmp,
+        at,
+    })
+}
+
+/// The ledger's 0, 1 and 8 replace `newsvault.prom` with what it printed through one hidden
+/// non-`.prom` file beside it, which the collector never reads; any other exit leaves the last
+/// file and no temporary one.
+#[test]
+fn the_watchdog_renames_a_hidden_file_for_0_1_and_8_and_keeps_the_last_file_otherwise() -> TestResult
+{
+    let mut got = Vec::new();
+    let mut expected = Vec::new();
+    for status in [0, 1, 8, 2] {
+        let watched = watch(status)?;
+        let hidden: Vec<bool> = watched
+            .tmp
+            .iter()
+            .map(|name| name.starts_with('.') && !name.ends_with(".prom"))
+            .collect();
+        got.push((status, watched.exit, watched.files, watched.prom, hidden));
+        let (exit, prom) = if status == 2 {
+            (Some(2), OLD_METRICS.to_owned())
+        } else {
+            (Some(0), format!("newsvault_stub{{exit=\"{status}\"}} 1\n"))
+        };
+        expected.push((status, exit, vec![PROM.to_owned()], prom, vec![true]));
+    }
+    assert_eq!(got, expected);
+    Ok(())
+}
+
+/// `--at` is the UTC now on a host 14 h ahead of UTC.
+#[test]
+fn the_watchdog_reads_at_the_utc_now_whatever_the_hosts_zone() -> TestResult {
+    let watched = watch(0)?;
+    let off = match watched.at.as_deref().map(DateTime::parse_from_rfc3339) {
+        Some(Ok(at)) => Some((Utc::now() - at.with_timezone(&Utc)).num_seconds().abs()),
+        _ => None,
+    };
+    assert!(
+        off.is_some_and(|off| off < AT_TOLERANCE_S),
+        "{:?}",
+        watched.at
+    );
+    Ok(())
+}

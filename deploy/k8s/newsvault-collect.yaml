@@ -1,0 +1,177 @@
+# Kept for a later move to Kubernetes (S7-D10, option C); validated in CI, not deployed. Two
+# CronJobs because one cron line cannot hold the 31 slots; the deploy test holds their union equal
+# to SLOTS and their job templates equal. The Secret is created by hand, never committed:
+# kubectl create secret generic bellwether-feed-contact --from-file=contact=<file>
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bellwether-vault
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: newsvault-collect-on-the-hour
+spec:
+  schedule: "0 2,5,8,11-22 * * *"
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 60
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # S7-D9: the systemd unit's TimeoutStartSec, and no retry.
+      activeDeadlineSeconds: 2790
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 86400
+      # No action makes a Job succeed, and Ignore starts a second pod in the slot; the shell below
+      # maps exit 8 to 0 instead. These rules name the failing exits in the Job's condition.
+      podFailurePolicy:
+        rules:
+          - action: FailJob
+            onExitCodes:
+              containerName: newsvault
+              operator: In
+              values: [2, 4, 7]
+      template:
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            fsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: newsvault
+              image: ghcr.io/kamilpajak/bellwether-newsvault:vX.Y.Z@sha256:REPLACE_WITH_THE_PUSHED_DIGEST
+              # tini -g signals the whole group, so a SIGTERM reaches newsvault under the shell.
+              command: ["/usr/bin/tini", "-g", "--", "/bin/sh", "-c"]
+              args:
+                - |
+                  /usr/local/bin/newsvault collect --source open_web_wires --window today \
+                    --schedule open_web --expected-runs 31 \
+                    --hosts /usr/share/bellwether/open_web_wires.hosts.json \
+                    --rules /usr/share/bellwether/open-web-feed.rules.json \
+                    --non-interactive --format json
+                  status=$?
+                  if [ "$status" -eq 8 ]; then exit 0; fi
+                  exit "$status"
+              env:
+                - name: BELLWETHER_FEED_CONTACT_FILE
+                  value: /run/secrets/bellwether/contact
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              volumeMounts:
+                - name: vault
+                  mountPath: /vault
+                - name: feed-contact
+                  mountPath: /run/secrets/bellwether
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: vault
+              persistentVolumeClaim:
+                claimName: bellwether-vault
+            - name: feed-contact
+              secret:
+                secretName: bellwether-feed-contact
+                defaultMode: 0440
+                items:
+                  - key: contact
+                    path: contact
+            - name: tmp
+              emptyDir:
+                sizeLimit: 16Mi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: newsvault-collect-on-the-half-hour
+spec:
+  schedule: "30 0,3,6,9,11-21,23 * * *"
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 60
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # S7-D9: the systemd unit's TimeoutStartSec, and no retry.
+      activeDeadlineSeconds: 2790
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 86400
+      # No action makes a Job succeed, and Ignore starts a second pod in the slot; the shell below
+      # maps exit 8 to 0 instead. These rules name the failing exits in the Job's condition.
+      podFailurePolicy:
+        rules:
+          - action: FailJob
+            onExitCodes:
+              containerName: newsvault
+              operator: In
+              values: [2, 4, 7]
+      template:
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            fsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: newsvault
+              image: ghcr.io/kamilpajak/bellwether-newsvault:vX.Y.Z@sha256:REPLACE_WITH_THE_PUSHED_DIGEST
+              # tini -g signals the whole group, so a SIGTERM reaches newsvault under the shell.
+              command: ["/usr/bin/tini", "-g", "--", "/bin/sh", "-c"]
+              args:
+                - |
+                  /usr/local/bin/newsvault collect --source open_web_wires --window today \
+                    --schedule open_web --expected-runs 31 \
+                    --hosts /usr/share/bellwether/open_web_wires.hosts.json \
+                    --rules /usr/share/bellwether/open-web-feed.rules.json \
+                    --non-interactive --format json
+                  status=$?
+                  if [ "$status" -eq 8 ]; then exit 0; fi
+                  exit "$status"
+              env:
+                - name: BELLWETHER_FEED_CONTACT_FILE
+                  value: /run/secrets/bellwether/contact
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              volumeMounts:
+                - name: vault
+                  mountPath: /vault
+                - name: feed-contact
+                  mountPath: /run/secrets/bellwether
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: vault
+              persistentVolumeClaim:
+                claimName: bellwether-vault
+            - name: feed-contact
+              secret:
+                secretName: bellwether-feed-contact
+                defaultMode: 0440
+                items:
+                  - key: contact
+                    path: contact
+            - name: tmp
+              emptyDir:
+                sizeLimit: 16Mi

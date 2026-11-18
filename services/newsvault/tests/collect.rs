@@ -46,6 +46,8 @@ const SOURCE: &str = "edgar_press";
 const CONTACT: &str = "bellwether collector contact@example.test";
 /// The address half of `CONTACT`, which is the part that is a person.
 const CONTACT_ADDRESS: &str = "contact@example.test";
+const FEED_CONTACT_FILE: &str = "BELLWETHER_FEED_CONTACT_FILE";
+const SEC_CONTACT_FILE: &str = "BELLWETHER_SEC_CONTACT_FILE";
 const SCHEDULE: &str = "nightly";
 const EXPECTED_RUNS: u32 = 1;
 
@@ -415,7 +417,9 @@ fn binary_env(args: &[&str], env: &[(&str, &str)]) -> Result<Answered, Box<dyn E
     let mut command = Command::new(env!("CARGO_BIN_EXE_newsvault"));
     command
         .env_remove("BELLWETHER_SEC_CONTACT")
-        .env_remove("BELLWETHER_FEED_CONTACT");
+        .env_remove("BELLWETHER_FEED_CONTACT")
+        .env_remove("BELLWETHER_SEC_CONTACT_FILE")
+        .env_remove("BELLWETHER_FEED_CONTACT_FILE");
     for (name, value) in env {
         command.env(name, value);
     }
@@ -2564,6 +2568,67 @@ fn every_registered_credential_is_the_one_its_providers_user_agent_names() -> Te
     Ok(())
 }
 
+/// The `_FILE` twin (owner decision 2026-11-17): a file holding the contact runs; set beside the
+/// variable is a usage error naming both; an absent file exits 4; a directory is `io_failed` and
+/// an empty one `credential_contact_missing`, both exit 2. No stream carries the address.
+#[test]
+fn a_contact_file_is_read_and_each_refusal_exits_by_name_without_the_address() -> TestResult {
+    let root = TempDir::new()?;
+    seed_robots(root.path())?;
+    let secrets = TempDir::new()?;
+    let file = secrets.path().join("feed-contact");
+    std::fs::write(&file, format!("{CONTACT}\n"))?;
+    let (file_shown, absent) = (path(&file), path(&secrets.path().join("absent")));
+    let args = open_web_args(root.path(), &[]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let read = binary_env(&args, &[(FEED_CONTACT_FILE, &file_shown)])?;
+    let both = binary_env(
+        &args,
+        &[
+            ("BELLWETHER_FEED_CONTACT", CONTACT),
+            (FEED_CONTACT_FILE, &file_shown),
+        ],
+    )?;
+    let missing = binary_env(&args, &[(FEED_CONTACT_FILE, &absent)])?;
+    let directory = binary_env(&args, &[(FEED_CONTACT_FILE, &path(secrets.path()))])?;
+    std::fs::write(&file, "\n")?;
+    let empty = binary_env(&args, &[(FEED_CONTACT_FILE, &file_shown)])?;
+    let first_line = |answered: &Answered| {
+        String::from_utf8_lossy(&answered.stderr)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert_eq!(
+        [&read, &both, &missing, &directory, &empty]
+            .map(|answered| (answered.code, answered.stdout.is_empty())),
+        [
+            (EXIT_OK, false),
+            (EXIT_USAGE, true),
+            (EXIT_NOT_FOUND, true),
+            (EXIT_USAGE, true),
+            (EXIT_USAGE, true)
+        ]
+    );
+    assert_eq!(
+        [&both, &missing, &empty].map(first_line),
+        [
+            format!(
+                "usage error: BELLWETHER_FEED_CONTACT and {FEED_CONTACT_FILE} are both set; set one"
+            ),
+            format!("error: {FEED_CONTACT_FILE} names {absent}, and no file is there"),
+            format!("error: {FEED_CONTACT_FILE} names {file_shown}, which holds no contact"),
+        ]
+    );
+    for answered in [&read, &both, &missing, &directory, &empty] {
+        for stream in [&answered.stdout, &answered.stderr] {
+            assert!(!String::from_utf8_lossy(stream).contains(CONTACT_ADDRESS));
+        }
+    }
+    Ok(())
+}
+
 /// Each provider's contact comes from its own variable: SEC's address set alone leaves the
 /// open-web User-Agent with none, refused at startup. Mutation 2026-11-15: `contact_variable`
 /// naming `BELLWETHER_SEC_CONTACT` for both turns this red (exit 0).
@@ -2578,6 +2643,25 @@ fn an_open_web_run_reads_its_contact_from_its_own_variable() -> TestResult {
     assert_eq!(
         (sec_only.code, sec_only.stdout.len(), own.code),
         (EXIT_USAGE, 0, EXIT_OK)
+    );
+    Ok(())
+}
+
+/// EDGAR's `_FILE` twin is the name the schema documents, and the open-web twin alone leaves
+/// EDGAR with no contact.
+#[test]
+fn an_edgar_run_reads_its_contact_from_its_own_file_variable() -> TestResult {
+    let root = TempDir::new()?;
+    let secrets = TempDir::new()?;
+    let file = secrets.path().join("sec-contact");
+    std::fs::write(&file, format!("{CONTACT}\n"))?;
+    let args = collect_args(root.path(), A_CLOSED_DAY, &["--dry-run"]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let own = binary_env(&args, &[(SEC_CONTACT_FILE, &path(&file))])?;
+    let other = binary_env(&args, &[(FEED_CONTACT_FILE, &path(&file))])?;
+    assert_eq!(
+        (own.code, other.code, other.stdout.len()),
+        (EXIT_OK, EXIT_USAGE, 0)
     );
     Ok(())
 }

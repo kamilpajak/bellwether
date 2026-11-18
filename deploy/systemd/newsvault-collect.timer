@@ -1,0 +1,44 @@
+# One line per slot of services/newsvault/src/schedule.rs's SLOTS, in UTC; the test
+# services/newsvault/tests/deploy.rs holds the two equal. No RandomizedDelaySec and no
+# Persistent=: a missed slot is not run late (S7-D10), and the ledger counts it short.
+[Unit]
+Description=newsvault collect at each poll schedule slot (UTC)
+Documentation=https://github.com/kamilpajak/bellwether/blob/main/docs/design/architecture.md
+
+[Timer]
+OnCalendar=*-*-* 00:30:00 UTC
+OnCalendar=*-*-* 02:00:00 UTC
+OnCalendar=*-*-* 03:30:00 UTC
+OnCalendar=*-*-* 05:00:00 UTC
+OnCalendar=*-*-* 06:30:00 UTC
+OnCalendar=*-*-* 08:00:00 UTC
+OnCalendar=*-*-* 09:30:00 UTC
+OnCalendar=*-*-* 11:00:00 UTC
+OnCalendar=*-*-* 11:30:00 UTC
+OnCalendar=*-*-* 12:00:00 UTC
+OnCalendar=*-*-* 12:30:00 UTC
+OnCalendar=*-*-* 13:00:00 UTC
+OnCalendar=*-*-* 13:30:00 UTC
+OnCalendar=*-*-* 14:00:00 UTC
+OnCalendar=*-*-* 14:30:00 UTC
+OnCalendar=*-*-* 15:00:00 UTC
+OnCalendar=*-*-* 15:30:00 UTC
+OnCalendar=*-*-* 16:00:00 UTC
+OnCalendar=*-*-* 16:30:00 UTC
+OnCalendar=*-*-* 17:00:00 UTC
+OnCalendar=*-*-* 17:30:00 UTC
+OnCalendar=*-*-* 18:00:00 UTC
+OnCalendar=*-*-* 18:30:00 UTC
+OnCalendar=*-*-* 19:00:00 UTC
+OnCalendar=*-*-* 19:30:00 UTC
+OnCalendar=*-*-* 20:00:00 UTC
+OnCalendar=*-*-* 20:30:00 UTC
+OnCalendar=*-*-* 21:00:00 UTC
+OnCalendar=*-*-* 21:30:00 UTC
+OnCalendar=*-*-* 22:00:00 UTC
+OnCalendar=*-*-* 23:30:00 UTC
+AccuracySec=1s
+Unit=newsvault-collect.service
+
+[Install]
+WantedBy=timers.target
