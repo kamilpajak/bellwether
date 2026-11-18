@@ -20,7 +20,9 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # The Dockerfile's Ubuntu release, so the tests link the system SQLite the image ships (3.45).
+    # Measured 2026-11-18: `ubuntu-latest` had moved to 26.04, whose SQLite is 3.46.1.
+    runs-on: ubuntu-24.04
     # The work is under a minute, and the default bound is six hours of a required status check
     # held by a hung step. A timed-out run surfaces as a cancellation, not a failure.
     timeout-minutes: 15
@@ -29,7 +31,10 @@ jobs:
       # A moving tag such as @v7 is a standing grant of write access to this gate, and a
       # reproducibility hole: two runs of one repository commit can execute different action code.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: cargo fmt --check
+      - name: the linked SQLite is 3.45, the image's
+        run: dpkg-query --showformat '${Version}' --show libsqlite3-0 | grep -E '^3\.45\.'
+      - if: ${{ !cancelled() }}
+        run: cargo fmt --check
       # "!cancelled()" keeps the step running after an earlier step failed while still skipping it
       # when the run is cancelled, so one run reports all three verdicts instead of stopping at a
       # formatting diff. The price: a failed checkout yields three "could not find Cargo.toml".
