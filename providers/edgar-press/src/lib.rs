@@ -490,6 +490,12 @@ impl Provider for EdgarPress {
         Cadence::SessionBound
     }
 
+    /// S7-D6's cap is open-web's (architecture.md section 11.2): a full EDGAR day asked 502
+    /// documents on 2026-11-13 under a 100 ms pace, and its archive arm converges by R20.
+    fn follow_up_cap(&self) -> Option<u32> {
+        None
+    }
+
     fn plan(
         &self,
         target: &TargetWindow,

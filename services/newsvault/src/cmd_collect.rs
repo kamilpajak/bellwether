@@ -18,8 +18,8 @@ use news_provider::provider::{Cadence, Calendar, CalendarError, Listing, PlanRef
 use news_provider::request::RequestPhase;
 use news_provider::{
     stamp_of, Archive, ArchiveError, AttemptReceipt, AttemptRow, Clock, CollectError, Collected,
-    CollectedItem, Committed, Credentials, Exchange, Exit, Headers, Payload, Provider, Relisted,
-    Run, RunId, SourceId, TargetWindow, Wire,
+    CollectedItem, Committed, Credentials, DeferReason, Deferred, Exchange, Exit, Headers, Payload,
+    Provider, Relisted, Run, RunId, SourceId, TargetWindow, Wire,
 };
 use open_web_feed::{
     Basis, Continuity, CrossChecker, DirectAnswer, Generation, HostRobots, OpenWebFeed, Paging,
@@ -1528,6 +1528,17 @@ fn envelope_of(
             })).collect::<Vec<Value>>(),
         },
         "swept": collected.swept,
+        // S7-D4: requests this run did not ask, in the order the queue reached them.
+        "deferred": collected.deferred.iter().map(|row| json!({
+            "source": row.source,
+            "target_window": row.target_window,
+            "host": row.host,
+            "url": row.url,
+            "phase": row.phase.name(),
+            "story_id": row.story_id,
+            "listed_date": row.listed_date,
+            "reason": row.reason.name(),
+        })).collect::<Vec<Value>>(),
         "attempts": collected.attempts.iter().map(|row| json!({
             "attempt_id": row.attempt_id,
             "source": row.source,
@@ -1557,6 +1568,7 @@ fn envelope_of(
             "robots_disallowed": row.robots_disallowed,
             "unusable_rows": row.unusable_rows,
             "items_committed": row.items_committed,
+            "deferred": row.deferred,
         })).collect::<Vec<Value>>(),
         "provenance_counts": provenance_counts(collected),
         "items_committed": collected.tally.committed,
@@ -1678,6 +1690,20 @@ pub fn render_human(envelope: &Value, out: &mut impl std::io::Write) -> std::io:
         "swept            {}",
         envelope["swept"].as_array().map_or(0, Vec::len)
     )?;
+    let deferred = envelope["deferred"].as_array().unwrap_or(&none);
+    let by_reason = |reason: DeferReason| {
+        deferred
+            .iter()
+            .filter(|row| text(row, "reason") == reason.name())
+            .count()
+    };
+    writeln!(
+        out,
+        "deferred         {} {} {}",
+        deferred.len(),
+        DeferReason::FollowUpCap.name(),
+        by_reason(DeferReason::FollowUpCap)
+    )?;
     writeln!(out, "exit             {}", envelope["exit"]["code"])?;
     Ok(())
 }
@@ -1765,6 +1791,11 @@ impl Archive for Committer {
     ) -> Result<(), ArchiveError> {
         Committer::record_relisted(self, attempt_id, relisted)
             .map_err(|why| refused("record the re-listed stories", &why))
+    }
+
+    fn record_deferred(&mut self, deferred: &Deferred) -> Result<(), ArchiveError> {
+        Committer::record_deferred(self, deferred)
+            .map_err(|why| refused("record a deferred request", &why))
     }
 }
 

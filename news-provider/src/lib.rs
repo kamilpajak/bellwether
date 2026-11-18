@@ -50,8 +50,9 @@ pub mod wire;
 pub use budget::{BudgetError, BudgetScope, HostKey, Pace, RequestBudget};
 pub use clock::{Clock, Sleeper, SystemClock, ThreadSleeper};
 pub use collect::{
-    collect, Archive, ArchiveError, AttemptRow, CollectError, Collected, Committed, Exchange, Exit,
-    NotPlannedRow, Payload, Relisted, Run, SourceTally, Tally, EXITS, MAX_TRANSIENT_RETRIES,
+    collect, Archive, ArchiveError, AttemptRow, CollectError, Collected, Committed, DeferReason,
+    Deferred, Exchange, Exit, NotPlannedRow, Payload, Relisted, Run, SourceTally, Tally, EXITS,
+    MAX_TRANSIENT_RETRIES,
 };
 pub use lag_policy::{LagPolicy, LagPolicyError, LAG_POLICY_SCHEMA};
 pub use ledger::{

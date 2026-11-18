@@ -332,6 +332,10 @@ impl Archive for Refusing {
     ) -> Result<(), ArchiveError> {
         Archive::record_relisted(&mut self.store, attempt_id, relisted)
     }
+
+    fn record_deferred(&mut self, deferred: &news_provider::Deferred) -> Result<(), ArchiveError> {
+        Archive::record_deferred(&mut self.store, deferred)
+    }
 }
 
 /// One run through the library, with the exchange the caller chose (static `Payloads` or a
@@ -707,6 +711,10 @@ impl Archive for Untouched {
         _relisted: &[news_provider::Relisted],
     ) -> Result<(), ArchiveError> {
         Err(self.touched("record_relisted"))
+    }
+
+    fn record_deferred(&mut self, _deferred: &news_provider::Deferred) -> Result<(), ArchiveError> {
+        Err(self.touched("record_deferred"))
     }
 }
 

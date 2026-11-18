@@ -1046,3 +1046,110 @@ fn a_reader_refuses_a_store_at_another_user_version() -> TestResult {
     assert_eq!(answers, refused);
     Ok(())
 }
+
+/// S7-D4: `deferred` rows are counted per reason for the source and day of their run, in the JSON
+/// row and on the human line. Distinct counts 5 (two runs), 7 and 11 so a swapped or merged source,
+/// run or day shows; a `host_held` row and a row deferred after `--at` count nowhere.
+#[test]
+fn deferred_rows_are_counted_per_reason_for_the_source_and_day_of_their_run() -> TestResult {
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    let rows = [
+        (
+            "run-0701-0034",
+            EDGAR,
+            2,
+            "follow_up_cap",
+            "2026-07-01T00:40:00.000000Z",
+        ),
+        (
+            "run-0701-0630",
+            EDGAR,
+            3,
+            "follow_up_cap",
+            "2026-07-01T06:40:00.000000Z",
+        ),
+        (
+            "run-0701-0034",
+            POLYGON,
+            7,
+            "follow_up_cap",
+            "2026-07-01T00:40:00.000000Z",
+        ),
+        (
+            "run-0702-a",
+            EDGAR,
+            11,
+            "follow_up_cap",
+            "2026-07-02T09:40:00.000000Z",
+        ),
+        (
+            "run-0701-1230",
+            EDGAR,
+            1,
+            "host_held",
+            "2026-07-01T12:40:00.000000Z",
+        ),
+        (
+            "run-0701-1230",
+            EDGAR,
+            1,
+            "follow_up_cap",
+            "2026-08-01T00:00:00.000000Z",
+        ),
+    ];
+    for (run, source, many, reason, at) in rows {
+        for nth in 0..many {
+            db.execute(
+                "INSERT INTO deferred (run_id, source, target_window, host, url, phase, reason,
+                                       deferred_at)
+                 VALUES (?1, ?2, '2026-07-01', 'example.test', ?3, 'document', ?4, ?5)",
+                rusqlite::params![
+                    run,
+                    source,
+                    format!("https://example.test/{nth}"),
+                    reason,
+                    at
+                ],
+            )?;
+        }
+    }
+    drop(db);
+    let json = over(&root, FIRST_DAY, EMPTY_DAY)?.json()?;
+    let counted = |day: &str, source: &str| {
+        per_source(&json, day, source)
+            .and_then(|row| row.get("deferred"))
+            .and_then(|counts| counts.get("follow_up_cap"))
+            .and_then(Value::as_i64)
+    };
+    let human = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .arg("ledger")
+        .args(["--store", &root.path().to_string_lossy()])
+        .args(["--at", AT, "--format", "human"])
+        .args(["--from", FIRST_DAY, "--to", FIRST_DAY])
+        .output()?
+        .stdout;
+    let shown: Vec<Option<i64>> = String::from_utf8(human)?
+        .lines()
+        .filter(|line| line.starts_with("  "))
+        .map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            words
+                .iter()
+                .position(|word| *word == "deferred_follow_up_cap")
+                .and_then(|at| words.get(at + 1))
+                .and_then(|word| word.parse().ok())
+        })
+        .collect();
+    assert_eq!(
+        (
+            counted(FIRST_DAY, EDGAR),
+            counted(FIRST_DAY, POLYGON),
+            counted(EMPTY_DAY, EDGAR),
+            counted(EMPTY_DAY, POLYGON),
+            shown,
+        ),
+        (Some(5), Some(7), Some(11), Some(0), vec![Some(5), Some(7)])
+    );
+    Ok(())
+}
