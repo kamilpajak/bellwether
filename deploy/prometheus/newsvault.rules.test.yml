@@ -304,7 +304,7 @@ tests:
               summary: no newsvault backup has reached Nextcloud for over 2 days, or none ever.
 
   # One missed day: the copy stamped 0, none a day later, the next run stamped 172,800 (its start)
-  # and written at 48h10m: quiet while it uploads.
+  # and written at 48h10m: quiet while it writes.
   - interval: 5m
     input_series:
       - series: 'newsvault_backup_last_success_timestamp_seconds'
