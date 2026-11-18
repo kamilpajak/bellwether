@@ -965,18 +965,25 @@ pub fn run(
         busy: Vec::new(),
         holds_capped: Vec::new(),
     };
+    let prior = prior_run_file(&ask.store, &run_id)?;
     // Before the lease, so a run that never gets one is a record rather than a hole.
     write_envelope(&ask.store, &envelope)?;
     let mut store = match Committer::open(&ask.store, &run) {
         Ok(store) => store,
         // S7-D9: finished and marked, so the ledger counts it apart from the runs it observes.
+        // A file of the same run id that was there first is put back, never marked.
         Err(StoreError::LeaseHeld(lock)) => {
-            let refused = Envelope {
-                finished_at: Some(clock.now()),
-                refused: Some(LEASE_HELD.to_owned()),
-                ..envelope
-            };
-            write_envelope(&ask.store, &refused)?;
+            match prior {
+                Some(bytes) => write_run_file(&ask.store, &run_id, &bytes)?,
+                None => write_envelope(
+                    &ask.store,
+                    &Envelope {
+                        finished_at: Some(clock.now()),
+                        refused: Some(LEASE_HELD.to_owned()),
+                        ..envelope
+                    },
+                )?,
+            }
             return Err(StoreError::LeaseHeld(lock).into());
         }
         Err(other) => return Err(other.into()),
@@ -1635,17 +1642,34 @@ fn run_id(ask: &Ask) -> String {
 /// tmp + rename, like every other file in the layout: a run killed while its envelope is rewritten
 /// otherwise leaves unparseable JSON and disables the command whose job is to report the kill.
 pub(crate) fn write_envelope(root: &Path, envelope: &Envelope) -> Result<(), CollectRunError> {
+    write_run_file(
+        root,
+        &envelope.run_id,
+        &serde_json::to_vec_pretty(envelope)?,
+    )
+}
+
+/// The bytes of `runs/<run_id>.json` as found, `None` when there is no such file.
+fn prior_run_file(root: &Path, run_id: &str) -> Result<Option<Vec<u8>>, CollectRunError> {
+    match std::fs::read(root.join(RUNS_DIR).join(format!("{run_id}.json"))) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(other) => Err(other.into()),
+    }
+}
+
+fn write_run_file(root: &Path, run_id: &str, bytes: &[u8]) -> Result<(), CollectRunError> {
     let runs = root.join(RUNS_DIR);
     std::fs::create_dir_all(&runs)?;
-    let staging = runs.join(format!("{STAGING_PREFIX}{}.json", envelope.run_id));
+    let staging = runs.join(format!("{STAGING_PREFIX}{run_id}.json"));
     // `File::create` TRUNCATES, which is right HERE and wrong for a blob or a segment: one run
     // writes its envelope twice by design, and refusing a staged file a crash left behind would
     // wedge that run id for good. The archive's content files keep `create_new`.
     let mut staged = std::fs::File::create(&staging)?;
-    std::io::Write::write_all(&mut staged, &serde_json::to_vec_pretty(envelope)?)?;
+    std::io::Write::write_all(&mut staged, bytes)?;
     staged.sync_all()?;
     drop(staged);
-    std::fs::rename(&staging, runs.join(format!("{}.json", envelope.run_id)))?;
+    std::fs::rename(&staging, runs.join(format!("{run_id}.json")))?;
     // A rename is durable only once the directory holding the new name is fsynced, which is the
     // pair `blobs.rs` and `publish.rs` already keep.
     std::fs::File::open(&runs)?.sync_all()?;

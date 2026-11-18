@@ -659,6 +659,31 @@ fn a_run_the_lease_kept_out_finishes_its_run_file_refused_lease_held() -> TestRe
     Ok(())
 }
 
+/// A lease-held run whose run id a finished run already has puts that run's file back byte for
+/// byte, so the ledger keeps the finished run observed and never reads it as `lease_held`.
+#[test]
+fn a_lease_held_run_puts_back_the_run_file_its_run_id_already_had() -> TestResult {
+    let root = TempDir::new()?;
+    let ask = ask(root.path(), A_LISTED_SESSION);
+    let provider = cmd_collect::open_provider(&ask)?;
+    let finished = cmd_collect::run(&ask, &provider, &Payloads::a_good_day()?, &Fixed)?;
+    let run_id = finished.envelope["run_id"].as_str().ok_or("run_id")?;
+    let run_file = root.path().join("runs").join(format!("{run_id}.json"));
+    let before = std::fs::read(&run_file)?;
+    let held = Committer::open(root.path(), &RunId::new("the-holder"))?;
+    let blocked = cmd_collect::run(&ask, &provider, &Payloads::a_good_day()?, &Fixed);
+    drop(held);
+    assert!(
+        matches!(
+            blocked,
+            Err(CollectRunError::Store(StoreError::LeaseHeld(_)))
+        ),
+        "{blocked:?}"
+    );
+    assert_eq!(std::fs::read(&run_file)?, before);
+    Ok(())
+}
+
 #[test]
 fn a_held_lease_exits_seven_and_leaves_a_run_record_rather_than_a_hole() -> TestResult {
     let root = TempDir::new()?;
@@ -2395,7 +2420,37 @@ fn every_collect_usage_error_is_written_as_a_usage_error() -> TestResult {
         args
     };
     let calendar = path(&fixture("calendar.json"));
+    let a_minute_ahead = (Utc::now() + chrono::TimeDelta::minutes(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let after_the_clock: Vec<String> = open_web_args(root.path(), &[])
+        .into_iter()
+        .filter(|arg| arg != "--dry-run")
+        .map(|arg| {
+            if arg == SATURDAY_AT {
+                a_minute_ahead.clone()
+            } else {
+                arg
+            }
+        })
+        .collect();
     let rows = [
+        (
+            "deadline not after at",
+            collect_args(
+                root.path(),
+                A_LISTED_SESSION,
+                &["--deadline", AT, "--dry-run"],
+            ),
+        ),
+        (
+            "deadline not after now",
+            collect_args(
+                root.path(),
+                A_LISTED_SESSION,
+                &["--deadline", "2026-11-10T23:30:00Z"],
+            ),
+        ),
+        ("at after the clock", after_the_clock),
         ("window unreadable", with_window("garbage")),
         ("window not the run day", with_window("2026-11-13")),
         (
