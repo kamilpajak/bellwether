@@ -865,7 +865,7 @@ mod tests {
     use crate::budget::{BudgetError, RequestBudget};
     use crate::clock::testing::{StepClock, WaitRecorder, WaitedClock};
     use crate::clock::Clock;
-    use crate::collect::{HostQueue, Payload, Popped, Queued};
+    use crate::collect::{Exchange, HostQueue, Payload, Popped, Queued};
     use crate::ledger::tests::{at, Recorder};
     use crate::ledger::{AttemptSlot, SendPermit};
     use crate::provider::Provenance;
@@ -2714,7 +2714,8 @@ mod tests {
         Ok((store, clock, wire))
     }
 
-    /// `url` reserved under `deadline`, then sent when the answer is `Go`.
+    /// `url` reserved under `deadline` through `Exchange`, the door `collect` uses, then sent when
+    /// the answer is `Go`.
     fn reserved(
         wire: &Wire,
         clock: &WaitedClock,
@@ -2725,7 +2726,8 @@ mod tests {
             url: url.to_owned(),
             ..request()
         };
-        let reservation = wire.reserve(&asked, clock, Some(deadline.parse()?))?;
+        let exchange: &dyn Exchange = wire;
+        let reservation = exchange.reserve(&asked, clock, Some(deadline.parse()?))?;
         if reservation == Reservation::Go {
             send_to(wire, clock, SECOND_ATTEMPT, url)?;
         }
@@ -2872,7 +2874,8 @@ mod tests {
             send_to(&wire, &clock, SECOND_ATTEMPT, REFUSED)?;
             let hold =
                 std::fs::read_to_string(store.path().join(PACE_DIR).join(LOOPBACK_HOLD_FILE))?;
-            recorded.push((wire.capped_holds(), hold, clock.waits()));
+            let exchange: &dyn Exchange = &wire;
+            recorded.push((exchange.capped_holds(), hold, clock.waits()));
         }
         let expected = |value: &str| -> Result<_, Box<dyn std::error::Error>> {
             Ok((

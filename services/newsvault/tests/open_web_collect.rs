@@ -5449,14 +5449,28 @@ fn deferred_requests_open_no_attempt_and_every_reader_counts_each_reason_apart()
             (counts.run_deadline, counts.host_held, counts.follow_up_cap)
         })
         .collect();
+    let mut ledger_human = Vec::new();
+    newsvault::cmd_ledger::render_human(&report, &mut ledger_human)?;
+    let ledger_human = String::from_utf8(ledger_human)?;
+    let ledger_line = ledger_human
+        .lines()
+        .find_map(|line| line.split_once("deferred_run_deadline"))
+        .and_then(|(_, rest)| rest.split_once(" items_new"))
+        .map(|(counts, _)| counts.to_owned());
     assert_eq!(
-        (lines, ledgered, envelope["holds_capped"].clone()),
+        (
+            lines,
+            ledgered,
+            ledger_line,
+            envelope["holds_capped"].clone()
+        ),
         (
             vec![
                 "deferred         7 run_deadline 3 host_held 4 follow_up_cap 0",
                 "holds capped     1"
             ],
             vec![(3, 4, 0)],
+            Some(" 3 deferred_host_held 4 deferred_follow_up_cap 0".to_owned()),
             serde_json::json!([{
                 "host": PRN_HOST,
                 "retry_after": "315360000",
@@ -5507,8 +5521,10 @@ fn with_no_deadline_every_request_is_asked_and_nothing_is_deferred() -> TestResu
 }
 
 /// S7-D6's exception meets the deadline (owner decision 2026-11-18): walk ids are outside the
-/// cap but not outside the deadline, so ids the pace reaches after it are deferred
-/// `run_deadline`, never asked, and the walk is not `complete`, so the next poll walks them.
+/// cap but not outside the deadline. The index and its three listed releases take four slots,
+/// the first walk id the fifth; the second walk id's slot opens after the deadline, so it and
+/// the three after it are deferred `run_deadline`, never asked, and the walk is not
+/// `complete`, so the next poll walks them again.
 #[test]
 fn walk_ids_the_deadline_cuts_are_deferred_and_the_walk_is_not_complete() -> TestResult {
     let root = after_a_first_walked_poll()?;
@@ -5517,7 +5533,7 @@ fn walk_ids_the_deadline_cuts_are_deferred_and_the_walk_is_not_complete() -> Tes
     let ask = Ask {
         hosts: Some(hosts_fixture(WALK_HOSTS)),
         at: instant(WALK_SECOND),
-        deadline: Some(instant(WALK_SECOND_PLUS_25_S)),
+        deadline: Some(instant(WALK_SECOND_PLUS_45_S)),
         schedule: Some("walk".to_owned()),
         ..ask(root.path(), cmd_collect::TODAY)
     };
@@ -5525,27 +5541,28 @@ fn walk_ids_the_deadline_cuts_are_deferred_and_the_walk_is_not_complete() -> Tes
     let answer = cmd_collect::run(&ask, &opened, &exchange, &At(instant(WALK_SECOND)))?;
     let (sent, _) = exchange.sent();
     let deferred = deferred_of(&answer.envelope);
-    let deferred_walk_ids = walked_ids(
-        &deferred
-            .iter()
-            .map(|row| row.1.clone())
-            .collect::<Vec<String>>(),
-    );
+    let urls: Vec<String> = deferred.iter().map(|row| row.1.clone()).collect();
     assert_eq!(
         (
-            sent.len(),
+            walked_ids(&sent),
+            walked_ids(&urls),
+            deferred.first().map(|row| row.3.clone()),
             deferred.iter().all(|row| row.2 == "run_deadline"),
-            deferred_walk_ids.is_empty(),
-            walked_ids(&sent)
-                .iter()
-                .any(|id| deferred_walk_ids.contains(id)),
             answer.envelope["walk"][0]["continuity"].as_str() == Some("complete"),
             answer.exit.error_code(),
         ),
-        (3, true, false, false, false, Some("partial_collect"))
+        (
+            vec![3_404_416],
+            vec![3_404_417, 3_404_418, 3_404_420, 3_404_421],
+            Some(Value::from(SIXTH_WALK_SLOT)),
+            true,
+            false,
+            Some("partial_collect")
+        )
     );
     Ok(())
 }
 
-/// `WALK_SECOND` plus 25 s: the walk's host gets three slots under `PACE`.
-const WALK_SECOND_PLUS_25_S: &str = "2026-11-17T12:05:55Z";
+/// `WALK_SECOND` plus 45 s: the walk's host gets five slots under `PACE`; the sixth opens at 50 s.
+const WALK_SECOND_PLUS_45_S: &str = "2026-11-17T12:06:15Z";
+const SIXTH_WALK_SLOT: &str = "2026-11-17T12:06:20.000000Z";
