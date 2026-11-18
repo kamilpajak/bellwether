@@ -18,6 +18,7 @@ use crate::store::{
     coverage_up_to, newest_visible_publication, require_current_version, unpublished_seq_ranges,
     SeqRange, WindowCoverage, COMMIT_LOG, RUNS_DIR,
 };
+use news_provider::DeferReason;
 use open_web_feed::Continuity;
 
 pub const SCHEMA: &str = "newsvault.ledger/1";
@@ -154,6 +155,8 @@ pub struct SourceRow {
     pub boundaries: BoundaryCounts,
     /// Section 11.2: walked polls' ids by answer, from `attempts.walk_*`; 0 before user_version 12.
     pub walk: WalkCounts,
+    /// S7-D4: requests the source's runs did not ask, from `deferred`, one count per reason.
+    pub deferred: DeferredCounts,
     pub items_new: i64,
     pub rows_committed: i64,
 }
@@ -216,6 +219,21 @@ impl WalkCounts {
             gone: self.gone + other.gone,
             other_language: self.other_language + other.other_language,
             unread: self.unread + other.unread,
+        }
+    }
+}
+
+/// One count per `news_provider::DeferReason`; `run_deadline` and `host_held` join with their
+/// producer (architecture.md section 11.5 step 7, PR 3).
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct DeferredCounts {
+    pub follow_up_cap: i64,
+}
+
+impl DeferredCounts {
+    const fn add(self, other: Self) -> Self {
+        Self {
+            follow_up_cap: self.follow_up_cap + other.follow_up_cap,
         }
     }
 }
@@ -382,6 +400,7 @@ pub fn read(root: &Path, ask: &Ask) -> Result<Report, LedgerReadError> {
     let grouped = grouped_attempts(&db, &at)?;
     let in_flight = in_flight_attempts(&db, &at)?;
     let answers = answers_per_attempt(&db, &at)?;
+    let deferred = deferred_per_run(&db, &at)?;
     let known_runs: BTreeSet<&str> = envelopes.iter().map(|run| run.run_id.as_str()).collect();
     let attempts_without_a_run_envelope = orphans(&db, &at, &known_runs)?;
     // Indexed by run once rather than scanned per day: a year at the measured cadence is about
@@ -389,13 +408,20 @@ pub fn read(root: &Path, ask: &Ask) -> Result<Report, LedgerReadError> {
     let grouped = by_run(&grouped, |row| &row.run_id);
     let in_flight = by_run(&in_flight, |row| &row.0);
     let answers_by_run = by_run(&answers, |row| &row.run_id);
+    let deferred = by_run(&deferred, |row| &row.run_id);
 
     let mut days = Vec::new();
     let mut matched = 0;
     let mut findings = Vec::new();
     let mut date = ask.from;
     while date <= ask.to {
-        let mut row = day_row(date, &envelopes, &grouped, &in_flight, &answers_by_run, ask);
+        let read = Read {
+            grouped: &grouped,
+            in_flight: &in_flight,
+            answers: &answers_by_run,
+            deferred: &deferred,
+        };
+        let mut row = day_row(date, &envelopes, &read, ask);
         matched += row.per_source.len();
         // The check runs over the whole day, before any cap: a cap that hides a finding is worse
         // than no cap (architecture.md section 8 row R16), which is the reason for `truncated`.
@@ -593,6 +619,32 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
     Ok(rows)
 }
 
+/// One run's `deferred` rows of one source, counted per reason.
+struct DeferredGroup {
+    run_id: String,
+    source: String,
+    counts: DeferredCounts,
+}
+
+fn deferred_per_run(db: &Connection, at: &str) -> Result<Vec<DeferredGroup>, LedgerReadError> {
+    let mut statement = db.prepare(
+        "SELECT run_id, source, SUM(reason = ?2) FROM deferred WHERE deferred_at <= ?1
+         GROUP BY run_id, source ORDER BY run_id, source",
+    )?;
+    let rows = statement
+        .query_map(params![at, DeferReason::FollowUpCap.name()], |row| {
+            Ok(DeferredGroup {
+                run_id: row.get(0)?,
+                source: row.get(1)?,
+                counts: DeferredCounts {
+                    follow_up_cap: row.get(2)?,
+                },
+            })
+        })?
+        .collect::<Result<Vec<DeferredGroup>, _>>()?;
+    Ok(rows)
+}
+
 /// `(run_id, source, attempt_id, answered)` for one attempt with no `Finalised` row.
 type InFlightRow = (String, String, String, bool);
 type InFlight = Vec<InFlightRow>;
@@ -725,14 +777,15 @@ fn of_the_day<'row, T>(
         .collect()
 }
 
-fn day_row(
-    date: NaiveDate,
-    envelopes: &[Envelope],
-    grouped: &BTreeMap<&str, Vec<&Grouped>>,
-    in_flight: &BTreeMap<&str, Vec<&InFlightRow>>,
-    answers: &BTreeMap<&str, Vec<&Answered>>,
-    ask: &Ask,
-) -> DayRow {
+/// Every store read a day row is built from, each indexed by run.
+struct Read<'a> {
+    grouped: &'a BTreeMap<&'a str, Vec<&'a Grouped>>,
+    in_flight: &'a BTreeMap<&'a str, Vec<&'a InFlightRow>>,
+    answers: &'a BTreeMap<&'a str, Vec<&'a Answered>>,
+    deferred: &'a BTreeMap<&'a str, Vec<&'a DeferredGroup>>,
+}
+
+fn day_row(date: NaiveDate, envelopes: &[Envelope], read: &Read, ask: &Ask) -> DayRow {
     let today: Vec<&Envelope> = envelopes
         .iter()
         .filter(|envelope| envelope.run_date == date && envelope.kind.is_collect())
@@ -746,7 +799,7 @@ fn day_row(
         .max()
         .unwrap_or_default();
     let mut by_source: BTreeMap<String, SourceRow> = BTreeMap::new();
-    for entry in of_the_day(grouped, &runs) {
+    for entry in of_the_day(read.grouped, &runs) {
         if !ask.wants(&entry.source) {
             continue;
         }
@@ -773,7 +826,7 @@ fn day_row(
             _ => row.in_flight += entry.attempts,
         }
     }
-    for (_, source, attempt_id, answered) in of_the_day(in_flight, &runs) {
+    for (_, source, attempt_id, answered) in of_the_day(read.in_flight, &runs) {
         if !ask.wants(source) {
             continue;
         }
@@ -786,7 +839,7 @@ fn day_row(
             row.opened_without_answered.push(attempt_id.clone());
         }
     }
-    for answer in of_the_day(answers, &runs) {
+    for answer in of_the_day(read.answers, &runs) {
         if !ask.wants(&answer.source) {
             continue;
         }
@@ -794,6 +847,15 @@ fn day_row(
             .entry(answer.source.clone())
             .or_insert_with(|| SourceRow::named(&answer.source));
         row.rows_committed += i64::try_from(answer.item_ids.len()).unwrap_or(i64::MAX);
+    }
+    for group in of_the_day(read.deferred, &runs) {
+        if !ask.wants(&group.source) {
+            continue;
+        }
+        let row = by_source
+            .entry(group.source.clone())
+            .or_insert_with(|| SourceRow::named(&group.source));
+        row.deferred = row.deferred.add(group.counts);
     }
     DayRow {
         run_date: date.to_string(),
@@ -838,6 +900,7 @@ impl SourceRow {
             continuity: ContinuityCounts::default(),
             boundaries: BoundaryCounts::default(),
             walk: WalkCounts::default(),
+            deferred: DeferredCounts::default(),
             items_new: 0,
             rows_committed: 0,
         }
@@ -946,7 +1009,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                  boundary_older_generation {} boundary_newer_generation {} \
                  boundary_generation_unknown {} walk_complete {} walk_first_poll {} \
                  walk_id_unread {} walk_range_unread {} walk_gone {} walk_other_language {} walk_unread {} \
-                 items_new {} rows {}",
+                 deferred_follow_up_cap {} items_new {} rows {}",
                 row.source,
                 row.ok,
                 row.empty,
@@ -976,6 +1039,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 row.walk.gone,
                 row.walk.other_language,
                 row.walk.unread,
+                row.deferred.follow_up_cap,
                 row.items_new,
                 row.rows_committed
             )?;

@@ -528,6 +528,11 @@ pub trait Provider: Send + Sync {
     /// a provider that forgot to declare would inherit a claim it never made.
     fn cadence(&self) -> Cadence;
 
+    /// How many `Document` follow-ups one run issues before the driver defers the rest, counted
+    /// at issue in round-robin order; `None` issues every one (architecture.md section 11.2,
+    /// S7-D6). Neither a retry nor an [`Extracted::walk`] id counts.
+    fn follow_up_cap(&self) -> Option<u32>;
+
     /// A [`Cadence::SessionBound`] plan takes the calendar AND the vendor's own listing, so a
     /// non-session day is zero requests and an unpublished day is a planning fact rather than a
     /// vendor verdict; [`listed_sessions`] refuses either one missing.

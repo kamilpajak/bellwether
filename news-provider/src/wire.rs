@@ -720,7 +720,7 @@ mod tests {
     use crate::budget::{BudgetError, RequestBudget};
     use crate::clock::testing::{StepClock, WaitRecorder, WaitedClock};
     use crate::clock::Clock;
-    use crate::collect::{HostQueue, Payload, Queued};
+    use crate::collect::{HostQueue, Payload, Popped, Queued};
     use crate::ledger::tests::{at, Recorder};
     use crate::ledger::{AttemptSlot, SendPermit};
     use crate::provider::Provenance;
@@ -2406,9 +2406,12 @@ mod tests {
             indexes.push(Request { url, ..request() });
             servers.push(served);
         }
-        let mut queue = HostQueue::of(indexes);
+        let mut queue = HostQueue::of(indexes, None);
         let mut ordinal = FIRST_ATTEMPT;
-        while let Some(Queued { request, retries }) = queue.pop() {
+        while let Some(Popped::Ask(Queued {
+            request, retries, ..
+        })) = queue.pop()
+        {
             let mut sink = Recorder::default();
             let Some(permit) = permit(&mut sink, ordinal) else {
                 return Err("no permit".into());
@@ -2429,7 +2432,12 @@ mod tests {
                 .collect();
             let transient = status.is_some_and(|code| RETRIED_STATUSES.contains(&code));
             let retrying = Queued::retried(transient, retries);
-            queue.requeue(follow_ups, Queued { request, retries }, retrying);
+            let asked = Queued {
+                request,
+                retries,
+                counted: false,
+            };
+            queue.requeue(follow_ups, Vec::new(), asked, retrying);
         }
         let served = servers
             .into_iter()

@@ -3177,6 +3177,10 @@ impl Archive for RefusingTheIndex {
     ) -> Result<(), ArchiveError> {
         Archive::record_relisted(&mut self.store, attempt_id, relisted)
     }
+
+    fn record_deferred(&mut self, deferred: &news_provider::Deferred) -> Result<(), ArchiveError> {
+        Archive::record_deferred(&mut self.store, deferred)
+    }
 }
 
 /// Section 3.2 `held`: an index whose commit the store refused stays open with no `vendor_rows`,
@@ -4032,6 +4036,8 @@ fn an_unreadable_stored_header_text_is_store_unreadable_and_records_no_continuit
     Ok(())
 }
 
+/// The table `MIGRATIONS[12]` adds, which a v12 store lacks.
+const DEFERRED_TABLE: &str = "DROP TABLE deferred;";
 /// The columns `MIGRATIONS[11]` adds, which a v11 store lacks.
 const WALK_COLUMNS: &str = "ALTER TABLE attempts DROP COLUMN walk_through;
      ALTER TABLE attempts DROP COLUMN walk_gone;
@@ -4046,11 +4052,15 @@ const BOUNDARY_COLUMNS: &str = "ALTER TABLE attempts DROP COLUMN boundary_same_g
 /// The first run over an older store reads that store's basis: `basis_pages` runs before the run
 /// migrates it. Review 2026-11-17: a v11 build over a v10 store read none and recorded `first_poll`.
 #[test]
-fn a_v10_or_v11_store_keeps_its_basis_for_the_run_that_migrates_it() -> TestResult {
+fn a_v10_v11_or_v12_store_keeps_its_basis_for_the_run_that_migrates_it() -> TestResult {
     let mut kept = Vec::new();
     for (version, dropped) in [
-        (10, format!("{WALK_COLUMNS}{BOUNDARY_COLUMNS}")),
-        (11, WALK_COLUMNS.to_owned()),
+        (
+            10,
+            format!("{DEFERRED_TABLE}{WALK_COLUMNS}{BOUNDARY_COLUMNS}"),
+        ),
+        (11, format!("{DEFERRED_TABLE}{WALK_COLUMNS}")),
+        (12, DEFERRED_TABLE.to_owned()),
     ] {
         let root = TempDir::new()?;
         seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
@@ -4069,7 +4079,7 @@ fn a_v10_or_v11_store_keeps_its_basis_for_the_run_that_migrates_it() -> TestResu
         )?;
         kept.push(poll_continuity(&second));
     }
-    assert_eq!(kept, vec![(vec![1], Some("complete".to_owned())); 2]);
+    assert_eq!(kept, vec![(vec![1], Some("complete".to_owned())); 3]);
     Ok(())
 }
 
@@ -4824,6 +4834,10 @@ impl Archive for HoldingToo {
     ) -> Result<(), ArchiveError> {
         Archive::record_relisted(&mut self.store, attempt_id, relisted)
     }
+
+    fn record_deferred(&mut self, deferred: &news_provider::Deferred) -> Result<(), ArchiveError> {
+        Archive::record_deferred(&mut self.store, deferred)
+    }
 }
 
 /// The driver drops a walked id whose story became held after `open_provider` read the answered
@@ -4862,5 +4876,285 @@ fn a_walked_id_held_after_the_range_was_read_is_not_asked() -> TestResult {
         walked_ids(&sent),
         vec![3_404_417, 3_404_418, 3_404_420, 3_404_421]
     );
+    Ok(())
+}
+
+const CNW_RELEASE_PREFIX: &str = "https://www.newswire.ca/news-releases/";
+/// The five-host run's document follow-ups before any synthetic CNW release: GNW 3, PRN 4, CNW 3,
+/// the Fed 3 and Yahoo 2 (`an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end`).
+const FIVE_HOST_FOLLOW_UPS: usize = 15;
+const FOLLOW_UP_CAP: usize = 150;
+
+/// `cnw/sitemap_news_3_urls.xml` with `extra` synthetic releases after its three, each dated as
+/// its first; the synthetic urls in sitemap order.
+fn cnw_sitemap_with(extra: usize) -> Result<(Vec<u8>, Vec<String>), Box<dyn Error>> {
+    let fixture =
+        std::fs::read_to_string(provider_dir().join("tests/fixtures/cnw/sitemap_news_3_urls.xml"))?;
+    let urls: Vec<String> = (0..extra)
+        .map(|nth| format!("{CNW_RELEASE_PREFIX}capped-release-{nth}-7{nth:08}.html"))
+        .collect();
+    let entries: String = urls
+        .iter()
+        .map(|url| {
+            format!(
+                "<url><loc>{url}</loc><news:news><news:publication><news:name>Canada NewsWire\
+                 </news:name><news:language>en</news:language></news:publication>\
+                 <news:publication_date>2026-11-16T02:22:00-05:00</news:publication_date>\
+                 <news:title>A capped release</news:title></news:news></url>\n"
+            )
+        })
+        .collect();
+    let body = fixture.replacen("</urlset>", &format!("{entries}</urlset>"), 1);
+    Ok((body.into_bytes(), urls))
+}
+
+type CappedRun = (TempDir, cmd_collect::Answer, Gnw, Vec<String>);
+
+/// The committed five hosts on Monday on a fresh store, CNW's sitemap listing `extra` more
+/// releases, each answered with a kept CNW page.
+fn capped_run(extra: usize) -> Result<CappedRun, Box<dyn Error>> {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    let (sitemap, urls) = cnw_sitemap_with(extra)?;
+    let mut exchange = Gnw::five_hosts()?;
+    exchange.pages.insert(CNW_INDEX.to_owned(), sitemap);
+    exchange.fallback = Some((
+        CNW_RELEASE_PREFIX.to_owned(),
+        std::fs::read(provider_dir().join("tests/fixtures/cnw/article_805423040.html"))?,
+    ));
+    let ask = Ask {
+        hosts: Some(seed::committed_hosts()),
+        at: instant(MONDAY_AT),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, &exchange, &Monday)?;
+    Ok((root, answer, exchange, urls))
+}
+
+fn document_attempts(envelope: &Value) -> usize {
+    envelope["attempts"].as_array().map_or(0, |rows| {
+        rows.iter().filter(|row| row["phase"] == "document").count()
+    })
+}
+
+/// One `deferred` row as stored, every column in table order.
+type DeferredRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+);
+
+fn stored_deferred(store: &Path) -> Result<Vec<DeferredRow>, Box<dyn Error>> {
+    let db = Connection::open_with_flags(store.join(COMMIT_LOG), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut query = db.prepare(
+        "SELECT run_id, source, target_window, host, url, phase, story_id, listed_date, reason,
+                deferred_at
+           FROM deferred ORDER BY rowid",
+    )?;
+    let rows = query
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+            ))
+        })?
+        .collect::<Result<Vec<DeferredRow>, _>>()?;
+    Ok(rows)
+}
+
+/// S7-D6 at its boundary through `collect`: 150 document follow-ups are all asked, no row is
+/// deferred and the run exits 0.
+#[test]
+fn a_run_of_exactly_150_follow_ups_asks_every_one_and_defers_none() -> TestResult {
+    let (root, answer, _, _) = capped_run(FOLLOW_UP_CAP - FIVE_HOST_FOLLOW_UPS)?;
+    assert_eq!(
+        (
+            answer.exit,
+            document_attempts(&answer.envelope),
+            answer.envelope["deferred"].as_array().map(Vec::len),
+            stored_deferred(root.path())?.len(),
+        ),
+        (Exit::Ok, FOLLOW_UP_CAP, Some(0), 0)
+    );
+    Ok(())
+}
+
+/// S7-D4 and S7-D6 through `collect`: the 151st follow-up, CNW's last in round-robin order, is
+/// never sent and is one `deferred` row naming it, in the envelope and the ledger; the run exits
+/// 8 `partial_collect` (S7-D8).
+#[test]
+fn the_151st_follow_up_is_deferred_recorded_and_never_sent_and_the_run_exits_8() -> TestResult {
+    let (root, answer, exchange, urls) = capped_run(FOLLOW_UP_CAP + 1 - FIVE_HOST_FOLLOW_UPS)?;
+    let last = urls.last().cloned().ok_or("no synthetic release")?;
+    let story = digest(canon::digest::story_id(
+        SOURCE,
+        last.trim_start_matches("https://"),
+    ));
+    let envelope = &answer.envelope;
+    let (sent, _) = exchange.sent();
+    let run_id = envelope["run_id"].as_str().ok_or("run_id")?.to_owned();
+    let listed = "2026-11-16T02:22:00-05:00";
+    let expected_row: DeferredRow = (
+        run_id,
+        SOURCE.to_owned(),
+        "2026-11-16".to_owned(),
+        Some("www.newswire.ca".to_owned()),
+        last.clone(),
+        "document".to_owned(),
+        story.clone(),
+        Some(listed.to_owned()),
+        "follow_up_cap".to_owned(),
+        "2026-11-16T09:30:30.000000Z".to_owned(),
+    );
+    assert_eq!(
+        (
+            answer.exit.code(),
+            answer.exit.error_code(),
+            document_attempts(envelope),
+            sent.contains(&last),
+            stored_deferred(root.path())?,
+        ),
+        (
+            8,
+            Some("partial_collect"),
+            FOLLOW_UP_CAP,
+            false,
+            vec![expected_row]
+        )
+    );
+    assert_eq!(
+        (
+            envelope["deferred"].clone(),
+            envelope["per_source"][0]["deferred"].as_u64(),
+        ),
+        (
+            serde_json::json!([{
+                "source": SOURCE,
+                "target_window": "2026-11-16",
+                "host": "www.newswire.ca",
+                "url": last,
+                "phase": "document",
+                "story_id": story,
+                "listed_date": listed,
+                "reason": "follow_up_cap",
+            }]),
+            Some(1)
+        )
+    );
+    let mut human = Vec::new();
+    cmd_collect::render_human(envelope, &mut human)?;
+    let line = String::from_utf8(human)?
+        .lines()
+        .find(|line| line.starts_with("deferred"))
+        .map(str::to_owned);
+    let report = newsvault::cmd_ledger::read(
+        root.path(),
+        &newsvault::cmd_ledger::Ask {
+            at: instant("2026-11-17T00:00:00Z"),
+            from: "2026-11-16".parse()?,
+            to: "2026-11-16".parse()?,
+            source: None,
+            expected_runs: None,
+            limit: None,
+            check: false,
+        },
+    )?;
+    let ledgered: Vec<i64> = report
+        .days
+        .iter()
+        .flat_map(|day| &day.per_source)
+        .map(|row| row.deferred.follow_up_cap)
+        .collect();
+    assert_eq!(
+        (line.as_deref(), ledgered),
+        (Some("deferred         1 follow_up_cap 1"), vec![1])
+    );
+    Ok(())
+}
+
+/// `RSS_1205` with `extra` synthetic English releases after its three, ids from 3405000 up.
+fn gnw_rss_with(extra: u64) -> Result<Vec<u8>, Box<dyn Error>> {
+    let fixture =
+        std::fs::read_to_string(provider_dir().join("tests/fixtures/gnw").join(RSS_1205))?;
+    let items: String = (0..extra)
+        .map(|nth| {
+            let id = 3_405_000 + nth;
+            let url = format!(
+                "https://www.globenewswire.com/news-release/2026/11/17/{id}/0/en/capped.html"
+            );
+            format!(
+                "<item><guid isPermaLink=\"true\">{url}</guid><link>{url}</link>\
+                 <title>A capped release</title><pubDate>Tue, 17 Nov 2026 12:03 GMT</pubDate>\
+                 <dc:identifier>{id}</dc:identifier><dc:language>en</dc:language></item>\n"
+            )
+        })
+        .collect();
+    Ok(fixture
+        .replacen("</channel>", &format!("{items}</channel>"), 1)
+        .into_bytes())
+}
+
+/// S7-D6's exception on the real path: a walked poll whose listed follow-ups pass the cap still
+/// sends every walk id and defers listed releases only; a deferral takes no ordinal, so the walk
+/// ids asked after it keep dense `attempt_id`s.
+#[test]
+fn a_walked_poll_past_the_cap_sends_every_walk_id_and_defers_listed_releases_only() -> TestResult {
+    let root = after_a_first_walked_poll()?;
+    let mut exchange = Gnw::walked(RSS_1205)?;
+    exchange.pages.insert(
+        INDEX.to_owned(),
+        gnw_rss_with(u64::try_from(FOLLOW_UP_CAP)?)?,
+    );
+    let second = walked_poll(
+        root.path(),
+        hosts_fixture(WALK_HOSTS),
+        WALK_SECOND,
+        &exchange,
+    )?;
+    let (sent, _) = exchange.sent();
+    let deferred: Vec<String> = stored_deferred(root.path())?
+        .into_iter()
+        .map(|row| row.4)
+        .collect();
+    let walked = [3_404_416, 3_404_417, 3_404_418, 3_404_420, 3_404_421];
+    assert_eq!(
+        (
+            walked_ids(&sent),
+            deferred.len(),
+            deferred
+                .iter()
+                .all(|url| url.ends_with("/0/en/capped.html")),
+            second.exit.error_code(),
+        ),
+        (walked.to_vec(), 3, true, Some("partial_collect"))
+    );
+    let run = second.envelope["run_id"].as_str().ok_or("run_id")?;
+    let window = second.envelope["window"].as_str().ok_or("window")?;
+    let ids: Vec<Option<String>> = second.envelope["attempts"]
+        .as_array()
+        .ok_or("attempts")?
+        .iter()
+        .map(|row| row["attempt_id"].as_str().map(str::to_owned))
+        .collect();
+    let dense: Vec<Option<String>> = (0..u32::try_from(ids.len())?)
+        .map(|ordinal| digest(canon::digest::attempt_id(run, SOURCE, window, ordinal)))
+        .collect();
+    assert_eq!(ids, dense);
     Ok(())
 }

@@ -1275,6 +1275,14 @@ fn edgar_press_declares_itself_session_bound() -> Outcome {
     Ok(())
 }
 
+/// S7-D6's cap is open-web's (architecture.md section 11.2): an EDGAR day of 502 documents
+/// (2026-11-13) is asked whole, and its archive arm converges by §8 row R20.
+#[test]
+fn edgar_press_declares_no_follow_up_cap() -> Outcome {
+    assert_eq!(provider()?.follow_up_cap(), None);
+    Ok(())
+}
+
 #[test]
 fn a_plan_with_no_calendar_is_refused_and_names_what_is_missing() -> Outcome {
     let refused = provider()?.plan(

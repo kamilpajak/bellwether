@@ -50,6 +50,66 @@ impl Exchange for Wire {
 /// (§8 row R21, §10). A permanent failure (4xx, `vendor_refused`) is never re-queued.
 pub const MAX_TRANSIENT_RETRIES: u32 = 2;
 
+/// Why a request was recorded as not looked at instead of asked: a `deferred` row (architecture.md
+/// section 3.2, S7-D4). `run_deadline` and `host_held` join with their producer, step 7 PR 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferReason {
+    FollowUpCap,
+}
+
+impl DeferReason {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::FollowUpCap => "follow_up_cap",
+        }
+    }
+}
+
+/// One request this run did not ask, and why. It has no attempt row, because no call was made
+/// (section 8 row R16); `story_id` by the rule `attempt_once` opens a `Document` attempt under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Deferred {
+    pub source: String,
+    pub target_window: String,
+    /// `None` for a url `host_of` cannot key, which shares the queue's `None` lane.
+    pub host: Option<String>,
+    pub url: String,
+    pub phase: RequestPhase,
+    pub story_id: Option<String>,
+    pub listed_date: Option<String>,
+    pub reason: DeferReason,
+    pub at: ObservationTime,
+}
+
+impl Deferred {
+    fn of(
+        provider: &dyn Provider,
+        request: Request,
+        reason: DeferReason,
+        at: ObservationTime,
+    ) -> Self {
+        let story_id = (request.phase == RequestPhase::Document)
+            .then(|| provider.story_of(&request))
+            .flatten()
+            .map(|story| story.hex().to_owned());
+        Self {
+            source: request.source.as_str().to_owned(),
+            target_window: request.target_window.as_str().to_owned(),
+            host: host_of(&request.url)
+                .ok()
+                .flatten()
+                .map(|host| host.as_str().to_owned()),
+            phase: request.phase,
+            story_id,
+            listed_date: request.listed_date,
+            url: request.url,
+            reason,
+            at,
+        }
+    }
+}
+
 /// What the archive refused, and which act asked. The act is what the exit table reads: a refused
 /// commit is `commit_failed` and a refused read is not.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
@@ -159,6 +219,10 @@ pub trait Archive: Sink {
         attempt_id: &str,
         relisted: &[Relisted],
     ) -> Result<(), ArchiveError>;
+
+    /// Records a request this run did not ask, before the run moves on: "we did not look" is a
+    /// row, apart from every attempt row (S7-D4).
+    fn record_deferred(&mut self, deferred: &Deferred) -> Result<(), ArchiveError>;
 }
 
 /// Why a run could not be driven at all. A vendor's own answer is never one of these: it is a
@@ -207,6 +271,8 @@ pub struct Tally {
     /// Targets not asked for, for a reason that is not clean work: [`NotPlanned::clean`].
     pub unclean_not_planned: u32,
     pub commit_refused: u32,
+    /// Requests recorded as [`Deferred`] and never asked, which no exit may read as finished.
+    pub deferred: u32,
 }
 
 /// What a run exits as. The registry codes are architecture.md section 5.1's.
@@ -273,6 +339,7 @@ impl Tally {
             + self.interrupted
             + self.unclean_not_planned
             + self.commit_refused
+            + self.deferred
     }
 
     /// The exit table as a TOTAL function over the counts, not a chain of ifs that falls through:
@@ -344,6 +411,7 @@ pub struct SourceTally {
     pub robots_disallowed: u32,
     pub unusable_rows: u32,
     pub items_committed: u32,
+    pub deferred: u32,
 }
 
 /// What one run did.
@@ -355,6 +423,8 @@ pub struct Collected {
     pub per_source: Vec<SourceTally>,
     /// Attempts a dead run left open, closed `interrupted` by this one.
     pub swept: Vec<String>,
+    /// Requests this run did not ask, in the order the queue reached them.
+    pub deferred: Vec<Deferred>,
     pub tally: Tally,
     pub blobs_written: u32,
     pub bytes_written: u64,
@@ -382,6 +452,7 @@ impl Collected {
             attempts: Vec::new(),
             per_source: Vec::new(),
             swept: Vec::new(),
+            deferred: Vec::new(),
             tally: Tally {
                 unclean_not_planned: count(
                     plan.not_planned
@@ -436,15 +507,33 @@ pub fn collect<A: Archive>(
         run: run.run,
         baseline: &baseline,
     };
-    let mut queue = HostQueue::of(plan.requests);
+    let mut queue = HostQueue::of(plan.requests, provider.follow_up_cap());
     let mut ordinal = 0;
     let mut issued = BTreeSet::new();
-    while let Some(Queued { request, retries }) = queue.pop() {
+    while let Some(popped) = queue.pop() {
+        let Queued {
+            request, retries, ..
+        } = match popped {
+            Popped::Ask(queued) => queued,
+            Popped::Defer(request) => {
+                let at = ObservationTime::new(clock.now());
+                let deferred = Deferred::of(provider, request, DeferReason::FollowUpCap, at);
+                archive.record_deferred(&deferred)?;
+                collected.tally.deferred += 1;
+                collected.deferred.push(deferred);
+                continue;
+            }
+        };
         let attempted = attempt_once(&driving, archive, &request, ordinal, &mut issued)?;
         ordinal += 1;
         let retrying = Queued::retried(attempted.is_transient(), retries);
         collected.absorb(&attempted, retrying);
-        queue.requeue(attempted.follow_ups, Queued { request, retries }, retrying);
+        let asked = Queued {
+            request,
+            retries,
+            counted: false,
+        };
+        queue.requeue(attempted.follow_ups, attempted.walked, asked, retrying);
     }
     collected.per_source = vec![tally_of(&source, &collected)];
     Ok(collected)
@@ -458,15 +547,26 @@ pub fn collect<A: Archive>(
 pub(crate) struct Queued {
     pub(crate) request: Request,
     pub(crate) retries: u32,
+    /// Counted against the follow-up cap when first popped: a `Document` follow-up an index
+    /// listed. A planned request, an `Index` follow-up, a walk id and a retry are not.
+    pub(crate) counted: bool,
 }
 
 impl Queued {
-    /// A request that has not yet been attempted. Both the plan's own requests and every follow-up
-    /// enter the queue this way; only a re-queue after a transient failure carries a non-zero count.
+    /// A planned request or a walk id, not yet attempted.
     pub(crate) const fn first_attempt(request: Request) -> Self {
         Self {
             request,
             retries: 0,
+            counted: false,
+        }
+    }
+
+    /// A follow-up an index listed, not yet attempted.
+    pub(crate) fn follow_up(request: Request) -> Self {
+        Self {
+            counted: request.phase == RequestPhase::Document,
+            ..Self::first_attempt(request)
         }
     }
 
@@ -483,13 +583,24 @@ pub(crate) struct HostQueue {
     /// `None` keys every url `host_of` cannot key; `Wire` refuses or fails those itself.
     lanes: Vec<(Option<HostKey>, VecDeque<Queued>)>,
     next: usize,
+    /// [`Provider::follow_up_cap`], and how many counted follow-ups `pop` has handed out to ask.
+    cap: Option<u32>,
+    issued: u32,
+}
+
+/// What [`HostQueue::pop`] hands the driver: a request to ask, or one past the cap to defer.
+pub(crate) enum Popped {
+    Ask(Queued),
+    Defer(Request),
 }
 
 impl HostQueue {
-    pub(crate) fn of(requests: Vec<Request>) -> Self {
+    pub(crate) fn of(requests: Vec<Request>, cap: Option<u32>) -> Self {
         let mut queue = Self {
             lanes: Vec::new(),
             next: 0,
+            cap,
+            issued: 0,
         };
         for request in requests {
             queue.push(Queued::first_attempt(request));
@@ -506,29 +617,51 @@ impl HostQueue {
         }
     }
 
-    /// After `asked` is attempted: its follow-ups, then itself again when `retrying`, each to the
-    /// back of its host's lane, so the pace limiter (R19) spaces the retry. §8 R21.
-    pub(crate) fn requeue(&mut self, follow_ups: Vec<Request>, asked: Queued, retrying: bool) {
+    /// After `asked` is attempted: its follow-ups, its walk ids, then itself again when
+    /// `retrying`, each to the back of its host's lane, so the pace limiter (R19) spaces the
+    /// retry. §8 R21. A retry is never counted again.
+    pub(crate) fn requeue(
+        &mut self,
+        follow_ups: Vec<Request>,
+        walked: Vec<Request>,
+        asked: Queued,
+        retrying: bool,
+    ) {
         for follow_up in follow_ups {
-            self.push(Queued::first_attempt(follow_up));
+            self.push(Queued::follow_up(follow_up));
+        }
+        for id in walked {
+            self.push(Queued::first_attempt(id));
         }
         if retrying {
             self.push(Queued {
                 request: asked.request,
                 retries: asked.retries + 1,
+                counted: false,
             });
         }
     }
 
-    /// The front of the first non-empty lane at or after the one after the last served.
-    pub(crate) fn pop(&mut self) -> Option<Queued> {
+    /// The front of the first non-empty lane at or after the one after the last served; a counted
+    /// follow-up past the cap comes back as `Defer`, so the cap binds in round-robin order.
+    pub(crate) fn pop(&mut self) -> Option<Popped> {
         let lanes = self.lanes.len();
-        (0..lanes).find_map(|step| {
+        let queued = (0..lanes).find_map(|step| {
             let at = (self.next + step) % lanes;
             let queued = self.lanes.get_mut(at)?.1.pop_front()?;
             self.next = at + 1;
             Some(queued)
-        })
+        })?;
+        if !queued.counted {
+            return Some(Popped::Ask(queued));
+        }
+        match self.cap {
+            Some(cap) if self.issued >= cap => Some(Popped::Defer(queued.request)),
+            _ => {
+                self.issued += 1;
+                Some(Popped::Ask(queued))
+            }
+        }
     }
 }
 
@@ -546,6 +679,8 @@ struct Driving<'a> {
 struct Attempted {
     row: AttemptRow,
     follow_ups: Vec<Request>,
+    /// [`Extracted::walk`]'s ids left to issue, outside the follow-up cap (S7-D6's exception).
+    walked: Vec<Request>,
     kind: OutcomeKind,
     permanent: bool,
     bytes_written: u64,
@@ -653,7 +788,7 @@ fn attempt_once<A: Archive>(
     };
     // A vendor_archive index records `matched` and hands over one window's covered set (R20); a
     // live index records `held` and hands over the held set of every window (§11.1, R16).
-    let follow_ups = match extracted {
+    let (follow_ups, walked) = match extracted {
         Some(extracted) if request.phase == RequestPhase::Index => {
             let matched = count(extracted.follow_ups.len());
             let archived = request.provenance == Provenance::VendorArchive;
@@ -686,9 +821,9 @@ fn attempt_once<A: Archive>(
                 archive.record_held(&attempt_id, held)?;
                 archive.record_relisted(&attempt_id, &relisted_of(provider, listed, &to_issue))?;
             }
-            to_issue.into_iter().chain(walked).collect()
+            (to_issue, walked)
         }
-        _ => Vec::new(),
+        _ => (Vec::new(), Vec::new()),
     };
     Ok(Attempted {
         row: AttemptRow {
@@ -708,6 +843,7 @@ fn attempt_once<A: Archive>(
             commit_refused: refusal,
         },
         follow_ups,
+        walked,
         kind,
         permanent: matches!(verdict, Verdict::PermanentFailure),
         bytes_written: match &answer {
@@ -835,6 +971,13 @@ fn tally_of(source: &SourceId, collected: &Collected) -> SourceTally {
         robots_disallowed: sum(|row| row.robots_disallowed),
         unusable_rows: sum(|row| row.unusable_rows),
         items_committed: sum(|row| row.items_committed),
+        deferred: count(
+            collected
+                .deferred
+                .iter()
+                .filter(|row| row.source == source.as_str())
+                .count(),
+        ),
     }
 }
 
@@ -844,7 +987,7 @@ fn count(of: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Exit, HostQueue, Queued, Tally, EXITS};
+    use super::{Exit, HostQueue, Popped, Queued, Tally, EXITS};
     use crate::provider::Provenance;
     use crate::request::{Request, RequestPhase, SourceId, TargetWindow};
     use canon::FileDigest;
@@ -871,25 +1014,223 @@ mod tests {
         }
     }
 
-    /// `collect`'s loop without the socket: each `(host, pages)` index answers `pages` follow-ups
-    /// on its own host, and `failing` fails transiently on every attempt. Every url popped, in order.
-    fn driven(plan: &[(&str, usize)], failing: &str) -> Vec<String> {
-        let mut queue = HostQueue::of(plan.iter().map(|(base, _)| asking(base, "index")).collect());
-        let mut popped = Vec::new();
-        while let Some(Queued { request, retries }) = queue.pop() {
-            popped.push(request.url.clone());
-            let base = request.url.trim_end_matches("index");
-            let pages = plan
+    /// What one host's index answers in [`capped`]: `documents` follow-ups `p0..`, `walked` walk
+    /// ids `w0..` and `pages` `Index` follow-ups `page0..`, each on the index's own host.
+    #[derive(Clone, Copy)]
+    struct Lane {
+        documents: usize,
+        walked: usize,
+        pages: usize,
+    }
+
+    const fn documents(documents: usize) -> Lane {
+        Lane {
+            documents,
+            walked: 0,
+            pages: 0,
+        }
+    }
+
+    /// `collect`'s loop without the socket, under `cap`: every url asked and every url deferred,
+    /// in order; `failing` fails transiently on every attempt.
+    fn capped(
+        plan: &[(&str, Lane)],
+        cap: Option<u32>,
+        failing: &str,
+    ) -> (Vec<String>, Vec<String>) {
+        let indexes = plan.iter().map(|(base, _)| asking(base, "index")).collect();
+        let mut queue = HostQueue::of(indexes, cap);
+        let (mut asked, mut deferred) = (Vec::new(), Vec::new());
+        while let Some(popped) = queue.pop() {
+            let Queued {
+                request, retries, ..
+            } = match popped {
+                Popped::Ask(queued) => queued,
+                Popped::Defer(request) => {
+                    deferred.push(request.url);
+                    continue;
+                }
+            };
+            asked.push(request.url.clone());
+            let base = request.url.trim_end_matches("index").to_owned();
+            let base = base.as_str();
+            let lane = plan
                 .iter()
                 .find(|(host, _)| request.url.ends_with("index") && *host == base)
-                .map_or(0, |(_, pages)| *pages);
-            let follow_ups = (0..pages)
-                .map(|page| asking(base, &format!("p{page}")))
+                .map_or(documents(0), |(_, lane)| *lane);
+            let named = |prefix: &str, many: usize| -> Vec<Request> {
+                (0..many)
+                    .map(|nth| asking(base, &format!("{prefix}{nth}")))
+                    .collect()
+            };
+            let pages = named("page", lane.pages).into_iter().map(|page| Request {
+                phase: RequestPhase::Index,
+                ..page
+            });
+            let follow_ups = named("p", lane.documents)
+                .into_iter()
+                .chain(pages)
                 .collect();
             let retrying = Queued::retried(request.url == failing, retries);
-            queue.requeue(follow_ups, Queued { request, retries }, retrying);
+            let again = Queued {
+                request,
+                retries,
+                counted: false,
+            };
+            queue.requeue(follow_ups, named("w", lane.walked), again, retrying);
         }
-        popped
+        (asked, deferred)
+    }
+
+    /// [`capped`] with no cap, each `(host, pages)` index answering `pages` documents.
+    fn driven(plan: &[(&str, usize)], failing: &str) -> Vec<String> {
+        let lanes: Vec<(&str, Lane)> = plan
+            .iter()
+            .map(|(base, pages)| (*base, documents(*pages)))
+            .collect();
+        capped(&lanes, None, failing).0
+    }
+
+    /// S7-D6 at its boundary: the 150th follow-up is asked and the 151st deferred; with no cap
+    /// (edgar's `None`) all 151 are asked.
+    #[test]
+    fn the_cap_asks_the_150th_follow_up_and_defers_the_151st() {
+        let at_cap = capped(&[(CNW, documents(150))], Some(150), "");
+        let over = capped(&[(CNW, documents(151))], Some(150), "");
+        let uncapped = capped(&[(CNW, documents(151))], None, "");
+        assert_eq!(
+            (
+                at_cap.0.len(),
+                at_cap.1.len(),
+                over.0.len(),
+                uncapped.0.len()
+            ),
+            (151, 0, 151, 152)
+        );
+        assert_eq!(
+            (over.0.last(), over.1, uncapped.1.len()),
+            (Some(&format!("{CNW}p149")), urls(&[(CNW, "p150")]), 0)
+        );
+    }
+
+    /// S7-D6: global and counted at issue in round-robin order, so the cap cuts the tails of the
+    /// longest lanes, interleaved as round-robin reaches them, and never a host's whole lane.
+    #[test]
+    fn the_cap_is_counted_at_issue_across_hosts_in_round_robin_order() {
+        let plan = [
+            (GNW, documents(2)),
+            (PRN, documents(4)),
+            (CNW, documents(4)),
+        ];
+        let (asked, deferred) = capped(&plan, Some(5), "");
+        assert_eq!(
+            (asked, deferred),
+            (
+                urls(&[
+                    (GNW, "index"),
+                    (PRN, "index"),
+                    (CNW, "index"),
+                    (GNW, "p0"),
+                    (PRN, "p0"),
+                    (CNW, "p0"),
+                    (GNW, "p1"),
+                    (PRN, "p1"),
+                ]),
+                urls(&[
+                    (CNW, "p1"),
+                    (PRN, "p2"),
+                    (CNW, "p2"),
+                    (PRN, "p3"),
+                    (CNW, "p3")
+                ])
+            )
+        );
+    }
+
+    /// S7-D6's arithmetic (architecture.md section 11.5 step 7): a first run's 301 follow-ups,
+    /// GNW 20, PRN 20, CNW 100, Fed 20 and Yahoo 141, lose 55 of CNW's and 96 of Yahoo's.
+    #[test]
+    fn the_global_cap_cuts_55_of_cnws_and_96_of_yahoos_first_run_follow_ups() {
+        const FED: &str = "https://www.federalreserve.gov/";
+        const YAHOO: &str = "https://finance.yahoo.com/";
+        let plan = [
+            (GNW, documents(20)),
+            (PRN, documents(20)),
+            (CNW, documents(100)),
+            (FED, documents(20)),
+            (YAHOO, documents(141)),
+        ];
+        let (_, deferred) = capped(&plan, Some(150), "");
+        let lost: Vec<usize> = plan
+            .iter()
+            .map(|(base, _)| deferred.iter().filter(|url| url.starts_with(base)).count())
+            .collect();
+        assert_eq!(lost, vec![0, 0, 55, 0, 96]);
+    }
+
+    /// S7-D6's exception (owner, 2026-11-17 ~21:30Z): walk ids are never counted, so a cap the
+    /// listed follow-ups exhaust still asks every walk id, and none is deferred.
+    #[test]
+    fn walk_ids_are_never_counted_against_the_cap_or_deferred() {
+        let lane = Lane {
+            documents: 2,
+            walked: 3,
+            pages: 0,
+        };
+        let (asked, deferred) = capped(&[(GNW, lane)], Some(1), "");
+        assert_eq!(
+            (asked, deferred),
+            (
+                urls(&[
+                    (GNW, "index"),
+                    (GNW, "p0"),
+                    (GNW, "w0"),
+                    (GNW, "w1"),
+                    (GNW, "w2")
+                ]),
+                urls(&[(GNW, "p1")])
+            )
+        );
+    }
+
+    /// §8 R21 beside S7-D6: a retry is the same follow-up asked again, never a new one, so it is
+    /// asked after the cap is reached and takes no other follow-up's place.
+    #[test]
+    fn a_retry_is_not_counted_against_the_cap() {
+        let failing = format!("{PRN}p0");
+        let (asked, deferred) = capped(&[(PRN, documents(3))], Some(2), &failing);
+        assert_eq!(
+            (asked, deferred),
+            (
+                urls(&[
+                    (PRN, "index"),
+                    (PRN, "p0"),
+                    (PRN, "p1"),
+                    (PRN, "p0"),
+                    (PRN, "p0")
+                ]),
+                urls(&[(PRN, "p2")])
+            )
+        );
+    }
+
+    /// An `Index` follow-up, PRN's next sitemap page, is outside the 150: section 11.2's worst
+    /// case is (150 + index requests) × 3 × 10 s, and a page cut would leave its poll unjoined.
+    #[test]
+    fn an_index_follow_up_is_not_counted_against_the_cap() {
+        let lane = Lane {
+            documents: 2,
+            walked: 0,
+            pages: 2,
+        };
+        let (asked, deferred) = capped(&[(PRN, lane)], Some(1), "");
+        assert_eq!(
+            (asked, deferred),
+            (
+                urls(&[(PRN, "index"), (PRN, "p0"), (PRN, "page0"), (PRN, "page1")]),
+                urls(&[(PRN, "p1")])
+            )
+        );
     }
 
     fn urls(of: &[(&str, &str)]) -> Vec<String> {
@@ -974,7 +1315,26 @@ mod tests {
 
     /// One row per bucket of architecture.md section 5.1's table, each stating the counts that reach
     /// it.
-    const TABLE: [(&str, Tally, Exit); 7] = [
+    const TABLE: [(&str, Tally, Exit); 9] = [
+        (
+            "every target committed and a follow-up deferred (S7-D8)",
+            Tally {
+                committed: 2,
+                ok: 1,
+                deferred: 1,
+                ..ZERO
+            },
+            Exit::PartialCollect,
+        ),
+        (
+            "nothing committed, every failure transient and a follow-up deferred",
+            Tally {
+                transient: 1,
+                deferred: 1,
+                ..ZERO
+            },
+            Exit::PartialCollect,
+        ),
         (
             "every target ok or empty",
             Tally {
@@ -1045,6 +1405,7 @@ mod tests {
         interrupted: 0,
         unclean_not_planned: 0,
         commit_refused: 0,
+        deferred: 0,
     };
 
     /// Two arms share one exit code, so the set comparison below is keyed on both.

@@ -55,6 +55,11 @@ impl HostKey {
         }
         Ok(Self(key))
     }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// A url's host as a [`HostKey`], by the one rule `Wire`'s host pace and the conformance harness's

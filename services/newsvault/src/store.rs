@@ -82,8 +82,8 @@ use std::path::{Path, PathBuf};
 use canon::{Digest, FileDigest};
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use news_provider::{
-    AttemptEvent, AttemptReceipt, Cost, LedgerError, OutcomeKind, Payload, Relisted, RunId, Sink,
-    SourceId, TargetWindow, ValidSource, Verdict,
+    AttemptEvent, AttemptReceipt, Cost, Deferred, LedgerError, OutcomeKind, Payload, Relisted,
+    RunId, Sink, SourceId, TargetWindow, ValidSource, Verdict,
 };
 use pit::datedness::{Datedness, Published};
 use pit::{ObservationTime, Visibility};
@@ -114,11 +114,11 @@ PRAGMA synchronous = FULL;
 ";
 
 /// The `PRAGMA user_version` this build writes, and the only one a read-only reader accepts.
-pub const SCHEMA_VERSION: i32 = 12;
+pub const SCHEMA_VERSION: i32 = 13;
 
 /// Version `i + 1` is reached from version `i` by `MIGRATIONS[i]`, run by [`migrate`] with
 /// foreign keys off, as SQLite's twelve-step table rebuild (lang_altertable.html) requires.
-const MIGRATIONS: [&str; 12] = [
+const MIGRATIONS: [&str; 13] = [
     "
 -- The hosts file a run was admitted under: architecture.md section 2's `hosts_version` row. NULL
 -- for a provider that reads no hosts file.
@@ -327,6 +327,24 @@ SELECT attempt_id, run_id, source, target_window, filter_params, universe_versio
 FROM attempts;
 DROP TABLE attempts;
 ALTER TABLE attempts_v12 RENAME TO attempts;
+",
+    "
+-- S7-D4 (architecture.md section 3.2): one row per request a run did not ask, never an attempt
+-- row. `reason` admits PR 3's two reasons now, so their producer needs no rebuild; only
+-- `follow_up_cap` has a producer at user_version 13. No key: a url deferred twice is two facts.
+CREATE TABLE deferred (
+    run_id        TEXT NOT NULL,
+    source        TEXT NOT NULL,
+    target_window TEXT NOT NULL,
+    host          TEXT,
+    url           TEXT NOT NULL,
+    phase         TEXT NOT NULL CHECK (phase IN ('index', 'document')),
+    story_id      TEXT,
+    listed_date   TEXT,
+    reason        TEXT NOT NULL
+        CHECK (reason IN ('run_deadline', 'host_held', 'follow_up_cap')),
+    deferred_at   TEXT NOT NULL
+);
 ",
 ];
 
@@ -1512,6 +1530,29 @@ impl Committer {
             params![attempt_id, compared],
         )?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    /// One `deferred` row under this store's run (S7-D4): a request the run did not ask.
+    pub fn record_deferred(&mut self, deferred: &Deferred) -> Result<(), StoreError> {
+        self.db.execute(
+            "INSERT INTO deferred
+                 (run_id, source, target_window, host, url, phase, story_id, listed_date, reason,
+                  deferred_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                self.run.as_str(),
+                deferred.source,
+                deferred.target_window,
+                deferred.host,
+                deferred.url,
+                deferred.phase.name(),
+                deferred.story_id,
+                deferred.listed_date,
+                deferred.reason.name(),
+                stamp(deferred.at.inner())
+            ],
+        )?;
         Ok(())
     }
 
@@ -4588,6 +4629,163 @@ mod tests {
         assert_eq!(
             (refused, read_only, user_version(&db)?),
             (expected.clone(), expected, 11)
+        );
+        Ok(())
+    }
+
+    /// A v12 store: the v11 fixture and `MIGRATIONS[11]`, with a walk on the v1 attempt.
+    fn a_store_at_user_version_twelve(temp: &TempDir) -> TestResult {
+        a_store_at_user_version_eleven(temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch(MIGRATIONS[11])?;
+        db.pragma_update(None, "user_version", 12)?;
+        db.execute_batch(
+            "UPDATE attempts SET continuity = 'id_unread', walk_through = 5, walk_gone = 6,
+                    walk_other_language = 7, walk_unread = 8
+              WHERE attempt_id = 'a v1 attempt';",
+        )?;
+        Ok(())
+    }
+
+    const V12_TABLES: [&str; 8] = V7_TABLES;
+    const DEFER_REASONS: [&str; 3] = ["run_deadline", "host_held", "follow_up_cap"];
+
+    fn deferred_rows(store: &Committer) -> Result<Vec<Vec<Option<String>>>, StoreError> {
+        let mut statement = store.db.prepare(
+            "SELECT run_id, source, target_window, host, url, phase, story_id, listed_date,
+                    reason, deferred_at
+               FROM deferred ORDER BY rowid",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                (0..10)
+                    .map(|nth| row.get::<_, Option<String>>(nth))
+                    .collect::<Result<Vec<Option<String>>, _>>()
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// §8 row M1 from user_version 12: the step to 13 adds `deferred` (S7-D4); a row written by
+    /// `record_deferred` keeps every field, the reason CHECK takes each of the three S7-D4 reasons
+    /// and refuses any other text, and the phase CHECK refuses a phase `RequestPhase` cannot name.
+    #[test]
+    fn a_store_at_user_version_twelve_opens_migrates_to_thirteen_and_takes_a_deferred_row(
+    ) -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_twelve(&temp)?;
+        let mut store = open(&temp)?;
+        store.record_deferred(&news_provider::Deferred {
+            source: "open_web_wires".to_owned(),
+            target_window: "2026-11-16".to_owned(),
+            host: Some("www.newswire.ca".to_owned()),
+            url: "https://www.newswire.ca/news-releases/a-805423040.html".to_owned(),
+            phase: RequestPhase::Document,
+            story_id: Some("a story".to_owned()),
+            listed_date: Some("2026-11-16T02:22:00-05:00".to_owned()),
+            reason: news_provider::DeferReason::FollowUpCap,
+            at: at(9),
+        })?;
+        let written = deferred_rows(&store)?;
+        let insert = |reason: &str, phase: &str| {
+            store
+                .db
+                .execute(
+                    "INSERT INTO deferred (run_id, source, target_window, url, phase, reason,
+                                           deferred_at)
+                     VALUES ('r', 's', 'w', 'u', ?1, ?2, 't')",
+                    params![phase, reason],
+                )
+                .is_ok()
+        };
+        let admitted: Vec<bool> = DEFER_REASONS
+            .iter()
+            .map(|reason| insert(reason, "document"))
+            .collect();
+        let refused = (
+            insert("expired", "document"),
+            insert("follow_up_cap", "page"),
+        );
+        let columns = super::columns_of(&store.db, "deferred")?;
+        let shape = |kind: &str, not_null: bool| (kind.to_owned(), not_null, None, 0);
+        let expected_shape: BTreeMap<String, super::ColumnShape> = [
+            ("run_id", shape("TEXT", true)),
+            ("source", shape("TEXT", true)),
+            ("target_window", shape("TEXT", true)),
+            ("host", shape("TEXT", false)),
+            ("url", shape("TEXT", true)),
+            ("phase", shape("TEXT", true)),
+            ("story_id", shape("TEXT", false)),
+            ("listed_date", shape("TEXT", false)),
+            ("reason", shape("TEXT", true)),
+            ("deferred_at", shape("TEXT", true)),
+        ]
+        .into_iter()
+        .map(|(name, column)| (name.to_owned(), column))
+        .collect();
+        let row = |text: &str| Some(text.to_owned());
+        assert_eq!(
+            (user_version(&store.db)?, written, admitted, refused),
+            (
+                SCHEMA_VERSION,
+                vec![vec![
+                    row(RUN),
+                    row("open_web_wires"),
+                    row("2026-11-16"),
+                    row("www.newswire.ca"),
+                    row("https://www.newswire.ca/news-releases/a-805423040.html"),
+                    row("document"),
+                    row("a story"),
+                    row("2026-11-16T02:22:00-05:00"),
+                    row("follow_up_cap"),
+                    Some(stamp(at(9).inner())),
+                ]],
+                vec![true; 3],
+                (false, false)
+            )
+        );
+        assert_eq!(columns, expected_shape);
+        Ok(())
+    }
+
+    /// §8 row M1, the carried half from user_version 12: every column of every row of every v12
+    /// table, compared by `quote()`; `deferred` is new and empty.
+    #[test]
+    fn a_v12_store_keeps_every_v12_column_of_every_row() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_twelve(&temp)?;
+        let v12 = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let before = quoted_rows(&v12, 12, &V12_TABLES)?;
+        drop(v12);
+        assert!(super::refuse_an_unreadable_version(temp.path()).is_ok());
+        let store = open(&temp)?;
+        let after = quoted_rows(&store.db, 12, &V12_TABLES)?;
+        assert_eq!(before.len(), V12_TABLES.len() + 1);
+        assert_eq!((after, deferred_rows(&store)?.len()), (before, 0));
+        Ok(())
+    }
+
+    /// §8 row M1, the per-version shape check at user_version 12.
+    #[test]
+    fn a_v12_store_whose_columns_differ_is_refused_and_left_at_user_version_twelve() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_twelve(&temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch("ALTER TABLE attempts DROP COLUMN walk_unread;")?;
+        drop(db);
+        let read_only = match super::refuse_an_unreadable_version(temp.path()) {
+            Err(StoreError::ShapeDiffers { found: 12, columns }) => columns,
+            other => vec![format!("{other:?}")],
+        };
+        let refused = match open(&temp) {
+            Err(StoreError::ShapeDiffers { found: 12, columns }) => columns,
+            other => vec![format!("{other:?}")],
+        };
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let expected = vec!["attempts.walk_unread".to_owned()];
+        assert_eq!(
+            (refused, read_only, user_version(&db)?),
+            (expected.clone(), expected, 12)
         );
         Ok(())
     }

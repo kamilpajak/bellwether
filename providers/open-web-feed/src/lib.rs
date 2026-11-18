@@ -64,6 +64,8 @@ const BODY_LIMIT: u64 = 2 * 1_024 * 1_024;
 /// refuses a host whose robots Crawl-delay is above it (owner decision 1, 2026-11-16). No per-IP
 /// pace: each host is its own queue (owner decision 1, 2026-11-17, §10).
 const INTERVAL: Duration = Duration::from_secs(10);
+/// S7-D6 (owner, 2026-11-17): the owner's choice, not measured (architecture.md section 11.2).
+pub const FOLLOW_UP_CAP: u32 = 150;
 
 /// Why no request may be made at all, each raised by `open` before the first request.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -817,6 +819,10 @@ impl Provider for OpenWebFeed {
 
     fn cadence(&self) -> Cadence {
         Cadence::EveryUtcDay
+    }
+
+    fn follow_up_cap(&self) -> Option<u32> {
+        Some(FOLLOW_UP_CAP)
     }
 
     /// One `Index` request per admitted host's index, and one for page 1 of its paged index, for

@@ -60,6 +60,9 @@
             "other_language": 0,
             "unread": 0
           },
+          "deferred": {
+            "follow_up_cap": 0
+          },
           "items_new": 3,
           "rows_committed": 3
         },
@@ -101,6 +104,9 @@
             "gone": 0,
             "other_language": 0,
             "unread": 0
+          },
+          "deferred": {
+            "follow_up_cap": 0
           },
           "items_new": 1,
           "rows_committed": 1
@@ -154,6 +160,9 @@
             "other_language": 0,
             "unread": 0
           },
+          "deferred": {
+            "follow_up_cap": 0
+          },
           "items_new": 0,
           "rows_committed": 0
         },
@@ -195,6 +204,9 @@
             "gone": 0,
             "other_language": 0,
             "unread": 0
+          },
+          "deferred": {
+            "follow_up_cap": 0
           },
           "items_new": 0,
           "rows_committed": 0
@@ -248,6 +260,9 @@
             "other_language": 0,
             "unread": 0
           },
+          "deferred": {
+            "follow_up_cap": 0
+          },
           "items_new": 0,
           "rows_committed": 0
         },
@@ -289,6 +304,9 @@
             "gone": 0,
             "other_language": 0,
             "unread": 0
+          },
+          "deferred": {
+            "follow_up_cap": 0
           },
           "items_new": 0,
           "rows_committed": 0
@@ -342,6 +360,9 @@
             "other_language": 0,
             "unread": 0
           },
+          "deferred": {
+            "follow_up_cap": 0
+          },
           "items_new": 0,
           "rows_committed": 0
         }
@@ -393,6 +414,9 @@
             "gone": 0,
             "other_language": 0,
             "unread": 0
+          },
+          "deferred": {
+            "follow_up_cap": 0
           },
           "items_new": 1,
           "rows_committed": 1

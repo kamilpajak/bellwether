@@ -387,6 +387,10 @@ mod tests {
             self.cadence
         }
 
+        fn follow_up_cap(&self) -> Option<u32> {
+            None
+        }
+
         fn plan(
             &self,
             target: &TargetWindow,
