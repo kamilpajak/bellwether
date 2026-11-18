@@ -12,11 +12,11 @@ keep=7
 vault="$HOME/.bellwether/vault"
 copy='bellwether-vault-[0-9]\{8\}T[0-9]\{6\}Z\.tar\.gz'
 
-# check VARIABLE KIND, KIND one of word, absolute, relative: every '/'-separated part starts with a
+# check NAME VALUE KIND, KIND one of word, absolute, relative: every '/'-separated part starts with a
 # letter or digit and holds only letters, digits, '.', '_' and '-'.
 check() {
-    eval "value=\${$1-}"
-    case $2:$value in
+    value=$2
+    case $3:$value in
         word: | word:*/* | absolute: | absolute:[!/]* | relative: | relative:/* | *:*/ | *:*//*)
             echo "$1 is unsafe: '$value'" >&2; exit 2 ;;
     esac
@@ -31,10 +31,10 @@ check() {
     set +f
     IFS=$saved_ifs
 }
-check NEXTCLOUD_CONTAINER word
-check NEXTCLOUD_DATA absolute
-check NEXTCLOUD_USER word
-check NEXTCLOUD_FOLDER relative
+check NEXTCLOUD_CONTAINER "${NEXTCLOUD_CONTAINER-}" word
+check NEXTCLOUD_DATA "${NEXTCLOUD_DATA-}" absolute
+check NEXTCLOUD_USER "${NEXTCLOUD_USER-}" word
+check NEXTCLOUD_FOLDER "${NEXTCLOUD_FOLDER-}" relative
 [ -d "$vault" ] || { echo "no store at $vault" >&2; exit 4; }
 
 container=$NEXTCLOUD_CONTAINER
