@@ -250,6 +250,10 @@ pub fn run(
         started_at: started,
         finished_at: None,
         kind: RunKind::RobotsRefresh,
+        refused: None,
+        wall_s: None,
+        busy: Vec::new(),
+        holds_capped: Vec::new(),
     };
     write_envelope(&ask.store, &envelope)?;
     let run = RunId::new(run_id.clone());

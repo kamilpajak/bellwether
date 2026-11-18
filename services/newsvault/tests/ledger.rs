@@ -1162,3 +1162,128 @@ fn deferred_rows_are_counted_per_reason_for_the_source_and_day_of_their_run() ->
     assert_eq!((filtered(EDGAR), filtered(POLYGON)), (Some(Some(5)), None));
     Ok(())
 }
+
+// ---- S7-D9 and S7-D11 (architecture.md section 11.5 step 7 PR 4) ----
+
+const BUSY_DAY: &str = "2026-07-10";
+const OVER_DAY: &str = "2026-07-11";
+
+/// Run files of `BUSY_DAY`: one observed run at exactly half a day of wall time and of one
+/// host's busy time, with two capped holds, and one run the lease kept out; and one run of
+/// `OVER_DAY` one second over half a day on both.
+fn busy_runs(root: &TempDir) -> TestResult {
+    let runs = root.path().join(RUNS_DIR);
+    let hold = |host: &str| {
+        serde_json::json!({"host": host, "retry_after": "315360000",
+                           "held_until": "2026-07-11T11:00:00Z"})
+    };
+    let files = [
+        (
+            "run-0710-a.json",
+            serde_json::json!({"schema": "newsvault.run/1", "run_id": "run-0710-a",
+                "run_date": BUSY_DAY, "expected_runs": 2,
+                "started_at": "2026-07-10T11:00:00Z", "finished_at": "2026-07-10T11:14:00Z",
+                "wall_s": 43_200.0,
+                "busy": [{"host": "a.test", "busy_s": 43_200.0}, {"host": "c.test", "busy_s": 7.5}],
+                "holds_capped": [hold("a.test"), hold("c.test")]}),
+        ),
+        (
+            "run-0710-b.json",
+            serde_json::json!({"schema": "newsvault.run/1", "run_id": "run-0710-b",
+                "run_date": BUSY_DAY, "expected_runs": 2,
+                "started_at": "2026-07-10T11:00:01Z", "finished_at": "2026-07-10T11:00:01Z",
+                "refused": "lease_held"}),
+        ),
+        (
+            "run-0711-a.json",
+            serde_json::json!({"schema": "newsvault.run/1", "run_id": "run-0711-a",
+                "run_date": OVER_DAY, "expected_runs": 1,
+                "started_at": "2026-07-11T11:00:00Z", "finished_at": "2026-07-11T11:14:00Z",
+                "wall_s": 43_201.0, "busy": [{"host": "b.test", "busy_s": 43_201.0}]}),
+        ),
+    ];
+    for (name, body) in files {
+        fs::write(runs.join(name), serde_json::to_vec(&body)?)?;
+    }
+    Ok(())
+}
+
+/// The lease-held run is left out of the runs observed, so its day is one run short; its
+/// day's wall time and busy hosts are the observed run's; past half a day, never at it, each
+/// bound is a `--check` finding; the human lines state the same numbers.
+#[test]
+fn the_ledger_sums_busy_time_against_half_a_day_and_leaves_lease_held_runs_unobserved() -> TestResult
+{
+    let root = fixture()?;
+    busy_runs(&root)?;
+    let answer = run(&root, &["--from", BUSY_DAY, "--to", OVER_DAY, "--check"])?;
+    let report = answer.json()?;
+    let busy_day = day(&report, BUSY_DAY).ok_or("busy day")?;
+    let over_day = day(&report, OVER_DAY).ok_or("over day")?;
+    let field = |day: &Value, name: &str| day[name].clone();
+    assert_eq!(
+        (
+            answer.code,
+            codes(&report),
+            [
+                "runs_observed",
+                "runs_expected",
+                "runs_lease_held",
+                "wall_s",
+                "wall_share",
+                "holds_capped"
+            ]
+            .map(|name| field(busy_day, name)),
+            field(busy_day, "busy"),
+            field(over_day, "wall_share"),
+            report["busy_bound"].clone(),
+        ),
+        (
+            EXIT_NO,
+            vec![
+                "runs_below_expected".to_owned(),
+                "wall_time_over_bound".to_owned(),
+                "host_busy_over_bound".to_owned()
+            ],
+            [
+                Value::from(1),
+                Value::from(2),
+                Value::from(1),
+                Value::from(43_200.0),
+                Value::from(0.5),
+                Value::from(2)
+            ],
+            serde_json::json!([
+                {"host": "a.test", "busy_s": 43_200.0, "share": 0.5},
+                {"host": "c.test", "busy_s": 7.5, "share": 7.5 / 86_400.0}
+            ]),
+            Value::from(43_201.0 / 86_400.0),
+            Value::from(0.5),
+        )
+    );
+    let human = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .arg("ledger")
+        .args(["--store", &root.path().to_string_lossy()])
+        .args(["--at", AT, "--format", "human"])
+        .args(["--from", BUSY_DAY, "--to", BUSY_DAY])
+        .output()?
+        .stdout;
+    let lines: Vec<String> = String::from_utf8(human)?
+        .lines()
+        .filter(|line| line.starts_with("busy"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            "busy             lease_held 1 wall_s 43200 wall_share 0.5 bound 0.5 holds_capped 2"
+                .to_owned(),
+            "busy_host        a.test busy_s 43200 share 0.5".to_owned(),
+            format!(
+                "busy_host        c.test busy_s 7.5 share {}",
+                7.5 / 86_400.0
+            ),
+        ]
+    );
+    Ok(())
+}

@@ -15,10 +15,10 @@ use news_provider::{
     Request, RequestPhase, RunId, SendFailure, SendPermit, Sink, SourceId, TargetWindow,
 };
 use news_provider::{CollectError, PlanRefusal, Run};
-use newsvault::cmd_collect::{self, Ask};
+use newsvault::cmd_collect::{self, Ask, CollectRunError};
 use newsvault::cmd_items::{self, PerStory};
 use newsvault::cmd_ledger;
-use newsvault::store::{Committer, COMMIT_LOG};
+use newsvault::store::{Committer, StoreError, COMMIT_LOG};
 use pit::ObservationTime;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
@@ -581,15 +581,40 @@ fn with_stdin_not_a_tty_the_binary_never_reads_dev_tty_and_never_blocks() -> Tes
     Ok(())
 }
 
+/// EDGAR is not on section 11.2's schedule: with no `--deadline` its run has none and no slot,
+/// at 23:00Z, which the schedule would put past the 22:00 slot's 22:14:30 deadline.
 #[test]
-fn the_run_envelope_exists_on_disk_before_the_first_send_and_before_the_lease() -> TestResult {
+fn an_edgar_run_with_no_deadline_takes_none_from_the_schedule() -> TestResult {
+    let root = TempDir::new()?;
+    let answer = collected(root.path(), A_LISTED_SESSION, &Payloads::a_good_day()?)?;
+    assert_eq!(
+        (
+            answer.envelope["deadline"].clone(),
+            answer.envelope["slot"].clone(),
+            answer.exit
+        ),
+        (Value::Null, Value::Null, Exit::Ok)
+    );
+    Ok(())
+}
+
+/// S7-D9: the run file written before the lease is finished and marked `lease_held` when another
+/// run holds it, with nothing sent.
+#[test]
+fn a_run_the_lease_kept_out_finishes_its_run_file_refused_lease_held() -> TestResult {
     let root = TempDir::new()?;
     let held = Committer::open(root.path(), &RunId::new("the-holder"))?;
     let exchange = Payloads::a_good_day()?;
     let ask = ask(root.path(), A_LISTED_SESSION);
     let provider = cmd_collect::open_provider(&ask)?;
     let blocked = cmd_collect::run(&ask, &provider, &exchange, &Fixed);
-    assert!(blocked.is_err(), "the lease was not held");
+    assert!(
+        matches!(
+            blocked,
+            Err(CollectRunError::Store(StoreError::LeaseHeld(_)))
+        ),
+        "{blocked:?}"
+    );
     assert_eq!(exchange.sends(), 0);
     let envelopes = tree(&root.path().join("runs"));
     let written: Vec<Value> = envelopes
@@ -600,9 +625,14 @@ fn the_run_envelope_exists_on_disk_before_the_first_send_and_before_the_lease() 
     assert_eq!(
         (
             written[0]["schema"].as_str(),
-            written[0]["finished_at"].is_null()
+            written[0]["finished_at"].as_str(),
+            written[0]["refused"].as_str()
         ),
-        (Some("newsvault.run/1"), true)
+        (
+            Some("newsvault.run/1"),
+            Some("2026-11-10T23:00:00Z"),
+            Some("lease_held")
+        )
     );
     drop(held);
     Ok(())

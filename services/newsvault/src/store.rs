@@ -887,22 +887,26 @@ pub fn basis_pages(
 const WALK_VERSION: i32 = 12;
 
 /// What a walked index's next poll reads before the lease (section 11.2): the newest usable
-/// answer of the index, the newest poll of it whose continuity is in `kept` with the id it walked
-/// through and its answer, and the url of every answered document attempt of `source`.
+/// answer of the index received by the frontier cutoff, whether a younger one exists, the newest
+/// poll whose continuity is in `kept` with the id it walked through and its answer, and the url
+/// of every answered document attempt of `source`.
 #[derive(Debug, Default)]
 pub struct WalkRead {
     pub previous: Option<String>,
+    pub younger: bool,
     pub basis: Option<(Option<u64>, String)>,
     pub answered: Vec<String>,
 }
 
 /// `WalkRead` from the store at `root`, read-only. Empty with no commit log and below
-/// user_version 12, where no poll walked: the run then records `first_poll`.
+/// user_version 12, where no poll walked: the run then records `first_poll`. An answer received
+/// at `frontier_by` exactly is old enough.
 pub fn walk_read(
     root: &Path,
     source: &SourceId,
     index_url: &str,
     kept: &[&str],
+    frontier_by: DateTime<Utc>,
 ) -> Result<WalkRead, StoreError> {
     let log = root.join(COMMIT_LOG);
     if !log.exists() {
@@ -912,15 +916,24 @@ pub fn walk_read(
     if !(WALK_VERSION..=SCHEMA_VERSION).contains(&user_version(&db)?) {
         return Ok(WalkRead::default());
     }
+    let usable = "FROM attempts a JOIN payloads p ON p.attempt_id = a.attempt_id
+                  WHERE a.source = ?1 AND p.url = ?2 AND p.phase = 'index' AND a.verdict = ?3";
+    let cutoff = stamp(frontier_by);
     let previous = db
         .query_row(
-            "SELECT p.raw_blob FROM attempts a JOIN payloads p ON p.attempt_id = a.attempt_id
-              WHERE a.source = ?1 AND p.url = ?2 AND p.phase = 'index' AND a.verdict = ?3
-              ORDER BY a.received_at DESC, a.attempt_id DESC LIMIT 1",
-            params![source.as_str(), index_url, Verdict::Usable.name()],
+            &format!(
+                "SELECT p.raw_blob {usable} AND a.received_at <= ?4
+                  ORDER BY a.received_at DESC, a.attempt_id DESC LIMIT 1"
+            ),
+            params![source.as_str(), index_url, Verdict::Usable.name(), cutoff],
             |row| row.get(0),
         )
         .optional()?;
+    let younger = db.query_row(
+        &format!("SELECT EXISTS (SELECT 1 {usable} AND a.received_at > ?4)"),
+        params![source.as_str(), index_url, Verdict::Usable.name(), cutoff],
+        |row| row.get(0),
+    )?;
     let marks = vec!["?"; kept.len()].join(", ");
     let basis = db
         .query_row(
@@ -951,6 +964,7 @@ pub fn walk_read(
         .transpose()?;
     Ok(WalkRead {
         previous,
+        younger,
         basis,
         answered: answered_urls(&db, source)?,
     })

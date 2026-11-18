@@ -116,6 +116,14 @@ pub struct CappedHold {
     pub held_until: DateTime<Utc>,
 }
 
+/// What servers asked of one host during a run (S7-D11): interval doublings, and the latest hold
+/// this run read or raised that was still ahead of the clock when it was seen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Slowed {
+    pub doublings: u32,
+    pub held_until: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SendFailure {
     /// Before the socket: a header names a credential this process does not hold. A startup
@@ -456,6 +464,8 @@ pub struct Wire {
     /// pace again.
     reserved: RefCell<Option<String>>,
     capped: RefCell<Vec<CappedHold>>,
+    /// Per host, the latest hold seen ahead of the clock in this run, for [`Wire::slowed`].
+    holds: RefCell<BTreeMap<HostKey, DateTime<Utc>>>,
 }
 
 const USER_AGENT: &str = "User-Agent";
@@ -520,6 +530,7 @@ impl Wire {
             backoff: RefCell::default(),
             reserved: RefCell::default(),
             capped: RefCell::default(),
+            holds: RefCell::default(),
         }
     }
 
@@ -567,6 +578,32 @@ impl Wire {
     #[must_use]
     pub fn capped_holds(&self) -> Vec<CappedHold> {
         self.capped.borrow().clone()
+    }
+
+    /// `host`'s doublings and the latest hold this `Wire` saw ahead of the clock; default for a
+    /// host it never paced.
+    #[must_use]
+    pub fn slowed(&self, host: &str) -> Slowed {
+        let Ok(key) = HostKey::new(host) else {
+            return Slowed::default();
+        };
+        Slowed {
+            doublings: self
+                .backoff
+                .borrow()
+                .get(&key)
+                .map_or(0, |backoff| backoff.doublings),
+            held_until: self.holds.borrow().get(&key).copied(),
+        }
+    }
+
+    fn note_hold(&self, host: &HostKey, until: Option<DateTime<Utc>>, now: DateTime<Utc>) {
+        let Some(until) = until.filter(|until| *until > now) else {
+            return;
+        };
+        let mut holds = self.holds.borrow_mut();
+        let kept = holds.entry(host.clone()).or_insert(until);
+        *kept = (*kept).max(until);
     }
 
     /// Consumes the permit, so one HTTP call needs one written ledger row, and waits out the
@@ -679,7 +716,9 @@ impl Wire {
         let scope = BudgetScope::PerHost(host.clone());
         let pace = Pace::beside_the_store(&self.store, &scope, interval);
         let held = Hold::beside_the_store(&self.store, host).until()?;
-        match pace.reserve_within(clock.now(), held, deadline, ordinary)? {
+        let now = clock.now();
+        self.note_hold(host, held, now);
+        match pace.reserve_within(now, held, deadline, ordinary)? {
             Reserved::Wait(wait) => {
                 self.sleeper.sleep(wait);
                 Ok(None)
@@ -731,6 +770,7 @@ impl Wire {
                 held_until,
             });
         }
+        self.note_hold(host, Some(held_until), received);
         Hold::beside_the_store(&self.store, host).raise(held_until)
     }
 
@@ -869,8 +909,9 @@ struct Failed {
 #[cfg(test)]
 mod tests {
     use super::{
-        retry_after, CappedHold, Credentials, Headers, RawResponse, Reservation, SendFailure,
-        Timeouts, TransportError, TransportKind, TransportProfile, Unreserved, Wire, USER_AGENT,
+        retry_after, CappedHold, Credentials, DateTime, Headers, RawResponse, Reservation,
+        SendFailure, Slowed, Timeouts, TransportError, TransportKind, TransportProfile, Unreserved,
+        Utc, Wire, USER_AGENT,
     };
     use crate::budget::{BudgetError, RequestBudget};
     use crate::clock::testing::{StepClock, WaitRecorder, WaitedClock};
@@ -2173,6 +2214,55 @@ mod tests {
     const OTHER_HOST_UNDOUBLED: Duration = Duration::from_millis(840);
     const ANSWERING_HOST_DOUBLED: Duration = Duration::from_millis(1_060);
     const RETRY_AFTER_JSON: &str = "[[\"retry-after\",\"120\"]]";
+
+    /// S7-D11's per-host report: two bare 429s are two doublings and a later `Retry-After` date
+    /// the hold; another host asked between them reports neither, and a date already past is no
+    /// hold.
+    #[test]
+    fn a_wire_reports_each_hosts_doublings_and_the_hold_it_saw() -> Checked {
+        let slowed = |heads: &[&str]| -> Result<(Slowed, Slowed), Box<dyn std::error::Error>> {
+            let store = tempfile::tempdir()?;
+            let clock = WaitedClock::at(RESERVED_AT)?;
+            let wire = Wire::with_sleeper(
+                polite_profile(),
+                held(),
+                store.path(),
+                &SourceId::new(SOURCE),
+                Box::new(clock.clone()),
+            );
+            let answers = heads.iter().map(|head| ((*head).to_owned(), Vec::new()));
+            let (url, served) = serve(answers.collect())?;
+            for ordinal in 0..u32::try_from(heads.len())? {
+                status_of(&wire, &clock, ordinal * 2, &url)?;
+                status_of(&wire, &clock, ordinal * 2 + 1, LOCALHOST)?;
+                clock.elapse(ELAPSED);
+            }
+            answered_by(served)?;
+            Ok((wire.slowed("127.0.0.1"), wire.slowed("localhost")))
+        };
+        let held_until = instant_of("2026-11-10T13:05:00Z")?;
+        assert_eq!(
+            (
+                slowed(&[NO_RETRY_AFTER, NO_RETRY_AFTER, RETRY_AFTER_DATE])?,
+                slowed(&[RETRY_AFTER_PAST])?.0,
+            ),
+            (
+                (
+                    Slowed {
+                        doublings: 2,
+                        held_until: Some(held_until)
+                    },
+                    Slowed::default()
+                ),
+                Slowed::default()
+            )
+        );
+        Ok(())
+    }
+
+    fn instant_of(text: &str) -> Result<DateTime<Utc>, chrono::ParseError> {
+        text.parse()
+    }
 
     /// The waits of `waits_after` one answer, given the wait of the last send.
     fn one_answer_then(same_host: Duration) -> Vec<Duration> {

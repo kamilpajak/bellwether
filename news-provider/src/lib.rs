@@ -51,8 +51,8 @@ pub use budget::{BudgetError, BudgetScope, Hold, HostKey, Pace, RequestBudget, R
 pub use clock::{Clock, Sleeper, SystemClock, ThreadSleeper};
 pub use collect::{
     collect, Archive, ArchiveError, AttemptRow, CollectError, Collected, Committed, DeferReason,
-    Deferred, Exchange, Exit, NotPlannedRow, Payload, Relisted, Run, SourceTally, Tally, EXITS,
-    MAX_TRANSIENT_RETRIES,
+    Deferred, Exchange, Exit, HostBusy, NotPlannedRow, Payload, Relisted, Run, SourceTally, Tally,
+    EXITS, MAX_TRANSIENT_RETRIES,
 };
 pub use lag_policy::{LagPolicy, LagPolicyError, LAG_POLICY_SCHEMA};
 pub use ledger::{
@@ -70,7 +70,7 @@ pub use request::{
     TargetWindow,
 };
 pub use wire::{
-    CappedHold, Credentials, Headers, RawResponse, Reservation, SendFailure, Timeouts,
+    CappedHold, Credentials, Headers, RawResponse, Reservation, SendFailure, Slowed, Timeouts,
     TransportError, TransportKind, TransportProfile, Unreserved, Wire, HOLD_CEILING,
 };
 

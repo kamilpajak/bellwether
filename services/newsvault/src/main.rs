@@ -146,7 +146,8 @@ enum Command {
         at: Option<String>,
         /// The last instant a request may be sent at (RFC 3339), after --at and, unless a dry
         /// run, after the clock's now. A request whose pace slot opens later is not asked and is
-        /// recorded as deferred, with its host's remaining requests. Absent: every request is asked.
+        /// recorded as deferred, with its host's remaining requests. Absent: open_web_wires stops
+        /// at its schedule slot's deadline, even one already passed; edgar_press has none.
         #[arg(long)]
         deadline: Option<String>,
         /// Plans, validates and resolves every target, and mutates nothing.
@@ -983,13 +984,16 @@ fn print_schema(format: Format) {
                              window earlier than the run's own date is refused unplanned (R11)"},
                     {"name": "at", "type": "rfc3339",
                      "doc": "the instant the run plans against; defaults to now; for open_web_wires \
-                             a run (not a dry run) whose at is not the clock's UTC day is refused"},
+                             a run (not a dry run) whose at is not the clock's UTC day, or is \
+                             after the clock's now, is refused"},
                     {"name": "deadline", "type": "rfc3339",
                      "doc": "the last instant a request may be sent at, after at and, unless \
                              dry_run, after the clock's now (else invalid_argument); a request whose pace slot opens later is not \
                              asked and is a deferred row (run_deadline, or host_held when a \
                              server's hold or slow-down moved it), with the rest of its host's \
-                             queue; absent, every request is asked"},
+                             queue; absent, open_web_wires takes min(slot start + period / 2, \
+                             next slot) - 30 s of the schedule slot the clock's now is in, one \
+                             already passed included, and edgar_press takes none"},
                     {"name": "dry_run", "type": "flag",
                      "doc": "plans and resolves every target and mutates nothing"},
                     {"name": "non_interactive", "type": "flag",
