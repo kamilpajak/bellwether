@@ -562,9 +562,7 @@ pub fn collect<A: Archive>(
     let mut ordinal = 0;
     let mut issued = BTreeSet::new();
     while let Some(popped) = queue.pop() {
-        let Queued {
-            request, retries, ..
-        } = match popped {
+        let queued = match popped {
             Popped::Ask(queued) => queued,
             Popped::Defer(request) => {
                 let at = ObservationTime::new(clock.now());
@@ -574,7 +572,7 @@ pub fn collect<A: Archive>(
             }
         };
         // Before the attempt row: a request past the deadline gets none (condition A).
-        let (go_at, by_server) = match exchange.reserve(&request, clock, run.deadline) {
+        let (go_at, by_server) = match exchange.reserve(&queued.request, clock, run.deadline) {
             Ok(Reservation::Go) => (None, false),
             Ok(Reservation::PastDeadline { go_at, by_server }) => (Some(go_at), by_server),
             Err(Unreserved::CredentialMissing(name)) => return Err(CollectError::Credential(name)),
@@ -587,8 +585,8 @@ pub fn collect<A: Archive>(
                 DeferReason::RunDeadline
             };
             let at = ObservationTime::new(clock.now());
-            let lane = queue.drain_lane_of(&request.url);
-            let mut first = Deferred::of(provider, request, reason, at);
+            let lane = queue.stop(&queued);
+            let mut first = Deferred::of(provider, queued.request, reason, at);
             first.go_at = Some(go_at);
             collected.defer(archive, first)?;
             for rest in lane {
@@ -596,6 +594,9 @@ pub fn collect<A: Archive>(
             }
             continue;
         }
+        let Queued {
+            request, retries, ..
+        } = queued;
         let attempted = attempt_once(&driving, archive, &request, ordinal, &mut issued)?;
         ordinal += 1;
         let retrying = Queued::retried(attempted.is_transient(), retries);
@@ -715,10 +716,13 @@ impl HostQueue {
         }
     }
 
-    /// Empties the lane `url`'s host keys, front first: what a host stopped at the deadline
-    /// leaves, its follow-ups, walk ids and retries included. Other lanes keep their turns.
-    pub(crate) fn drain_lane_of(&mut self, url: &str) -> Vec<Request> {
-        let host = host_of(url).ok().flatten();
+    /// `stopped` at the deadline: its cap slot back when counted, since it is never asked, and
+    /// its host's lane emptied front first, follow-ups, walk ids and retries included.
+    pub(crate) fn stop(&mut self, stopped: &Queued) -> Vec<Request> {
+        if stopped.counted {
+            self.issued = self.issued.saturating_sub(1);
+        }
+        let host = host_of(&stopped.request.url).ok().flatten();
         self.lanes
             .iter_mut()
             .find(|(key, _)| *key == host)
@@ -1149,21 +1153,22 @@ mod tests {
         let mut queue = HostQueue::of(indexes, cap);
         let (mut asked, mut deferred) = (Vec::new(), Vec::new());
         while let Some(popped) = queue.pop() {
-            let Queued {
-                request, retries, ..
-            } = match popped {
+            let queued = match popped {
                 Popped::Ask(queued) => queued,
                 Popped::Defer(request) => {
                     deferred.push(request.url);
                     continue;
                 }
             };
-            if request.url == stop {
-                let lane = queue.drain_lane_of(&request.url);
-                deferred.push(request.url);
+            if queued.request.url == stop {
+                let lane = queue.stop(&queued);
+                deferred.push(queued.request.url);
                 deferred.extend(lane.into_iter().map(|rest| rest.url));
                 continue;
             }
+            let Queued {
+                request, retries, ..
+            } = queued;
             asked.push(request.url.clone());
             let base = request.url.trim_end_matches("index").to_owned();
             let base = base.as_str();
@@ -1374,6 +1379,21 @@ mod tests {
                     (GNW, "w0"),
                     (GNW, "w1")
                 ])
+            )
+        );
+    }
+
+    /// A counted follow-up stopped at the deadline is never asked, so it gives its cap slot back:
+    /// PRN's second follow-up is asked under a cap of 2, not deferred as past the cap.
+    #[test]
+    fn a_follow_up_stopped_at_the_deadline_spends_no_cap_slot() {
+        let plan = [(GNW, documents(2)), (PRN, documents(2))];
+        let (asked, deferred) = stopped(&plan, Some(2), "", &format!("{GNW}p0"));
+        assert_eq!(
+            (asked, deferred),
+            (
+                urls(&[(GNW, "index"), (PRN, "index"), (PRN, "p0"), (PRN, "p1")]),
+                urls(&[(GNW, "p0"), (GNW, "p1")])
             )
         );
     }
