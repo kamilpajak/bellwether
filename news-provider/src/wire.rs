@@ -546,10 +546,9 @@ impl Wire {
             .collect()
     }
 
-    /// Waits out the vendor's pace for `request` and reserves its slot, or, when the slot would
-    /// open after `deadline`, answers `PastDeadline` having written and waited nothing. `collect`
-    /// asks this BEFORE it opens the attempt row, so a request past the deadline has none
-    /// (condition A, architecture.md section 11.5 step 7).
+    /// Waits out the pace for `request` and reserves its slot, or answers `PastDeadline` having
+    /// written and waited nothing. `collect` asks this before it opens the attempt row, so a
+    /// request past the deadline has none (condition A, architecture.md section 11.5 step 7).
     pub fn reserve(
         &self,
         request: &Request,

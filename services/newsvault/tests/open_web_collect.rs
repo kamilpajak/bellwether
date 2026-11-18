@@ -249,10 +249,9 @@ struct Gnw {
     paced: Option<Paced>,
 }
 
-/// `Wire::reserve`'s rule over the clock's one instant instead of a pace file: a host's `n`th
-/// slot opens `PACE` × `n` after it; a host in `held` opens no slot before its instant once it
-/// answered once; a slot after the deadline is refused, `by_server` when the pace alone opens
-/// by then. Every deadline `collect` handed over is kept, so the test reads what reached it.
+/// `Wire::reserve`'s rule over the clock's one instant: a host's `n`th slot opens `PACE` × `n`
+/// after it, a `held` host's not before its instant once it answered; past the deadline it is
+/// refused, `by_server` when the pace alone opens by then. `deadlines` keeps what `collect` sent.
 struct Paced {
     held: BTreeMap<String, DateTime<Utc>>,
     capped: Vec<news_provider::CappedHold>,
@@ -5312,11 +5311,9 @@ fn deferred_of(envelope: &Value) -> Vec<DeferredSeen> {
         })
 }
 
-/// Condition A (owner, 2026-11-16): PRN, held past the deadline once its RSS answered, is
-/// stopped with its sitemap and the releases its RSS listed deferred `host_held`, the first
-/// carrying the hold's end; GNW, CNW and the Fed lose their fourth request to the ordinary
-/// pace as `run_deadline`; Yahoo's three requests all go. `reserve` was handed the deadline
-/// asked for, and the run exits 8.
+/// Condition A: PRN, held past the deadline after its RSS answered, is stopped with its whole
+/// lane `host_held`; GNW, CNW and the Fed lose their fourth request to the pace as
+/// `run_deadline`; Yahoo's three all go; the run exits 8.
 #[test]
 fn a_held_host_past_the_deadline_is_stopped_with_its_lane_while_the_other_hosts_are_asked(
 ) -> TestResult {
@@ -5396,10 +5393,9 @@ fn attempted_urls(store: &Path, envelope: &Value) -> Result<BTreeSet<String>, Bo
     Ok(urls.into_iter().collect())
 }
 
-/// A request past the deadline opens no attempt row and is one `deferred` row; each reader
-/// counts the two reasons apart, with counts that differ, so a reader swapping them is red:
-/// the envelope's rows, its per-source total and human line, and the ledger. The capped hold
-/// the exchange reported reaches the envelope and its human line (S7-D7).
+/// A request past the deadline opens no attempt row and is one `deferred` row. Every reader
+/// counts the reasons apart with counts that differ (3, 4, 0), so a swap is red; the capped
+/// hold reaches the envelope and its human line (S7-D7).
 #[test]
 fn deferred_requests_open_no_attempt_and_every_reader_counts_each_reason_apart() -> TestResult {
     let (root, answer, _) = held_and_paced_run()?;
@@ -5520,11 +5516,9 @@ fn with_no_deadline_every_request_is_asked_and_nothing_is_deferred() -> TestResu
     Ok(())
 }
 
-/// S7-D6's exception meets the deadline (owner decision 2026-11-18): walk ids are outside the
-/// cap but not outside the deadline. The index and its three listed releases take four slots,
-/// the first walk id the fifth; the second walk id's slot opens after the deadline, so it and
-/// the three after it are deferred `run_deadline`, never asked, and the walk is not
-/// `complete`, so the next poll walks them again.
+/// Owner decision 2026-11-18: walk ids are outside the cap, not the deadline. The index, its
+/// three releases and one walk id take five slots; the four ids after it are deferred
+/// `run_deadline`, never asked, and the walk is not `complete`.
 #[test]
 fn walk_ids_the_deadline_cuts_are_deferred_and_the_walk_is_not_complete() -> TestResult {
     let root = after_a_first_walked_poll()?;

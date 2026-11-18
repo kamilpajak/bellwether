@@ -170,9 +170,8 @@ impl Pace {
     }
 
     /// As [`Pace::reserve`], with no slot granted before `floor` (a server's hold, row R19), and
-    /// nothing written when the slot opens after `deadline` (S7-D3, condition A). `ordinary` is
-    /// the interval the profile states, so the answer can say when the slot would open without
-    /// the floor or a doubled `min_interval`.
+    /// nothing written when the slot opens after `deadline` (condition A). `ordinary` is the
+    /// profile's own interval, for when the slot opens with no floor and no doubling.
     pub fn reserve_within(
         &self,
         now: DateTime<Utc>,
