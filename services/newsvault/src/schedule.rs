@@ -65,6 +65,9 @@ pub const SLOTS: [Slot; 31] = [
 pub enum ScheduleRefusal {
     #[error("the schedule names no slot")]
     NoSlot,
+    /// `slot_at` finds no slot only at chrono's first or last day, which has no day beside it.
+    #[error("no slot of the schedule starts at or before {at}")]
+    NoSlotAt { at: DateTime<Utc> },
     #[error("{hour:02}:{minute:02} is not a UTC time of day")]
     NotATimeOfDay { hour: u32, minute: u32 },
     #[error("slot {slot} is named twice")]

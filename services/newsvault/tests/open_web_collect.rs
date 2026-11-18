@@ -6635,6 +6635,29 @@ fn age_is_read_at_the_runs_start_and_a_row_closes_at_its_attempts_clock() -> Tes
     Ok(())
 }
 
+/// An `--at` with no slot at or before it, chrono's first instant, is a named refusal, not a
+/// frontier read against the first instant. Mutation: that silent fallback put back: red.
+#[test]
+fn an_at_with_no_schedule_slot_before_it_is_refused_by_name() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts_fixture(WALK_HOSTS), ROBOTS_EARLIER)?;
+    let ask = Ask {
+        hosts: Some(hosts_fixture(WALK_HOSTS)),
+        at: DateTime::<Utc>::MIN_UTC,
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let refused = cmd_collect::open_provider(&ask).err();
+    assert!(
+        matches!(
+            refused,
+            Some(CollectRunError::ScheduleUnusable(ref why)) if why.to_string()
+                == format!("no slot of the schedule starts at or before {}", DateTime::<Utc>::MIN_UTC)
+        ),
+        "{refused:?}"
+    );
+    Ok(())
+}
+
 /// `WALK_SECOND` plus 5 s: GNW's first slot goes, its second, at 10 s, is past it.
 const WALK_SECOND_PLUS_5_S: &str = "2026-11-17T12:30:35Z";
 

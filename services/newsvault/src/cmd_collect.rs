@@ -556,9 +556,10 @@ pub fn open_provider(ask: &Ask) -> Result<Opened, CollectRunError> {
                 let paging = provider.paging();
                 let basis = basis_of(&ask.store, &paging)?;
                 let walk = provider.walk();
-                let slot = schedule::committed(patience_of(&provider))?.slot_at(ask.at);
-                let frontier_by = slot.map_or(DateTime::<Utc>::MIN_UTC, |slot| slot.start);
-                let ranges = ranges_of(&ask.store, &walk, frontier_by)?;
+                let slot = schedule::committed(patience_of(&provider))?
+                    .slot_at(ask.at)
+                    .ok_or(ScheduleRefusal::NoSlotAt { at: ask.at })?;
+                let ranges = ranges_of(&ask.store, &walk, slot.start)?;
                 let handed = ranges
                     .iter()
                     .filter_map(|(url, plan)| Some((url.clone(), plan.range()?.clone())))
