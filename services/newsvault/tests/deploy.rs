@@ -19,6 +19,15 @@ const TIMEOUT_MARGIN: TimeDelta = TimeDelta::seconds(120);
 /// The watchdog timer's interval, an `OnCalendar` firing once an hour.
 const WATCHDOG_INTERVAL_S: i64 = 3_600;
 const CONTACT: &str = "bellwether collector contact@example.test";
+/// A bind `--mount`, which refuses a missing source where `--volume` creates it as root's directory.
+const CONTACT_MOUNT: &str =
+    "--mount type=bind,src=%h/.config/bellwether/feed-contact,dst=/run/secrets/feed-contact,readonly";
+const STORE_LOCK: &str =
+    "/usr/bin/flock --nonblock --conflict-exit-code 7 %t/bellwether-store.lock";
+/// The Dockerfile's base image and the runner of every workflow job: one Ubuntu release.
+const UBUNTU_IMAGE: &str = "ARG UBUNTU=ubuntu:noble-";
+const UBUNTU_RUNNER: &str = "ubuntu-24.04";
+const WORKFLOWS: [&str; 3] = ["ci.yml", "image.yml", "deploy.yml"];
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -147,7 +156,7 @@ fn the_collect_unit_succeeds_on_exit_8_never_restarts_and_mounts_the_contact() -
             start.contains("--name newsvault-collect"),
             start.contains("--env BELLWETHER_FEED_CONTACT_FILE=/run/secrets/feed-contact"),
             start.contains("BELLWETHER_FEED_CONTACT="),
-            start.contains("feed-contact:/run/secrets/feed-contact:ro"),
+            start.contains(CONTACT_MOUNT),
         ),
         (vec!["8".to_owned()], 0, true, true, true, false, true)
     );
@@ -274,6 +283,128 @@ fn each_staleness_threshold_is_two_of_the_intervals_it_watches() -> TestResult {
             unit_values(&timer, "OnCalendar").len(),
         ),
         (Some(2 * longest), Some(2 * WATCHDOG_INTERVAL_S), true, 1)
+    );
+    Ok(())
+}
+
+/// The words of a unit's `ExecStart` before the image, the container's `--name` value replaced.
+fn container_shape(unit: &str) -> (Vec<String>, Option<String>) {
+    let start = unit_values(unit, "ExecStart").join(" ");
+    let mut words = start
+        .split(' ')
+        .take_while(|word| *word != "${NEWSVAULT_IMAGE}");
+    let mut shape = Vec::new();
+    let mut name = None;
+    while let Some(word) = words.next() {
+        shape.push(word.to_owned());
+        if word == "--name" {
+            name = words.next().map(str::to_owned);
+            shape.push("<name>".to_owned());
+        }
+    }
+    (shape, name)
+}
+
+/// S7-D10's scheduler lock: a refresh and a collect take one lock and run one container shape, so
+/// neither writes the store while the other does.
+#[test]
+fn the_collect_and_refresh_units_share_one_lock_and_one_container_shape() -> TestResult {
+    let (collect, collect_name) =
+        container_shape(&read("deploy/systemd/newsvault-collect.service")?);
+    let (refresh, refresh_name) =
+        container_shape(&read("deploy/systemd/newsvault-robots-refresh.service")?);
+    let shape = collect.join(" ");
+    assert_eq!(
+        (
+            collect == refresh,
+            collect_name,
+            refresh_name,
+            shape.starts_with(STORE_LOCK),
+            shape.contains(CONTACT_MOUNT),
+        ),
+        (
+            true,
+            Some("newsvault-collect".to_owned()),
+            Some("newsvault-robots-refresh".to_owned()),
+            true,
+            true
+        )
+    );
+    Ok(())
+}
+
+/// S7-D8's watchdog reads yesterday, which `NewsvaultRunsMissed` alerts on, with every slot due, so
+/// a day no run reached is a shortfall of 31; `--check` gives the findings the rules read.
+#[test]
+fn the_watchdog_checks_yesterday_and_today_with_every_slot_expected() -> TestResult {
+    let script = read("deploy/systemd/newsvault-watchdog")?.replace("\\\n", " ");
+    let call = script
+        .lines()
+        .find(|line| line.contains(" ledger "))
+        .map(|line| line.split_whitespace().collect::<Vec<&str>>().join(" "))
+        .unwrap_or_default();
+    let ask = format!(
+        "ledger --at \"$at\" --from \"$yesterday\" --to \"$today\" --expected-runs {} --check \
+         --format prometheus",
+        SLOTS.len()
+    );
+    assert_eq!(
+        (
+            call.contains(&ask),
+            call.contains("--network none"),
+            call.contains("--mount \"type=bind,src=$HOME/.bellwether/vault,dst=/vault,readonly\""),
+            script.contains("yesterday=$(date -u -d \"$today -1 day\" +%Y-%m-%d)"),
+        ),
+        (true, true, true, true),
+        "{call}"
+    );
+    Ok(())
+}
+
+/// No host path reaches a container through `--volume`, which creates a missing one as root's.
+#[test]
+fn no_unit_or_script_mounts_a_host_path_with_volume() -> TestResult {
+    let mut volumes = Vec::new();
+    for file in [
+        "deploy/systemd/newsvault-collect.service",
+        "deploy/systemd/newsvault-robots-refresh.service",
+        "deploy/systemd/newsvault-watchdog",
+    ] {
+        let text = read(file)?;
+        volumes.extend(
+            text.lines()
+                .filter(|line| !line.trim_start().starts_with('#'))
+                .filter(|line| line.contains("--volume") || line.contains(" -v "))
+                .map(|line| format!("{file}: {line}")),
+        );
+    }
+    assert_eq!(volumes, Vec::<String>::new());
+    Ok(())
+}
+
+/// The gate links the system SQLite of the release the image is built on (3.45 on 24.04);
+/// measured 2026-11-18, `ubuntu-latest` was 26.04, whose SQLite is 3.46.1.
+#[test]
+fn every_workflow_job_runs_on_the_images_ubuntu_release() -> TestResult {
+    let mut runners = Vec::new();
+    for workflow in WORKFLOWS {
+        let text = read(&format!(".github/workflows/{workflow}"))?;
+        let used: BTreeSet<String> = text
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("runs-on: "))
+            .map(str::to_owned)
+            .collect();
+        runners.push((workflow, used.into_iter().collect::<Vec<String>>()));
+    }
+    assert_eq!(
+        (runners, read("Dockerfile")?.contains(UBUNTU_IMAGE)),
+        (
+            WORKFLOWS
+                .iter()
+                .map(|workflow| (*workflow, vec![UBUNTU_RUNNER.to_owned()]))
+                .collect::<Vec<_>>(),
+            true
+        )
     );
     Ok(())
 }

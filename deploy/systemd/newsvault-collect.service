@@ -12,12 +12,14 @@ EnvironmentFile=%h/.config/bellwether/newsvault.env
 ExecStartPre=/bin/sh -c 'test "$$(timedatectl show --property=NTPSynchronized --value)" = yes || { echo "the clock is not NTP-synchronised" >&2; exit 1; }'
 # The store lock a robots refresh also takes; held by another, the run exits 7 as lease_held does.
 # --pull never: the image is pulled at install, so no run spends its window on a registry.
+# --mount, not --volume: --volume creates a missing host path as a root-owned directory, and the
+# run then fails on it until root removes it; --mount refuses the run instead (docker's docs).
 ExecStart=/usr/bin/flock --nonblock --conflict-exit-code 7 %t/bellwether-store.lock \
     /usr/bin/docker run --rm --name newsvault-collect --pull never \
     --user %U:%G --read-only --tmpfs /tmp:rw,size=16m \
     --cap-drop ALL --security-opt no-new-privileges \
-    --volume %h/.bellwether/vault:/vault \
-    --volume %h/.config/bellwether/feed-contact:/run/secrets/feed-contact:ro \
+    --mount type=bind,src=%h/.bellwether/vault,dst=/vault \
+    --mount type=bind,src=%h/.config/bellwether/feed-contact,dst=/run/secrets/feed-contact,readonly \
     --env BELLWETHER_FEED_CONTACT_FILE=/run/secrets/feed-contact \
     ${NEWSVAULT_IMAGE} \
     collect --source open_web_wires --window today --schedule open_web --expected-runs 31 \
@@ -27,7 +29,8 @@ ExecStart=/usr/bin/flock --nonblock --conflict-exit-code 7 %t/bellwether-store.l
 # A timeout's SIGTERM reaches the container through docker's signal proxy; one that outlives it is
 # removed here. A container a killed client leaves otherwise stays and blocks the next start by name.
 ExecStopPost=/bin/sh -c 'if [ "$$SERVICE_RESULT" = timeout ]; then /usr/bin/docker rm --force newsvault-collect; fi'
-# S7-D8: exit 8 is a partial run, so a failed unit means 2, 4 or 7.
+# S7-D8: exit 8 is a partial run. A failed unit is newsvault's 2, 4 or 7, the lock's 7, the NTP
+# check's 1 or docker's 125; no rule reads the unit's state (architecture.md S7-D8).
 SuccessExitStatus=8
 # S7-D9: the longest slot window (2,670 s) plus 120 s, which the deploy test derives; no Restart=.
 TimeoutStartSec=2790

@@ -12,8 +12,8 @@ ExecStart=/usr/bin/flock --nonblock --conflict-exit-code 7 %t/bellwether-store.l
     /usr/bin/docker run --rm --name newsvault-robots-refresh --pull never \
     --user %U:%G --read-only --tmpfs /tmp:rw,size=16m \
     --cap-drop ALL --security-opt no-new-privileges \
-    --volume %h/.bellwether/vault:/vault \
-    --volume %h/.config/bellwether/feed-contact:/run/secrets/feed-contact:ro \
+    --mount type=bind,src=%h/.bellwether/vault,dst=/vault \
+    --mount type=bind,src=%h/.config/bellwether/feed-contact,dst=/run/secrets/feed-contact,readonly \
     --env BELLWETHER_FEED_CONTACT_FILE=/run/secrets/feed-contact \
     ${NEWSVAULT_IMAGE} \
     robots refresh --source open_web_wires \

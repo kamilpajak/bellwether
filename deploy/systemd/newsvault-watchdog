@@ -11,9 +11,10 @@ tmp="$NEWSVAULT_TEXTFILE_DIR/.newsvault.prom.$$"
 /usr/bin/docker run --rm --name newsvault-watchdog --pull never \
     --user "$(id -u):$(id -g)" --read-only --network none \
     --cap-drop ALL --security-opt no-new-privileges \
-    --volume "$HOME/.bellwether/vault:/vault:ro" \
+    --mount "type=bind,src=$HOME/.bellwether/vault,dst=/vault,readonly" \
     "$NEWSVAULT_IMAGE" \
-    ledger --at "$at" --from "$yesterday" --to "$today" --check --format prometheus >"$tmp"
+    ledger --at "$at" --from "$yesterday" --to "$today" --expected-runs 31 --check \
+    --format prometheus >"$tmp"
 status=$?
 case $status in
     0 | 1 | 8) exec mv -f "$tmp" "$NEWSVAULT_TEXTFILE_DIR/newsvault.prom" ;;
