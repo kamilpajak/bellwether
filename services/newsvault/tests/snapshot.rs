@@ -153,7 +153,9 @@ fn a_dry_run_reports_the_stores_version_and_writes_nothing() -> TestResult {
 }
 
 /// `(exit, code, retryable, stdout empty)` of one refused snapshot.
-fn refusal(answered: &Output) -> (Option<i32>, Option<String>, Option<bool>, bool) {
+type Refusal = (Option<i32>, Option<String>, Option<bool>, bool);
+
+fn refusal(answered: &Output) -> Refusal {
     let object: Value = serde_json::from_slice(&answered.stderr).unwrap_or(Value::Null);
     (
         answered.status.code(),
@@ -199,30 +201,41 @@ fn each_refusal_exits_by_its_code_with_stdout_empty() -> TestResult {
     Ok(())
 }
 
-/// The online backup copies a damaged page as it is; the copy is refused as malformed and
-/// neither the copy nor its partial is left.
-#[test]
-fn a_damaged_store_is_refused_as_malformed_and_nothing_is_left() -> TestResult {
+/// One snapshot of a store `damage` changed, given the page size: its refusal, the message, and
+/// what is left beside the store.
+fn damaged(
+    damage: impl Fn(&mut [u8], usize),
+) -> Result<(Refusal, String, Vec<String>), Box<dyn Error>> {
     let root = tempfile::TempDir::new()?;
     store_at(root.path())?;
     let log = root.path().join(COMMIT_LOG);
     let mut bytes = std::fs::read(&log)?;
     let page: u16 = Connection::open(&log)?.query_row("PRAGMA page_size", [], |row| row.get(0))?;
-    let page = usize::from(page);
-    let damaged = bytes.len().min(3 * page);
-    for byte in bytes.iter_mut().take(damaged).skip(page) {
-        *byte = 0xA5;
-    }
+    damage(&mut bytes, usize::from(page));
     std::fs::write(&log, bytes)?;
-    let out = root.path().join(COPY);
-    let answered = snapshot(root.path(), &out, &[])?;
+    let answered = snapshot(root.path(), &root.path().join(COPY), &[])?;
     let mut left: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(root.path())? {
         left.push(entry?.file_name().to_string_lossy().into_owned());
     }
     left.sort();
+    let object: Value = serde_json::from_slice(&answered.stderr).unwrap_or(Value::Null);
+    let message = object["message"].as_str().unwrap_or_default().to_owned();
+    Ok((refusal(&answered), message, left))
+}
+
+/// The online backup copies a page as it is: overwritten pages fail as `SQLITE_CORRUPT`, and
+/// neither the copy nor its partial is left.
+#[test]
+fn a_damaged_store_is_refused_as_malformed_and_nothing_is_left() -> TestResult {
+    let (refused, message, left) = damaged(|bytes, page| {
+        let end = bytes.len().min(3 * page);
+        for byte in bytes.iter_mut().take(end).skip(page) {
+            *byte = 0xA5;
+        }
+    })?;
     assert_eq!(
-        (refusal(&answered), left),
+        (refused, left),
         (
             (
                 Some(2),
@@ -232,8 +245,34 @@ fn a_damaged_store_is_refused_as_malformed_and_nothing_is_left() -> TestResult {
             ),
             vec!["LOCK".to_owned(), COMMIT_LOG.to_owned()],
         ),
-        "{}",
-        String::from_utf8_lossy(&answered.stderr)
+        "{message}"
+    );
+    Ok(())
+}
+
+/// A header whose freelist count is 3 too high opens and copies cleanly; only the copy's
+/// `quick_check` names it.
+#[test]
+fn a_freelist_count_the_pages_disagree_with_is_named_by_the_copys_quick_check() -> TestResult {
+    const FREELIST_COUNT: std::ops::Range<usize> = 36..40;
+    let (refused, message, left) = damaged(|bytes, _| {
+        if let Some(count) = bytes.get_mut(FREELIST_COUNT) {
+            count.copy_from_slice(&3_u32.to_be_bytes());
+        }
+    })?;
+    assert_eq!(
+        (refused, message.contains("Freelist"), left),
+        (
+            (
+                Some(2),
+                Some("input_unparseable".to_owned()),
+                Some(false),
+                true
+            ),
+            true,
+            vec!["LOCK".to_owned(), COMMIT_LOG.to_owned()],
+        ),
+        "{message}"
     );
     Ok(())
 }

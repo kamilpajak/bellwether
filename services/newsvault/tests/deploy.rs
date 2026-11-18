@@ -1217,6 +1217,7 @@ struct Trouble {
     listing_lacks_new: bool,
     docker_exit: Option<i32>,
     plain_http: bool,
+    mkcol_status: Option<u16>,
 }
 
 /// One run of `deploy/systemd/newsvault-backup` against a stub docker, curl and mv.
@@ -1318,6 +1319,10 @@ fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
             "STUB_DOCKER_EXIT",
             trouble.docker_exit.unwrap_or(0).to_string(),
         )
+        .env(
+            "STUB_MKCOL_CODE",
+            trouble.mkcol_status.unwrap_or(201).to_string(),
+        )
         .stdin(Stdio::null())
         .output()?;
     let mut uploads = Vec::new();
@@ -1413,10 +1418,32 @@ fn the_backup_uploads_the_snapshot_and_the_store_then_keeps_the_seven_newest() -
 }
 
 /// The app password reaches curl only as its escaped config on stdin: never in any argv, any
-/// environment, or the script's own output.
+/// environment, or the script's own output, a failed run's included.
 #[test]
 fn the_app_password_reaches_curl_only_as_its_config_on_stdin() -> TestResult {
     let backed = backup(Trouble::default())?;
+    let mut failed_outputs = Vec::new();
+    for trouble in [
+        Trouble {
+            mkcol_status: Some(500),
+            ..Trouble::default()
+        },
+        Trouble {
+            put_fails: true,
+            ..Trouble::default()
+        },
+        Trouble {
+            listing_lacks_new: true,
+            ..Trouble::default()
+        },
+        Trouble {
+            password_mode: Some(0o640),
+            ..Trouble::default()
+        },
+    ] {
+        let failed = backup(trouble)?;
+        failed_outputs.push((failed.exit, failed.output.contains(PASSWORD)));
+    }
     let in_argv = backed
         .curl_args
         .iter()
@@ -1437,8 +1464,22 @@ fn the_app_password_reaches_curl_only_as_its_config_on_stdin() -> TestResult {
             backed.output.contains(PASSWORD),
             backed.curl_config.matches(PASSWORD_IN_CONFIG).count(),
             configured,
+            failed_outputs,
         ),
-        (Some(0), 0, false, false, 6, true)
+        (
+            Some(0),
+            0,
+            false,
+            false,
+            6,
+            true,
+            vec![
+                (Some(7), false),
+                (Some(7), false),
+                (Some(8), false),
+                (Some(2), false)
+            ]
+        )
     );
     Ok(())
 }

@@ -207,7 +207,7 @@ tests:
               summary: "2026-11-17 saw fewer collect runs than its 31 slots."
 
   # The collect unit's result each hour: exit 0, exit 8 (a partial run, SuccessExitStatus), exit 2,
-  # killed by a signal (-1), a success whose exit is 7, then exit 0 again.
+  # killed by a signal (-1), a success whose exit is 7, then exit 0 while the backup unit fails.
   - interval: 1h
     input_series:
       - series: 'newsvault_unit_result_success{unit="collect"}'
@@ -215,7 +215,7 @@ tests:
       - series: 'newsvault_unit_exit_status{unit="collect"}'
         values: '0 8 2 -1 7 0'
       - series: 'newsvault_unit_result_success{unit="backup"}'
-        values: '1 1 1 1 1 1'
+        values: '1 1 1 1 1 0'
       - series: 'newsvault_unit_exit_status{unit="backup"}'
         values: '2 2 2 2 2 2'
     alert_rule_test:
