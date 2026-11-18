@@ -412,7 +412,7 @@ mod tests {
 
     use chrono::{DateTime, Utc};
 
-    use super::{BudgetError, BudgetScope, HostKey, Pace};
+    use super::{BudgetError, BudgetScope, Hold, HostKey, Pace};
     use crate::request::SourceId;
 
     const SHOUTED: &str = "WWW.SEC.GOV";
@@ -421,6 +421,9 @@ mod tests {
     /// Each breaks exactly one rule, so deleting any one rule lets its row through.
     const ONE_RULE_BROKEN_EACH: [&str; 5] =
         ["", ".sec.gov", "www.sec.gov.", "www..sec.gov", "[::1]"];
+
+    const TWO_MINUTES_ON: &str = "2026-11-10T13:02:00Z";
+    const FIVE_SECONDS_ON: &str = "2026-11-10T13:00:05Z";
 
     /// A parseable robots Crawl-delay that `DateTime` cannot add (review of PR #23, 2026-11-15).
     const AN_INTERVAL_PAST_THE_CALENDAR: Duration = Duration::from_secs(9_000_000_000_000);
@@ -498,5 +501,20 @@ mod tests {
             .filter(|host| HostKey::new(host).is_ok())
             .collect();
         assert_eq!(admitted, Vec::<&str>::new());
+    }
+
+    /// S7-D7: a hold is raised, never lowered, so a later, shorter `Retry-After` (a robots
+    /// refresh, or another run on the store) leaves the longer one in force.
+    #[test]
+    fn a_later_shorter_hold_does_not_lower_the_hold_on_file() -> Result<(), String> {
+        let store = tempfile::tempdir().map_err(|why| why.to_string())?;
+        let host = HostKey::new(SEC).map_err(|why| why.to_string())?;
+        let hold = Hold::beside_the_store(store.path(), &host);
+        let instant = |at: &str| at.parse::<DateTime<Utc>>().map_err(|why| why.to_string());
+        let (longer, shorter) = (instant(TWO_MINUTES_ON)?, instant(FIVE_SECONDS_ON)?);
+        hold.raise(longer).map_err(|why| why.to_string())?;
+        hold.raise(shorter).map_err(|why| why.to_string())?;
+        assert_eq!(hold.until(), Ok(Some(longer)));
+        Ok(())
     }
 }
