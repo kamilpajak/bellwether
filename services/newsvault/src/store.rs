@@ -865,6 +865,23 @@ pub fn refuse_an_unreadable_version(root: &Path) -> Result<(), StoreError> {
     }
 }
 
+/// The writer's lease, taken by a reader that must see no commit while it copies; `None` when no
+/// writer ever opened `root`. Opened read-only: `flock` needs no write access, so a read-only
+/// mount serves, and a `Committer` started meanwhile is `LeaseHeld`.
+pub fn hold_lease_to_copy(root: &Path) -> Result<Option<File>, StoreError> {
+    let lock_path = root.join(LOCK_FILE);
+    let lease = match File::open(&lock_path) {
+        Ok(lease) => lease,
+        Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(failure) => return Err(StoreError::Io(failure)),
+    };
+    match lease.try_lock() {
+        Ok(()) => Ok(Some(lease)),
+        Err(TryLockError::WouldBlock) => Err(StoreError::LeaseHeld(lock_path)),
+        Err(TryLockError::Error(failure)) => Err(StoreError::Io(failure)),
+    }
+}
+
 /// The bytes of the blob `hex` names in the store at `root`, `None` when no such file is there.
 /// Read without the commit log: the pinned robots body `collect` parses (section 11.2). Bytes
 /// that no longer hash to `hex` are `BlobAltered`.

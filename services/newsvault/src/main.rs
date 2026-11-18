@@ -15,6 +15,7 @@ use newsvault::cmd_collect::{self, CollectRunError};
 use newsvault::cmd_items;
 use newsvault::cmd_ledger::{self, Ask, LedgerReadError, Report};
 use newsvault::cmd_robots::{self, RobotsError};
+use newsvault::cmd_snapshot::{self, SnapshotError};
 use newsvault::contact::{self, ContactError};
 use newsvault::lake::{Day, LakeError, LakeReader};
 use newsvault::publish::{publish_run, Fsync, PublishError};
@@ -191,6 +192,22 @@ enum Command {
     Robots {
         #[command(subcommand)]
         action: RobotsAction,
+    },
+    /// One consistent copy of the commit log, for the daily backup. Writes only --out.
+    Snapshot {
+        /// The file the copy is written to; refused when it exists.
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Checks the store, the lease and --out, and writes nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Accepted and does nothing: no command here prompts or reads stdin.
+        #[arg(long)]
+        non_interactive: bool,
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
     },
     /// Machine-readable description of this tool.
     Schema {
@@ -551,6 +568,29 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
             emit_items(&report, format)?;
             Ok(Verdict::Ok)
         }
+        Command::Snapshot {
+            out,
+            store,
+            dry_run,
+            non_interactive: _,
+            format,
+        } => {
+            let ask = cmd_snapshot::Ask {
+                store: vault_root(store),
+                out,
+                dry_run,
+            };
+            match cmd_snapshot::run(&ask) {
+                Ok(snapshot) => {
+                    emit_snapshot(&snapshot, format)?;
+                    Ok(Verdict::Ok)
+                }
+                Err(refused) => {
+                    emit_snapshot_error(&refused, &ask, format)?;
+                    Ok(Verdict::No(refused.exit()))
+                }
+            }
+        }
         Command::Publish { at, store, format } => {
             let at = instant(&at, "--at");
             let root = vault_root(store);
@@ -783,6 +823,54 @@ fn emit_robots_error(object: &serde_json::Value, format: Format) -> anyhow::Resu
             object["code"].as_str().unwrap_or_default(),
             object["retryable"]
         )?,
+    }
+    Ok(())
+}
+
+fn emit_snapshot(snapshot: &cmd_snapshot::Snapshot, format: Format) -> anyhow::Result<()> {
+    let out = std::io::stdout();
+    let mut out = out.lock();
+    match format {
+        Format::Json => {
+            serde_json::to_writer_pretty(&mut out, snapshot)?;
+            writeln!(out)?;
+        }
+        Format::Human => writeln!(
+            out,
+            "{} {} user_version {} bytes {}{}",
+            snapshot.store,
+            snapshot.out,
+            snapshot.user_version,
+            snapshot.bytes,
+            if snapshot.dry_run { " (dry run)" } else { "" }
+        )?,
+    }
+    Ok(())
+}
+
+/// A refusal on stderr with stdout empty; a retryable one suggests the same argv again.
+fn emit_snapshot_error(
+    refused: &SnapshotError,
+    ask: &cmd_snapshot::Ask,
+    format: Format,
+) -> anyhow::Result<()> {
+    let object = serde_json::json!({
+        "schema": "newsvault.error/1",
+        "code": refused.code(),
+        "message": refused.to_string(),
+        "retryable": refused.retryable(),
+        "details": {"store": ask.store.display().to_string(), "out": ask.out.display().to_string()},
+        "suggestions": if refused.retryable() {
+            vec![std::env::args().collect::<Vec<String>>()]
+        } else {
+            Vec::new()
+        },
+    });
+    let err = std::io::stderr();
+    let mut err = err.lock();
+    match format {
+        Format::Json => writeln!(err, "{object}")?,
+        Format::Human => writeln!(err, "error: {refused} ({})", refused.code())?,
     }
     Ok(())
 }
@@ -1117,6 +1205,30 @@ fn print_schema(format: Format) {
                     "7": "every row failed transiently (vendor_unreachable), or another run holds \
                           the lease (lease_held)",
                     "8": "a row failed"
+                },
+                "mutates": true
+            },
+            {
+                "path": ["snapshot"],
+                "summary": "One consistent copy of the commit log (SQLite online backup, one step, under the store's lease), checked by PRAGMA quick_check.",
+                "options": [
+                    {"name": "out", "type": "path", "required": true,
+                     "doc": "written as a hidden partial beside it and renamed once checked; an existing file is refused"},
+                    {"name": "store", "type": "path"},
+                    {"name": "dry_run", "type": "flag",
+                     "doc": "checks the store, the lease and out, reports the source's user_version and size, writes nothing"},
+                    {"name": "non_interactive", "type": "flag",
+                     "doc": "accepted and does nothing: no command here prompts or reads stdin"},
+                    {"name": "format", "type": "enum", "values": ["human", "json"]}
+                ],
+                "env": [{"name": "BELLWETHER_VAULT",
+                         "doc": "the store when --store is not given, then ~/.bellwether/vault"}],
+                "output": cmd_snapshot::SCHEMA,
+                "exits": {
+                    "0": "the copy is at out",
+                    "2": "invalid_argument (out exists), input_unparseable (the copy fails quick_check), io_failed",
+                    "4": "input_absent: no commit log, or out's directory does not exist",
+                    "7": "lease_held: a writer holds the store"
                 },
                 "mutates": true
             },
