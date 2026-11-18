@@ -1368,10 +1368,20 @@ fn terminate_during_write(
         }
         std::thread::sleep(std::time::Duration::from_millis(TERM_POLL_MS));
     }
-    Command::new("/bin/sh")
-        .args(["-c", "kill -TERM -- \"-$1\"", "sh", &child.id().to_string()])
+    // dash's `kill -TERM -- -<pid>` exits 2 "Illegal number" and signals nothing (CI, 2026-11-18).
+    let killed = Command::new(UNIT_SHELL)
+        .args([
+            "-c",
+            "kill -s TERM -- \"-$1\"",
+            "sh",
+            &child.id().to_string(),
+        ])
         .status()?;
-    Ok(child.wait_with_output()?)
+    let output = child.wait_with_output()?;
+    if !killed.success() {
+        return Err(format!("kill of the run's process group exited {killed}").into());
+    }
+    Ok(output)
 }
 
 fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
