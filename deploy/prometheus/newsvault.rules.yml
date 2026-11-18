@@ -111,10 +111,11 @@ groups:
         annotations:
           summary: newsvault's last collect run failed, or exited other than 0 and 8.
 
-      # Two daily backup intervals (2 x 86,400 s) with no copy on Nextcloud, or none yet (N1).
+      # Two daily intervals plus one run's bound (2 x 86,400 s + TimeoutStartSec 1,800 s + 90 s stop
+      # timeout): the stamp is the run's start, written after its upload, so one missed day stays quiet.
       - alert: NewsvaultBackupStale
         expr: |
-          (time() - max(newsvault_backup_last_success_timestamp_seconds)) > 172800
+          (time() - max(newsvault_backup_last_success_timestamp_seconds)) > 174690
           or absent(newsvault_backup_last_success_timestamp_seconds)
         labels:
           severity: critical
@@ -126,4 +127,4 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: the last newsvault backup run failed; the newest copy on Nextcloud is older than a day.
+          summary: the last newsvault backup run failed; at exit 8 the copy is up and old copies were not deleted, otherwise no copy was made.

@@ -1044,17 +1044,27 @@ fn the_backup_runs_once_a_day_inside_the_longest_gap_the_collect_runs_leave() ->
     Ok(())
 }
 
-/// Two daily intervals with no copy on Nextcloud, as the watchdog's staleness is two of its own.
+/// Two daily intervals plus one run's bound: the stamp is the run's start and appears only after
+/// its upload, so at two intervals alone one missed day fired while the next run uploaded.
 #[test]
-fn the_backup_staleness_threshold_is_two_of_its_daily_intervals() -> TestResult {
+fn the_backup_staleness_threshold_is_two_daily_intervals_plus_one_runs_bound() -> TestResult {
     let rules = read("deploy/prometheus/newsvault.rules.yml")?;
     let timer = read("deploy/systemd/newsvault-backup.timer")?;
+    let service = read("deploy/systemd/newsvault-backup.service")?;
+    let bound = integers(&unit_values(&service, "TimeoutStartSec"));
     assert_eq!(
         (
             threshold(&rules, "NewsvaultBackupStale"),
-            daily_times(&timer).iter().flatten().count()
+            daily_times(&timer).iter().flatten().count(),
+            bound.len(),
         ),
-        (Some(2 * DAY_S), 1)
+        (
+            bound
+                .first()
+                .map(|bound| 2 * DAY_S + bound + DEFAULT_TIMEOUT_STOP_S),
+            1,
+            1
+        )
     );
     Ok(())
 }
@@ -1084,8 +1094,12 @@ fn the_backup_unit_takes_the_store_lock_without_waiting_and_records_its_result()
     Ok(())
 }
 
+/// `ci.yml`'s check that the compiler it runs is the pinned one.
+const RUSTC_IS_THE_PIN: &str = r#"rustc --version | grep -F "rustc $(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml) ""#;
+
 /// `rust-toolchain.toml` is the one home of the toolchain: the Dockerfile and `ci.yml` install it
-/// from that file and name no version, override or toolchain variable of their own.
+/// from that file and name no version, override or toolchain variable of their own; the only
+/// `rustup` command either runs is the bare `rustup toolchain install`.
 #[test]
 fn one_rust_toolchain_is_named_only_in_rust_toolchain_toml() -> TestResult {
     let pin = read("rust-toolchain.toml")?;
@@ -1110,13 +1124,17 @@ fn one_rust_toolchain_is_named_only_in_rust_toolchain_toml() -> TestResult {
             channel.as_str(),
             "RUST_TOOLCHAIN",
             "RUSTUP_TOOLCHAIN",
-            "rustup default",
-            "rustup override",
             "toolchain:",
             "cargo +",
         ] {
             if text.contains(word) {
                 named_elsewhere.push(format!("{file}: {word}"));
+            }
+        }
+        for line in text.lines().filter(|line| line.contains("rustup ")) {
+            if !(line.ends_with("rustup toolchain install") && line.matches("rustup ").count() == 1)
+            {
+                named_elsewhere.push(format!("{file}: {line}"));
             }
         }
     }
@@ -1135,7 +1153,7 @@ fn one_rust_toolchain_is_named_only_in_rust_toolchain_toml() -> TestResult {
                 .any(|line| line.contains("--default-toolchain none")),
             dockerfile.contains(&"COPY rust-toolchain.toml .".to_owned()),
             installs(&dockerfile),
-            installs(&check),
+            holds(&check, &["rustup toolchain install", RUSTC_IS_THE_PIN]),
         ),
         (3, true, Vec::<String>::new(), true, true, true, true)
     );
@@ -1234,6 +1252,7 @@ struct Backed {
     metric: String,
     old_link: String,
     textfile: Vec<String>,
+    staging: Vec<String>,
 }
 
 fn sorted_names(dir: &Path) -> Result<Vec<String>, Box<dyn Error>> {
@@ -1352,6 +1371,7 @@ fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
         metric: read_or_empty(&textfile.join(BACKUP_PROM)),
         old_link: read_or_empty(&work.path().join("old-link")),
         textfile: sorted_names(&textfile)?,
+        staging: sorted_names(&home.join(".cache/bellwether")).unwrap_or_default(),
     })
 }
 
@@ -1604,27 +1624,73 @@ fn a_failed_upload_or_a_listing_without_the_copy_deletes_nothing_and_exits_by_na
     Ok(())
 }
 
-/// A password file others can read refuses the run before any request; a refused snapshot ends it
-/// with the snapshot's exit and no request.
+/// A password file others or the group may read or write refuses the run before any request; a
+/// refused snapshot ends it with the snapshot's exit and no request.
 #[test]
 fn a_shared_password_file_or_a_refused_snapshot_stops_before_any_request() -> TestResult {
-    let shared = backup(Trouble {
-        password_mode: Some(0o644),
-        ..Trouble::default()
-    })?;
+    let mut shared = Vec::new();
+    for mode in [0o644, 0o620, 0o602] {
+        let backed = backup(Trouble {
+            password_mode: Some(mode),
+            ..Trouble::default()
+        })?;
+        shared.push((
+            format!("{mode:o}"),
+            backed.exit,
+            backed.calls.len(),
+            backed.docker_args.len(),
+        ));
+    }
     let refused = backup(Trouble {
         docker_exit: Some(7),
         ..Trouble::default()
     })?;
     assert_eq!(
+        (shared, refused.exit, refused.calls.len()),
         (
-            shared.exit,
-            shared.calls.len(),
-            shared.docker_args.len(),
-            refused.exit,
-            refused.calls.len()
-        ),
-        (Some(2), 0, 0, Some(7), 0)
+            vec![
+                ("644".to_owned(), Some(2), 0, 0),
+                ("620".to_owned(), Some(2), 0, 0),
+                ("602".to_owned(), Some(2), 0, 0),
+            ],
+            Some(7),
+            0
+        )
+    );
+    Ok(())
+}
+
+/// The work directory under `~/.cache/bellwether` holds a whole snapshot and archive; every run,
+/// a failed one included, removes it.
+#[test]
+fn every_run_removes_its_staging_copy_whether_it_succeeds_or_fails() -> TestResult {
+    let mut left = Vec::new();
+    for trouble in [
+        Trouble::default(),
+        Trouble {
+            put_fails: true,
+            ..Trouble::default()
+        },
+        Trouble {
+            listing_lacks_new: true,
+            ..Trouble::default()
+        },
+        Trouble {
+            docker_exit: Some(7),
+            ..Trouble::default()
+        },
+    ] {
+        let backed = backup(trouble)?;
+        left.push((backed.exit, backed.staging));
+    }
+    assert_eq!(
+        left,
+        vec![
+            (Some(0), Vec::new()),
+            (Some(7), Vec::new()),
+            (Some(8), Vec::new()),
+            (Some(7), Vec::new()),
+        ]
     );
     Ok(())
 }

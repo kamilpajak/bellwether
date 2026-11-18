@@ -119,6 +119,78 @@ fn a_copy_taken_while_another_connection_commits_is_one_whole_commit_at_the_stor
     Ok(())
 }
 
+/// Rows of `SPILL_PAD` bytes the open transaction inserts: about 2 MB against a cache and spill
+/// threshold of `SPILL_CACHE_PAGES`. macOS's `/usr/lib` SQLite 3.54.0 defaults `cache_spill` to
+/// 20,000 pages and spilled nothing until it was set (2026-11-18).
+const SPILL_ROWS: i64 = 2_000;
+const SPILL_PAD: i64 = 1_000;
+const SPILL_CACHE_PAGES: i64 = 10;
+const SPILL_HOLD: Duration = Duration::from_secs(2);
+
+/// Inserts `SPILL_ROWS` in one transaction from a small cache, reports the spill on `spilled`,
+/// holds the transaction open for `SPILL_HOLD`, then commits.
+fn spill_then_commit(
+    log: &Path,
+    spilled: &std::sync::mpsc::Sender<()>,
+) -> Result<i64, rusqlite::Error> {
+    let db = Connection::open(log)?;
+    db.pragma_update(None, "cache_size", SPILL_CACHE_PAGES)?;
+    db.pragma_update(None, "cache_spill", SPILL_CACHE_PAGES)?;
+    db.execute_batch("BEGIN IMMEDIATE")?;
+    for row in 0..SPILL_ROWS {
+        db.execute(
+            "INSERT INTO grown (n, pad) VALUES (?1, zeroblob(?2))",
+            [row, SPILL_PAD],
+        )?;
+    }
+    if spilled.send(()).is_err() {
+        return db.execute_batch("ROLLBACK").map(|()| 0);
+    }
+    std::thread::sleep(SPILL_HOLD);
+    db.execute_batch("COMMIT")?;
+    Ok(SPILL_ROWS)
+}
+
+/// A file copy taken now would hold the uncommitted pages without their journal; the online
+/// backup waits on the writer's lock and copies the whole commit.
+#[test]
+fn a_copy_started_while_a_transaction_has_spilled_into_the_file_holds_that_whole_commit(
+) -> TestResult {
+    let root = tempfile::TempDir::new()?;
+    store_at(root.path())?;
+    let log = root.path().join(COMMIT_LOG);
+    Connection::open(&log)?
+        .execute_batch("CREATE TABLE grown (n INTEGER NOT NULL, pad BLOB NOT NULL)")?;
+    let before = std::fs::metadata(&log)?.len();
+    let (spilled, on_spill) = std::sync::mpsc::channel();
+    let writer = {
+        let log = log.clone();
+        std::thread::spawn(move || spill_then_commit(&log, &spilled))
+    };
+    on_spill.recv()?;
+    let grown_before_commit = std::fs::metadata(&log)?.len() > before;
+    let out = root.path().join(COPY);
+    let answered = snapshot(root.path(), &out, &[])?;
+    let written = match writer.join() {
+        Ok(written) => written?,
+        Err(_) => return Err("the writer thread panicked".into()),
+    };
+    let copy = Connection::open_with_flags(&out, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let check: String = copy.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    assert_eq!(
+        (
+            grown_before_commit,
+            answered.status.code(),
+            counted(&copy, "grown")?,
+            check
+        ),
+        (true, Some(0), written, "ok".to_owned()),
+        "{}",
+        String::from_utf8_lossy(&answered.stderr)
+    );
+    Ok(())
+}
+
 #[test]
 fn a_dry_run_reports_the_stores_version_and_writes_nothing() -> TestResult {
     let root = tempfile::TempDir::new()?;
