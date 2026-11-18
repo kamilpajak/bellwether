@@ -4955,7 +4955,7 @@ mod tests {
 
     /// §8 row M1 from 13: `deferred` keyed by its rowid, `deferred_closed` added (S7-D5). The
     /// reader names the open document row only; a second close keeps nothing of its call; the
-    /// CHECKs tie `attempt_id` to `answered` and refuse any other name.
+    /// CHECKs tie `attempt_id` to `answered` and refuse any other name; it names a real attempt.
     #[test]
     fn a_store_at_user_version_thirteen_opens_migrates_to_fourteen_and_closes_a_deferred_row(
     ) -> TestResult {
@@ -4990,6 +4990,7 @@ mod tests {
             insert(2, "answered", None),
             insert(2, "held", Some("a v1 attempt")),
             insert(9, "held", None),
+            insert(2, "answered", Some("no such attempt")),
         );
         let admitted = insert(2, CLOSINGS[2], None);
         let columns = super::columns_of(&store.db, "deferred_closed")?;
@@ -5026,7 +5027,7 @@ mod tests {
         );
         assert_eq!(
             (reopened, refused, admitted, columns),
-            (0, (false, false, false, false), true, expected_shape)
+            (0, (false, false, false, false, false), true, expected_shape)
         );
         Ok(())
     }

@@ -1347,7 +1347,7 @@ fn closed_deferred_rows_are_counted_per_closing_and_an_expired_one_is_a_finding(
     let counted = |day: &str, source: &str| {
         per_source(&report, day, source).map(|row| row["carried"].clone())
     };
-    let expired: Vec<(String, String)> =
+    let expired_of = |report: &Value| -> Vec<(String, String)> {
         report["check"]["findings"]
             .as_array()
             .map_or_else(Vec::new, |findings| {
@@ -1361,7 +1361,16 @@ fn closed_deferred_rows_are_counted_per_closing_and_an_expired_one_is_a_finding(
                         )
                     })
                     .collect()
-            });
+            })
+    };
+    let expired = expired_of(&report);
+    let edgar_only = run(
+        &root,
+        &[
+            "--from", FIRST_DAY, "--to", FIRST_DAY, "--source", EDGAR, "--check",
+        ],
+    )?
+    .json()?;
     let human = Command::new(env!("CARGO_BIN_EXE_newsvault"))
         .arg("ledger")
         .args(["--store", &root.path().to_string_lossy()])
@@ -1381,6 +1390,8 @@ fn closed_deferred_rows_are_counted_per_closing_and_an_expired_one_is_a_finding(
             counted(EMPTY_DAY, EDGAR),
             expired,
             shown,
+            per_source(&edgar_only, FIRST_DAY, POLYGON).is_some(),
+            expired_of(&edgar_only),
         ),
         (
             Some(serde_json::json!({"answered": 1, "held": 2, "expired": 3})),
@@ -1391,6 +1402,8 @@ fn closed_deferred_rows_are_counted_per_closing_and_an_expired_one_is_a_finding(
                 (FIRST_DAY.to_owned(), POLYGON.to_owned())
             ],
             Some(" 1 carried_held 2 carried_expired 3".to_owned()),
+            false,
+            vec![(FIRST_DAY.to_owned(), EDGAR.to_owned())],
         )
     );
     Ok(())

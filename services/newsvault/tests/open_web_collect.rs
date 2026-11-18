@@ -6286,16 +6286,23 @@ fn deferred_walk_ids_are_carried_to_the_front_of_their_lane_and_closed_answered(
             third.envelope["per_source"][0]["carried"].clone(),
             carried_line(&third.envelope)?,
             run_file["source"].clone(),
+            third.envelope["carried"].as_array().map(|items| {
+                items
+                    .iter()
+                    .map(|item| item["attempt_id"].as_str().map(str::to_owned))
+                    .collect::<Vec<Option<String>>>()
+            }),
         ),
         (
             deferred
                 .iter()
                 .map(|url| (url.clone(), true, Value::from("answered"), 1))
                 .collect(),
-            closed,
+            closed.clone(),
             serde_json::json!({"queued": 4, "answered": 4, "held": 0, "expired": 0}),
             Some("carried          4 queued 4 answered 4 held 0 expired 0".to_owned()),
             Value::from(SOURCE),
+            Some(closed.into_iter().map(|row| row.2).collect()),
         )
     );
     Ok(())
@@ -6335,12 +6342,16 @@ fn a_carried_item_whose_story_the_store_holds_is_closed_held_and_not_asked() -> 
             carried_of(&second.envelope),
             closed_rows(root.path())?,
             carried_line(&second.envelope)?,
+            second.envelope["per_source"][0]["carried"].clone(),
+            second.envelope["carried"][0]["attempt_id"].clone(),
         ),
         (
             false,
             vec![(url, false, Value::from("held"), 1)],
             vec![(1, "held".to_owned(), None)],
             Some("carried          1 queued 0 answered 0 held 1 expired 0".to_owned()),
+            serde_json::json!({"queued": 0, "answered": 0, "held": 1, "expired": 0}),
+            Value::Null,
         )
     );
     Ok(())
@@ -6408,6 +6419,7 @@ fn a_deferred_item_is_carried_at_23_59_59_and_closed_expired_at_24_hours() -> Te
                 .collect::<Vec<String>>(),
             carried,
             expired_findings,
+            second.envelope["per_source"][0]["carried"].clone(),
         ));
     }
     let url = walk_url(UNLISTED_ID);
@@ -6419,14 +6431,16 @@ fn a_deferred_item_is_carried_at_23_59_59_and_closed_expired_at_24_hours() -> Te
                 vec![(url.clone(), true, Value::from("answered"), 1)],
                 vec!["answered".to_owned()],
                 vec![(1, 0, 0)],
-                0
+                0,
+                serde_json::json!({"queued": 1, "answered": 1, "held": 0, "expired": 0}),
             ),
             (
                 false,
                 vec![(url, false, Value::from("expired"), 1)],
                 vec!["expired".to_owned()],
                 vec![(0, 0, 1)],
-                1
+                1,
+                serde_json::json!({"queued": 0, "answered": 0, "held": 0, "expired": 1}),
             ),
         ]
     );
@@ -6458,8 +6472,9 @@ fn expired_findings_of(store: &Path) -> Result<usize, Box<dyn Error>> {
 /// PR #53 review F1: an over-age item is not carried, but the run's own walk lists its story again
 /// and asks it, so it is closed `answered` by that attempt, not `expired`, and `--check` stays
 /// quiet. One row names no story and is matched by its url; the other, another spelling of the url,
-/// by its story. Mutations: closing over-age items at the start, their story put in `issued`,
-/// matching by url only, matching by story only: red.
+/// by its story. Its first answer is 503, so both close by the first of its two attempts. Mutations:
+/// closing over-age items at the start, their story put in `issued`, matching by url only, matching
+/// by story only, keeping the last attempt: red.
 #[test]
 fn an_over_age_item_the_runs_own_index_lists_again_is_asked_and_closed_answered() -> TestResult {
     let probe = after_a_first_walked_poll()?;
@@ -6487,7 +6502,7 @@ fn an_over_age_item_the_runs_own_index_lists_again_is_asked_and_closed_answered(
         None,
         instant(WALK_SECOND) - A_DAY,
     )?;
-    let exchange = Gnw::walked(RSS_1205)?;
+    let exchange = Gnw::walked(RSS_1205)?.answering(&url, &[UNAVAILABLE]);
     let second = walked_poll(
         root.path(),
         hosts_fixture(WALK_HOSTS),
@@ -6507,7 +6522,7 @@ fn an_over_age_item_the_runs_own_index_lists_again_is_asked_and_closed_answered(
             expired_findings_of(root.path())?,
         ),
         (
-            1,
+            2,
             vec![
                 (url, false, Value::from("answered"), 1),
                 (spelled, false, Value::from("answered"), 1),
@@ -6554,6 +6569,67 @@ fn a_young_item_the_provider_cannot_rebuild_is_not_asked_and_stays_open() -> Tes
             false,
             vec![(url.to_owned(), false, Value::Null, 1)],
             Vec::new(),
+        )
+    );
+    Ok(())
+}
+
+/// S7-D5's age is read at the run's start: an unrebuildable item 23:59:50 old stays open though the
+/// clock passes 24 h during the run. A carried row closes at the clock of its closing attempt,
+/// 12 s on (`WAIT` + `TOOK` + `AFTER`). Mutations: age at the close, `closed_at` at the start: red.
+#[test]
+fn age_is_read_at_the_runs_start_and_a_row_closes_at_its_attempts_clock() -> TestResult {
+    let root = after_a_first_walked_poll()?;
+    let start = instant(WALK_SECOND);
+    let carried = walk_url(UNLISTED_ID);
+    an_open_row(
+        root.path(),
+        &carried,
+        walk_story(UNLISTED_ID).as_deref(),
+        None,
+        start - TimeDelta::hours(1),
+    )?;
+    let unrebuildable = "https://unadmitted.example.com/news/1.html";
+    an_open_row(
+        root.path(),
+        unrebuildable,
+        None,
+        None,
+        start - A_DAY + TimeDelta::seconds(10),
+    )?;
+    let clock = Rc::new(Cell::new(start));
+    let exchange = Ticked {
+        inner: Gnw::walked(RSS_1205)?,
+        clock: clock.clone(),
+    };
+    let ask = Ask {
+        hosts: Some(hosts_fixture(WALK_HOSTS)),
+        at: start,
+        schedule: Some("walk".to_owned()),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, &exchange, &Ticking(clock.clone()))?;
+    let closed_at: Vec<(i64, String)> = Connection::open_with_flags(
+        root.path().join(COMMIT_LOG),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?
+    .prepare("SELECT deferred_id, closed_at FROM deferred_closed ORDER BY deferred_id")?
+    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+    .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        (
+            clock.get() - start > TimeDelta::seconds(10),
+            carried_of(&answer.envelope),
+            closed_at,
+        ),
+        (
+            true,
+            vec![
+                (unrebuildable.to_owned(), false, Value::Null, 1),
+                (carried, true, Value::from("answered"), 1),
+            ],
+            vec![(1, micros(start + WAIT + TOOK + AFTER))],
         )
     );
     Ok(())

@@ -2063,4 +2063,27 @@ mod tests {
             )
         );
     }
+
+    /// S7-D5: a carried request whose host has no planned lane opens one and is asked.
+    #[test]
+    fn a_carried_request_on_a_host_with_no_lane_opens_one_and_is_asked() {
+        let mut queue = HostQueue::of(vec![asking(PRN, "index")], None);
+        queue.carry(vec![Queued {
+            carried: vec![1],
+            ..Queued::first_attempt(asking(GNW, "c1"))
+        }]);
+        let mut asked = Vec::new();
+        while let Some(popped) = queue.pop() {
+            if let Popped::Ask(queued) = popped {
+                asked.push((queued.request.url, queued.carried));
+            }
+        }
+        assert_eq!(
+            asked,
+            vec![
+                (format!("{PRN}index"), Vec::new()),
+                (format!("{GNW}c1"), vec![1]),
+            ]
+        );
+    }
 }

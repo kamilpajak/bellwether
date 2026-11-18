@@ -5079,8 +5079,10 @@ fn every_golden_page_extracts_to_its_committed_body_under_the_committed_version(
 
 /// S7-D5: a deferred document is rebuilt as the request the index built, follow-up and walk id
 /// alike; nothing off an admitted host or under a robots disallow. Only the walk id is a walk id
-/// (S7-D6's exception): the walk's url with a listed value is not. Mutation (PR #53 review F6):
-/// `is_walk_id` without its `listed_date` clause: red.
+/// (S7-D6's exception): the walk's url with a listed value is not. Neither a url on GNW that keys no
+/// release nor one on a candidate host is rebuilt, though robots allow both. Mutations: `is_walk_id`
+/// without its `listed_date` clause (PR #53 review F6), `carried` without `item_key` or
+/// `admitted_row`: red.
 #[test]
 fn a_deferred_document_is_rebuilt_as_its_request_and_a_walk_id_is_known_by_its_url() -> Outcome {
     let feed = walking(after_the_first_poll(&[])?)?;
@@ -5101,6 +5103,17 @@ fn a_deferred_document_is_rebuilt_as_its_request_and_a_walk_id_is_known_by_its_u
         listed_date: follow_up.listed_date.clone(),
         ..walk_id.clone()
     };
+    let candidate = OpenWebFeed::open(
+        &hosts_fixture("one_admitted_one_candidate.json"),
+        &rules_path(),
+        CONTACT,
+    )?;
+    let every_host_allowed: BTreeMap<String, HostRobots> = candidate
+        .host_pins()
+        .into_iter()
+        .map(|row| (row.host, HostRobots::Absent))
+        .collect();
+    let candidate = candidate.with_robots(every_host_allowed);
     assert_eq!(
         (
             rebuilt(&feed, &follow_up),
@@ -5110,6 +5123,12 @@ fn a_deferred_document_is_rebuilt_as_its_request_and_a_walk_id_is_known_by_its_u
             feed.is_walk_id(&listed_walk_form),
             feed.carried(&window, "https://example.test/news-release/1.html", None),
             rebuilt(&disallowing, &walk_id),
+            feed.carried(&window, "https://rss.globenewswire.com/about", None),
+            candidate.carried(
+                &window,
+                "https://www.prnewswire.com/news-release/2026/11/17/3404430/0/en/x.html",
+                None
+            ),
         ),
         (
             Some(follow_up.clone()),
@@ -5118,7 +5137,9 @@ fn a_deferred_document_is_rebuilt_as_its_request_and_a_walk_id_is_known_by_its_u
             true,
             false,
             None,
-            None
+            None,
+            None,
+            None,
         )
     );
     Ok(())
