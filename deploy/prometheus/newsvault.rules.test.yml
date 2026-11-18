@@ -54,6 +54,16 @@ tests:
             exp_annotations:
               summary: newsvault's watchdog has written no ledger read for over 2 h, or none of this schema.
 
+  # No watchdog file at all is the stale alert's to name, not the never-asked one's.
+  - interval: 1h
+    input_series:
+      - series: 'up{job="node"}'
+        values: '1'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: NewsvaultNeverAsked
+        exp_alerts: []
+
   - interval: 1h
     input_series:
       - series: 'newsvault_ledger_at_timestamp_seconds{schema="newsvault.prom/1"}'
