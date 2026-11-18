@@ -9,8 +9,8 @@ use crate::minute_of;
 use crate::parse::index_rows;
 use crate::rules::{ProviderKeys, Rule};
 
-/// The longest period of architecture.md section 11.2's period table (`outside`, 90 min). No
-/// schedule exists in code (2026-11-17), so this copy and that table change together.
+/// The longest period of `newsvault`'s schedule (`schedule::SLOTS`, 90 min); a `newsvault` test
+/// holds this copy to that table (architecture.md section 11.2).
 pub const LONGEST_POLL_PERIOD: TimeDelta = TimeDelta::minutes(90);
 
 /// How long before a keyed row's minute a direct answer is still read (owner decision 2026-11-17).

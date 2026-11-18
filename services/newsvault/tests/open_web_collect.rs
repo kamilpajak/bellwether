@@ -5509,8 +5509,8 @@ fn deferred_requests_open_no_attempt_and_every_reader_counts_each_reason_apart()
 }
 
 /// S7-D3 by default: with no `--deadline` an open-web run at 09:30:30 belongs to the 09:30 slot
-/// (90 min, next 11:00) and every reservation carries its deadline, 10:14:30; PRN, held to
-/// 11:30:30, is stopped `host_held` with its lane while every other host is asked.
+/// (90 min, next 11:00) and every reservation, one per send and PRN's stopped one, carries its
+/// deadline, 10:14:30; PRN, held to 11:30:30, is stopped `host_held` with its lane.
 #[test]
 fn with_no_deadline_an_open_web_run_stops_at_its_schedule_slots_deadline() -> TestResult {
     let root = TempDir::new()?;
@@ -5525,11 +5525,10 @@ fn with_no_deadline_an_open_web_run_stops_at_its_schedule_slots_deadline() -> Te
     let opened = cmd_collect::open_provider(&ask)?;
     let answer = cmd_collect::run(&ask, &opened, &exchange, &Monday)?;
     let (sent, _) = exchange.sent();
-    let deadlines = exchange.paced.as_ref().map(|paced| {
-        let mut seen = paced.deadlines.borrow().clone();
-        seen.dedup();
-        seen
-    });
+    let deadlines = exchange
+        .paced
+        .as_ref()
+        .map(|paced| paced.deadlines.borrow().clone());
     let reasons: BTreeSet<String> = deferred_of(&answer.envelope)
         .into_iter()
         .map(|row| format!("{} {}", row.0, row.2))
@@ -5545,7 +5544,10 @@ fn with_no_deadline_an_open_web_run_stops_at_its_schedule_slots_deadline() -> Te
         (
             FIVE_HOST_FOLLOW_UPS + 1,
             BTreeSet::from([format!("{PRN_HOST} host_held")]),
-            Some(vec![Some(instant(SLOT_0930_DEADLINE))]),
+            Some(vec![
+                Some(instant(SLOT_0930_DEADLINE));
+                FIVE_HOST_FOLLOW_UPS + 2
+            ]),
             Value::from("2026-11-16T10:14:30.000000Z"),
             serde_json::json!({
                 "start": "2026-11-16T09:30:00.000000Z",

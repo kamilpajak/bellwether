@@ -130,6 +130,8 @@ impl Clock for Fixed {
 struct Payloads {
     answers: BTreeMap<String, (u16, Vec<u8>)>,
     asked: RefCell<Vec<String>>,
+    /// The deadline each `reserve` was handed, in order.
+    reserved: RefCell<Vec<Option<DateTime<Utc>>>>,
 }
 
 impl Payloads {
@@ -141,6 +143,7 @@ impl Payloads {
         Ok(Self {
             answers: held,
             asked: RefCell::new(Vec::new()),
+            reserved: RefCell::new(Vec::new()),
         })
     }
 
@@ -159,6 +162,16 @@ impl Payloads {
 }
 
 impl Exchange for Payloads {
+    fn reserve(
+        &self,
+        _request: &Request,
+        _clock: &dyn Clock,
+        deadline: Option<DateTime<Utc>>,
+    ) -> Result<news_provider::Reservation, news_provider::Unreserved> {
+        self.reserved.borrow_mut().push(deadline);
+        Ok(news_provider::Reservation::Go)
+    }
+
     fn send(
         &self,
         permit: SendPermit,
@@ -582,18 +595,26 @@ fn with_stdin_not_a_tty_the_binary_never_reads_dev_tty_and_never_blocks() -> Tes
 }
 
 /// EDGAR is not on section 11.2's schedule: with no `--deadline` its run has none and no slot,
-/// at 23:00Z, which the schedule would put past the 22:00 slot's 22:14:30 deadline.
+/// at 23:00Z, which the schedule would put past the 22:00 slot's 22:14:30 deadline. Each send is
+/// still reserved once first, with no deadline.
 #[test]
 fn an_edgar_run_with_no_deadline_takes_none_from_the_schedule() -> TestResult {
     let root = TempDir::new()?;
-    let answer = collected(root.path(), A_LISTED_SESSION, &Payloads::a_good_day()?)?;
+    let exchange = Payloads::a_good_day()?;
+    let answer = collected(root.path(), A_LISTED_SESSION, &exchange)?;
     assert_eq!(
         (
             answer.envelope["deadline"].clone(),
             answer.envelope["slot"].clone(),
-            answer.exit
+            answer.exit,
+            exchange.reserved.borrow().clone(),
         ),
-        (Value::Null, Value::Null, Exit::Ok)
+        (
+            Value::Null,
+            Value::Null,
+            Exit::Ok,
+            vec![None; exchange.sends()]
+        )
     );
     Ok(())
 }
@@ -1925,6 +1946,7 @@ fn gnw_payloads(answers: &[(&str, u16, &str)]) -> Result<Payloads, Box<dyn Error
     Ok(Payloads {
         answers: held,
         asked: RefCell::new(Vec::new()),
+        reserved: RefCell::new(Vec::new()),
     })
 }
 
