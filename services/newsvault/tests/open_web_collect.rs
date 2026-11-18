@@ -3175,11 +3175,20 @@ fn a_story_whose_listing_stays_unparseable_is_fetched_by_every_poll() -> TestRes
     Ok(())
 }
 
-/// A real store whose first `commit` of a run refuses: the index attempt, since a live poll
-/// opens no other attempt before it.
+/// What [`RefusingTheIndex`] refuses.
+#[derive(PartialEq, Eq)]
+enum Refusal {
+    /// The first `commit` of a run: the index attempt, since a live poll opens none before it.
+    TheIndexCommit,
+    /// Every `record_relisted`, which a live index calls after its commit: the run aborts.
+    TheRelistedRows,
+}
+
+/// A real store that refuses one act of a run's index attempt.
 struct RefusingTheIndex {
     store: Committer,
     commits: RefCell<usize>,
+    refusal: Refusal,
 }
 
 impl Sink for RefusingTheIndex {
@@ -3200,7 +3209,8 @@ impl Archive for RefusingTheIndex {
         payload: Option<&news_provider::Payload>,
         observed: ObservationTime,
     ) -> Result<Committed, ArchiveError> {
-        if self.commits.replace_with(|nth| *nth + 1) == 0 {
+        if self.commits.replace_with(|nth| *nth + 1) == 0 && self.refusal == Refusal::TheIndexCommit
+        {
             return Err(ArchiveError {
                 act: "commit",
                 detail: "refused the index".to_owned(),
@@ -3248,6 +3258,12 @@ impl Archive for RefusingTheIndex {
         attempt_id: &str,
         relisted: &[news_provider::Relisted],
     ) -> Result<(), ArchiveError> {
+        if self.refusal == Refusal::TheRelistedRows {
+            return Err(ArchiveError {
+                act: "record relisted rows",
+                detail: "refused the relisted rows".to_owned(),
+            });
+        }
         Archive::record_relisted(&mut self.store, attempt_id, relisted)
     }
 
@@ -3335,6 +3351,7 @@ fn polled_through_a_refused_index(root: &Path, exchange: &Gnw) -> Result<Exit, B
     let mut archive = RefusingTheIndex {
         store: Committer::open(root, &run)?,
         commits: RefCell::new(0),
+        refusal: Refusal::TheIndexCommit,
     };
     let driven = cmd_collect::drive(
         &ask,
@@ -3423,6 +3440,62 @@ fn a_quiet_day_whose_every_listed_story_is_held_passes_ledger_check() -> TestRes
     assert_eq!(
         ledger_of_the_next_day(root.path())?,
         (vec![(3, 3, 0)], Vec::new(), Some(EXIT_OK))
+    );
+    Ok(())
+}
+
+/// PR #53 review F3: a run that aborts after its all-held index committed still leaves `held` 3
+/// beside `vendor_rows` 3, so `--check` raises no `rows_committed_zero_against_vendor_rows`.
+/// The run file is the unfinished one `run` writes before its lease. Mutation: `held` written
+/// only once the queue is empty: red.
+#[test]
+fn an_index_whose_run_aborts_after_its_commit_keeps_its_held() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let exchange = Gnw::day()?;
+    poll(root.path(), RUN_AT, "first", &exchange)?;
+    let ask = Ask {
+        at: instant(THE_NEXT_DAY),
+        schedule: Some("aborted".to_owned()),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let run = RunId::new("aborted");
+    let runs = root.path().join(RUNS_DIR);
+    let first = std::fs::read_dir(&runs)?
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("first"))
+        .ok_or("no first run file")?;
+    let mut unfinished: Value = serde_json::from_slice(&std::fs::read(first.path())?)?;
+    unfinished["run_id"] = Value::from("aborted");
+    unfinished["run_date"] = Value::from(NEXT_DAY_DATE);
+    unfinished["started_at"] = Value::from(THE_NEXT_DAY);
+    unfinished["finished_at"] = Value::Null;
+    unfinished["wall_s"] = Value::Null;
+    std::fs::write(runs.join("aborted.json"), serde_json::to_vec(&unfinished)?)?;
+    let mut archive = RefusingTheIndex {
+        store: Committer::open(root.path(), &run)?,
+        commits: RefCell::new(0),
+        refusal: Refusal::TheRelistedRows,
+    };
+    let aborted = cmd_collect::drive(
+        &ask,
+        opened.provider.as_ref(),
+        &mut archive,
+        &exchange,
+        &At(instant(THE_NEXT_DAY)),
+        &run,
+    )
+    .is_err();
+    drop(archive);
+    let (counts, codes, _) = ledger_of_the_next_day(root.path())?;
+    assert_eq!(
+        (
+            aborted,
+            counts,
+            codes.contains(&"rows_committed_zero_against_vendor_rows")
+        ),
+        (true, vec![(3, 3, 0)], false)
     );
     Ok(())
 }
@@ -6356,6 +6429,132 @@ fn a_deferred_item_is_carried_at_23_59_59_and_closed_expired_at_24_hours() -> Te
                 1
             ),
         ]
+    );
+    Ok(())
+}
+
+/// The `deferred_expired` findings of `ledger --check` over 2026-11-17.
+fn expired_findings_of(store: &Path) -> Result<usize, Box<dyn Error>> {
+    let report = newsvault::cmd_ledger::read(
+        store,
+        &newsvault::cmd_ledger::Ask {
+            at: instant("2026-11-18T00:00:00Z"),
+            from: "2026-11-17".parse()?,
+            to: "2026-11-17".parse()?,
+            source: Some(SOURCE.to_owned()),
+            expected_runs: None,
+            limit: None,
+            check: true,
+        },
+    )?;
+    Ok(report
+        .check
+        .findings
+        .iter()
+        .filter(|finding| finding.code == "deferred_expired")
+        .count())
+}
+
+/// PR #53 review F1: an over-age item is not carried, but the run's own walk lists its story again
+/// and asks it, so it is closed `answered` by that attempt, not `expired`, and `--check` stays
+/// quiet. One row names no story and is matched by its url; the other, another spelling of the url,
+/// by its story. Mutations: closing over-age items at the start, their story put in `issued`,
+/// matching by url only, matching by story only: red.
+#[test]
+fn an_over_age_item_the_runs_own_index_lists_again_is_asked_and_closed_answered() -> TestResult {
+    let probe = after_a_first_walked_poll()?;
+    walked_poll(
+        probe.path(),
+        hosts_fixture(WALK_HOSTS),
+        WALK_SECOND,
+        &Gnw::walked(RSS_1205)?,
+    )?;
+    let (url, story): (String, String) = Connection::open(probe.path().join(COMMIT_LOG))?
+        .query_row(
+        "SELECT p.url, a.story_id FROM attempts a JOIN payloads p ON p.attempt_id = a.attempt_id
+              WHERE p.phase = 'document' AND a.story_id IS NOT NULL
+              ORDER BY a.opened_at DESC, a.attempt_id LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let root = after_a_first_walked_poll()?;
+    an_open_row(root.path(), &url, None, None, instant(WALK_SECOND) - A_DAY)?;
+    let spelled = url.replace("/x.html", "/another-spelling.html");
+    an_open_row(
+        root.path(),
+        &spelled,
+        Some(&story),
+        None,
+        instant(WALK_SECOND) - A_DAY,
+    )?;
+    let exchange = Gnw::walked(RSS_1205)?;
+    let second = walked_poll(
+        root.path(),
+        hosts_fixture(WALK_HOSTS),
+        WALK_SECOND,
+        &exchange,
+    )?;
+    let (sent, _) = exchange.sent();
+    let attempt = second.envelope["attempts"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["url"] == url.as_str()))
+        .and_then(|row| row["attempt_id"].as_str().map(str::to_owned));
+    assert_eq!(
+        (
+            sent.iter().filter(|one| **one == url).count(),
+            carried_of(&second.envelope),
+            closed_rows(root.path())?,
+            expired_findings_of(root.path())?,
+        ),
+        (
+            1,
+            vec![
+                (url, false, Value::from("answered"), 1),
+                (spelled, false, Value::from("answered"), 1),
+            ],
+            vec![
+                (1, "answered".to_owned(), attempt.clone()),
+                (2, "answered".to_owned(), attempt),
+            ],
+            0,
+        )
+    );
+    Ok(())
+}
+
+/// S7-D5: an item younger than 24 h that the provider cannot rebuild, its host no longer admitted,
+/// is not asked and stays open, so a later run can still close it. Mutation: such an item closed
+/// `expired` at the run's end: red.
+#[test]
+fn a_young_item_the_provider_cannot_rebuild_is_not_asked_and_stays_open() -> TestResult {
+    let root = after_a_first_walked_poll()?;
+    let url = "https://unadmitted.example.com/news/1.html";
+    an_open_row(
+        root.path(),
+        url,
+        None,
+        None,
+        instant(WALK_SECOND) - TimeDelta::hours(1),
+    )?;
+    let exchange = Gnw::walked(RSS_1205)?;
+    let second = walked_poll(
+        root.path(),
+        hosts_fixture(WALK_HOSTS),
+        WALK_SECOND,
+        &exchange,
+    )?;
+    let (sent, _) = exchange.sent();
+    assert_eq!(
+        (
+            sent.iter().any(|one| one == url),
+            carried_of(&second.envelope),
+            closed_rows(root.path())?,
+        ),
+        (
+            false,
+            vec![(url.to_owned(), false, Value::Null, 1)],
+            Vec::new(),
+        )
     );
     Ok(())
 }

@@ -192,7 +192,7 @@ impl Deferred {
 }
 
 /// S7-D5's age limit: an item whose oldest open row is this old at the run's start, or older,
-/// is closed `expired` and never asked.
+/// is not carried, and is closed `expired` at the run's end unless the run asked its story.
 pub const CARRY_LIMIT: TimeDelta = TimeDelta::hours(24);
 
 /// One open `deferred` row of a `Document` request, one no `deferred_closed` row names (S7-D5).
@@ -209,11 +209,12 @@ pub struct OpenDeferred {
 /// How an open `deferred` row is closed (S7-D5), stored by its [`Closing::name`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Closing {
-    /// Carried and asked, whatever the answer.
+    /// Asked by this run, whatever the answer: carried, or listed again by its own index.
     Answered { attempt_id: String },
     /// The archive held its story at the run's start, so it was not asked.
     Held,
-    /// Its oldest open row was [`CARRY_LIMIT`] old or older at the run's start; never asked.
+    /// Its oldest open row was [`CARRY_LIMIT`] old or older at the run's start, and the run did
+    /// not ask its url or its story.
     Expired,
 }
 
@@ -250,7 +251,7 @@ pub struct Carried {
     pub story_id: Option<String>,
     pub deferred_ids: Vec<i64>,
     pub first_deferred_at: DateTime<Utc>,
-    /// Put at the front of its host's lane; false when closed at the start or not rebuilt.
+    /// Put at the front of its host's lane; false when closed `held`, over 24 h, or not rebuilt.
     pub queued: bool,
     /// `None`: still open, asked by no attempt of this run or never rebuilt.
     pub closed: Option<Closing>,
@@ -685,7 +686,8 @@ pub fn collect<A: Archive>(
         run: run.run,
         baseline: &baseline,
     };
-    let (carried, carrying) = carry(provider, archive, clock)?;
+    let started = clock.now();
+    let (carried, carrying) = carry(provider, archive, started)?;
     let mut issued: BTreeSet<String> = carried
         .iter()
         .filter(|item| item.queued)
@@ -696,6 +698,7 @@ pub fn collect<A: Archive>(
     queue.carry(carrying);
     let mut ordinal = 0;
     let mut asked = BTreeSet::new();
+    let mut asked_by: BTreeMap<String, String> = BTreeMap::new();
     let mut pending_held = Vec::new();
     let mut busy: BTreeMap<Option<String>, HostBusy> = BTreeMap::new();
     while let Some(popped) = queue.pop() {
@@ -745,6 +748,11 @@ pub fn collect<A: Archive>(
         let mut attempted = attempt_once(&driving, archive, &request, ordinal, &mut issued)?;
         ordinal += 1;
         asked.extend(attempted.story.clone());
+        for key in attempted.story.iter().chain([&request.url]) {
+            asked_by
+                .entry(key.clone())
+                .or_insert_with(|| attempted.row.attempt_id.clone());
+        }
         pending_held.extend(attempted.held.take());
         if !carried.is_empty() {
             let closing = Closing::Answered {
@@ -773,9 +781,12 @@ pub fn collect<A: Archive>(
             .iter()
             .filter(|story| asked.contains(*story))
             .count();
-        let held = pending.held.saturating_add(count(queued_and_asked));
-        archive.record_held(&pending.attempt_id, held)?;
+        if queued_and_asked > 0 {
+            let held = pending.held.saturating_add(count(queued_and_asked));
+            archive.record_held(&pending.attempt_id, held)?;
+        }
     }
+    close_uncarried(archive, &mut collected.carried, &asked_by, started, clock)?;
     collected.capped_holds = exchange.capped_holds();
     for row in &collected.deferred {
         busy.entry(row.host.clone()).or_default().not_looked += 1;
@@ -797,12 +808,12 @@ pub fn collect<A: Archive>(
 }
 
 /// S7-D5: the source's open `Document` rows, one item per url in the order of its oldest row. An
-/// item whose story the archive holds is closed `held`, one whose oldest row is [`CARRY_LIMIT`]
-/// old is closed `expired`; the provider rebuilds the rest, and one it does not stays open.
+/// item whose story the archive holds is closed `held`; the provider rebuilds each other item
+/// younger than [`CARRY_LIMIT`], and [`close_uncarried`] decides the rest at the run's end.
 fn carry<A: Archive>(
     provider: &dyn Provider,
     archive: &mut A,
-    clock: &dyn Clock,
+    now: DateTime<Utc>,
 ) -> Result<(Vec<Carried>, Vec<Queued>), CollectError> {
     let source = provider.source();
     let open = archive.open_deferred(&source)?;
@@ -810,7 +821,6 @@ fn carry<A: Archive>(
         return Ok((Vec::new(), Vec::new()));
     }
     let held = archive.held_story_ids(&source)?;
-    let now = clock.now();
     let mut items: Vec<(String, Vec<OpenDeferred>)> = Vec::new();
     for row in open {
         match items.iter_mut().find(|(url, _)| *url == row.url) {
@@ -825,13 +835,11 @@ fn carry<A: Archive>(
         };
         let ids: Vec<i64> = rows.iter().map(|row| row.deferred_id).collect();
         let story_id = rows.iter().find_map(|row| row.story_id.clone());
-        let closing = if story_id.as_ref().is_some_and(|story| held.contains(story)) {
-            Some(Closing::Held)
-        } else if now - oldest.deferred_at >= CARRY_LIMIT {
-            Some(Closing::Expired)
-        } else {
-            None
-        };
+        let over_age = now - oldest.deferred_at >= CARRY_LIMIT;
+        let closing = story_id
+            .as_ref()
+            .is_some_and(|story| held.contains(story))
+            .then_some(Closing::Held);
         let mut item = Carried {
             source: source.as_str().to_owned(),
             target_window: oldest.target_window.clone(),
@@ -846,11 +854,16 @@ fn carry<A: Archive>(
         if let Some(closing) = closing {
             archive.close_deferred(&ids, &closing, ObservationTime::new(now))?;
             item.closed = Some(closing);
-        } else if let Some(request) = provider.carried(
-            &TargetWindow::new(&oldest.target_window),
-            &url,
-            oldest.listed_date.as_deref(),
-        ) {
+        } else if let Some(request) = (!over_age)
+            .then(|| {
+                provider.carried(
+                    &TargetWindow::new(&oldest.target_window),
+                    &url,
+                    oldest.listed_date.as_deref(),
+                )
+            })
+            .flatten()
+        {
             item.queued = true;
             queued.push(Queued {
                 counted: !provider.is_walk_id(&request),
@@ -862,6 +875,42 @@ fn carry<A: Archive>(
         carried.push(item);
     }
     Ok((carried, queued))
+}
+
+/// Once the queue is empty, each open item the run did not carry: closed `answered` by the first
+/// attempt that asked its url or its story (PR #53 review F1), else `expired` when it was over
+/// [`CARRY_LIMIT`] at `started`, else left open.
+fn close_uncarried<A: Archive>(
+    archive: &mut A,
+    carried: &mut [Carried],
+    asked_by: &BTreeMap<String, String>,
+    started: DateTime<Utc>,
+    clock: &dyn Clock,
+) -> Result<(), CollectError> {
+    for item in carried
+        .iter_mut()
+        .filter(|item| !item.queued && item.closed.is_none())
+    {
+        let asked = item
+            .story_id
+            .iter()
+            .chain([&item.url])
+            .find_map(|key| asked_by.get(key));
+        let closing = match asked {
+            Some(attempt_id) => Closing::Answered {
+                attempt_id: attempt_id.clone(),
+            },
+            None if started - item.first_deferred_at >= CARRY_LIMIT => Closing::Expired,
+            None => continue,
+        };
+        archive.close_deferred(
+            &item.deferred_ids,
+            &closing,
+            ObservationTime::new(clock.now()),
+        )?;
+        item.closed = Some(closing);
+    }
+    Ok(())
 }
 
 fn busy_key(url: &str) -> Option<String> {
@@ -1058,7 +1107,8 @@ struct Attempted {
     committed: Committed,
     /// The story a `Document` attempt asked for.
     story: Option<String>,
-    /// A live index's `held`, written once the run's queue is empty.
+    /// A live index's `held`: its archive-held part is written at the attempt, the rest once the
+    /// run's queue is empty.
     held: Option<PendingHeld>,
 }
 
@@ -1207,11 +1257,14 @@ fn attempt_once<A: Archive>(
                     .filter(|story| in_run.contains(story))
                     .collect();
                 let dropped = matched.saturating_sub(count(to_issue.len()));
-                held = Some(PendingHeld {
+                let pending = PendingHeld {
                     attempt_id: attempt_id.clone(),
                     held: dropped.saturating_sub(count(queued.len())),
                     queued,
-                });
+                };
+                // The final part now, so a run that aborts leaves no NULL beside `vendor_rows`.
+                archive.record_held(&attempt_id, pending.held)?;
+                held = Some(pending);
                 archive.record_relisted(&attempt_id, &relisted_of(provider, listed, &to_issue))?;
             }
             (to_issue, walked)

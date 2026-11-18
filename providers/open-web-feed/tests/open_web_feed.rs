@@ -5079,7 +5079,8 @@ fn every_golden_page_extracts_to_its_committed_body_under_the_committed_version(
 
 /// S7-D5: a deferred document is rebuilt as the request the index built, follow-up and walk id
 /// alike; nothing off an admitted host or under a robots disallow. Only the walk id is a walk id
-/// (S7-D6's exception).
+/// (S7-D6's exception): the walk's url with a listed value is not. Mutation (PR #53 review F6):
+/// `is_walk_id` without its `listed_date` clause: red.
 #[test]
 fn a_deferred_document_is_rebuilt_as_its_request_and_a_walk_id_is_known_by_its_url() -> Outcome {
     let feed = walking(after_the_first_poll(&[])?)?;
@@ -5096,12 +5097,17 @@ fn a_deferred_document_is_rebuilt_as_its_request_and_a_walk_id_is_known_by_its_u
     };
     let (disallowing, _) = gnw_disallowing("/")?;
     let window = TargetWindow::new(WALK_DAY);
+    let listed_walk_form = Request {
+        listed_date: follow_up.listed_date.clone(),
+        ..walk_id.clone()
+    };
     assert_eq!(
         (
             rebuilt(&feed, &follow_up),
             rebuilt(&feed, &walk_id),
             feed.is_walk_id(&follow_up),
             feed.is_walk_id(&walk_id),
+            feed.is_walk_id(&listed_walk_form),
             feed.carried(&window, "https://example.test/news-release/1.html", None),
             rebuilt(&disallowing, &walk_id),
         ),
@@ -5110,6 +5116,7 @@ fn a_deferred_document_is_rebuilt_as_its_request_and_a_walk_id_is_known_by_its_u
             Some(walk_id.clone()),
             false,
             true,
+            false,
             None,
             None
         )
