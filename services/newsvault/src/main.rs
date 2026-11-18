@@ -993,7 +993,8 @@ fn print_schema(format: Format) {
                              server's hold or slow-down moved it), with the rest of its host's \
                              queue; absent, open_web_wires takes min(slot start + period / 2, \
                              next slot) - 30 s of the schedule slot the clock's now is in, one \
-                             already passed included, and edgar_press takes none"},
+                             already passed included, a dry run's too whatever its at, and \
+                             edgar_press takes none"},
                     {"name": "dry_run", "type": "flag",
                      "doc": "plans and resolves every target and mutates nothing"},
                     {"name": "non_interactive", "type": "flag",
