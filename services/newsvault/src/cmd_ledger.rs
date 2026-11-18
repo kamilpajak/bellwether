@@ -1346,3 +1346,338 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
     }
     Ok(())
 }
+
+/// The version of [`render_prometheus`]'s exposition, carried as the `schema` label of
+/// `newsvault_ledger_at_timestamp_seconds`, which the staleness alert selects on.
+pub const PROMETHEUS_SCHEMA: &str = "newsvault.prom/1";
+
+/// A day's metrics are labelled by how many UTC days before `at`'s it is, so an alert can tell
+/// today, still running, from yesterday, closed; a run date that is not a date is `unknown`.
+fn days_ago(at: DateTime<Utc>, run_date: &str) -> String {
+    run_date.parse::<NaiveDate>().map_or_else(
+        |_| "unknown".to_owned(),
+        |day| (at.date_naive() - day).num_days().to_string(),
+    )
+}
+
+fn label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+fn family(
+    out: &mut impl std::io::Write,
+    name: &str,
+    help: &str,
+    samples: &[(String, String)],
+) -> std::io::Result<()> {
+    writeln!(out, "# HELP {name} {help}")?;
+    writeln!(out, "# TYPE {name} gauge")?;
+    for (labels, value) in samples {
+        if labels.is_empty() {
+            writeln!(out, "{name} {value}")?;
+        } else {
+            writeln!(out, "{name}{{{labels}}} {value}")?;
+        }
+    }
+    Ok(())
+}
+
+/// The same report as node-exporter textfile metrics, one family per alert input in
+/// `deploy/prometheus/newsvault.rules.yml`; architecture.md section 11.5 step 7 names each reader.
+pub fn render_prometheus(
+    report: &Report,
+    at: DateTime<Utc>,
+    out: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    let per_source = |count: &dyn Fn(&SourceRow) -> i64| -> Vec<(String, String)> {
+        report
+            .days
+            .iter()
+            .flat_map(|day| {
+                day.per_source.iter().map(move |row| {
+                    (
+                        format!(
+                            "source=\"{}\",days_ago=\"{}\"",
+                            label(&row.source),
+                            days_ago(at, &day.run_date)
+                        ),
+                        count(row).to_string(),
+                    )
+                })
+            })
+            .collect()
+    };
+    let mut findings: BTreeMap<(&str, String), u32> = BTreeMap::new();
+    for finding in &report.check.findings {
+        *findings
+            .entry((finding.code, days_ago(at, &finding.run_date)))
+            .or_default() += 1;
+    }
+    writeln!(out, "# {PROMETHEUS_SCHEMA}")?;
+    family(
+        out,
+        "newsvault_ledger_at_timestamp_seconds",
+        "The ledger read's --at as Unix seconds; the watchdog's last run.",
+        &[(
+            format!("schema=\"{PROMETHEUS_SCHEMA}\""),
+            at.timestamp().to_string(),
+        )],
+    )?;
+    family(
+        out,
+        "newsvault_ledger_complete",
+        "1 when the read saw every run file and every attempt's run file, else 0 (exit 8).",
+        &[(String::new(), u8::from(report.is_complete()).to_string())],
+    )?;
+    if let Some(age) = report.freshness.asking_clock.age_seconds {
+        family(
+            out,
+            "newsvault_collect_last_asked_age_seconds",
+            "Seconds from the newest vendor request any run sent to --at.",
+            &[(String::new(), age.to_string())],
+        )?;
+    }
+    family(
+        out,
+        "newsvault_deferred_host_held",
+        "Requests a server's hold or slow-down kept out of a run (S7-D4 host_held).",
+        &per_source(&|row| row.deferred.host_held),
+    )?;
+    family(
+        out,
+        "newsvault_carried_expired",
+        "Deferred rows the carry closed expired after 24 h, never asked (S7-D5).",
+        &per_source(&|row| row.carried.expired),
+    )?;
+    family(
+        out,
+        "newsvault_walk_range_unread_polls",
+        "Walked polls that read no walk range (section 11.2 range_unread).",
+        &per_source(&|row| row.walk.range_unread),
+    )?;
+    family(
+        out,
+        "newsvault_holds_capped",
+        "Answers whose Retry-After was cut to the 24 h ceiling (S7-D7).",
+        &report
+            .days
+            .iter()
+            .map(|day| {
+                (
+                    format!("days_ago=\"{}\"", days_ago(at, &day.run_date)),
+                    day.holds_capped.to_string(),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    family(
+        out,
+        "newsvault_check_findings",
+        "ledger --check findings per code; a code with none has no sample.",
+        &findings
+            .into_iter()
+            .map(|((code, ago), count)| {
+                (
+                    format!("code=\"{}\",days_ago=\"{ago}\"", label(code)),
+                    count.to_string(),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        render_prometheus, CarriedCounts, Check, ClockAge, DayRow, DeferredCounts, Finding,
+        Freshness, Report, SourceRow, WalkCounts, BUSY_BOUND, SCHEMA,
+    };
+    use chrono::{DateTime, Utc};
+
+    const AT: &str = "2026-11-18T10:00:00Z";
+    const SOURCE: &str = "open_web_wires";
+
+    fn day(run_date: &str, holds_capped: u32, host_held: i64, expired: i64, range: i64) -> DayRow {
+        let mut row = SourceRow::named(SOURCE);
+        row.deferred = DeferredCounts {
+            run_deadline: 101,
+            host_held,
+            follow_up_cap: 103,
+        };
+        row.carried = CarriedCounts {
+            answered: 104,
+            held: 105,
+            expired,
+        };
+        row.walk = WalkCounts {
+            range_unread: range,
+            id_unread: 106,
+            ..WalkCounts::default()
+        };
+        DayRow {
+            run_date: run_date.to_owned(),
+            runs_expected: 31,
+            runs_observed: 7,
+            runs_shortfall: 24,
+            runs_over_expected: 0,
+            runs_unfinished: Vec::new(),
+            runs_lease_held: 0,
+            wall_s: 0.0,
+            wall_share: 0.0,
+            busy: Vec::new(),
+            holds_capped,
+            per_source: vec![row],
+        }
+    }
+
+    fn finding(code: &'static str, run_date: &str) -> Finding {
+        Finding {
+            code,
+            run_date: run_date.to_owned(),
+            source: None,
+            detail: String::new(),
+        }
+    }
+
+    /// Every metric a value no other metric holds, so a family reading another's field is red.
+    #[test]
+    fn each_metric_carries_its_own_count_for_its_own_day() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let at: DateTime<Utc> = AT.parse()?;
+        let report = Report {
+            schema: SCHEMA,
+            at: AT.to_owned(),
+            from: "2026-11-17".to_owned(),
+            to: "2026-11-18".to_owned(),
+            source: None,
+            expected_runs: None,
+            limit: None,
+            days: vec![
+                day("2026-11-17", 2, 3, 5, 7),
+                day("2026-11-18", 11, 13, 17, 19),
+            ],
+            result_digest_drift: Vec::new(),
+            coverage: Vec::new(),
+            unreadable_runs: Vec::new(),
+            attempts_without_a_run_envelope: Vec::new(),
+            unpublished_seq_ranges: Vec::new(),
+            freshness: Freshness {
+                asking_clock: ClockAge {
+                    newest: Some("2026-11-18T09:59:37Z".to_owned()),
+                    age_seconds: Some(23),
+                },
+                publication_clock: ClockAge {
+                    newest: None,
+                    age_seconds: Some(29),
+                },
+            },
+            busy_bound: BUSY_BOUND,
+            matched: 2,
+            returned: 2,
+            truncated: false,
+            check: Check {
+                asked: true,
+                findings: vec![
+                    finding("runs_below_expected", "2026-11-17"),
+                    finding("runs_below_expected", "2026-11-18"),
+                    finding("host_busy_over_bound", "2026-11-18"),
+                    finding("host_busy_over_bound", "2026-11-18"),
+                    finding("coverage_incomplete", "2026-11"),
+                ],
+            },
+        };
+        let mut out = Vec::new();
+        render_prometheus(&report, at, &mut out)?;
+        let samples: Vec<String> = String::from_utf8(out)?
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(str::to_owned)
+            .collect();
+        let day = |ago: u8| format!("source=\"{SOURCE}\",days_ago=\"{ago}\"");
+        assert_eq!(
+            samples,
+            [
+                "newsvault_ledger_at_timestamp_seconds{schema=\"newsvault.prom/1\"} 1794996000"
+                    .to_owned(),
+                "newsvault_ledger_complete 1".to_owned(),
+                "newsvault_collect_last_asked_age_seconds 23".to_owned(),
+                format!("newsvault_deferred_host_held{{{}}} 3", day(1)),
+                format!("newsvault_deferred_host_held{{{}}} 13", day(0)),
+                format!("newsvault_carried_expired{{{}}} 5", day(1)),
+                format!("newsvault_carried_expired{{{}}} 17", day(0)),
+                format!("newsvault_walk_range_unread_polls{{{}}} 7", day(1)),
+                format!("newsvault_walk_range_unread_polls{{{}}} 19", day(0)),
+                "newsvault_holds_capped{days_ago=\"1\"} 2".to_owned(),
+                "newsvault_holds_capped{days_ago=\"0\"} 11".to_owned(),
+                "newsvault_check_findings{code=\"coverage_incomplete\",days_ago=\"unknown\"} 1"
+                    .to_owned(),
+                "newsvault_check_findings{code=\"host_busy_over_bound\",days_ago=\"0\"} 2"
+                    .to_owned(),
+                "newsvault_check_findings{code=\"runs_below_expected\",days_ago=\"0\"} 1"
+                    .to_owned(),
+                "newsvault_check_findings{code=\"runs_below_expected\",days_ago=\"1\"} 1"
+                    .to_owned(),
+            ]
+        );
+        Ok(())
+    }
+
+    /// An incomplete read is a 0, and a store no request reached has no age sample at all, so
+    /// the absence alert reads it instead of a made-up age.
+    #[test]
+    fn an_incomplete_read_is_zero_and_no_request_is_no_age_sample(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let at: DateTime<Utc> = AT.parse()?;
+        let report = Report {
+            schema: SCHEMA,
+            at: AT.to_owned(),
+            from: "2026-11-18".to_owned(),
+            to: "2026-11-18".to_owned(),
+            source: None,
+            expected_runs: None,
+            limit: None,
+            days: Vec::new(),
+            result_digest_drift: Vec::new(),
+            coverage: Vec::new(),
+            unreadable_runs: vec![super::Unreadable {
+                path: "runs/x.json".to_owned(),
+                code: "io_failed",
+            }],
+            attempts_without_a_run_envelope: Vec::new(),
+            unpublished_seq_ranges: Vec::new(),
+            freshness: Freshness {
+                asking_clock: ClockAge {
+                    newest: None,
+                    age_seconds: None,
+                },
+                publication_clock: ClockAge {
+                    newest: None,
+                    age_seconds: None,
+                },
+            },
+            busy_bound: BUSY_BOUND,
+            matched: 0,
+            returned: 0,
+            truncated: false,
+            check: Check {
+                asked: true,
+                findings: Vec::new(),
+            },
+        };
+        let mut out = Vec::new();
+        render_prometheus(&report, at, &mut out)?;
+        let text = String::from_utf8(out)?;
+        assert_eq!(
+            (
+                text.lines()
+                    .any(|line| line == "newsvault_ledger_complete 0"),
+                text.contains("newsvault_collect_last_asked_age_seconds"),
+            ),
+            (true, false)
+        );
+        Ok(())
+    }
+}

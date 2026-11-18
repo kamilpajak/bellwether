@@ -85,8 +85,9 @@ enum Command {
         /// Answer one question - is the coverage shortfall over its bound - and exit 1 for no.
         #[arg(long)]
         check: bool,
-        #[arg(long, value_enum, default_value_t = Format::Human)]
-        format: Format,
+        /// `prometheus` writes node-exporter textfile metrics (newsvault.prom/1) for the watchdog.
+        #[arg(long, value_enum, default_value_t = LedgerFormat::Human)]
+        format: LedgerFormat,
     },
     /// Exports every committed row no segment carries yet, one segment per publication day.
     Publish {
@@ -229,6 +230,14 @@ enum RobotsAction {
 enum Format {
     Human,
     Json,
+}
+
+/// The ledger alone has a third rendering: its counts as Prometheus textfile metrics.
+#[derive(Clone, Copy, ValueEnum)]
+enum LedgerFormat {
+    Human,
+    Json,
+    Prometheus,
 }
 
 /// `all` is the default on purpose: a default that silently collapses rows is R1's defect moved
@@ -414,7 +423,7 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 check,
             };
             let report = cmd_ledger::read(&vault_root(store), &ask)?;
-            emit_ledger(&report, format)?;
+            emit_ledger(&report, ask.at, format)?;
             Ok(if !report.is_complete() {
                 Verdict::No(EXIT_INCOMPLETE)
             } else if report.answer_is_no() {
@@ -795,15 +804,16 @@ fn stamped(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
-fn emit_ledger(report: &Report, format: Format) -> anyhow::Result<()> {
+fn emit_ledger(report: &Report, at: DateTime<Utc>, format: LedgerFormat) -> anyhow::Result<()> {
     let out = std::io::stdout();
     let mut out = out.lock();
     match format {
-        Format::Json => {
+        LedgerFormat::Json => {
             serde_json::to_writer_pretty(&mut out, report)?;
             writeln!(out)?;
         }
-        Format::Human => cmd_ledger::render_human(report, &mut out)?,
+        LedgerFormat::Human => cmd_ledger::render_human(report, &mut out)?,
+        LedgerFormat::Prometheus => cmd_ledger::render_prometheus(report, at, &mut out)?,
     }
     Ok(())
 }
@@ -971,9 +981,12 @@ fn print_schema(format: Format) {
                      "doc": "caps the rows within a day, never the number of days"},
                     {"name": "check", "type": "flag",
                      "doc": "exit 1 when the answer is no"},
-                    {"name": "format", "type": "enum", "values": ["human", "json"]}
+                    {"name": "format", "type": "enum", "values": ["human", "json", "prometheus"],
+                     "doc": "prometheus: node-exporter textfile metrics, schema newsvault.prom/1, \
+                             on stdout for the same exits 0, 1 and 8"}
                 ],
                 "output": cmd_ledger::SCHEMA,
+                "outputs": {"json": cmd_ledger::SCHEMA, "prometheus": cmd_ledger::PROMETHEUS_SCHEMA},
                 "mutates": false
             },
             {
