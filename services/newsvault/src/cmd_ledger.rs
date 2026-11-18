@@ -1501,13 +1501,19 @@ pub fn render_prometheus(
 #[cfg(test)]
 mod tests {
     use super::{
-        render_prometheus, CarriedCounts, Check, ClockAge, DayRow, DeferredCounts, Finding,
+        label, render_prometheus, CarriedCounts, Check, ClockAge, DayRow, DeferredCounts, Finding,
         Freshness, Report, SourceRow, WalkCounts, BUSY_BOUND, PROMETHEUS_FAMILIES, SCHEMA,
     };
     use chrono::{DateTime, Utc};
 
     const AT: &str = "2026-11-18T10:00:00Z";
     const SOURCE: &str = "open_web_wires";
+
+    /// The text format's three escapes in a label value; an unescaped `"` ends the value early.
+    #[test]
+    fn a_label_value_escapes_its_quote_backslash_and_newline() {
+        assert_eq!(label("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    }
 
     fn day(run_date: &str, holds_capped: u32, host_held: i64, expired: i64, range: i64) -> DayRow {
         let mut row = SourceRow::named(SOURCE);

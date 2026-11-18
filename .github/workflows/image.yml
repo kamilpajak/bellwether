@@ -27,6 +27,8 @@ jobs:
         run: docker run --rm --read-only --user 1000:1000 newsvault:ci schema --format json | jq -e '.schema == "newsvault.schema/1"'
       - name: the runtime SQLite is 3.45, the one CI's tests link
         run: docker run --rm --entrypoint dpkg-query newsvault:ci --showformat '${Version}' --show libsqlite3-0 | grep -E '^3\.45\.'
+      - name: the image runs as user 10001 under tini
+        run: docker inspect --format '{{.Config.User}} {{json .Config.Entrypoint}}' newsvault:ci | grep -Fx '10001 ["/usr/bin/tini","--","/usr/local/bin/newsvault"]'
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -57,6 +59,7 @@ jobs:
             --tag "$IMAGE:$GITHUB_REF_NAME" .
       - run: docker run --rm --read-only --user 1000:1000 "$IMAGE:$GITHUB_REF_NAME" schema --format json | jq -e '.schema == "newsvault.schema/1"'
       - run: docker run --rm --entrypoint dpkg-query "$IMAGE:$GITHUB_REF_NAME" --showformat '${Version}' --show libsqlite3-0 | grep -E '^3\.45\.'
+      - run: docker inspect --format '{{.Config.User}} {{json .Config.Entrypoint}}' "$IMAGE:$GITHUB_REF_NAME" | grep -Fx '10001 ["/usr/bin/tini","--","/usr/local/bin/newsvault"]'
       - env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s' "$TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin

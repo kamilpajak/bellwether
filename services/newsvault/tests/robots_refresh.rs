@@ -27,6 +27,7 @@ type TestResult = Result<(), Box<dyn Error>>;
 
 const SOURCE: &str = "open_web_wires";
 const CONTACT: &str = "bellwether collector contact@example.test";
+const CONTACT_ADDRESS: &str = "contact@example.test";
 const NOW: &str = "2026-11-15T10:00:00Z";
 const RUN_DAY: &str = "2026-11-15";
 const RUN_ID: &str = "robots-20261115T100000Z";
@@ -932,6 +933,35 @@ fn a_robots_refresh_dry_run_plans_one_url_per_row_and_writes_nothing() -> TestRe
             planned,
             false
         )
+    );
+    Ok(())
+}
+
+/// The refresh unit passes the contact only as a file: a dry run with only the `_FILE` twin set
+/// reads it and prints the address on neither stream.
+#[test]
+fn a_robots_refresh_reads_its_contact_from_the_file_variable() -> TestResult {
+    let root = TempDir::new()?;
+    let file = root.path().join("feed-contact");
+    std::fs::write(&file, format!("{CONTACT}\n"))?;
+    let output = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .args(["robots", "refresh", "--source", SOURCE, "--dry-run"])
+        .args(["--format", "json", "--non-interactive"])
+        .arg("--hosts")
+        .arg(two_row_hosts())
+        .arg("--rules")
+        .arg(provider_dir().join("rules/open-web-feed.rules.json"))
+        .arg("--store")
+        .arg(root.path().join("vault"))
+        .env_remove("BELLWETHER_FEED_CONTACT")
+        .env("BELLWETHER_FEED_CONTACT_FILE", &file)
+        .stdin(Stdio::null())
+        .output()?;
+    let printed = [&output.stdout, &output.stderr]
+        .map(|stream| String::from_utf8_lossy(stream).contains(CONTACT_ADDRESS));
+    assert_eq!(
+        (output.status.code(), printed),
+        (Some(EXIT_OK), [false, false])
     );
     Ok(())
 }

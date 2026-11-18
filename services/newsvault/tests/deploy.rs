@@ -5,8 +5,9 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
-use chrono::TimeDelta;
+use chrono::{DateTime, TimeDelta, Utc};
 use news_provider::Provider;
 use newsvault::cmd_ledger::PROMETHEUS_FAMILIES;
 use newsvault::schedule::{self, SLOTS};
@@ -28,6 +29,64 @@ const STORE_LOCK: &str =
 const UBUNTU_IMAGE: &str = "ARG UBUNTU=ubuntu:noble-";
 const UBUNTU_RUNNER: &str = "ubuntu-24.04";
 const WORKFLOWS: [&str; 3] = ["ci.yml", "image.yml", "deploy.yml"];
+/// Each workflow job that links or ships SQLite, and so checks it is 3.45.
+const SQLITE_JOBS: [(&str, &str); 3] = [
+    ("ci.yml", "check"),
+    ("image.yml", "build"),
+    ("image.yml", "publish"),
+];
+const SQLITE_CHECK: &str = r"--show libsqlite3-0 | grep -E '^3\.45\.'";
+/// Each validator `deploy.yml` runs, by job, as the tail of its `run` line.
+const VALIDATORS: [(&str, &str); 5] = [
+    (
+        "prometheus-rules",
+        "--entrypoint /bin/promtool \"$PROMETHEUS\" check rules newsvault.rules.yml",
+    ),
+    (
+        "prometheus-rules",
+        "--entrypoint /bin/promtool \"$PROMETHEUS\" test rules newsvault.rules.test.yml",
+    ),
+    (
+        "kubernetes-manifests",
+        "./kubeconform -strict -summary -kubernetes-version 1.34.12 deploy/k8s/",
+    ),
+    (
+        "systemd-units",
+        "run: shellcheck deploy/systemd/newsvault-watchdog",
+    ),
+    (
+        "systemd-units",
+        "systemd-analyze --user --man=no verify deploy/systemd/*.service deploy/systemd/*.timer",
+    ),
+];
+const IMAGE_IDENTITY: &str =
+    "docker inspect --format '{{.Config.User}} {{json .Config.Entrypoint}}'";
+const IMAGE_IDENTITY_EXPECTED: &str =
+    "| grep -Fx '10001 [\"/usr/bin/tini\",\"--\",\"/usr/local/bin/newsvault\"]'";
+const SERVICES: [&str; 3] = [
+    "newsvault-collect.service",
+    "newsvault-robots-refresh.service",
+    "newsvault-watchdog.service",
+];
+const ENV_FILE: &str = "%h/.config/bellwether/newsvault.env";
+/// systemd's `DefaultTimeoutStopSec`: the stop a start past its timeout is given before SIGKILL.
+const DEFAULT_TIMEOUT_STOP_S: i64 = 90;
+const NTP_CHECK: &str = "/bin/sh -c 'test \"$$(timedatectl show --property=NTPSynchronized \
+     --value)\" = yes || { echo \"the clock is not NTP-synchronised\" >&2; exit 1; }'";
+const TINI_COMMAND: &str = "command: [\"/usr/bin/tini\", \"-g\", \"--\", \"/bin/sh\", \"-c\"]";
+const WATCHDOG_DOCKER: &str = "/usr/bin/docker run";
+const PROM: &str = "newsvault.prom";
+const OLD_METRICS: &str = "newsvault_old 1\n";
+/// Stands in for docker: lists the textfile directory while its stdout is open, records its
+/// arguments one per line, and prints one sample naming its exit.
+const DOCKER_STUB: &str = r#"ls -a "$NEWSVAULT_TEXTFILE_DIR" >"$STUB_SEEN"
+printf '%s\n' "$@" >"$STUB_ARGS"
+printf 'newsvault_stub{exit="%s"} 1\n' "$STUB_EXIT"
+exit "$STUB_EXIT"
+"#;
+/// UTC+14, so a `date` without `-u` is 14 h from the UTC now.
+const FAR_ZONE: &str = "Pacific/Kiritimati";
+const AT_TOLERANCE_S: i64 = 600;
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -396,15 +455,463 @@ fn every_workflow_job_runs_on_the_images_ubuntu_release() -> TestResult {
             .collect();
         runners.push((workflow, used.into_iter().collect::<Vec<String>>()));
     }
+    let mut unchecked = Vec::new();
+    for (workflow, name) in SQLITE_JOBS {
+        let lines = job(&read(&format!(".github/workflows/{workflow}"))?, name);
+        if !lines.iter().any(|line| line.ends_with(SQLITE_CHECK)) {
+            unchecked.push(format!("{workflow} {name}"));
+        }
+    }
     assert_eq!(
-        (runners, read("Dockerfile")?.contains(UBUNTU_IMAGE)),
+        (
+            runners,
+            read("Dockerfile")?.contains(UBUNTU_IMAGE),
+            unchecked
+        ),
         (
             WORKFLOWS
                 .iter()
                 .map(|workflow| (*workflow, vec![UBUNTU_RUNNER.to_owned()]))
                 .collect::<Vec<_>>(),
+            true,
+            Vec::<String>::new()
+        )
+    );
+    Ok(())
+}
+
+/// Each line trimmed, comment lines dropped.
+fn trimmed(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether `lines` holds `run` as consecutive lines.
+fn holds(lines: &[String], run: &[&str]) -> bool {
+    lines.windows(run.len()).any(|window| window == run)
+}
+
+/// One workflow job's lines, trimmed, from its `  name:` header to the next job.
+fn job(workflow: &str, name: &str) -> Vec<String> {
+    let header = format!("  {name}:");
+    let body: Vec<&str> = workflow
+        .lines()
+        .skip_while(|line| *line != header)
+        .skip(1)
+        .take_while(|line| line.is_empty() || line.starts_with("   "))
+        .collect();
+    trimmed(&body.join("\n"))
+}
+
+/// The lines under one top-level key of a workflow, trimmed.
+fn top_level(workflow: &str, key: &str) -> Vec<String> {
+    let header = format!("{key}:");
+    workflow
+        .lines()
+        .skip_while(|line| *line != header)
+        .skip(1)
+        .take_while(|line| line.starts_with(' '))
+        .map(|line| line.trim().to_owned())
+        .collect()
+}
+
+/// `deploy.yml` runs each tool on the file it checks; a dropped step or flag is red here.
+#[test]
+fn the_deploy_workflow_runs_each_validator_on_its_file() -> TestResult {
+    let deploy = read(".github/workflows/deploy.yml")?;
+    let missing: Vec<&str> = VALIDATORS
+        .iter()
+        .filter(|(name, command)| {
+            !job(&deploy, name)
+                .iter()
+                .any(|line| line.ends_with(command))
+        })
+        .map(|(_, command)| *command)
+        .collect();
+    assert_eq!(missing, Vec::<&str>::new());
+    Ok(())
+}
+
+/// Only a `v*` tag on a commit of main with a green `ci.yml` run publishes, and only that job
+/// holds `packages: write`.
+#[test]
+fn only_a_tag_on_a_green_main_commit_publishes_and_only_that_job_writes_packages() -> TestResult {
+    let image = read(".github/workflows/image.yml")?;
+    let publish = job(&image, "publish");
+    assert_eq!(
+        (
+            top_level(&image, "permissions"),
+            publish.first().cloned(),
+            image.matches("packages: write").count(),
+            publish.contains(&"packages: write".to_owned()),
+            holds(
+                &publish,
+                &[
+                    "run: |",
+                    "git merge-base --is-ancestor \"$GITHUB_SHA\" origin/main",
+                    "green=$(gh api \"repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?\
+                     head_sha=$GITHUB_SHA&status=success\" --jq '.total_count')",
+                    "test \"$green\" -gt 0",
+                ]
+            ),
+            trimmed(&image).contains(&"tags: [\"v*\"]".to_owned()),
+        ),
+        (
+            vec!["contents: read".to_owned()],
+            Some("if: startsWith(github.ref, 'refs/tags/v')".to_owned()),
+            1,
+            true,
+            true,
             true
         )
+    );
+    Ok(())
+}
+
+/// The Dockerfile's user and entrypoint, and each image job reading both back from the built
+/// image; that reading runs only in CI.
+#[test]
+fn the_image_runs_as_user_10001_under_tini() -> TestResult {
+    let dockerfile = trimmed(&read("Dockerfile")?);
+    let image = read(".github/workflows/image.yml")?;
+    let read_back: Vec<bool> = ["build", "publish"]
+        .iter()
+        .map(|name| {
+            job(&image, name).iter().any(|line| {
+                line.contains(IMAGE_IDENTITY) && line.ends_with(IMAGE_IDENTITY_EXPECTED)
+            })
+        })
+        .collect();
+    assert_eq!(
+        (
+            dockerfile.contains(&"USER 10001".to_owned()),
+            dockerfile.contains(
+                &"ENTRYPOINT [\"/usr/bin/tini\", \"--\", \"/usr/local/bin/newsvault\"]".to_owned()
+            ),
+            read_back,
+        ),
+        (true, true, vec![true, true])
+    );
+    Ok(())
+}
+
+/// A `simple` unit counts as started once its process forks, so `TimeoutStartSec` would bound
+/// nothing; each unit reads the one env file.
+#[test]
+fn every_service_is_a_oneshot_reading_the_env_file() -> TestResult {
+    let mut seen = Vec::new();
+    for service in SERVICES {
+        let unit = read(&format!("deploy/systemd/{service}"))?;
+        seen.push((
+            service,
+            unit_values(&unit, "Type"),
+            unit_values(&unit, "EnvironmentFile"),
+        ));
+    }
+    assert_eq!(
+        seen,
+        SERVICES
+            .map(|service| (
+                service,
+                vec!["oneshot".to_owned()],
+                vec![ENV_FILE.to_owned()]
+            ))
+            .to_vec()
+    );
+    Ok(())
+}
+
+/// A hung read is stopped, its stop timeout included, before the next hourly firing, which a
+/// still-active unit would swallow.
+#[test]
+fn a_hung_watchdog_is_stopped_before_its_next_firing() -> TestResult {
+    let unit = read("deploy/systemd/newsvault-watchdog.service")?;
+    let bounded: Vec<bool> = integers(&unit_values(&unit, "TimeoutStartSec"))
+        .iter()
+        .map(|start| start + DEFAULT_TIMEOUT_STOP_S < WATCHDOG_INTERVAL_S)
+        .collect();
+    assert_eq!(bounded, vec![true]);
+    Ok(())
+}
+
+#[test]
+fn each_timer_starts_its_own_service() -> TestResult {
+    let mut started = Vec::new();
+    for timer in ["newsvault-collect.timer", "newsvault-watchdog.timer"] {
+        let unit = read(&format!("deploy/systemd/{timer}"))?;
+        started.push((timer, unit_values(&unit, "Unit")));
+    }
+    assert_eq!(
+        started,
+        vec![
+            (
+                "newsvault-collect.timer",
+                vec!["newsvault-collect.service".to_owned()]
+            ),
+            (
+                "newsvault-watchdog.timer",
+                vec!["newsvault-watchdog.service".to_owned()]
+            ),
+        ]
+    );
+    Ok(())
+}
+
+/// The container's flags word for word; the refresh unit is held to the same words by
+/// `the_collect_and_refresh_units_share_one_lock_and_one_container_shape`.
+#[test]
+fn the_collect_container_is_removed_read_only_unprivileged_and_never_pulled() -> TestResult {
+    let (shape, _) = container_shape(&read("deploy/systemd/newsvault-collect.service")?);
+    let expected = format!(
+        "{STORE_LOCK} /usr/bin/docker run --rm --name <name> --pull never --user %U:%G \
+         --read-only --tmpfs /tmp:rw,size=16m --cap-drop ALL --security-opt no-new-privileges \
+         --mount type=bind,src=%h/.bellwether/vault,dst=/vault {CONTACT_MOUNT} \
+         --env BELLWETHER_FEED_CONTACT_FILE=/run/secrets/feed-contact"
+    );
+    assert_eq!(shape.join(" "), expected);
+    Ok(())
+}
+
+/// A timed-out run's container is removed by the name it runs under, and a collect starts only
+/// on an NTP-synchronised clock.
+#[test]
+fn a_timed_out_container_is_removed_by_its_own_name_and_a_collect_needs_a_synced_clock(
+) -> TestResult {
+    let mut removals = Vec::new();
+    let mut expected = Vec::new();
+    for service in [
+        "newsvault-collect.service",
+        "newsvault-robots-refresh.service",
+    ] {
+        let unit = read(&format!("deploy/systemd/{service}"))?;
+        let name = container_shape(&unit).1.unwrap_or_default();
+        removals.push((service, unit_values(&unit, "ExecStopPost")));
+        expected.push((
+            service,
+            vec![format!(
+                "/bin/sh -c 'if [ \"$$SERVICE_RESULT\" = timeout ]; then /usr/bin/docker rm \
+                 --force {name}; fi'"
+            )],
+        ));
+    }
+    let collect = read("deploy/systemd/newsvault-collect.service")?;
+    assert_eq!(
+        (removals, unit_values(&collect, "ExecStartPre")),
+        (expected, vec![NTP_CHECK.to_owned()])
+    );
+    Ok(())
+}
+
+/// The words after `${NEWSVAULT_IMAGE}` in a unit's `ExecStart`.
+fn container_args(unit: &str) -> Vec<String> {
+    unit_values(unit, "ExecStart")
+        .join(" ")
+        .split(' ')
+        .skip_while(|word| *word != "${NEWSVAULT_IMAGE}")
+        .skip(1)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Each Kubernetes job's `newsvault` arguments, the binary's path dropped.
+fn job_args(jobs: &str) -> Vec<Vec<String>> {
+    job_templates(jobs)
+        .iter()
+        .map(|template| {
+            let mut words = Vec::new();
+            let mut open = false;
+            for line in template.lines().map(str::trim) {
+                open = open || line.starts_with("/usr/local/bin/newsvault ");
+                if open {
+                    words.extend(
+                        line.trim_end_matches('\\')
+                            .split_whitespace()
+                            .map(str::to_owned),
+                    );
+                    if !line.ends_with('\\') {
+                        break;
+                    }
+                }
+            }
+            words.into_iter().skip(1).collect()
+        })
+        .collect()
+}
+
+/// The systemd collect and both Kubernetes jobs ask one `collect`, from one env file.
+#[test]
+fn the_collect_unit_asks_what_each_kubernetes_job_asks() -> TestResult {
+    let args = container_args(&read("deploy/systemd/newsvault-collect.service")?);
+    assert_eq!(
+        (
+            args.first().cloned(),
+            job_args(&read("deploy/k8s/newsvault-collect.yaml")?)
+        ),
+        (Some("collect".to_owned()), vec![args.clone(); 2])
+    );
+    Ok(())
+}
+
+/// Each CronJob by value: no overlap, no retry, no restart, exit 8 mapped to 0 under `tini -g`,
+/// exits 2, 4 and 7 named on the container that runs, a read-only root and secret, no capability.
+#[test]
+fn each_kubernetes_job_maps_exit_8_to_0_and_holds_its_limits() -> TestResult {
+    let jobs = read("deploy/k8s/newsvault-collect.yaml")?;
+    let mut missing = Vec::new();
+    for document in jobs
+        .split("\n---\n")
+        .filter(|document| document.contains("kind: CronJob"))
+    {
+        let lines = trimmed(document);
+        let container = lines
+            .iter()
+            .skip_while(|line| *line != "containers:")
+            .nth(1)
+            .and_then(|line| line.strip_prefix("- name: "))
+            .unwrap_or_default();
+        let named = format!("containerName: {container}");
+        let runs: [&[&str]; 10] = [
+            &["concurrencyPolicy: Forbid"],
+            &["startingDeadlineSeconds: 60"],
+            &["backoffLimit: 0"],
+            &["restartPolicy: Never"],
+            &[TINI_COMMAND],
+            &[
+                "status=$?",
+                "if [ \"$status\" -eq 8 ]; then exit 0; fi",
+                "exit \"$status\"",
+            ],
+            &[
+                "podFailurePolicy:",
+                "rules:",
+                "- action: FailJob",
+                "onExitCodes:",
+                &named,
+                "operator: In",
+                "values: [2, 4, 7]",
+            ],
+            &["readOnlyRootFilesystem: true"],
+            &["capabilities:", "drop: [ALL]"],
+            &[
+                "- name: feed-contact",
+                "mountPath: /run/secrets/bellwether",
+                "readOnly: true",
+            ],
+        ];
+        missing.push(
+            runs.iter()
+                .filter(|run| !holds(&lines, run))
+                .map(|run| run.join(" / "))
+                .collect::<Vec<String>>(),
+        );
+    }
+    assert_eq!(missing, vec![Vec::<String>::new(); 2]);
+    Ok(())
+}
+
+/// One run of the watchdog script, its docker replaced by `DOCKER_STUB` exiting `status`.
+struct Watched {
+    exit: Option<i32>,
+    files: Vec<String>,
+    prom: String,
+    tmp: Vec<String>,
+    at: Option<String>,
+}
+
+fn watch(status: i32) -> Result<Watched, Box<dyn Error>> {
+    let work = tempfile::TempDir::new()?;
+    let textfile = work.path().join("textfile");
+    std::fs::create_dir(&textfile)?;
+    std::fs::write(textfile.join(PROM), OLD_METRICS)?;
+    let stub = work.path().join("docker");
+    let (seen, args, script) = (
+        work.path().join("seen"),
+        work.path().join("args"),
+        work.path().join("watchdog"),
+    );
+    std::fs::write(&stub, DOCKER_STUB)?;
+    let text = read("deploy/systemd/newsvault-watchdog")?;
+    if text.matches(WATCHDOG_DOCKER).count() != 1 {
+        return Err(format!("the watchdog runs `{WATCHDOG_DOCKER}` once").into());
+    }
+    let stubbed = format!("/bin/sh '{}' run", stub.display());
+    std::fs::write(&script, text.replace(WATCHDOG_DOCKER, &stubbed))?;
+    let output = Command::new("/bin/sh")
+        .arg(&script)
+        .env("NEWSVAULT_IMAGE", "newsvault:test")
+        .env("NEWSVAULT_TEXTFILE_DIR", &textfile)
+        .env("STUB_EXIT", status.to_string())
+        .env("STUB_SEEN", &seen)
+        .env("STUB_ARGS", &args)
+        .env("TZ", FAR_ZONE)
+        .stdin(Stdio::null())
+        .output()?;
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&textfile)? {
+        files.push(entry?.file_name().to_string_lossy().into_owned());
+    }
+    files.sort();
+    let tmp = std::fs::read_to_string(&seen)?
+        .lines()
+        .filter(|name| ![".", "..", PROM].contains(name))
+        .map(str::to_owned)
+        .collect();
+    let at = std::fs::read_to_string(&args)?
+        .lines()
+        .skip_while(|word| *word != "--at")
+        .nth(1)
+        .map(str::to_owned);
+    Ok(Watched {
+        exit: output.status.code(),
+        files,
+        prom: std::fs::read_to_string(textfile.join(PROM))?,
+        tmp,
+        at,
+    })
+}
+
+/// The ledger's 0, 1 and 8 replace `newsvault.prom` with what it printed through one hidden
+/// non-`.prom` file beside it, which the collector never reads; any other exit leaves the last
+/// file and no temporary one.
+#[test]
+fn the_watchdog_renames_a_hidden_file_for_0_1_and_8_and_keeps_the_last_file_otherwise() -> TestResult
+{
+    let mut got = Vec::new();
+    let mut expected = Vec::new();
+    for status in [0, 1, 8, 2] {
+        let watched = watch(status)?;
+        let hidden: Vec<bool> = watched
+            .tmp
+            .iter()
+            .map(|name| name.starts_with('.') && !name.ends_with(".prom"))
+            .collect();
+        got.push((status, watched.exit, watched.files, watched.prom, hidden));
+        let (exit, prom) = if status == 2 {
+            (Some(2), OLD_METRICS.to_owned())
+        } else {
+            (Some(0), format!("newsvault_stub{{exit=\"{status}\"}} 1\n"))
+        };
+        expected.push((status, exit, vec![PROM.to_owned()], prom, vec![true]));
+    }
+    assert_eq!(got, expected);
+    Ok(())
+}
+
+/// `--at` is the UTC now on a host 14 h ahead of UTC.
+#[test]
+fn the_watchdog_reads_at_the_utc_now_whatever_the_hosts_zone() -> TestResult {
+    let watched = watch(0)?;
+    let off = match watched.at.as_deref().map(DateTime::parse_from_rfc3339) {
+        Some(Ok(at)) => Some((Utc::now() - at.with_timezone(&Utc)).num_seconds().abs()),
+        _ => None,
+    };
+    assert!(
+        off.is_some_and(|off| off < AT_TOLERANCE_S),
+        "{:?}",
+        watched.at
     );
     Ok(())
 }
