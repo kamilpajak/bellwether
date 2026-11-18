@@ -18,7 +18,7 @@ use crate::store::{
     coverage_up_to, newest_visible_publication, require_current_version, unpublished_seq_ranges,
     SeqRange, WindowCoverage, COMMIT_LOG, RUNS_DIR,
 };
-use news_provider::DeferReason;
+use news_provider::{Closing, DeferReason};
 use open_web_feed::Continuity;
 
 pub const SCHEMA: &str = "newsvault.ledger/1";
@@ -43,6 +43,8 @@ const ROWS_ZERO_AGAINST_VENDOR_ROWS: &str = "rows_committed_zero_against_vendor_
 const COVERAGE_INCOMPLETE: &str = "coverage_incomplete";
 const WALL_TIME_OVER_BOUND: &str = "wall_time_over_bound";
 const HOST_BUSY_OVER_BOUND: &str = "host_busy_over_bound";
+/// S7-D8 (owner, 2026-11-17): a deferred document the carry closed after 24 h, never asked.
+const DEFERRED_EXPIRED: &str = "deferred_expired";
 
 /// Codes from architecture.md section 5.1, used for a run envelope the reader could not take.
 const INPUT_UNPARSEABLE: &str = "input_unparseable";
@@ -183,6 +185,9 @@ pub struct SourceRow {
     pub walk: WalkCounts,
     /// S7-D4: requests the source's runs did not ask, from `deferred`, one count per reason.
     pub deferred: DeferredCounts,
+    /// S7-D5: `deferred` rows the source's runs closed, from `deferred_closed`, one count per
+    /// `news_provider::Closing`; a row counts on the day of the run that closed it.
+    pub carried: CarriedCounts,
     pub items_new: i64,
     pub rows_committed: i64,
 }
@@ -263,6 +268,24 @@ impl DeferredCounts {
             run_deadline: self.run_deadline + other.run_deadline,
             host_held: self.host_held + other.host_held,
             follow_up_cap: self.follow_up_cap + other.follow_up_cap,
+        }
+    }
+}
+
+/// One count per `news_provider::Closing` name.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct CarriedCounts {
+    pub answered: i64,
+    pub held: i64,
+    pub expired: i64,
+}
+
+impl CarriedCounts {
+    const fn add(self, other: Self) -> Self {
+        Self {
+            answered: self.answered + other.answered,
+            held: self.held + other.held,
+            expired: self.expired + other.expired,
         }
     }
 }
@@ -366,6 +389,10 @@ pub struct Envelope {
     pub schema: String,
     pub run_id: String,
     pub run_date: NaiveDate,
+    /// The source a `collect` run asked, which `--source` filters busy time by; absent in a file
+    /// written before 2026-11-18 and in a robots refresh's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub expected_runs: u32,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -456,6 +483,7 @@ pub fn read(root: &Path, ask: &Ask) -> Result<Report, LedgerReadError> {
     let in_flight = in_flight_attempts(&db, &at)?;
     let answers = answers_per_attempt(&db, &at)?;
     let deferred = deferred_per_run(&db, &at)?;
+    let carried = carried_per_run(&db, &at)?;
     let known_runs: BTreeSet<&str> = envelopes.iter().map(|run| run.run_id.as_str()).collect();
     let attempts_without_a_run_envelope = orphans(&db, &at, &known_runs)?;
     // Indexed by run once rather than scanned per day: a year at the measured cadence is about
@@ -464,6 +492,7 @@ pub fn read(root: &Path, ask: &Ask) -> Result<Report, LedgerReadError> {
     let in_flight = by_run(&in_flight, |row| &row.0);
     let answers_by_run = by_run(&answers, |row| &row.run_id);
     let deferred = by_run(&deferred, |row| &row.run_id);
+    let carried = by_run(&carried, |row| &row.run_id);
 
     let mut days = Vec::new();
     let mut matched = 0;
@@ -475,6 +504,7 @@ pub fn read(root: &Path, ask: &Ask) -> Result<Report, LedgerReadError> {
             in_flight: &in_flight,
             answers: &answers_by_run,
             deferred: &deferred,
+            carried: &carried,
         };
         let mut row = day_row(date, &envelopes, &read, ask);
         matched += row.per_source.len();
@@ -710,6 +740,38 @@ fn deferred_per_run(db: &Connection, at: &str) -> Result<Vec<DeferredGroup>, Led
     Ok(rows)
 }
 
+/// One run's `deferred_closed` rows of one source, counted per `Closing`.
+struct CarriedGroup {
+    run_id: String,
+    source: String,
+    counts: CarriedCounts,
+}
+
+fn carried_per_run(db: &Connection, at: &str) -> Result<Vec<CarriedGroup>, LedgerReadError> {
+    let [answered, held, expired] = Closing::NAMES;
+    let mut statement = db.prepare(
+        "SELECT c.run_id, d.source, SUM(c.closed_as = ?2), SUM(c.closed_as = ?3),
+                SUM(c.closed_as = ?4)
+           FROM deferred_closed c JOIN deferred d ON d.deferred_id = c.deferred_id
+          WHERE c.closed_at <= ?1
+          GROUP BY c.run_id, d.source ORDER BY c.run_id, d.source",
+    )?;
+    let rows = statement
+        .query_map(params![at, answered, held, expired], |row| {
+            Ok(CarriedGroup {
+                run_id: row.get(0)?,
+                source: row.get(1)?,
+                counts: CarriedCounts {
+                    answered: row.get(2)?,
+                    held: row.get(3)?,
+                    expired: row.get(4)?,
+                },
+            })
+        })?
+        .collect::<Result<Vec<CarriedGroup>, _>>()?;
+    Ok(rows)
+}
+
 /// `(run_id, source, attempt_id, answered)` for one attempt with no `Finalised` row.
 type InFlightRow = (String, String, String, bool);
 type InFlight = Vec<InFlightRow>;
@@ -848,6 +910,7 @@ struct Read<'a> {
     in_flight: &'a BTreeMap<&'a str, Vec<&'a InFlightRow>>,
     answers: &'a BTreeMap<&'a str, Vec<&'a Answered>>,
     deferred: &'a BTreeMap<&'a str, Vec<&'a DeferredGroup>>,
+    carried: &'a BTreeMap<&'a str, Vec<&'a CarriedGroup>>,
 }
 
 fn day_row(date: NaiveDate, envelopes: &[Envelope], read: &Read, ask: &Ask) -> DayRow {
@@ -855,16 +918,21 @@ fn day_row(date: NaiveDate, envelopes: &[Envelope], read: &Read, ask: &Ask) -> D
         .iter()
         .filter(|envelope| envelope.run_date == date && envelope.kind.is_collect())
         .partition(|envelope| envelope.refused.as_deref() == Some(LEASE_HELD));
+    // Under `--source`, a run file naming another source or none adds no busy time (answer 6).
+    let timed: Vec<&&Envelope> = today
+        .iter()
+        .filter(|envelope| ask.source.is_none() || envelope.source == ask.source)
+        .collect();
     // `sum` of no f64 is -0.0, printed `-0.0` (measured 2026-11-18 on the golden ledger file).
-    let wall_s = today
+    let wall_s = timed
         .iter()
         .filter_map(|envelope| envelope.wall_s)
         .fold(0.0, |total, run| total + run);
     let mut busy: BTreeMap<Option<String>, f64> = BTreeMap::new();
-    for lane in today.iter().flat_map(|envelope| &envelope.busy) {
+    for lane in timed.iter().flat_map(|envelope| &envelope.busy) {
         *busy.entry(lane.host.clone()).or_default() += lane.busy_s;
     }
-    let holds_capped = today
+    let holds_capped = timed
         .iter()
         .map(|envelope| envelope.holds_capped.len())
         .sum::<usize>();
@@ -937,6 +1005,15 @@ fn day_row(date: NaiveDate, envelopes: &[Envelope], read: &Read, ask: &Ask) -> D
             .or_insert_with(|| SourceRow::named(&group.source));
         row.deferred = row.deferred.add(group.counts);
     }
+    for group in of_the_day(read.carried, &runs) {
+        if !ask.wants(&group.source) {
+            continue;
+        }
+        let row = by_source
+            .entry(group.source.clone())
+            .or_insert_with(|| SourceRow::named(&group.source));
+        row.carried = row.carried.add(group.counts);
+    }
     DayRow {
         run_date: date.to_string(),
         runs_expected: expected,
@@ -993,6 +1070,7 @@ impl SourceRow {
             boundaries: BoundaryCounts::default(),
             walk: WalkCounts::default(),
             deferred: DeferredCounts::default(),
+            carried: CarriedCounts::default(),
             items_new: 0,
             rows_committed: 0,
         }
@@ -1040,6 +1118,17 @@ fn findings_for(day: &DayRow) -> Vec<Finding> {
                 run_date: day.run_date.clone(),
                 source: Some(row.source.clone()),
                 detail: format!("{} failed, {} interrupted", row.failed, row.interrupted),
+            });
+        }
+        if row.carried.expired > 0 {
+            findings.push(Finding {
+                code: DEFERRED_EXPIRED,
+                run_date: day.run_date.clone(),
+                source: Some(row.source.clone()),
+                detail: format!(
+                    "{} deferred row(s) closed expired, never asked",
+                    row.carried.expired
+                ),
             });
         }
         if row.rows_committed == 0 && row.vendor_rows - row.held > 0 {
@@ -1137,6 +1226,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                  boundary_generation_unknown {} walk_complete {} walk_first_poll {} \
                  walk_id_unread {} walk_range_unread {} walk_gone {} walk_other_language {} walk_unread {} \
                  deferred_run_deadline {} deferred_host_held {} deferred_follow_up_cap {} \
+                 carried_answered {} carried_held {} carried_expired {} \
                  items_new {} rows {}",
                 row.source,
                 row.ok,
@@ -1170,6 +1260,9 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 row.deferred.run_deadline,
                 row.deferred.host_held,
                 row.deferred.follow_up_cap,
+                row.carried.answered,
+                row.carried.held,
+                row.carried.expired,
                 row.items_new,
                 row.rows_committed
             )?;

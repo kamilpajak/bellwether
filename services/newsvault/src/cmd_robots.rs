@@ -246,6 +246,7 @@ pub fn run(
         schema: RUN_ENVELOPE_SCHEMA.to_owned(),
         run_id: run_id.clone(),
         run_date: started.date_naive(),
+        source: None,
         expected_runs: 0,
         started_at: started,
         finished_at: None,

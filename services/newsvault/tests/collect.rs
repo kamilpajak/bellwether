@@ -350,6 +350,22 @@ impl Archive for Refusing {
     fn record_deferred(&mut self, deferred: &news_provider::Deferred) -> Result<(), ArchiveError> {
         Archive::record_deferred(&mut self.store, deferred)
     }
+
+    fn open_deferred(
+        &self,
+        source: &SourceId,
+    ) -> Result<Vec<news_provider::OpenDeferred>, ArchiveError> {
+        Archive::open_deferred(&self.store, source)
+    }
+
+    fn close_deferred(
+        &mut self,
+        deferred_ids: &[i64],
+        closing: &news_provider::Closing,
+        at: ObservationTime,
+    ) -> Result<(), ArchiveError> {
+        Archive::close_deferred(&mut self.store, deferred_ids, closing, at)
+    }
 }
 
 /// One run through the library, with the exchange the caller chose (static `Payloads` or a
@@ -858,6 +874,22 @@ impl Archive for Untouched {
 
     fn record_deferred(&mut self, _deferred: &news_provider::Deferred) -> Result<(), ArchiveError> {
         Err(self.touched("record_deferred"))
+    }
+
+    fn open_deferred(
+        &self,
+        _source: &SourceId,
+    ) -> Result<Vec<news_provider::OpenDeferred>, ArchiveError> {
+        Err(self.touched("open_deferred"))
+    }
+
+    fn close_deferred(
+        &mut self,
+        _deferred_ids: &[i64],
+        _closing: &news_provider::Closing,
+        _at: ObservationTime,
+    ) -> Result<(), ArchiveError> {
+        Err(self.touched("close_deferred"))
     }
 }
 

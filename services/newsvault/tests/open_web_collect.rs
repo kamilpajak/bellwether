@@ -3254,6 +3254,22 @@ impl Archive for RefusingTheIndex {
     fn record_deferred(&mut self, deferred: &news_provider::Deferred) -> Result<(), ArchiveError> {
         Archive::record_deferred(&mut self.store, deferred)
     }
+
+    fn open_deferred(
+        &self,
+        source: &SourceId,
+    ) -> Result<Vec<news_provider::OpenDeferred>, ArchiveError> {
+        Archive::open_deferred(&self.store, source)
+    }
+
+    fn close_deferred(
+        &mut self,
+        deferred_ids: &[i64],
+        closing: &news_provider::Closing,
+        at: ObservationTime,
+    ) -> Result<(), ArchiveError> {
+        Archive::close_deferred(&mut self.store, deferred_ids, closing, at)
+    }
 }
 
 /// Section 3.2 `held`: an index whose commit the store refused stays open with no `vendor_rows`,
@@ -4109,8 +4125,25 @@ fn an_unreadable_stored_header_text_is_store_unreadable_and_records_no_continuit
     Ok(())
 }
 
-/// The table `MIGRATIONS[12]` adds, which a v12 store lacks.
-const DEFERRED_TABLE: &str = "DROP TABLE deferred;";
+/// The table `MIGRATIONS[13]` adds, which a v13 store lacks, and `deferred` as a v13 store holds
+/// it, with no `deferred_id`.
+const CLOSED_TABLE: &str = "DROP TABLE deferred_closed;";
+const V13_DEFERRED: &str = "DROP TABLE deferred;
+     CREATE TABLE deferred (
+         run_id        TEXT NOT NULL,
+         source        TEXT NOT NULL,
+         target_window TEXT NOT NULL,
+         host          TEXT,
+         url           TEXT NOT NULL,
+         phase         TEXT NOT NULL CHECK (phase IN ('index', 'document')),
+         story_id      TEXT,
+         listed_date   TEXT,
+         reason        TEXT NOT NULL
+             CHECK (reason IN ('run_deadline', 'host_held', 'follow_up_cap')),
+         deferred_at   TEXT NOT NULL
+     );";
+/// The tables `MIGRATIONS[12]` and `MIGRATIONS[13]` add, which a v12 store lacks.
+const DEFERRED_TABLE: &str = "DROP TABLE deferred_closed; DROP TABLE deferred;";
 /// The columns `MIGRATIONS[11]` adds, which a v11 store lacks.
 const WALK_COLUMNS: &str = "ALTER TABLE attempts DROP COLUMN walk_through;
      ALTER TABLE attempts DROP COLUMN walk_gone;
@@ -4125,7 +4158,7 @@ const BOUNDARY_COLUMNS: &str = "ALTER TABLE attempts DROP COLUMN boundary_same_g
 /// The first run over an older store reads that store's basis: `basis_pages` runs before the run
 /// migrates it. Review 2026-11-17: a v11 build over a v10 store read none and recorded `first_poll`.
 #[test]
-fn a_v10_v11_or_v12_store_keeps_its_basis_for_the_run_that_migrates_it() -> TestResult {
+fn a_v10_to_v13_store_keeps_its_basis_for_the_run_that_migrates_it() -> TestResult {
     let mut kept = Vec::new();
     for (version, dropped) in [
         (
@@ -4134,6 +4167,7 @@ fn a_v10_v11_or_v12_store_keeps_its_basis_for_the_run_that_migrates_it() -> Test
         ),
         (11, format!("{DEFERRED_TABLE}{WALK_COLUMNS}")),
         (12, DEFERRED_TABLE.to_owned()),
+        (13, format!("{CLOSED_TABLE}{V13_DEFERRED}")),
     ] {
         let root = TempDir::new()?;
         seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
@@ -4152,7 +4186,7 @@ fn a_v10_v11_or_v12_store_keeps_its_basis_for_the_run_that_migrates_it() -> Test
         )?;
         kept.push(poll_continuity(&second));
     }
-    assert_eq!(kept, vec![(vec![1], Some("complete".to_owned())); 3]);
+    assert_eq!(kept, vec![(vec![1], Some("complete".to_owned())); 4]);
     Ok(())
 }
 
@@ -4911,6 +4945,22 @@ impl Archive for HoldingToo {
     fn record_deferred(&mut self, deferred: &news_provider::Deferred) -> Result<(), ArchiveError> {
         Archive::record_deferred(&mut self.store, deferred)
     }
+
+    fn open_deferred(
+        &self,
+        source: &SourceId,
+    ) -> Result<Vec<news_provider::OpenDeferred>, ArchiveError> {
+        Archive::open_deferred(&self.store, source)
+    }
+
+    fn close_deferred(
+        &mut self,
+        deferred_ids: &[i64],
+        closing: &news_provider::Closing,
+        at: ObservationTime,
+    ) -> Result<(), ArchiveError> {
+        Archive::close_deferred(&mut self.store, deferred_ids, closing, at)
+    }
 }
 
 /// The driver drops a walked id whose story became held after `open_provider` read the answered
@@ -4986,8 +5036,26 @@ type CappedRun = (TempDir, cmd_collect::Answer, Gnw, Vec<String>);
 /// The committed five hosts on Monday on a fresh store, CNW's sitemap listing `extra` more
 /// releases, each answered with a kept CNW page.
 fn capped_run(extra: usize) -> Result<CappedRun, Box<dyn Error>> {
+    capped_run_carrying(extra, &[])
+}
+
+/// [`capped_run`] over a store holding one open `document` row per `(url, listed_date)`,
+/// deferred an hour before `MONDAY_AT` (S7-D5).
+fn capped_run_carrying(
+    extra: usize,
+    carried: &[(&str, Option<&str>)],
+) -> Result<CappedRun, Box<dyn Error>> {
     let root = TempDir::new()?;
     seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    for (url, listed) in carried {
+        an_open_row(
+            root.path(),
+            url,
+            None,
+            *listed,
+            instant(MONDAY_AT) - TimeDelta::hours(1),
+        )?;
+    }
     let (sitemap, urls) = cnw_sitemap_with(extra)?;
     let mut exchange = Gnw::five_hosts()?;
     exchange.pages.insert(CNW_INDEX.to_owned(), sitemap);
@@ -5482,7 +5550,7 @@ fn deferred_requests_open_no_attempt_and_every_reader_counts_each_reason_apart()
     let ledger_line = ledger_human
         .lines()
         .find_map(|line| line.split_once("deferred_run_deadline"))
-        .and_then(|(_, rest)| rest.split_once(" items_new"))
+        .and_then(|(_, rest)| rest.split_once(" carried_answered"))
         .map(|(counts, _)| counts.to_owned());
     assert_eq!(
         (
@@ -5641,21 +5709,33 @@ const SIXTH_WALK_SLOT: &str = "2026-11-17T12:31:20.000000Z";
 
 // ---- Step 7 PR 4: the frontier's age, the clock, S7-D11's busy fields ----
 
-/// The first poll's answer is received 1 s before `WALK_FIRST`, at 12:00:29: exactly the shortest
-/// period, 30 min, before 12:30:29, and 29:59 before 12:30:28.
-const FRONTIER_30_00_OLD: &str = "2026-11-17T12:30:29Z";
-const FRONTIER_29_59_OLD: &str = "2026-11-17T12:30:28Z";
+/// The first poll of each pair is answered 1 s before its `--at`: at 12:30:00, the 12:30 slot's
+/// start, or 1 µs before it. The second poll is in that slot.
+const ANSWERED_AT_THE_SLOT_START: &str = "2026-11-17T12:30:01Z";
+const ANSWERED_1_US_BEFORE_IT: &str = "2026-11-17T12:30:00.999999Z";
 
-/// Owner decision 2026-11-18: the answer setting the walk's top must be at least the schedule's
-/// shortest period old. At exactly 30:00 it is read and the poll walks to its frontier; at 29:59
-/// no older answer exists, so the poll is `range_unread`, asks no id and stays no basis.
+/// Owner decision 2026-11-18 (PR #52 answer 1): the answer setting the walk's top must be received
+/// before the start of the poll's slot. 1 µs before it is read and the poll walks to its frontier;
+/// at the start no older answer exists, so the poll is `range_unread`, asks no id, stays no basis.
 #[test]
-fn the_walks_frontier_answer_must_be_a_shortest_period_old() -> TestResult {
+fn the_walks_frontier_answer_must_be_received_before_its_slot_starts() -> TestResult {
     let mut seen = Vec::new();
-    for at in [FRONTIER_30_00_OLD, FRONTIER_29_59_OLD] {
-        let root = after_a_first_walked_poll()?;
+    for first in [ANSWERED_1_US_BEFORE_IT, ANSWERED_AT_THE_SLOT_START] {
+        let root = TempDir::new()?;
+        seed_gnw(root.path(), &hosts_fixture(WALK_HOSTS), ROBOTS_EARLIER)?;
+        walked_poll(
+            root.path(),
+            hosts_fixture(WALK_HOSTS),
+            first,
+            &Gnw::walked(RSS_1200)?,
+        )?;
         let exchange = Gnw::walked(RSS_1205)?;
-        let poll = walked_poll(root.path(), hosts_fixture(WALK_HOSTS), at, &exchange)?;
+        let poll = walked_poll(
+            root.path(),
+            hosts_fixture(WALK_HOSTS),
+            WALK_SECOND,
+            &exchange,
+        )?;
         let (sent, _) = exchange.sent();
         seen.push((
             walked_ids(&sent).len(),
@@ -5673,24 +5753,21 @@ fn the_walks_frontier_answer_must_be_a_shortest_period_old() -> TestResult {
     Ok(())
 }
 
-/// The real time order: a live poll's answer arrives after its own `--at` (here 1 s after, the
-/// clock 2 s after). The 12:30:30 poll finds the 12:00:30 answer 29:59 old, so it is
-/// `range_unread`; the 13:00:30 poll walks to the 12:00:30 answer, two 30-min slots back.
-#[test]
-fn in_real_time_order_a_walk_reads_the_answer_of_two_busy_slots_back() -> TestResult {
+/// `(walked ids, through, continuity)` of one poll.
+type PollWalk = (usize, Value, Value);
+
+/// Each poll at `at` with `feed`, its answer received `ANSWER_AFTER_AT_S` after its `--at` and
+/// the clock 1 s later still.
+fn real_time_polls(polls: &[(&str, &str)]) -> Result<Vec<PollWalk>, Box<dyn Error>> {
     let root = TempDir::new()?;
     seed_gnw(root.path(), &hosts_fixture(WALK_HOSTS), ROBOTS_EARLIER)?;
     let mut seen = Vec::new();
-    for (at, feed) in [
-        (WALK_FIRST, RSS_1200),
-        (WALK_SECOND, RSS_1205),
-        (WALK_THIRD, RSS_1205),
-    ] {
+    for (at, feed) in polls {
         let exchange = Gnw::walked(feed)?;
         let ask = Ask {
             hosts: Some(hosts_fixture(WALK_HOSTS)),
             at: instant(at),
-            schedule: Some("walk".to_owned()),
+            schedule: Some((*at).to_owned()),
             ..ask(root.path(), cmd_collect::TODAY)
         };
         let opened = cmd_collect::open_provider(&ask)?;
@@ -5704,19 +5781,40 @@ fn in_real_time_order_a_walk_reads_the_answer_of_two_busy_slots_back() -> TestRe
             walk["continuity"].clone(),
         ));
     }
+    Ok(seen)
+}
+
+/// The real time order: a live poll's answer arrives after its own `--at`, here at 12:00:31. The
+/// 12:30:30 poll reads it, one 30-min slot back (PG-D2's one-period lag).
+#[test]
+fn in_real_time_order_a_walk_reads_the_answer_of_the_slot_before() -> TestResult {
     assert_eq!(
-        seen,
+        real_time_polls(&[(WALK_FIRST, RSS_1200), (WALK_SECOND, RSS_1205)])?,
         vec![
             (0, Value::Null, Value::from("first_poll")),
-            (0, Value::Null, Value::from("range_unread")),
             (5, Value::from(FIRST_FRONTIER), Value::from("complete")),
         ]
     );
     Ok(())
 }
 
-/// How long after its `--at` a live poll's answer is received in
-/// `in_real_time_order_a_walk_reads_the_answer_of_two_busy_slots_back`.
+/// A manual poll at 12:00:45 is in the 12:00 slot, so the 12:00:31 answer is not before its slot
+/// and the poll is `range_unread`.
+const MANUAL_IN_THE_FIRST_SLOT: &str = "2026-11-17T12:00:45Z";
+
+#[test]
+fn a_manual_poll_in_the_same_slot_does_not_read_that_slots_answer() -> TestResult {
+    assert_eq!(
+        real_time_polls(&[(WALK_FIRST, RSS_1200), (MANUAL_IN_THE_FIRST_SLOT, RSS_1205)])?,
+        vec![
+            (0, Value::Null, Value::from("first_poll")),
+            (0, Value::Null, Value::from("range_unread")),
+        ]
+    );
+    Ok(())
+}
+
+/// How long after its `--at` a live poll's answer is received in `real_time_polls`.
 const ANSWER_AFTER_AT_S: i64 = 1;
 
 /// S7-D3 and S7-D11 read the clock, not `--at`: a run planned at 18:59:30 (the 18:30 slot) and
@@ -5956,5 +6054,552 @@ fn every_busy_field_reaches_the_envelope_the_run_file_and_the_ledger() -> TestRe
             ),
         ]
     );
+    Ok(())
+}
+
+// ---- Step 7 PR 5: S7-D5's carried queue (architecture.md section 3.2's `deferred_closed`) ----
+
+/// The run id of every row `an_open_row` writes.
+const EARLIER_RUN: &str = "an earlier run";
+
+fn micros(at: DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+/// One open `document` row an earlier run left, deferred at `deferred_at` with reason
+/// `run_deadline`, as `record_deferred` writes it.
+fn an_open_row(
+    store: &Path,
+    url: &str,
+    story: Option<&str>,
+    listed: Option<&str>,
+    deferred_at: DateTime<Utc>,
+) -> TestResult {
+    let db = Connection::open(store.join(COMMIT_LOG))?;
+    db.execute(
+        "INSERT INTO deferred (run_id, source, target_window, host, url, phase, story_id,
+                               listed_date, reason, deferred_at)
+         VALUES (?8, ?1, ?2, ?3, ?4, 'document', ?5, ?6, 'run_deadline', ?7)",
+        rusqlite::params![
+            SOURCE,
+            deferred_at.date_naive().to_string(),
+            host_of(url),
+            url,
+            story,
+            listed,
+            micros(deferred_at),
+            EARLIER_RUN
+        ],
+    )?;
+    Ok(())
+}
+
+/// `(deferred_id, closed_as, attempt_id)` of one `deferred_closed` row.
+type ClosedRow = (i64, String, Option<String>);
+
+/// Every `deferred_closed` row, by `deferred_id`.
+fn closed_rows(store: &Path) -> Result<Vec<ClosedRow>, Box<dyn Error>> {
+    let db = Connection::open_with_flags(store.join(COMMIT_LOG), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let rows = db
+        .prepare(
+            "SELECT deferred_id, closed_as, attempt_id FROM deferred_closed ORDER BY deferred_id",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// `(url, queued, closed_as, rows)` of each envelope `carried` item.
+fn carried_of(envelope: &Value) -> Vec<(String, bool, Value, usize)> {
+    envelope["carried"]
+        .as_array()
+        .map_or_else(Vec::new, |items| {
+            items
+                .iter()
+                .map(|item| {
+                    (
+                        item["url"].as_str().unwrap_or_default().to_owned(),
+                        item["queued"].as_bool() == Some(true),
+                        item["closed_as"].clone(),
+                        item["deferred_ids"].as_array().map_or(0, Vec::len),
+                    )
+                })
+                .collect()
+        })
+}
+
+/// The story `walk_url(id)` keys, as `record_deferred` names it.
+fn walk_story(id: u64) -> Option<String> {
+    digest(canon::digest::story_id(
+        SOURCE,
+        &format!("rss.globenewswire.com/news-release/{id}/en"),
+    ))
+}
+
+/// The human `carried` line of an envelope.
+fn carried_line(envelope: &Value) -> Result<Option<String>, Box<dyn Error>> {
+    let mut human = Vec::new();
+    cmd_collect::render_human(envelope, &mut human)?;
+    Ok(String::from_utf8(human)?
+        .lines()
+        .find(|line| line.starts_with("carried"))
+        .map(str::to_owned))
+}
+
+/// S7-D5: the four walk ids the 12:30:30 poll's deadline cut are asked first by the 13:00:30 poll,
+/// ahead of GNW's index, and each row is closed `answered` by its first attempt. The first answers
+/// 503 and is asked once more, never by the walk too. The run file names its source (answer 6).
+#[test]
+fn deferred_walk_ids_are_carried_to_the_front_of_their_lane_and_closed_answered() -> TestResult {
+    let root = after_a_first_walked_poll()?;
+    let mut cut = Gnw::walked(RSS_1205)?;
+    cut.paced = Some(paced(&[], Vec::new()));
+    let ask = Ask {
+        hosts: Some(hosts_fixture(WALK_HOSTS)),
+        at: instant(WALK_SECOND),
+        deadline: Some(instant(WALK_SECOND_PLUS_45_S)),
+        schedule: Some("walk".to_owned()),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    cmd_collect::run(&ask, &opened, &cut, &At(instant(WALK_SECOND)))?;
+    let deferred: Vec<String> = stored_deferred(root.path())?
+        .into_iter()
+        .map(|row| row.4)
+        .collect();
+    let first = deferred.first().ok_or("no deferred row")?;
+    let exchange = Gnw::walked(RSS_1205)?.answering(first, &[UNAVAILABLE]);
+    let third = walked_poll(
+        root.path(),
+        hosts_fixture(WALK_HOSTS),
+        WALK_THIRD,
+        &exchange,
+    )?;
+    let (sent, _) = exchange.sent();
+    let attempt_of = |url: &str| {
+        third.envelope["attempts"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["url"] == url))
+            .and_then(|row| row["attempt_id"].as_str().map(str::to_owned))
+    };
+    let closed: Vec<ClosedRow> = deferred
+        .iter()
+        .zip(1..)
+        .map(|(url, id)| (id, "answered".to_owned(), attempt_of(url)))
+        .collect();
+    let run_id = third.envelope["run_id"].as_str().ok_or("run_id")?;
+    let run_file: Value = serde_json::from_slice(&std::fs::read(
+        root.path().join(RUNS_DIR).join(format!("{run_id}.json")),
+    )?)?;
+    assert_eq!(
+        (
+            walked_ids(&deferred),
+            sent.get(..5).map(<[String]>::to_vec),
+            deferred
+                .iter()
+                .map(|url| sent.iter().filter(|one| *one == url).count())
+                .collect::<Vec<usize>>(),
+        ),
+        (
+            vec![3_404_417, 3_404_418, 3_404_420, 3_404_421],
+            Some(deferred.iter().cloned().chain([INDEX.to_owned()]).collect()),
+            vec![2, 1, 1, 1],
+        )
+    );
+    assert_eq!(
+        (
+            carried_of(&third.envelope),
+            closed_rows(root.path())?,
+            third.envelope["per_source"][0]["carried"].clone(),
+            carried_line(&third.envelope)?,
+            run_file["source"].clone(),
+        ),
+        (
+            deferred
+                .iter()
+                .map(|url| (url.clone(), true, Value::from("answered"), 1))
+                .collect(),
+            closed,
+            serde_json::json!({"queued": 4, "answered": 4, "held": 0, "expired": 0}),
+            Some("carried          4 queued 4 answered 4 held 0 expired 0".to_owned()),
+            Value::from(SOURCE),
+        )
+    );
+    Ok(())
+}
+
+/// S7-D5: an open row whose story the store already holds is closed `held` at the run's start and
+/// never asked.
+#[test]
+fn a_carried_item_whose_story_the_store_holds_is_closed_held_and_not_asked() -> TestResult {
+    let root = after_a_first_walked_poll()?;
+    let (url, story): (String, String) = Connection::open(root.path().join(COMMIT_LOG))?
+        .query_row(
+        "SELECT p.url, a.story_id FROM attempts a JOIN payloads p ON p.attempt_id = a.attempt_id
+              WHERE p.phase = 'document' AND a.verdict = 'usable'
+              ORDER BY a.attempt_id LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    an_open_row(
+        root.path(),
+        &url,
+        Some(&story),
+        None,
+        instant(WALK_SECOND) - TimeDelta::hours(1),
+    )?;
+    let exchange = Gnw::walked(RSS_1205)?;
+    let second = walked_poll(
+        root.path(),
+        hosts_fixture(WALK_HOSTS),
+        WALK_SECOND,
+        &exchange,
+    )?;
+    let (sent, _) = exchange.sent();
+    assert_eq!(
+        (
+            sent.contains(&url),
+            carried_of(&second.envelope),
+            closed_rows(root.path())?,
+            carried_line(&second.envelope)?,
+        ),
+        (
+            false,
+            vec![(url, false, Value::from("held"), 1)],
+            vec![(1, "held".to_owned(), None)],
+            Some("carried          1 queued 0 answered 0 held 1 expired 0".to_owned()),
+        )
+    );
+    Ok(())
+}
+
+const A_DAY_LESS_A_SECOND: TimeDelta = TimeDelta::seconds(24 * 60 * 60 - 1);
+const A_DAY: TimeDelta = TimeDelta::hours(24);
+/// A GNW id no index lists and no walk range of `WALK_SECOND` reaches.
+const UNLISTED_ID: u64 = 3_404_430;
+
+/// S7-D5's 24 h, inclusive: a row deferred 23:59:59 before the run is carried and answered; one
+/// deferred exactly 24 h before is closed `expired`, never asked, counted by the ledger and a
+/// `--check` finding (S7-D8).
+#[test]
+fn a_deferred_item_is_carried_at_23_59_59_and_closed_expired_at_24_hours() -> TestResult {
+    let mut seen = Vec::new();
+    for age in [A_DAY_LESS_A_SECOND, A_DAY] {
+        let root = after_a_first_walked_poll()?;
+        let url = walk_url(UNLISTED_ID);
+        an_open_row(
+            root.path(),
+            &url,
+            walk_story(UNLISTED_ID).as_deref(),
+            None,
+            instant(WALK_SECOND) - age,
+        )?;
+        let exchange = Gnw::walked(RSS_1205)?;
+        let second = walked_poll(
+            root.path(),
+            hosts_fixture(WALK_HOSTS),
+            WALK_SECOND,
+            &exchange,
+        )?;
+        let (sent, _) = exchange.sent();
+        let report = newsvault::cmd_ledger::read(
+            root.path(),
+            &newsvault::cmd_ledger::Ask {
+                at: instant("2026-11-18T00:00:00Z"),
+                from: "2026-11-17".parse()?,
+                to: "2026-11-17".parse()?,
+                source: Some(SOURCE.to_owned()),
+                expected_runs: None,
+                limit: None,
+                check: true,
+            },
+        )?;
+        let carried: Vec<(i64, i64, i64)> = report
+            .days
+            .iter()
+            .flat_map(|day| &day.per_source)
+            .map(|row| (row.carried.answered, row.carried.held, row.carried.expired))
+            .collect();
+        let expired_findings = report
+            .check
+            .findings
+            .iter()
+            .filter(|finding| finding.code == "deferred_expired")
+            .count();
+        seen.push((
+            sent.first() == Some(&url),
+            carried_of(&second.envelope),
+            closed_rows(root.path())?
+                .into_iter()
+                .map(|row| row.1)
+                .collect::<Vec<String>>(),
+            carried,
+            expired_findings,
+        ));
+    }
+    let url = walk_url(UNLISTED_ID);
+    assert_eq!(
+        seen,
+        vec![
+            (
+                true,
+                vec![(url.clone(), true, Value::from("answered"), 1)],
+                vec!["answered".to_owned()],
+                vec![(1, 0, 0)],
+                0
+            ),
+            (
+                false,
+                vec![(url, false, Value::from("expired"), 1)],
+                vec!["expired".to_owned()],
+                vec![(0, 0, 1)],
+                1
+            ),
+        ]
+    );
+    Ok(())
+}
+
+/// `WALK_SECOND` plus 5 s: GNW's first slot goes, its second, at 10 s, is past it.
+const WALK_SECOND_PLUS_5_S: &str = "2026-11-17T12:30:35Z";
+
+/// S7-D5: a carried request the deadline stops again gets a new `deferred` row and keeps its old
+/// one open, so the next run carries one item over both rows and ages it from the older: exactly
+/// 24 h after it, both rows are closed `expired` though the newer is 23 h old.
+#[test]
+fn a_carried_request_deferred_again_keeps_its_rows_open_and_ages_from_its_first() -> TestResult {
+    let root = after_a_first_walked_poll()?;
+    let first = instant(WALK_SECOND) - TimeDelta::hours(1);
+    let (asked, again) = (walk_url(UNLISTED_ID + 1), walk_url(UNLISTED_ID));
+    an_open_row(
+        root.path(),
+        &asked,
+        walk_story(UNLISTED_ID + 1).as_deref(),
+        None,
+        first,
+    )?;
+    an_open_row(
+        root.path(),
+        &again,
+        walk_story(UNLISTED_ID).as_deref(),
+        None,
+        first + TimeDelta::seconds(1),
+    )?;
+    let mut exchange = Gnw::walked(RSS_1205)?;
+    exchange.paced = Some(paced(&[], Vec::new()));
+    let ask = Ask {
+        hosts: Some(hosts_fixture(WALK_HOSTS)),
+        at: instant(WALK_SECOND),
+        deadline: Some(instant(WALK_SECOND_PLUS_5_S)),
+        schedule: Some("walk".to_owned()),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let second = cmd_collect::run(&ask, &opened, &exchange, &At(instant(WALK_SECOND)))?;
+    let (sent, _) = exchange.sent();
+    let again_rows: Vec<String> = stored_deferred(root.path())?
+        .into_iter()
+        .filter(|row| row.4 == again)
+        .map(|row| row.8)
+        .collect();
+    let after_second = closed_rows(root.path())?;
+    let third_at = first + TimeDelta::seconds(1) + A_DAY;
+    let late = Gnw::walked(RSS_1205)?;
+    let third = walked_poll(
+        root.path(),
+        hosts_fixture(WALK_HOSTS),
+        &micros(third_at),
+        &late,
+    )?;
+    let (late_sent, _) = late.sent();
+    assert_eq!(
+        (
+            sent,
+            carried_of(&second.envelope),
+            again_rows,
+            after_second.len(),
+            second.exit.error_code(),
+        ),
+        (
+            vec![asked.clone()],
+            vec![
+                (asked, true, Value::from("answered"), 1),
+                (again.clone(), true, Value::Null, 1),
+            ],
+            vec!["run_deadline".to_owned(); 2],
+            1,
+            Some("partial_collect"),
+        )
+    );
+    assert_eq!(
+        (
+            late_sent.contains(&again),
+            carried_of(&third.envelope),
+            closed_rows(root.path())?
+                .into_iter()
+                .skip(1)
+                .map(|row| row.1)
+                .collect::<Vec<String>>(),
+        ),
+        (
+            false,
+            vec![(again, false, Value::from("expired"), 2)],
+            vec!["expired".to_owned(); 2],
+        )
+    );
+    Ok(())
+}
+
+/// Owner decision 2026-11-18 (PR #52 answer 4): a deferred `Index` request is never carried and
+/// never closed; the next run asks its indexes anyway, and the row stays the "not looked" record.
+#[test]
+fn deferred_index_requests_are_never_carried_or_closed() -> TestResult {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    let mut late = Gnw::five_hosts()?;
+    late.paced = Some(paced(&[], Vec::new()));
+    let ask_at = |at: &str| Ask {
+        hosts: Some(seed::committed_hosts()),
+        at: instant(at),
+        schedule: Some(at.to_owned()),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let past_its_deadline = "2026-11-16T10:15:00Z";
+    let first = ask_at(past_its_deadline);
+    let opened = cmd_collect::open_provider(&first)?;
+    cmd_collect::run(&first, &opened, &late, &At(instant(past_its_deadline)))?;
+    let next = ask_at(MONDAY_NEXT_SLOT);
+    let opened = cmd_collect::open_provider(&next)?;
+    let answer = cmd_collect::run(
+        &next,
+        &opened,
+        &Gnw::five_hosts()?,
+        &At(instant(MONDAY_NEXT_SLOT)),
+    )?;
+    let phases: Vec<String> = stored_deferred(root.path())?
+        .into_iter()
+        .map(|row| row.5)
+        .collect();
+    assert_eq!(
+        (
+            phases,
+            carried_of(&answer.envelope),
+            closed_rows(root.path())?.len()
+        ),
+        (vec!["index".to_owned(); 6], Vec::new(), 0)
+    );
+    Ok(())
+}
+
+/// The 11:00 slot of `MONDAY_AT`'s day, whose stop is 11:14:30.
+const MONDAY_NEXT_SLOT: &str = "2026-11-16T11:00:30Z";
+
+/// S7-D6 with S7-D5: a carried listed follow-up is counted at issue, so beside 150 new ones the
+/// last CNW follow-up is deferred; a carried walk id is not counted and defers nothing.
+#[test]
+fn a_carried_follow_up_counts_against_the_cap_and_a_carried_walk_id_does_not() -> TestResult {
+    let listed = format!("{CNW_RELEASE_PREFIX}a-carried-release-799999999.html");
+    let walk = "https://rss.globenewswire.com/news-release/2026/11/16/3404430/0/en/x.html";
+    let extra = FOLLOW_UP_CAP - FIVE_HOST_FOLLOW_UPS;
+    let (follow_up_root, follow_up, follow_up_sent, urls) = capped_run_carrying(
+        extra,
+        &[(listed.as_str(), Some("2026-11-16T02:22:00-05:00"))],
+    )?;
+    let (walk_root, walked, walk_sent, _) = capped_run_carrying(extra, &[(walk, None)])?;
+    let deferred_urls = |root: &TempDir| -> Result<Vec<String>, Box<dyn Error>> {
+        Ok(stored_deferred(root.path())?
+            .into_iter()
+            .filter(|row| row.0 != EARLIER_RUN)
+            .map(|row| row.4)
+            .collect())
+    };
+    assert_eq!(
+        (
+            follow_up_sent.sent().0.contains(&listed),
+            deferred_urls(&follow_up_root)?,
+            follow_up.envelope["per_source"][0]["carried"]["answered"].as_u64(),
+            walk_sent.sent().0.contains(&walk.to_owned()),
+            deferred_urls(&walk_root)?,
+            walked.envelope["per_source"][0]["carried"]["answered"].as_u64(),
+        ),
+        (
+            true,
+            urls.last().cloned().into_iter().collect::<Vec<String>>(),
+            Some(1),
+            true,
+            Vec::<String>::new(),
+            Some(1),
+        )
+    );
+    Ok(())
+}
+
+/// PRN's RSS with `extra` synthetic releases before its three, each answered with PRN's synthetic
+/// page: the cap then reaches the three, which PRN's sitemap lists too.
+fn prn_rss_with(extra: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+    let fixture =
+        std::fs::read_to_string(provider_dir().join("tests/fixtures/prn/rss_3_items.xml"))?;
+    let items: String = (0..extra)
+        .map(|nth| {
+            let url = format!("{PRN_RELEASE_PREFIX}held-count-{nth}-3030{nth:05}.html");
+            format!(
+                "<item><title>A synthetic release</title><link>{url}</link><guid>{url}</guid>\
+                 <pubDate>Mon, 16 Nov 2026 09:00:00 +0000</pubDate></item>"
+            )
+        })
+        .collect();
+    Ok(fixture
+        .replacen("<item>", &format!("{items}<item>"), 1)
+        .into_bytes())
+}
+
+/// `attempts.held` of the run's PRN sitemap page 1.
+fn sitemap_held(store: &Path) -> Result<Option<i64>, Box<dyn Error>> {
+    let db = Connection::open_with_flags(store.join(COMMIT_LOG), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    Ok(db.query_row(
+        "SELECT a.held FROM attempts a JOIN payloads p ON p.attempt_id = a.attempt_id
+          WHERE p.url = ?1",
+        [PRN_SITEMAP],
+        |row| row.get(0),
+    )?)
+}
+
+/// PR #50's question 1 (owner decision 2026-11-18): PRN's sitemap, read before its RSS's
+/// follow-ups, drops the three it shares with them. Asked, they count `held` (3); deferred by the
+/// cap, they were never asked and count nothing (0).
+#[test]
+fn a_story_queued_by_this_run_counts_held_only_once_the_run_asked_it() -> TestResult {
+    let mut seen = Vec::new();
+    for extra in [0, FOLLOW_UP_CAP] {
+        let root = TempDir::new()?;
+        seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+        let mut exchange = Gnw::paged(&[])?;
+        exchange
+            .pages
+            .insert(PRN_INDEX.to_owned(), prn_rss_with(extra)?);
+        let ask = Ask {
+            hosts: Some(seed::committed_hosts()),
+            at: instant(MONDAY_AT),
+            ..ask(root.path(), cmd_collect::TODAY)
+        };
+        let opened = cmd_collect::open_provider(&ask)?;
+        cmd_collect::run(&ask, &opened, &exchange, &Monday)?;
+        let (sent, _) = exchange.sent();
+        let shared: Vec<String> = PRN_RELEASES
+            .iter()
+            .map(|(key, _)| format!("https://{key}"))
+            .collect();
+        let deferred: Vec<String> = stored_deferred(root.path())?
+            .into_iter()
+            .map(|row| row.4)
+            .filter(|url| shared.contains(url))
+            .collect();
+        seen.push((
+            sitemap_held(root.path())?,
+            shared.iter().filter(|url| sent.contains(url)).count(),
+            deferred.len(),
+        ));
+    }
+    assert_eq!(seen, vec![(Some(3), 3, 0), (Some(0), 0, 3)]);
     Ok(())
 }

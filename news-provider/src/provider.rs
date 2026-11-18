@@ -574,6 +574,19 @@ pub trait Provider: Send + Sync {
     /// the rule `extract` dates its item by; `Unknown` when that rule reads none. The driver
     /// compares a held story's listing with its stored item (architecture.md section 8 row R15).
     fn listed_publication(&self, follow_up: &Request) -> Published;
+
+    /// S7-D5: a `Document` request an earlier run deferred, rebuilt from its `deferred` row as
+    /// this provider would build it now; `None` when it would not ask it now, and the row then
+    /// stays open until it expires.
+    fn carried(
+        &self,
+        target: &TargetWindow,
+        url: &str,
+        listed_date: Option<&str>,
+    ) -> Option<Request>;
+
+    /// S7-D6's exception: an [`Extracted::walk`] id, which the follow-up cap does not count.
+    fn is_walk_id(&self, request: &Request) -> bool;
 }
 
 #[cfg(test)]

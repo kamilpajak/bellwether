@@ -5076,3 +5076,43 @@ fn every_golden_page_extracts_to_its_committed_body_under_the_committed_version(
     );
     Ok(())
 }
+
+/// S7-D5: a deferred document is rebuilt as the request the index built, follow-up and walk id
+/// alike; nothing off an admitted host or under a robots disallow. Only the walk id is a walk id
+/// (S7-D6's exception).
+#[test]
+fn a_deferred_document_is_rebuilt_as_its_request_and_a_walk_id_is_known_by_its_url() -> Outcome {
+    let feed = walking(after_the_first_poll(&[])?)?;
+    let request = gnw_index_on(&feed, WALK_DAY, WALK_AT)?;
+    let extracted = feed.extract(&request, &blob(gnw(RSS_1205)));
+    let follow_up = extracted
+        .follow_ups
+        .first()
+        .cloned()
+        .ok_or("no follow-up")?;
+    let walk_id = extracted.walk.first().cloned().ok_or("no walk id")?;
+    let rebuilt = |feed: &OpenWebFeed, one: &Request| {
+        feed.carried(&one.target_window, &one.url, one.listed_date.as_deref())
+    };
+    let (disallowing, _) = gnw_disallowing("/")?;
+    let window = TargetWindow::new(WALK_DAY);
+    assert_eq!(
+        (
+            rebuilt(&feed, &follow_up),
+            rebuilt(&feed, &walk_id),
+            feed.is_walk_id(&follow_up),
+            feed.is_walk_id(&walk_id),
+            feed.carried(&window, "https://example.test/news-release/1.html", None),
+            rebuilt(&disallowing, &walk_id),
+        ),
+        (
+            Some(follow_up.clone()),
+            Some(walk_id.clone()),
+            false,
+            true,
+            None,
+            None
+        )
+    );
+    Ok(())
+}

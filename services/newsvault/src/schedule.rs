@@ -182,12 +182,6 @@ impl Schedule {
         TimeDelta::minutes(longest.unwrap_or_default())
     }
 
-    #[must_use]
-    pub fn shortest_period(&self) -> TimeDelta {
-        let shortest = self.slots.iter().map(|slot| slot.period_minutes).min();
-        TimeDelta::minutes(shortest.unwrap_or_default())
-    }
-
     /// The slot `now` belongs to: the latest slot start at or before it, the previous UTC day's
     /// last slot before the day's first one.
     #[must_use]
@@ -455,15 +449,11 @@ mod tests {
         assert_eq!(replayed, STOPS);
     }
 
-    /// The cross-check lead and the GNW frontier age are the committed schedule's periods, so a
-    /// change to `SLOTS` that moves either is red here (architecture.md section 11.2).
+    /// The cross-check lead is the committed schedule's longest period, so a change to `SLOTS`
+    /// that moves it is red here (architecture.md section 11.2).
     #[test]
-    fn the_cross_check_lead_is_the_longest_period_and_the_frontier_age_the_shortest() {
-        let periods = committed(PATIENCE)
-            .map(|schedule| (schedule.longest_period(), schedule.shortest_period()));
-        assert_eq!(
-            periods,
-            Ok((open_web_feed::LONGEST_POLL_PERIOD, TimeDelta::minutes(30)))
-        );
+    fn the_cross_check_lead_is_the_committed_schedules_longest_period() {
+        let longest = committed(PATIENCE).map(|schedule| schedule.longest_period());
+        assert_eq!(longest, Ok(open_web_feed::LONGEST_POLL_PERIOD));
     }
 }

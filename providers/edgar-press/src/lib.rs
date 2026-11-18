@@ -624,6 +624,21 @@ impl Provider for EdgarPress {
             tz: self.parsed.zone,
         })
     }
+
+    /// Carries nothing (S7-D5): a deferred EDGAR document stays open until it expires, and the
+    /// archive arm's covered set asks it again (section 8 row R20).
+    fn carried(
+        &self,
+        _target: &TargetWindow,
+        _url: &str,
+        _listed_date: Option<&str>,
+    ) -> Option<Request> {
+        None
+    }
+
+    fn is_walk_id(&self, _request: &Request) -> bool {
+        false
+    }
 }
 
 /// The accession an EDGAR document url ends in:

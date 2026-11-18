@@ -944,6 +944,40 @@ impl Provider for OpenWebFeed {
             _ => Published::Unknown,
         }
     }
+
+    /// S7-D5: a deferred document built as `index_rows_of` builds a follow-up, under this run's
+    /// hosts file and extraction version; `None` off an admitted host, for a url that keys no
+    /// story, or one the pinned robots disallow.
+    fn carried(
+        &self,
+        target: &TargetWindow,
+        url: &str,
+        listed_date: Option<&str>,
+    ) -> Option<Request> {
+        self.admitted_row(url)?;
+        (self.item_key(url).is_some() && self.robots_allow(url)).then(|| Request {
+            source: SourceId::new(SOURCE),
+            target_window: target.clone(),
+            phase: RequestPhase::Document,
+            provenance: Provenance::LiveIngest,
+            url: url.to_owned(),
+            headers: Vec::new(),
+            params: Vec::new(),
+            universe_version: empty_roster(),
+            listed_date: listed_date.map(str::to_owned),
+            hosts_version: Some(self.hosts.version.clone()),
+            extract_version: Some(self.extract_version.clone()),
+        })
+    }
+
+    /// The walk's own url of a release with no listed value, as `document_of` dates it.
+    fn is_walk_id(&self, request: &Request) -> bool {
+        request.phase == RequestPhase::Document
+            && request.listed_date.is_none()
+            && self
+                .rule_of(request)
+                .is_some_and(|rule| self.walked(request, rule))
+    }
 }
 
 /// A url's lowercased host and its path (`/` when empty), without scheme, port, query or
