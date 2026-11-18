@@ -1363,13 +1363,15 @@ pub const PROMETHEUS_FAMILIES: [&str; 8] = [
     "newsvault_check_findings",
 ];
 
-/// A day's metrics are labelled by how many UTC days before `at`'s it is, so an alert can tell
-/// today, still running, from yesterday, closed; a run date that is not a date is `unknown`.
-fn days_ago(at: DateTime<Utc>, run_date: &str) -> String {
-    run_date.parse::<NaiveDate>().map_or_else(
+/// A day's labels: `run_date`, which names one alert across the UTC midnight, and how many UTC days
+/// before `at`'s it is, so a rule can tell today, still running, from yesterday, closed; a run
+/// date that is not a date is `days_ago="unknown"`.
+fn day_labels(at: DateTime<Utc>, run_date: &str) -> String {
+    let ago = run_date.parse::<NaiveDate>().map_or_else(
         |_| "unknown".to_owned(),
         |day| (at.date_naive() - day).num_days().to_string(),
-    )
+    );
+    format!("run_date=\"{}\",days_ago=\"{ago}\"", label(run_date))
 }
 
 fn label(value: &str) -> String {
@@ -1412,9 +1414,9 @@ pub fn render_prometheus(
                 day.per_source.iter().map(move |row| {
                     (
                         format!(
-                            "source=\"{}\",days_ago=\"{}\"",
+                            "source=\"{}\",{}",
                             label(&row.source),
-                            days_ago(at, &day.run_date)
+                            day_labels(at, &day.run_date)
                         ),
                         count(row).to_string(),
                     )
@@ -1422,10 +1424,10 @@ pub fn render_prometheus(
             })
             .collect()
     };
-    let mut findings: BTreeMap<(&str, String), u32> = BTreeMap::new();
+    let mut findings: BTreeMap<(&str, &str), u32> = BTreeMap::new();
     for finding in &report.check.findings {
         *findings
-            .entry((finding.code, days_ago(at, &finding.run_date)))
+            .entry((finding.code, finding.run_date.as_str()))
             .or_default() += 1;
     }
     writeln!(out, "# {PROMETHEUS_SCHEMA}")?;
@@ -1477,12 +1479,7 @@ pub fn render_prometheus(
         &report
             .days
             .iter()
-            .map(|day| {
-                (
-                    format!("days_ago=\"{}\"", days_ago(at, &day.run_date)),
-                    day.holds_capped.to_string(),
-                )
-            })
+            .map(|day| (day_labels(at, &day.run_date), day.holds_capped.to_string()))
             .collect::<Vec<_>>(),
     )?;
     family(
@@ -1491,9 +1488,9 @@ pub fn render_prometheus(
         "ledger --check findings per code; a code with none has no sample.",
         &findings
             .into_iter()
-            .map(|((code, ago), count)| {
+            .map(|((code, run_date), count)| {
                 (
-                    format!("code=\"{}\",days_ago=\"{ago}\"", label(code)),
+                    format!("code=\"{}\",{}", label(code), day_labels(at, run_date)),
                     count.to_string(),
                 )
             })
@@ -1615,7 +1612,10 @@ mod tests {
             .filter(|line| !line.starts_with('#'))
             .map(str::to_owned)
             .collect();
-        let day = |ago: u8| format!("source=\"{SOURCE}\",days_ago=\"{ago}\"");
+        let day = |ago: u8| {
+            let date = if ago == 0 { "2026-11-18" } else { "2026-11-17" };
+            format!("source=\"{SOURCE}\",run_date=\"{date}\",days_ago=\"{ago}\"")
+        };
         assert_eq!(
             samples,
             [
@@ -1629,15 +1629,19 @@ mod tests {
                 format!("newsvault_carried_expired{{{}}} 17", day(0)),
                 format!("newsvault_walk_range_unread_polls{{{}}} 7", day(1)),
                 format!("newsvault_walk_range_unread_polls{{{}}} 19", day(0)),
-                "newsvault_holds_capped{days_ago=\"1\"} 2".to_owned(),
-                "newsvault_holds_capped{days_ago=\"0\"} 11".to_owned(),
-                "newsvault_check_findings{code=\"coverage_incomplete\",days_ago=\"unknown\"} 1"
+                "newsvault_holds_capped{run_date=\"2026-11-17\",days_ago=\"1\"} 2".to_owned(),
+                "newsvault_holds_capped{run_date=\"2026-11-18\",days_ago=\"0\"} 11".to_owned(),
+                "newsvault_check_findings{code=\"coverage_incomplete\",run_date=\"2026-11\",\
+                 days_ago=\"unknown\"} 1"
                     .to_owned(),
-                "newsvault_check_findings{code=\"host_busy_over_bound\",days_ago=\"0\"} 2"
+                "newsvault_check_findings{code=\"host_busy_over_bound\",run_date=\"2026-11-18\",\
+                 days_ago=\"0\"} 2"
                     .to_owned(),
-                "newsvault_check_findings{code=\"runs_below_expected\",days_ago=\"0\"} 1"
+                "newsvault_check_findings{code=\"runs_below_expected\",run_date=\"2026-11-17\",\
+                 days_ago=\"1\"} 1"
                     .to_owned(),
-                "newsvault_check_findings{code=\"runs_below_expected\",days_ago=\"1\"} 1"
+                "newsvault_check_findings{code=\"runs_below_expected\",run_date=\"2026-11-18\",\
+                 days_ago=\"0\"} 1"
                     .to_owned(),
             ]
         );

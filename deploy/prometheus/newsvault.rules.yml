@@ -1,6 +1,6 @@
-# Readers of the newsvault.prom/1 textfile the hourly watchdog writes (deploy/systemd/). Each count
-# is per UTC run day, today (days_ago 0) and yesterday (1), so an alert stays firing while its day
-# is in the watchdog's two-day range. Thresholds and their construction: architecture.md S7-D8.
+# Readers of the newsvault.prom/1 textfile the hourly watchdog writes (deploy/systemd/). A per-day
+# count is aggregated without days_ago, so one day's alert keeps its labels (run_date) across UTC
+# midnight. Thresholds and their construction: architecture.md S7-D8.
 groups:
   - name: newsvault
     rules:
@@ -40,62 +40,62 @@ groups:
 
       # S7-D8: a server's hold or slow-down cut a run.
       - alert: NewsvaultHostHeld
-        expr: newsvault_deferred_host_held > 0
+        expr: max without(days_ago) (newsvault_deferred_host_held) > 0
         labels:
           severity: critical
         annotations:
-          summary: "{{ $labels.source }}: {{ $value }} request(s) deferred host_held, days_ago {{ $labels.days_ago }}."
+          summary: "{{ $labels.source }}: {{ $value }} request(s) deferred host_held, run date {{ $labels.run_date }}."
 
       # S7-D8: a deferred document closed after 24 h, never asked.
       - alert: NewsvaultDeferredExpired
-        expr: newsvault_carried_expired > 0
+        expr: max without(days_ago) (newsvault_carried_expired) > 0
         labels:
           severity: critical
         annotations:
-          summary: "{{ $labels.source }}: {{ $value }} deferred row(s) expired, days_ago {{ $labels.days_ago }}."
+          summary: "{{ $labels.source }}: {{ $value }} deferred row(s) expired, run date {{ $labels.run_date }}."
 
       # Persistent = 2 or more in a day: a manual poll inside a slot reads one by construction
       # (section 11.2); a changed link shape makes every scheduled poll range_unread.
       - alert: NewsvaultWalkRangeUnreadPersistent
-        expr: newsvault_walk_range_unread_polls >= 2
+        expr: max without(days_ago) (newsvault_walk_range_unread_polls) >= 2
         labels:
           severity: critical
         annotations:
-          summary: "{{ $labels.source }}: {{ $value }} walked poll(s) read no range, days_ago {{ $labels.days_ago }}."
+          summary: "{{ $labels.source }}: {{ $value }} walked poll(s) read no range, run date {{ $labels.run_date }}."
 
       # S7-D7: a Retry-After above the 24 h ceiling, cut to it.
       - alert: NewsvaultHoldsCapped
-        expr: newsvault_holds_capped > 0
+        expr: max without(days_ago) (newsvault_holds_capped) > 0
         labels:
           severity: critical
         annotations:
-          summary: "{{ $value }} Retry-After value(s) held to the 24 h ceiling, days_ago {{ $labels.days_ago }}."
+          summary: "{{ $value }} Retry-After value(s) held to the 24 h ceiling, run date {{ $labels.run_date }}."
 
       - alert: NewsvaultWallTimeOverBound
-        expr: newsvault_check_findings{code="wall_time_over_bound"} > 0
+        expr: max without(days_ago) (newsvault_check_findings{code="wall_time_over_bound"}) > 0
         labels:
           severity: warning
         annotations:
-          summary: newsvault's runs took more than half a day of wall time, days_ago {{ $labels.days_ago }}.
+          summary: newsvault's runs took more than half a day of wall time, run date {{ $labels.run_date }}.
 
       - alert: NewsvaultHostBusyOverBound
-        expr: newsvault_check_findings{code="host_busy_over_bound"} > 0
+        expr: max without(days_ago) (newsvault_check_findings{code="host_busy_over_bound"}) > 0
         labels:
           severity: warning
         annotations:
-          summary: "{{ $value }} host(s) busy more than half a day, days_ago {{ $labels.days_ago }}."
+          summary: "{{ $value }} host(s) busy more than half a day, run date {{ $labels.run_date }}."
 
       # Yesterday only: today's runs are short until its last slot has run.
       - alert: NewsvaultRunsMissed
-        expr: newsvault_check_findings{code="runs_below_expected", days_ago="1"} > 0
+        expr: max without(days_ago) (newsvault_check_findings{code="runs_below_expected", days_ago="1"}) > 0
         labels:
           severity: warning
         annotations:
-          summary: yesterday saw fewer collect runs than its 31 slots.
+          summary: "{{ $labels.run_date }} saw fewer collect runs than its 31 slots."
 
       - alert: NewsvaultRowsZero
-        expr: newsvault_check_findings{code="rows_committed_zero_against_vendor_rows"} > 0
+        expr: max without(days_ago) (newsvault_check_findings{code="rows_committed_zero_against_vendor_rows"}) > 0
         labels:
           severity: warning
         annotations:
-          summary: a source listed vendor rows and committed no item, days_ago {{ $labels.days_ago }}.
+          summary: a source listed vendor rows and committed no item, run date {{ $labels.run_date }}.
