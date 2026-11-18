@@ -1,35 +1,53 @@
 #!/bin/sh
-# The daily copy of the store to Nextcloud over WebDAV (architecture.md section 10, N1), run by
+# The daily copy of the store into Nextcloud (architecture.md section 10, N1), run by
 # newsvault-backup.service under the store lock: `newsvault snapshot` of the commit log plus every
-# other store file in one .tar.gz, uploaded, then all but the 7 newest copies deleted. The app
-# password goes to curl as a config on stdin, never in argv, the environment or a file of ours.
-# Exits: 2 setup, 4 an absent input, 7 the upload, 8 the copy is up and the retention failed;
-# the snapshot's own exit when it refuses.
+# other store file in one .tar.gz, written into the data directory through the AIO container as
+# www-data, registered with `occ files:scan`, then all but the 7 newest copies deleted.
+# Exits: 2 setup or an unsafe setting, 4 an absent input, 7 the write, rename or scan, 8 the copy
+# is in and the retention failed; the snapshot's own exit when it refuses.
 set -u
+export LC_ALL=C
 : "${NEWSVAULT_IMAGE:?set in newsvault.env}" "${NEWSVAULT_TEXTFILE_DIR:?set in newsvault.env}"
-: "${NEXTCLOUD_URL:?set in newsvault.env}" "${NEXTCLOUD_USER:?set in newsvault.env}"
 keep=7
-folder=Backups/bellwether
 vault="$HOME/.bellwether/vault"
-password_file="$HOME/.config/bellwether/nextcloud-app-password"
+copy='bellwether-vault-[0-9]\{8\}T[0-9]\{6\}Z\.tar\.gz'
 
-case $NEXTCLOUD_URL in
-    https://*) ;;
-    *) echo "NEXTCLOUD_URL must start with https://" >&2; exit 2 ;;
-esac
-if [ ! -f "$password_file" ]; then
-    echo "no Nextcloud app password at $password_file" >&2
-    exit 4
-fi
-if [ -n "$(find "$password_file" -prune \( -perm -040 -o -perm -004 -o -perm -020 -o -perm -002 \))" ]; then
-    echo "$password_file is readable or writable by others; install it with mode 0600" >&2
-    exit 2
-fi
+# check VARIABLE KIND, KIND one of word, absolute, relative: every '/'-separated part starts with a
+# letter or digit and holds only letters, digits, '.', '_' and '-'.
+check() {
+    eval "value=\${$1-}"
+    case $2:$value in
+        word: | word:*/* | absolute: | absolute:[!/]* | relative: | relative:/* | *:*/ | *:*//*)
+            echo "$1 is unsafe: '$value'" >&2; exit 2 ;;
+    esac
+    saved_ifs=$IFS
+    IFS=/
+    set -f
+    for part in ${value#/}; do
+        case $part in
+            '' | [!A-Za-z0-9]* | *[!A-Za-z0-9._-]*) echo "$1 is unsafe: '$value'" >&2; exit 2 ;;
+        esac
+    done
+    set +f
+    IFS=$saved_ifs
+}
+check NEXTCLOUD_CONTAINER word
+check NEXTCLOUD_DATA absolute
+check NEXTCLOUD_USER word
+check NEXTCLOUD_FOLDER relative
 [ -d "$vault" ] || { echo "no store at $vault" >&2; exit 4; }
+
+container=$NEXTCLOUD_CONTAINER
+dir="$NEXTCLOUD_DATA/$NEXTCLOUD_USER/files/$NEXTCLOUD_FOLDER"
+scanned="$NEXTCLOUD_USER/files/$NEXTCLOUD_FOLDER"
+as_www() {
+    docker exec -u www-data "$container" "$@"
+}
 
 mkdir -p "$HOME/.cache/bellwether" || exit 2
 work=$(mktemp -d "$HOME/.cache/bellwether/backup.XXXXXX") || exit 2
-trap 'rm -rf "$work"' EXIT
+staged=''
+trap 'rm -rf "$work"; if [ -n "$staged" ]; then as_www rm -f -- "$staged"; fi' EXIT
 trap 'exit 130' INT TERM
 
 at=$(date -u +%s)
@@ -55,25 +73,19 @@ done
 tar -czf "$work/$name" -C "$work" commit.sqlite3 -C "$vault" "$@" || exit 2
 bytes=$(wc -c <"$work/$name" | tr -d ' ')
 
-credentials() {
-    printf 'user = "%s:' "$(printf '%s' "$NEXTCLOUD_USER" | sed 's/[\\"]/\\&/g')"
-    sed 's/[\\"]/\\&/g' <"$password_file" | tr -d '\r\n'
-    printf '"\n'
-}
-dav_curl() {
-    credentials | curl --config - --silent --show-error --proto =https --tlsv1.2 --retry 2 "$@"
-}
-dav="${NEXTCLOUD_URL%/}/remote.php/dav/files/$NEXTCLOUD_USER"
-
-# MKCOL answers 405 for a folder that exists.
-for path in "${folder%%/*}" "$folder"; do
-    code=$(dav_curl --request MKCOL --output /dev/null --write-out '%{http_code}' "$dav/$path/") || exit 7
-    case $code in
-        201 | 405) ;;
-        *) echo "MKCOL $path answered $code" >&2; exit 7 ;;
-    esac
-done
-dav_curl --fail --upload-file "$work/$name" --output /dev/null "$dav/$folder/$name" || exit 7
+as_www mkdir -p -- "$dir" || { echo "creating $dir in $container failed" >&2; exit 7; }
+# Written under a hidden name and renamed, so the final name never holds part of a copy.
+staged="$dir/.$name.partial"
+written=$(docker exec -i -u www-data "$container" sh -c 'cat >"$1" && wc -c <"$1"' sh "$staged" \
+    <"$work/$name") || { echo "writing $staged in $container failed" >&2; exit 7; }
+written=$(printf '%s' "$written" | tr -d ' \n')
+if [ "$written" != "$bytes" ]; then
+    echo "$staged holds $written of $bytes bytes; not renamed" >&2
+    exit 7
+fi
+as_www mv -- "$staged" "$dir/$name" || { echo "renaming $staged failed" >&2; exit 7; }
+staged=''
+as_www php occ files:scan "--path=$scanned" || { echo "occ files:scan $scanned failed" >&2; exit 7; }
 
 tmp="$NEWSVAULT_TEXTFILE_DIR/.newsvault-backup.prom.$$"
 if ! {
@@ -86,17 +98,27 @@ if ! {
     exit 2
 fi
 
-# Deletes only names of this shape, and nothing unless the listing holds the copy just put.
-listing=$(dav_curl --fail --request PROPFIND --header 'Depth: 1' "$dav/$folder/") || exit 8
-names=$(printf '%s\n' "$listing" | grep -o 'bellwether-vault-[0-9]\{8\}T[0-9]\{6\}Z\.tar\.gz' | sort -u)
+# Deletes only names of the copy's shape and a killed run's staging files, and nothing unless the
+# listing holds the copy just written.
+listing=$(as_www ls -1A -- "$dir") || { echo "listing $dir failed; nothing deleted" >&2; exit 8; }
+names=$(printf '%s\n' "$listing" | grep -x "$copy" | sort -u)
 if ! printf '%s\n' "$names" | grep -qxF "$name"; then
-    echo "the listing of $folder lacks $name; nothing deleted" >&2
+    echo "the listing of $dir lacks $name; nothing deleted" >&2
     exit 8
 fi
+set --
 excess=$(($(printf '%s\n' "$names" | wc -l) - keep))
 if [ "$excess" -gt 0 ]; then
     for old in $(printf '%s\n' "$names" | head -n "$excess"); do
-        dav_curl --fail --request DELETE --output /dev/null "$dav/$folder/$old" || exit 8
+        set -- "$@" "$dir/$old"
     done
 fi
-echo "uploaded $name, $bytes bytes, to $folder; kept the $keep newest"
+for left in $(printf '%s\n' "$listing" | grep -x "\\.$copy\\.partial"); do
+    set -- "$@" "$dir/$left"
+done
+if [ "$#" -gt 0 ]; then
+    as_www rm -f -- "$@" || { echo "deleting the oldest copies in $dir failed" >&2; exit 8; }
+    as_www php occ files:scan "--path=$scanned" ||
+        { echo "occ files:scan $scanned after the deletion failed" >&2; exit 8; }
+fi
+echo "wrote $name, $bytes bytes, to $scanned; kept the $keep newest"

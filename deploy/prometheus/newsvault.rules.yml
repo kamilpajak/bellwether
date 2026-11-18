@@ -112,7 +112,7 @@ groups:
           summary: newsvault's last collect run failed, or exited other than 0 and 8.
 
       # Two daily intervals plus one run's bound (2 x 86,400 s + TimeoutStartSec 1,800 s + 90 s stop
-      # timeout): the stamp is the run's start, written after its upload, so one missed day stays quiet.
+      # timeout): the stamp is the run's start, written after its scan, so one missed day stays quiet.
       - alert: NewsvaultBackupStale
         expr: |
           (time() - max(newsvault_backup_last_success_timestamp_seconds)) > 174690

@@ -1160,17 +1160,24 @@ fn one_rust_toolchain_is_named_only_in_rust_toolchain_toml() -> TestResult {
     Ok(())
 }
 
-const PASSWORD: &str = "nc-app-PASSWORD-7f3k";
-/// The stored password: the secret, then a quote and a backslash curl's config must escape.
-const PASSWORD_FILE_TEXT: &str = "nc-app-PASSWORD-7f3k\"q\\b\n";
-const PASSWORD_IN_CONFIG: &str = "user = \"bellwether:nc-app-PASSWORD-7f3k\\\"q\\\\b\"";
-const NEXTCLOUD: &str = "https://cloud.example.test/";
-const DAV: &str = "https://cloud.example.test/remote.php/dav/files/bellwether";
 const OLD_BACKUP_METRICS: &str = "newsvault_backup_last_success_bytes 1\n";
 const BACKUP_PROM: &str = "newsvault-backup.prom";
 const SNAPSHOT_BYTES: &str = "the snapshot";
-/// Copies already on Nextcloud, oldest first, and a file of another shape that is never deleted.
-const LISTED: [&str; 9] = [
+const NC_SETTINGS: [&str; 4] = [
+    "NEXTCLOUD_CONTAINER",
+    "NEXTCLOUD_DATA",
+    "NEXTCLOUD_USER",
+    "NEXTCLOUD_FOLDER",
+];
+/// The template's values (owner decisions 2026-11-18) as the container sees them.
+const NC_DATA: &str = "/mnt/ncdata";
+const NC_DIR: &str = "/mnt/ncdata/admin/files/Backups/bellwether";
+const NC_SCAN: &str = "php occ files:scan --path=admin/files/Backups/bellwether";
+const EXEC: &str = "exec -u www-data nextcloud-aio-nextcloud";
+const EXEC_STDIN: &str = "exec -i -u www-data nextcloud-aio-nextcloud";
+const WRITE: &str = "sh -c cat >\"$1\" && wc -c <\"$1\" sh";
+/// Copies already in the folder, oldest first.
+const COPIES: [&str; 8] = [
     "bellwether-vault-20000101T225500Z.tar.gz",
     "bellwether-vault-20000102T225500Z.tar.gz",
     "bellwether-vault-20000103T225500Z.tar.gz",
@@ -1179,42 +1186,54 @@ const LISTED: [&str; 9] = [
     "bellwether-vault-20000106T225500Z.tar.gz",
     "bellwether-vault-20000107T225500Z.tar.gz",
     "bellwether-vault-20000108T225500Z.tar.gz",
-    "notes.txt",
 ];
-/// Records its argv, then writes a snapshot into the directory mounted on `/out`.
+/// Files of another shape, which no run deletes.
+const OTHERS: [&str; 2] = ["bellwether-vault-20000101T225500Z.tar.gz.bak", "notes.txt"];
+/// A staging file a killed run left, which the next run's retention removes.
+const STALE_PARTIAL: &str = ".bellwether-vault-20000101T225500Z.tar.gz.partial";
+/// Stands in for docker. `run`: records its argv, then writes a snapshot into the directory
+/// mounted on `/out`. `exec`: records its argv on one line, fails the step `STUB_FAIL` names,
+/// and runs the command on the host with `/mnt/ncdata` mapped to `$STUB_DIR/ncdata`.
 const BACKUP_DOCKER_STUB: &str = r#"#!/bin/sh
-printf '%s\n' "$@" >>"$STUB_DIR/docker-args"
-for arg; do
-    case $arg in type=bind,src=*,dst=/out) out=${arg#type=bind,src=}; out=${out%,dst=/out} ;; esac
+if [ "$1" = run ]; then
+    printf '%s\n' "$@" >>"$STUB_DIR/docker-args"
+    for arg; do
+        case $arg in type=bind,src=*,dst=/out) out=${arg#type=bind,src=}; out=${out%,dst=/out} ;; esac
+    done
+    [ "${STUB_DOCKER_EXIT:-0}" = 0 ] || exit "$STUB_DOCKER_EXIT"
+    printf 'the snapshot' >"$out/commit.sqlite3"
+    echo '{"schema": "newsvault.snapshot/1"}'
+    exit 0
+fi
+echo "$*" >>"$STUB_DIR/execs"
+shift
+while :; do
+    case $1 in -i) shift ;; -u) shift 2 ;; *) break ;; esac
 done
-[ "${STUB_DOCKER_EXIT:-0}" = 0 ] || exit "$STUB_DOCKER_EXIT"
-printf 'the snapshot' >"$out/commit.sqlite3"
-echo '{"schema": "newsvault.snapshot/1"}'
-"#;
-/// A WebDAV server in one file: records each call's argv, stdin and environment, answers MKCOL
-/// with a status, keeps each PUT and lists them after `listed` on PROPFIND.
-const CURL_STUB: &str = r#"#!/bin/sh
-{ echo '-- call'; printf '%s\n' "$@"; } >>"$STUB_DIR/curl-args"
-{ echo '-- call'; cat; } >>"$STUB_DIR/curl-config"
-env >>"$STUB_DIR/curl-env"
-method=GET; upload=''; url=''; prev=''
-for arg; do
-    case $prev in --request) method=$arg ;; --upload-file) method=PUT; upload=$arg ;; esac
-    case $arg in https://*) url=$arg ;; esac
-    prev=$arg
-done
-echo "$method $url" >>"$STUB_DIR/calls"
-case $method in
-    MKCOL) printf '%s' "${STUB_MKCOL_CODE:-201}" ;;
-    PUT) [ "${STUB_PUT_FAILS:-}" = yes ] && exit 22; cp "$upload" "$STUB_DIR/uploads/" ;;
-    PROPFIND)
-        printf '<d:multistatus>'
-        while read -r name; do printf '<d:href>/x/%s</d:href>' "$name"; done <"$STUB_DIR/listed"
-        if [ "${STUB_LISTING_LACKS_NEW:-}" != yes ]; then
-            for put in "$STUB_DIR"/uploads/*; do printf '<d:href>/x/%s</d:href>' "${put##*/}"; done
-        fi
-        printf '</d:multistatus>' ;;
+shift
+case $1 in
+    sh) step=write ;;
+    mv) step=rename ;;
+    ls) step=list ;;
+    php) if [ -e "$STUB_DIR/scanned" ]; then step=rescan; else step=scan; : >"$STUB_DIR/scanned"; fi ;;
+    *) step=$1 ;;
 esac
+[ "$step" = "${STUB_FAIL:-}" ] && exit 1
+n=$#
+for arg; do
+    case $arg in /mnt/ncdata/*) arg="$STUB_DIR/ncdata/${arg#/mnt/ncdata/}" ;; esac
+    set -- "$@" "$arg"
+done
+shift "$n"
+case $step in
+    write)
+        if [ "${STUB_SHORT_WRITE:-}" = yes ]; then head -c 5 >"$5"; wc -c <"$5"; exit; fi
+        shift; exec /bin/sh "$@" ;;
+    list) [ "${STUB_LISTING_LACKS_NEW:-}" = yes ] && exec cat "$STUB_DIR/listed"; shift; exec /bin/ls "$@" ;;
+    mkdir | rm | rename) cmd=$1; shift; exec "/bin/$cmd" "$@" ;;
+    scan | rescan) exit 0 ;;
+esac
+exit 127
 "#;
 /// Records its argv, then moves.
 const MV_STUB: &str =
@@ -1230,25 +1249,31 @@ fn executable(path: &Path, text: &str) -> TestResult {
 /// How one backup run is set up to go wrong, if at all.
 #[derive(Default, Clone, Copy)]
 struct Trouble {
-    password_mode: Option<u32>,
-    put_fails: bool,
+    /// The container step that exits 1: mkdir, write, rename, scan, list, rm or rescan.
+    fail: Option<&'static str>,
+    short_write: bool,
     listing_lacks_new: bool,
     docker_exit: Option<i32>,
-    plain_http: bool,
-    mkcol_status: Option<u16>,
+    /// A Nextcloud setting replacing the template's, `None` unsetting it.
+    setting: Option<(&'static str, Option<&'static str>)>,
+    /// `Some(n)`: the folder holds the n oldest `COPIES` only; `None`: all, `OTHERS` and
+    /// `STALE_PARTIAL`.
+    copies: Option<usize>,
+    folder_absent: bool,
 }
 
-/// One run of `deploy/systemd/newsvault-backup` against a stub docker, curl and mv.
+/// One run of `deploy/systemd/newsvault-backup` against a stub docker and mv.
 struct Backed {
     exit: Option<i32>,
     output: String,
-    calls: Vec<String>,
-    curl_args: Vec<Vec<String>>,
-    curl_config: String,
-    curl_env: String,
+    /// The new copy's name, read from the write's staging path.
+    name: String,
+    execs: Vec<String>,
     docker_args: Vec<String>,
     mv_args: Vec<String>,
-    uploads: Vec<(String, Vec<u8>)>,
+    /// The folder's names after the run.
+    folder: Vec<String>,
+    archive: Vec<u8>,
     metric: String,
     old_link: String,
     textfile: Vec<String>,
@@ -1272,8 +1297,30 @@ fn lines_of(path: &Path) -> Vec<String> {
     read_or_empty(path).lines().map(str::to_owned).collect()
 }
 
+/// The template's `KEY=value` lines.
+fn env_template() -> Result<Vec<(String, String)>, Box<dyn Error>> {
+    Ok(read("deploy/systemd/newsvault.env")?
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect())
+}
+
+/// The names a folder is seeded with for `trouble`.
+fn seeded(trouble: Trouble) -> Vec<&'static str> {
+    match trouble.copies {
+        Some(count) => COPIES.iter().take(count).copied().collect(),
+        None => COPIES
+            .iter()
+            .chain(&OTHERS)
+            .chain(&[STALE_PARTIAL])
+            .copied()
+            .collect(),
+    }
+}
+
 fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
-    use std::os::unix::fs::PermissionsExt;
     let work = tempfile::TempDir::new()?;
     let (home, stub, textfile) = (
         work.path().join("home"),
@@ -1281,12 +1328,12 @@ fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
         work.path().join("textfile"),
     );
     let vault = home.join(".bellwether/vault");
+    let folder = stub.join("ncdata/admin/files/Backups/bellwether");
     for dir in [
         vault.join("blobs/sha256/ab"),
         vault.join("runs"),
-        home.join(".config/bellwether"),
         stub.join("bin"),
-        stub.join("uploads"),
+        stub.join("ncdata/admin/files"),
         textfile.clone(),
     ] {
         std::fs::create_dir_all(dir)?;
@@ -1301,25 +1348,20 @@ fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
     ] {
         std::fs::write(vault.join(file), text)?;
     }
-    let password = home.join(".config/bellwether/nextcloud-app-password");
-    std::fs::write(&password, PASSWORD_FILE_TEXT)?;
-    std::fs::set_permissions(
-        &password,
-        std::fs::Permissions::from_mode(trouble.password_mode.unwrap_or(0o600)),
-    )?;
+    if !trouble.folder_absent {
+        std::fs::create_dir_all(&folder)?;
+        for name in seeded(trouble) {
+            std::fs::write(folder.join(name), "an old copy")?;
+        }
+    }
+    std::fs::write(stub.join("listed"), seeded(trouble).join("\n") + "\n")?;
     std::fs::write(textfile.join(BACKUP_PROM), OLD_BACKUP_METRICS)?;
     std::fs::hard_link(textfile.join(BACKUP_PROM), work.path().join("old-link"))?;
-    std::fs::write(stub.join("listed"), LISTED.join("\n") + "\n")?;
     executable(&stub.join("bin/docker"), BACKUP_DOCKER_STUB)?;
-    executable(&stub.join("bin/curl"), CURL_STUB)?;
     executable(&stub.join("bin/mv"), MV_STUB)?;
     let flag = |set: bool| if set { "yes" } else { "no" };
-    let url = if trouble.plain_http {
-        "http://cloud.example.test/"
-    } else {
-        NEXTCLOUD
-    };
-    let output = Command::new("/bin/sh")
+    let mut command = Command::new("/bin/sh");
+    command
         .arg(repo().join("deploy/systemd/newsvault-backup"))
         .env_clear()
         .env("HOME", &home)
@@ -1329,31 +1371,35 @@ fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
         )
         .env("NEWSVAULT_IMAGE", "newsvault:test")
         .env("NEWSVAULT_TEXTFILE_DIR", &textfile)
-        .env("NEXTCLOUD_URL", url)
-        .env("NEXTCLOUD_USER", "bellwether")
         .env("STUB_DIR", &stub)
-        .env("STUB_PUT_FAILS", flag(trouble.put_fails))
+        .env("STUB_FAIL", trouble.fail.unwrap_or("none"))
+        .env("STUB_SHORT_WRITE", flag(trouble.short_write))
         .env("STUB_LISTING_LACKS_NEW", flag(trouble.listing_lacks_new))
         .env(
             "STUB_DOCKER_EXIT",
             trouble.docker_exit.unwrap_or(0).to_string(),
         )
-        .env(
-            "STUB_MKCOL_CODE",
-            trouble.mkcol_status.unwrap_or(201).to_string(),
-        )
-        .stdin(Stdio::null())
-        .output()?;
-    let mut uploads = Vec::new();
-    for name in sorted_names(&stub.join("uploads"))? {
-        let bytes = std::fs::read(stub.join("uploads").join(&name))?;
-        uploads.push((name, bytes));
+        .stdin(Stdio::null());
+    for (key, value) in env_template()? {
+        if NC_SETTINGS.contains(&key.as_str()) {
+            command.env(key, value);
+        }
     }
-    let curl_args = read_or_empty(&stub.join("curl-args"))
-        .split("-- call\n")
-        .filter(|call| !call.is_empty())
-        .map(|call| call.lines().map(str::to_owned).collect())
-        .collect();
+    match trouble.setting {
+        Some((key, Some(value))) => command.env(key, value),
+        Some((key, None)) => command.env_remove(key),
+        None => &mut command,
+    };
+    let output = command.output()?;
+    let execs = lines_of(&stub.join("execs"));
+    let name = execs
+        .iter()
+        .find(|call| call.starts_with(EXEC_STDIN))
+        .and_then(|call| call.rsplit('/').next())
+        .and_then(|staged| staged.strip_prefix('.'))
+        .and_then(|staged| staged.strip_suffix(".partial"))
+        .unwrap_or_default()
+        .to_owned();
     Ok(Backed {
         exit: output.status.code(),
         output: format!(
@@ -1361,13 +1407,12 @@ fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         ),
-        calls: lines_of(&stub.join("calls")),
-        curl_args,
-        curl_config: read_or_empty(&stub.join("curl-config")),
-        curl_env: read_or_empty(&stub.join("curl-env")),
+        archive: std::fs::read(folder.join(&name)).unwrap_or_default(),
+        name,
+        execs,
         docker_args: lines_of(&stub.join("docker-args")),
         mv_args: lines_of(&stub.join("mv-args")),
-        uploads,
+        folder: sorted_names(&folder).unwrap_or_default(),
         metric: read_or_empty(&textfile.join(BACKUP_PROM)),
         old_link: read_or_empty(&work.path().join("old-link")),
         textfile: sorted_names(&textfile)?,
@@ -1375,7 +1420,7 @@ fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
     })
 }
 
-/// The uploaded archive's file members and the bytes of its `commit.sqlite3`, read with `tar`.
+/// The archive's file members and the bytes of its `commit.sqlite3`, read with `tar`.
 fn members(archive: &[u8]) -> Result<(Vec<String>, String), Box<dyn Error>> {
     let work = tempfile::TempDir::new()?;
     let (file, into) = (work.path().join("a.tar.gz"), work.path().join("into"));
@@ -1402,26 +1447,39 @@ fn members(archive: &[u8]) -> Result<(Vec<String>, String), Box<dyn Error>> {
     Ok((names, log))
 }
 
-/// MKCOL each folder, PUT one archive holding the snapshot as `commit.sqlite3` and every other
-/// store file but the live log, its journal and `LOCK`, then PROPFIND and DELETE all but the 7
-/// newest copies; a file of another shape stays.
+fn sorted(names: &[&str]) -> Vec<String> {
+    let mut names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+    names.sort();
+    names
+}
+
+/// One archive holding the snapshot as `commit.sqlite3` and every other store file but the live
+/// log, its journal and `LOCK`, written to a hidden name in the folder, renamed, scanned; then the
+/// oldest copies beyond 7 and a killed run's staging file deleted and the folder scanned again.
 #[test]
-fn the_backup_uploads_the_snapshot_and_the_store_then_keeps_the_seven_newest() -> TestResult {
+fn the_backup_writes_through_the_container_renames_scans_then_keeps_the_seven_newest() -> TestResult
+{
     let backed = backup(Trouble::default())?;
-    let (name, archive) = backed.uploads.first().cloned().unwrap_or_default();
-    let (names, log) = members(&archive)?;
-    let folder = format!("{DAV}/Backups/bellwether");
+    let (names, log) = members(&backed.archive)?;
+    let (dir, name) = (NC_DIR, &backed.name);
+    let mut kept = vec![name.as_str()];
+    kept.extend(&COPIES[2..]);
+    kept.extend(&OTHERS);
     assert_eq!(
-        (backed.exit, backed.calls, names, log),
+        (backed.exit, backed.execs, names, log, backed.folder),
         (
             Some(0),
             vec![
-                format!("MKCOL {DAV}/Backups/"),
-                format!("MKCOL {folder}/"),
-                format!("PUT {folder}/{name}"),
-                format!("PROPFIND {folder}/"),
-                format!("DELETE {folder}/{}", LISTED[0]),
-                format!("DELETE {folder}/{}", LISTED[1]),
+                format!("{EXEC} mkdir -p -- {dir}"),
+                format!("{EXEC_STDIN} {WRITE} {dir}/.{name}.partial"),
+                format!("{EXEC} mv -- {dir}/.{name}.partial {dir}/{name}"),
+                format!("{EXEC} {NC_SCAN}"),
+                format!("{EXEC} ls -1A -- {dir}"),
+                format!(
+                    "{EXEC} rm -f -- {dir}/{} {dir}/{} {dir}/{STALE_PARTIAL}",
+                    COPIES[0], COPIES[1]
+                ),
+                format!("{EXEC} {NC_SCAN}"),
             ],
             vec![
                 ".kept".to_owned(),
@@ -1430,6 +1488,7 @@ fn the_backup_uploads_the_snapshot_and_the_store_then_keeps_the_seven_newest() -
                 "runs/20261118T225500Z.json".to_owned(),
             ],
             SNAPSHOT_BYTES.to_owned(),
+            sorted(&kept),
         ),
         "{}",
         backed.output
@@ -1437,110 +1496,289 @@ fn the_backup_uploads_the_snapshot_and_the_store_then_keeps_the_seven_newest() -
     Ok(())
 }
 
-/// The app password reaches curl only as its escaped config on stdin: never in any argv, any
-/// environment, or the script's own output, a failed run's included.
+/// From an absent folder to 8 copies before the run, the folder ends with the 7 newest, the new
+/// copy among them; a run that deletes nothing scans once.
 #[test]
-fn the_app_password_reaches_curl_only_as_its_config_on_stdin() -> TestResult {
-    let backed = backup(Trouble::default())?;
-    let mut failed_outputs = Vec::new();
-    for trouble in [
-        Trouble {
-            mkcol_status: Some(500),
+fn the_folder_keeps_exactly_the_seven_newest_copies_whatever_it_held() -> TestResult {
+    let mut got = Vec::new();
+    for (copies, absent) in [(0, true), (5, false), (6, false), (7, false), (8, false)] {
+        let backed = backup(Trouble {
+            copies: Some(copies),
+            folder_absent: absent,
             ..Trouble::default()
-        },
-        Trouble {
-            put_fails: true,
-            ..Trouble::default()
-        },
-        Trouble {
-            listing_lacks_new: true,
-            ..Trouble::default()
-        },
-        Trouble {
-            password_mode: Some(0o640),
-            ..Trouble::default()
-        },
-    ] {
-        let failed = backup(trouble)?;
-        failed_outputs.push((failed.exit, failed.output.contains(PASSWORD)));
+        })?;
+        let scans = backed
+            .execs
+            .iter()
+            .filter(|call| call.ends_with(NC_SCAN))
+            .count();
+        got.push((copies, backed.exit, backed.folder.len(), scans));
     }
-    let in_argv = backed
-        .curl_args
-        .iter()
-        .flatten()
-        .chain(&backed.docker_args)
-        .chain(&backed.mv_args)
-        .filter(|word| word.contains(PASSWORD))
-        .count();
-    let configured = backed
-        .curl_args
-        .iter()
-        .all(|call| call.windows(2).any(|pair| pair == ["--config", "-"]));
+    let newest = backup(Trouble {
+        copies: Some(8),
+        ..Trouble::default()
+    })?;
+    let mut kept = vec![newest.name.as_str()];
+    kept.extend(&COPIES[2..]);
     assert_eq!(
+        (got, newest.folder),
         (
-            backed.exit,
-            in_argv,
-            backed.curl_env.contains(PASSWORD),
-            backed.output.contains(PASSWORD),
-            backed.curl_config.matches(PASSWORD_IN_CONFIG).count(),
-            configured,
-            failed_outputs,
-        ),
-        (
-            Some(0),
-            0,
-            false,
-            false,
-            6,
-            true,
             vec![
-                (Some(7), false),
-                (Some(7), false),
-                (Some(8), false),
-                (Some(2), false)
-            ]
+                (0, Some(0), 1, 1),
+                (5, Some(0), 6, 1),
+                (6, Some(0), 7, 1),
+                (7, Some(0), 7, 2),
+                (8, Some(0), 7, 2),
+            ],
+            sorted(&kept)
         )
     );
     Ok(())
 }
 
-/// Every request is `--proto =https`, none turns certificate checks off, and an `http://` URL is
-/// refused before any request.
+/// Every container call runs as `www-data`, only the write attaches stdin, and nothing runs
+/// privileged, as root or through `sudo`.
 #[test]
-fn every_backup_request_is_https_only_and_verifies_tls() -> TestResult {
+fn every_container_call_runs_as_www_data_and_only_the_write_reads_stdin() -> TestResult {
     let backed = backup(Trouble::default())?;
-    let unsafe_calls: Vec<String> = backed
-        .curl_args
+    let script = read("deploy/systemd/newsvault-backup")?;
+    let as_www: Vec<bool> = backed
+        .execs
         .iter()
-        .filter(|call| {
-            !call.windows(2).any(|pair| pair == ["--proto", "=https"])
-                || call.iter().any(|word| word == "-k" || word == "--insecure")
-        })
-        .map(|call| call.join(" "))
+        .map(|call| call.starts_with(&format!("{EXEC} ")))
         .collect();
-    let refused = backup(Trouble {
-        plain_http: true,
-        ..Trouble::default()
-    })?;
+    let with_stdin = backed
+        .execs
+        .iter()
+        .filter(|call| call.starts_with(&format!("{EXEC_STDIN} {WRITE} ")))
+        .count();
+    let forbidden = ["--privileged", "-u root", "--user root", "sudo", "-u 0"]
+        .iter()
+        .filter(|word| {
+            script.contains(*word) || backed.execs.iter().any(|call| call.contains(*word))
+        })
+        .count();
     assert_eq!(
+        (backed.exit, as_www, with_stdin, forbidden),
         (
-            backed.curl_args.len(),
-            unsafe_calls,
-            backed.curl_config.contains("insecure"),
-            refused.exit,
-            refused.calls.len()
-        ),
-        (6, Vec::<String>::new(), false, Some(2), 0)
+            Some(0),
+            vec![true, false, true, true, true, true, true],
+            1,
+            0
+        )
     );
     Ok(())
 }
 
-/// The metric is the archive's size and the snapshot's time, written to a hidden non-`.prom` file
-/// beside `newsvault-backup.prom` and renamed onto it: the old file's inode keeps the old text.
+/// A write whose byte count differs from the archive's size is never renamed: exit 7, its
+/// staging file removed, no copy deleted, the last metric kept.
 #[test]
-fn the_backup_writes_its_metric_through_a_hidden_file_renamed_after_the_upload() -> TestResult {
+fn a_short_write_is_never_renamed_and_its_staging_file_is_removed() -> TestResult {
+    let backed = backup(Trouble {
+        short_write: true,
+        ..Trouble::default()
+    })?;
+    let partial = format!(".{}.partial", backed.name);
+    let renames = backed
+        .execs
+        .iter()
+        .filter(|call| call.contains(" mv "))
+        .count();
+    assert_eq!(
+        (
+            backed.exit,
+            renames,
+            backed.folder.contains(&partial),
+            backed.folder.contains(&backed.name),
+            backed.folder.len(),
+            backed.metric,
+            backed.output.contains("not renamed"),
+        ),
+        (
+            Some(7),
+            0,
+            false,
+            false,
+            seeded(Trouble::default()).len(),
+            OLD_BACKUP_METRICS.to_owned(),
+            true
+        ),
+        "{}",
+        backed.output
+    );
+    Ok(())
+}
+
+/// A failed mkdir, write, rename or scan exits 7 naming its step, deletes no copy, leaves no
+/// staging file and keeps the last metric.
+#[test]
+fn a_failed_mkdir_write_rename_or_scan_exits_7_by_name_and_deletes_nothing() -> TestResult {
+    let mut got = Vec::new();
+    for (step, said) in [
+        ("mkdir", "creating"),
+        ("write", "writing"),
+        ("rename", "renaming"),
+        ("scan", "files:scan"),
+    ] {
+        let backed = backup(Trouble {
+            fail: Some(step),
+            ..Trouble::default()
+        })?;
+        let partial = format!(".{}.partial", backed.name);
+        let copies_left = COPIES
+            .iter()
+            .filter(|copy| backed.folder.contains(&(**copy).to_owned()))
+            .count();
+        got.push((
+            step,
+            backed.exit,
+            copies_left,
+            backed.folder.contains(&partial),
+            backed.metric == OLD_BACKUP_METRICS,
+            backed.output.contains(said),
+        ));
+    }
+    assert_eq!(
+        got,
+        vec![
+            ("mkdir", Some(7), 8, false, true, true),
+            ("write", Some(7), 8, false, true, true),
+            ("rename", Some(7), 8, false, true, true),
+            ("scan", Some(7), 8, false, true, true),
+        ]
+    );
+    Ok(())
+}
+
+/// The copy is in and scanned, so its metric is written; then a failed listing, a listing without
+/// the copy, a failed deletion or a failed second scan exits 8 naming its step. The first two
+/// delete nothing.
+#[test]
+fn a_failed_retention_exits_8_after_the_metric_and_a_bad_listing_deletes_nothing() -> TestResult {
+    let mut got = Vec::new();
+    for (trouble, said) in [
+        (
+            Trouble {
+                fail: Some("list"),
+                ..Trouble::default()
+            },
+            "failed; nothing deleted",
+        ),
+        (
+            Trouble {
+                listing_lacks_new: true,
+                ..Trouble::default()
+            },
+            "lacks",
+        ),
+        (
+            Trouble {
+                fail: Some("rm"),
+                ..Trouble::default()
+            },
+            "deleting",
+        ),
+        (
+            Trouble {
+                fail: Some("rescan"),
+                ..Trouble::default()
+            },
+            "after the deletion",
+        ),
+    ] {
+        let backed = backup(trouble)?;
+        let copies_left = COPIES
+            .iter()
+            .filter(|copy| backed.folder.contains(&(**copy).to_owned()))
+            .count();
+        got.push((
+            backed.exit,
+            copies_left,
+            backed.folder.contains(&backed.name),
+            backed.metric == OLD_BACKUP_METRICS,
+            backed.output.contains(said),
+        ));
+    }
+    assert_eq!(
+        got,
+        vec![
+            (Some(8), 8, true, false, true),
+            (Some(8), 8, true, false, true),
+            (Some(8), 8, true, false, true),
+            (Some(8), 6, true, false, true),
+        ]
+    );
+    Ok(())
+}
+
+/// Each Nextcloud setting is refused by name before any docker call when unset, empty, relative
+/// where a path must be absolute (or the reverse), holding `..`, an empty part, a trailing `/`, or
+/// a character outside letters, digits, `.`, `_` and `-`; a safe value of another shape runs.
+#[test]
+fn an_unsafe_nextcloud_setting_is_refused_by_name_before_any_docker_call() -> TestResult {
+    let unsafe_values: [(&str, Option<&str>); 18] = [
+        ("NEXTCLOUD_CONTAINER", None),
+        ("NEXTCLOUD_CONTAINER", Some("")),
+        ("NEXTCLOUD_CONTAINER", Some("--privileged")),
+        ("NEXTCLOUD_CONTAINER", Some("nextcloud/aio")),
+        ("NEXTCLOUD_DATA", Some("mnt/ncdata")),
+        ("NEXTCLOUD_DATA", Some("/mnt/../etc")),
+        ("NEXTCLOUD_DATA", Some("/")),
+        ("NEXTCLOUD_DATA", Some("/mnt/ncdata/")),
+        ("NEXTCLOUD_USER", Some("..")),
+        ("NEXTCLOUD_USER", Some("admin/files")),
+        ("NEXTCLOUD_FOLDER", Some("/Backups")),
+        ("NEXTCLOUD_FOLDER", Some("Backups/../../etc")),
+        ("NEXTCLOUD_FOLDER", Some("Backups//bellwether")),
+        ("NEXTCLOUD_FOLDER", Some("Back ups")),
+        ("NEXTCLOUD_FOLDER", Some("Backups/$(id)")),
+        ("NEXTCLOUD_FOLDER", Some("Backups/b*")),
+        ("NEXTCLOUD_FOLDER", Some("Backups/a\nb")),
+        ("NEXTCLOUD_FOLDER", Some("Backups/.hidden")),
+    ];
+    let mut refused = Vec::new();
+    for (key, value) in unsafe_values {
+        let backed = backup(Trouble {
+            setting: Some((key, value)),
+            ..Trouble::default()
+        })?;
+        refused.push((
+            key,
+            value,
+            backed.exit,
+            backed.docker_args.len() + backed.execs.len(),
+            backed.output.contains(key),
+        ));
+    }
+    let safe = backup(Trouble {
+        setting: Some(("NEXTCLOUD_FOLDER", Some("Backups/bell_wether-2.x"))),
+        ..Trouble::default()
+    })?;
+    let expected: Vec<_> = unsafe_values
+        .iter()
+        .map(|(key, value)| (*key, *value, Some(2), 0, true))
+        .collect();
+    assert_eq!(
+        (
+            refused,
+            safe.exit,
+            safe.execs
+                .first()
+                .cloned()
+                .unwrap_or_default()
+                .ends_with(&format!("{NC_DATA}/admin/files/Backups/bell_wether-2.x"))
+        ),
+        (expected, Some(0), true)
+    );
+    Ok(())
+}
+
+/// The metric is the archive's size and the snapshot's time, written after the scan to a hidden
+/// non-`.prom` file beside `newsvault-backup.prom` and renamed onto it: the old inode keeps the
+/// old text.
+#[test]
+fn the_backup_writes_its_metric_through_a_hidden_file_renamed_after_the_scan() -> TestResult {
     let backed = backup(Trouble::default())?;
-    let size = backed.uploads.first().map_or(0, |(_, bytes)| bytes.len());
     let at: Option<i64> = backed
         .metric
         .lines()
@@ -1549,9 +1787,11 @@ fn the_backup_writes_its_metric_through_a_hidden_file_renamed_after_the_upload()
     let hidden = moved_beside(&backed.mv_args, BACKUP_PROM);
     assert_eq!(
         (
-            backed
-                .metric
-                .contains(&format!("newsvault_backup_last_success_bytes {size}\n")),
+            backed.metric.contains(&format!(
+                "newsvault_backup_last_success_bytes {}\n",
+                backed.archive.len()
+            )),
+            backed.archive.is_empty(),
             at.is_some_and(|at| (Utc::now().timestamp() - at).abs() < AT_TOLERANCE_S),
             backed.old_link,
             hidden,
@@ -1559,6 +1799,7 @@ fn the_backup_writes_its_metric_through_a_hidden_file_renamed_after_the_upload()
         ),
         (
             true,
+            false,
             true,
             OLD_BACKUP_METRICS.to_owned(),
             true,
@@ -1592,70 +1833,16 @@ fn moved_beside(args: &[String], target: &str) -> bool {
         })
 }
 
-/// A failed PUT exits 7 and keeps the last metric; a listing without the new copy exits 8 after
-/// its metric. Neither deletes anything.
+/// A refused snapshot ends the run with the snapshot's exit and no container call.
 #[test]
-fn a_failed_upload_or_a_listing_without_the_copy_deletes_nothing_and_exits_by_name() -> TestResult {
-    let put = backup(Trouble {
-        put_fails: true,
-        ..Trouble::default()
-    })?;
-    let listing = backup(Trouble {
-        listing_lacks_new: true,
-        ..Trouble::default()
-    })?;
-    let deletes = |calls: &[String]| {
-        calls
-            .iter()
-            .filter(|call| call.starts_with("DELETE "))
-            .count()
-    };
-    assert_eq!(
-        (
-            put.exit,
-            deletes(&put.calls),
-            put.metric,
-            listing.exit,
-            deletes(&listing.calls),
-            listing.metric == OLD_BACKUP_METRICS,
-        ),
-        (Some(7), 0, OLD_BACKUP_METRICS.to_owned(), Some(8), 0, false)
-    );
-    Ok(())
-}
-
-/// A password file others or the group may read or write refuses the run before any request; a
-/// refused snapshot ends it with the snapshot's exit and no request.
-#[test]
-fn a_shared_password_file_or_a_refused_snapshot_stops_before_any_request() -> TestResult {
-    let mut shared = Vec::new();
-    for mode in [0o644, 0o620, 0o602] {
-        let backed = backup(Trouble {
-            password_mode: Some(mode),
-            ..Trouble::default()
-        })?;
-        shared.push((
-            format!("{mode:o}"),
-            backed.exit,
-            backed.calls.len(),
-            backed.docker_args.len(),
-        ));
-    }
+fn a_refused_snapshot_stops_before_any_container_call() -> TestResult {
     let refused = backup(Trouble {
         docker_exit: Some(7),
         ..Trouble::default()
     })?;
     assert_eq!(
-        (shared, refused.exit, refused.calls.len()),
-        (
-            vec![
-                ("644".to_owned(), Some(2), 0, 0),
-                ("620".to_owned(), Some(2), 0, 0),
-                ("602".to_owned(), Some(2), 0, 0),
-            ],
-            Some(7),
-            0
-        )
+        (refused.exit, refused.execs, refused.metric),
+        (Some(7), Vec::<String>::new(), OLD_BACKUP_METRICS.to_owned())
     );
     Ok(())
 }
@@ -1668,7 +1855,15 @@ fn every_run_removes_its_staging_copy_whether_it_succeeds_or_fails() -> TestResu
     for trouble in [
         Trouble::default(),
         Trouble {
-            put_fails: true,
+            fail: Some("write"),
+            ..Trouble::default()
+        },
+        Trouble {
+            short_write: true,
+            ..Trouble::default()
+        },
+        Trouble {
+            fail: Some("scan"),
             ..Trouble::default()
         },
         Trouble {
@@ -1687,6 +1882,8 @@ fn every_run_removes_its_staging_copy_whether_it_succeeds_or_fails() -> TestResu
         left,
         vec![
             (Some(0), Vec::new()),
+            (Some(7), Vec::new()),
+            (Some(7), Vec::new()),
             (Some(7), Vec::new()),
             (Some(8), Vec::new()),
             (Some(7), Vec::new()),
