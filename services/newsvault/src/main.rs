@@ -15,6 +15,7 @@ use newsvault::cmd_collect::{self, CollectRunError};
 use newsvault::cmd_items;
 use newsvault::cmd_ledger::{self, Ask, LedgerReadError, Report};
 use newsvault::cmd_robots::{self, RobotsError};
+use newsvault::contact::{self, ContactError};
 use newsvault::lake::{Day, LakeError, LakeReader};
 use newsvault::publish::{publish_run, Fsync, PublishError};
 use newsvault::store::{Committer, StoreError};
@@ -272,6 +273,9 @@ fn prefix_of(failure: &anyhow::Error) -> &'static str {
         || failure
             .downcast_ref::<RobotsError>()
             .is_some_and(RobotsError::is_usage)
+        || failure
+            .downcast_ref::<ContactError>()
+            .is_some_and(ContactError::is_usage)
     {
         "usage error"
     } else {
@@ -328,6 +332,12 @@ fn exit_code(failure: &anyhow::Error) -> u8 {
                 | open_web_feed::Refusal::NoHostAdmitted(_),
             ) => EXIT_NOT_FOUND,
             RobotsError::Store(StoreError::LeaseHeld(_)) => EXIT_LEASE_HELD,
+            _ => EXIT_USAGE,
+        };
+    }
+    if let Some(refused) = failure.downcast_ref::<ContactError>() {
+        return match refused {
+            ContactError::FileAbsent { .. } => EXIT_NOT_FOUND,
             _ => EXIT_USAGE,
         };
     }
@@ -445,7 +455,7 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 hosts,
                 rules,
                 lag_policy,
-                contact: contact(registered),
+                contact: contact(registered)?,
                 at: match at {
                     Some(raw) => instant(&raw, "--at"),
                     None => clock.now(),
@@ -493,7 +503,7 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 hosts,
                 rules,
                 store: vault_root(store),
-                contact: contact(registered),
+                contact: contact(registered)?,
                 dry_run,
             };
             let feed = cmd_robots::open(&ask)?;
@@ -571,11 +581,15 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
     }
 }
 
-/// The User-Agent's contact address, from the chosen provider's own variable. It comes from the
-/// environment and never from a flag, so it is not in a process listing; an unset variable reads
-/// as empty and the provider refuses it at startup as `credential_contact_missing`.
-fn contact(registered: cmd_collect::Registered) -> String {
-    std::env::var(registered.contact_variable()).unwrap_or_default()
+/// The User-Agent's contact address, from the chosen provider's own variable or the file its
+/// `_FILE` twin names; never from a flag, so it is not in a process listing. Neither set reads as
+/// empty, which the provider refuses at startup as `credential_contact_missing`.
+fn contact(registered: cmd_collect::Registered) -> Result<String, ContactError> {
+    contact::read(
+        registered.contact_variable(),
+        registered.contact_file_variable(),
+        |name| std::env::var_os(name),
+    )
 }
 
 fn emit_collect(envelope: &serde_json::Value, format: Format) -> anyhow::Result<()> {
@@ -910,6 +924,12 @@ fn emit(day: &Day, before_cutoff: usize, format: Format) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One text for both `_FILE` variables, so the two cannot describe one rule two ways.
+const CONTACT_FILE_DOC: &str = "a file holding the contact instead, one trailing newline removed; \
+    set with its variable: invalid_argument (2); absent: input_absent (4); unreadable or not UTF-8: \
+    io_failed (2); empty: credential_contact_missing (2); a control character left: \
+    input_unparseable (2)";
+
 fn print_schema(format: Format) {
     let doc = serde_json::json!({
         "schema": "newsvault.schema/1",
@@ -1003,8 +1023,12 @@ fn print_schema(format: Format) {
                 ],
                 "env": [{"name": "BELLWETHER_SEC_CONTACT", "source": "edgar_press",
                          "doc": "the contact address SEC requires in the User-Agent"},
+                        {"name": "BELLWETHER_SEC_CONTACT_FILE", "source": "edgar_press",
+                         "doc": CONTACT_FILE_DOC},
                         {"name": "BELLWETHER_FEED_CONTACT", "source": "open_web_wires",
-                         "doc": "the contact address the open-web User-Agent carries"}],
+                         "doc": "the contact address the open-web User-Agent carries"},
+                        {"name": "BELLWETHER_FEED_CONTACT_FILE", "source": "open_web_wires",
+                         "doc": CONTACT_FILE_DOC}],
                 "output": cmd_collect::SCHEMA,
                 "mutates": true
             },
@@ -1058,6 +1082,8 @@ fn print_schema(format: Format) {
                 ],
                 "env": [{"name": "BELLWETHER_FEED_CONTACT", "source": "open_web_wires",
                          "doc": "the contact address the open-web User-Agent carries"},
+                        {"name": "BELLWETHER_FEED_CONTACT_FILE", "source": "open_web_wires",
+                         "doc": CONTACT_FILE_DOC},
                         {"name": "BELLWETHER_VAULT",
                          "doc": "the store when --store is not given, then ~/.bellwether/vault"}],
                 "output": cmd_robots::SCHEMA,

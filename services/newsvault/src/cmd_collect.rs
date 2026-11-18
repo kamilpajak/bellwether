@@ -357,6 +357,15 @@ impl Registered {
         }
     }
 
+    /// The `_FILE` twin of [`Self::contact_variable`], naming a file that holds the contact.
+    #[must_use]
+    pub const fn contact_file_variable(self) -> &'static str {
+        match self {
+            Self::EdgarPress => "BELLWETHER_SEC_CONTACT_FILE",
+            Self::OpenWebWires => "BELLWETHER_FEED_CONTACT_FILE",
+        }
+    }
+
     /// What the provider's `cadence()` returns once opened, known before any file is read so a
     /// usage error is never hidden behind an absent input: review 2026-11-15 measured exit 4 for
     /// a run that was missing `--calendar` and also named an absent roster.
