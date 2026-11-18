@@ -75,6 +75,9 @@ pub struct Ask {
     pub lag_policy: Option<PathBuf>,
     pub contact: String,
     pub at: DateTime<Utc>,
+    /// The last instant a request may be sent at (condition A); `None` sends every request.
+    /// Given by the caller until architecture.md section 11.5 step 7 PR 4 computes it (S7-D3).
+    pub deadline: Option<DateTime<Utc>>,
     pub dry_run: bool,
 }
 
@@ -109,6 +112,19 @@ pub enum CollectRunError {
     /// 02:00Z planned the next UTC day (review 2026-11-15).
     #[error("{source_id} plans session days and takes no --window today; name the day")]
     TodayRefused { source_id: &'static str },
+    /// A deadline at or before `--at` would defer every request before the first is asked.
+    #[error("--deadline {deadline} is not after --at {at}")]
+    DeadlineNotAfterAt {
+        deadline: DateTime<Utc>,
+        at: DateTime<Utc>,
+    },
+    /// S7-D2: the deadline bounds the run's wall time, so one the clock has reached would defer
+    /// every request too; `--at` may lie in the past, so the check above does not catch it.
+    #[error("--deadline {deadline} is not after the clock's {now}")]
+    DeadlineNotAfterNow {
+        deadline: DateTime<Utc>,
+        now: DateTime<Utc>,
+    },
     #[error("no {what} at {path}")]
     InputAbsent { what: &'static str, path: PathBuf },
     #[error("the calendar at {path} is unusable: {why}")]
@@ -213,6 +229,8 @@ impl CollectRunError {
             | Self::FlagRefused { .. }
             | Self::AtIsNotTheClockDay { .. }
             | Self::TodayRefused { .. }
+            | Self::DeadlineNotAfterAt { .. }
+            | Self::DeadlineNotAfterNow { .. }
             | Self::WindowRefused(_) => true,
             Self::InputAbsent { .. }
             | Self::UnusableCalendar { .. }
@@ -826,6 +844,7 @@ pub fn drive<A: Archive>(
             calendar: calendar.as_ref(),
             listing: listing.as_ref(),
             at: ObservationTime::new(ask.at),
+            deadline: ask.deadline,
         },
     )
     .map_err(CollectRunError::of_driver)?;
@@ -853,11 +872,21 @@ pub fn run(
     let provider = opened.provider.as_ref();
     let run_id = run_id(ask);
     let run_date = ask.at.date_naive();
+    if let Some(deadline) = ask.deadline.filter(|deadline| *deadline <= ask.at) {
+        return Err(CollectRunError::DeadlineNotAfterAt {
+            deadline,
+            at: ask.at,
+        });
+    }
     if ask.dry_run {
         return planned(ask, opened, &run_id, run_date);
     }
+    let now = clock.now();
+    if let Some(deadline) = ask.deadline.filter(|deadline| *deadline <= now) {
+        return Err(CollectRunError::DeadlineNotAfterNow { deadline, now });
+    }
     // A dry run may name another day, which tests and plans need; a fetch may not.
-    let today = clock.now().date_naive();
+    let today = now.date_naive();
     if provider.cadence() == Cadence::EveryUtcDay && run_date != today {
         return Err(CollectRunError::AtIsNotTheClockDay {
             source_id: opened.registered.source(),
@@ -1518,6 +1547,7 @@ fn envelope_of(
         "observation_lag_probe_id": opened.lag.as_ref().map(|lag| lag.probe_id.clone()),
         "observation_lag_seconds": opened.lag.as_ref().map(|lag| lag.seconds),
         "at": ask.at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        "deadline": ask.deadline.map(micros),
         "dry_run": ask.dry_run,
         "plan": {
             "requests": collected.planned_requests,
@@ -1538,6 +1568,13 @@ fn envelope_of(
             "story_id": row.story_id,
             "listed_date": row.listed_date,
             "reason": row.reason.name(),
+            "go_at": row.go_at.map(micros),
+        })).collect::<Vec<Value>>(),
+        // S7-D7: answers whose Retry-After was past the 24 h ceiling, each host held to it.
+        "holds_capped": collected.capped_holds.iter().map(|hold| json!({
+            "host": hold.host,
+            "retry_after": hold.retry_after,
+            "held_until": micros(hold.held_until),
         })).collect::<Vec<Value>>(),
         "attempts": collected.attempts.iter().map(|row| json!({
             "attempt_id": row.attempt_id,
@@ -1587,6 +1624,10 @@ fn envelope_of(
             "retryable": exit.retryable(),
         },
     })
+}
+
+fn micros(at: DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
 /// The mix of retrieval models this run read under, because two of them are two populations
@@ -1691,18 +1732,21 @@ pub fn render_human(envelope: &Value, out: &mut impl std::io::Write) -> std::io:
         envelope["swept"].as_array().map_or(0, Vec::len)
     )?;
     let deferred = envelope["deferred"].as_array().unwrap_or(&none);
-    let by_reason = |reason: DeferReason| {
-        deferred
-            .iter()
-            .filter(|row| text(row, "reason") == reason.name())
-            .count()
-    };
+    let by_reason: String = DeferReason::ALL
+        .iter()
+        .map(|reason| {
+            let rows = deferred
+                .iter()
+                .filter(|row| text(row, "reason") == reason.name())
+                .count();
+            format!(" {} {rows}", reason.name())
+        })
+        .collect();
+    writeln!(out, "deferred         {}{by_reason}", deferred.len())?;
     writeln!(
         out,
-        "deferred         {} {} {}",
-        deferred.len(),
-        DeferReason::FollowUpCap.name(),
-        by_reason(DeferReason::FollowUpCap)
+        "holds capped     {}",
+        envelope["holds_capped"].as_array().map_or(0, Vec::len)
     )?;
     writeln!(out, "exit             {}", envelope["exit"]["code"])?;
     Ok(())
