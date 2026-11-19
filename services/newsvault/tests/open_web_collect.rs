@@ -5738,6 +5738,42 @@ fn deferred_requests_open_no_attempt_and_every_reader_counts_each_reason_apart()
     Ok(())
 }
 
+/// §8 row R22 at the deadline: GNW's and the Fed's stopped release (`run_deadline`) and PRN's
+/// releases stopped behind its sitemap (`host_held`, the rest of its lane) each name the index
+/// attempt that listed them; the sitemap, an `Index` follow-up, names none.
+#[test]
+fn requests_stopped_at_the_deadline_keep_the_index_that_listed_them() -> TestResult {
+    let (root, _, _) = held_and_paced_run()?;
+    let db = Connection::open_with_flags(
+        root.path().join(COMMIT_LOG),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let rows: Vec<(String, String, Option<String>)> = db
+        .prepare(
+            "SELECT d.reason, d.host, p.url FROM deferred d
+               LEFT JOIN payloads p ON p.attempt_id = d.listed_by
+              ORDER BY d.rowid",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    let row = |reason: &str, host: &str, index: Option<&str>| {
+        (reason.to_owned(), host.to_owned(), index.map(str::to_owned))
+    };
+    let prn_release = row("host_held", PRN_HOST, Some(PRN_INDEX));
+    assert_eq!(
+        rows,
+        vec![
+            row("host_held", PRN_HOST, None),
+            prn_release.clone(),
+            prn_release.clone(),
+            prn_release,
+            row("run_deadline", GNW_HOST, Some(INDEX)),
+            row("run_deadline", "www.federalreserve.gov", Some(FED_INDEX)),
+        ]
+    );
+    Ok(())
+}
+
 /// S7-D3 by default: with no `--deadline` an open-web run at 09:30:30 belongs to the 09:30 slot
 /// (90 min, next 11:00) and every reservation, one per send and PRN's stopped one, carries its
 /// deadline, 10:14:30; PRN, held to 11:30:30, is stopped `host_held` with its lane.
@@ -7181,6 +7217,38 @@ fn a_document_names_the_index_attempt_that_listed_it_and_a_carried_one_its_first
                 (next_run, 0, None, 1, Some(5_400.0), 0),
             ]
         )
+    );
+    Ok(())
+}
+
+/// §8 row R22 on a retry inside one run: GNW release 0 answers 503, then 200, and both of its
+/// attempt rows name the GNW index attempt that listed it.
+#[test]
+fn a_retried_document_names_its_listing_on_every_attempt() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let retried = release_url(0)?;
+    let exchange = Gnw::day()?.answering(&retried, &[UNAVAILABLE]);
+    poll(root.path(), RUN_AT, "first", &exchange)?;
+    let index = attempt_of_url(root.path(), INDEX)?;
+    let db = Connection::open_with_flags(
+        root.path().join(COMMIT_LOG),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let (key, _, _, _) = RELEASES.first().ok_or("no release")?;
+    let story = digest(canon::digest::story_id(SOURCE, &keyed(key))).ok_or("story id")?;
+    let rows: Vec<(Option<i64>, Option<String>)> = db
+        .prepare(
+            "SELECT transport_status, listed_by FROM attempts WHERE story_id = ?1 ORDER BY rowid",
+        )?
+        .query_map([&story], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(
+        rows,
+        vec![
+            (Some(i64::from(UNAVAILABLE)), Some(index.clone())),
+            (Some(200), Some(index)),
+        ]
     );
     Ok(())
 }
