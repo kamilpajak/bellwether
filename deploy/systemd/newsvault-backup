@@ -8,6 +8,10 @@
 set -u
 export LC_ALL=C
 : "${NEWSVAULT_IMAGE:?set in newsvault.env}" "${NEWSVAULT_TEXTFILE_DIR:?set in newsvault.env}"
+case $NEWSVAULT_TEXTFILE_DIR in
+    /*) ;;
+    *) echo "NEWSVAULT_TEXTFILE_DIR is not an absolute path: '$NEWSVAULT_TEXTFILE_DIR'" >&2; exit 2 ;;
+esac
 keep=7
 vault="$HOME/.bellwether/vault"
 copy='bellwether-vault-[0-9]\{8\}T[0-9]\{6\}Z\.tar\.gz'

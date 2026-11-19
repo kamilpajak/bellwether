@@ -47,6 +47,8 @@ pub struct CrossCheck {
     /// `cross_checked` rows whose key's own direct index has no parsed answer after their minute
     /// closed: "we did not look", never "not listed".
     pub not_looked: u32,
+    /// `cross_checked` rows whose key's host is a candidate row: no direct index to compare with.
+    pub no_direct_index: u32,
     pub listed_directly: u32,
     pub unlisted: Vec<Unlisted>,
     /// Distinct normalised titles the readable direct payloads listed.
@@ -56,7 +58,7 @@ pub struct CrossCheck {
 }
 
 /// The keyed row's rule, every admitted direct row's index url with its rule, and each
-/// `cross_check` key's own direct index url.
+/// `cross_check` key's own direct index url, absent for a key whose host is not admitted.
 #[derive(Debug, Clone)]
 pub struct CrossChecker {
     index_url: String,
@@ -103,7 +105,7 @@ impl CrossChecker {
             .checked_sub_signed(DIRECT_LEAD)
     }
 
-    /// The earliest minute a `cross_check` row of `keyed` is listed at.
+    /// The earliest minute a `cross_check` row of `keyed` with a direct index is listed at.
     #[must_use]
     pub fn earliest_cross_checked(&self, keyed: &[u8]) -> Option<DateTime<Utc>> {
         index_rows(keyed, &self.rule)?
@@ -112,7 +114,7 @@ impl CrossChecker {
                 row.image
                     .as_deref()
                     .and_then(|image| self.keys.key_of(image))
-                    .is_some_and(|key| self.keys.cross_check.contains_key(key))
+                    .is_some_and(|key| self.index_of.contains_key(key))
             })
             .filter_map(|row| minute_of(row.valid_raw.as_deref()?, &self.rule.valid_format))
             .map(|minute| minute.start())
@@ -159,6 +161,7 @@ impl CrossChecker {
             no_key: 0,
             not_compared: 0,
             not_looked: 0,
+            no_direct_index: 0,
             listed_directly: 0,
             unlisted: Vec::new(),
             direct_titles: u32::try_from(listed.len()).unwrap_or(u32::MAX),
@@ -182,16 +185,17 @@ impl CrossChecker {
                 continue;
             }
             checked.cross_checked += 1;
+            let Some(own) = self.index_of.get(key) else {
+                checked.no_direct_index += 1;
+                continue;
+            };
             let minute = row
                 .valid_raw
                 .as_deref()
                 .and_then(|raw| minute_of(raw, &self.rule.valid_format));
             let watched = minute
                 .is_some_and(|minute| watched_from.is_some_and(|from| minute.start() >= from));
-            let looked_until = self
-                .index_of
-                .get(key)
-                .and_then(|url| newest.get(url.as_str()));
+            let looked_until = newest.get(own.as_str());
             let looked = minute
                 .and_then(|minute| minute.closes())
                 .is_some_and(|closes| looked_until.is_some_and(|until| *until >= closes));

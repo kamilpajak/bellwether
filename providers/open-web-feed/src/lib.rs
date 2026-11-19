@@ -1,8 +1,7 @@
 //! Our own forward news feed: dated indexes and article pages from admitted hosts, collected live
-//! for the run's UTC day only. The design is `docs/design/architecture.md` section 11; GNW, PR
-//! Newswire, Canada Newswire, the Federal Reserve and Yahoo Finance's wire keys are the admitted
-//! hosts (section 11.5 steps 2 and 6). It declares no HTTP dependency and holds no clock and no
-//! `Sink`.
+//! for the run's UTC day only. The design is `docs/design/architecture.md` section 11; the hosts
+//! file names which hosts are admitted (section 11.2). It declares no HTTP dependency and holds no
+//! clock and no `Sink`.
 
 mod crosscheck;
 mod depth;
@@ -156,12 +155,12 @@ pub enum Refusal {
         rule: String,
         format: String,
     },
-    /// Section 11.2: a `cross_check` key's rows are "not looked" until its host's index answers,
-    /// so a host no other admitted row holds would leave them unlooked forever.
+    /// Section 11.2: a key's host must be another hosts row; a candidate row's key is counted as
+    /// having no direct index, and a host no row names is refused, never counted that way.
     #[error(
-        "the rules at {path} map rule {rule}'s cross_check key {key} to {host}, which no other admitted hosts row holds"
+        "the rules at {path} map rule {rule}'s cross_check key {key} to {host}, which no other hosts row names"
     )]
-    CrossCheckHostNotAdmitted {
+    CrossCheckHostUnknown {
         path: PathBuf,
         rule: String,
         key: String,
@@ -316,7 +315,7 @@ impl OpenWebFeed {
             }
         })?;
         let hosts = read_hosts(hosts, &parsed)?;
-        cross_checked_hosts_admitted(&hosts, &parsed, rules)?;
+        cross_checked_hosts_named(&hosts, &parsed, rules)?;
         let released = hosts
             .rows
             .iter()
@@ -438,7 +437,8 @@ impl OpenWebFeed {
     }
 
     /// The first admitted row whose rule names `cross_check` keys, against every other admitted
-    /// row's index (section 11.2, option C); `None` when no rule names one.
+    /// row's index (section 11.2, option C); `None` when no rule names one. A key whose host is a
+    /// candidate row has no index here.
     #[must_use]
     pub fn cross_checker(&self) -> Option<CrossChecker> {
         let (keyed, rule, keys) = self.hosts.admitted().find_map(|row| {
@@ -1112,8 +1112,9 @@ pub(crate) fn known_fields(
     }
 }
 
-/// Every `cross_check` host of an admitted row's rule is another admitted row's host.
-fn cross_checked_hosts_admitted(
+/// Every `cross_check` host of an admitted row's rule is another hosts row's host, admitted or
+/// candidate.
+fn cross_checked_hosts_named(
     hosts: &Hosts,
     rules: &BTreeMap<String, Rule>,
     path: &Path,
@@ -1126,11 +1127,12 @@ fn cross_checked_hosts_admitted(
             continue;
         };
         for (key, host) in &keys.cross_check {
-            let admitted = hosts
-                .admitted()
+            let named = hosts
+                .rows
+                .iter()
                 .any(|row| row.host == *host && row.host != keyed.host);
-            if !admitted {
-                return Err(Refusal::CrossCheckHostNotAdmitted {
+            if !named {
+                return Err(Refusal::CrossCheckHostUnknown {
                     path: path.to_path_buf(),
                     rule: keyed.rule.clone(),
                     key: key.clone(),

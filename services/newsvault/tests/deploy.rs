@@ -2132,3 +2132,75 @@ fn the_unit_result_names_success_and_the_exit_status_through_a_renamed_hidden_fi
     );
     Ok(())
 }
+
+/// The scripts that write node-exporter textfiles, each with the arguments its unit passes.
+const TEXTFILE_SCRIPTS: [(&str, &[&str]); 3] = [
+    ("deploy/systemd/newsvault-watchdog", &[]),
+    ("deploy/systemd/newsvault-unit-result", &["collect"]),
+    ("deploy/systemd/newsvault-backup", &[]),
+];
+
+/// The template's textfile directory is a placeholder, since installs differ: each script refuses
+/// it by name with exit 2 before docker runs or a file is written. Mutations 2026-11-19, each
+/// script's check removed and the template a path again: each red.
+#[test]
+fn the_templates_textfile_placeholder_is_refused_by_every_script_before_it_runs() -> TestResult {
+    let template = env_template()?;
+    let placeholder = template
+        .iter()
+        .find(|(key, _)| key == "NEWSVAULT_TEXTFILE_DIR")
+        .map(|(_, value)| value.clone())
+        .ok_or("the template sets no NEWSVAULT_TEXTFILE_DIR")?;
+    let mut seen = Vec::new();
+    for (script, args) in TEXTFILE_SCRIPTS {
+        let work = tempfile::TempDir::new()?;
+        let (stub, cwd, home) = (
+            work.path().join("bin"),
+            work.path().join("cwd"),
+            work.path().join("home"),
+        );
+        for dir in [&stub, &cwd, &home.join(".bellwether/vault")] {
+            std::fs::create_dir_all(dir)?;
+        }
+        let called = work.path().join("docker-called");
+        executable(
+            &stub.join("docker"),
+            &format!("#!/bin/sh\ntouch '{}'\n", called.display()),
+        )?;
+        let text = read(script)?.replace(
+            WATCHDOG_DOCKER,
+            &format!("{} run", stub.join("docker").display()),
+        );
+        let copy = work.path().join("script");
+        std::fs::write(&copy, text)?;
+        let mut command = Command::new(UNIT_SHELL);
+        command
+            .arg(&copy)
+            .args(args)
+            .current_dir(&cwd)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", format!("{}:/usr/bin:/bin", stub.display()))
+            .env("NEWSVAULT_IMAGE", "newsvault:test")
+            .env("SERVICE_RESULT", "success")
+            .stdin(Stdio::null());
+        for (key, value) in &template {
+            command.env(key, value);
+        }
+        command.env("NEXTCLOUD_USER", NC_USER);
+        let output = command.output()?;
+        seen.push((
+            script,
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).contains("NEWSVAULT_TEXTFILE_DIR"),
+            called.exists(),
+            sorted_names(&cwd)?,
+        ));
+    }
+    let expected: Vec<_> = TEXTFILE_SCRIPTS
+        .iter()
+        .map(|(script, _)| (*script, Some(2), true, false, Vec::<String>::new()))
+        .collect();
+    assert_eq!((placeholder.starts_with('/'), seen), (false, expected));
+    Ok(())
+}
