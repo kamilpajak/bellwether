@@ -5289,3 +5289,111 @@ fn a_deferred_document_is_rebuilt_as_its_request_and_a_walk_id_is_known_by_its_u
     );
     Ok(())
 }
+
+// ---- ticker-first (owner decision 2026-11-19, section 11.2) ----
+
+/// Each follow-up's url tail (its release id), phase and `names_ticker`.
+fn named_tickers(extracted: &Extracted) -> Vec<(String, RequestPhase, bool)> {
+    extracted
+        .follow_ups
+        .iter()
+        .map(|follow_up| {
+            let tail = follow_up.url.rsplit(['-', '=']).next().unwrap_or_default();
+            (tail.to_owned(), follow_up.phase, follow_up.names_ticker)
+        })
+        .collect()
+}
+
+/// A PRN sitemap row with a non-empty `news:stock_tickers` marks its follow-up; a row with none,
+/// one whose element is blank and every PRN RSS row do not (the RSS names no ticker). Real `sitemap_p1_1200.xml` (2 of 3 rows name one). Mutations 2026-11-19:
+/// `names_ticker: false` in `index_rows_of`: red; the sitemap's non-empty check dropped: red.
+#[test]
+fn a_prn_sitemap_row_naming_stock_tickers_marks_its_follow_up_and_nothing_else_does() -> Outcome {
+    let provider = provider()?;
+    let sitemap = prn_sitemap_request(&provider)?;
+    let page = prn("sitemap_p1_1200.xml");
+    let emptied = String::from_utf8(page.clone())?.replacen("NYSE:DBI", " ", 1);
+    let rss = provider.extract(&prn_index_request(&provider)?, &blob(prn(PRN_REAL_INDEX)));
+    let document = RequestPhase::Document;
+    let row = |id: &str, named: bool| (format!("{id}.html"), document, named);
+    assert_eq!(
+        (
+            named_tickers(&provider.extract(&sitemap, &blob(page))),
+            named_tickers(&provider.extract(&sitemap, &blob(emptied.into_bytes()))),
+            rss.follow_ups
+                .iter()
+                .any(|follow_up| follow_up.names_ticker),
+            rss.follow_ups.len(),
+        ),
+        (
+            vec![
+                row("302941008", true),
+                row("302941554", true),
+                row("302941908", false),
+            ],
+            vec![
+                row("302941008", false),
+                row("302941554", true),
+                row("302941908", false),
+            ],
+            false,
+            3,
+        )
+    );
+    Ok(())
+}
+
+/// A GNW RSS item with a `category` of the form `Exchange:SYMBOL` marks its follow-up; an item whose
+/// only category is a subject, and one with none, do not. No committed GNW payload holds a
+/// `category`, so the real `rssfeed_3_items.xml` gets two inserted. Mutations 2026-11-19: the RSS
+/// arm `names_ticker: false`: red; `is_ticker_category` always true: red.
+#[test]
+fn a_gnw_item_whose_category_names_an_exchange_and_symbol_marks_its_follow_up() -> Outcome {
+    let provider = provider()?;
+    let pub_date = |minute: &str| format!("<pubDate>Sat, 14 Nov 2026 {minute} GMT</pubDate>");
+    let rss = String::from_utf8(gnw(REAL_INDEX))?
+        .replacen(
+            &pub_date("19:00"),
+            &format!("{}<category>Sports</category>", pub_date("19:00")),
+            1,
+        )
+        .replacen(
+            &pub_date("18:45"),
+            &format!("{}<category>Nasdaq:FRVO</category>", pub_date("18:45")),
+            1,
+        );
+    let marked: Vec<bool> = follow_ups(&provider, rss.as_bytes())?
+        .follow_ups
+        .iter()
+        .map(|follow_up| follow_up.names_ticker)
+        .collect();
+    assert_eq!(marked, vec![false, true, false]);
+    Ok(())
+}
+
+/// No index row stands behind a GNW walk id or a carried request, so neither names a ticker, nor
+/// does a planned index. Mutations 2026-11-19: `names_ticker: true` in `walk_of`: red; in
+/// `carried`: red.
+#[test]
+fn a_walk_id_a_carried_request_and_a_planned_index_name_no_ticker() -> Outcome {
+    let feed = walking(after_the_first_poll(&[])?)?;
+    let request = gnw_index_on(&feed, WALK_DAY, WALK_AT)?;
+    let extracted = feed.extract(&request, &blob(gnw(RSS_1205)));
+    let carried = feed
+        .carried(
+            &TargetWindow::new(WALK_DAY),
+            &walk_url("2026/11/17", FIRST_FRONTIER + 1),
+            Some("Tue, 17 Nov 2026 12:01 GMT"),
+        )
+        .ok_or("nothing carried")?;
+    assert_eq!(
+        (
+            extracted.walk.is_empty(),
+            extracted.walk.iter().any(|walked| walked.names_ticker),
+            carried.names_ticker,
+            request.names_ticker,
+        ),
+        (false, false, false, false)
+    );
+    Ok(())
+}

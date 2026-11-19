@@ -530,6 +530,7 @@ impl OpenWebFeed {
             params: Vec::new(),
             universe_version: empty_roster(),
             listed_date: None,
+            names_ticker: false,
             hosts_version: Some(self.hosts.version.clone()),
             extract_version: Some(self.extract_version.clone()),
         }
@@ -538,7 +539,8 @@ impl OpenWebFeed {
     /// Each index row whose rewritten link stays on the index's own host, passes the path filter
     /// and the provider key filter, and keys a story no earlier row of this index keyed is one
     /// follow-up unless the host's robots disallow its url (`robots_disallowed`); the raw
-    /// publication value rides `listed_date`, never sent.
+    /// publication value rides `listed_date` and whether the row names a ticker `names_ticker`,
+    /// neither sent.
     fn index_rows_of(&self, request: &Request, raw: &RawBlob) -> Extracted {
         let (Some(rule), Some((host, _))) = (self.rule_of(request), host_and_path(&request.url))
         else {
@@ -578,6 +580,7 @@ impl OpenWebFeed {
                     params: Vec::new(),
                     universe_version: empty_roster(),
                     listed_date: row.valid_raw.clone(),
+                    names_ticker: row.names_ticker,
                     hosts_version: request.hosts_version.clone(),
                     extract_version: request.extract_version.clone(),
                 }),
@@ -635,6 +638,7 @@ impl OpenWebFeed {
                 params: Vec::new(),
                 universe_version: empty_roster(),
                 listed_date: None,
+                names_ticker: false,
                 hosts_version: request.hosts_version.clone(),
                 extract_version: request.extract_version.clone(),
             })
@@ -966,6 +970,7 @@ impl Provider for OpenWebFeed {
             params: Vec::new(),
             universe_version: empty_roster(),
             listed_date: listed_date.map(str::to_owned),
+            names_ticker: false,
             hosts_version: Some(self.hosts.version.clone()),
             extract_version: Some(self.extract_version.clone()),
         })

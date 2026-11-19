@@ -316,6 +316,7 @@ mod tests {
                 params: Vec::new(),
                 universe_version: FileDigest::of(ROSTER),
                 listed_date: None,
+                names_ticker: false,
                 hosts_version: None,
                 extract_version: None,
             }

@@ -1268,6 +1268,7 @@ fn an_attempt_a_dead_run_left_open_is_closed_interrupted_by_the_next_run() -> Te
         params: Vec::new(),
         universe_version: provider.provider.universe_version(),
         listed_date: None,
+        names_ticker: false,
         hosts_version: None,
         extract_version: None,
     };

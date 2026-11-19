@@ -111,6 +111,10 @@ pub struct Request {
     /// The date the listing row behind a `Document` follow-up carries, as its column reads. Never
     /// sent and outside `filter_params`; `None` on an `Index` request.
     pub listed_date: Option<String>,
+    /// Whether the listing row behind a `Document` follow-up names a listed company (a ticker):
+    /// `HostQueue` asks such follow-ups first within their host's lane (architecture.md section
+    /// 11.2). Never sent and outside `filter_params`; `false` on any other request.
+    pub names_ticker: bool,
     /// sha256 of the hosts file that admitted this request's host (architecture.md section 2).
     /// Outside `filter_params`: it decides admission and pace, not what the vendor is asked.
     /// `None` for a provider that reads no hosts file.
@@ -209,6 +213,7 @@ mod tests {
             }],
             universe_version: FileDigest::of(universe_version),
             listed_date: None,
+            names_ticker: false,
             hosts_version: None,
             extract_version: None,
         }

@@ -17,6 +17,14 @@ const SITEMAP_NAMESPACE: &str = "http://www.sitemaps.org/schemas/sitemap/0.9";
 const NEWS_NAMESPACE: &str = "http://www.google.com/schemas/sitemap-news/0.9";
 const IMAGE_NAMESPACE: &str = "http://www.google.com/schemas/sitemap-image/1.1";
 const TITLE: &str = "title";
+/// A news sitemap row's tickers: PRN's carried one in 314 of 943 releases (2026-11-19).
+const STOCK_TICKERS: &str = "stock_tickers";
+/// An RSS item's categories: GNW's carried an `Exchange:SYMBOL` one in 75 of 244 items (2026-11-19).
+const CATEGORY: &str = "category";
+/// `^[A-Za-z][A-Za-z .&-]*:[A-Za-z0-9.-]+$`, the owner's form of a GNW ticker category
+/// (2026-11-19): the exchange's characters past its first letter, then the symbol's.
+const EXCHANGE_SYMBOLS: [char; 4] = [' ', '.', '&', '-'];
+const TICKER_SYMBOLS: [char; 2] = ['.', '-'];
 /// Elements whose text is never prose.
 const NOT_PROSE: [&str; 4] = ["script", "style", "noscript", "template"];
 /// Read as a space: PRN's `<b>About SIGNAL<br /></b>SIGNAL is` otherwise fused to `SIGNALSIGNAL`
@@ -73,13 +81,15 @@ const LOCAL_PART_SYMBOLS: [char; 6] = ['.', '_', '%', '+', '\'', '-'];
 const SHORTEST_TOP_LABEL: usize = 2;
 
 /// One index row's fields as the payload spells them. `title` is RSS `title` or `news:title`;
-/// `image` is a news sitemap row's first `image:loc`, `None` for RSS.
+/// `image` is a news sitemap row's first `image:loc`, `None` for RSS. `names_ticker`: a non-empty
+/// `news:stock_tickers`, or an RSS `category` that `is_ticker_category` reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IndexRow {
     pub(crate) link: Option<String>,
     pub(crate) valid_raw: Option<String>,
     pub(crate) title: Option<String>,
     pub(crate) image: Option<String>,
+    pub(crate) names_ticker: bool,
 }
 
 /// The rows of the rule's index shape, or `None` when the payload is not one at all, which is what
@@ -121,6 +131,10 @@ fn sitemap_rows(document: &roxmltree::Document, rule: &Rule) -> Option<Vec<Index
                     image: child_in(url, IMAGE_NAMESPACE, "image")
                         .and_then(|image| child_in(image, IMAGE_NAMESPACE, "loc"))
                         .and_then(text_of),
+                    names_ticker: news
+                        .and_then(|news| child_in(news, NEWS_NAMESPACE, STOCK_TICKERS))
+                        .and_then(text_of)
+                        .is_some_and(|tickers| !tickers.is_empty()),
                 }
             })
             .collect(),
@@ -161,9 +175,31 @@ fn rss_rows(document: &roxmltree::Document, rule: &Rule) -> Option<Vec<IndexRow>
                 valid_raw: child_text(item, rule.valid_field.as_str()),
                 title: child_text(item, TITLE),
                 image: None,
+                names_ticker: item
+                    .children()
+                    .filter(|node| is_rss(*node, CATEGORY))
+                    .filter_map(|node| node.text())
+                    .any(|text| is_ticker_category(text.trim())),
             })
             .collect(),
     )
+}
+
+/// `EXCHANGE_SYMBOLS`' pattern, whole: one colon, an exchange starting with a letter before it and
+/// a non-empty symbol after it.
+pub(crate) fn is_ticker_category(text: &str) -> bool {
+    let Some((exchange, symbol)) = text.split_once(':') else {
+        return false;
+    };
+    let mut exchange = exchange.chars();
+    exchange
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && exchange.all(|c| c.is_ascii_alphabetic() || EXCHANGE_SYMBOLS.contains(&c))
+        && !symbol.is_empty()
+        && symbol
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || TICKER_SYMBOLS.contains(&c))
 }
 
 /// RSS 2.0 elements carry no namespace; `has_tag_name(&str)` compares the local name alone, so
@@ -378,7 +414,39 @@ fn prose(element: ElementRef, into: &mut String, mut tables: Option<&mut Vec<Str
 
 #[cfg(test)]
 mod tests {
-    use super::without_addresses;
+    use super::{is_ticker_category, without_addresses};
+
+    /// The owner's GNW ticker form (2026-11-19): each case's answer is Python's `re.fullmatch`
+    /// with `^[A-Za-z][A-Za-z .&-]*:[A-Za-z0-9.-]+$` (run 2026-11-19). Mutations 2026-11-19: a digit
+    /// allowed first: red; `' '` allowed in the symbol: red; the empty-symbol check dropped: red.
+    #[test]
+    fn a_ticker_category_is_exactly_what_the_owners_pattern_matches() {
+        let cases = [
+            ("NYSE:LLY", true),
+            ("NASDAQ-NMS:ADP", true),
+            ("HongKong:0388", true),
+            ("TSX:ABC.U", true),
+            ("Euronext Paris:ALCJ", true),
+            ("AT&T:T", true),
+            ("NYSE :ABC", true),
+            ("N.Y.S.E.:X", true),
+            ("Monetary Policy", false),
+            (":ABC", false),
+            ("NYSE:", false),
+            ("1NYSE:A", false),
+            ("NYSE:A:B", false),
+            ("NYSE: ABC", false),
+            ("Ö:ABC", false),
+            ("NYSE:ÄBC", false),
+            ("NYSE,NASDAQ:ABC", false),
+            ("NYSE:ABC,NYSE:DEF", false),
+        ];
+        let read: Vec<(&str, bool)> = cases
+            .iter()
+            .map(|(text, _)| (*text, is_ticker_category(text)))
+            .collect();
+        assert_eq!(read, cases.to_vec());
+    }
 
     /// Decision r (section 11.1): each case's result is Python's `re.sub` with the research regex
     /// and an empty replacement (run 2026-11-16).

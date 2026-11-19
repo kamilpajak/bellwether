@@ -1272,8 +1272,10 @@ fn a_readmitted_canada_newswire_is_collected_after_the_committed_files_robots_re
         .into_iter()
         .filter(|url| url.contains(CNW_HOST))
         .collect();
+    // HKEX's release, the sitemap's third, names `HongKong:0388`, so it is asked first. Mutation
+    // 2026-11-19, `push_document` ignoring `names_ticker`: red.
     let expected_sent: Vec<String> = std::iter::once(CNW_INDEX.to_owned())
-        .chain(CNW_RELEASES.iter().map(|(key, _)| format!("https://{key}")))
+        .chain([2, 0, 1].map(|nth| format!("https://{}", CNW_RELEASES[nth].0)))
         .collect();
     let db = Connection::open_with_flags(
         root.path().join(COMMIT_LOG),
@@ -1663,11 +1665,14 @@ fn round_robin_of_committed_hosts() -> (Vec<String>, String) {
 }
 
 /// `(host's index, the rest of the host's lane)` as urls, GNW, PRN, Fed, Yahoo. PRN's lane holds
-/// its sitemap page 1, the three RSS releases, then the sitemap-only release.
+/// its sitemap page 1, Lilly's release (the RSS listed it third with no ticker, the sitemap names
+/// `NYSE:LLY`, so it is promoted ahead of the RSS's other two), those two, then the sitemap-only
+/// release, which names none.
 fn committed_host_urls() -> [(String, Vec<String>); 4] {
     let pages = |keys: Vec<&str>| keys.iter().map(|key| format!("https://{key}")).collect();
+    let [north_carolina, novo, lilly] = PRN_RELEASES.map(|(key, _)| key);
     let prn_lane: Vec<String> = std::iter::once(PRN_SITEMAP.to_owned())
-        .chain(pages(PRN_RELEASES.iter().map(|(key, _)| *key).collect()))
+        .chain(pages(vec![lilly, north_carolina, novo]))
         .chain([format!("https://{PRN_SITEMAP_ONLY}")])
         .collect();
     [
@@ -1689,6 +1694,9 @@ fn committed_host_urls() -> [(String, Vec<String>); 4] {
 
 /// Owner decision 2026-11-17 (§10): `collect` serves its hosts round-robin, in first-appearance
 /// order, so the four indexes, then one release of each host per turn; Yahoo's two run out first.
+/// PRN's lane is ticker-first (owner, 2026-11-19), its sitemap promoting a story the RSS queued.
+/// Mutations 2026-11-19: `HostQueue::promote` a no-op: red; `Lane::pop_front` taking `unnamed`
+/// before `named`: red.
 #[test]
 fn a_committed_hosts_run_asks_its_hosts_round_robin() -> TestResult {
     let (expected, _) = round_robin_of_committed_hosts();
@@ -1715,7 +1723,8 @@ fn a_retried_release_waits_behind_the_other_hosts_and_stops_at_the_cap() -> Test
 
 /// §8 R21 with lanes of unequal length: PRN's RSS fails every time, so each retry is asked on a
 /// later PRN turn and never waits for the other hosts' releases to drain. The sitemap, asked
-/// between, lists every PRN release, so all four are fetched from it.
+/// between, lists every PRN release, so all four are fetched from it, the one naming `NYSE:LLY`
+/// first; the first retry keeps its place ahead of them (owner, 2026-11-19).
 #[test]
 fn a_retried_index_keeps_its_host_turn_while_the_other_hosts_releases_are_served() -> TestResult {
     let mut hosts = committed_host_urls();
@@ -1723,10 +1732,11 @@ fn a_retried_index_keeps_its_host_turn_while_the_other_hosts_releases_are_served
         .iter()
         .map(|(key, _)| format!("https://{key}"))
         .collect();
+    let [north_carolina, novo, lilly] = [0, 1, 2].map(|nth| prn_releases[nth].clone());
     hosts[1].1 = [PRN_SITEMAP.to_owned(), PRN_INDEX.to_owned()]
         .into_iter()
-        .chain([format!("https://{PRN_SITEMAP_ONLY}")])
-        .chain(prn_releases)
+        .chain([lilly, format!("https://{PRN_SITEMAP_ONLY}")])
+        .chain([north_carolina, novo])
         .chain([PRN_INDEX.to_owned()])
         .collect();
     let expected = round_robin(&hosts);
@@ -7347,8 +7357,10 @@ fn sitemap_held(store: &Path) -> Result<Option<i64>, Box<dyn Error>> {
 }
 
 /// PR #50's question 1 (owner decision 2026-11-18): PRN's sitemap, read before its RSS's
-/// follow-ups, drops the three it shares with them. Asked, they count `held` (3); deferred by the
-/// cap, they were never asked and count nothing (0).
+/// follow-ups, drops the three it shares with them. Asked, they count `held` (3); behind the cap,
+/// the two it names no ticker for are deferred, never asked and count nothing, while Lilly's,
+/// promoted by its `NYSE:LLY` ahead of the 300 RSS-only ones, is asked and counts (1).
+/// Mutations 2026-11-19: `attempt_once` promoting nothing: red; `HostQueue::promote` a no-op: red.
 #[test]
 fn a_story_queued_by_this_run_counts_held_only_once_the_run_asked_it() -> TestResult {
     let mut seen = Vec::new();
@@ -7382,6 +7394,6 @@ fn a_story_queued_by_this_run_counts_held_only_once_the_run_asked_it() -> TestRe
             deferred.len(),
         ));
     }
-    assert_eq!(seen, vec![(Some(3), 3, 0), (Some(0), 0, 3)]);
+    assert_eq!(seen, vec![(Some(3), 3, 0), (Some(1), 1, 2)]);
     Ok(())
 }
