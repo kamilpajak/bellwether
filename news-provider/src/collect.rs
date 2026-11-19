@@ -2126,6 +2126,29 @@ mod tests {
         );
     }
 
+    /// S7-D5: fresh-first holds per lane, not across lanes. Under a cap of 3, GNW's lane is out of
+    /// fresh requests after `p0`, so its carried `c1` is asked on GNW's next turn and takes the
+    /// last slot; PRN's `p1` and `p2` are deferred.
+    #[test]
+    fn a_lane_out_of_fresh_requests_asks_its_carried_one_in_its_own_turn() {
+        let plan = [(GNW, documents(1)), (PRN, documents(3))];
+        let carried = vec![carried(GNW, "c1", true, 1)];
+        let (asked, deferred) = carrying(&plan, carried, Some(3), "", "");
+        assert_eq!(
+            (asked, deferred),
+            (
+                urls(&[
+                    (GNW, "index"),
+                    (PRN, "index"),
+                    (GNW, "p0"),
+                    (PRN, "p0"),
+                    (GNW, "c1")
+                ]),
+                urls(&[(PRN, "p1"), (PRN, "p2")])
+            )
+        );
+    }
+
     /// The 14:30 run of 2026-11-19 under fresh-first: GNW 20 follow-ups and 19 walk ids, PRN 155
     /// new follow-ups and 75 carried, Yahoo 61, cap 150. Carried first, the run asked PRN 69
     /// carried and 0 new; now it asks 69 new, and every carried one is deferred.
