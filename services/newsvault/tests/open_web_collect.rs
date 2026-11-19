@@ -7221,6 +7221,66 @@ fn a_document_names_the_index_attempt_that_listed_it_and_a_carried_one_its_first
     Ok(())
 }
 
+/// §8 row R22 with S7-D5: a url with two open rows is asked under its OLDEST row's listing,
+/// and one whose oldest row names none (a row from before user_version 15) is asked unlinked
+/// although a newer row names one.
+#[test]
+fn a_carried_url_is_asked_under_its_oldest_rows_listing_even_when_that_names_none() -> TestResult {
+    let (root, _, exchange, _) = capped_run(FOLLOW_UP_CAP + 2 - READMITTED_FOLLOW_UPS)?;
+    let index = attempt_of_url(root.path(), CNW_INDEX)?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    let deferred: Vec<(String, Option<String>)> = db
+        .prepare("SELECT url, listed_by FROM deferred ORDER BY deferred_id")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let [(linked, _), (unlinked, _)] = deferred.as_slice() else {
+        return Err(format!("two deferred urls, not {deferred:?}").into());
+    };
+    let other: String = db.query_row(
+        "SELECT attempt_id FROM attempts WHERE story_id IS NULL AND attempt_id != ?1
+          ORDER BY rowid LIMIT 1",
+        [&index],
+        |row| row.get(0),
+    )?;
+    db.execute(
+        "UPDATE deferred SET listed_by = NULL WHERE url = ?1",
+        [unlinked],
+    )?;
+    let newer = micros(instant(MONDAY_NEXT_SLOT) - TimeDelta::minutes(1));
+    for url in [linked, unlinked] {
+        db.execute(
+            "INSERT INTO deferred (run_id, source, target_window, host, url, phase, story_id,
+                                   listed_date, reason, deferred_at, listed_by)
+             SELECT run_id, source, target_window, host, url, phase, story_id, listed_date,
+                    reason, ?2, ?3
+               FROM deferred WHERE url = ?1",
+            [url, &newer, &other],
+        )?;
+    }
+    drop(db);
+    let ask = Ask {
+        hosts: Some(seed::readmitted_hosts()),
+        at: instant(MONDAY_NEXT_SLOT),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let next = cmd_collect::run(&ask, &opened, &exchange, &At(instant(MONDAY_NEXT_SLOT)))?;
+    let next_run = next.envelope["run_id"].as_str().ok_or("run_id")?.to_owned();
+    assert_eq!(
+        (
+            deferred.iter().map(|row| row.1.clone()).collect::<Vec<_>>(),
+            listings_of(root.path(), linked)?,
+            listings_of(root.path(), unlinked)?,
+        ),
+        (
+            vec![Some(index.clone()); 2],
+            vec![(next_run.clone(), Some(index))],
+            vec![(next_run, None)],
+        )
+    );
+    Ok(())
+}
+
 /// §8 row R22 on a retry inside one run: GNW release 0 answers 503, then 200, and both of its
 /// attempt rows name the GNW index attempt that listed it.
 #[test]
