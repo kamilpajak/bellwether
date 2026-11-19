@@ -1371,7 +1371,7 @@ fn attempt_once<A: Archive>(
             };
             let named: Vec<Request> = listed
                 .iter()
-                .filter(|follow_up| follow_up.names_ticker && !to_issue.contains(follow_up))
+                .filter(|follow_up| follow_up.names_ticker)
                 .cloned()
                 .collect();
             promoted = stories_of(&named)
