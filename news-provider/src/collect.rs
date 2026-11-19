@@ -966,16 +966,30 @@ impl Queued {
     }
 }
 
-/// The driver's queue: one FIFO lane per url host (`host_of`, the key `Wire` paces by), served
+/// The driver's queue: one lane per url host (`host_of`, the key `Wire` paces by), served
 /// round-robin in the order each host first entered, so a wait owed to one host does not stand in
-/// front of another host's due request. One host is one lane, which is a plain FIFO (§10).
+/// front of another host's due request. One host is one lane (§10).
 pub(crate) struct HostQueue {
     /// `None` keys every url `host_of` cannot key; `Wire` refuses or fails those itself.
-    lanes: Vec<(Option<HostKey>, VecDeque<Queued>)>,
+    lanes: Vec<(Option<HostKey>, Lane)>,
     next: usize,
     /// [`Provider::follow_up_cap`], and how many counted follow-ups `pop` has handed out to ask.
     cap: Option<u32>,
     issued: u32,
+}
+
+/// One host's requests: this run's own (planned, follow-ups, walk ids, retries) in `fresh`, an
+/// earlier run's carried ones in `carried`, asked only once `fresh` is empty (S7-D5, 2026-11-19).
+#[derive(Default)]
+struct Lane {
+    fresh: VecDeque<Queued>,
+    carried: VecDeque<Queued>,
+}
+
+impl Lane {
+    fn pop_front(&mut self) -> Option<Queued> {
+        self.fresh.pop_front().or_else(|| self.carried.pop_front())
+    }
 }
 
 /// What [`HostQueue::pop`] hands the driver: a request to ask, or one past the cap to defer.
@@ -998,18 +1012,27 @@ impl HostQueue {
         queue
     }
 
-    /// To the back of its host's lane; a host not seen before opens a lane after every other.
+    /// Its host's lane; a host not seen before opens a lane after every other.
+    fn lane_of(&mut self, request: &Request) -> &mut Lane {
+        let host = host_of(&request.url).ok().flatten();
+        let at = match self.lanes.iter().position(|(key, _)| *key == host) {
+            Some(at) => at,
+            None => {
+                self.lanes.push((host, Lane::default()));
+                self.lanes.len() - 1
+            }
+        };
+        &mut self.lanes[at].1
+    }
+
+    /// To the back of its host's fresh requests.
     fn push(&mut self, queued: Queued) {
-        let host = host_of(&queued.request.url).ok().flatten();
-        match self.lanes.iter_mut().find(|(key, _)| *key == host) {
-            Some((_, lane)) => lane.push_back(queued),
-            None => self.lanes.push((host, VecDeque::from([queued]))),
-        }
+        self.lane_of(&queued.request).fresh.push_back(queued);
     }
 
     /// After `asked` is attempted: its follow-ups, its walk ids, then itself again when
-    /// `retrying`, each to the back of its host's lane, so the pace limiter (R19) spaces the
-    /// retry. §8 R21. A retry is never counted again.
+    /// `retrying`, each to the back of its host's fresh requests, so the pace limiter (R19) spaces
+    /// the retry. §8 R21. A retry is never counted again.
     pub(crate) fn requeue(
         &mut self,
         follow_ups: Vec<Request>,
@@ -1033,16 +1056,16 @@ impl HostQueue {
         }
     }
 
-    /// S7-D5 as amended 2026-11-18: called before the first `pop`, so each carried request goes
-    /// behind its host's planned index and ahead of every follow-up that index will list.
+    /// S7-D5 as amended 2026-11-19: each carried request, in the order given, behind every fresh
+    /// request its host's lane holds or will hold this run.
     pub(crate) fn carry(&mut self, carried: Vec<Queued>) {
         for queued in carried {
-            self.push(queued);
+            self.lane_of(&queued.request).carried.push_back(queued);
         }
     }
 
     /// `stopped` at the deadline: its cap slot back when counted, since it is never asked, and
-    /// its host's lane emptied front first, follow-ups, walk ids and retries included.
+    /// its host's lane emptied, fresh requests first, then carried ones.
     pub(crate) fn stop(&mut self, stopped: &Queued) -> Vec<Request> {
         if stopped.counted {
             self.issued = self.issued.saturating_sub(1);
@@ -1051,7 +1074,13 @@ impl HostQueue {
         self.lanes
             .iter_mut()
             .find(|(key, _)| *key == host)
-            .map(|(_, lane)| lane.drain(..).map(|queued| queued.request).collect())
+            .map(|(_, lane)| {
+                lane.fresh
+                    .drain(..)
+                    .chain(lane.carried.drain(..))
+                    .map(|queued| queued.request)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -1538,8 +1567,20 @@ mod tests {
         failing: &str,
         stop: &str,
     ) -> (Vec<String>, Vec<String>) {
+        carrying(plan, Vec::new(), cap, failing, stop)
+    }
+
+    /// [`stopped`], with `carried` handed to `HostQueue::carry` before the first `pop`.
+    fn carrying(
+        plan: &[(&str, Lane)],
+        carried: Vec<Queued>,
+        cap: Option<u32>,
+        failing: &str,
+        stop: &str,
+    ) -> (Vec<String>, Vec<String>) {
         let indexes = plan.iter().map(|(base, _)| asking(base, "index")).collect();
         let mut queue = HostQueue::of(indexes, cap);
+        queue.carry(carried);
         let (mut asked, mut deferred) = (Vec::new(), Vec::new());
         while let Some(popped) = queue.pop() {
             let queued = match popped {
@@ -2024,16 +2065,24 @@ mod tests {
         );
     }
 
-    /// S7-D5 (amended 2026-11-18): a host's planned index first, then its carried requests in the
-    /// order given, then the follow-ups that index lists.
-    #[test]
-    fn a_lane_asks_its_planned_index_then_carried_requests_then_new_follow_ups() {
-        let mut queue = HostQueue::of(vec![asking(GNW, "index")], None);
-        let carried = |path: &str, id: i64| Queued {
+    /// A carried request of `base`'s host, closing open row `id`; `counted` unless a walk id.
+    fn carried(base: &str, path: &str, counted: bool, id: i64) -> Queued {
+        Queued {
+            counted,
             carried: vec![id],
-            ..Queued::first_attempt(asking(GNW, path))
-        };
-        queue.carry(vec![carried("c1", 1), carried("c2", 2)]);
+            ..Queued::first_attempt(asking(base, path))
+        }
+    }
+
+    /// S7-D5 (amended 2026-11-19): a host's planned index first, then the follow-ups it lists,
+    /// then its carried requests in the order given.
+    #[test]
+    fn a_lane_asks_its_planned_index_then_new_follow_ups_then_carried_requests() {
+        let mut queue = HostQueue::of(vec![asking(GNW, "index")], None);
+        queue.carry(vec![
+            carried(GNW, "c1", true, 1),
+            carried(GNW, "c2", true, 2),
+        ]);
         let mut asked = Vec::new();
         if let Some(Popped::Ask(index)) = queue.pop() {
             asked.push(index.request.url.clone());
@@ -2046,43 +2095,116 @@ mod tests {
         }
         assert_eq!(
             asked,
-            ["index", "c1", "c2", "f1"].map(|path| format!("{GNW}{path}"))
+            ["index", "f1", "c1", "c2"].map(|path| format!("{GNW}{path}"))
         );
     }
 
-    /// S7-D5: carried requests go behind the planned index of their host's lane; a counted one
-    /// spends a cap slot and a walk id does not (S7-D6).
+    /// S7-D5: carried requests go behind their lane's index and the follow-ups it lists; a counted
+    /// one spends a cap slot and a walk id does not (S7-D6). Under a cap of 2, GNW's new follow-up
+    /// and its first carried one are asked, the carried walk id too, the second carried deferred.
     #[test]
     fn carried_requests_follow_their_lanes_index_and_only_counted_ones_spend_the_cap() {
-        let mut queue = HostQueue::of(vec![asking(GNW, "index"), asking(PRN, "index")], Some(1));
-        let carried = |path: &str, counted: bool, id: i64| Queued {
-            counted,
-            carried: vec![id],
-            ..Queued::first_attempt(asking(GNW, path))
-        };
-        queue.carry(vec![
-            carried("c1", true, 1),
-            carried("w1", false, 2),
-            carried("c2", true, 3),
-        ]);
-        let (mut asked, mut deferred) = (Vec::new(), Vec::new());
-        while let Some(popped) = queue.pop() {
-            match popped {
-                Popped::Ask(queued) => asked.push((queued.request.url, queued.carried)),
-                Popped::Defer(request) => deferred.push(request.url),
-            }
-        }
+        let plan = [(GNW, documents(1)), (PRN, documents(0))];
+        let carried = vec![
+            carried(GNW, "c1", true, 1),
+            carried(GNW, "w1", false, 2),
+            carried(GNW, "c2", true, 3),
+        ];
+        let (asked, deferred) = carrying(&plan, carried, Some(2), "", "");
         assert_eq!(
             (asked, deferred),
             (
-                vec![
-                    (format!("{GNW}index"), Vec::new()),
-                    (format!("{PRN}index"), Vec::new()),
-                    (format!("{GNW}c1"), vec![1]),
-                    (format!("{GNW}w1"), vec![2]),
-                ],
-                vec![format!("{GNW}c2")]
+                urls(&[
+                    (GNW, "index"),
+                    (PRN, "index"),
+                    (GNW, "p0"),
+                    (GNW, "c1"),
+                    (GNW, "w1")
+                ]),
+                urls(&[(GNW, "c2")])
             )
+        );
+    }
+
+    /// S7-D5: fresh-first holds per lane, not across lanes. Under a cap of 3, GNW's lane is out of
+    /// fresh requests after `p0`, so its carried `c1` is asked on GNW's next turn and takes the
+    /// last slot; PRN's `p1` and `p2` are deferred.
+    #[test]
+    fn a_lane_out_of_fresh_requests_asks_its_carried_one_in_its_own_turn() {
+        let plan = [(GNW, documents(1)), (PRN, documents(3))];
+        let carried = vec![carried(GNW, "c1", true, 1)];
+        let (asked, deferred) = carrying(&plan, carried, Some(3), "", "");
+        assert_eq!(
+            (asked, deferred),
+            (
+                urls(&[
+                    (GNW, "index"),
+                    (PRN, "index"),
+                    (GNW, "p0"),
+                    (PRN, "p0"),
+                    (GNW, "c1")
+                ]),
+                urls(&[(PRN, "p1"), (PRN, "p2")])
+            )
+        );
+    }
+
+    /// The 14:30 run of 2026-11-19 under fresh-first: GNW 20 follow-ups and 19 walk ids, PRN 155
+    /// new follow-ups and 75 carried, Yahoo 61, cap 150. Carried first, the run asked PRN 69
+    /// carried and 0 new; now it asks 69 new, and every carried one is deferred.
+    #[test]
+    fn the_cap_is_spent_on_new_follow_ups_before_carried_ones() {
+        const YAHOO: &str = "https://finance.yahoo.com/";
+        let gnw = Lane {
+            documents: 20,
+            walked: 19,
+            pages: 0,
+        };
+        let plan = [(GNW, gnw), (PRN, documents(155)), (YAHOO, documents(61))];
+        let carried = (0..75)
+            .map(|nth| carried(PRN, &format!("c{nth}"), true, nth))
+            .collect();
+        let (asked, deferred) = carrying(&plan, carried, Some(150), "", "");
+        let count =
+            |of: &[String], prefix: &str| of.iter().filter(|url| url.starts_with(prefix)).count();
+        let prn_new = format!("{PRN}p");
+        let prn_carried = format!("{PRN}c");
+        assert_eq!(
+            (
+                count(&asked, &format!("{GNW}p")),
+                count(&asked, &format!("{YAHOO}p")),
+                count(&asked, &prn_new),
+                count(&asked, &prn_carried),
+                count(&deferred, &prn_new),
+                count(&deferred, &prn_carried),
+            ),
+            (20, 61, 69, 0, 86, 75)
+        );
+    }
+
+    /// Condition A with S7-D5: a lane stopped at the deadline defers its new requests first, then
+    /// its carried ones, and nothing of it is left to ask.
+    #[test]
+    fn a_stopped_lane_defers_its_carried_requests_too() {
+        let mut queue = HostQueue::of(vec![asking(GNW, "index")], None);
+        queue.carry(vec![
+            carried(GNW, "c1", true, 1),
+            carried(GNW, "c2", true, 2),
+        ]);
+        if let Some(Popped::Ask(index)) = queue.pop() {
+            let follow_ups = vec![asking(GNW, "f1"), asking(GNW, "f2")];
+            queue.requeue(follow_ups, Vec::new(), index, false);
+        }
+        let lane = match queue.pop() {
+            Some(Popped::Ask(stopped)) => queue.stop(&stopped),
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            (
+                lane.into_iter().map(|rest| rest.url).collect::<Vec<_>>(),
+                queue.pop().is_none()
+            ),
+            (urls(&[(GNW, "f2"), (GNW, "c1"), (GNW, "c2")]), true)
         );
     }
 

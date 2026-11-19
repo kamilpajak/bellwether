@@ -6301,9 +6301,10 @@ fn carried_line(envelope: &Value) -> Result<Option<String>, Box<dyn Error>> {
         .map(str::to_owned))
 }
 
-/// S7-D5: the four walk ids the 12:30:30 poll's deadline cut are asked by the 13:00:30 poll right
-/// behind GNW's index (lane order amended 2026-11-18), each row closed `answered` by its first attempt. The first answers
-/// 503 and is asked once more, never by the walk too. The run file names its source (answer 6).
+/// S7-D5: the four walk ids the 12:30:30 poll's deadline cut are asked by the 13:00:30 poll behind
+/// GNW's index and every new request (lane order amended 2026-11-19), each row closed `answered` by
+/// its first attempt. The first answers 503 and is asked once more, right after it, never by the
+/// walk too. The run file names its source (answer 6).
 #[test]
 fn deferred_walk_ids_are_carried_behind_their_lanes_index_and_closed_answered() -> TestResult {
     let root = after_a_first_walked_poll()?;
@@ -6349,7 +6350,9 @@ fn deferred_walk_ids_are_carried_behind_their_lanes_index_and_closed_answered() 
     assert_eq!(
         (
             walked_ids(&deferred),
-            sent.get(..5).map(<[String]>::to_vec),
+            sent.first().cloned(),
+            sent.get(sent.len().saturating_sub(5)..)
+                .map(<[String]>::to_vec),
             deferred
                 .iter()
                 .map(|url| sent.iter().filter(|one| *one == url).count())
@@ -6357,10 +6360,13 @@ fn deferred_walk_ids_are_carried_behind_their_lanes_index_and_closed_answered() 
         ),
         (
             vec![3_404_417, 3_404_418, 3_404_420, 3_404_421],
+            Some(INDEX.to_owned()),
             Some(
-                [INDEX.to_owned()]
+                deferred
+                    .first()
                     .into_iter()
-                    .chain(deferred.iter().cloned())
+                    .chain(deferred.iter())
+                    .cloned()
                     .collect()
             ),
             vec![2, 1, 1, 1],
@@ -6390,6 +6396,51 @@ fn deferred_walk_ids_are_carried_behind_their_lanes_index_and_closed_answered() 
             Some("carried          4 queued 4 answered 4 held 0 expired 0".to_owned()),
             Value::from(SOURCE),
             Some(closed.into_iter().map(|row| row.2).collect()),
+        )
+    );
+    Ok(())
+}
+
+/// `RSS_1205`'s English 3404462, as its index lists it.
+const RELISTED_RELEASE: &str = "https://rss.globenewswire.com/news-release/2026/11/17/3404462/0/en/ghd-s-first-integrated-annual-report-combines-business-financial-and-sustainability-performance.html";
+
+/// S7-D5 with first sighting: a carried story the poll's index lists again joined `issued` at the
+/// run's start, so the index drops it and it is asked once, as carried, behind the new requests.
+#[test]
+fn a_relisted_carried_story_stays_carried_and_is_not_issued_twice() -> TestResult {
+    let root = after_a_first_walked_poll()?;
+    an_open_row(
+        root.path(),
+        RELISTED_RELEASE,
+        walk_story(SECOND_FRONTIER).as_deref(),
+        None,
+        instant(WALK_SECOND) - TimeDelta::hours(1),
+    )?;
+    let exchange = Gnw::walked(RSS_1205)?;
+    let second = walked_poll(
+        root.path(),
+        hosts_fixture(WALK_HOSTS),
+        WALK_SECOND,
+        &exchange,
+    )?;
+    let (sent, _) = exchange.sent();
+    assert_eq!(
+        (
+            sent.iter().filter(|url| *url == RELISTED_RELEASE).count(),
+            sent.last().map(String::as_str),
+            carried_of(&second.envelope),
+            stored_deferred(root.path())?.len(),
+        ),
+        (
+            1,
+            Some(RELISTED_RELEASE),
+            vec![(
+                RELISTED_RELEASE.to_owned(),
+                true,
+                Value::from("answered"),
+                1
+            )],
+            1,
         )
     );
     Ok(())
@@ -6449,7 +6500,7 @@ const A_DAY: TimeDelta = TimeDelta::hours(24);
 /// A GNW id no index lists and no walk range of `WALK_SECOND` reaches.
 const UNLISTED_ID: u64 = 3_404_430;
 
-/// S7-D5's 24 h, inclusive: a row deferred 23:59:59 before the run is carried and answered; one
+/// S7-D5's 24 h, inclusive: a row deferred 23:59:59 before the run is carried and answered last; one
 /// deferred exactly 24 h before is closed `expired`, never asked, counted by the ledger and a
 /// `--check` finding (S7-D8).
 #[test]
@@ -6498,7 +6549,7 @@ fn a_deferred_item_is_carried_at_23_59_59_and_closed_expired_at_24_hours() -> Te
             .filter(|finding| finding.code == "deferred_expired")
             .count();
         seen.push((
-            sent.get(1) == Some(&url),
+            sent.last() == Some(&url),
             carried_of(&second.envelope),
             closed_rows(root.path())?
                 .into_iter()
@@ -6740,7 +6791,7 @@ fn a_young_item_the_provider_cannot_rebuild_is_not_asked_and_stays_open() -> Tes
 
 /// S7-D5's age is read at the run's start: an unrebuildable item 23:59:50 old stays open though the
 /// clock passes 24 h during the run. A carried row closes at the clock of its closing attempt, the
-/// second after GNW's index, 2 × 12 s on (`WAIT` + `TOOK` + `AFTER`). Mutations: age at the close,
+/// run's last, 12 s (`WAIT` + `TOOK` + `AFTER`) per attempt on. Mutations: age at the close,
 /// `closed_at` at the start: red.
 #[test]
 fn age_is_read_at_the_runs_start_and_a_row_closes_at_its_attempts_clock() -> TestResult {
@@ -6775,6 +6826,8 @@ fn age_is_read_at_the_runs_start_and_a_row_closes_at_its_attempts_clock() -> Tes
     };
     let opened = cmd_collect::open_provider(&ask)?;
     let answer = cmd_collect::run(&ask, &opened, &exchange, &Ticking(clock.clone()))?;
+    let (sent, _) = exchange.inner.sent();
+    let attempts = i32::try_from(sent.len())?;
     let closed_at: Vec<(i64, String)> = Connection::open_with_flags(
         root.path().join(COMMIT_LOG),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -6794,7 +6847,7 @@ fn age_is_read_at_the_runs_start_and_a_row_closes_at_its_attempts_clock() -> Tes
                 (unrebuildable.to_owned(), false, Value::Null, 1),
                 (carried, true, Value::from("answered"), 1),
             ],
-            vec![(1, micros(start + (WAIT + TOOK + AFTER) * 2))],
+            vec![(1, micros(start + (WAIT + TOOK + AFTER) * attempts))],
         )
     );
     Ok(())
@@ -6823,9 +6876,9 @@ fn an_at_with_no_schedule_slot_before_it_is_refused_by_name() -> TestResult {
     Ok(())
 }
 
-/// `WALK_SECOND` plus 15 s: GNW's slots at 0 s (its index) and 10 s go, its third, at 20 s, is
-/// past it.
-const WALK_SECOND_PLUS_15_S: &str = "2026-11-17T12:30:45Z";
+/// `WALK_SECOND` plus 95 s: GNW's slots at 0 s (its index) to 90 s go, the eleventh, at 100 s, is
+/// past it; the poll's new requests take the slots at 10 s to 80 s.
+const WALK_SECOND_PLUS_95_S: &str = "2026-11-17T12:32:05Z";
 /// Above the highest id `RSS_1205` lists, so the walk of a run that asked GNW's index never
 /// reaches it.
 const ABOVE_EVERY_WALK: u64 = 3_404_530;
@@ -6857,7 +6910,7 @@ fn a_carried_request_deferred_again_keeps_its_rows_open_and_ages_from_its_first(
     let ask = Ask {
         hosts: Some(hosts_fixture(WALK_HOSTS)),
         at: instant(WALK_SECOND),
-        deadline: Some(instant(WALK_SECOND_PLUS_15_S)),
+        deadline: Some(instant(WALK_SECOND_PLUS_95_S)),
         schedule: Some("walk".to_owned()),
         ..ask(root.path(), cmd_collect::TODAY)
     };
@@ -6881,14 +6934,14 @@ fn a_carried_request_deferred_again_keeps_its_rows_open_and_ages_from_its_first(
     let (late_sent, _) = late.sent();
     assert_eq!(
         (
-            sent,
+            (sent.first().cloned(), sent.last().cloned(), sent.len()),
             carried_of(&second.envelope),
             again_rows,
             after_second.len(),
             second.exit.error_code(),
         ),
         (
-            vec![INDEX.to_owned(), asked.clone()],
+            (Some(INDEX.to_owned()), Some(asked.clone()), 10),
             vec![
                 (asked, true, Value::from("answered"), 1),
                 (again.clone(), true, Value::Null, 1),
@@ -6970,14 +7023,14 @@ fn deferred_index_requests_are_never_carried_or_closed() -> TestResult {
 /// The 11:00 slot of `MONDAY_AT`'s day, whose stop is 11:14:30.
 const MONDAY_NEXT_SLOT: &str = "2026-11-16T11:00:30Z";
 
-/// S7-D6 with S7-D5: a carried listed follow-up is counted at issue, so beside 150 new ones the
-/// last CNW follow-up is deferred; a carried walk id is not counted and defers nothing.
+/// S7-D6 with S7-D5: a carried listed follow-up is counted at issue and waits behind the 150 new
+/// ones (2026-11-19), so it is the one deferred; a carried walk id is not counted and is asked.
 #[test]
 fn a_carried_follow_up_counts_against_the_cap_and_a_carried_walk_id_does_not() -> TestResult {
     let listed = format!("{CNW_RELEASE_PREFIX}a-carried-release-799999999.html");
     let walk = "https://rss.globenewswire.com/news-release/2026/11/16/3404430/0/en/x.html";
     let extra = FOLLOW_UP_CAP - READMITTED_FOLLOW_UPS;
-    let (follow_up_root, follow_up, follow_up_sent, urls) = capped_run_carrying(
+    let (follow_up_root, follow_up, follow_up_sent, _) = capped_run_carrying(
         extra,
         &[(listed.as_str(), Some("2026-11-16T02:22:00-05:00"))],
     )?;
@@ -6999,9 +7052,9 @@ fn a_carried_follow_up_counts_against_the_cap_and_a_carried_walk_id_does_not() -
             walked.envelope["per_source"][0]["carried"]["answered"].as_u64(),
         ),
         (
-            true,
-            urls.last().cloned().into_iter().collect::<Vec<String>>(),
-            Some(1),
+            false,
+            vec![listed.clone()],
+            Some(0),
             true,
             Vec::<String>::new(),
             Some(1),
