@@ -4,6 +4,10 @@
 # which reads only *.prom, never sees half a file. The ledger's answers 0, 1 and 8 all carry metrics.
 set -u
 : "${NEWSVAULT_IMAGE:?set in newsvault.env}" "${NEWSVAULT_TEXTFILE_DIR:?set in newsvault.env}"
+case $NEWSVAULT_TEXTFILE_DIR in
+    /*) ;;
+    *) echo "NEWSVAULT_TEXTFILE_DIR is not an absolute path: '$NEWSVAULT_TEXTFILE_DIR'" >&2; exit 2 ;;
+esac
 at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 today=$(date -u -d "$at" +%Y-%m-%d)
 yesterday=$(date -u -d "$today -1 day" +%Y-%m-%d)

@@ -4,6 +4,10 @@
 # deploy/prometheus/newsvault.rules.yml read. Written to a dot-file beside the target and renamed.
 set -u
 : "${NEWSVAULT_TEXTFILE_DIR:?set in newsvault.env}"
+case $NEWSVAULT_TEXTFILE_DIR in
+    /*) ;;
+    *) echo "NEWSVAULT_TEXTFILE_DIR is not an absolute path: '$NEWSVAULT_TEXTFILE_DIR'" >&2; exit 2 ;;
+esac
 label=${1:?usage: newsvault-unit-result <label>}
 case $label in
     *[!a-z]*) echo "the label $label is not lowercase letters" >&2; exit 2 ;;
