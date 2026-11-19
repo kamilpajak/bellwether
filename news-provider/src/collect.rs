@@ -1672,13 +1672,13 @@ mod tests {
         capped(&lanes, None, failing).0
     }
 
-    /// S7-D6 at its boundary: the 150th follow-up is asked and the 151st deferred; with no cap
-    /// (edgar's `None`) all 151 are asked.
+    /// S7-D6 at its boundary: the 300th follow-up is asked and the 301st deferred; with no cap
+    /// (edgar's `None`) all 301 are asked.
     #[test]
-    fn the_cap_asks_the_150th_follow_up_and_defers_the_151st() {
-        let at_cap = capped(&[(CNW, documents(150))], Some(150), "");
-        let over = capped(&[(CNW, documents(151))], Some(150), "");
-        let uncapped = capped(&[(CNW, documents(151))], None, "");
+    fn the_cap_asks_the_300th_follow_up_and_defers_the_301st() {
+        let at_cap = capped(&[(CNW, documents(300))], Some(300), "");
+        let over = capped(&[(CNW, documents(301))], Some(300), "");
+        let uncapped = capped(&[(CNW, documents(301))], None, "");
         assert_eq!(
             (
                 at_cap.0.len(),
@@ -1686,11 +1686,11 @@ mod tests {
                 over.0.len(),
                 uncapped.0.len()
             ),
-            (151, 0, 151, 152)
+            (301, 0, 301, 302)
         );
         assert_eq!(
             (over.0.last(), over.1, uncapped.1.len()),
-            (Some(&format!("{CNW}p149")), urls(&[(CNW, "p150")]), 0)
+            (Some(&format!("{CNW}p299")), urls(&[(CNW, "p300")]), 0)
         );
     }
 
@@ -1729,9 +1729,10 @@ mod tests {
     }
 
     /// S7-D6's arithmetic (architecture.md section 11.5 step 7): a first run's 301 follow-ups,
-    /// GNW 20, PRN 20, CNW 100, Fed 20 and Yahoo 141, lose 55 of CNW's and 96 of Yahoo's.
+    /// GNW 20, PRN 20, CNW 100, Fed 20 and Yahoo 141, lose 1 of Yahoo's, the longest lane's last,
+    /// under the cap of 300 (2026-11-19); 55 of CNW's and 96 of Yahoo's under the 150 before it.
     #[test]
-    fn the_global_cap_cuts_55_of_cnws_and_96_of_yahoos_first_run_follow_ups() {
+    fn the_global_cap_cuts_one_of_yahoos_first_run_follow_ups() {
         const FED: &str = "https://www.federalreserve.gov/";
         const YAHOO: &str = "https://finance.yahoo.com/";
         let plan = [
@@ -1741,12 +1742,12 @@ mod tests {
             (FED, documents(20)),
             (YAHOO, documents(141)),
         ];
-        let (_, deferred) = capped(&plan, Some(150), "");
+        let (_, deferred) = capped(&plan, Some(300), "");
         let lost: Vec<usize> = plan
             .iter()
             .map(|(base, _)| deferred.iter().filter(|url| url.starts_with(base)).count())
             .collect();
-        assert_eq!(lost, vec![0, 0, 55, 0, 96]);
+        assert_eq!(lost, vec![0, 0, 0, 0, 1]);
     }
 
     /// S7-D6's exception (owner, 2026-11-17 ~21:30Z): walk ids are never counted, so a cap the
@@ -1795,8 +1796,8 @@ mod tests {
         );
     }
 
-    /// An `Index` follow-up, PRN's next sitemap page, is outside the 150: section 11.2's worst
-    /// case is (150 + index requests) × 3 × 10 s, and a page cut would leave its poll unjoined.
+    /// An `Index` follow-up, PRN's next sitemap page, is outside the cap: section 11.2's worst
+    /// case counts index requests apart from it, and a page cut would leave its poll unjoined.
     #[test]
     fn an_index_follow_up_is_not_counted_against_the_cap() {
         let lane = Lane {
@@ -2182,8 +2183,8 @@ mod tests {
     }
 
     /// The 14:30 run of 2026-11-19 under fresh-first: GNW 20 follow-ups and 19 walk ids, PRN 155
-    /// new follow-ups and 75 carried, Yahoo 61, cap 150. Carried first, the run asked PRN 69
-    /// carried and 0 new; now it asks 69 new, and every carried one is deferred.
+    /// new follow-ups and 75 carried, Yahoo 61, cap 300 (150 then). Every new one is asked, then
+    /// 64 carried; 11 carried are deferred. The deadline is not modelled here.
     #[test]
     fn the_cap_is_spent_on_new_follow_ups_before_carried_ones() {
         const YAHOO: &str = "https://finance.yahoo.com/";
@@ -2196,7 +2197,7 @@ mod tests {
         let carried = (0..75)
             .map(|nth| carried(PRN, &format!("c{nth}"), true, nth))
             .collect();
-        let (asked, deferred) = carrying(&plan, carried, Some(150), "", "");
+        let (asked, deferred) = carrying(&plan, carried, Some(300), "", "");
         let count =
             |of: &[String], prefix: &str| of.iter().filter(|url| url.starts_with(prefix)).count();
         let prn_new = format!("{PRN}p");
@@ -2210,7 +2211,7 @@ mod tests {
                 count(&deferred, &prn_new),
                 count(&deferred, &prn_carried),
             ),
-            (20, 61, 69, 0, 86, 75)
+            (20, 61, 155, 64, 0, 11)
         );
     }
 

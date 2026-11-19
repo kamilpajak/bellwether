@@ -63,8 +63,9 @@ const BODY_LIMIT: u64 = 2 * 1_024 * 1_024;
 /// refuses a host whose robots Crawl-delay is above it (owner decision 1, 2026-11-16). No per-IP
 /// pace: each host is its own queue (owner decision 1, 2026-11-17, §10). 7 s: owner, 2026-11-19.
 const INTERVAL: Duration = Duration::from_secs(7);
-/// S7-D6 (owner, 2026-11-17): the owner's choice, not measured (architecture.md section 11.2).
-pub const FOLLOW_UP_CAP: u32 = 150;
+/// S7-D6 (owner, 2026-11-17; 300 since 2026-11-19): the owner's choice (architecture.md section
+/// 11.2's cap bullet holds the counts it was raised against).
+pub const FOLLOW_UP_CAP: u32 = 300;
 
 /// Why no request may be made at all, each raised by `open` before the first request.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

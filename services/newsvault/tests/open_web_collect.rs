@@ -5170,7 +5170,7 @@ const CNW_RELEASE_PREFIX: &str = "https://www.newswire.ca/news-releases/";
 /// The re-admitted file's document follow-ups before any synthetic CNW release: GNW 3, PRN 4,
 /// CNW 3, the Fed 3 and Yahoo 2.
 const READMITTED_FOLLOW_UPS: usize = 15;
-const FOLLOW_UP_CAP: usize = 150;
+const FOLLOW_UP_CAP: usize = 300;
 /// CNW's share of `READMITTED_FOLLOW_UPS`.
 const READMITTED_CNW: usize = 3;
 
@@ -5200,7 +5200,7 @@ fn cnw_sitemap_with(extra: usize) -> Result<(Vec<u8>, Vec<String>), Box<dyn Erro
 type CappedRun = (TempDir, cmd_collect::Answer, Gnw, Vec<String>);
 
 /// The re-admitted hosts file on Monday on a fresh store, CNW's sitemap listing `extra` more
-/// releases, each answered with a kept CNW page: its 100 rows make a 150-follow-up run.
+/// releases, each answered with a kept CNW page: its 285 rows make a 300-follow-up run.
 fn capped_run(extra: usize) -> Result<CappedRun, Box<dyn Error>> {
     capped_run_carrying(extra, &[])
 }
@@ -5285,10 +5285,10 @@ fn stored_deferred(store: &Path) -> Result<Vec<DeferredRow>, Box<dyn Error>> {
     Ok(rows)
 }
 
-/// S7-D6 at its boundary through `collect`: 150 document follow-ups are all asked, no row is
-/// deferred and the run exits 0.
+/// S7-D6 at its boundary through `collect`: 300 document follow-ups are all asked, no row is
+/// deferred and the run exits 0. Mutation 2026-11-19, `FOLLOW_UP_CAP` 299: red.
 #[test]
-fn a_run_of_exactly_150_follow_ups_asks_every_one_and_defers_none() -> TestResult {
+fn a_run_of_exactly_300_follow_ups_asks_every_one_and_defers_none() -> TestResult {
     let (root, answer, _, _) = capped_run(FOLLOW_UP_CAP - READMITTED_FOLLOW_UPS)?;
     assert_eq!(
         (
@@ -5302,11 +5302,11 @@ fn a_run_of_exactly_150_follow_ups_asks_every_one_and_defers_none() -> TestResul
     Ok(())
 }
 
-/// S7-D4 and S7-D6 through `collect`: the 151st follow-up, CNW's last in round-robin order, is
+/// S7-D4 and S7-D6 through `collect`: the 301st follow-up, CNW's last in round-robin order, is
 /// never sent and is one `deferred` row naming it, in the envelope and the ledger; the run exits
-/// 8 `partial_collect` (S7-D8).
+/// 8 `partial_collect` (S7-D8). Mutation 2026-11-19, `FOLLOW_UP_CAP` 301: red.
 #[test]
-fn the_151st_follow_up_is_deferred_recorded_and_never_sent_and_the_run_exits_8() -> TestResult {
+fn the_301st_follow_up_is_deferred_recorded_and_never_sent_and_the_run_exits_8() -> TestResult {
     let (root, answer, exchange, urls) = capped_run(FOLLOW_UP_CAP + 1 - READMITTED_FOLLOW_UPS)?;
     let last = urls.last().cloned().ok_or("no synthetic release")?;
     let story = digest(canon::digest::story_id(
@@ -7068,7 +7068,7 @@ fn deferred_index_requests_are_never_carried_or_closed() -> TestResult {
 /// The 11:00 slot of `MONDAY_AT`'s day, whose stop is 11:14:30.
 const MONDAY_NEXT_SLOT: &str = "2026-11-16T11:00:30Z";
 
-/// S7-D6 with S7-D5: a carried listed follow-up is counted at issue and waits behind the 150 new
+/// S7-D6 with S7-D5: a carried listed follow-up is counted at issue and waits behind the 300 new
 /// ones (2026-11-19), so it is the one deferred; a carried walk id is not counted and is asked.
 #[test]
 fn a_carried_follow_up_counts_against_the_cap_and_a_carried_walk_id_does_not() -> TestResult {
@@ -7139,7 +7139,7 @@ fn attempt_of_url(store: &Path, url: &str) -> Result<String, Box<dyn Error>> {
 type LatencySeen = (String, i64, Option<f64>, i64, Option<f64>, i64);
 
 /// §8 row R22 through `collect` and `ledger`: each CNW document names CNW's index attempt; the
-/// 151st, deferred by the cap, keeps that name in its `deferred` row and the next slot's run asks
+/// 301st, deferred by the cap, keeps that name in its `deferred` row and the next slot's run asks
 /// it under it, so its latency spans both runs: 11:00:29 − 09:30:29 = 5,400 s, carried.
 #[test]
 fn a_document_names_the_index_attempt_that_listed_it_and_a_carried_one_its_first_runs() -> TestResult
