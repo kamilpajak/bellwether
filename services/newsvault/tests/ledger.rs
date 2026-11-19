@@ -1533,6 +1533,8 @@ const WIRES: &str = "open_web_wires";
 const LISTING_RUN: &str = "run-0701-0034";
 const CARRYING_RUN: &str = "run-0701-0630";
 const LISTED_AT: &str = "2026-07-01T00:35:00.000000Z";
+/// `LISTED_AT` + 31 days, received after `AT`, so the reader's `--at` cutoff leaves it out.
+const AFTER_AT_S: i64 = 31 * 86_400;
 
 /// One answered attempt of `source` in `run`, received `after_s` seconds after `LISTED_AT`; a
 /// Document attempt (a story) with its payload at `url` when `url` is set, else the index.
@@ -1571,7 +1573,8 @@ fn answered(
 
 /// R22: per run and host, fresh documents (listed by the run's own index) and carried ones
 /// (listed by an earlier run's) apart, nearest-rank p50 and p95 over unsorted rows, max, the
-/// unlinked count; `--source` keeps one source; the human line states the JSON row.
+/// unlinked count; `--source` keeps one source; a document received after `--at` is not counted;
+/// the human line states the JSON row.
 #[test]
 fn listing_latency_is_reported_per_run_and_host_with_fresh_and_carried_apart() -> TestResult {
     let root = fixture()?;
@@ -1596,6 +1599,8 @@ fn listing_latency_is_reported_per_run_and_host_with_fresh_and_carried_apart() -
         Some(index),
     )?;
     answered(&db, at("l-walk-id"), 7, Some("https://a.test/w"), None)?;
+    let late = Some("https://a.test/late");
+    answered(&db, at("l-after-at"), AFTER_AT_S, late, Some(index))?;
     let polygon = ("l-polygon", LISTING_RUN, POLYGON);
     answered(&db, polygon, 1, Some("https://c.test/0"), Some(index))?;
     for (attempt, after_s) in [("l-carried-0", 7_200), ("l-carried-1", 3_600)] {
