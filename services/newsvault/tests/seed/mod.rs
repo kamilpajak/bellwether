@@ -54,6 +54,12 @@ pub fn committed_hosts() -> PathBuf {
     provider_dir().join("hosts/open_web_wires.hosts.json")
 }
 
+/// The committed hosts file with CNW's status `admitted`, as before 2026-11-19.
+#[allow(dead_code)]
+pub fn readmitted_hosts() -> PathBuf {
+    provider_dir().join("tests/fixtures/hosts/cnw_readmitted.json")
+}
+
 /// One `robots refresh` of the committed hosts file into `store` at `at`, every pinned row
 /// answered 200 with its committed body and the Fed's answered 404.
 pub fn refresh_committed(store: &Path, at: &str) -> Result<cmd_robots::Answer, Box<dyn Error>> {

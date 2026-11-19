@@ -200,6 +200,8 @@ const PRN_OUTSIDE_THE_SECTION: [&str; 4] = [
 ];
 const CNW_INDEX: &str = "https://www.newswire.ca/sitemap-news.xml?page=1";
 const CNW_HOST: &str = "www.newswire.ca";
+/// The committed hosts file as it stood before 2026-11-19, CNW admitted.
+const CNW_READMITTED: &str = "cnw_readmitted.json";
 /// Urls 1-3 of the 100 in the 2026-11-16 08:04:39Z news sitemap (§11.6 weekday probe, p0800).
 const CNW_REAL_INDEX: &str = "sitemap_news_3_urls.xml";
 const CNW_LINKS: [&str; 3] = [
@@ -469,6 +471,15 @@ fn rules_fixture(name: &str) -> PathBuf {
 fn provider() -> Result<OpenWebFeed, Refusal> {
     Ok(handed(
         OpenWebFeed::open(&hosts_path(), &rules_path(), CONTACT)?,
+        |_| HostRobots::Absent,
+    ))
+}
+
+/// The committed hosts file with CNW's status `admitted`, the one change that re-admits it
+/// (section 11.2); robots handed as `provider` hands them.
+fn readmitted() -> Result<OpenWebFeed, Refusal> {
+    Ok(handed(
+        OpenWebFeed::open(&hosts_fixture(CNW_READMITTED), &rules_path(), CONTACT)?,
         |_| HostRobots::Absent,
     ))
 }
@@ -780,33 +791,90 @@ fn a_target_other_than_the_run_day_is_refused_before_any_request() -> Outcome {
         );
     }
     let plan = provider.plan(&TargetWindow::new(RUN_DAY), None, None, at(RUN_AT))?;
-    assert_eq!(plan.requests.len(), 6);
+    assert_eq!(plan.requests.len(), 5);
     assert_eq!(plan.not_planned, Vec::new());
     Ok(())
 }
 
-/// Section 11.2's host order, PRN's sitemap page 1 after its RSS. Mutations, each red: 2026-11-16
-/// the PRN row `candidate`, the GNW and PRN rows swapped; 2026-11-17 the CNW, Fed and Yahoo rows
-/// `candidate`, CNW's index the RSS feed, PRN's `paged_index` removed.
-#[test]
-fn the_committed_hosts_file_plans_gnw_then_prn_and_its_sitemap_then_cnw_then_the_fed_then_yahoo(
-) -> Outcome {
-    let plan = provider()?.plan(&TargetWindow::new(RUN_DAY), None, None, at(RUN_AT))?;
-    let urls: Vec<&str> = plan
+fn planned_urls(provider: &OpenWebFeed) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let plan = provider.plan(&TargetWindow::new(RUN_DAY), None, None, at(RUN_AT))?;
+    Ok(plan
         .requests
-        .iter()
-        .map(|request| request.url.as_str())
+        .into_iter()
+        .map(|request| request.url)
+        .collect())
+}
+
+/// Section 11.2's host order, PRN's sitemap page 1 after its RSS, CNW not admitted since
+/// 2026-11-19. Mutations, each red: 2026-11-16 the PRN row `candidate`, the GNW and PRN rows
+/// swapped; 2026-11-17 the Fed and Yahoo rows `candidate`, PRN's `paged_index` removed.
+#[test]
+fn the_committed_hosts_file_plans_gnw_then_prn_and_its_sitemap_then_the_fed_then_yahoo() -> Outcome
+{
+    assert_eq!(
+        planned_urls(&provider()?)?,
+        [GNW_INDEX, PRN_INDEX, PRN_SITEMAP, FED_INDEX, YAHOO_INDEX]
+    );
+    Ok(())
+}
+
+/// Owner decision 2026-11-19: CNW stays a candidate row, its rule, pin and index kept, so no
+/// index, robots path or carried page of it is asked. Mutation 2026-11-19, the CNW row
+/// `admitted`: red.
+#[test]
+fn the_committed_hosts_file_names_canada_newswire_a_candidate_and_asks_nothing_of_it() -> Outcome {
+    let provider = provider()?;
+    let cnw_paths: Vec<AdmittedPath> = provider
+        .admitted_paths()
+        .into_iter()
+        .filter(|path| path.host == CNW_HOST)
+        .collect();
+    let pin = provider
+        .host_pins()
+        .into_iter()
+        .find(|row| row.host == CNW_HOST)
+        .map(|row| (row.admitted, row.robots.is_some()));
+    let carried = provider.carried(&TargetWindow::new(RUN_DAY), CNW_ARTICLE_URL, None);
+    let planned_on_cnw: Vec<String> = planned_urls(&provider)?
+        .into_iter()
+        .filter(|url| url.contains(CNW_HOST))
         .collect();
     assert_eq!(
-        urls,
-        vec![
-            GNW_INDEX,
-            PRN_INDEX,
-            PRN_SITEMAP,
-            CNW_INDEX,
-            FED_INDEX,
-            YAHOO_INDEX
-        ]
+        (planned_on_cnw, cnw_paths, pin, carried),
+        (Vec::<String>::new(), Vec::new(), Some((false, true)), None)
+    );
+    Ok(())
+}
+
+/// Re-admission is one hosts-file change: the fixture is the committed file with CNW's `status`
+/// alone set to `admitted`, and it plans CNW's sitemap in its section 11.2 place. Mutation
+/// 2026-11-19, another byte of the fixture changed: red.
+#[test]
+fn canada_newswire_is_readmitted_by_its_status_alone() -> Outcome {
+    let committed = std::fs::read_to_string(hosts_path())?;
+    let row = format!("\"host\": \"{CNW_HOST}\",\n      \"status\": ");
+    let candidate = format!("{row}\"candidate\"");
+    let readmitted_text = std::fs::read_to_string(hosts_fixture(CNW_READMITTED))?;
+    assert_eq!(
+        (
+            committed.matches(&candidate).count(),
+            committed.replace(&candidate, &format!("{row}\"admitted\"")) == readmitted_text,
+            planned_urls(&readmitted()?)?,
+        ),
+        (
+            1,
+            true,
+            [
+                GNW_INDEX,
+                PRN_INDEX,
+                PRN_SITEMAP,
+                CNW_INDEX,
+                FED_INDEX,
+                YAHOO_INDEX
+            ]
+            .map(str::to_owned)
+            .to_vec()
+        )
     );
     Ok(())
 }
@@ -1946,7 +2014,7 @@ fn the_real_pr_newswire_article_carries_its_title_its_canonical_link_and_its_www
 #[test]
 fn the_real_canada_newswire_sitemap_yields_one_follow_up_per_release_with_its_raw_date() -> Outcome
 {
-    let provider = provider()?;
+    let provider = readmitted()?;
     let extracted = provider.extract(&cnw_index_request(&provider)?, &blob(cnw(CNW_REAL_INDEX)));
     assert_eq!(
         (extracted.vendor_rows, extracted.filtered_out),
@@ -1976,7 +2044,7 @@ fn the_real_canada_newswire_sitemap_yields_one_follow_up_per_release_with_its_ra
 /// tests the prefix from the wide side. Mutation 2026-11-17, the prefix `/`: red.
 #[test]
 fn a_canada_newswire_link_outside_news_releases_is_filtered_out_and_counted() -> Outcome {
-    let provider = provider()?;
+    let provider = readmitted()?;
     let index = cnw_sitemap(&[
         (CNW_ARTICLE_URL, CNW_PUBLICATION_DATES[0]),
         (CNW_OFF_PREFIX_URL, CNW_PUBLICATION_DATES[0]),
@@ -1998,7 +2066,7 @@ fn a_canada_newswire_link_outside_news_releases_is_filtered_out_and_counted() ->
 /// namespace placed first are never read. Mutation 2026-11-17, the namespace test dropped: red.
 #[test]
 fn a_sitemap_element_named_like_a_field_in_another_namespace_is_never_read() -> Outcome {
-    let provider = provider()?;
+    let provider = readmitted()?;
     let index = format!(
         "<?xml version=\"1.0\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\" \
          xmlns:news=\"http://www.google.com/schemas/sitemap-news/0.9\" \
@@ -2028,7 +2096,7 @@ fn a_sitemap_element_named_like_a_field_in_another_namespace_is_never_read() -> 
 /// anywhere under `url`, `children()` read as `descendants()`: each red.
 #[test]
 fn a_sitemap_row_is_a_top_level_url_with_its_trimmed_loc_and_its_news_child_only() -> Outcome {
-    let provider = provider()?;
+    let provider = readmitted()?;
     let nested = "https://www.newswire.ca/news-releases/a-nested-url-100000001.html";
     let index = format!(
         "<?xml version=\"1.0\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\" \
@@ -2072,7 +2140,7 @@ fn a_sitemap_row_is_a_top_level_url_with_its_trimmed_loc_and_its_news_child_only
 /// rule reading `rss`, red; the root check reading only "not `rss`", red.
 #[test]
 fn the_canada_newswire_index_is_its_news_sitemap_and_an_rss_answer_is_permanent() -> Outcome {
-    let provider = provider()?;
+    let provider = readmitted()?;
     let request = cnw_index_request(&provider)?;
     let empty = cnw_sitemap(&[]);
     let sitemap_index = format!(
@@ -2113,7 +2181,7 @@ fn the_canada_newswire_index_is_its_news_sitemap_and_an_rss_answer_is_permanent(
 #[test]
 fn a_canada_newswire_publication_date_is_a_minute_at_its_own_offset_and_never_an_instant() -> Outcome
 {
-    let provider = provider()?;
+    let provider = readmitted()?;
     let request = cnw_follow_up(&provider, 0)?;
     let extract = |raw: &str| {
         let dated = Request {
@@ -2167,7 +2235,7 @@ fn a_canada_newswire_publication_date_is_a_minute_at_its_own_offset_and_never_an
 /// the container `body`, `article` and `section`: each red.
 #[test]
 fn the_extracted_body_is_article_text_and_never_page_html_on_a_canada_newswire_page() -> Outcome {
-    let provider = provider()?;
+    let provider = readmitted()?;
     let item =
         only_item(&provider.extract(&cnw_follow_up(&provider, 0)?, &blob(cnw(CNW_ARTICLE))))?;
     let body = item.body.ok_or("no body")?.text;
@@ -2201,7 +2269,7 @@ fn the_extracted_body_is_article_text_and_never_page_html_on_a_canada_newswire_p
 /// real page. Mutations 2026-11-17, the container `article` and `div.release-content`: each red.
 #[test]
 fn a_canada_newswire_page_with_no_release_body_is_unusable_as_no_article_body() -> Outcome {
-    let provider = provider()?;
+    let provider = readmitted()?;
     let page = blob(cnw(CNW_NO_RELEASE_BODY_PAGE));
     let row = only_unusable(&provider.extract(&cnw_follow_up(&provider, 2)?, &page))?;
     assert_eq!(
@@ -2229,7 +2297,7 @@ fn a_canada_newswire_page_with_no_release_body_is_unusable_as_no_article_body() 
 #[test]
 fn the_real_canada_newswire_article_carries_its_title_its_canonical_link_and_its_item_key(
 ) -> Outcome {
-    let provider = provider()?;
+    let provider = readmitted()?;
     assert_eq!(
         provider.item_key(CNW_ARTICLE_URL).as_deref(),
         Some(CNW_ARTICLE_KEY)
@@ -2270,7 +2338,7 @@ fn the_real_canada_newswire_article_carries_its_title_its_canonical_link_and_its
 /// allow; the sitemap's query is part of it.
 #[test]
 fn the_committed_canada_newswire_row_asks_its_sitemap_with_its_query_and_its_prefix() -> Outcome {
-    let asked: Vec<String> = provider()?
+    let asked: Vec<String> = readmitted()?
         .admitted_paths()
         .into_iter()
         .filter(|path| path.host == CNW_HOST)
@@ -2797,13 +2865,13 @@ fn a_provider_key_filter_nothing_can_read_whole_is_refused() {
     }
 }
 
-/// A `cross_check` key's host must be another admitted row, or its rows are never looked for:
-/// GNW absent from the CNW-and-Yahoo hosts file, and a key mapped to Yahoo itself. Mutations
-/// 2026-11-17, the check removed and the own-host clause dropped: each red.
+/// A `cross_check` key's host must be another hosts row: GNW absent from the CNW-and-Yahoo hosts
+/// file, and a key mapped to Yahoo itself. Mutations 2026-11-17, the check removed and the
+/// own-host clause dropped: each red.
 #[test]
-fn a_cross_check_key_whose_host_no_other_admitted_row_holds_is_refused() {
+fn a_cross_check_key_whose_host_no_other_hosts_row_names_is_refused() {
     let refused = |hosts: PathBuf, rules: PathBuf| match refusal_of(&hosts, &rules, CONTACT) {
-        Some(Refusal::CrossCheckHostNotAdmitted {
+        Some(Refusal::CrossCheckHostUnknown {
             rule, key, host, ..
         }) => Some((rule, key, host)),
         _ => None,
@@ -2859,7 +2927,14 @@ fn a_cross_check_host_in_upper_case_names_its_admitted_row() {
 
 // ---- Yahoo cross-check (section 11.2, option C) ----
 
+/// Over `readmitted`, the hosts the Yahoo fixture's `cross_check` rows were cut against.
 fn checker() -> Result<CrossChecker, Box<dyn std::error::Error>> {
+    readmitted()?
+        .cross_checker()
+        .ok_or_else(|| "the re-admitted files cross-check nothing".into())
+}
+
+fn committed_checker() -> Result<CrossChecker, Box<dyn std::error::Error>> {
     provider()?
         .cross_checker()
         .ok_or_else(|| "the committed files cross-check nothing".into())
@@ -2904,17 +2979,78 @@ fn every_index_at(
         .collect()
 }
 
-/// The committed files: Yahoo is the keyed index, and the other four admitted indexes are direct.
+/// Yahoo is the keyed index, and every other admitted index is direct: GNW, PRN and the Fed in the
+/// committed files, CNW too once re-admitted.
 #[test]
-fn the_committed_hosts_file_cross_checks_yahoo_against_the_other_four_indexes() -> Outcome {
-    let checker = checker()?;
-    let direct: Vec<bool> = [GNW_INDEX, PRN_INDEX, CNW_INDEX, FED_INDEX, YAHOO_INDEX]
-        .iter()
-        .map(|url| checker.is_direct_index(url))
-        .collect();
+fn the_committed_hosts_file_cross_checks_yahoo_against_every_other_admitted_index() -> Outcome {
+    let direct = |checker: &CrossChecker| -> (String, Vec<bool>) {
+        let direct = [GNW_INDEX, PRN_INDEX, CNW_INDEX, FED_INDEX, YAHOO_INDEX]
+            .iter()
+            .map(|url| checker.is_direct_index(url))
+            .collect();
+        (checker.index_url().to_owned(), direct)
+    };
     assert_eq!(
-        (checker.index_url(), direct),
-        (YAHOO_INDEX, vec![true, true, true, true, false])
+        (direct(&committed_checker()?), direct(&checker()?)),
+        (
+            (YAHOO_INDEX.to_owned(), vec![true, true, false, true, false]),
+            (YAHOO_INDEX.to_owned(), vec![true, true, true, true, false])
+        )
+    );
+    Ok(())
+}
+
+/// Owner decision 2026-11-19: a `cnwgroup.com` row is `no_direct_index` while CNW is a candidate,
+/// never `not_looked`, `not_compared` or unlisted, and its minute does not move `read_from`.
+/// Mutations 2026-11-19, the row left to `not_looked`, the earliest over every key: each red.
+#[test]
+fn a_cross_check_row_whose_host_is_not_admitted_has_no_direct_index() -> Outcome {
+    let row = |key: &str, at: &'static str| {
+        (
+            format!("https://finance.yahoo.com/{key}/{at}"),
+            at,
+            format!("https://media.zenfs.com/en/{key}/a.jpg"),
+        )
+    };
+    let rows = [
+        row("prnewswire.com", "2026-11-16T09:00:00Z"),
+        row("globenewswire.com", "2026-11-16T09:00:00Z"),
+        row("cnwgroup.com", "2026-11-16T09:00:00Z"),
+        row("cnwgroup.com", "2026-11-16T07:30:00Z"),
+    ];
+    let listed: Vec<(&str, &str, Option<&str>)> = rows
+        .iter()
+        .map(|(link, at, image)| (link.as_str(), *at, Some(image.as_str())))
+        .collect();
+    let index = yahoo_sitemap(&listed);
+    let committed = committed_checker()?;
+    let all = every_index_at(LOOKED_AT, &[])?;
+    let counted = |from: Option<DateTime<Utc>>| {
+        committed.check(&index, &all, from).map(|checked| {
+            let keys: Vec<String> = checked.unlisted.into_iter().map(|row| row.key).collect();
+            (
+                checked.cross_checked,
+                checked.no_direct_index,
+                checked.not_looked,
+                checked.not_compared,
+                keys,
+            )
+        })
+    };
+    let compared = vec!["prnewswire.com".to_owned(), "globenewswire.com".to_owned()];
+    assert_eq!(
+        (
+            counted(instant("2026-11-16T07:00:00Z")),
+            counted(None),
+            committed.earliest_cross_checked(&index),
+            checker()?.earliest_cross_checked(&index),
+        ),
+        (
+            Some((4, 2, 0, 0, compared)),
+            Some((4, 2, 0, 2, Vec::new())),
+            instant("2026-11-16T09:00:00Z"),
+            instant("2026-11-16T07:30:00Z"),
+        )
     );
     Ok(())
 }
@@ -4107,7 +4243,7 @@ fn the_committed_hosts_file_pins_the_committed_robots_body() -> Outcome {
             },
             HostPin {
                 host: CNW_HOST.to_owned(),
-                admitted: true,
+                admitted: false,
                 robots: pin(cnw("robots_www_newswire_ca.txt")),
             },
             HostPin {
@@ -4289,7 +4425,7 @@ fn a_rules_file_holding_a_field_nothing_reads_is_refused() {
 /// `Minute`, so a ceiling of `Instant` would claim a precision nothing here can deliver.
 #[test]
 fn the_open_web_feed_breaks_no_claim_of_the_seam() -> Outcome {
-    let provider = provider()?;
+    let provider = readmitted()?;
     let article = article_request(&provider)?;
     let synthetic = follow_ups(&provider, &gnw(SYNTHETIC_INDEX))?
         .follow_ups
@@ -4498,7 +4634,7 @@ fn every_planned_request_and_follow_up_carries_the_extraction_version() -> Outco
 
 /// The committed golden file as JSON, and the same shape computed from the fixtures now.
 fn golden_bodies() -> Result<(serde_json::Value, serde_json::Value), Box<dyn std::error::Error>> {
-    let provider = provider()?;
+    let provider = readmitted()?;
     let mut bodies = serde_json::Map::new();
     let gnw_request = article_request(&provider)?;
     let prn_request = prn_article_request(&provider)?;

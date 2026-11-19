@@ -1370,6 +1370,7 @@ fn checked_json(checker: &CrossChecker, read: &Read) -> Value {
             },
             "not_compared": checked.not_compared,
             "not_looked": checked.not_looked,
+            "no_direct_index": checked.no_direct_index,
             "listed_directly": checked.listed_directly,
             "unlisted_count": checked.unlisted.len(),
             "unlisted": checked.unlisted.iter().map(|row| json!({
@@ -1926,11 +1927,13 @@ pub fn render_human(envelope: &Value, out: &mut impl std::io::Write) -> std::io:
     } else if !cross_check.is_null() {
         writeln!(
             out,
-            "cross-check      {} unlisted directly, {} listed, {} not compared, {} not looked",
+            "cross-check      {} unlisted directly, {} listed, {} not compared, {} not looked, \
+             {} with no direct index",
             checked["unlisted_count"],
             checked["listed_directly"],
             checked["not_compared"],
-            checked["not_looked"]
+            checked["not_looked"],
+            checked["no_direct_index"]
         )?;
     }
     for poll in envelope["continuity"].as_array().unwrap_or(&none) {

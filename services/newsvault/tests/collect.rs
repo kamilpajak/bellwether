@@ -1929,9 +1929,9 @@ const GNW_INDEX: &str = "https://rss.globenewswire.com/rssfeed/";
 /// `synthetic_index_one_release.xml`'s one `www.` link, rewritten to `rss.` as the rules say.
 const GNW_RELEASE: &str =
     "https://rss.globenewswire.com/news-release/2026/11/14/9999999/0/en/synthetic-release.html";
-/// The committed hosts file admits GNW, PR Newswire, Canada Newswire, the Fed and Yahoo, and PR
-/// Newswire's paged sitemap: six index requests.
-const ADMITTED_INDEXES: u64 = 6;
+/// The committed hosts file admits GNW, PR Newswire, the Fed and Yahoo, and PR Newswire's paged
+/// sitemap: five index requests. CNW is a candidate row since 2026-11-19.
+const ADMITTED_INDEXES: u64 = 5;
 /// `open_web_hosts()` admits GNW alone.
 const GNW_ONLY_ADMITTED_HOSTS: u64 = 1;
 /// Before `SATURDAY_AT`: when the seeded robots fetches were ledgered.
@@ -2239,8 +2239,8 @@ fn two_sources_in_one_invocation_are_refused() -> TestResult {
 }
 
 /// The committed hosts file, every robots row seeded. Mutations 2026-11-16, its PRN row set to
-/// `candidate`: red (one request); 2026-11-17, its CNW, Fed and Yahoo rows set to `candidate`
-/// and PRN's `paged_index` removed: each red (one request fewer).
+/// `candidate`: red (one request); 2026-11-17, its Fed and Yahoo rows set to `candidate` and PRN's
+/// `paged_index` removed: each red (one request fewer); 2026-11-19, its CNW row `admitted`: red.
 #[test]
 fn an_open_web_dry_run_plans_one_request_per_admitted_index_and_writes_nothing() -> TestResult {
     let root = TempDir::new()?;

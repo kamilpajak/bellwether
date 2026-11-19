@@ -672,9 +672,9 @@ fn a_fetched_robots_digest_other_than_the_pin_exits_one_and_names_both() -> Test
     Ok(())
 }
 
-/// Section 11.2: the production file's five admitted rows, each answered with its committed
-/// body, the Fed's with its 404 page. Mutations 2026-11-16 and 2026-11-17, one character of the
-/// PRN, CNW and Yahoo pins changed, and the Fed pin a digest: each red (exit 1).
+/// The committed file's five rows, candidate CNW asked too, each answered with its committed body
+/// (the Fed's 404). Mutations 2026-11-16 and 2026-11-17, one character of the PRN, CNW or Yahoo
+/// pin changed, the Fed pin a digest: each red (CNW's by `matches_pin`, the others exit 1).
 #[test]
 fn the_committed_hosts_file_refreshed_with_its_committed_bodies_matches_every_pin() -> TestResult {
     let root = TempDir::new()?;
@@ -688,10 +688,14 @@ fn the_committed_hosts_file_refreshed_with_its_committed_bodies_matches_every_pi
         (YAHOO_ROBOTS, OK, &yahoo),
     ]);
     let answer = refreshed(root.path(), committed_hosts(), &exchange)?;
-    let matched: Vec<(Option<bool>, Option<&str>)> = (0..5)
+    let matched: Vec<(Option<&str>, Option<bool>, Option<&str>)> = (0..5)
         .map(|nth| {
             let row = &answer.report["rows"][nth];
-            (row["matches_pin"].as_bool(), row["parse_verdict"].as_str())
+            (
+                row["status"].as_str(),
+                row["matches_pin"].as_bool(),
+                row["parse_verdict"].as_str(),
+            )
         })
         .collect();
     assert_eq!(
@@ -699,11 +703,11 @@ fn the_committed_hosts_file_refreshed_with_its_committed_bodies_matches_every_pi
         (
             RobotsExit::Ok,
             vec![
-                (Some(true), Some("rules")),
-                (Some(true), Some("rules")),
-                (Some(true), Some("rules")),
-                (Some(true), Some("no_rules_absent")),
-                (Some(true), Some("rules")),
+                (Some("admitted"), Some(true), Some("rules")),
+                (Some("admitted"), Some(true), Some("rules")),
+                (Some("candidate"), Some(true), Some("rules")),
+                (Some("admitted"), Some(true), Some("no_rules_absent")),
+                (Some("admitted"), Some(true), Some("rules")),
             ],
             // `robots_rows` orders by host.
             vec![

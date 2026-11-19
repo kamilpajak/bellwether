@@ -121,6 +121,7 @@ const PRN_SITEMAP_PAGE_3: &str = "https://www.prnewswire.com/sitemap-news.xml?pa
 const PRN_RELEASE_PREFIX: &str = "https://www.prnewswire.com/news-releases/";
 const PRN_SITEMAP_ONLY: &str = "www.prnewswire.com/news-releases/stark-future-closes-financing-round-in-excess-of-150-million-in-total-transactional-value-as-its-electric-motorcycles-overtake-combustion-on-the-world-stage-302939742.html";
 const CNW_INDEX: &str = "https://www.newswire.ca/sitemap-news.xml?page=1";
+const CNW_HOST: &str = "www.newswire.ca";
 /// `cnw/sitemap_news_3_urls.xml`'s three links with the page each is answered with. HKEX's page
 /// is not kept, so 807505308 is answered with the synthetic page that has no `section.release-body`.
 const CNW_RELEASES: [(&str, &str); 3] = [
@@ -890,13 +891,13 @@ fn every_body_an_open_web_run_stores_is_indexed_and_linked_to_its_attempt() -> T
     Ok(())
 }
 
-/// Section 11.2, the committed hosts file on Monday 2026-11-16: five indexes, PRN's sitemap page 1
-/// (the RSS releases and 302939742), then each host's pages, each release fetched once. The
-/// mutations that turn it red are §11.5 step 6's tables.
+/// Section 11.2, the committed hosts file on Monday 2026-11-16: four indexes, PRN's sitemap page
+/// 1, then each host's pages once; the stub answers CNW too and is never asked it. The mutations
+/// that turn it red are §11.5 step 6's tables.
 #[test]
-fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end() -> TestResult {
-    const ATTEMPTS: usize = 21;
-    const ITEMS: usize = 10;
+fn an_open_web_run_collects_a_gnw_a_prn_a_fed_and_a_yahoo_day_end_to_end() -> TestResult {
+    const ATTEMPTS: usize = 17;
+    const ITEMS: usize = 8;
     let root = TempDir::new()?;
     seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
     let ask = Ask {
@@ -911,9 +912,7 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
     let attempts = envelope["attempts"].as_array().ok_or("attempts")?;
     let hosts_version = canon::FileDigest::of(&std::fs::read(seed::committed_hosts())?);
     // Every index is asked before any page.
-    let indexes: Vec<Option<&str>> = [0, 1, 2, 3, 4]
-        .map(|nth| attempts[nth]["url"].as_str())
-        .into();
+    let indexes: Vec<Option<&str>> = [0, 1, 2, 3].map(|nth| attempts[nth]["url"].as_str()).into();
     assert_eq!(
         (
             answer.exit,
@@ -931,7 +930,6 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
             vec![
                 Some(INDEX),
                 Some(PRN_INDEX),
-                Some(CNW_INDEX),
                 Some(FED_INDEX),
                 Some(YAHOO_INDEX)
             ],
@@ -955,7 +953,7 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
         })
         .collect();
     let mut expected_counts = BTreeMap::new();
-    for index in [INDEX, PRN_INDEX, CNW_INDEX, FED_INDEX] {
+    for index in [INDEX, PRN_INDEX, FED_INDEX] {
         expected_counts.insert(index.to_owned(), (Some(3), Some(0), Some(0)));
     }
     expected_counts.insert(YAHOO_INDEX.to_owned(), (Some(8), Some(0), Some(0)));
@@ -971,10 +969,6 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
         .iter()
         .enumerate()
         .map(|(nth, (key, _))| (*key, nth != 0));
-    let cnw_pages = CNW_RELEASES
-        .iter()
-        .enumerate()
-        .map(|(nth, (key, _))| (*key, nth != 2));
     let fed_pages = FED_RELEASES
         .iter()
         .enumerate()
@@ -985,7 +979,6 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
         .map(|(nth, (key, _))| (*key, nth != 1));
     for (key, committed) in gnw_pages
         .chain(prn_pages)
-        .chain(cnw_pages)
         .chain(fed_pages)
         .chain(yahoo_pages)
     {
@@ -1043,17 +1036,6 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
             ),
             MONDAY_RECEIVED_AT,
         )?,
-        // The sitemap's -05:00 local minute, stored as its UTC minute beside the raw text.
-        cnw_item(
-            0,
-            ("2026-11-16T07:22:00.000000Z", "2026-11-16T02:22:00-05:00"),
-            MONDAY_RECEIVED_AT,
-        )?,
-        cnw_item(
-            1,
-            ("2026-11-16T06:47:00.000000Z", "2026-11-16T01:47:00-05:00"),
-            MONDAY_RECEIVED_AT,
-        )?,
         // A day before the 10th is printed unpadded, and read as that day.
         fed_item(
             0,
@@ -1087,7 +1069,7 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
     let stored = stored_items(&db)?;
     assert_eq!(stored, expected);
     // Each story holds the page its url was answered with. Mutations 2026-11-17, the stub's pages
-    // swapped for Fed 0/2 (green before this assertion), PRN 1/2 and CNW 0/1: each red.
+    // swapped for Fed 0/2 (green before this assertion) and PRN 1/2: each red.
     let golden: Value = serde_json::from_slice(&std::fs::read(
         provider_dir().join("tests/fixtures/golden_bodies.json"),
     )?)?;
@@ -1116,18 +1098,6 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
             PRN_RELEASES[2].0,
             "article_302938569.html",
             "Lilly to present new data across Zepbound, Foundayo, EloraTZP and retatrutide at ObesityWeek 2026, moving obesity care beyond the scale",
-        ),
-        (
-            "cnw",
-            CNW_RELEASES[0].0,
-            "article_805423040.html",
-            "Global Voltage, Travel-Ready Protection: ELEGRP Powers Dyson Supersonic Travel hair dryer",
-        ),
-        (
-            "cnw",
-            CNW_RELEASES[1].0,
-            "article_823884942.html",
-            "Segway Powersports Secures Class 2 One-Two Finish on SCORE Baja 1000 Debut",
         ),
         (
             "fed",
@@ -1181,6 +1151,8 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let (sent, _) = exchange.sent();
+    let on_cnw: Vec<&String> = sent.iter().filter(|url| url.contains(CNW_HOST)).collect();
+    assert_eq!(on_cnw, Vec::<&String>::new());
     let asked: Vec<usize> = PRN_RELEASES
         .iter()
         .map(|(key, _)| key)
@@ -1230,8 +1202,8 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
         (
             Some(YAHOO_INDEX),
             Some(MONDAY_RECEIVED_AT),
-            Some(4),
-            Some(4),
+            Some(3),
+            Some(3),
             &serde_json::json!({"followed": 2, "cross_checked": 3, "other_key": 2, "no_key": 1}),
             Some(3),
             Some(0),
@@ -1264,7 +1236,8 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
         ),
         (
             Some(
-                "cross-check      0 unlisted directly, 0 listed, 3 not compared, 0 not looked"
+                "cross-check      0 unlisted directly, 0 listed, 3 not compared, 0 not looked, \
+                 0 with no direct index"
                     .to_owned()
             ),
             Some(format!(
@@ -1278,6 +1251,65 @@ fn an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end()
     Ok(())
 }
 
+/// Owner decision 2026-11-19: the committed file's robots refresh asks candidate CNW too, so the
+/// re-admitted file collects CNW's sitemap and three releases with no other step. Mutation
+/// 2026-11-19, the refresh asking admitted rows only: red.
+#[test]
+fn a_readmitted_canada_newswire_is_collected_after_the_committed_files_robots_refresh() -> TestResult
+{
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    let ask = Ask {
+        hosts: Some(seed::readmitted_hosts()),
+        at: instant(MONDAY_AT),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let exchange = Gnw::five_hosts()?;
+    let answer = cmd_collect::run(&ask, &opened, &exchange, &Monday)?;
+    let (sent, _) = exchange.sent();
+    let on_cnw: Vec<String> = sent
+        .into_iter()
+        .filter(|url| url.contains(CNW_HOST))
+        .collect();
+    let expected_sent: Vec<String> = std::iter::once(CNW_INDEX.to_owned())
+        .chain(CNW_RELEASES.iter().map(|(key, _)| format!("https://{key}")))
+        .collect();
+    let db = Connection::open_with_flags(
+        root.path().join(COMMIT_LOG),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let stored = stored_items(&db)?;
+    // The sitemap's -05:00 local minute, stored as its UTC minute beside the raw text.
+    let expected: BTreeMap<String, Row> = [
+        cnw_item(
+            0,
+            ("2026-11-16T07:22:00.000000Z", "2026-11-16T02:22:00-05:00"),
+            MONDAY_RECEIVED_AT,
+        )?,
+        cnw_item(
+            1,
+            ("2026-11-16T06:47:00.000000Z", "2026-11-16T01:47:00-05:00"),
+            MONDAY_RECEIVED_AT,
+        )?,
+    ]
+    .into_iter()
+    .collect();
+    let stored_cnw: BTreeMap<String, Row> = stored
+        .iter()
+        .filter(|(story, _)| expected.contains_key(*story))
+        .map(|(story, row)| (story.clone(), row.clone()))
+        .collect();
+    // The four-host run's 8 items and CNW's two.
+    assert_eq!(
+        (answer.exit, on_cnw, stored.len(), stored_cnw),
+        (Exit::Ok, expected_sent, 10, expected),
+        "{:#}",
+        answer.envelope
+    );
+    Ok(())
+}
+
 struct FixedAt(DateTime<Utc>);
 
 impl Clock for FixedAt {
@@ -1286,8 +1318,8 @@ impl Clock for FixedAt {
     }
 }
 
-/// A store over the committed five hosts with every robots fetch ledgered.
-fn five_host_store() -> Result<(TempDir, PathBuf), Box<dyn Error>> {
+/// A store over the committed hosts file with every robots fetch ledgered.
+fn committed_store() -> Result<(TempDir, PathBuf), Box<dyn Error>> {
     let root = TempDir::new()?;
     seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
     Ok((root, seed::committed_hosts()))
@@ -1310,15 +1342,14 @@ fn cross_checked_at(
     Ok((answer.exit, answer.envelope["cross_check"].clone()))
 }
 
-/// Two runs over the five hosts, Yahoo 503 in the first and retried in the second: two wire-key
-/// rows no direct index listed are named and one is counted. The first run's four direct answers
-/// are older than `read_from` and are not read. Mutations 2026-11-17: the `since` bound removed,
-/// `watched_from` the newest direct answer, the first keyed attempt read: each red.
+/// Yahoo 503, then retried: three wire-key rows no direct index listed are named, ELEGRP's among
+/// them since CNW is a candidate; the first run's answers predate `read_from`. Mutations
+/// 2026-11-17, no `since` bound, the newest `watched_from`, the first keyed attempt: each red.
 #[test]
 fn a_yahoo_row_under_a_wire_key_no_direct_index_listed_is_named_in_the_run_envelope() -> TestResult
 {
     const EARLY_AT: &str = "2026-11-16T05:00:30Z";
-    let (root, hosts) = five_host_store()?;
+    let (root, hosts) = committed_store()?;
     let run_at = |at: &str, exchange: &Gnw| {
         cross_checked_at(root.path(), &hosts, at, exchange).map(|(_, checked)| checked)
     };
@@ -1348,9 +1379,9 @@ fn a_yahoo_row_under_a_wire_key_no_direct_index_listed_is_named_in_the_run_envel
         (
             true,
             Some("2026-11-16T05:00:29.000000Z"),
-            Some(4),
+            Some(3),
             Some(0),
-            Some(1),
+            Some(0),
             vec![
                 (
                     Some("globenewswire.com"),
@@ -1360,7 +1391,65 @@ fn a_yahoo_row_under_a_wire_key_no_direct_index_listed_is_named_in_the_run_envel
                     Some("prnewswire.com"),
                     Some("https://finance.yahoo.com/economy/articles/kyiv-based-horizon-capital-reaches-090000908.html")
                 ),
+                (
+                    Some("prnewswire.com"),
+                    Some("https://finance.yahoo.com/technology/articles/global-voltage-travel-ready-protection-072200770.html")
+                ),
             ],
+        ),
+        "{checked:#}"
+    );
+    Ok(())
+}
+
+/// Owner decision 2026-11-19: the fixture's last row filed under `cnwgroup.com` is reported
+/// `no_direct_index` in the envelope and its human line, never compared. Mutation 2026-11-19, the
+/// envelope's `no_direct_index` given `not_looked`: red.
+#[test]
+fn a_yahoo_row_under_cnws_key_is_reported_with_no_direct_index_in_the_run_envelope() -> TestResult {
+    const PRN_IMAGE: &str = "media.zenfs.com/en/prnewswire.com";
+    let (root, hosts) = committed_store()?;
+    let mut exchange = Gnw::five_hosts()?;
+    let sitemap = String::from_utf8(exchange.pages.get(YAHOO_INDEX).cloned().unwrap_or_default())?;
+    let (before, after) = sitemap
+        .rsplit_once(PRN_IMAGE)
+        .ok_or("no prnewswire.com row")?;
+    exchange.pages.insert(
+        YAHOO_INDEX.to_owned(),
+        format!("{before}media.zenfs.com/en/cnwgroup.com{after}").into_bytes(),
+    );
+    let ask = Ask {
+        hosts: Some(hosts),
+        at: instant(MONDAY_AT),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, &exchange, &Monday)?;
+    let checked = &answer.envelope["cross_check"]["result"];
+    let mut human = Vec::new();
+    cmd_collect::render_human(&answer.envelope, &mut human)?;
+    let line = String::from_utf8(human)?
+        .lines()
+        .find(|line| line.starts_with("cross-check"))
+        .map(str::to_owned);
+    assert_eq!(
+        (
+            checked["rows"]["cross_checked"].as_u64(),
+            checked["no_direct_index"].as_u64(),
+            checked["not_looked"].as_u64(),
+            checked["not_compared"].as_u64(),
+            line,
+        ),
+        (
+            Some(3),
+            Some(1),
+            Some(0),
+            Some(2),
+            Some(
+                "cross-check      0 unlisted directly, 0 listed, 2 not compared, 0 not looked, \
+                 1 with no direct index"
+                    .to_owned()
+            ),
         ),
         "{checked:#}"
     );
@@ -1372,7 +1461,7 @@ fn a_yahoo_row_under_a_wire_key_no_direct_index_listed_is_named_in_the_run_envel
 /// 503 body is read but never parsed. Review 2026-11-17: a CNW 503 named three rows unlisted.
 #[test]
 fn a_cross_check_row_whose_own_index_did_not_answer_after_is_not_looked() -> TestResult {
-    let (root, hosts) = five_host_store()?;
+    let (root, hosts) = committed_store()?;
     cross_checked_at(
         root.path(),
         &hosts,
@@ -1400,8 +1489,8 @@ fn a_cross_check_row_whose_own_index_did_not_answer_after_is_not_looked() -> Tes
             unlisted,
         ),
         (
-            Some(6),
-            Some(3),
+            Some(5),
+            Some(2),
             Some(2),
             Some(0),
             vec![Some("globenewswire.com")]
@@ -1418,7 +1507,7 @@ fn a_cross_check_row_whose_own_index_did_not_answer_after_is_not_looked() -> Tes
 fn a_direct_answer_received_exactly_one_lead_before_the_earliest_row_is_read() -> TestResult {
     let mut read = Vec::new();
     for early in ["2026-11-16T05:52:01Z", "2026-11-16T05:52:00Z"] {
-        let (root, hosts) = five_host_store()?;
+        let (root, hosts) = committed_store()?;
         cross_checked_at(
             root.path(),
             &hosts,
@@ -1428,7 +1517,7 @@ fn a_direct_answer_received_exactly_one_lead_before_the_earliest_row_is_read() -
         let (_, checked) = cross_checked_at(root.path(), &hosts, MONDAY_AT, &Gnw::five_hosts()?)?;
         read.push(checked["direct_payloads_read"].as_u64());
     }
-    assert_eq!(read, [Some(8), Some(4)]);
+    assert_eq!(read, [Some(6), Some(3)]);
     Ok(())
 }
 
@@ -1436,32 +1525,32 @@ type Damage = fn(&Path, &[u8]) -> std::io::Result<()>;
 /// How many blobs were damaged, the run's exit, its cross-check, and (envelopes, any unfinished).
 type DamagedRun = (usize, Exit, Value, (usize, bool));
 
-/// A second run after the first run's CNW sitemap blob was `damage`d on disk.
-fn run_over_a_damaged_sitemap(damage: Damage) -> Result<DamagedRun, Box<dyn Error>> {
-    let (root, hosts) = five_host_store()?;
+/// A second run after the first run's Fed feed blob was `damage`d on disk.
+fn run_over_a_damaged_feed(damage: Damage) -> Result<DamagedRun, Box<dyn Error>> {
+    let (root, hosts) = committed_store()?;
     cross_checked_at(
         root.path(),
         &hosts,
         "2026-11-16T07:20:30Z",
         &Gnw::five_hosts()?.answering(YAHOO_INDEX, &[UNAVAILABLE; 3]),
     )?;
+    let feed = std::fs::read(provider_dir().join("tests/fixtures/fed/press_all_3_items.xml"))?;
     let mut damaged = 0;
     for file in blob_paths(&root.path().join("blobs"))? {
         let bytes = std::fs::read(&file)?;
-        let text = String::from_utf8_lossy(&bytes);
-        if text.contains("<urlset") && text.contains("newswire.ca") {
+        if bytes == feed {
             damage(&file, &bytes)?;
             damaged += 1;
         }
     }
-    // CNW 503 now, so this run stores no fresh copy of the same sitemap over the damaged one.
+    // The Fed 503 now, so this run stores no fresh copy of the same feed over the damaged one.
     let (exit, checked) = cross_checked_at(
         root.path(),
         &hosts,
         MONDAY_AT,
         &Gnw::five_hosts()?
             .answering(YAHOO_INDEX, &[UNAVAILABLE])
-            .answering(CNW_INDEX, &[UNAVAILABLE; 3]),
+            .answering(FED_INDEX, &[UNAVAILABLE; 3]),
     )?;
     let unfinished = std::fs::read_dir(root.path().join(RUNS_DIR))?
         .map(|entry| -> Result<bool, Box<dyn Error>> {
@@ -1486,7 +1575,7 @@ fn a_damaged_direct_blob_is_a_cross_check_error_and_the_run_finishes() -> TestRe
     let removed: Damage = |file, _| std::fs::remove_file(file);
     let mut seen = Vec::new();
     for damage in [altered, removed] {
-        let (damaged, exit, checked, envelopes) = run_over_a_damaged_sitemap(damage)?;
+        let (damaged, exit, checked, envelopes) = run_over_a_damaged_feed(damage)?;
         seen.push((
             damaged,
             exit,
@@ -1533,8 +1622,8 @@ fn blob_paths(dir: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     Ok(found)
 }
 
-/// The committed five-host file on Monday, on a fresh store: each attempt's url and id, in order.
-fn five_host_attempts(exchange: &Gnw) -> Result<Vec<(String, String)>, Box<dyn Error>> {
+/// The committed hosts file on Monday, on a fresh store: each attempt's url and id, in order.
+fn committed_host_attempts(exchange: &Gnw) -> Result<Vec<(String, String)>, Box<dyn Error>> {
     let root = TempDir::new()?;
     seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
     let ask = Ask {
@@ -1556,7 +1645,7 @@ fn five_host_attempts(exchange: &Gnw) -> Result<Vec<(String, String)>, Box<dyn E
         .collect()
 }
 
-/// The five indexes, then one request of each host's lane per turn, a lane that ran out skipped.
+/// The indexes, then one request of each host's lane per turn, a lane that ran out skipped.
 fn round_robin(hosts: &[(String, Vec<String>)]) -> Vec<String> {
     let mut order: Vec<String> = hosts.iter().map(|(index, _)| index.clone()).collect();
     let longest = hosts.iter().map(|(_, lane)| lane.len()).max().unwrap_or(0);
@@ -1566,16 +1655,16 @@ fn round_robin(hosts: &[(String, Vec<String>)]) -> Vec<String> {
     order
 }
 
-/// `round_robin` of the committed five hosts, and GNW's first release.
-fn round_robin_of_five_hosts() -> (Vec<String>, String) {
-    let hosts = five_host_urls();
+/// `round_robin` of the committed hosts, and GNW's first release.
+fn round_robin_of_committed_hosts() -> (Vec<String>, String) {
+    let hosts = committed_host_urls();
     let first = hosts[0].1.first().cloned().unwrap_or_default();
     (round_robin(&hosts), first)
 }
 
-/// `(host's index, the rest of the host's lane)` as urls, GNW, PRN, CNW, Fed, Yahoo. PRN's lane
-/// holds its sitemap page 1, the three RSS releases, then the sitemap-only release.
-fn five_host_urls() -> [(String, Vec<String>); 5] {
+/// `(host's index, the rest of the host's lane)` as urls, GNW, PRN, Fed, Yahoo. PRN's lane holds
+/// its sitemap page 1, the three RSS releases, then the sitemap-only release.
+fn committed_host_urls() -> [(String, Vec<String>); 4] {
     let pages = |keys: Vec<&str>| keys.iter().map(|key| format!("https://{key}")).collect();
     let prn_lane: Vec<String> = std::iter::once(PRN_SITEMAP.to_owned())
         .chain(pages(PRN_RELEASES.iter().map(|(key, _)| *key).collect()))
@@ -1588,10 +1677,6 @@ fn five_host_urls() -> [(String, Vec<String>); 5] {
         ),
         (PRN_INDEX.to_owned(), prn_lane),
         (
-            CNW_INDEX.to_owned(),
-            pages(CNW_RELEASES.iter().map(|(key, _)| *key).collect()),
-        ),
-        (
             FED_INDEX.to_owned(),
             pages(FED_RELEASES.iter().map(|(key, _)| *key).collect()),
         ),
@@ -1603,11 +1688,11 @@ fn five_host_urls() -> [(String, Vec<String>); 5] {
 }
 
 /// Owner decision 2026-11-17 (§10): `collect` serves its hosts round-robin, in first-appearance
-/// order, so the five indexes, then one release of each host per turn; Yahoo's two run out first.
+/// order, so the four indexes, then one release of each host per turn; Yahoo's two run out first.
 #[test]
-fn a_five_host_run_asks_its_hosts_round_robin() -> TestResult {
-    let (expected, _) = round_robin_of_five_hosts();
-    let attempts = five_host_attempts(&Gnw::five_hosts()?)?;
+fn a_committed_hosts_run_asks_its_hosts_round_robin() -> TestResult {
+    let (expected, _) = round_robin_of_committed_hosts();
+    let attempts = committed_host_attempts(&Gnw::five_hosts()?)?;
     let urls: Vec<String> = attempts.into_iter().map(|(url, _)| url).collect();
     assert_eq!(urls, expected);
     Ok(())
@@ -1617,12 +1702,12 @@ fn a_five_host_run_asks_its_hosts_round_robin() -> TestResult {
 /// GNW's lane, after every request already queued, and stops at `MAX_TRANSIENT_RETRIES`.
 #[test]
 fn a_retried_release_waits_behind_the_other_hosts_and_stops_at_the_cap() -> TestResult {
-    let (_, failing) = round_robin_of_five_hosts();
-    let mut hosts = five_host_urls();
+    let (_, failing) = round_robin_of_committed_hosts();
+    let mut hosts = committed_host_urls();
     hosts[0].1.extend([failing.clone(), failing.clone()]);
     let expected = round_robin(&hosts);
     let exchange = Gnw::five_hosts()?.answering(&failing, &[UNAVAILABLE; 3]);
-    let attempts = five_host_attempts(&exchange)?;
+    let attempts = committed_host_attempts(&exchange)?;
     let urls: Vec<String> = attempts.into_iter().map(|(url, _)| url).collect();
     assert_eq!(urls, expected);
     Ok(())
@@ -1633,7 +1718,7 @@ fn a_retried_release_waits_behind_the_other_hosts_and_stops_at_the_cap() -> Test
 /// between, lists every PRN release, so all four are fetched from it.
 #[test]
 fn a_retried_index_keeps_its_host_turn_while_the_other_hosts_releases_are_served() -> TestResult {
-    let mut hosts = five_host_urls();
+    let mut hosts = committed_host_urls();
     let prn_releases: Vec<String> = PRN_RELEASES
         .iter()
         .map(|(key, _)| format!("https://{key}"))
@@ -1646,7 +1731,7 @@ fn a_retried_index_keeps_its_host_turn_while_the_other_hosts_releases_are_served
         .collect();
     let expected = round_robin(&hosts);
     let exchange = Gnw::five_hosts()?.answering(PRN_INDEX, &[UNAVAILABLE; 3]);
-    let attempts = five_host_attempts(&exchange)?;
+    let attempts = committed_host_attempts(&exchange)?;
     let urls: Vec<String> = attempts.into_iter().map(|(url, _)| url).collect();
     assert_eq!(urls, expected);
     Ok(())
@@ -1655,11 +1740,11 @@ fn a_retried_index_keeps_its_host_turn_while_the_other_hosts_releases_are_served
 /// An attempt id hashes (run, source, window, ordinal), and the ordinal is the position in the
 /// round-robin order: the same plan and answers on two fresh stores give the same ids, url by url.
 #[test]
-fn a_replayed_five_host_run_gives_every_attempt_the_same_id_and_url() -> TestResult {
-    let first = five_host_attempts(&Gnw::five_hosts()?)?;
-    let second = five_host_attempts(&Gnw::five_hosts()?)?;
+fn a_replayed_committed_hosts_run_gives_every_attempt_the_same_id_and_url() -> TestResult {
+    let first = committed_host_attempts(&Gnw::five_hosts()?)?;
+    let second = committed_host_attempts(&Gnw::five_hosts()?)?;
     let distinct: std::collections::BTreeSet<&String> = first.iter().map(|(_, id)| id).collect();
-    assert_eq!((first.len(), distinct.len(), &first), (21, 21, &second));
+    assert_eq!((first.len(), distinct.len(), &first), (17, 17, &second));
     Ok(())
 }
 
@@ -2430,7 +2515,7 @@ fn a_document_path_is_checked_as_googles_parser_reads_the_fetched_url() -> TestR
     Ok(())
 }
 
-/// Owner decision 2026-11-17 on the five-host stub: Yahoo's Laverock row moved under its real
+/// Owner decision 2026-11-17 on the committed hosts: Yahoo's Laverock row moved under its real
 /// `Disallow: /m/` is not asked and is counted on Yahoo's index only; its sibling is asked, and
 /// the Fed, pinned `absent` (a 404), has every release asked.
 #[test]
@@ -2495,7 +2580,6 @@ fn a_yahoo_row_under_a_robots_disallow_is_not_fetched_and_its_siblings_are() -> 
             vec![
                 (Some(INDEX), Some(0), Some(0)),
                 (Some(PRN_INDEX), Some(0), Some(0)),
-                (Some(CNW_INDEX), Some(0), Some(0)),
                 (Some(FED_INDEX), Some(0), Some(0)),
                 (Some(YAHOO_INDEX), Some(6), Some(1)),
                 (Some(PRN_SITEMAP), Some(0), Some(0)),
@@ -5076,9 +5160,9 @@ fn a_walked_id_held_after_the_range_was_read_is_not_asked() -> TestResult {
 }
 
 const CNW_RELEASE_PREFIX: &str = "https://www.newswire.ca/news-releases/";
-/// The five-host run's document follow-ups before any synthetic CNW release: GNW 3, PRN 4, CNW 3,
-/// the Fed 3 and Yahoo 2 (`an_open_web_run_collects_a_gnw_a_prn_a_cnw_a_fed_and_a_yahoo_day_end_to_end`).
-const FIVE_HOST_FOLLOW_UPS: usize = 15;
+/// The re-admitted file's document follow-ups before any synthetic CNW release: GNW 3, PRN 4,
+/// CNW 3, the Fed 3 and Yahoo 2.
+const READMITTED_FOLLOW_UPS: usize = 15;
 const FOLLOW_UP_CAP: usize = 150;
 
 /// `cnw/sitemap_news_3_urls.xml` with `extra` synthetic releases after its three, each dated as
@@ -5106,8 +5190,8 @@ fn cnw_sitemap_with(extra: usize) -> Result<(Vec<u8>, Vec<String>), Box<dyn Erro
 
 type CappedRun = (TempDir, cmd_collect::Answer, Gnw, Vec<String>);
 
-/// The committed five hosts on Monday on a fresh store, CNW's sitemap listing `extra` more
-/// releases, each answered with a kept CNW page.
+/// The re-admitted hosts file on Monday on a fresh store, CNW's sitemap listing `extra` more
+/// releases, each answered with a kept CNW page: its 100 rows make a 150-follow-up run.
 fn capped_run(extra: usize) -> Result<CappedRun, Box<dyn Error>> {
     capped_run_carrying(extra, &[])
 }
@@ -5137,7 +5221,7 @@ fn capped_run_carrying(
         std::fs::read(provider_dir().join("tests/fixtures/cnw/article_805423040.html"))?,
     ));
     let ask = Ask {
-        hosts: Some(seed::committed_hosts()),
+        hosts: Some(seed::readmitted_hosts()),
         at: instant(MONDAY_AT),
         ..ask(root.path(), cmd_collect::TODAY)
     };
@@ -5196,7 +5280,7 @@ fn stored_deferred(store: &Path) -> Result<Vec<DeferredRow>, Box<dyn Error>> {
 /// deferred and the run exits 0.
 #[test]
 fn a_run_of_exactly_150_follow_ups_asks_every_one_and_defers_none() -> TestResult {
-    let (root, answer, _, _) = capped_run(FOLLOW_UP_CAP - FIVE_HOST_FOLLOW_UPS)?;
+    let (root, answer, _, _) = capped_run(FOLLOW_UP_CAP - READMITTED_FOLLOW_UPS)?;
     assert_eq!(
         (
             answer.exit,
@@ -5214,7 +5298,7 @@ fn a_run_of_exactly_150_follow_ups_asks_every_one_and_defers_none() -> TestResul
 /// 8 `partial_collect` (S7-D8).
 #[test]
 fn the_151st_follow_up_is_deferred_recorded_and_never_sent_and_the_run_exits_8() -> TestResult {
-    let (root, answer, exchange, urls) = capped_run(FOLLOW_UP_CAP + 1 - FIVE_HOST_FOLLOW_UPS)?;
+    let (root, answer, exchange, urls) = capped_run(FOLLOW_UP_CAP + 1 - READMITTED_FOLLOW_UPS)?;
     let last = urls.last().cloned().ok_or("no synthetic release")?;
     let story = digest(canon::digest::story_id(
         SOURCE,
@@ -5400,7 +5484,7 @@ fn paced(held: &[(&str, &str)], capped: Vec<news_provider::CappedHold>) -> Paced
     }
 }
 
-/// The committed five hosts on Monday on a fresh store, under `deadline`.
+/// The committed hosts on Monday on a fresh store, under `deadline`.
 fn deadline_run(
     exchange: &Gnw,
     deadline: &str,
@@ -5484,8 +5568,8 @@ fn deferred_of(envelope: &Value) -> Vec<DeferredSeen> {
 }
 
 /// Condition A: PRN, held past the deadline after its RSS answered, is stopped with its whole
-/// lane `host_held`; GNW, CNW and the Fed lose their fourth request to the pace as
-/// `run_deadline`; Yahoo's three all go; the run exits 8.
+/// lane `host_held`; GNW and the Fed lose their fourth request to the pace as `run_deadline`;
+/// Yahoo's three all go; the run exits 8.
 #[test]
 fn a_held_host_past_the_deadline_is_stopped_with_its_lane_while_the_other_hosts_are_asked(
 ) -> TestResult {
@@ -5530,7 +5614,6 @@ fn a_held_host_past_the_deadline_is_stopped_with_its_lane_while_the_other_hosts_
         (
             vec![
                 ("rss.globenewswire.com".to_owned(), Value::from(FOURTH_SLOT)),
-                ("www.newswire.ca".to_owned(), Value::from(FOURTH_SLOT)),
                 (
                     "www.federalreserve.gov".to_owned(),
                     Value::from(FOURTH_SLOT)
@@ -5566,7 +5649,7 @@ fn attempted_urls(store: &Path, envelope: &Value) -> Result<BTreeSet<String>, Bo
 }
 
 /// A request past the deadline opens no attempt row and is one `deferred` row. Every reader
-/// counts the reasons apart with counts that differ (3, 4, 0), so a swap is red; the capped
+/// counts the reasons apart with counts that differ (2, 4, 0), so a swap is red; the capped
 /// hold reaches the envelope and its human line (S7-D7).
 #[test]
 fn deferred_requests_open_no_attempt_and_every_reader_counts_each_reason_apart() -> TestResult {
@@ -5587,7 +5670,7 @@ fn deferred_requests_open_no_attempt_and_every_reader_counts_each_reason_apart()
             seen.iter().filter(|row| attempted.contains(&row.0)).count(),
             envelope["per_source"][0]["deferred"].as_u64(),
         ),
-        (true, 0, Some(7))
+        (true, 0, Some(6))
     );
     let mut human = Vec::new();
     cmd_collect::render_human(envelope, &mut human)?;
@@ -5634,11 +5717,11 @@ fn deferred_requests_open_no_attempt_and_every_reader_counts_each_reason_apart()
         ),
         (
             vec![
-                "deferred         7 run_deadline 3 host_held 4 follow_up_cap 0",
+                "deferred         6 run_deadline 2 host_held 4 follow_up_cap 0",
                 "holds capped     1"
             ],
-            vec![(3, 4, 0)],
-            Some(" 3 deferred_host_held 4 deferred_follow_up_cap 0".to_owned()),
+            vec![(2, 4, 0)],
+            Some(" 2 deferred_host_held 4 deferred_follow_up_cap 0".to_owned()),
             serde_json::json!([{
                 "host": PRN_HOST,
                 "retry_after": "315360000",
@@ -5674,6 +5757,8 @@ fn with_no_deadline_an_open_web_run_stops_at_its_schedule_slots_deadline() -> Te
         .into_iter()
         .map(|row| format!("{} {}", row.0, row.2))
         .collect();
+    // Sent: the GNW, Fed and Yahoo indexes and releases (4 + 4 + 3) and PRN's RSS; one deadline
+    // more for PRN's stopped reservation.
     assert_eq!(
         (
             sent.len(),
@@ -5683,12 +5768,9 @@ fn with_no_deadline_an_open_web_run_stops_at_its_schedule_slots_deadline() -> Te
             answer.envelope["slot"].clone(),
         ),
         (
-            FIVE_HOST_FOLLOW_UPS + 1,
+            12,
             BTreeSet::from([format!("{PRN_HOST} host_held")]),
-            Some(vec![
-                Some(instant(SLOT_0930_DEADLINE));
-                FIVE_HOST_FOLLOW_UPS + 2
-            ]),
+            Some(vec![Some(instant(SLOT_0930_DEADLINE)); 13]),
             Value::from("2026-11-16T10:14:30.000000Z"),
             serde_json::json!({
                 "start": "2026-11-16T09:30:00.000000Z",
@@ -5730,7 +5812,7 @@ fn a_run_started_past_its_slots_deadline_asks_nothing_and_defers_every_index() -
             answer.envelope["plan"]["requests"].as_u64(),
             answer.exit.error_code(),
         ),
-        (0, 6, 6, true, Some(6), Some("partial_collect"))
+        (0, 5, 5, true, Some(5), Some("partial_collect"))
     );
     Ok(())
 }
@@ -6452,6 +6534,83 @@ fn a_deferred_item_is_carried_at_23_59_59_and_closed_expired_at_24_hours() -> Te
     Ok(())
 }
 
+/// Owner decision 2026-11-19: a CNW row deferred while admitted is never asked, stays open under
+/// 24 h, then closes `expired`, one `deferred_expired` finding. Mutations 2026-11-19, `carried`
+/// without `admitted_row` plus robots handed for every row: red; either alone: green.
+#[test]
+fn a_deferred_row_of_a_host_no_longer_admitted_is_never_asked_and_expires_at_24_hours() -> TestResult
+{
+    let (url, listed) = (
+        format!("https://{}", CNW_RELEASES[0].0),
+        "2026-11-16T02:22:00-05:00",
+    );
+    let story = digest(canon::digest::story_id(SOURCE, CNW_RELEASES[0].0));
+    let mut seen = Vec::new();
+    for age in [A_DAY_LESS_A_SECOND, A_DAY] {
+        let (root, hosts) = committed_store()?;
+        an_open_row(
+            root.path(),
+            &url,
+            story.as_deref(),
+            Some(listed),
+            instant(MONDAY_AT) - age,
+        )?;
+        let exchange = Gnw::five_hosts()?;
+        let ask = Ask {
+            hosts: Some(hosts),
+            at: instant(MONDAY_AT),
+            ..ask(root.path(), cmd_collect::TODAY)
+        };
+        let opened = cmd_collect::open_provider(&ask)?;
+        let answer = cmd_collect::run(&ask, &opened, &exchange, &Monday)?;
+        let report = newsvault::cmd_ledger::read(
+            root.path(),
+            &newsvault::cmd_ledger::Ask {
+                at: instant("2026-11-17T00:00:00Z"),
+                from: "2026-11-15".parse()?,
+                to: "2026-11-16".parse()?,
+                source: Some(SOURCE.to_owned()),
+                expected_runs: None,
+                limit: None,
+                check: true,
+            },
+        )?;
+        let expired_findings = report
+            .check
+            .findings
+            .iter()
+            .filter(|finding| finding.code == "deferred_expired")
+            .count();
+        seen.push((
+            exchange.sent().0.contains(&url),
+            carried_of(&answer.envelope),
+            closed_rows(root.path())?
+                .into_iter()
+                .map(|row| row.1)
+                .collect::<Vec<String>>(),
+            expired_findings,
+        ));
+    }
+    assert_eq!(
+        seen,
+        vec![
+            (
+                false,
+                vec![(url.clone(), false, Value::Null, 1)],
+                Vec::new(),
+                0
+            ),
+            (
+                false,
+                vec![(url, false, Value::from("expired"), 1)],
+                vec!["expired".to_owned()],
+                1
+            ),
+        ]
+    );
+    Ok(())
+}
+
 /// The `deferred_expired` findings of `ledger --check` over 2026-11-17.
 fn expired_findings_of(store: &Path) -> Result<usize, Box<dyn Error>> {
     let report = newsvault::cmd_ledger::read(
@@ -6803,7 +6962,7 @@ fn deferred_index_requests_are_never_carried_or_closed() -> TestResult {
             carried_of(&answer.envelope),
             closed_rows(root.path())?.len()
         ),
-        (vec!["index".to_owned(); 6], Vec::new(), 0)
+        (vec!["index".to_owned(); 5], Vec::new(), 0)
     );
     Ok(())
 }
@@ -6817,7 +6976,7 @@ const MONDAY_NEXT_SLOT: &str = "2026-11-16T11:00:30Z";
 fn a_carried_follow_up_counts_against_the_cap_and_a_carried_walk_id_does_not() -> TestResult {
     let listed = format!("{CNW_RELEASE_PREFIX}a-carried-release-799999999.html");
     let walk = "https://rss.globenewswire.com/news-release/2026/11/16/3404430/0/en/x.html";
-    let extra = FOLLOW_UP_CAP - FIVE_HOST_FOLLOW_UPS;
+    let extra = FOLLOW_UP_CAP - READMITTED_FOLLOW_UPS;
     let (follow_up_root, follow_up, follow_up_sent, urls) = capped_run_carrying(
         extra,
         &[(listed.as_str(), Some("2026-11-16T02:22:00-05:00"))],
