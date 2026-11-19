@@ -1632,8 +1632,7 @@ pub fn render_prometheus(
 mod tests {
     use super::{
         label, render_prometheus, CarriedCounts, Check, ClockAge, DayRow, DeferredCounts, Finding,
-        Freshness, Latency, Report, SourceRow, WalkCounts, BUSY_BOUND, PROMETHEUS_FAMILIES,
-        SCHEMA,
+        Freshness, Latency, Report, SourceRow, WalkCounts, BUSY_BOUND, PROMETHEUS_FAMILIES, SCHEMA,
     };
     use chrono::{DateTime, Utc};
 
