@@ -130,7 +130,8 @@
           "items_new": 1,
           "rows_committed": 1
         }
-      ]
+      ],
+      "listing_latency": []
     },
     {
       "run_date": "2026-07-02",
@@ -249,7 +250,8 @@
           "items_new": 0,
           "rows_committed": 0
         }
-      ]
+      ],
+      "listing_latency": []
     },
     {
       "run_date": "2026-07-03",
@@ -368,7 +370,8 @@
           "items_new": 0,
           "rows_committed": 0
         }
-      ]
+      ],
+      "listing_latency": []
     },
     {
       "run_date": "2026-07-04",
@@ -435,7 +438,8 @@
           "items_new": 0,
           "rows_committed": 0
         }
-      ]
+      ],
+      "listing_latency": []
     },
     {
       "run_date": "2026-07-05",
@@ -502,7 +506,8 @@
           "items_new": 1,
           "rows_committed": 1
         }
-      ]
+      ],
+      "listing_latency": []
     }
   ],
   "result_digest_drift": [

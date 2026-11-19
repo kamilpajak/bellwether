@@ -1526,3 +1526,250 @@ fn the_ledger_filters_busy_time_by_the_run_files_source() -> TestResult {
     );
     Ok(())
 }
+
+// ---- §8 row R22: listing-to-fetch latency ----
+
+const WIRES: &str = "open_web_wires";
+const LISTING_RUN: &str = "run-0701-0034";
+const CARRYING_RUN: &str = "run-0701-0630";
+const LISTED_AT: &str = "2026-07-01T00:35:00.000000Z";
+/// `LISTED_AT` + 31 days, received after `AT`, so the reader's `--at` cutoff leaves it out.
+const AFTER_AT_S: i64 = 31 * 86_400;
+
+/// One answered attempt of `source` in `run`, received `after_s` seconds after `LISTED_AT`; a
+/// Document attempt (a story) with its payload at `url` when `url` is set, else the index.
+fn answered(
+    db: &Connection,
+    (attempt, run, source): (&str, &str, &str),
+    after_s: i64,
+    url: Option<&str>,
+    listed_by: Option<&str>,
+) -> TestResult {
+    let listed: chrono::DateTime<chrono::Utc> = LISTED_AT.parse()?;
+    let received = (listed + chrono::TimeDelta::seconds(after_s))
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    db.execute(
+        "INSERT INTO attempts (attempt_id, run_id, source, target_window, filter_params,
+                               universe_version, opened_at, received_at, story_id, listed_by)
+         VALUES (?1, ?2, ?3, '2026-07-01', 'fp', 'uv', ?4, ?4, ?5, ?6)",
+        rusqlite::params![
+            attempt,
+            run,
+            source,
+            received,
+            url.map(|_| format!("story of {attempt}")),
+            listed_by
+        ],
+    )?;
+    if let Some(url) = url {
+        db.execute(
+            "INSERT INTO payloads (attempt_id, url, phase, raw_blob, headers, truncated)
+             VALUES (?1, ?2, 'document', 'b-0701-p', '[]', 0)",
+            [attempt, url],
+        )?;
+    }
+    Ok(())
+}
+
+/// R22: per run and host, fresh documents (listed by the run's own index) and carried ones
+/// (listed by an earlier run's) apart, nearest-rank p50 and p95 over unsorted rows, max, the
+/// unlinked count; `--source` keeps one source; a document received after `--at` is not counted;
+/// the human line states the JSON row.
+#[test]
+fn listing_latency_is_reported_per_run_and_host_with_fresh_and_carried_apart() -> TestResult {
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    let index = "l-index";
+    answered(&db, (index, LISTING_RUN, WIRES), 0, None, None)?;
+    for (nth, after_s) in [70, 10, 100, 40, 20, 90, 30, 60, 80, 50]
+        .into_iter()
+        .enumerate()
+    {
+        let attempt = format!("l-fresh-{nth}");
+        let url = format!("https://a.test/{nth}");
+        let at = (attempt.as_str(), LISTING_RUN, WIRES);
+        answered(&db, at, after_s, Some(&url), Some(index))?;
+    }
+    let at = |attempt| (attempt, LISTING_RUN, WIRES);
+    answered(
+        &db,
+        at("l-other-host"),
+        5,
+        Some("https://b.test/0"),
+        Some(index),
+    )?;
+    answered(&db, at("l-walk-id"), 7, Some("https://a.test/w"), None)?;
+    let late = Some("https://a.test/late");
+    answered(&db, at("l-after-at"), AFTER_AT_S, late, Some(index))?;
+    let polygon = ("l-polygon", LISTING_RUN, POLYGON);
+    answered(&db, polygon, 1, Some("https://c.test/0"), Some(index))?;
+    for (attempt, after_s) in [("l-carried-0", 7_200), ("l-carried-1", 3_600)] {
+        let at = (attempt, CARRYING_RUN, WIRES);
+        answered(&db, at, after_s, Some("https://a.test/c"), Some(index))?;
+    }
+    drop(db);
+    let report = over(&root, FIRST_DAY, FIRST_DAY)?.json()?;
+    let wires = run(
+        &root,
+        &["--from", FIRST_DAY, "--to", FIRST_DAY, "--source", WIRES],
+    )?
+    .json()?;
+    let rows = |report: &Value| day(report, FIRST_DAY).map(|day| day["listing_latency"].clone());
+    let none = serde_json::json!({"documents": 0, "p50_s": null, "p95_s": null, "max_s": null});
+    let span = |documents: i64, p50: f64, p95: f64, max: f64| serde_json::json!({"documents": documents, "p50_s": p50, "p95_s": p95, "max_s": max});
+    let row = |run: &str, source: &str, host: &str, fresh: &Value, carried: &Value, unlinked| {
+        serde_json::json!({"run_id": run, "source": source, "host": host, "fresh": fresh,
+                           "carried": carried, "unlinked": unlinked})
+    };
+    let a_fresh = row(
+        LISTING_RUN,
+        WIRES,
+        "a.test",
+        &span(10, 50.0, 100.0, 100.0),
+        &none,
+        1,
+    );
+    let b_fresh = row(
+        LISTING_RUN,
+        WIRES,
+        "b.test",
+        &span(1, 5.0, 5.0, 5.0),
+        &none,
+        0,
+    );
+    let c_fresh = row(
+        LISTING_RUN,
+        POLYGON,
+        "c.test",
+        &span(1, 1.0, 1.0, 1.0),
+        &none,
+        0,
+    );
+    let a_carried = row(
+        CARRYING_RUN,
+        WIRES,
+        "a.test",
+        &none,
+        &span(2, 3_600.0, 7_200.0, 7_200.0),
+        0,
+    );
+    let human = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .arg("ledger")
+        .args(["--store", &root.path().to_string_lossy()])
+        .args(["--at", AT, "--format", "human"])
+        .args(["--from", FIRST_DAY, "--to", FIRST_DAY, "--source", WIRES])
+        .output()?
+        .stdout;
+    let lines: Vec<String> = String::from_utf8(human)?
+        .lines()
+        .filter(|line| line.starts_with("latency"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        (rows(&report), rows(&wires)),
+        (
+            Some(serde_json::json!([
+                a_fresh.clone(),
+                b_fresh.clone(),
+                c_fresh,
+                a_carried.clone()
+            ])),
+            Some(serde_json::json!([a_fresh, b_fresh, a_carried])),
+        )
+    );
+    assert_eq!(
+        lines,
+        vec![
+            format!(
+                "latency          {LISTING_RUN} {WIRES} a.test fresh 10 p50_s 50 p95_s 100 \
+                 max_s 100 carried 0 p50_s - p95_s - max_s - unlinked 1"
+            ),
+            format!(
+                "latency          {LISTING_RUN} {WIRES} b.test fresh 1 p50_s 5 p95_s 5 max_s 5 \
+                 carried 0 p50_s - p95_s - max_s - unlinked 0"
+            ),
+            format!(
+                "latency          {CARRYING_RUN} {WIRES} a.test fresh 0 p50_s - p95_s - max_s - \
+                 carried 2 p50_s 3600 p95_s 7200 max_s 7200 unlinked 0"
+            ),
+        ]
+    );
+    Ok(())
+}
+
+/// R22: a Document attempt answered with no body (a transport failure: `Payload::stored` keeps
+/// none) is counted under a null host, printed `-`; one received exactly at `--at` is counted.
+#[test]
+fn listing_latency_counts_a_bodyless_answer_under_no_host_and_one_received_at_the_cutoff(
+) -> TestResult {
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    let index = "l-index";
+    answered(&db, (index, LISTING_RUN, WIRES), 0, None, None)?;
+    let at = |attempt| (attempt, LISTING_RUN, WIRES);
+    let bodyless = "l-bodyless";
+    answered(&db, at(bodyless), 30, Some("https://a.test/0"), Some(index))?;
+    db.execute("DELETE FROM payloads WHERE attempt_id = ?1", [bodyless])?;
+    let listed: chrono::DateTime<chrono::Utc> = LISTED_AT.parse()?;
+    let at_s = (AT.parse::<chrono::DateTime<chrono::Utc>>()? - listed).num_seconds();
+    answered(
+        &db,
+        at("l-at"),
+        at_s,
+        Some("https://d.test/at"),
+        Some(index),
+    )?;
+    drop(db);
+    let report = over(&root, FIRST_DAY, FIRST_DAY)?.json()?;
+    let human = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .arg("ledger")
+        .args(["--store", &root.path().to_string_lossy()])
+        .args(["--at", AT, "--format", "human"])
+        .args(["--from", FIRST_DAY, "--to", FIRST_DAY])
+        .output()?
+        .stdout;
+    let lines: Vec<String> = String::from_utf8(human)?
+        .lines()
+        .filter(|line| line.starts_with("latency"))
+        .map(str::to_owned)
+        .collect();
+    let hosts: Option<Vec<(Value, Value, Value)>> = day(&report, FIRST_DAY)
+        .and_then(|day| day["listing_latency"].as_array())
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let fresh = &row["fresh"];
+                    (
+                        row["host"].clone(),
+                        fresh["documents"].clone(),
+                        fresh["max_s"].clone(),
+                    )
+                })
+                .collect()
+        });
+    let none = "carried 0 p50_s - p95_s - max_s - unlinked 0";
+    assert_eq!(
+        (hosts, lines),
+        (
+            Some(vec![
+                (Value::Null, Value::from(1), Value::from(30.0)),
+                (
+                    Value::from("d.test"),
+                    Value::from(1),
+                    Value::from(at_s as f64)
+                ),
+            ]),
+            vec![
+                format!(
+                    "latency          {LISTING_RUN} {WIRES} - fresh 1 p50_s 30 p95_s 30 \
+                     max_s 30 {none}"
+                ),
+                format!(
+                    "latency          {LISTING_RUN} {WIRES} d.test fresh 1 p50_s {at_s} \
+                     p95_s {at_s} max_s {at_s} {none}"
+                ),
+            ]
+        )
+    );
+    Ok(())
+}

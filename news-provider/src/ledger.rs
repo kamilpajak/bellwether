@@ -76,6 +76,9 @@ pub enum AttemptEvent {
         /// The story a Document request fetches, named before the socket so a swept attempt still
         /// says what it was fetching; None for an index or robots request (section 11.1).
         story_id: Option<Digest>,
+        /// The index attempt whose answer listed this Document's story, by this run or, carried,
+        /// by an earlier one: the start of §8 row R22's latency. None for any other request.
+        listed_by: Option<String>,
         opened_at: ObservationTime,
     },
     Answered {
@@ -352,6 +355,19 @@ impl AttemptSlot {
         ordinal: u32,
         at: ObservationTime,
     ) -> Result<Self, LedgerError> {
+        Self::open_listed(sink, request, story, None, run, ordinal, at)
+    }
+
+    /// [`AttemptSlot::open`] naming `listed_by`, the index attempt that listed the request.
+    pub fn open_listed(
+        sink: &mut dyn Sink,
+        request: &Request,
+        story: Option<&Digest>,
+        listed_by: Option<&str>,
+        run: &RunId,
+        ordinal: u32,
+        at: ObservationTime,
+    ) -> Result<Self, LedgerError> {
         let attempt_id = AttemptId(
             attempt_id(
                 run.as_str(),
@@ -372,6 +388,7 @@ impl AttemptSlot {
             hosts_version: request.hosts_version.clone(),
             extract_version: request.extract_version.clone(),
             story_id: story.cloned(),
+            listed_by: listed_by.map(str::to_owned),
             opened_at: at,
         })?;
         Ok(Self {

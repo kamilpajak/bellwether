@@ -115,11 +115,11 @@ PRAGMA synchronous = FULL;
 ";
 
 /// The `PRAGMA user_version` this build writes, and the only one a read-only reader accepts.
-pub const SCHEMA_VERSION: i32 = 14;
+pub const SCHEMA_VERSION: i32 = 15;
 
 /// Version `i + 1` is reached from version `i` by `MIGRATIONS[i]`, run by [`migrate`] with
 /// foreign keys off, as SQLite's twelve-step table rebuild (lang_altertable.html) requires.
-const MIGRATIONS: [&str; 14] = [
+const MIGRATIONS: [&str; 15] = [
     "
 -- The hosts file a run was admitted under: architecture.md section 2's `hosts_version` row. NULL
 -- for a provider that reads no hosts file.
@@ -380,6 +380,13 @@ CREATE TABLE deferred_closed (
     closed_at   TEXT NOT NULL,
     CHECK ((closed_as = 'answered') = (attempt_id IS NOT NULL))
 );
+",
+    "
+-- Section 8 row R22: the index attempt whose answer listed a Document attempt's story, or a
+-- deferred document's, carried to the attempt a later run asks it under. NULL for any other
+-- request and on every row before user_version 15, not backfilled.
+ALTER TABLE attempts ADD COLUMN listed_by TEXT REFERENCES attempts (attempt_id);
+ALTER TABLE deferred ADD COLUMN listed_by TEXT REFERENCES attempts (attempt_id);
 ",
 ];
 
@@ -1604,8 +1611,8 @@ impl Committer {
         self.db.execute(
             "INSERT INTO deferred
                  (run_id, source, target_window, host, url, phase, story_id, listed_date, reason,
-                  deferred_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                  deferred_at, listed_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 self.run.as_str(),
                 deferred.source,
@@ -1616,7 +1623,8 @@ impl Committer {
                 deferred.story_id,
                 deferred.listed_date,
                 deferred.reason.name(),
-                stamp(deferred.at.inner())
+                stamp(deferred.at.inner()),
+                deferred.listed_by
             ],
         )?;
         Ok(())
@@ -1626,7 +1634,8 @@ impl Committer {
     /// An `index` row is never carried and never closed: the next run asks its indexes anyway.
     pub fn open_deferred(&self, source: &SourceId) -> Result<Vec<OpenDeferred>, StoreError> {
         let mut statement = self.db.prepare(
-            "SELECT d.deferred_id, d.target_window, d.url, d.story_id, d.listed_date, d.deferred_at
+            "SELECT d.deferred_id, d.target_window, d.url, d.story_id, d.listed_date, d.deferred_at,
+                    d.listed_by
                FROM deferred d
               WHERE d.source = ?1 AND d.phase = ?2
                 AND NOT EXISTS (SELECT 1 FROM deferred_closed c
@@ -1654,6 +1663,7 @@ impl Committer {
                         story_id: row.get(3)?,
                         listed_date: row.get(4)?,
                         deferred_at,
+                        listed_by: row.get(6)?,
                     })
                 },
             )?
@@ -2127,14 +2137,16 @@ impl Committer {
             hosts_version,
             extract_version,
             story_id,
+            listed_by,
             opened_at,
         } = event
         {
             self.db.execute(
                 "INSERT INTO attempts
                      (attempt_id, run_id, source, target_window, filter_params, universe_version,
-                      opened_at, hosts_version, story_id, extract_version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(attempt_id) DO NOTHING",
+                      opened_at, hosts_version, story_id, extract_version, listed_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(attempt_id) DO NOTHING",
                 params![
                     attempt_id.hex(),
                     run.as_str(),
@@ -2145,7 +2157,8 @@ impl Committer {
                     stamp(opened_at.inner()),
                     hosts_version.as_ref().map(FileDigest::hex),
                     story_id.as_ref().map(Digest::hex),
-                    extract_version.as_ref().map(Digest::hex)
+                    extract_version.as_ref().map(Digest::hex),
+                    listed_by
                 ],
             )?;
         }
@@ -4816,6 +4829,7 @@ mod tests {
             listed_date: Some("2026-11-16T02:22:00-05:00".to_owned()),
             reason: news_provider::DeferReason::FollowUpCap,
             at: at(9),
+            listed_by: None,
             go_at: None,
         })?;
         let written = deferred_rows(&store)?;
@@ -4852,6 +4866,7 @@ mod tests {
             ("listed_date", shape("TEXT", false)),
             ("reason", shape("TEXT", true)),
             ("deferred_at", shape("TEXT", true)),
+            ("listed_by", shape("TEXT", false)),
         ]
         .into_iter()
         .map(|(name, column)| (name.to_owned(), column))
@@ -5101,6 +5116,150 @@ mod tests {
         assert_eq!(
             (refused, read_only, user_version(&db)?),
             (expected.clone(), expected, 13)
+        );
+        Ok(())
+    }
+
+    /// A v14 store: the v13 fixture and `MIGRATIONS[13]`, its document row closed `expired`.
+    fn a_store_at_user_version_fourteen(temp: &TempDir) -> TestResult {
+        a_store_at_user_version_thirteen(temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch(MIGRATIONS[13])?;
+        db.pragma_update(None, "user_version", 14)?;
+        db.execute_batch(
+            "INSERT INTO deferred_closed VALUES (1, 'a v14 run', 'expired', NULL, 't');",
+        )?;
+        Ok(())
+    }
+
+    const V14_TABLES: [&str; 10] = [
+        "attempts",
+        "blobs",
+        "items",
+        "seq_reservations",
+        "published",
+        "robots",
+        "payloads",
+        "relisted",
+        "deferred",
+        "deferred_closed",
+    ];
+
+    /// §8 rows M1 and R22 from 14: an attempt and a `deferred` row name the index attempt that
+    /// listed them, `open_deferred` reads the name back, and a name of no attempt is refused.
+    #[test]
+    fn a_store_at_user_version_fourteen_opens_migrates_to_fifteen_and_links_a_listing() -> TestResult
+    {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_fourteen(&temp)?;
+        let mut store = open(&temp)?;
+        let run = RunId::new(RUN);
+        let index = AttemptSlot::open(&mut store, &request(), None, &run, 1, at(1))?;
+        let listing = index.attempt_id().hex().to_owned();
+        let listed =
+            AttemptSlot::open_listed(&mut store, &request(), None, Some(&listing), &run, 2, at(2))?;
+        let unlisted =
+            AttemptSlot::open_listed(&mut store, &request(), None, Some("none"), &run, 3, at(3))
+                .is_err();
+        let url = "https://www.newswire.ca/news-releases/a-805423040.html";
+        let deferred = |listed_by: &str| news_provider::Deferred {
+            source: "open_web_wires".to_owned(),
+            target_window: "2026-11-16".to_owned(),
+            host: Some("www.newswire.ca".to_owned()),
+            url: url.to_owned(),
+            phase: RequestPhase::Document,
+            story_id: None,
+            listed_date: None,
+            reason: news_provider::DeferReason::FollowUpCap,
+            at: at(9),
+            listed_by: Some(listed_by.to_owned()),
+            go_at: None,
+        };
+        store.record_deferred(&deferred(&listing))?;
+        let deferred_unlisted = store.record_deferred(&deferred("none")).is_err();
+        let linked: Vec<(String, Option<String>)> = store
+            .db
+            .prepare("SELECT attempt_id, listed_by FROM attempts WHERE run_id = ?1 ORDER BY rowid")?
+            .query_map([RUN], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        let carried: Vec<(String, Option<String>)> = store
+            .open_deferred(&SourceId::new("open_web_wires"))?
+            .into_iter()
+            .map(|row| (row.url, row.listed_by))
+            .collect();
+        let shape = |table: &str| -> Result<Option<super::ColumnShape>, StoreError> {
+            Ok(super::columns_of(&store.db, table)?.remove("listed_by"))
+        };
+        let text = Some(("TEXT".to_owned(), false, None, 0));
+        assert_eq!(
+            (
+                user_version(&store.db)?,
+                linked,
+                (unlisted, deferred_unlisted),
+                carried,
+                shape("attempts")?,
+                shape("deferred")?,
+            ),
+            (
+                SCHEMA_VERSION,
+                vec![
+                    (listing.clone(), None),
+                    (listed.attempt_id().hex().to_owned(), Some(listing.clone())),
+                ],
+                (true, true),
+                vec![(url.to_owned(), Some(listing))],
+                text.clone(),
+                text,
+            )
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the carried half from user_version 14: every column of every row of every v14
+    /// table, compared by `quote()`; `listed_by` is NULL on every carried row.
+    #[test]
+    fn a_v14_store_keeps_every_v14_column_of_every_row() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_fourteen(&temp)?;
+        let v14 = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let before = quoted_rows(&v14, 14, &V14_TABLES)?;
+        drop(v14);
+        assert!(super::refuse_an_unreadable_version(temp.path()).is_ok());
+        let store = open(&temp)?;
+        let after = quoted_rows(&store.db, 14, &V14_TABLES)?;
+        let linked: i64 = store.db.query_row(
+            "SELECT (SELECT COUNT(listed_by) FROM attempts)
+                  + (SELECT COUNT(listed_by) FROM deferred)",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(before.len(), V13_TABLES.len() + 3);
+        assert_eq!((after, linked), (before, 0));
+        Ok(())
+    }
+
+    /// §8 row M1, the per-version shape check at user_version 14.
+    #[test]
+    fn a_v14_store_whose_columns_differ_is_refused_and_left_at_user_version_fourteen() -> TestResult
+    {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_fourteen(&temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch("ALTER TABLE deferred_closed DROP COLUMN closed_at;")?;
+        drop(db);
+        let read_only = match super::refuse_an_unreadable_version(temp.path()) {
+            Err(StoreError::ShapeDiffers { found: 14, columns }) => columns,
+            other => vec![format!("{other:?}")],
+        };
+        let refused = match open(&temp) {
+            Err(StoreError::ShapeDiffers { found: 14, columns }) => columns,
+            other => vec![format!("{other:?}")],
+        };
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let expected = vec!["deferred_closed.closed_at".to_owned()];
+        assert_eq!(
+            (refused, read_only, user_version(&db)?),
+            (expected.clone(), expected, 14)
         );
         Ok(())
     }

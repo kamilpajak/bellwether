@@ -28,6 +28,7 @@ pub const LEASE_HELD: &str = "lease_held";
 /// Section 11.1 Pace and section 11.2's stop deadline: at most half a day, per host and per run.
 pub const BUSY_BOUND: f64 = 0.5;
 const SECONDS_A_DAY: f64 = 86_400.0;
+const MICROS_A_SECOND: f64 = 1_000_000.0;
 const IN_FLIGHT: &str = "in_flight";
 const OUTCOME_OK: &str = "ok";
 const OUTCOME_EMPTY: &str = "empty";
@@ -128,6 +129,49 @@ pub struct DayRow {
     /// S7-D7: answers whose `Retry-After` the observed runs held to the 24 h ceiling.
     pub holds_capped: u32,
     pub per_source: Vec<SourceRow>,
+    /// §8 row R22: per run, source and host of the day's runs, in that order.
+    pub listing_latency: Vec<LatencyRow>,
+}
+
+/// One host's Document attempts in one run, each from its `received_at` back to the
+/// `received_at` of the index attempt `attempts.listed_by` names (§8 row R22).
+#[derive(Debug, Clone, Serialize)]
+pub struct LatencyRow {
+    pub run_id: String,
+    pub source: String,
+    /// `news_provider::host_of` of the attempt's payload url; null when it stored none.
+    pub host: Option<String>,
+    /// Listed by an index attempt of this run.
+    pub fresh: Latency,
+    /// Listed by an earlier run's index attempt, then deferred and carried (S7-D5).
+    pub carried: Latency,
+    /// Answered attempts naming no listing: a walk id, or one opened before user_version 15.
+    pub unlinked: i64,
+}
+
+/// Nearest-rank percentiles, in seconds: the value at rank ⌈p × n / 100⌉ of the n sorted ones.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Latency {
+    pub documents: i64,
+    pub p50_s: Option<f64>,
+    pub p95_s: Option<f64>,
+    pub max_s: Option<f64>,
+}
+
+impl Latency {
+    fn of(mut seconds: Vec<f64>) -> Self {
+        seconds.sort_by(f64::total_cmp);
+        let rank = |percent: usize| {
+            let rank = (percent * seconds.len()).div_ceil(100).max(1);
+            seconds.get(rank - 1).copied()
+        };
+        Self {
+            documents: i64::try_from(seconds.len()).unwrap_or(i64::MAX),
+            p50_s: rank(50),
+            p95_s: rank(95),
+            max_s: seconds.last().copied(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -484,6 +528,7 @@ pub fn read(root: &Path, ask: &Ask) -> Result<Report, LedgerReadError> {
     let answers = answers_per_attempt(&db, &at)?;
     let deferred = deferred_per_run(&db, &at)?;
     let carried = carried_per_run(&db, &at)?;
+    let latency = latency_per_run(&db, &at)?;
     let known_runs: BTreeSet<&str> = envelopes.iter().map(|run| run.run_id.as_str()).collect();
     let attempts_without_a_run_envelope = orphans(&db, &at, &known_runs)?;
     // Indexed by run once rather than scanned per day: a year at the measured cadence is about
@@ -493,6 +538,7 @@ pub fn read(root: &Path, ask: &Ask) -> Result<Report, LedgerReadError> {
     let answers_by_run = by_run(&answers, |row| &row.run_id);
     let deferred = by_run(&deferred, |row| &row.run_id);
     let carried = by_run(&carried, |row| &row.run_id);
+    let latency = by_run(&latency, |row| &row.run_id);
 
     let mut days = Vec::new();
     let mut matched = 0;
@@ -505,6 +551,7 @@ pub fn read(root: &Path, ask: &Ask) -> Result<Report, LedgerReadError> {
             answers: &answers_by_run,
             deferred: &deferred,
             carried: &carried,
+            latency: &latency,
         };
         let mut row = day_row(date, &envelopes, &read, ask);
         matched += row.per_source.len();
@@ -772,6 +819,61 @@ fn carried_per_run(db: &Connection, at: &str) -> Result<Vec<CarriedGroup>, Ledge
     Ok(rows)
 }
 
+fn latency_per_run(db: &Connection, at: &str) -> Result<Vec<LatencyRow>, LedgerReadError> {
+    let mut statement = db.prepare(
+        "SELECT d.run_id, d.source, p.url, d.received_at, l.received_at, l.run_id
+           FROM attempts d
+           LEFT JOIN payloads p ON p.attempt_id = d.attempt_id
+           LEFT JOIN attempts l ON l.attempt_id = d.listed_by
+          WHERE d.story_id IS NOT NULL AND d.received_at IS NOT NULL AND d.received_at <= ?1
+          ORDER BY d.run_id, d.source, d.attempt_id",
+    )?;
+    type Spans = (Vec<f64>, Vec<f64>, i64);
+    let mut grouped: BTreeMap<(String, String, Option<String>), Spans> = BTreeMap::new();
+    let mut rows = statement.query([at])?;
+    while let Some(row) = rows.next()? {
+        let run: String = row.get(0)?;
+        let url: Option<String> = row.get(2)?;
+        let host = url
+            .as_deref()
+            .and_then(|url| news_provider::host_of(url).ok().flatten())
+            .map(|host| host.as_str().to_owned());
+        let spans = grouped.entry((run.clone(), row.get(1)?, host)).or_default();
+        let fetched: String = row.get(3)?;
+        let listed: Option<String> = row.get(4)?;
+        let listing_run: Option<String> = row.get(5)?;
+        match listed
+            .as_deref()
+            .and_then(|listed| seconds_between(listed, &fetched))
+        {
+            Some(seconds) if listing_run.as_deref() == Some(run.as_str()) => spans.0.push(seconds),
+            Some(seconds) => spans.1.push(seconds),
+            None => spans.2 += 1,
+        }
+    }
+    Ok(grouped
+        .into_iter()
+        .map(
+            |((run_id, source, host), (fresh, carried, unlinked))| LatencyRow {
+                run_id,
+                source,
+                host,
+                fresh: Latency::of(fresh),
+                carried: Latency::of(carried),
+                unlinked,
+            },
+        )
+        .collect())
+}
+
+/// `to` less `from`, two stored stamps, in seconds; None when either does not parse.
+fn seconds_between(from: &str, to: &str) -> Option<f64> {
+    let from = DateTime::parse_from_rfc3339(from).ok()?;
+    let to = DateTime::parse_from_rfc3339(to).ok()?;
+    let micros = (to - from).num_microseconds()?;
+    Some(micros as f64 / MICROS_A_SECOND)
+}
+
 /// `(run_id, source, attempt_id, answered)` for one attempt with no `Finalised` row.
 type InFlightRow = (String, String, String, bool);
 type InFlight = Vec<InFlightRow>;
@@ -911,6 +1013,7 @@ struct Read<'a> {
     answers: &'a BTreeMap<&'a str, Vec<&'a Answered>>,
     deferred: &'a BTreeMap<&'a str, Vec<&'a DeferredGroup>>,
     carried: &'a BTreeMap<&'a str, Vec<&'a CarriedGroup>>,
+    latency: &'a BTreeMap<&'a str, Vec<&'a LatencyRow>>,
 }
 
 fn day_row(date: NaiveDate, envelopes: &[Envelope], read: &Read, ask: &Ask) -> DayRow {
@@ -1038,6 +1141,11 @@ fn day_row(date: NaiveDate, envelopes: &[Envelope], read: &Read, ask: &Ask) -> D
             .collect(),
         holds_capped: u32::try_from(holds_capped).unwrap_or(u32::MAX),
         per_source: by_source.into_values().collect(),
+        listing_latency: of_the_day(read.latency, &runs)
+            .into_iter()
+            .filter(|row| ask.wants(&row.source))
+            .cloned()
+            .collect(),
     }
 }
 
@@ -1265,6 +1373,28 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 row.carried.expired,
                 row.items_new,
                 row.rows_committed
+            )?;
+        }
+        for row in &day.listing_latency {
+            let span = |latency: &Latency| {
+                let seconds = |value: Option<f64>| value.map_or("-".to_owned(), |s| s.to_string());
+                format!(
+                    "{} p50_s {} p95_s {} max_s {}",
+                    latency.documents,
+                    seconds(latency.p50_s),
+                    seconds(latency.p95_s),
+                    seconds(latency.max_s)
+                )
+            };
+            writeln!(
+                out,
+                "latency          {} {} {} fresh {} carried {} unlinked {}",
+                row.run_id,
+                row.source,
+                row.host.as_deref().unwrap_or("-"),
+                span(&row.fresh),
+                span(&row.carried),
+                row.unlinked
             )?;
         }
     }
@@ -1502,7 +1632,7 @@ pub fn render_prometheus(
 mod tests {
     use super::{
         label, render_prometheus, CarriedCounts, Check, ClockAge, DayRow, DeferredCounts, Finding,
-        Freshness, Report, SourceRow, WalkCounts, BUSY_BOUND, PROMETHEUS_FAMILIES, SCHEMA,
+        Freshness, Latency, Report, SourceRow, WalkCounts, BUSY_BOUND, PROMETHEUS_FAMILIES, SCHEMA,
     };
     use chrono::{DateTime, Utc};
 
@@ -1513,6 +1643,23 @@ mod tests {
     #[test]
     fn a_label_value_escapes_its_quote_backslash_and_newline() {
         assert_eq!(label("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    }
+
+    /// §8 row R22's nearest rank ⌈p × n / 100⌉: of 20, p95 is the 19th and not the max; of 11,
+    /// p95 is the 11th (⌈10.45⌉), where rounding would read the 10th.
+    #[test]
+    fn a_percentile_is_the_nearest_rank_rounded_up() {
+        let ranked = |n: u32| Latency::of((1..=n).rev().map(f64::from).collect());
+        let span = |documents: i64, p50: f64, p95: f64, max: f64| Latency {
+            documents,
+            p50_s: Some(p50),
+            p95_s: Some(p95),
+            max_s: Some(max),
+        };
+        assert_eq!(
+            (ranked(20), ranked(11)),
+            (span(20, 10.0, 19.0, 20.0), span(11, 6.0, 11.0, 11.0))
+        );
     }
 
     fn day(run_date: &str, holds_capped: u32, host_held: i64, expired: i64, range: i64) -> DayRow {
@@ -1545,6 +1692,7 @@ mod tests {
             busy: Vec::new(),
             holds_capped,
             per_source: vec![row],
+            listing_latency: Vec::new(),
         }
     }
 
