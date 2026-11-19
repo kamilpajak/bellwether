@@ -5343,31 +5343,103 @@ fn a_prn_sitemap_row_naming_stock_tickers_marks_its_follow_up_and_nothing_else_d
     Ok(())
 }
 
-/// A GNW RSS item with a `category` of the form `Exchange:SYMBOL` marks its follow-up; an item whose
-/// only category is a subject, and one with none, do not. No committed GNW payload holds a
-/// `category`, so the real `rssfeed_3_items.xml` gets two inserted. Mutations 2026-11-19: the RSS
-/// arm `names_ticker: false`: red; `is_ticker_category` always true: red.
-#[test]
-fn a_gnw_item_whose_category_names_an_exchange_and_symbol_marks_its_follow_up() -> Outcome {
-    let provider = provider()?;
-    let pub_date = |minute: &str| format!("<pubDate>Sat, 14 Nov 2026 {minute} GMT</pubDate>");
-    let rss = String::from_utf8(gnw(REAL_INDEX))?
-        .replacen(
-            &pub_date("19:00"),
-            &format!("{}<category>Sports</category>", pub_date("19:00")),
-            1,
-        )
-        .replacen(
-            &pub_date("18:45"),
-            &format!("{}<category>Nasdaq:FRVO</category>", pub_date("18:45")),
-            1,
-        );
-    let marked: Vec<bool> = follow_ups(&provider, rss.as_bytes())?
+/// Real GNW poll of 2026-11-19 09:36:50Z, items 3406348 (no category), 3406341 (two stock
+/// categories, then two ISIN) and 3406345 (three stock, one ISIN), each opening tag split over two
+/// lines as served.
+const RSS_CATEGORIES: &str = "rssfeed_0936_3_items.xml";
+
+/// `RSS_CATEGORIES` with `edit` applied to item `id` alone, then each follow-up's `names_ticker`.
+fn names_with(
+    provider: &OpenWebFeed,
+    id: &str,
+    edit: impl Fn(&str) -> String,
+) -> Result<Vec<bool>, Box<dyn std::error::Error>> {
+    let rss = String::from_utf8(gnw(RSS_CATEGORIES))?;
+    let marker = format!("<dc:identifier>{id}</dc:identifier>");
+    let edited: Vec<String> = rss
+        .split_inclusive("</item>")
+        .map(|part| {
+            if part.contains(&marker) {
+                edit(part)
+            } else {
+                part.to_owned()
+            }
+        })
+        .collect();
+    Ok(follow_ups(provider, edited.concat().as_bytes())?
         .follow_ups
         .iter()
         .map(|follow_up| follow_up.names_ticker)
-        .collect();
-    assert_eq!(marked, vec![false, true, false]);
+        .collect())
+}
+
+/// A GNW item names a ticker when one of its categories carries GNW's stock `domain`
+/// (`.../rss/stock`); an item with no category, or whose categories are ISINs alone
+/// (`.../rss/ISIN`), does not. Mutations 2026-11-19: the RSS arm `names_ticker: false`: red; the
+/// `domain` filter dropped: red (the ISIN-only item named).
+#[test]
+fn a_gnw_item_with_a_stock_domain_category_names_a_ticker_and_an_isin_alone_does_not() -> Outcome {
+    let provider = provider()?;
+    let isin_only = |item: &str| item.replace("/rss/stock\"", "/rss/ISIN\"");
+    assert_eq!(
+        (
+            names_with(&provider, "3406341", str::to_owned)?,
+            names_with(&provider, "3406341", isin_only)?,
+        ),
+        (vec![false, true, true], vec![false, false, true])
+    );
+    Ok(())
+}
+
+/// A stock category counts behind a category with no `domain` (GNW served `GENERAL` once on
+/// 2026-11-19), and only as RSS's own unprefixed `category`: as `media:category` it names nothing.
+/// Mutations 2026-11-19: only the first `category` read (`.take(1)`): red; `is_rss` replaced by a
+/// local-name match: red.
+#[test]
+fn a_stock_category_counts_behind_another_and_never_under_a_namespace_prefix() -> Outcome {
+    let provider = provider()?;
+    let general_first = |item: &str| {
+        item.replacen(
+            "<category",
+            "<category>GENERAL</category>\r\n      <category",
+            1,
+        )
+    };
+    let prefixed = |item: &str| {
+        item.replace("<category", "<media:category")
+            .replace("</category>", "</media:category>")
+    };
+    assert_eq!(
+        (
+            names_with(&provider, "3406341", general_first)?,
+            names_with(&provider, "3406341", prefixed)?,
+        ),
+        (vec![false, true, true], vec![false, false, true])
+    );
+    Ok(())
+}
+
+/// A stock category's text is trimmed: surrounding whitespace still names a ticker, whitespace
+/// alone does not. Mutation 2026-11-19, the text not trimmed (`!text.is_empty()`): red (the blank
+/// item named).
+#[test]
+fn a_stock_category_holding_only_whitespace_names_no_ticker() -> Outcome {
+    let provider = provider()?;
+    let padded = |item: &str| {
+        item.replace(">Amsterdam:WKL<", ">\r\n  Amsterdam:WKL \t<")
+            .replace(">OTC Markets:WTKWY<", "> OTC Markets:WTKWY\r\n<")
+    };
+    let blank = |item: &str| {
+        item.replace(">Amsterdam:WKL<", ">\r\n  <")
+            .replace(">OTC Markets:WTKWY<", "> \t<")
+    };
+    assert_eq!(
+        (
+            names_with(&provider, "3406341", padded)?,
+            names_with(&provider, "3406341", blank)?,
+        ),
+        (vec![false, true, true], vec![false, false, true])
+    );
     Ok(())
 }
 
