@@ -3445,14 +3445,15 @@ fn rss_titles(titles: &[&str]) -> Vec<u8> {
 
 // ---- transport ----
 
-/// Owner decision 1, 2026-11-17: each host its own 10 s queue, and no per-IP queue across hosts.
+/// Owner decision 1, 2026-11-17: each host its own queue, and no per-IP queue across hosts; 7 s
+/// per host since 2026-11-19 (owner). Mutation 2026-11-19, `INTERVAL` left at 10 s: red.
 #[test]
-fn the_profile_paces_each_host_at_one_request_per_ten_seconds_and_no_shared_ip_queue() -> Outcome {
+fn the_profile_paces_each_host_every_seven_seconds_and_no_shared_ip_queue() -> Outcome {
     let profile = provider()?.transport();
-    let ten = std::time::Duration::from_secs(10);
+    let seven = std::time::Duration::from_secs(7);
     assert_eq!(
         (profile.budget.min_interval, profile.budget.per_host),
-        (None, Some(ten))
+        (None, Some(seven))
     );
     assert_eq!(
         profile.user_agent,

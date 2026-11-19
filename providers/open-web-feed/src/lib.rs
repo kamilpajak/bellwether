@@ -61,8 +61,8 @@ const VENDOR_PATIENCE: Duration = Duration::from_secs(30);
 const BODY_LIMIT: u64 = 2 * 1_024 * 1_024;
 /// Section 11.1's floor, as `per_host` for every host (§8 row R19 hole 7): `newsvault collect`
 /// refuses a host whose robots Crawl-delay is above it (owner decision 1, 2026-11-16). No per-IP
-/// pace: each host is its own queue (owner decision 1, 2026-11-17, §10).
-const INTERVAL: Duration = Duration::from_secs(10);
+/// pace: each host is its own queue (owner decision 1, 2026-11-17, §10). 7 s: owner, 2026-11-19.
+const INTERVAL: Duration = Duration::from_secs(7);
 /// S7-D6 (owner, 2026-11-17): the owner's choice, not measured (architecture.md section 11.2).
 pub const FOLLOW_UP_CAP: u32 = 150;
 

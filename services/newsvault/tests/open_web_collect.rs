@@ -2634,10 +2634,10 @@ fn a_robots_blob_written_after_the_provider_opened_is_unverified() -> TestResult
     Ok(())
 }
 
-/// §8 row R19(b), owner decision 1 (2026-11-16): a pinned Crawl-delay above the one shared 10 s
-/// interval refuses the host, nasdaq's 30 s and the B2 body's 30 s alike; the provider is never
-/// slowed. Mutations 2026-11-16, the Crawl-delay arm removed: red; `>` as `>=`: red (10 s case);
-/// the 10 s floor check removed: red.
+/// §8 row R19(b), owner decision 1 (2026-11-16): a pinned Crawl-delay above the one shared 7 s
+/// interval (owner, 2026-11-19) refuses the host, nasdaq's 30 s and the B2 body's 30 s alike; the
+/// provider is never slowed. Mutations 2026-11-16, the Crawl-delay arm removed: red; `>` as `>=`:
+/// red (7 s case); the floor check removed: red. 2026-11-19, `PACE_FLOOR` left at 10 s: red.
 #[test]
 fn a_hosts_row_whose_robots_crawl_delay_is_above_the_shared_interval_is_refused() -> TestResult {
     let secs = |n: u64| Some(Duration::from_secs(n));
@@ -2645,7 +2645,7 @@ fn a_hosts_row_whose_robots_crawl_delay_is_above_the_shared_interval_is_refused(
     for body in [
         robots_fixture("www.nasdaq.com.txt")?,
         b"User-agent: *\nCrawl-delay: 30\nUser-agent: bingbot\nDisallow: /prywatne/\n".to_vec(),
-        b"User-agent: *\nCrawl-delay: 10\n".to_vec(),
+        b"User-agent: *\nCrawl-delay: 7\n".to_vec(),
     ] {
         let dir = TempDir::new()?;
         let (store, hosts) = pinned_to(dir.path(), &body)?;
@@ -2660,18 +2660,21 @@ fn a_hosts_row_whose_robots_crawl_delay_is_above_the_shared_interval_is_refused(
             verdict(&cmd_collect::run(&ask, &opened, &Gnw::day()?, &Fixed)),
         ));
     }
-    let over = "crawl-delay 30s over 10s".to_owned();
+    let over = "crawl-delay 30s over 7s".to_owned();
     assert_eq!(
         seen,
         [
-            (secs(10), over.clone()),
-            (secs(10), over),
-            (secs(10), "admitted".to_owned())
+            (secs(7), over.clone()),
+            (secs(7), over),
+            (secs(7), "admitted".to_owned())
         ]
     );
-    // (per_host, Crawl-delay, admitted): 10 s at least, and the delay at most per_host.
+    // (per_host, Crawl-delay, admitted): 7 s at least, and the delay at most per_host.
     let cases = [
-        (secs(10), secs(30), false),
+        (secs(7), secs(30), false),
+        (secs(7), secs(7), true),
+        (secs(7), secs(8), false),
+        (secs(6), None, false),
         (secs(30), secs(30), true),
         (secs(10), secs(10), true),
         (secs(10), secs(5), true),
@@ -2758,7 +2761,7 @@ fn a_path_or_unreadable_robots_refusal_names_its_fact_and_suggests_no_refresh() 
                 Value::Null,
                 Value::Null,
                 Value::from(30.0),
-                Value::from(10.0)
+                Value::from(7.0)
             ]),
         ]
     );
