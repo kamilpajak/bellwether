@@ -958,12 +958,13 @@ pub(crate) struct Queued {
     pub(crate) counted: bool,
     /// The open `deferred` rows a carried request closes once asked (S7-D5); empty otherwise.
     pub(crate) carried: Vec<i64>,
-    /// A `Document` follow-up's index attempt; a carried one's oldest row's; else None (R22).
+    /// A `Document` follow-up's or walk id's index attempt; a carried one's oldest row's; else
+    /// None (R22).
     pub(crate) listed_by: Option<String>,
 }
 
 impl Queued {
-    /// A planned request or a walk id, not yet attempted.
+    /// A planned request, not yet attempted.
     pub(crate) const fn first_attempt(request: Request) -> Self {
         Self {
             request,
@@ -981,6 +982,14 @@ impl Queued {
             counted: document,
             listed_by: listing.filter(|_| document).map(str::to_owned),
             ..Self::first_attempt(request)
+        }
+    }
+
+    /// A walk id the index attempt `listing` walked to: linked like a follow-up, never counted.
+    pub(crate) fn walked(request: Request, listing: Option<&str>) -> Self {
+        Self {
+            counted: false,
+            ..Self::follow_up(request, listing)
         }
     }
 
@@ -1069,7 +1078,7 @@ impl HostQueue {
             self.push(Queued::follow_up(follow_up, listing));
         }
         for id in walked {
-            self.push(Queued::first_attempt(id));
+            self.push(Queued::walked(id, listing));
         }
         if retrying {
             self.push(Queued {
@@ -2233,8 +2242,9 @@ mod tests {
         );
     }
 
-    /// §8 row R22: a document follow-up names the index attempt that listed it, its retry and its
-    /// cap deferral keep the name, and a next page and a walk id name none.
+    /// §8 row R22: a document follow-up and a walk id name the index attempt that produced them,
+    /// the follow-up's retry and cap deferral keep the name, the walk id takes no cap slot, and a
+    /// next page names none.
     #[test]
     fn a_document_follow_up_its_retry_and_its_deferral_name_their_listing_and_a_page_none() {
         let mut queue = HostQueue::of(vec![asking(GNW, "index")], Some(1));
@@ -2270,7 +2280,7 @@ mod tests {
                 (format!("{GNW}f1"), false, listed()),
                 (format!("{GNW}page"), false, None),
                 (format!("{GNW}f2"), true, listed()),
-                (format!("{GNW}w1"), false, None),
+                (format!("{GNW}w1"), false, listed()),
                 (format!("{GNW}f1"), false, listed()),
             ]
         );
