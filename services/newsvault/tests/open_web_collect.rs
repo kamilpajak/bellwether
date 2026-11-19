@@ -1706,6 +1706,42 @@ fn a_committed_hosts_run_asks_its_hosts_round_robin() -> TestResult {
     Ok(())
 }
 
+/// Ticker-first through `collect` (owner, 2026-11-19): when PRN's sitemap both promotes Lilly's
+/// RSS follow-up and lists a new release naming a ticker (Stark's row given an inserted
+/// `news:stock_tickers`), the promoted one is asked first, then the new one, then the RSS's
+/// unnamed two. Mutation 2026-11-19 (review of PR #60), `collect` calling `promote` after
+/// `requeue`: red.
+#[test]
+fn a_story_the_sitemap_promotes_is_asked_before_the_sitemaps_own_ticker_named_release() -> TestResult
+{
+    let mut exchange = Gnw::five_hosts()?;
+    let sitemap = exchange
+        .pages
+        .get(PRN_SITEMAP)
+        .ok_or("no PRN sitemap page")?;
+    let named = String::from_utf8(sitemap.clone())?.replacen(
+        ",Venture Capital</news:keywords>",
+        ",Venture Capital</news:keywords>\n      <news:stock_tickers>OTC:STARK</news:stock_tickers>",
+        1,
+    );
+    exchange
+        .pages
+        .insert(PRN_SITEMAP.to_owned(), named.into_bytes());
+    let mut hosts = committed_host_urls();
+    let [north_carolina, novo, lilly] = PRN_RELEASES.map(|(key, _)| format!("https://{key}"));
+    hosts[1].1 = vec![
+        PRN_SITEMAP.to_owned(),
+        lilly,
+        format!("https://{PRN_SITEMAP_ONLY}"),
+        north_carolina,
+        novo,
+    ];
+    let attempts = committed_host_attempts(&exchange)?;
+    let urls: Vec<String> = attempts.into_iter().map(|(url, _)| url).collect();
+    assert_eq!(urls, round_robin(&hosts));
+    Ok(())
+}
+
 /// §8 R21 under round-robin: GNW's first release fails every time; each retry goes to the back of
 /// GNW's lane, after every request already queued, and stops at `MAX_TRANSIENT_RETRIES`.
 #[test]

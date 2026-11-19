@@ -2446,19 +2446,25 @@ mod tests {
         );
     }
 
-    /// Owner decision 2026-11-19: PRN's RSS lists `x` with no ticker, its sitemap names one for
-    /// `x`, which the run already queued, so the sitemap's own follow-up is dropped and the RSS's
-    /// moves to the back of the named ones, ahead of the sitemap's new `n`, keeping the RSS as its
-    /// listing; a carried request and a walk id of a promoted story stay where they are, and the cap
-    /// still counts at `pop`. Mutations 2026-11-19: `promote` a no-op: red; `promote` putting the
-    /// story at the front of the unnamed ones instead: red.
+    /// Owner decision 2026-11-19: PRN's RSS lists `m` with a ticker and `x` without, its sitemap
+    /// names one for `x`, which the run already queued, so the sitemap's own follow-up is dropped
+    /// and the RSS's moves to the back of the named ones, behind `m` and ahead of the sitemap's new
+    /// `n`, keeping the RSS as its listing; a carried request and a walk id of a promoted story stay
+    /// where they are, and the cap still counts at `pop`. Mutations 2026-11-19: `promote` a no-op:
+    /// red; `promote` putting the story at the front of the unnamed ones instead: red; at the front
+    /// of the named ones (review of PR #60): red.
     #[test]
     fn a_later_listing_naming_a_ticker_promotes_a_queued_story_and_nothing_else() {
         let plan = vec![asking(PRN, "rss"), asking(PRN, "sitemap")];
-        let mut queue = HostQueue::of(plan, Some(3));
+        let mut queue = HostQueue::of(plan, Some(4));
         queue.carry(vec![carried(PRN, "c", true, 1)]);
         if let Some(Popped::Ask(rss)) = queue.pop() {
-            let follow_ups = vec![asking(PRN, "a"), asking(PRN, "x"), asking(PRN, "b")];
+            let follow_ups = vec![
+                asking(PRN, "a"),
+                asking(PRN, "x"),
+                ticker_named(PRN, "m"),
+                asking(PRN, "b"),
+            ];
             queue.requeue(follow_ups, vec![asking(PRN, "w")], rss, false, Some("rss"));
         }
         if let Some(Popped::Ask(sitemap)) = queue.pop() {
@@ -2482,6 +2488,7 @@ mod tests {
         assert_eq!(
             handed,
             vec![
+                (format!("{PRN}m"), true, by("rss")),
                 (format!("{PRN}x"), true, by("rss")),
                 (format!("{PRN}n"), true, by("sitemap")),
                 (format!("{PRN}a"), true, by("rss")),
