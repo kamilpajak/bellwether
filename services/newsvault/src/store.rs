@@ -5162,7 +5162,7 @@ mod tests {
             AttemptSlot::open_listed(&mut store, &request(), None, Some("none"), &run, 3, at(3))
                 .is_err();
         let url = "https://www.newswire.ca/news-releases/a-805423040.html";
-        store.record_deferred(&news_provider::Deferred {
+        let deferred = |listed_by: &str| news_provider::Deferred {
             source: "open_web_wires".to_owned(),
             target_window: "2026-11-16".to_owned(),
             host: Some("www.newswire.ca".to_owned()),
@@ -5172,9 +5172,11 @@ mod tests {
             listed_date: None,
             reason: news_provider::DeferReason::FollowUpCap,
             at: at(9),
-            listed_by: Some(listing.clone()),
+            listed_by: Some(listed_by.to_owned()),
             go_at: None,
-        })?;
+        };
+        store.record_deferred(&deferred(&listing))?;
+        let deferred_unlisted = store.record_deferred(&deferred("none")).is_err();
         let linked: Vec<(String, Option<String>)> = store
             .db
             .prepare("SELECT attempt_id, listed_by FROM attempts WHERE run_id = ?1 ORDER BY rowid")?
@@ -5193,7 +5195,7 @@ mod tests {
             (
                 user_version(&store.db)?,
                 linked,
-                unlisted,
+                (unlisted, deferred_unlisted),
                 carried,
                 shape("attempts")?,
                 shape("deferred")?,
@@ -5204,7 +5206,7 @@ mod tests {
                     (listing.clone(), None),
                     (listed.attempt_id().hex().to_owned(), Some(listing.clone())),
                 ],
-                true,
+                (true, true),
                 vec![(url.to_owned(), Some(listing))],
                 text.clone(),
                 text,
