@@ -293,6 +293,7 @@ fn request_for(row: &HostPin, hosts_version: &FileDigest) -> Request {
         params: Vec::new(),
         universe_version: FileDigest::of(&[]),
         listed_date: None,
+        names_ticker: false,
         hosts_version: Some(hosts_version.clone()),
         extract_version: None,
     }

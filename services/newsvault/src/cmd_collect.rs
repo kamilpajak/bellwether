@@ -45,9 +45,9 @@ pub(crate) const RUN_ID_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 const STAGING_PREFIX: &str = ".tmp-";
 /// The one window spelling that is not a day: the UTC date of the run's own `at`.
 pub const TODAY: &str = "today";
-/// Section 11.1's 10 s, held apart from `open-web-feed`'s own interval so the floor check does not
+/// Section 11.1's 7 s, held apart from `open-web-feed`'s own interval so the floor check does not
 /// move when the profile it checks does.
-const PACE_FLOOR: Duration = Duration::from_secs(10);
+const PACE_FLOOR: Duration = Duration::from_secs(7);
 /// Section 11.2's option C match: `open_web_feed::normalised` titles, equal.
 const CROSS_CHECK_MATCH: &str = "normalised_title";
 /// A walked id GNW's CDN answers 410 for 30 days (owner decision 2026-11-17, section 11.2).
@@ -201,7 +201,7 @@ pub enum CollectRunError {
     #[error("the pinned robots.txt of admitted host {host} disallows {path}, which its row asks")]
     RobotsDisallowsPath { host: String, path: String },
     /// Code `robots_refused`, exit 2: the provider's per-host interval is below section 11.1's
-    /// 10 s floor (`None`: no per-host pace at all).
+    /// 7 s floor (`None`: no per-host pace at all).
     #[error("admitted host {host} would be paced every {per_host:?}, below the floor {floor:?}")]
     PaceBelowFloor {
         host: String,
@@ -1562,7 +1562,7 @@ fn refuse_what_the_pinned_robots_forbids(
     refuse_a_pace_below_the_floor(&row.host, per_host, robots.and_then(Robots::crawl_delay))
 }
 
-/// Section 8 row R19(b): `per_host` must be at least 10 s (`None` is refused), and the Crawl-delay
+/// Section 8 row R19(b): `per_host` must be at least 7 s (`None` is refused), and the Crawl-delay
 /// at most `per_host`, the one interval every host shares (owner decision 1, 2026-11-16).
 pub fn refuse_a_pace_below_the_floor(
     host: &str,
@@ -2403,6 +2403,7 @@ mod tests {
             params: Vec::new(),
             universe_version: FileDigest::of(b"{}"),
             listed_date: None,
+            names_ticker: false,
             hosts_version: None,
             extract_version: None,
         };

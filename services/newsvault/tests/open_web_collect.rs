@@ -1272,8 +1272,10 @@ fn a_readmitted_canada_newswire_is_collected_after_the_committed_files_robots_re
         .into_iter()
         .filter(|url| url.contains(CNW_HOST))
         .collect();
+    // HKEX's release, the sitemap's third, names `HongKong:0388`, so it is asked first. Mutation
+    // 2026-11-19, `push_document` ignoring `names_ticker`: red.
     let expected_sent: Vec<String> = std::iter::once(CNW_INDEX.to_owned())
-        .chain(CNW_RELEASES.iter().map(|(key, _)| format!("https://{key}")))
+        .chain([2, 0, 1].map(|nth| format!("https://{}", CNW_RELEASES[nth].0)))
         .collect();
     let db = Connection::open_with_flags(
         root.path().join(COMMIT_LOG),
@@ -1663,11 +1665,14 @@ fn round_robin_of_committed_hosts() -> (Vec<String>, String) {
 }
 
 /// `(host's index, the rest of the host's lane)` as urls, GNW, PRN, Fed, Yahoo. PRN's lane holds
-/// its sitemap page 1, the three RSS releases, then the sitemap-only release.
+/// its sitemap page 1, Lilly's release (the RSS listed it third with no ticker, the sitemap names
+/// `NYSE:LLY`, so it is promoted ahead of the RSS's other two), those two, then the sitemap-only
+/// release, which names none.
 fn committed_host_urls() -> [(String, Vec<String>); 4] {
     let pages = |keys: Vec<&str>| keys.iter().map(|key| format!("https://{key}")).collect();
+    let [north_carolina, novo, lilly] = PRN_RELEASES.map(|(key, _)| key);
     let prn_lane: Vec<String> = std::iter::once(PRN_SITEMAP.to_owned())
-        .chain(pages(PRN_RELEASES.iter().map(|(key, _)| *key).collect()))
+        .chain(pages(vec![lilly, north_carolina, novo]))
         .chain([format!("https://{PRN_SITEMAP_ONLY}")])
         .collect();
     [
@@ -1689,12 +1694,51 @@ fn committed_host_urls() -> [(String, Vec<String>); 4] {
 
 /// Owner decision 2026-11-17 (§10): `collect` serves its hosts round-robin, in first-appearance
 /// order, so the four indexes, then one release of each host per turn; Yahoo's two run out first.
+/// PRN's lane is ticker-first (owner, 2026-11-19), its sitemap promoting a story the RSS queued.
+/// Mutations 2026-11-19: `HostQueue::promote` a no-op: red; `Lane::pop_front` taking `unnamed`
+/// before `named`: red.
 #[test]
 fn a_committed_hosts_run_asks_its_hosts_round_robin() -> TestResult {
     let (expected, _) = round_robin_of_committed_hosts();
     let attempts = committed_host_attempts(&Gnw::five_hosts()?)?;
     let urls: Vec<String> = attempts.into_iter().map(|(url, _)| url).collect();
     assert_eq!(urls, expected);
+    Ok(())
+}
+
+/// Ticker-first through `collect` (owner, 2026-11-19): when PRN's sitemap both promotes Lilly's
+/// RSS follow-up and lists a new release naming a ticker (Stark's row given an inserted
+/// `news:stock_tickers`), the promoted one is asked first, then the new one, then the RSS's
+/// unnamed two. Mutation 2026-11-19 (review of PR #60), `collect` calling `promote` after
+/// `requeue`: red.
+#[test]
+fn a_story_the_sitemap_promotes_is_asked_before_the_sitemaps_own_ticker_named_release() -> TestResult
+{
+    let mut exchange = Gnw::five_hosts()?;
+    let sitemap = exchange
+        .pages
+        .get(PRN_SITEMAP)
+        .ok_or("no PRN sitemap page")?;
+    let named = String::from_utf8(sitemap.clone())?.replacen(
+        ",Venture Capital</news:keywords>",
+        ",Venture Capital</news:keywords>\n      <news:stock_tickers>OTC:STARK</news:stock_tickers>",
+        1,
+    );
+    exchange
+        .pages
+        .insert(PRN_SITEMAP.to_owned(), named.into_bytes());
+    let mut hosts = committed_host_urls();
+    let [north_carolina, novo, lilly] = PRN_RELEASES.map(|(key, _)| format!("https://{key}"));
+    hosts[1].1 = vec![
+        PRN_SITEMAP.to_owned(),
+        lilly,
+        format!("https://{PRN_SITEMAP_ONLY}"),
+        north_carolina,
+        novo,
+    ];
+    let attempts = committed_host_attempts(&exchange)?;
+    let urls: Vec<String> = attempts.into_iter().map(|(url, _)| url).collect();
+    assert_eq!(urls, round_robin(&hosts));
     Ok(())
 }
 
@@ -1715,7 +1759,8 @@ fn a_retried_release_waits_behind_the_other_hosts_and_stops_at_the_cap() -> Test
 
 /// §8 R21 with lanes of unequal length: PRN's RSS fails every time, so each retry is asked on a
 /// later PRN turn and never waits for the other hosts' releases to drain. The sitemap, asked
-/// between, lists every PRN release, so all four are fetched from it.
+/// between, lists every PRN release, so all four are fetched from it, the one naming `NYSE:LLY`
+/// first; the first retry keeps its place ahead of them (owner, 2026-11-19).
 #[test]
 fn a_retried_index_keeps_its_host_turn_while_the_other_hosts_releases_are_served() -> TestResult {
     let mut hosts = committed_host_urls();
@@ -1723,10 +1768,11 @@ fn a_retried_index_keeps_its_host_turn_while_the_other_hosts_releases_are_served
         .iter()
         .map(|(key, _)| format!("https://{key}"))
         .collect();
+    let [north_carolina, novo, lilly] = [0, 1, 2].map(|nth| prn_releases[nth].clone());
     hosts[1].1 = [PRN_SITEMAP.to_owned(), PRN_INDEX.to_owned()]
         .into_iter()
-        .chain([format!("https://{PRN_SITEMAP_ONLY}")])
-        .chain(prn_releases)
+        .chain([lilly, format!("https://{PRN_SITEMAP_ONLY}")])
+        .chain([north_carolina, novo])
         .chain([PRN_INDEX.to_owned()])
         .collect();
     let expected = round_robin(&hosts);
@@ -2634,10 +2680,10 @@ fn a_robots_blob_written_after_the_provider_opened_is_unverified() -> TestResult
     Ok(())
 }
 
-/// §8 row R19(b), owner decision 1 (2026-11-16): a pinned Crawl-delay above the one shared 10 s
-/// interval refuses the host, nasdaq's 30 s and the B2 body's 30 s alike; the provider is never
-/// slowed. Mutations 2026-11-16, the Crawl-delay arm removed: red; `>` as `>=`: red (10 s case);
-/// the 10 s floor check removed: red.
+/// §8 row R19(b), owner decision 1 (2026-11-16): a pinned Crawl-delay above the one shared 7 s
+/// interval (owner, 2026-11-19) refuses the host, nasdaq's 30 s and the B2 body's 30 s alike; the
+/// provider is never slowed. Mutations 2026-11-16, the Crawl-delay arm removed: red; `>` as `>=`:
+/// red (7 s case); the floor check removed: red. 2026-11-19, `PACE_FLOOR` left at 10 s: red.
 #[test]
 fn a_hosts_row_whose_robots_crawl_delay_is_above_the_shared_interval_is_refused() -> TestResult {
     let secs = |n: u64| Some(Duration::from_secs(n));
@@ -2645,7 +2691,7 @@ fn a_hosts_row_whose_robots_crawl_delay_is_above_the_shared_interval_is_refused(
     for body in [
         robots_fixture("www.nasdaq.com.txt")?,
         b"User-agent: *\nCrawl-delay: 30\nUser-agent: bingbot\nDisallow: /prywatne/\n".to_vec(),
-        b"User-agent: *\nCrawl-delay: 10\n".to_vec(),
+        b"User-agent: *\nCrawl-delay: 7\n".to_vec(),
     ] {
         let dir = TempDir::new()?;
         let (store, hosts) = pinned_to(dir.path(), &body)?;
@@ -2660,18 +2706,21 @@ fn a_hosts_row_whose_robots_crawl_delay_is_above_the_shared_interval_is_refused(
             verdict(&cmd_collect::run(&ask, &opened, &Gnw::day()?, &Fixed)),
         ));
     }
-    let over = "crawl-delay 30s over 10s".to_owned();
+    let over = "crawl-delay 30s over 7s".to_owned();
     assert_eq!(
         seen,
         [
-            (secs(10), over.clone()),
-            (secs(10), over),
-            (secs(10), "admitted".to_owned())
+            (secs(7), over.clone()),
+            (secs(7), over),
+            (secs(7), "admitted".to_owned())
         ]
     );
-    // (per_host, Crawl-delay, admitted): 10 s at least, and the delay at most per_host.
+    // (per_host, Crawl-delay, admitted): 7 s at least, and the delay at most per_host.
     let cases = [
-        (secs(10), secs(30), false),
+        (secs(7), secs(30), false),
+        (secs(7), secs(7), true),
+        (secs(7), secs(8), false),
+        (secs(6), None, false),
         (secs(30), secs(30), true),
         (secs(10), secs(10), true),
         (secs(10), secs(5), true),
@@ -2758,7 +2807,7 @@ fn a_path_or_unreadable_robots_refusal_names_its_fact_and_suggests_no_refresh() 
                 Value::Null,
                 Value::Null,
                 Value::from(30.0),
-                Value::from(10.0)
+                Value::from(7.0)
             ]),
         ]
     );
@@ -5167,7 +5216,7 @@ const CNW_RELEASE_PREFIX: &str = "https://www.newswire.ca/news-releases/";
 /// The re-admitted file's document follow-ups before any synthetic CNW release: GNW 3, PRN 4,
 /// CNW 3, the Fed 3 and Yahoo 2.
 const READMITTED_FOLLOW_UPS: usize = 15;
-const FOLLOW_UP_CAP: usize = 150;
+const FOLLOW_UP_CAP: usize = 300;
 /// CNW's share of `READMITTED_FOLLOW_UPS`.
 const READMITTED_CNW: usize = 3;
 
@@ -5197,7 +5246,7 @@ fn cnw_sitemap_with(extra: usize) -> Result<(Vec<u8>, Vec<String>), Box<dyn Erro
 type CappedRun = (TempDir, cmd_collect::Answer, Gnw, Vec<String>);
 
 /// The re-admitted hosts file on Monday on a fresh store, CNW's sitemap listing `extra` more
-/// releases, each answered with a kept CNW page: its 100 rows make a 150-follow-up run.
+/// releases, each answered with a kept CNW page: its 285 rows make a 300-follow-up run.
 fn capped_run(extra: usize) -> Result<CappedRun, Box<dyn Error>> {
     capped_run_carrying(extra, &[])
 }
@@ -5282,10 +5331,10 @@ fn stored_deferred(store: &Path) -> Result<Vec<DeferredRow>, Box<dyn Error>> {
     Ok(rows)
 }
 
-/// S7-D6 at its boundary through `collect`: 150 document follow-ups are all asked, no row is
-/// deferred and the run exits 0.
+/// S7-D6 at its boundary through `collect`: 300 document follow-ups are all asked, no row is
+/// deferred and the run exits 0. Mutation 2026-11-19, `FOLLOW_UP_CAP` 299: red.
 #[test]
-fn a_run_of_exactly_150_follow_ups_asks_every_one_and_defers_none() -> TestResult {
+fn a_run_of_exactly_300_follow_ups_asks_every_one_and_defers_none() -> TestResult {
     let (root, answer, _, _) = capped_run(FOLLOW_UP_CAP - READMITTED_FOLLOW_UPS)?;
     assert_eq!(
         (
@@ -5299,11 +5348,11 @@ fn a_run_of_exactly_150_follow_ups_asks_every_one_and_defers_none() -> TestResul
     Ok(())
 }
 
-/// S7-D4 and S7-D6 through `collect`: the 151st follow-up, CNW's last in round-robin order, is
+/// S7-D4 and S7-D6 through `collect`: the 301st follow-up, CNW's last in round-robin order, is
 /// never sent and is one `deferred` row naming it, in the envelope and the ledger; the run exits
-/// 8 `partial_collect` (S7-D8).
+/// 8 `partial_collect` (S7-D8). Mutation 2026-11-19, `FOLLOW_UP_CAP` 301: red.
 #[test]
-fn the_151st_follow_up_is_deferred_recorded_and_never_sent_and_the_run_exits_8() -> TestResult {
+fn the_301st_follow_up_is_deferred_recorded_and_never_sent_and_the_run_exits_8() -> TestResult {
     let (root, answer, exchange, urls) = capped_run(FOLLOW_UP_CAP + 1 - READMITTED_FOLLOW_UPS)?;
     let last = urls.last().cloned().ok_or("no synthetic release")?;
     let story = digest(canon::digest::story_id(
@@ -7065,7 +7114,7 @@ fn deferred_index_requests_are_never_carried_or_closed() -> TestResult {
 /// The 11:00 slot of `MONDAY_AT`'s day, whose stop is 11:14:30.
 const MONDAY_NEXT_SLOT: &str = "2026-11-16T11:00:30Z";
 
-/// S7-D6 with S7-D5: a carried listed follow-up is counted at issue and waits behind the 150 new
+/// S7-D6 with S7-D5: a carried listed follow-up is counted at issue and waits behind the 300 new
 /// ones (2026-11-19), so it is the one deferred; a carried walk id is not counted and is asked.
 #[test]
 fn a_carried_follow_up_counts_against_the_cap_and_a_carried_walk_id_does_not() -> TestResult {
@@ -7136,7 +7185,7 @@ fn attempt_of_url(store: &Path, url: &str) -> Result<String, Box<dyn Error>> {
 type LatencySeen = (String, i64, Option<f64>, i64, Option<f64>, i64);
 
 /// §8 row R22 through `collect` and `ledger`: each CNW document names CNW's index attempt; the
-/// 151st, deferred by the cap, keeps that name in its `deferred` row and the next slot's run asks
+/// 301st, deferred by the cap, keeps that name in its `deferred` row and the next slot's run asks
 /// it under it, so its latency spans both runs: 11:00:29 − 09:30:29 = 5,400 s, carried.
 #[test]
 fn a_document_names_the_index_attempt_that_listed_it_and_a_carried_one_its_first_runs() -> TestResult
@@ -7344,8 +7393,10 @@ fn sitemap_held(store: &Path) -> Result<Option<i64>, Box<dyn Error>> {
 }
 
 /// PR #50's question 1 (owner decision 2026-11-18): PRN's sitemap, read before its RSS's
-/// follow-ups, drops the three it shares with them. Asked, they count `held` (3); deferred by the
-/// cap, they were never asked and count nothing (0).
+/// follow-ups, drops the three it shares with them. Asked, they count `held` (3); behind the cap,
+/// the two it names no ticker for are deferred, never asked and count nothing, while Lilly's,
+/// promoted by its `NYSE:LLY` ahead of the 300 RSS-only ones, is asked and counts (1).
+/// Mutations 2026-11-19: `attempt_once` promoting nothing: red; `HostQueue::promote` a no-op: red.
 #[test]
 fn a_story_queued_by_this_run_counts_held_only_once_the_run_asked_it() -> TestResult {
     let mut seen = Vec::new();
@@ -7379,6 +7430,6 @@ fn a_story_queued_by_this_run_counts_held_only_once_the_run_asked_it() -> TestRe
             deferred.len(),
         ));
     }
-    assert_eq!(seen, vec![(Some(3), 3, 0), (Some(0), 0, 3)]);
+    assert_eq!(seen, vec![(Some(3), 3, 0), (Some(1), 1, 2)]);
     Ok(())
 }

@@ -595,6 +595,7 @@ pub(crate) mod tests {
             url: URL.to_owned(),
             universe_version: FileDigest::of(ROSTER),
             listed_date: None,
+            names_ticker: false,
             hosts_version: None,
             extract_version: None,
             headers: vec![(

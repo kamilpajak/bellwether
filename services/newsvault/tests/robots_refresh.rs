@@ -1145,7 +1145,7 @@ fn robots_fixture(name: &str) -> Result<Vec<u8>, std::io::Error> {
 /// over the same body, in the JSON row and on the human line, and the schema lists exactly these
 /// values; a failed fetch carries none. Mutations 2026-11-16, the Crawl-delay check dropped from
 /// `parse_verdict_of`: red; `parse_verdict` dropped from `render_human`: red; the check written
-/// as `>=` in `parse_verdict_of`: red (the 10 s delay equal to the 10 s interval).
+/// as `>=` in `parse_verdict_of`: red (the 7 s delay equal to the 7 s interval, 2026-11-19).
 #[test]
 fn a_refresh_reports_the_parse_verdict_of_each_answered_row() -> TestResult {
     let gnw = gnw_body()?;
@@ -1162,7 +1162,7 @@ fn a_refresh_reports_the_parse_verdict_of_each_answered_row() -> TestResult {
         ),
         (OK, robots_fixture("synthetic_html_page.txt")?),
         (OK, robots_fixture("www.nasdaq.com.txt")?),
-        (OK, b"User-agent: *\nCrawl-delay: 10\n".to_vec()),
+        (OK, b"User-agent: *\nCrawl-delay: 7\n".to_vec()),
         (OK, b"User-agent: *\nCrawl-delay: soon\n".to_vec()),
         (OK, b"Sitemap: https://www.prnewswire.com/s.xml\n".to_vec()),
         (OK, b"User-agent: *\nDisallow: /\xe4\n".to_vec()),

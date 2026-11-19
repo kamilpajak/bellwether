@@ -3445,14 +3445,15 @@ fn rss_titles(titles: &[&str]) -> Vec<u8> {
 
 // ---- transport ----
 
-/// Owner decision 1, 2026-11-17: each host its own 10 s queue, and no per-IP queue across hosts.
+/// Owner decision 1, 2026-11-17: each host its own queue, and no per-IP queue across hosts; 7 s
+/// per host since 2026-11-19 (owner). Mutation 2026-11-19, `INTERVAL` left at 10 s: red.
 #[test]
-fn the_profile_paces_each_host_at_one_request_per_ten_seconds_and_no_shared_ip_queue() -> Outcome {
+fn the_profile_paces_each_host_every_seven_seconds_and_no_shared_ip_queue() -> Outcome {
     let profile = provider()?.transport();
-    let ten = std::time::Duration::from_secs(10);
+    let seven = std::time::Duration::from_secs(7);
     assert_eq!(
         (profile.budget.min_interval, profile.budget.per_host),
-        (None, Some(ten))
+        (None, Some(seven))
     );
     assert_eq!(
         profile.user_agent,
@@ -5285,6 +5286,186 @@ fn a_deferred_document_is_rebuilt_as_its_request_and_a_walk_id_is_known_by_its_u
             None,
             None,
         )
+    );
+    Ok(())
+}
+
+// ---- ticker-first (owner decision 2026-11-19, section 11.2) ----
+
+/// Each follow-up's url tail (its release id), phase and `names_ticker`.
+fn named_tickers(extracted: &Extracted) -> Vec<(String, RequestPhase, bool)> {
+    extracted
+        .follow_ups
+        .iter()
+        .map(|follow_up| {
+            let tail = follow_up.url.rsplit(['-', '=']).next().unwrap_or_default();
+            (tail.to_owned(), follow_up.phase, follow_up.names_ticker)
+        })
+        .collect()
+}
+
+/// A PRN sitemap row with a non-empty `news:stock_tickers` marks its follow-up; a row with none,
+/// one whose element is blank and every PRN RSS row do not (the RSS names no ticker). Real `sitemap_p1_1200.xml` (2 of 3 rows name one). Mutations 2026-11-19:
+/// `names_ticker: false` in `index_rows_of`: red; the sitemap's non-empty check dropped: red.
+#[test]
+fn a_prn_sitemap_row_naming_stock_tickers_marks_its_follow_up_and_nothing_else_does() -> Outcome {
+    let provider = provider()?;
+    let sitemap = prn_sitemap_request(&provider)?;
+    let page = prn("sitemap_p1_1200.xml");
+    let emptied = String::from_utf8(page.clone())?.replacen("NYSE:DBI", " ", 1);
+    let rss = provider.extract(&prn_index_request(&provider)?, &blob(prn(PRN_REAL_INDEX)));
+    let document = RequestPhase::Document;
+    let row = |id: &str, named: bool| (format!("{id}.html"), document, named);
+    assert_eq!(
+        (
+            named_tickers(&provider.extract(&sitemap, &blob(page))),
+            named_tickers(&provider.extract(&sitemap, &blob(emptied.into_bytes()))),
+            rss.follow_ups
+                .iter()
+                .any(|follow_up| follow_up.names_ticker),
+            rss.follow_ups.len(),
+        ),
+        (
+            vec![
+                row("302941008", true),
+                row("302941554", true),
+                row("302941908", false),
+            ],
+            vec![
+                row("302941008", false),
+                row("302941554", true),
+                row("302941908", false),
+            ],
+            false,
+            3,
+        )
+    );
+    Ok(())
+}
+
+/// Real GNW poll of 2026-11-19 09:36:50Z, items 3406348 (no category), 3406341 (two stock
+/// categories, then two ISIN) and 3406345 (three stock, one ISIN), each opening tag split over two
+/// lines as served.
+const RSS_CATEGORIES: &str = "rssfeed_0936_3_items.xml";
+
+/// `RSS_CATEGORIES` with `edit` applied to item `id` alone, then each follow-up's `names_ticker`.
+fn names_with(
+    provider: &OpenWebFeed,
+    id: &str,
+    edit: impl Fn(&str) -> String,
+) -> Result<Vec<bool>, Box<dyn std::error::Error>> {
+    let rss = String::from_utf8(gnw(RSS_CATEGORIES))?;
+    let marker = format!("<dc:identifier>{id}</dc:identifier>");
+    let edited: Vec<String> = rss
+        .split_inclusive("</item>")
+        .map(|part| {
+            if part.contains(&marker) {
+                edit(part)
+            } else {
+                part.to_owned()
+            }
+        })
+        .collect();
+    Ok(follow_ups(provider, edited.concat().as_bytes())?
+        .follow_ups
+        .iter()
+        .map(|follow_up| follow_up.names_ticker)
+        .collect())
+}
+
+/// A GNW item names a ticker when one of its categories carries GNW's stock `domain`
+/// (`.../rss/stock`); an item with no category, or whose categories are ISINs alone
+/// (`.../rss/ISIN`), does not. Mutations 2026-11-19: the RSS arm `names_ticker: false`: red; the
+/// `domain` filter dropped: red (the ISIN-only item named).
+#[test]
+fn a_gnw_item_with_a_stock_domain_category_names_a_ticker_and_an_isin_alone_does_not() -> Outcome {
+    let provider = provider()?;
+    let isin_only = |item: &str| item.replace("/rss/stock\"", "/rss/ISIN\"");
+    assert_eq!(
+        (
+            names_with(&provider, "3406341", str::to_owned)?,
+            names_with(&provider, "3406341", isin_only)?,
+        ),
+        (vec![false, true, true], vec![false, false, true])
+    );
+    Ok(())
+}
+
+/// A stock category counts behind a category with no `domain` (GNW served `GENERAL` once on
+/// 2026-11-19), and only as RSS's own unprefixed `category`: as `media:category` it names nothing.
+/// Mutations 2026-11-19: only the first `category` read (`.take(1)`): red; `is_rss` replaced by a
+/// local-name match: red.
+#[test]
+fn a_stock_category_counts_behind_another_and_never_under_a_namespace_prefix() -> Outcome {
+    let provider = provider()?;
+    let general_first = |item: &str| {
+        item.replacen(
+            "<category",
+            "<category>GENERAL</category>\r\n      <category",
+            1,
+        )
+    };
+    let prefixed = |item: &str| {
+        item.replace("<category", "<media:category")
+            .replace("</category>", "</media:category>")
+    };
+    assert_eq!(
+        (
+            names_with(&provider, "3406341", general_first)?,
+            names_with(&provider, "3406341", prefixed)?,
+        ),
+        (vec![false, true, true], vec![false, false, true])
+    );
+    Ok(())
+}
+
+/// A stock category's text is trimmed: surrounding whitespace still names a ticker, whitespace
+/// alone does not. Mutation 2026-11-19, the text not trimmed (`!text.is_empty()`): red (the blank
+/// item named).
+#[test]
+fn a_stock_category_holding_only_whitespace_names_no_ticker() -> Outcome {
+    let provider = provider()?;
+    let padded = |item: &str| {
+        item.replace(">Amsterdam:WKL<", ">\r\n  Amsterdam:WKL \t<")
+            .replace(">OTC Markets:WTKWY<", "> OTC Markets:WTKWY\r\n<")
+    };
+    let blank = |item: &str| {
+        item.replace(">Amsterdam:WKL<", ">\r\n  <")
+            .replace(">OTC Markets:WTKWY<", "> \t<")
+    };
+    assert_eq!(
+        (
+            names_with(&provider, "3406341", padded)?,
+            names_with(&provider, "3406341", blank)?,
+        ),
+        (vec![false, true, true], vec![false, false, true])
+    );
+    Ok(())
+}
+
+/// No index row stands behind a GNW walk id or a carried request, so neither names a ticker, nor
+/// does a planned index. Mutations 2026-11-19: `names_ticker: true` in `walk_of`: red; in
+/// `carried`: red.
+#[test]
+fn a_walk_id_a_carried_request_and_a_planned_index_name_no_ticker() -> Outcome {
+    let feed = walking(after_the_first_poll(&[])?)?;
+    let request = gnw_index_on(&feed, WALK_DAY, WALK_AT)?;
+    let extracted = feed.extract(&request, &blob(gnw(RSS_1205)));
+    let carried = feed
+        .carried(
+            &TargetWindow::new(WALK_DAY),
+            &walk_url("2026/11/17", FIRST_FRONTIER + 1),
+            Some("Tue, 17 Nov 2026 12:01 GMT"),
+        )
+        .ok_or("nothing carried")?;
+    assert_eq!(
+        (
+            extracted.walk.is_empty(),
+            extracted.walk.iter().any(|walked| walked.names_ticker),
+            carried.names_ticker,
+            request.names_ticker,
+        ),
+        (false, false, false, false)
     );
     Ok(())
 }

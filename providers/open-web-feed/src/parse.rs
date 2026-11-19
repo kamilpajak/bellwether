@@ -17,6 +17,13 @@ const SITEMAP_NAMESPACE: &str = "http://www.sitemaps.org/schemas/sitemap/0.9";
 const NEWS_NAMESPACE: &str = "http://www.google.com/schemas/sitemap-news/0.9";
 const IMAGE_NAMESPACE: &str = "http://www.google.com/schemas/sitemap-image/1.1";
 const TITLE: &str = "title";
+/// A news sitemap row's tickers, and the RSS `category` `domain` GNW files a ticker under (its
+/// ISINs under `.../rss/ISIN`); counts and the rejected text pattern: architecture.md §11.5 step 7,
+/// ticker-first.
+const STOCK_TICKERS: &str = "stock_tickers";
+const CATEGORY: &str = "category";
+const DOMAIN: &str = "domain";
+const STOCK_DOMAIN: &str = "/rss/stock";
 /// Elements whose text is never prose.
 const NOT_PROSE: [&str; 4] = ["script", "style", "noscript", "template"];
 /// Read as a space: PRN's `<b>About SIGNAL<br /></b>SIGNAL is` otherwise fused to `SIGNALSIGNAL`
@@ -73,13 +80,16 @@ const LOCAL_PART_SYMBOLS: [char; 6] = ['.', '_', '%', '+', '\'', '-'];
 const SHORTEST_TOP_LABEL: usize = 2;
 
 /// One index row's fields as the payload spells them. `title` is RSS `title` or `news:title`;
-/// `image` is a news sitemap row's first `image:loc`, `None` for RSS.
+/// `image` is a news sitemap row's first `image:loc`, `None` for RSS. `names_ticker`: a non-empty
+/// `news:stock_tickers`, or an RSS `category` whose `domain` ends with `STOCK_DOMAIN` and whose
+/// trimmed text is non-empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IndexRow {
     pub(crate) link: Option<String>,
     pub(crate) valid_raw: Option<String>,
     pub(crate) title: Option<String>,
     pub(crate) image: Option<String>,
+    pub(crate) names_ticker: bool,
 }
 
 /// The rows of the rule's index shape, or `None` when the payload is not one at all, which is what
@@ -121,6 +131,10 @@ fn sitemap_rows(document: &roxmltree::Document, rule: &Rule) -> Option<Vec<Index
                     image: child_in(url, IMAGE_NAMESPACE, "image")
                         .and_then(|image| child_in(image, IMAGE_NAMESPACE, "loc"))
                         .and_then(text_of),
+                    names_ticker: news
+                        .and_then(|news| child_in(news, NEWS_NAMESPACE, STOCK_TICKERS))
+                        .and_then(text_of)
+                        .is_some_and(|tickers| !tickers.is_empty()),
                 }
             })
             .collect(),
@@ -161,6 +175,15 @@ fn rss_rows(document: &roxmltree::Document, rule: &Rule) -> Option<Vec<IndexRow>
                 valid_raw: child_text(item, rule.valid_field.as_str()),
                 title: child_text(item, TITLE),
                 image: None,
+                names_ticker: item
+                    .children()
+                    .filter(|node| is_rss(*node, CATEGORY))
+                    .filter(|node| {
+                        node.attribute(DOMAIN)
+                            .is_some_and(|domain| domain.ends_with(STOCK_DOMAIN))
+                    })
+                    .filter_map(|node| node.text())
+                    .any(|text| !text.trim().is_empty()),
             })
             .collect(),
     )

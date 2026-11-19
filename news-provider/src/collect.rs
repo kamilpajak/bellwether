@@ -784,6 +784,11 @@ pub fn collect<A: Archive>(
             listed_by,
         };
         let listing = Some(attempted.row.attempt_id.as_str());
+        queue.promote(&attempted.promoted, |request| {
+            provider
+                .story_of(request)
+                .map(|story| story.hex().to_owned())
+        });
         queue.requeue(
             attempted.follow_ups,
             attempted.walked,
@@ -1013,15 +1018,34 @@ pub(crate) struct HostQueue {
 
 /// One host's requests: this run's own (planned, follow-ups, walk ids, retries) in `fresh`, an
 /// earlier run's carried ones in `carried`, asked only once `fresh` is empty (S7-D5, 2026-11-19).
+/// A fresh `Document` follow-up holds a [`Slot::Document`] in `fresh`, filled when popped from
+/// `named` (its row names a ticker) first, then `unnamed`, each in listing order (2026-11-19).
 #[derive(Default)]
 struct Lane {
-    fresh: VecDeque<Queued>,
+    fresh: VecDeque<Slot>,
+    named: VecDeque<Queued>,
+    unnamed: VecDeque<Queued>,
     carried: VecDeque<Queued>,
+}
+
+/// A place in a lane's `fresh` order: a request that keeps it, or one a document follow-up fills.
+enum Slot {
+    Kept(Box<Queued>),
+    Document,
 }
 
 impl Lane {
     fn pop_front(&mut self) -> Option<Queued> {
-        self.fresh.pop_front().or_else(|| self.carried.pop_front())
+        match self.fresh.pop_front() {
+            Some(Slot::Kept(queued)) => Some(*queued),
+            Some(Slot::Document) => self.named.pop_front().or_else(|| self.unnamed.pop_front()),
+            None => self.carried.pop_front(),
+        }
+    }
+
+    /// Every request in the order `pop_front` would hand them out, the lane left empty.
+    fn drain(&mut self) -> Vec<Queued> {
+        std::iter::from_fn(|| self.pop_front()).collect()
     }
 }
 
@@ -1060,7 +1084,41 @@ impl HostQueue {
 
     /// To the back of its host's fresh requests.
     fn push(&mut self, queued: Queued) {
-        self.lane_of(&queued.request).fresh.push_back(queued);
+        self.lane_of(&queued.request)
+            .fresh
+            .push_back(Slot::Kept(Box::new(queued)));
+    }
+
+    /// A fresh `Document` follow-up: a slot at the back of its host's fresh requests, filled by
+    /// the lane's first named follow-up, else its first unnamed one.
+    fn push_document(&mut self, queued: Queued) {
+        let lane = self.lane_of(&queued.request);
+        lane.fresh.push_back(Slot::Document);
+        if queued.request.names_ticker {
+            lane.named.push_back(queued);
+        } else {
+            lane.unnamed.push_back(queued);
+        }
+    }
+
+    /// Each fresh unnamed follow-up whose story (`story_of`) is in `stories` moves to the back of
+    /// its lane's named ones: a later index named a ticker for a story an earlier one listed
+    /// without. Its request, listing and cap count are unchanged; anything else is left in place.
+    pub(crate) fn promote(
+        &mut self,
+        stories: &BTreeSet<String>,
+        story_of: impl Fn(&Request) -> Option<String>,
+    ) {
+        if stories.is_empty() {
+            return;
+        }
+        for (_, lane) in &mut self.lanes {
+            let (promoted, kept) = lane.unnamed.drain(..).partition(|queued: &Queued| {
+                story_of(&queued.request).is_some_and(|story| stories.contains(&story))
+            });
+            lane.unnamed = kept;
+            lane.named.extend(promoted);
+        }
     }
 
     /// After `asked` is attempted as `listing`: its follow-ups, its walk ids, then itself again
@@ -1075,7 +1133,12 @@ impl HostQueue {
         listing: Option<&str>,
     ) {
         for follow_up in follow_ups {
-            self.push(Queued::follow_up(follow_up, listing));
+            let queued = Queued::follow_up(follow_up, listing);
+            if queued.request.phase == RequestPhase::Document {
+                self.push_document(queued);
+            } else {
+                self.push(queued);
+            }
         }
         for id in walked {
             self.push(Queued::walked(id, listing));
@@ -1100,7 +1163,7 @@ impl HostQueue {
     }
 
     /// `stopped` at the deadline: its cap slot back when counted, since it is never asked, and
-    /// its host's lane emptied, fresh requests first, then carried ones.
+    /// its host's lane emptied in the order it would have been asked.
     pub(crate) fn stop(&mut self, stopped: &Queued) -> Vec<Queued> {
         if stopped.counted {
             self.issued = self.issued.saturating_sub(1);
@@ -1109,7 +1172,7 @@ impl HostQueue {
         self.lanes
             .iter_mut()
             .find(|(key, _)| *key == host)
-            .map(|(_, lane)| lane.fresh.drain(..).chain(lane.carried.drain(..)).collect())
+            .map(|(_, lane)| lane.drain())
             .unwrap_or_default()
     }
 
@@ -1164,6 +1227,8 @@ struct Attempted {
     /// A live index's `held`: its archive-held part is written at the attempt, the rest once the
     /// run's queue is empty.
     held: Option<PendingHeld>,
+    /// Stories this index names a ticker for that an earlier index of this run queued without.
+    promoted: BTreeSet<String>,
 }
 
 /// A live index's `held` (section 11.1) before the run ends: `held` follow-ups the archive held,
@@ -1278,6 +1343,7 @@ fn attempt_once<A: Archive>(
     // A vendor_archive index records `matched` and hands over one window's covered set (R20); a
     // live index records `held` and hands over the held set of every window (§11.1, R16).
     let mut held = None;
+    let mut promoted = BTreeSet::new();
     let (follow_ups, walked) = match extracted {
         Some(extracted) if request.phase == RequestPhase::Index => {
             let matched = count(extracted.follow_ups.len());
@@ -1303,6 +1369,15 @@ fn attempt_once<A: Archive>(
                     .map(|story| story.hex().to_owned())
                     .collect()
             };
+            let named: Vec<Request> = listed
+                .iter()
+                .filter(|follow_up| follow_up.names_ticker)
+                .cloned()
+                .collect();
+            promoted = stories_of(&named)
+                .into_iter()
+                .filter(|story| in_run.contains(story))
+                .collect();
             issued.extend(stories_of(&to_issue));
             stories.extend(stories_of(&to_issue));
             let walked = provider.follow_ups_to_issue(extracted.walk, &stories);
@@ -1362,6 +1437,7 @@ fn attempt_once<A: Archive>(
         committed,
         story: story.map(|story| story.hex().to_owned()),
         held,
+        promoted,
     })
 }
 
@@ -1558,6 +1634,7 @@ mod tests {
             params: Vec::new(),
             universe_version: FileDigest::of(b"{}"),
             listed_date: None,
+            names_ticker: false,
             hosts_version: None,
             extract_version: None,
         }
@@ -1672,13 +1749,13 @@ mod tests {
         capped(&lanes, None, failing).0
     }
 
-    /// S7-D6 at its boundary: the 150th follow-up is asked and the 151st deferred; with no cap
-    /// (edgar's `None`) all 151 are asked.
+    /// S7-D6 at its boundary: the 300th follow-up is asked and the 301st deferred; with no cap
+    /// (edgar's `None`) all 301 are asked.
     #[test]
-    fn the_cap_asks_the_150th_follow_up_and_defers_the_151st() {
-        let at_cap = capped(&[(CNW, documents(150))], Some(150), "");
-        let over = capped(&[(CNW, documents(151))], Some(150), "");
-        let uncapped = capped(&[(CNW, documents(151))], None, "");
+    fn the_cap_asks_the_300th_follow_up_and_defers_the_301st() {
+        let at_cap = capped(&[(CNW, documents(300))], Some(300), "");
+        let over = capped(&[(CNW, documents(301))], Some(300), "");
+        let uncapped = capped(&[(CNW, documents(301))], None, "");
         assert_eq!(
             (
                 at_cap.0.len(),
@@ -1686,11 +1763,11 @@ mod tests {
                 over.0.len(),
                 uncapped.0.len()
             ),
-            (151, 0, 151, 152)
+            (301, 0, 301, 302)
         );
         assert_eq!(
             (over.0.last(), over.1, uncapped.1.len()),
-            (Some(&format!("{CNW}p149")), urls(&[(CNW, "p150")]), 0)
+            (Some(&format!("{CNW}p299")), urls(&[(CNW, "p300")]), 0)
         );
     }
 
@@ -1729,9 +1806,10 @@ mod tests {
     }
 
     /// S7-D6's arithmetic (architecture.md section 11.5 step 7): a first run's 301 follow-ups,
-    /// GNW 20, PRN 20, CNW 100, Fed 20 and Yahoo 141, lose 55 of CNW's and 96 of Yahoo's.
+    /// GNW 20, PRN 20, CNW 100, Fed 20 and Yahoo 141, lose 1 of Yahoo's, the longest lane's last,
+    /// under the cap of 300 (2026-11-19); 55 of CNW's and 96 of Yahoo's under the 150 before it.
     #[test]
-    fn the_global_cap_cuts_55_of_cnws_and_96_of_yahoos_first_run_follow_ups() {
+    fn the_global_cap_cuts_one_of_yahoos_first_run_follow_ups() {
         const FED: &str = "https://www.federalreserve.gov/";
         const YAHOO: &str = "https://finance.yahoo.com/";
         let plan = [
@@ -1741,12 +1819,12 @@ mod tests {
             (FED, documents(20)),
             (YAHOO, documents(141)),
         ];
-        let (_, deferred) = capped(&plan, Some(150), "");
+        let (_, deferred) = capped(&plan, Some(300), "");
         let lost: Vec<usize> = plan
             .iter()
             .map(|(base, _)| deferred.iter().filter(|url| url.starts_with(base)).count())
             .collect();
-        assert_eq!(lost, vec![0, 0, 55, 0, 96]);
+        assert_eq!(lost, vec![0, 0, 0, 0, 1]);
     }
 
     /// S7-D6's exception (owner, 2026-11-17 ~21:30Z): walk ids are never counted, so a cap the
@@ -1795,8 +1873,8 @@ mod tests {
         );
     }
 
-    /// An `Index` follow-up, PRN's next sitemap page, is outside the 150: section 11.2's worst
-    /// case is (150 + index requests) × 3 × 10 s, and a page cut would leave its poll unjoined.
+    /// An `Index` follow-up, PRN's next sitemap page, is outside the cap: section 11.2's worst
+    /// case counts index requests apart from it, and a page cut would leave its poll unjoined.
     #[test]
     fn an_index_follow_up_is_not_counted_against_the_cap() {
         let lane = Lane {
@@ -2182,8 +2260,8 @@ mod tests {
     }
 
     /// The 14:30 run of 2026-11-19 under fresh-first: GNW 20 follow-ups and 19 walk ids, PRN 155
-    /// new follow-ups and 75 carried, Yahoo 61, cap 150. Carried first, the run asked PRN 69
-    /// carried and 0 new; now it asks 69 new, and every carried one is deferred.
+    /// new follow-ups and 75 carried, Yahoo 61, cap 300 (150 then). Every new one is asked, then
+    /// 64 carried; 11 carried are deferred. The deadline is not modelled here.
     #[test]
     fn the_cap_is_spent_on_new_follow_ups_before_carried_ones() {
         const YAHOO: &str = "https://finance.yahoo.com/";
@@ -2196,7 +2274,7 @@ mod tests {
         let carried = (0..75)
             .map(|nth| carried(PRN, &format!("c{nth}"), true, nth))
             .collect();
-        let (asked, deferred) = carrying(&plan, carried, Some(150), "", "");
+        let (asked, deferred) = carrying(&plan, carried, Some(300), "", "");
         let count =
             |of: &[String], prefix: &str| of.iter().filter(|url| url.starts_with(prefix)).count();
         let prn_new = format!("{PRN}p");
@@ -2210,7 +2288,7 @@ mod tests {
                 count(&deferred, &prn_new),
                 count(&deferred, &prn_carried),
             ),
-            (20, 61, 69, 0, 86, 75)
+            (20, 61, 155, 64, 0, 11)
         );
     }
 
@@ -2307,5 +2385,139 @@ mod tests {
                 (format!("{GNW}c1"), vec![1]),
             ]
         );
+    }
+
+    /// A follow-up whose index row names a ticker.
+    fn ticker_named(base: &str, path: &str) -> Request {
+        Request {
+            names_ticker: true,
+            ..asking(base, path)
+        }
+    }
+
+    /// Every url `queue` hands out from now on, asked or deferred, with the listing each names.
+    fn emptied(queue: &mut HostQueue) -> Vec<(String, Option<String>)> {
+        std::iter::from_fn(|| queue.pop())
+            .map(|popped| match popped {
+                Popped::Ask(queued) | Popped::Defer(queued) => {
+                    (queued.request.url, queued.listed_by)
+                }
+            })
+            .collect()
+    }
+
+    /// Owner decision 2026-11-19: a lane's fresh document follow-ups whose row names a ticker are
+    /// asked before those naming none, each group in listing order, while a next page, a walk id
+    /// and a retry keep the places they were queued at. Mutations 2026-11-19: `Lane::pop_front`
+    /// taking `unnamed` first: red; `push_document` ignoring `names_ticker`: red.
+    #[test]
+    fn named_follow_ups_go_first_in_listing_order_and_every_other_request_keeps_its_place() {
+        let mut queue = HostQueue::of(vec![asking(PRN, "index")], None);
+        if let Some(Popped::Ask(index)) = queue.pop() {
+            let page = Request {
+                phase: RequestPhase::Index,
+                ..asking(PRN, "page")
+            };
+            let follow_ups = vec![
+                asking(PRN, "u0"),
+                ticker_named(PRN, "n0"),
+                asking(PRN, "u1"),
+                page,
+                ticker_named(PRN, "n1"),
+            ];
+            let walked = vec![asking(PRN, "w0")];
+            queue.requeue(follow_ups, walked, index, true, None);
+        }
+        let asked: Vec<String> = emptied(&mut queue)
+            .into_iter()
+            .map(|(url, _)| url)
+            .collect();
+        assert_eq!(
+            asked,
+            urls(&[
+                (PRN, "n0"),
+                (PRN, "n1"),
+                (PRN, "u0"),
+                (PRN, "page"),
+                (PRN, "u1"),
+                (PRN, "w0"),
+                (PRN, "index"),
+            ])
+        );
+    }
+
+    /// Owner decision 2026-11-19: PRN's RSS lists `m` with a ticker and `x` without, its sitemap
+    /// names one for `x`, which the run already queued, so the sitemap's own follow-up is dropped
+    /// and the RSS's moves to the back of the named ones, behind `m` and ahead of the sitemap's new
+    /// `n`, keeping the RSS as its listing; a carried request and a walk id of a promoted story stay
+    /// where they are, and the cap still counts at `pop`. Mutations 2026-11-19: `promote` a no-op:
+    /// red; `promote` putting the story at the front of the unnamed ones instead: red; at the front
+    /// of the named ones (review of PR #60): red.
+    #[test]
+    fn a_later_listing_naming_a_ticker_promotes_a_queued_story_and_nothing_else() {
+        let plan = vec![asking(PRN, "rss"), asking(PRN, "sitemap")];
+        let mut queue = HostQueue::of(plan, Some(4));
+        queue.carry(vec![carried(PRN, "c", true, 1)]);
+        if let Some(Popped::Ask(rss)) = queue.pop() {
+            let follow_ups = vec![
+                asking(PRN, "a"),
+                asking(PRN, "x"),
+                ticker_named(PRN, "m"),
+                asking(PRN, "b"),
+            ];
+            queue.requeue(follow_ups, vec![asking(PRN, "w")], rss, false, Some("rss"));
+        }
+        if let Some(Popped::Ask(sitemap)) = queue.pop() {
+            let stories: BTreeSet<String> = ["x", "w", "c"]
+                .iter()
+                .map(|path| format!("{PRN}{path}"))
+                .collect();
+            queue.promote(&stories, |request| Some(request.url.clone()));
+            let follow_ups = vec![ticker_named(PRN, "n")];
+            queue.requeue(follow_ups, Vec::new(), sitemap, false, Some("sitemap"));
+        }
+        let mut handed = Vec::new();
+        while let Some(popped) = queue.pop() {
+            let (queued, asked) = match popped {
+                Popped::Ask(queued) => (queued, true),
+                Popped::Defer(queued) => (queued, false),
+            };
+            handed.push((queued.request.url, asked, queued.listed_by));
+        }
+        let by = |listing: &str| Some(listing.to_owned());
+        assert_eq!(
+            handed,
+            vec![
+                (format!("{PRN}m"), true, by("rss")),
+                (format!("{PRN}x"), true, by("rss")),
+                (format!("{PRN}n"), true, by("sitemap")),
+                (format!("{PRN}a"), true, by("rss")),
+                (format!("{PRN}w"), true, by("rss")),
+                (format!("{PRN}b"), false, by("rss")),
+                (format!("{PRN}c"), false, None),
+            ]
+        );
+    }
+
+    /// Condition A with ticker-first: a lane stopped at the deadline defers in the order it would
+    /// have asked, named follow-ups first. Mutation 2026-11-19, `stop` draining `named` after
+    /// `unnamed`: red.
+    #[test]
+    fn a_stopped_lane_defers_its_named_follow_ups_first() {
+        let mut queue = HostQueue::of(vec![asking(GNW, "index")], None);
+        if let Some(Popped::Ask(index)) = queue.pop() {
+            let follow_ups = vec![
+                asking(GNW, "u0"),
+                ticker_named(GNW, "n0"),
+                ticker_named(GNW, "n1"),
+            ];
+            queue.requeue(follow_ups, Vec::new(), index, false, None);
+        }
+        let lane = match queue.pop() {
+            Some(Popped::Ask(stopped)) => queue.stop(&stopped),
+            _ => Vec::new(),
+        };
+        let deferred: Vec<String> = lane.into_iter().map(|rest| rest.request.url).collect();
+        assert_eq!(deferred, urls(&[(GNW, "n1"), (GNW, "u0")]));
     }
 }

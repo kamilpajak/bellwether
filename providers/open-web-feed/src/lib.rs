@@ -61,10 +61,11 @@ const VENDOR_PATIENCE: Duration = Duration::from_secs(30);
 const BODY_LIMIT: u64 = 2 * 1_024 * 1_024;
 /// Section 11.1's floor, as `per_host` for every host (§8 row R19 hole 7): `newsvault collect`
 /// refuses a host whose robots Crawl-delay is above it (owner decision 1, 2026-11-16). No per-IP
-/// pace: each host is its own queue (owner decision 1, 2026-11-17, §10).
-const INTERVAL: Duration = Duration::from_secs(10);
-/// S7-D6 (owner, 2026-11-17): the owner's choice, not measured (architecture.md section 11.2).
-pub const FOLLOW_UP_CAP: u32 = 150;
+/// pace: each host is its own queue (owner decision 1, 2026-11-17, §10). 7 s: owner, 2026-11-19.
+const INTERVAL: Duration = Duration::from_secs(7);
+/// S7-D6 (owner, 2026-11-17; 300 since 2026-11-19): the owner's choice (architecture.md section
+/// 11.2's cap bullet holds the counts it was raised against).
+pub const FOLLOW_UP_CAP: u32 = 300;
 
 /// Why no request may be made at all, each raised by `open` before the first request.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -529,6 +530,7 @@ impl OpenWebFeed {
             params: Vec::new(),
             universe_version: empty_roster(),
             listed_date: None,
+            names_ticker: false,
             hosts_version: Some(self.hosts.version.clone()),
             extract_version: Some(self.extract_version.clone()),
         }
@@ -537,7 +539,8 @@ impl OpenWebFeed {
     /// Each index row whose rewritten link stays on the index's own host, passes the path filter
     /// and the provider key filter, and keys a story no earlier row of this index keyed is one
     /// follow-up unless the host's robots disallow its url (`robots_disallowed`); the raw
-    /// publication value rides `listed_date`, never sent.
+    /// publication value rides `listed_date` and whether the row names a ticker `names_ticker`,
+    /// neither sent.
     fn index_rows_of(&self, request: &Request, raw: &RawBlob) -> Extracted {
         let (Some(rule), Some((host, _))) = (self.rule_of(request), host_and_path(&request.url))
         else {
@@ -577,6 +580,7 @@ impl OpenWebFeed {
                     params: Vec::new(),
                     universe_version: empty_roster(),
                     listed_date: row.valid_raw.clone(),
+                    names_ticker: row.names_ticker,
                     hosts_version: request.hosts_version.clone(),
                     extract_version: request.extract_version.clone(),
                 }),
@@ -634,6 +638,7 @@ impl OpenWebFeed {
                 params: Vec::new(),
                 universe_version: empty_roster(),
                 listed_date: None,
+                names_ticker: false,
                 hosts_version: request.hosts_version.clone(),
                 extract_version: request.extract_version.clone(),
             })
@@ -965,6 +970,7 @@ impl Provider for OpenWebFeed {
             params: Vec::new(),
             universe_version: empty_roster(),
             listed_date: listed_date.map(str::to_owned),
+            names_ticker: false,
             hosts_version: Some(self.hosts.version.clone()),
             extract_version: Some(self.extract_version.clone()),
         })
