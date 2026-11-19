@@ -3001,8 +3001,9 @@ fn the_committed_hosts_file_cross_checks_yahoo_against_every_other_admitted_inde
 }
 
 /// Owner decision 2026-11-19: a `cnwgroup.com` row is `no_direct_index` while CNW is a candidate,
-/// never `not_looked`, `not_compared` or unlisted, and its minute does not move `read_from`.
-/// Mutations 2026-11-19, the row left to `not_looked`, the earliest over every key: each red.
+/// never `not_looked`, `not_compared`, unlisted or listed by another index, and its minute does
+/// not move `read_from`. Mutations 2026-11-19, the row left to `not_looked`, the earliest over
+/// every key, the row listed when another index lists its title: each red.
 #[test]
 fn a_cross_check_row_whose_host_is_not_admitted_has_no_direct_index() -> Outcome {
     let row = |key: &str, at: &'static str| {
@@ -3038,16 +3039,23 @@ fn a_cross_check_row_whose_host_is_not_admitted_has_no_direct_index() -> Outcome
         })
     };
     let compared = vec!["prnewswire.com".to_owned(), "globenewswire.com".to_owned()];
+    let cnw_title = rows[2].0.as_str();
+    let listed_elsewhere = every_index_at(LOOKED_AT, &[(PRN_INDEX, rss_titles(&[cnw_title]))])?;
+    let elsewhere = committed
+        .check(&index, &listed_elsewhere, instant("2026-11-16T07:00:00Z"))
+        .map(|checked| (checked.no_direct_index, checked.listed_directly));
     assert_eq!(
         (
             counted(instant("2026-11-16T07:00:00Z")),
             counted(None),
+            elsewhere,
             committed.earliest_cross_checked(&index),
             checker()?.earliest_cross_checked(&index),
         ),
         (
             Some((4, 2, 0, 0, compared)),
             Some((4, 2, 0, 2, Vec::new())),
+            Some((2, 0)),
             instant("2026-11-16T09:00:00Z"),
             instant("2026-11-16T07:30:00Z"),
         )

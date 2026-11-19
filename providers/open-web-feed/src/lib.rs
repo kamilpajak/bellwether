@@ -156,7 +156,7 @@ pub enum Refusal {
         format: String,
     },
     /// Section 11.2: a key's host must be another hosts row; a candidate row's key is counted as
-    /// having no direct index, and a host no row names would be a typo counted the same way.
+    /// having no direct index, and a host no row names is refused, never counted that way.
     #[error(
         "the rules at {path} map rule {rule}'s cross_check key {key} to {host}, which no other hosts row names"
     )]
