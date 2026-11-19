@@ -3414,10 +3414,10 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
   | User-Agent | at | `cf-ray` |
   |---|---|---|
-  | the production User-Agent | 10:05:35Z | `a5ce65b97f5d15f8-WAW` |
-  | `bellwether-probe/0.1 (+contact)` | 10:05:58Z | `a5ce6647f9eabfad-WAW` |
-  | `alphalens-probe/0.1 (+contact)` | 10:08:53Z | `a5ce6a8e5cb2ee3c-WAW` |
-  | curl 8.7.1's default | 10:09:05Z | `a5ce6adb0a1ae5d6-WAW` |
+  | the production User-Agent | 10:05:35Z | `a5ce65b97f5d15f8` |
+  | `bellwether-probe/0.1 (+contact)` | 10:05:58Z | `a5ce6647f9eabfad` |
+  | `alphalens-probe/0.1 (+contact)` | 10:08:53Z | `a5ce6a8e5cb2ee3c` |
+  | curl 8.7.1's default | 10:09:05Z | `a5ce6adb0a1ae5d6` |
 
 - The same probe User-Agent from the same kind of connection got 200 on 5 of 5 CNW release pages on 2026-11-16 08:05 to 08:06Z (probe6, above).
 - So the challenge is neither the VPS address nor our User-Agent; it began between 2026-11-16 08:06Z and 2026-11-19 09:37Z. A browser loads CNW pages (owner, 2026-11-19), consistent with a JavaScript challenge a browser passes.
