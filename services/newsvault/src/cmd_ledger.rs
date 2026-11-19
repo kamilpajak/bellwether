@@ -1632,7 +1632,8 @@ pub fn render_prometheus(
 mod tests {
     use super::{
         label, render_prometheus, CarriedCounts, Check, ClockAge, DayRow, DeferredCounts, Finding,
-        Freshness, Report, SourceRow, WalkCounts, BUSY_BOUND, PROMETHEUS_FAMILIES, SCHEMA,
+        Freshness, Latency, Report, SourceRow, WalkCounts, BUSY_BOUND, PROMETHEUS_FAMILIES,
+        SCHEMA,
     };
     use chrono::{DateTime, Utc};
 
@@ -1643,6 +1644,23 @@ mod tests {
     #[test]
     fn a_label_value_escapes_its_quote_backslash_and_newline() {
         assert_eq!(label("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    }
+
+    /// §8 row R22's nearest rank ⌈p × n / 100⌉: of 20, p95 is the 19th and not the max; of 11,
+    /// p95 is the 11th (⌈10.45⌉), where rounding would read the 10th.
+    #[test]
+    fn a_percentile_is_the_nearest_rank_rounded_up() {
+        let ranked = |n: u32| Latency::of((1..=n).rev().map(f64::from).collect());
+        let span = |documents: i64, p50: f64, p95: f64, max: f64| Latency {
+            documents,
+            p50_s: Some(p50),
+            p95_s: Some(p95),
+            max_s: Some(max),
+        };
+        assert_eq!(
+            (ranked(20), ranked(11)),
+            (span(20, 10.0, 19.0, 20.0), span(11, 6.0, 11.0, 11.0))
+        );
     }
 
     fn day(run_date: &str, holds_capped: u32, host_held: i64, expired: i64, range: i64) -> DayRow {
