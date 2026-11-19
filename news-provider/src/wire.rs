@@ -2713,8 +2713,9 @@ mod tests {
                 retries,
                 counted: false,
                 carried: Vec::new(),
+                listed_by: None,
             };
-            queue.requeue(follow_ups, Vec::new(), asked, retrying);
+            queue.requeue(follow_ups, Vec::new(), asked, retrying, None);
         }
         let served = servers
             .into_iter()

@@ -47,7 +47,7 @@ pub mod provider;
 pub mod request;
 pub mod wire;
 
-pub use budget::{BudgetError, BudgetScope, Hold, HostKey, Pace, RequestBudget, Reserved};
+pub use budget::{host_of, BudgetError, BudgetScope, Hold, HostKey, Pace, RequestBudget, Reserved};
 pub use clock::{Clock, Sleeper, SystemClock, ThreadSleeper};
 pub use collect::{
     collect, Archive, ArchiveError, AttemptRow, Carried, CarryTally, Closing, CollectError,

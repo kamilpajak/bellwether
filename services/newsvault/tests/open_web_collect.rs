@@ -4282,6 +4282,9 @@ fn an_unreadable_stored_header_text_is_store_unreadable_and_records_no_continuit
     Ok(())
 }
 
+/// The columns `MIGRATIONS[14]` adds, which a v14 store lacks; a v13 `deferred` holds neither.
+const LISTED_BY: &str = "ALTER TABLE attempts DROP COLUMN listed_by;";
+const LISTED_BY_DEFERRED: &str = "ALTER TABLE deferred DROP COLUMN listed_by;";
 /// The table `MIGRATIONS[13]` adds, which a v13 store lacks, and `deferred` as a v13 store holds
 /// it, with no `deferred_id`.
 const CLOSED_TABLE: &str = "DROP TABLE deferred_closed;";
@@ -4315,16 +4318,17 @@ const BOUNDARY_COLUMNS: &str = "ALTER TABLE attempts DROP COLUMN boundary_same_g
 /// The first run over an older store reads that store's basis: `basis_pages` runs before the run
 /// migrates it. Review 2026-11-17: a v11 build over a v10 store read none and recorded `first_poll`.
 #[test]
-fn a_v10_to_v13_store_keeps_its_basis_for_the_run_that_migrates_it() -> TestResult {
+fn a_v10_to_v14_store_keeps_its_basis_for_the_run_that_migrates_it() -> TestResult {
     let mut kept = Vec::new();
     for (version, dropped) in [
         (
             10,
-            format!("{DEFERRED_TABLE}{WALK_COLUMNS}{BOUNDARY_COLUMNS}"),
+            format!("{LISTED_BY}{DEFERRED_TABLE}{WALK_COLUMNS}{BOUNDARY_COLUMNS}"),
         ),
-        (11, format!("{DEFERRED_TABLE}{WALK_COLUMNS}")),
-        (12, DEFERRED_TABLE.to_owned()),
-        (13, format!("{CLOSED_TABLE}{V13_DEFERRED}")),
+        (11, format!("{LISTED_BY}{DEFERRED_TABLE}{WALK_COLUMNS}")),
+        (12, format!("{LISTED_BY}{DEFERRED_TABLE}")),
+        (13, format!("{LISTED_BY}{CLOSED_TABLE}{V13_DEFERRED}")),
+        (14, format!("{LISTED_BY}{LISTED_BY_DEFERRED}")),
     ] {
         let root = TempDir::new()?;
         seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
@@ -4343,7 +4347,7 @@ fn a_v10_to_v13_store_keeps_its_basis_for_the_run_that_migrates_it() -> TestResu
         )?;
         kept.push(poll_continuity(&second));
     }
-    assert_eq!(kept, vec![(vec![1], Some("complete".to_owned())); 4]);
+    assert_eq!(kept, vec![(vec![1], Some("complete".to_owned())); 5]);
     Ok(())
 }
 
@@ -5164,6 +5168,8 @@ const CNW_RELEASE_PREFIX: &str = "https://www.newswire.ca/news-releases/";
 /// CNW 3, the Fed 3 and Yahoo 2.
 const READMITTED_FOLLOW_UPS: usize = 15;
 const FOLLOW_UP_CAP: usize = 150;
+/// CNW's share of `READMITTED_FOLLOW_UPS`.
+const READMITTED_CNW: usize = 3;
 
 /// `cnw/sitemap_news_3_urls.xml` with `extra` synthetic releases after its three, each dated as
 /// its first; the synthetic urls in sitemap order.
@@ -7058,6 +7064,122 @@ fn a_carried_follow_up_counts_against_the_cap_and_a_carried_walk_id_does_not() -
             true,
             Vec::<String>::new(),
             Some(1),
+        )
+    );
+    Ok(())
+}
+
+/// `(run_id, listed_by)` of one attempt.
+type Listing = (String, Option<String>);
+
+/// [`Listing`] of every attempt whose payload url is `url`, by rowid.
+fn listings_of(store: &Path, url: &str) -> Result<Vec<Listing>, Box<dyn Error>> {
+    let db = Connection::open_with_flags(store.join(COMMIT_LOG), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let rows = db
+        .prepare(
+            "SELECT a.run_id, a.listed_by FROM attempts a
+               JOIN payloads p ON p.attempt_id = a.attempt_id
+              WHERE p.url = ?1 ORDER BY a.rowid",
+        )?
+        .query_map([url], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// `attempt_id` of the one attempt whose payload url is `url`.
+fn attempt_of_url(store: &Path, url: &str) -> Result<String, Box<dyn Error>> {
+    let db = Connection::open_with_flags(store.join(COMMIT_LOG), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    Ok(db.query_row(
+        "SELECT attempt_id FROM payloads WHERE url = ?1",
+        [url],
+        |row| row.get(0),
+    )?)
+}
+
+/// `(run_id, fresh documents, fresh max_s, carried documents, carried p50_s, unlinked)`.
+type LatencySeen = (String, i64, Option<f64>, i64, Option<f64>, i64);
+
+/// §8 row R22 through `collect` and `ledger`: each CNW document names CNW's index attempt; the
+/// 151st, deferred by the cap, keeps that name in its `deferred` row and the next slot's run asks
+/// it under it, so its latency spans both runs: 11:00:29 − 09:30:29 = 5,400 s, carried.
+#[test]
+fn a_document_names_the_index_attempt_that_listed_it_and_a_carried_one_its_first_runs() -> TestResult
+{
+    let (root, first, exchange, urls) = capped_run(FOLLOW_UP_CAP + 1 - READMITTED_FOLLOW_UPS)?;
+    let last = urls.last().cloned().ok_or("no synthetic release")?;
+    let (sent, _) = exchange.sent();
+    let index = attempt_of_url(root.path(), CNW_INDEX)?;
+    let first_run = first.envelope["run_id"]
+        .as_str()
+        .ok_or("run_id")?
+        .to_owned();
+    let cnw_sent: Vec<&String> = sent
+        .iter()
+        .filter(|url| url.starts_with(CNW_RELEASE_PREFIX))
+        .collect();
+    let mut first_listings = BTreeSet::new();
+    for url in &cnw_sent {
+        first_listings.extend(listings_of(root.path(), url)?);
+    }
+    let deferred_by: Option<String> = Connection::open(root.path().join(COMMIT_LOG))?.query_row(
+        "SELECT listed_by FROM deferred WHERE url = ?1",
+        [&last],
+        |row| row.get(0),
+    )?;
+    let ask = Ask {
+        hosts: Some(seed::readmitted_hosts()),
+        at: instant(MONDAY_NEXT_SLOT),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let next = cmd_collect::run(&ask, &opened, &exchange, &At(instant(MONDAY_NEXT_SLOT)))?;
+    let next_run = next.envelope["run_id"].as_str().ok_or("run_id")?.to_owned();
+    let report = newsvault::cmd_ledger::read(
+        root.path(),
+        &newsvault::cmd_ledger::Ask {
+            at: instant("2026-11-17T00:00:00Z"),
+            from: "2026-11-16".parse()?,
+            to: "2026-11-16".parse()?,
+            source: None,
+            expected_runs: None,
+            limit: None,
+            check: false,
+        },
+    )?;
+    let cnw: Vec<LatencySeen> = report
+        .days
+        .iter()
+        .flat_map(|day| &day.listing_latency)
+        .filter(|row| row.host.as_deref() == Some(CNW_HOST))
+        .map(|row| {
+            (
+                row.run_id.clone(),
+                row.fresh.documents,
+                row.fresh.max_s,
+                row.carried.documents,
+                row.carried.p50_s,
+                row.unlinked,
+            )
+        })
+        .collect();
+    let fresh = i64::try_from(cnw_sent.len())?;
+    assert_eq!(
+        (
+            fresh,
+            first_listings,
+            deferred_by,
+            listings_of(root.path(), &last)?,
+            cnw
+        ),
+        (
+            i64::try_from(READMITTED_CNW + FOLLOW_UP_CAP + 1 - READMITTED_FOLLOW_UPS - 1)?,
+            BTreeSet::from([(first_run.clone(), Some(index.clone()))]),
+            Some(index.clone()),
+            vec![(next_run.clone(), Some(index))],
+            vec![
+                (first_run, fresh, Some(0.0), 0, None, 0),
+                (next_run, 0, None, 1, Some(5_400.0), 0),
+            ]
         )
     );
     Ok(())

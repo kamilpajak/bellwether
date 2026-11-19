@@ -157,6 +157,8 @@ pub struct Deferred {
     pub listed_date: Option<String>,
     pub reason: DeferReason,
     pub at: ObservationTime,
+    /// The queued request's index attempt (`attempts.listed_by`), so a carry keeps its first listing.
+    pub listed_by: Option<String>,
     /// When the pace would have sent it: set on the one request whose reservation came back
     /// past the deadline, `None` for the rest of its lane and for a follow-up past the cap.
     pub go_at: Option<DateTime<Utc>>,
@@ -165,10 +167,13 @@ pub struct Deferred {
 impl Deferred {
     fn of(
         provider: &dyn Provider,
-        request: Request,
+        queued: Queued,
         reason: DeferReason,
         at: ObservationTime,
     ) -> Self {
+        let Queued {
+            request, listed_by, ..
+        } = queued;
         let story_id = (request.phase == RequestPhase::Document)
             .then(|| provider.story_of(&request))
             .flatten()
@@ -186,6 +191,7 @@ impl Deferred {
             url: request.url,
             reason,
             at,
+            listed_by,
             go_at: None,
         }
     }
@@ -204,6 +210,7 @@ pub struct OpenDeferred {
     pub story_id: Option<String>,
     pub listed_date: Option<String>,
     pub deferred_at: DateTime<Utc>,
+    pub listed_by: Option<String>,
 }
 
 /// How an open `deferred` row is closed (S7-D5), stored by its [`Closing::name`].
@@ -704,9 +711,9 @@ pub fn collect<A: Archive>(
     while let Some(popped) = queue.pop() {
         let queued = match popped {
             Popped::Ask(queued) => queued,
-            Popped::Defer(request) => {
+            Popped::Defer(queued) => {
                 let at = ObservationTime::new(clock.now());
-                let deferred = Deferred::of(provider, request, DeferReason::FollowUpCap, at);
+                let deferred = Deferred::of(provider, queued, DeferReason::FollowUpCap, at);
                 collected.defer(archive, deferred)?;
                 continue;
             }
@@ -731,7 +738,7 @@ pub fn collect<A: Archive>(
             let at = ObservationTime::new(clock.now());
             busy.entry(host).or_default().stopped = true;
             let lane = queue.stop(&queued);
-            let mut first = Deferred::of(provider, queued.request, reason, at);
+            let mut first = Deferred::of(provider, queued, reason, at);
             first.go_at = Some(go_at);
             collected.defer(archive, first)?;
             for rest in lane {
@@ -743,9 +750,12 @@ pub fn collect<A: Archive>(
             request,
             retries,
             carried,
+            listed_by,
             ..
         } = queued;
-        let mut attempted = attempt_once(&driving, archive, &request, ordinal, &mut issued)?;
+        let listing = listed_by.as_deref();
+        let mut attempted =
+            attempt_once(&driving, archive, &request, ordinal, listing, &mut issued)?;
         ordinal += 1;
         asked.extend(attempted.story.clone());
         for key in attempted.story.iter().chain([&request.url]) {
@@ -771,8 +781,16 @@ pub fn collect<A: Archive>(
             retries,
             counted: false,
             carried: Vec::new(),
+            listed_by,
         };
-        queue.requeue(attempted.follow_ups, attempted.walked, again, retrying);
+        let listing = Some(attempted.row.attempt_id.as_str());
+        queue.requeue(
+            attempted.follow_ups,
+            attempted.walked,
+            again,
+            retrying,
+            listing,
+        );
     }
     // Once the queue is empty: a story this run had queued counts as held only if it was asked.
     for pending in pending_held {
@@ -870,6 +888,7 @@ fn carry<A: Archive>(
                 request,
                 retries: 0,
                 carried: ids,
+                listed_by: oldest.listed_by.clone(),
             });
         }
         carried.push(item);
@@ -939,6 +958,8 @@ pub(crate) struct Queued {
     pub(crate) counted: bool,
     /// The open `deferred` rows a carried request closes once asked (S7-D5); empty otherwise.
     pub(crate) carried: Vec<i64>,
+    /// A `Document` follow-up's index attempt; a carried one's oldest row's; else None (R22).
+    pub(crate) listed_by: Option<String>,
 }
 
 impl Queued {
@@ -949,13 +970,16 @@ impl Queued {
             retries: 0,
             counted: false,
             carried: Vec::new(),
+            listed_by: None,
         }
     }
 
-    /// A follow-up an index listed, not yet attempted.
-    pub(crate) fn follow_up(request: Request) -> Self {
+    /// A follow-up the index attempt `listing` listed, not yet attempted.
+    pub(crate) fn follow_up(request: Request, listing: Option<&str>) -> Self {
+        let document = request.phase == RequestPhase::Document;
         Self {
-            counted: request.phase == RequestPhase::Document,
+            counted: document,
+            listed_by: listing.filter(|_| document).map(str::to_owned),
             ..Self::first_attempt(request)
         }
     }
@@ -995,7 +1019,7 @@ impl Lane {
 /// What [`HostQueue::pop`] hands the driver: a request to ask, or one past the cap to defer.
 pub(crate) enum Popped {
     Ask(Queued),
-    Defer(Request),
+    Defer(Queued),
 }
 
 impl HostQueue {
@@ -1030,18 +1054,19 @@ impl HostQueue {
         self.lane_of(&queued.request).fresh.push_back(queued);
     }
 
-    /// After `asked` is attempted: its follow-ups, its walk ids, then itself again when
-    /// `retrying`, each to the back of its host's fresh requests, so the pace limiter (R19) spaces
-    /// the retry. §8 R21. A retry is never counted again.
+    /// After `asked` is attempted as `listing`: its follow-ups, its walk ids, then itself again
+    /// when `retrying`, each to the back of its host's fresh requests, so the pace limiter (R19)
+    /// spaces the retry. §8 R21. A retry is never counted again.
     pub(crate) fn requeue(
         &mut self,
         follow_ups: Vec<Request>,
         walked: Vec<Request>,
         asked: Queued,
         retrying: bool,
+        listing: Option<&str>,
     ) {
         for follow_up in follow_ups {
-            self.push(Queued::follow_up(follow_up));
+            self.push(Queued::follow_up(follow_up, listing));
         }
         for id in walked {
             self.push(Queued::first_attempt(id));
@@ -1052,6 +1077,7 @@ impl HostQueue {
                 retries: asked.retries + 1,
                 counted: false,
                 carried: Vec::new(),
+                listed_by: asked.listed_by,
             });
         }
     }
@@ -1066,7 +1092,7 @@ impl HostQueue {
 
     /// `stopped` at the deadline: its cap slot back when counted, since it is never asked, and
     /// its host's lane emptied, fresh requests first, then carried ones.
-    pub(crate) fn stop(&mut self, stopped: &Queued) -> Vec<Request> {
+    pub(crate) fn stop(&mut self, stopped: &Queued) -> Vec<Queued> {
         if stopped.counted {
             self.issued = self.issued.saturating_sub(1);
         }
@@ -1074,13 +1100,7 @@ impl HostQueue {
         self.lanes
             .iter_mut()
             .find(|(key, _)| *key == host)
-            .map(|(_, lane)| {
-                lane.fresh
-                    .drain(..)
-                    .chain(lane.carried.drain(..))
-                    .map(|queued| queued.request)
-                    .collect()
-            })
+            .map(|(_, lane)| lane.fresh.drain(..).chain(lane.carried.drain(..)).collect())
             .unwrap_or_default()
     }
 
@@ -1098,7 +1118,7 @@ impl HostQueue {
             return Some(Popped::Ask(queued));
         }
         match self.cap {
-            Some(cap) if self.issued >= cap => Some(Popped::Defer(queued.request)),
+            Some(cap) if self.issued >= cap => Some(Popped::Defer(queued)),
             _ => {
                 self.issued += 1;
                 Some(Popped::Ask(queued))
@@ -1164,6 +1184,7 @@ fn attempt_once<A: Archive>(
     archive: &mut A,
     request: &Request,
     ordinal: u32,
+    listed_by: Option<&str>,
     issued: &mut BTreeSet<String>,
 ) -> Result<Attempted, CollectError> {
     let Driving {
@@ -1177,10 +1198,11 @@ fn attempt_once<A: Archive>(
     let story = (request.phase == RequestPhase::Document)
         .then(|| provider.story_of(request))
         .flatten();
-    let mut slot = AttemptSlot::open(
+    let mut slot = AttemptSlot::open_listed(
         archive,
         request,
         story.as_ref(),
+        listed_by,
         run,
         ordinal,
         ObservationTime::new(clock.now()),
@@ -1585,15 +1607,15 @@ mod tests {
         while let Some(popped) = queue.pop() {
             let queued = match popped {
                 Popped::Ask(queued) => queued,
-                Popped::Defer(request) => {
-                    deferred.push(request.url);
+                Popped::Defer(queued) => {
+                    deferred.push(queued.request.url);
                     continue;
                 }
             };
             if queued.request.url == stop {
                 let lane = queue.stop(&queued);
                 deferred.push(queued.request.url);
-                deferred.extend(lane.into_iter().map(|rest| rest.url));
+                deferred.extend(lane.into_iter().map(|rest| rest.request.url));
                 continue;
             }
             let Queued {
@@ -1625,8 +1647,9 @@ mod tests {
                 retries,
                 counted: false,
                 carried: Vec::new(),
+                listed_by: None,
             };
-            queue.requeue(follow_ups, named("w", lane.walked), again, retrying);
+            queue.requeue(follow_ups, named("w", lane.walked), again, retrying, None);
         }
         (asked, deferred)
     }
@@ -2086,7 +2109,7 @@ mod tests {
         let mut asked = Vec::new();
         if let Some(Popped::Ask(index)) = queue.pop() {
             asked.push(index.request.url.clone());
-            queue.requeue(vec![asking(GNW, "f1")], Vec::new(), index, false);
+            queue.requeue(vec![asking(GNW, "f1")], Vec::new(), index, false, None);
         }
         while let Some(popped) = queue.pop() {
             if let Popped::Ask(queued) = popped {
@@ -2170,7 +2193,7 @@ mod tests {
         ]);
         if let Some(Popped::Ask(index)) = queue.pop() {
             let follow_ups = vec![asking(GNW, "f1"), asking(GNW, "f2")];
-            queue.requeue(follow_ups, Vec::new(), index, false);
+            queue.requeue(follow_ups, Vec::new(), index, false, None);
         }
         let lane = match queue.pop() {
             Some(Popped::Ask(stopped)) => queue.stop(&stopped),
@@ -2178,10 +2201,55 @@ mod tests {
         };
         assert_eq!(
             (
-                lane.into_iter().map(|rest| rest.url).collect::<Vec<_>>(),
+                lane.into_iter()
+                    .map(|rest| rest.request.url)
+                    .collect::<Vec<_>>(),
                 queue.pop().is_none()
             ),
             (urls(&[(GNW, "f2"), (GNW, "c1"), (GNW, "c2")]), true)
+        );
+    }
+
+    /// §8 row R22: a document follow-up names the index attempt that listed it, its retry and its
+    /// cap deferral keep the name, and a next page and a walk id name none.
+    #[test]
+    fn a_document_follow_up_its_retry_and_its_deferral_name_their_listing_and_a_page_none() {
+        let mut queue = HostQueue::of(vec![asking(GNW, "index")], Some(1));
+        if let Some(Popped::Ask(index)) = queue.pop() {
+            let page = Request {
+                phase: RequestPhase::Index,
+                ..asking(GNW, "page")
+            };
+            let follow_ups = vec![asking(GNW, "f1"), page, asking(GNW, "f2")];
+            let walked = vec![asking(GNW, "w1")];
+            queue.requeue(follow_ups, walked, index, false, Some("the index"));
+        }
+        let mut named = Vec::new();
+        while let Some(popped) = queue.pop() {
+            let (queued, deferred) = match popped {
+                Popped::Ask(queued) => (queued, false),
+                Popped::Defer(queued) => (queued, true),
+            };
+            named.push((
+                queued.request.url.clone(),
+                deferred,
+                queued.listed_by.clone(),
+            ));
+            if queued.request.url.ends_with("f1") && queued.retries == 0 {
+                let retry = Queued::retried(true, queued.retries);
+                queue.requeue(Vec::new(), Vec::new(), queued, retry, Some("f1's own"));
+            }
+        }
+        let listed = || Some("the index".to_owned());
+        assert_eq!(
+            named,
+            vec![
+                (format!("{GNW}f1"), false, listed()),
+                (format!("{GNW}page"), false, None),
+                (format!("{GNW}f2"), true, listed()),
+                (format!("{GNW}w1"), false, None),
+                (format!("{GNW}f1"), false, listed()),
+            ]
         );
     }
 
