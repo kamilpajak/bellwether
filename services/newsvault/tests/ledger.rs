@@ -1696,3 +1696,80 @@ fn listing_latency_is_reported_per_run_and_host_with_fresh_and_carried_apart() -
     );
     Ok(())
 }
+
+/// R22: a Document attempt answered with no body (a transport failure: `Payload::stored` keeps
+/// none) is counted under a null host, printed `-`; one received exactly at `--at` is counted.
+#[test]
+fn listing_latency_counts_a_bodyless_answer_under_no_host_and_one_received_at_the_cutoff(
+) -> TestResult {
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    let index = "l-index";
+    answered(&db, (index, LISTING_RUN, WIRES), 0, None, None)?;
+    let at = |attempt| (attempt, LISTING_RUN, WIRES);
+    let bodyless = "l-bodyless";
+    answered(&db, at(bodyless), 30, Some("https://a.test/0"), Some(index))?;
+    db.execute("DELETE FROM payloads WHERE attempt_id = ?1", [bodyless])?;
+    let listed: chrono::DateTime<chrono::Utc> = LISTED_AT.parse()?;
+    let at_s = (AT.parse::<chrono::DateTime<chrono::Utc>>()? - listed).num_seconds();
+    answered(
+        &db,
+        at("l-at"),
+        at_s,
+        Some("https://d.test/at"),
+        Some(index),
+    )?;
+    drop(db);
+    let report = over(&root, FIRST_DAY, FIRST_DAY)?.json()?;
+    let human = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .arg("ledger")
+        .args(["--store", &root.path().to_string_lossy()])
+        .args(["--at", AT, "--format", "human"])
+        .args(["--from", FIRST_DAY, "--to", FIRST_DAY])
+        .output()?
+        .stdout;
+    let lines: Vec<String> = String::from_utf8(human)?
+        .lines()
+        .filter(|line| line.starts_with("latency"))
+        .map(str::to_owned)
+        .collect();
+    let hosts: Option<Vec<(Value, Value, Value)>> = day(&report, FIRST_DAY)
+        .and_then(|day| day["listing_latency"].as_array())
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let fresh = &row["fresh"];
+                    (
+                        row["host"].clone(),
+                        fresh["documents"].clone(),
+                        fresh["max_s"].clone(),
+                    )
+                })
+                .collect()
+        });
+    let none = "carried 0 p50_s - p95_s - max_s - unlinked 0";
+    assert_eq!(
+        (hosts, lines),
+        (
+            Some(vec![
+                (Value::Null, Value::from(1), Value::from(30.0)),
+                (
+                    Value::from("d.test"),
+                    Value::from(1),
+                    Value::from(at_s as f64)
+                ),
+            ]),
+            vec![
+                format!(
+                    "latency          {LISTING_RUN} {WIRES} - fresh 1 p50_s 30 p95_s 30 \
+                     max_s 30 {none}"
+                ),
+                format!(
+                    "latency          {LISTING_RUN} {WIRES} d.test fresh 1 p50_s {at_s} \
+                     p95_s {at_s} max_s {at_s} {none}"
+                ),
+            ]
+        )
+    );
+    Ok(())
+}
