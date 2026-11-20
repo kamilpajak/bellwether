@@ -19,7 +19,7 @@ use news_provider::{
 use newsvault::cmd_collect::{self, Ask, CollectRunError};
 use newsvault::cmd_items::{self, PerStory};
 use newsvault::store::{Committer, StoreError, COMMIT_LOG, RUNS_DIR, SCHEMA_VERSION};
-use open_web_feed::{OpenWebFeed, GENERATION_HEADER};
+use open_web_feed::{OpenWebFeed, BODY_LIMIT, GENERATION_HEADER};
 use pit::ObservationTime;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
@@ -58,8 +58,6 @@ const PAGE_TYPE: &str = "text/html; charset=utf-8";
 /// The loopback 301's body, `MOVED_BODY` in `tests/loopback/mod.rs`, and its length.
 const MOVED_BODY: &[u8] = b"moved";
 const MOVED_BODY_BYTES: i64 = 5;
-/// open-web's `BODY_LIMIT` (8 MiB, `providers/open-web-feed/src/lib.rs`), private to that crate.
-const OPEN_WEB_BODY_LIMIT: i64 = 8 * 1_024 * 1_024;
 /// Two robots fetches before `RUN_AT`, the second the newer.
 const ROBOTS_EARLIER: &str = "2026-11-14T17:00:00Z";
 const ROBOTS_LATER: &str = "2026-11-14T18:00:00Z";
@@ -3096,12 +3094,12 @@ fn a_document_answered_with_a_redirect_is_fetched_again_by_the_next_poll() -> Te
 fn a_redirect_whose_body_is_over_the_limit_is_fetched_again_by_the_next_poll() -> TestResult {
     let polled = polled_twice_through_a_redirect(MovedBody::OverTheLimit)?;
     let moved = release_0_path()?;
-    let limit = usize::try_from(OPEN_WEB_BODY_LIMIT)?;
+    let limit = usize::try_from(BODY_LIMIT)?;
     assert_eq!(
         polled.first_payload,
         Some((
             true,
-            OPEN_WEB_BODY_LIMIT,
+            i64::try_from(BODY_LIMIT)?,
             canon::FileDigest::of(&vec![b'x'; limit]).hex().to_owned(),
             moved_headers()
         ))
@@ -3136,7 +3134,7 @@ fn a_redirect_whose_body_is_over_the_limit_is_fetched_again_by_the_next_poll() -
 fn a_body_cut_at_the_limit_counts_in_the_envelope_s_blobs_and_bytes_written() -> TestResult {
     let short = polled_twice_through_a_redirect(MovedBody::Short)?.first_written;
     let over = polled_twice_through_a_redirect(MovedBody::OverTheLimit)?.first_written;
-    let grown = u64::try_from(OPEN_WEB_BODY_LIMIT - MOVED_BODY_BYTES)?;
+    let grown = BODY_LIMIT - u64::try_from(MOVED_BODY_BYTES)?;
     assert_eq!(over, (short.0, short.1 + grown));
     Ok(())
 }
