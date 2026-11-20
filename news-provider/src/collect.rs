@@ -222,6 +222,7 @@ pub struct ReleasedCut {
     pub url: String,
     pub listed_date: Option<String>,
     pub listed_by: Option<String>,
+    pub closed_at: DateTime<Utc>,
 }
 
 /// How an open `deferred` row is closed (S7-D5), stored by its [`Closing::name`].
@@ -395,12 +396,11 @@ pub trait Archive: Sink {
     fn open_deferred(&self, source: &SourceId) -> Result<Vec<OpenDeferred>, ArchiveError>;
 
     /// Section 11.1: each story of `source` whose LATEST attempt is a permanent failure stored cut
-    /// shorter than `body_limit` and closed after `since`, oldest first.
+    /// shorter than `body_limit`, oldest first; [`carry`] applies [`CARRY_LIMIT`].
     fn released_cuts(
         &self,
         source: &SourceId,
         body_limit: u64,
-        since: DateTime<Utc>,
     ) -> Result<Vec<ReleasedCut>, ArchiveError>;
 
     /// Closes each of `deferred_ids` as `closing` at `at`; a row is closed once, never updated.
@@ -878,7 +878,7 @@ fn carry<A: Archive>(
     let source = provider.source();
     let body_limit = provider.transport().body_limit;
     let open = archive.open_deferred(&source)?;
-    let released = archive.released_cuts(&source, body_limit, now - CARRY_LIMIT)?;
+    let released = archive.released_cuts(&source, body_limit)?;
     let (carried, mut queued) = carry_deferred(provider, archive, open, now)?;
     let carrying: BTreeSet<&str> = carried
         .iter()
@@ -887,7 +887,7 @@ fn carry<A: Archive>(
         .collect();
     let mut reasked = BTreeSet::new();
     for cut in released {
-        if carrying.contains(cut.story_id.as_str()) {
+        if now - cut.closed_at >= CARRY_LIMIT || carrying.contains(cut.story_id.as_str()) {
             continue;
         }
         let target = TargetWindow::new(&cut.target_window);

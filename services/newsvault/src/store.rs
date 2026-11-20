@@ -1684,21 +1684,20 @@ impl Committer {
 
     /// Section 11.1's released cuts: each story of `source` whose latest attempt (by rowid, the
     /// order attempts are opened in) is a permanent failure stored cut shorter than
-    /// `body_limit` and closed after `since`. A later attempt of the story, whatever its
-    /// answer, ends the release, so a re-ask is asked once.
+    /// `body_limit`. A later attempt of the story, whatever its answer, ends the release, so a
+    /// re-ask is asked once.
     pub fn released_cuts(
         &self,
         source: &SourceId,
         body_limit: u64,
-        since: DateTime<Utc>,
     ) -> Result<Vec<ReleasedCut>, StoreError> {
         let mut statement = self.db.prepare(
-            "SELECT a.story_id, a.target_window, p.url, p.listed_date, a.listed_by
+            "SELECT a.story_id, a.target_window, p.url, p.listed_date, a.listed_by, a.closed_at
                FROM attempts a
                JOIN payloads p ON p.attempt_id = a.attempt_id
                JOIN blobs b ON b.digest = p.raw_blob
               WHERE a.source = ?1 AND a.story_id IS NOT NULL AND a.verdict = ?2
-                AND p.truncated = 1 AND b.bytes < ?3 AND a.closed_at > ?4
+                AND p.truncated = 1 AND b.bytes < ?3
                 AND NOT EXISTS (SELECT 1 FROM attempts later
                                  WHERE later.source = a.source AND later.story_id = a.story_id
                                    AND later.rowid > a.rowid)
@@ -1710,15 +1709,25 @@ impl Committer {
                     source.as_str(),
                     Verdict::PermanentFailure.name(),
                     i64::try_from(body_limit).unwrap_or(i64::MAX),
-                    stamp(since)
                 ],
                 |row| {
+                    let at: String = row.get(5)?;
+                    let closed_at = DateTime::parse_from_rfc3339(&at)
+                        .map_err(|failure| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Text,
+                                Box::new(failure),
+                            )
+                        })?
+                        .with_timezone(&Utc);
                     Ok(ReleasedCut {
                         story_id: row.get(0)?,
                         target_window: row.get(1)?,
                         url: row.get(2)?,
                         listed_date: row.get(3)?,
                         listed_by: row.get(4)?,
+                        closed_at,
                     })
                 },
             )?

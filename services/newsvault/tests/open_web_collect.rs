@@ -3662,9 +3662,8 @@ impl Archive for RefusingTheIndex {
         &self,
         source: &SourceId,
         body_limit: u64,
-        since: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<news_provider::ReleasedCut>, ArchiveError> {
-        Archive::released_cuts(&self.store, source, body_limit, since)
+        Archive::released_cuts(&self.store, source, body_limit)
     }
 
     fn close_deferred(
@@ -5424,9 +5423,8 @@ impl Archive for HoldingToo {
         &self,
         source: &SourceId,
         body_limit: u64,
-        since: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<news_provider::ReleasedCut>, ArchiveError> {
-        Archive::released_cuts(&self.store, source, body_limit, since)
+        Archive::released_cuts(&self.store, source, body_limit)
     }
 
     fn close_deferred(

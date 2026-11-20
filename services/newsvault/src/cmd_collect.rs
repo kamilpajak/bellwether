@@ -2162,9 +2162,8 @@ impl Archive for Committer {
         &self,
         source: &SourceId,
         body_limit: u64,
-        since: DateTime<Utc>,
     ) -> Result<Vec<ReleasedCut>, ArchiveError> {
-        Committer::released_cuts(self, source, body_limit, since)
+        Committer::released_cuts(self, source, body_limit)
             .map_err(|why| refused("read the released cuts", &why))
     }
 
