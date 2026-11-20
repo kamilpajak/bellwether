@@ -1506,12 +1506,12 @@ impl Committer {
     }
 
     /// Section 11.1's held read. A NULL status or count is held through the `COALESCE`s: without
-    /// them SQLite evaluates the `NOT (...)` to NULL and drops the row. `read_whole_up_to` is the
+    /// them SQLite evaluates the `NOT (...)` to NULL and drops the row. `body_limit` is the
     /// body limit in force now: a cut body is exactly the limit it was cut at (section 3.9).
     pub fn held_story_ids(
         &self,
         source: &SourceId,
-        read_whole_up_to: u64,
+        body_limit: u64,
     ) -> Result<BTreeSet<String>, StoreError> {
         let mut statement = self.db.prepare(
             "SELECT i.story_id FROM items i
@@ -1537,7 +1537,7 @@ impl Committer {
                     Verdict::PermanentFailure.name(),
                     REDIRECTS.start(),
                     REDIRECTS.end(),
-                    i64::try_from(read_whole_up_to).unwrap_or(i64::MAX)
+                    i64::try_from(body_limit).unwrap_or(i64::MAX)
                 ],
                 |row| row.get::<_, String>(0),
             )?
@@ -1684,12 +1684,12 @@ impl Committer {
 
     /// Section 11.1's released cuts: each story of `source` whose latest attempt (by rowid, the
     /// order attempts are opened in) is a permanent failure stored cut shorter than
-    /// `read_whole_up_to` and closed after `since`. A later attempt of the story, whatever its
+    /// `body_limit` and closed after `since`. A later attempt of the story, whatever its
     /// answer, ends the release, so a re-ask is asked once.
     pub fn released_cuts(
         &self,
         source: &SourceId,
-        read_whole_up_to: u64,
+        body_limit: u64,
         since: DateTime<Utc>,
     ) -> Result<Vec<ReleasedCut>, StoreError> {
         let mut statement = self.db.prepare(
@@ -1709,7 +1709,7 @@ impl Committer {
                 params![
                     source.as_str(),
                     Verdict::PermanentFailure.name(),
-                    i64::try_from(read_whole_up_to).unwrap_or(i64::MAX),
+                    i64::try_from(body_limit).unwrap_or(i64::MAX),
                     stamp(since)
                 ],
                 |row| {
@@ -6628,22 +6628,60 @@ mod tests {
         Ok(())
     }
 
+    /// Parameters the guard below lets through, each with why it is no row cap and no slice.
+    const NOT_A_ROW_CAP_OR_SLICE: [&str; 2] = [
+        // A byte length compared with a stored cut's `blobs.bytes` (section 11.1).
+        "body_limit: u64",
+        // The partition key, matched by equality: the day a request targets, not a run of rows.
+        "target: &TargetWindow",
+    ];
+
+    /// Each top-level parameter of the `(...)` that opens `signature`, trimmed.
+    fn parameters(signature: &str) -> Vec<String> {
+        let (mut depth, mut current, mut found) = (0_i32, String::new(), Vec::new());
+        for character in signature.chars().skip_while(|c| *c != '(') {
+            match character {
+                '(' | '<' | '[' => depth += 1,
+                ')' | '>' | ']' => depth -= 1,
+                _ => {}
+            }
+            if (character == ',' && depth == 1) || depth == 0 {
+                found.push(current.trim().trim_start_matches('(').trim().to_owned());
+                current.clear();
+            } else {
+                current.push(character);
+            }
+            if depth == 0 {
+                break;
+            }
+        }
+        found.retain(|parameter| !parameter.is_empty());
+        found
+    }
+
+    /// The store never takes a row count or a slice; the caller slices and states how (731a027,
+    /// `ok_vendor_rows`). Checks each `pub fn` parameter's name and type, lowercased, not fn
+    /// names or return types. Mutations 2026-11-20 in §8 row R23.
     #[test]
-    fn the_public_write_api_has_no_limit_or_window_parameter() {
+    fn no_public_store_fn_takes_a_row_cap_or_a_slice_parameter() {
         let marker = format!("#[cfg({})]", "test");
         let production = include_str!("store.rs")
             .split(&marker)
             .next()
             .unwrap_or_default()
             .to_owned();
-        let mut carrying: Vec<&str> = Vec::new();
+        let mut carrying: Vec<String> = Vec::new();
         for item in production.split("pub fn ").skip(1) {
             let signature = item.split('{').next().unwrap_or_default();
-            if signature.contains("limit") || signature.contains("window") {
-                carrying.push(signature);
+            for parameter in parameters(signature) {
+                let lowered = parameter.to_lowercase();
+                let named = lowered.contains("limit") || lowered.contains("window");
+                if named && !NOT_A_ROW_CAP_OR_SLICE.contains(&parameter.as_str()) {
+                    carrying.push(parameter);
+                }
             }
         }
-        assert_eq!(carrying, Vec::<&str>::new());
+        assert_eq!(carrying, Vec::<String>::new());
     }
 
     #[test]
