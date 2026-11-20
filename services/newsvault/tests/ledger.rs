@@ -813,7 +813,7 @@ fn a_cut(
 /// `--at` or its carry row is over the limit; a 3xx cut, a young cut (by `closed_at`), a re-asked
 /// cut, one an open young `deferred` row carries and a whole body are neither; a young row closed
 /// by `--at` or deferred after it carries nothing, one closed after `--at` still carries. 2 held against 7 released, so the two counters
-/// cannot swap. Mutations 2026-11-20 in §8 row R23.
+/// cannot swap. Mutations 2026-11-20 and 2026-11-21 in §8 row R23.
 #[test]
 fn cuts_held_at_the_limit_and_released_out_of_reach_are_counted_apart() -> TestResult {
     let root = fixture()?;

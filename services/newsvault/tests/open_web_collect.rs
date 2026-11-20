@@ -3401,7 +3401,7 @@ fn a_released_cut_of_release_0(root: &Path) -> Result<Gnw, Box<dyn Error>> {
 }
 
 /// Section 11.1: a re-ask answered whole is asked under the cut's window, listed time and listing,
-/// and commits one item timed by the listing. Mutations 2026-11-20 in §8 row R23.
+/// and commits one item timed by the listing. Mutations 2026-11-21 in §8 row R23.
 #[test]
 fn a_reask_answered_whole_commits_one_item_under_the_cut_s_window_and_listing() -> TestResult {
     let root = TempDir::new()?;
@@ -3442,7 +3442,7 @@ fn a_reask_answered_whole_commits_one_item_under_the_cut_s_window_and_listing() 
 }
 
 /// Section 11.1: a released cut is its story's latest attempt even when an attempt came before it;
-/// here three transient ones, then the cut. Mutation 2026-11-20 in §8 row R23.
+/// here three transient ones, then the cut. Mutation 2026-11-21 in §8 row R23.
 #[test]
 fn a_released_cut_after_an_earlier_attempt_of_its_story_is_asked_once() -> TestResult {
     let root = TempDir::new()?;
@@ -3466,7 +3466,7 @@ fn a_released_cut_after_an_earlier_attempt_of_its_story_is_asked_once() -> TestR
 }
 
 /// Section 11.1: a re-ask is queued like a carried request, so one answered 503 is asked again
-/// within the run. Mutation 2026-11-20 in §8 row R23.
+/// within the run. Mutation 2026-11-21 in §8 row R23.
 #[test]
 fn a_reask_that_fails_transiently_is_retried_within_the_run() -> TestResult {
     let root = TempDir::new()?;
