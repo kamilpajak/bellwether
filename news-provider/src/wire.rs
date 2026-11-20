@@ -2004,7 +2004,7 @@ mod tests {
 
     /// P10's over-limit rule: the first `body_limit` bytes and the head stay with the failure. The
     /// cut's length IS the limit it was cut at: section 11.1's held read compares it with the limit
-    /// in force (§8 row R24; mutation 2026-11-20, `read_up_to` keeping `limit − 1`: red).
+    /// in force (§8 row R23; mutation 2026-11-20, `read_up_to` keeping `limit − 1`: red).
     #[test]
     fn a_body_over_the_limit_keeps_its_first_limit_bytes_and_its_headers() -> Checked {
         let limit = usize::try_from(TEST_BODY_LIMIT)?;

@@ -85,7 +85,7 @@ use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use news_provider::request::RequestPhase;
 use news_provider::{
     AttemptEvent, AttemptReceipt, Closing, Cost, Deferred, LedgerError, OpenDeferred, OutcomeKind,
-    Payload, Relisted, RunId, Sink, SourceId, TargetWindow, ValidSource, Verdict,
+    Payload, ReleasedCut, Relisted, RunId, Sink, SourceId, TargetWindow, ValidSource, Verdict,
 };
 use pit::datedness::{Datedness, Published};
 use pit::{ObservationTime, Visibility};
@@ -1680,6 +1680,50 @@ impl Committer {
             )?
             .collect::<Result<Vec<OpenDeferred>, _>>()?;
         Ok(rows)
+    }
+
+    /// Section 11.1's released cuts: each story of `source` whose latest attempt (by rowid, the
+    /// order attempts are opened in) is a permanent failure stored cut shorter than
+    /// `read_whole_up_to` and closed after `since`. A later attempt of the story, whatever its
+    /// answer, ends the release, so a re-ask is asked once.
+    pub fn released_cuts(
+        &self,
+        source: &SourceId,
+        read_whole_up_to: u64,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<ReleasedCut>, StoreError> {
+        let mut statement = self.db.prepare(
+            "SELECT a.story_id, a.target_window, p.url, p.listed_date, a.listed_by
+               FROM attempts a
+               JOIN payloads p ON p.attempt_id = a.attempt_id
+               JOIN blobs b ON b.digest = p.raw_blob
+              WHERE a.source = ?1 AND a.story_id IS NOT NULL AND a.verdict = ?2
+                AND p.truncated = 1 AND b.bytes < ?3 AND a.closed_at > ?4
+                AND NOT EXISTS (SELECT 1 FROM attempts later
+                                 WHERE later.source = a.source AND later.story_id = a.story_id
+                                   AND later.rowid > a.rowid)
+              ORDER BY a.closed_at, a.attempt_id",
+        )?;
+        let released = statement
+            .query_map(
+                params![
+                    source.as_str(),
+                    Verdict::PermanentFailure.name(),
+                    i64::try_from(read_whole_up_to).unwrap_or(i64::MAX),
+                    stamp(since)
+                ],
+                |row| {
+                    Ok(ReleasedCut {
+                        story_id: row.get(0)?,
+                        target_window: row.get(1)?,
+                        url: row.get(2)?,
+                        listed_date: row.get(3)?,
+                        listed_by: row.get(4)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<ReleasedCut>, _>>()?;
+        Ok(released)
     }
 
     /// One `deferred_closed` row per id under this store's run, in one transaction; a row closed
@@ -6446,7 +6490,7 @@ mod tests {
 
     /// Section 11.1, owner decision of 2026-11-20: a permanent failure stored cut holds its story
     /// while the limit in force is at most the cut's length, and nothing once a larger one is; a
-    /// whole body holds at any length. Mutations 2026-11-20 in §8 row R24.
+    /// whole body holds at any length. Mutations 2026-11-20 in §8 row R23.
     #[test]
     fn a_cut_body_is_held_until_a_limit_above_its_length_is_in_force() -> TestResult {
         let temp = TempDir::new()?;

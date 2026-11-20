@@ -19,7 +19,8 @@ use news_provider::request::RequestPhase;
 use news_provider::{
     stamp_of, Archive, ArchiveError, AttemptReceipt, AttemptRow, Clock, Closing, CollectError,
     Collected, CollectedItem, Committed, Credentials, DeferReason, Deferred, Exchange, Exit,
-    Headers, OpenDeferred, Payload, Provider, Relisted, Run, RunId, SourceId, TargetWindow, Wire,
+    Headers, OpenDeferred, Payload, Provider, ReleasedCut, Relisted, Run, RunId, SourceId,
+    TargetWindow, Wire,
 };
 use open_web_feed::{
     Basis, Continuity, CrossChecker, DirectAnswer, Generation, HostRobots, OpenWebFeed, Paging,
@@ -2145,6 +2146,16 @@ impl Archive for Committer {
     fn open_deferred(&self, source: &SourceId) -> Result<Vec<OpenDeferred>, ArchiveError> {
         Committer::open_deferred(self, source)
             .map_err(|why| refused("read the deferred rows", &why))
+    }
+
+    fn released_cuts(
+        &self,
+        source: &SourceId,
+        body_limit: u64,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<ReleasedCut>, ArchiveError> {
+        Committer::released_cuts(self, source, body_limit, since)
+            .map_err(|why| refused("read the released cuts", &why))
     }
 
     fn close_deferred(

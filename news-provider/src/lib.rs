@@ -52,7 +52,7 @@ pub use clock::{Clock, Sleeper, SystemClock, ThreadSleeper};
 pub use collect::{
     collect, Archive, ArchiveError, AttemptRow, Carried, CarryTally, Closing, CollectError,
     Collected, Committed, DeferReason, Deferred, Exchange, Exit, HostBusy, NotPlannedRow,
-    OpenDeferred, Payload, Relisted, Run, SourceTally, Tally, CARRY_LIMIT, EXITS,
+    OpenDeferred, Payload, ReleasedCut, Relisted, Run, SourceTally, Tally, CARRY_LIMIT, EXITS,
     MAX_TRANSIENT_RETRIES,
 };
 pub use lag_policy::{LagPolicy, LagPolicyError, LAG_POLICY_SCHEMA};

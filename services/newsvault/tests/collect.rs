@@ -361,6 +361,15 @@ impl Archive for Refusing {
         Archive::open_deferred(&self.store, source)
     }
 
+    fn released_cuts(
+        &self,
+        source: &SourceId,
+        body_limit: u64,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<news_provider::ReleasedCut>, ArchiveError> {
+        Archive::released_cuts(&self.store, source, body_limit, since)
+    }
+
     fn close_deferred(
         &mut self,
         deferred_ids: &[i64],
@@ -887,6 +896,15 @@ impl Archive for Untouched {
         _source: &SourceId,
     ) -> Result<Vec<news_provider::OpenDeferred>, ArchiveError> {
         Err(self.touched("open_deferred"))
+    }
+
+    fn released_cuts(
+        &self,
+        _source: &SourceId,
+        _body_limit: u64,
+        _since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<news_provider::ReleasedCut>, ArchiveError> {
+        Err(self.touched("released_cuts"))
     }
 
     fn close_deferred(

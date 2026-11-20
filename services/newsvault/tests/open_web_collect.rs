@@ -3141,6 +3141,207 @@ fn a_body_cut_at_the_limit_counts_in_the_envelope_s_blobs_and_bytes_written() ->
     Ok(())
 }
 
+const A_LITTLE_LATER: &str = "2026-11-14T19:10:00Z";
+const LATER_STILL: &str = "2026-11-14T19:15:00Z";
+const LATEST_THAT_DAY: &str = "2026-11-14T19:20:00Z";
+/// More than `CARRY_LIMIT` (24 h) after every poll of 2026-11-14.
+const OVER_A_DAY_LATER: &str = "2026-11-15T19:30:00Z";
+/// The limit three Yahoo pages were cut at on 2026-11-19 (section 11.1).
+const OLD_BODY_LIMIT: usize = 2 * 1_024 * 1_024;
+/// The loopback path answered `301` in the re-ask tests.
+const MOVED_PATH: &str = "/moved";
+
+/// Release 0's story id.
+fn release_0_story() -> Result<String, Box<dyn Error>> {
+    let (key, _, _, _) = RELEASES[0];
+    Ok(digest(canon::digest::story_id(SOURCE, &keyed(key))).ok_or("story id")?)
+}
+
+/// `stub` behind a `Relay` that sends release 0 through the real open-web `Wire` to `to`.
+fn relayed<'stub>(
+    root: &Path,
+    stub: &'stub Gnw,
+    to: String,
+) -> Result<loopback::Relay<'stub>, Box<dyn Error>> {
+    let ask = ask(root, cmd_collect::TODAY);
+    let opened = cmd_collect::open_provider(&ask)?;
+    Ok(loopback::Relay {
+        stub,
+        wire: cmd_collect::wire_for(&ask, &opened),
+        relayed: BTreeMap::from([(release_url(0)?, to)]),
+        asked: RefCell::default(),
+    })
+}
+
+/// `Gnw::day` whose index no longer lists release 0, its first `<item>`.
+fn gnw_without_release_0() -> Result<Gnw, Box<dyn Error>> {
+    let mut gnw = Gnw::day()?;
+    let index = String::from_utf8(gnw.pages.get(INDEX).ok_or("no index")?.clone())?;
+    let (head, rest) = index.split_once("<item>").ok_or("no item")?;
+    let (_, tail) = rest.split_once("</item>").ok_or("no item end")?;
+    let unlisted = format!("{head}{tail}");
+    if unlisted.contains("3403075") {
+        return Err("release 0 is still listed".into());
+    }
+    gnw.pages.insert(INDEX.to_owned(), unlisted.into_bytes());
+    Ok(gnw)
+}
+
+/// The loopback server: `MOVED_PATH` answered `301`, every other path with one byte over
+/// open-web's limit, which the real `Wire` stores cut at the limit.
+fn over_the_limit_server(root: &Path) -> Result<loopback::Loopback, Box<dyn Error>> {
+    let opened = cmd_collect::open_provider(&ask(root, cmd_collect::TODAY))?;
+    let over = usize::try_from(opened.provider.transport().body_limit)? + 1;
+    Ok(loopback::Loopback::redirecting_with(
+        MOVED_PATH,
+        MOVED_BODY.to_vec(),
+        vec![b'x'; over],
+    )?)
+}
+
+/// Stands in for a raised limit: release 0's newest cut is linked to the blob a cut under
+/// `OLD_BODY_LIMIT` stores. The held read and `released_cuts` read a cut's length from
+/// `blobs.bytes` alone, and the 8 MiB cut's own blob row stays as it was.
+fn as_if_cut_under_the_old_limit(root: &Path) -> TestResult {
+    let db = Connection::open(root.join(COMMIT_LOG))?;
+    let old = canon::FileDigest::of(&vec![b'x'; OLD_BODY_LIMIT]);
+    db.execute(
+        "INSERT OR IGNORE INTO blobs (digest, bytes, first_indexed_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![old.hex(), i64::try_from(OLD_BODY_LIMIT)?, RUN_AT],
+    )?;
+    let linked = db.execute(
+        "UPDATE payloads SET raw_blob = ?1 WHERE attempt_id =
+           (SELECT a.attempt_id FROM attempts a JOIN payloads p ON p.attempt_id = a.attempt_id
+             WHERE a.story_id = ?2 AND p.truncated = 1 ORDER BY a.rowid DESC LIMIT 1)",
+        rusqlite::params![old.hex(), release_0_story()?],
+    )?;
+    if linked != 1 {
+        return Err("release 0 has no cut to stand in for".into());
+    }
+    Ok(())
+}
+
+/// Section 11.1, owner decision of 2026-11-20, through the real open-web `Wire`: a page over the
+/// limit is cut at the limit and held while that limit is in force; once a cut is shorter than the
+/// limit, the story is asked once, by `carry` when no index lists it, by `carry` and its listing
+/// together without a second fetch, and by its listing alone once the cut is over `CARRY_LIMIT`
+/// old. Each re-ask is cut at the limit again and held. Mutations 2026-11-20 in §8 row R23.
+#[test]
+fn a_cut_story_is_not_fetched_again_until_the_limit_is_raised_and_then_once() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let (listing, unlisted) = (Gnw::day()?, gnw_without_release_0()?);
+    let server = over_the_limit_server(root.path())?;
+    let page = server.url(&release_0_path()?);
+    let listed = relayed(root.path(), &listing, page.clone())?;
+    let not_listed = relayed(root.path(), &unlisted, page)?;
+    let mut fetched = Vec::new();
+    let mut polled = |at: &str, schedule: &str, relay: &loopback::Relay| -> TestResult {
+        poll(root.path(), at, schedule, relay)?;
+        fetched.push(server.seen()?.len());
+        Ok(())
+    };
+    polled(RUN_AT, "first", &listed)?;
+    polled(LATER_THE_SAME_DAY, "second", &listed)?;
+    as_if_cut_under_the_old_limit(root.path())?;
+    polled(A_LITTLE_LATER, "third", &not_listed)?;
+    polled(LATER_STILL, "fourth", &listed)?;
+    as_if_cut_under_the_old_limit(root.path())?;
+    polled(LATEST_THAT_DAY, "fifth", &listed)?;
+    as_if_cut_under_the_old_limit(root.path())?;
+    polled(OVER_A_DAY_LATER, "sixth", &listed)?;
+    server.finish()?;
+    assert_eq!(fetched, vec![1, 0, 1, 0, 1, 1]);
+    Ok(())
+}
+
+/// Section 11.1: a released cut no index lists is asked by `carry` only while it is younger than
+/// `CARRY_LIMIT`, the age S7-D5 carries a deferred row to. Mutation 2026-11-20 in §8 row R23.
+#[test]
+fn a_released_cut_older_than_the_carry_limit_is_not_asked() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let (listing, unlisted) = (Gnw::day()?, gnw_without_release_0()?);
+    let server = over_the_limit_server(root.path())?;
+    let page = server.url(&release_0_path()?);
+    poll(
+        root.path(),
+        RUN_AT,
+        "first",
+        &relayed(root.path(), &listing, page.clone())?,
+    )?;
+    let first = server.seen()?.len();
+    as_if_cut_under_the_old_limit(root.path())?;
+    let not_listed = relayed(root.path(), &unlisted, page)?;
+    poll(root.path(), OVER_A_DAY_LATER, "second", &not_listed)?;
+    let second = server.seen()?.len();
+    server.finish()?;
+    assert_eq!((first, second), (1, 0));
+    Ok(())
+}
+
+/// Section 11.1: a re-ask is asked once. One answered with a 301 holds nothing, so a filter of
+/// "not held" would ask it on every run for 24 h; the latest attempt is no longer the cut, so
+/// `carry` does not. Mutation 2026-11-20 in §8 row R23.
+#[test]
+fn a_reask_answered_with_a_redirect_is_not_asked_again() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let (listing, unlisted) = (Gnw::day()?, gnw_without_release_0()?);
+    let server = over_the_limit_server(root.path())?;
+    let page = server.url(&release_0_path()?);
+    poll(
+        root.path(),
+        RUN_AT,
+        "first",
+        &relayed(root.path(), &listing, page)?,
+    )?;
+    let first = server.seen()?;
+    as_if_cut_under_the_old_limit(root.path())?;
+    let moved = relayed(root.path(), &unlisted, server.url(MOVED_PATH))?;
+    poll(root.path(), LATER_THE_SAME_DAY, "second", &moved)?;
+    let second = server.seen()?;
+    poll(root.path(), A_LITTLE_LATER, "third", &moved)?;
+    let third = server.seen()?;
+    server.finish()?;
+    assert_eq!(
+        (first.len(), second, third),
+        (1, vec![MOVED_PATH.to_owned()], Vec::<String>::new())
+    );
+    Ok(())
+}
+
+/// Section 11.1: `carry` reads the released cuts before it returns on a store with no open
+/// `deferred` row, and a re-ask writes no `deferred` row of its own. Mutation 2026-11-20 in §8
+/// row R23.
+#[test]
+fn a_released_cut_is_asked_on_a_run_with_no_open_deferred_rows() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let (listing, unlisted) = (Gnw::day()?, gnw_without_release_0()?);
+    let server = over_the_limit_server(root.path())?;
+    let page = server.url(&release_0_path()?);
+    poll(
+        root.path(),
+        RUN_AT,
+        "first",
+        &relayed(root.path(), &listing, page.clone())?,
+    )?;
+    server.seen()?;
+    as_if_cut_under_the_old_limit(root.path())?;
+    let deferred = || -> Result<i64, Box<dyn Error>> {
+        let db = Connection::open(root.path().join(COMMIT_LOG))?;
+        Ok(db.query_row("SELECT COUNT(*) FROM deferred", [], |row| row.get(0))?)
+    };
+    let before = deferred()?;
+    let not_listed = relayed(root.path(), &unlisted, page)?;
+    poll(root.path(), LATER_THE_SAME_DAY, "second", &not_listed)?;
+    let asked = server.seen()?.len();
+    server.finish()?;
+    assert_eq!((before, asked, deferred()?), (0, 1, 0));
+    Ok(())
+}
+
 /// Section 11.4, §8 R21: a transient failure holds nothing, so after the run's own retries run out
 /// the next poll asks again. Mutation 2026-11-15, `transient_failure` added to the held verdicts:
 /// red.
@@ -3410,6 +3611,15 @@ impl Archive for RefusingTheIndex {
         source: &SourceId,
     ) -> Result<Vec<news_provider::OpenDeferred>, ArchiveError> {
         Archive::open_deferred(&self.store, source)
+    }
+
+    fn released_cuts(
+        &self,
+        source: &SourceId,
+        body_limit: u64,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<news_provider::ReleasedCut>, ArchiveError> {
+        Archive::released_cuts(&self.store, source, body_limit, since)
     }
 
     fn close_deferred(
@@ -5163,6 +5373,15 @@ impl Archive for HoldingToo {
         source: &SourceId,
     ) -> Result<Vec<news_provider::OpenDeferred>, ArchiveError> {
         Archive::open_deferred(&self.store, source)
+    }
+
+    fn released_cuts(
+        &self,
+        source: &SourceId,
+        body_limit: u64,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<news_provider::ReleasedCut>, ArchiveError> {
+        Archive::released_cuts(&self.store, source, body_limit, since)
     }
 
     fn close_deferred(
