@@ -344,11 +344,13 @@ pub trait Archive: Sink {
 
     /// The story ids this archive holds under `source` across EVERY target window: a committed
     /// item, or a closed Document attempt whose verdict was usable, empty or permanent. A transient
-    /// failure, a permanent failure answered with a 3xx, a usable attempt with an unusable row the
-    /// index row decided, a swept attempt and one in flight hold nothing (section 11.1).
+    /// failure, a permanent failure answered with a 3xx, a permanent failure whose body was stored
+    /// cut shorter than `body_limit` (the limit in force now), a usable attempt with an unusable
+    /// row the index row decided, a swept attempt and one in flight hold nothing (section 11.1).
     fn held_story_ids(
         &self,
         source: &SourceId,
+        body_limit: u64,
     ) -> Result<std::collections::BTreeSet<String>, ArchiveError>;
 
     /// Records how many in-universe follow-ups an index attempt named: the denominator the coverage
@@ -843,7 +845,7 @@ fn carry<A: Archive>(
     if open.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let held = archive.held_story_ids(&source)?;
+    let held = archive.held_story_ids(&source, provider.transport().body_limit)?;
     let mut items: Vec<(String, Vec<OpenDeferred>)> = Vec::new();
     for row in open {
         match items.iter_mut().find(|(url, _)| *url == row.url) {
@@ -1352,7 +1354,7 @@ fn attempt_once<A: Archive>(
                 archive.record_planned_coverage(&attempt_id, matched)?;
                 archive.covered_story_ids(&request.source, &request.target_window)?
             } else {
-                archive.held_story_ids(&request.source)?
+                archive.held_story_ids(&request.source, provider.transport().body_limit)?
             };
             let in_run: BTreeSet<String> = issued.difference(&stories).cloned().collect();
             stories.extend(issued.iter().cloned());

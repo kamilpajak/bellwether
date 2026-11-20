@@ -1506,8 +1506,13 @@ impl Committer {
     }
 
     /// Section 11.1's held read. A NULL status or count is held through the `COALESCE`s: without
-    /// them SQLite evaluates the `NOT (...)` to NULL and drops the row.
-    pub fn held_story_ids(&self, source: &SourceId) -> Result<BTreeSet<String>, StoreError> {
+    /// them SQLite evaluates the `NOT (...)` to NULL and drops the row. `read_whole_up_to` is the
+    /// body limit in force now: a cut body is exactly the limit it was cut at (section 3.9).
+    pub fn held_story_ids(
+        &self,
+        source: &SourceId,
+        read_whole_up_to: u64,
+    ) -> Result<BTreeSet<String>, StoreError> {
         let mut statement = self.db.prepare(
             "SELECT i.story_id FROM items i
              JOIN attempts a ON a.attempt_id = i.attempt_id
@@ -1517,6 +1522,10 @@ impl Committer {
              WHERE source = ?1 AND story_id IS NOT NULL AND closed_at IS NOT NULL
                AND verdict IN (?2, ?3, ?4)
                AND NOT (verdict = ?4 AND COALESCE(transport_status, 0) BETWEEN ?5 AND ?6)
+               AND NOT (verdict = ?4 AND EXISTS (
+                        SELECT 1 FROM payloads p JOIN blobs b ON b.digest = p.raw_blob
+                         WHERE p.attempt_id = attempts.attempt_id AND p.truncated = 1
+                           AND b.bytes < ?7))
                AND NOT (verdict = ?2 AND COALESCE(listing_unusable, 0) > 0)",
         )?;
         let held = statement
@@ -1527,7 +1536,8 @@ impl Committer {
                     Verdict::Empty.name(),
                     Verdict::PermanentFailure.name(),
                     REDIRECTS.start(),
-                    REDIRECTS.end()
+                    REDIRECTS.end(),
+                    i64::try_from(read_whole_up_to).unwrap_or(i64::MAX)
                 ],
                 |row| row.get::<_, String>(0),
             )?
@@ -6347,7 +6357,7 @@ mod tests {
         store.record(closed, None, &[], at(10))?;
         let in_flight = document_slot(&mut store, here, "in flight", 6)?;
         drop(in_flight);
-        let held = store.held_story_ids(&SourceId::new(SOURCE))?;
+        let held = store.held_story_ids(&SourceId::new(SOURCE), LIMIT_NOW)?;
         assert_eq!(
             held,
             [STORY, "usable, no item", "empty", "permanent"]
@@ -6380,13 +6390,94 @@ mod tests {
             a_document_answered(&mut store, here, (story, ordinal), failed, status)?;
         }
         a_document_closed(&mut store, here, "usable", 6, Verdict::Usable)?;
-        let held = store.held_story_ids(&SourceId::new(SOURCE))?;
+        let held = store.held_story_ids(&SourceId::new(SOURCE), LIMIT_NOW)?;
         assert_eq!(
             held,
             ["400", "404", "no status", "usable"]
                 .map(|story| story_hex(SOURCE, story))
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>()
+        );
+        Ok(())
+    }
+
+    /// The body limit in force for the held read's tests: only its relation to a cut's length
+    /// matters, and a body of exactly the limit is read whole (`news_provider::wire::read_up_to`).
+    const LIMIT_NOW: u64 = 1_024;
+    const STATUS_NOT_FOUND: u16 = 404;
+
+    /// A status, the body answered with it, and whether that body is stored cut.
+    type Failed<'body> = (u16, &'body [u8], bool);
+
+    /// A Document attempt under (SOURCE, WINDOW) closed `permanent_failure` with `status`, its
+    /// `body` linked as its payload and marked cut when `truncated`.
+    fn a_document_failed_with_body(
+        store: &mut Committer,
+        (source_item_id, ordinal): (&str, u32),
+        (status, body, truncated): Failed,
+    ) -> TestResult {
+        let slot = document_slot(store, (SOURCE, WINDOW), source_item_id, ordinal)?;
+        let attempt = slot.attempt_id().clone();
+        let answer = Ok(RawResponse::new(
+            attempt,
+            status,
+            body.to_vec(),
+            at(2),
+            at(3),
+        ));
+        let outcome = Outcome::decide(
+            &Verdict::PermanentFailure,
+            Counts {
+                vendor_rows: 0,
+                listing_unusable: 0,
+                robots_disallowed: 0,
+            },
+            &Baseline::from_trailing_ok(&TRAILING_OK),
+        );
+        let closed = slot.close(store, outcome, &answer, at(4))?;
+        let raw = store.put_blob(body)?;
+        let payload = Payload {
+            truncated,
+            ..a_payload(&raw)
+        };
+        store.record(closed, Some(&payload), &[], at(5))?;
+        Ok(())
+    }
+
+    /// Section 11.1, owner decision of 2026-11-20: a permanent failure stored cut holds its story
+    /// while the limit in force is at most the cut's length, and nothing once a larger one is; a
+    /// whole body holds at any length. Mutations 2026-11-20 in §8 row R24.
+    #[test]
+    fn a_cut_body_is_held_until_a_limit_above_its_length_is_in_force() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let limit = usize::try_from(LIMIT_NOW)?;
+        let at_the_limit = vec![b'x'; limit];
+        let at_half = vec![b'y'; limit / 2];
+        let bodies: [(&str, Failed); 3] = [
+            ("cut at the limit", (STATUS_OK, &at_the_limit, true)),
+            ("cut at half", (STATUS_OK, &at_half, true)),
+            ("whole, 404", (STATUS_NOT_FOUND, b"gone", false)),
+        ];
+        for ((story, failed), ordinal) in bodies.into_iter().zip(0..) {
+            a_document_failed_with_body(&mut store, (story, ordinal), failed)?;
+        }
+        let source = SourceId::new(SOURCE);
+        let named = |stories: &[&str]| -> std::collections::BTreeSet<String> {
+            stories
+                .iter()
+                .map(|story| story_hex(SOURCE, story))
+                .collect()
+        };
+        assert_eq!(
+            (
+                store.held_story_ids(&source, LIMIT_NOW)?,
+                store.held_story_ids(&source, LIMIT_NOW / 2)?
+            ),
+            (
+                named(&["cut at the limit", "whole, 404"]),
+                named(&["cut at the limit", "cut at half", "whole, 404"])
+            )
         );
         Ok(())
     }
@@ -6413,7 +6504,7 @@ mod tests {
             "UPDATE attempts SET listing_unusable = NULL WHERE story_id = ?1",
             params![story_hex(SOURCE, "usable, listing count NULL")],
         )?;
-        let held = store.held_story_ids(&SourceId::new(SOURCE))?;
+        let held = store.held_story_ids(&SourceId::new(SOURCE), LIMIT_NOW)?;
         assert_eq!(
             held,
             ["usable, listing count NULL", "usable, page unusable"]
@@ -6482,7 +6573,7 @@ mod tests {
             4,
             failed,
         )?;
-        let held = store.held_story_ids(&SourceId::new(SOURCE))?;
+        let held = store.held_story_ids(&SourceId::new(SOURCE), LIMIT_NOW)?;
         assert_eq!(
             held,
             [STORY, "yesterday", "today"]

@@ -2108,8 +2108,10 @@ impl Archive for Committer {
     fn held_story_ids(
         &self,
         source: &SourceId,
+        body_limit: u64,
     ) -> Result<std::collections::BTreeSet<String>, ArchiveError> {
-        Committer::held_story_ids(self, source).map_err(|why| refused("read the held set", &why))
+        Committer::held_story_ids(self, source, body_limit)
+            .map_err(|why| refused("read the held set", &why))
     }
 
     fn record_planned_coverage(

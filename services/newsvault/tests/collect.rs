@@ -326,8 +326,9 @@ impl Archive for Refusing {
     fn held_story_ids(
         &self,
         source: &SourceId,
+        body_limit: u64,
     ) -> Result<std::collections::BTreeSet<String>, ArchiveError> {
-        Archive::held_story_ids(&self.store, source)
+        Archive::held_story_ids(&self.store, source, body_limit)
     }
 
     fn record_planned_coverage(
@@ -853,6 +854,7 @@ impl Archive for Untouched {
     fn held_story_ids(
         &self,
         _source: &SourceId,
+        _body_limit: u64,
     ) -> Result<std::collections::BTreeSet<String>, ArchiveError> {
         Err(self.touched("held_story_ids"))
     }
