@@ -58,8 +58,8 @@ const PAGE_TYPE: &str = "text/html; charset=utf-8";
 /// The loopback 301's body, `MOVED_BODY` in `tests/loopback/mod.rs`, and its length.
 const MOVED_BODY: &[u8] = b"moved";
 const MOVED_BODY_BYTES: i64 = 5;
-/// open-web's `BODY_LIMIT` (2 MiB, `providers/open-web-feed/src/lib.rs`), private to that crate.
-const OPEN_WEB_BODY_LIMIT: i64 = 2 * 1_024 * 1_024;
+/// open-web's `BODY_LIMIT` (8 MiB, `providers/open-web-feed/src/lib.rs`), private to that crate.
+const OPEN_WEB_BODY_LIMIT: i64 = 8 * 1_024 * 1_024;
 /// Two robots fetches before `RUN_AT`, the second the newer.
 const ROBOTS_EARLIER: &str = "2026-11-14T17:00:00Z";
 const ROBOTS_LATER: &str = "2026-11-14T18:00:00Z";

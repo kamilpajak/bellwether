@@ -523,8 +523,8 @@ fn refused_robots_redirect(truncated: bool, bytes: i64) -> Refreshed {
 
 /// The loopback 301's body, `b"moved"` in `tests/loopback/mod.rs`.
 const MOVED_BODY_BYTES: i64 = 5;
-/// open-web's `BODY_LIMIT` (2 MiB, `providers/open-web-feed/src/lib.rs`), private to that crate.
-const OPEN_WEB_BODY_LIMIT: i64 = 2 * 1_024 * 1_024;
+/// open-web's `BODY_LIMIT` (8 MiB, `providers/open-web-feed/src/lib.rs`), private to that crate.
+const OPEN_WEB_BODY_LIMIT: i64 = 8 * 1_024 * 1_024;
 
 /// Section 11.2, §11.5 step 5: the refresh's open-web `Wire` refuses a robots.txt 3xx, so the
 /// target, which serves the pinned body, is never fetched. Mutations 2026-11-15, open-web following
