@@ -811,8 +811,9 @@ fn a_cut(
 /// cut below it that is over `CARRY_LIMIT` old and still its story's latest attempt is counted
 /// released but unreachable, at the limit's edge too, and when its story's next attempt opens after
 /// `--at` or its carry row is over the limit; a 3xx cut, a young cut (by `closed_at`), a re-asked
-/// cut, one an open young `deferred` row carries and a whole body are neither. 2 held against 5
-/// released, so the two counters cannot swap. Mutations 2026-11-20 in §8 row R23.
+/// cut, one an open young `deferred` row carries and a whole body are neither; a young row closed
+/// by `--at` or deferred after it carries nothing, one closed after `--at` still carries. 2 held against 7 released, so the two counters
+/// cannot swap. Mutations 2026-11-20 in §8 row R23.
 #[test]
 fn cuts_held_at_the_limit_and_released_out_of_reach_are_counted_apart() -> TestResult {
     let root = fixture()?;
@@ -841,6 +842,27 @@ fn cuts_held_at_the_limit_and_released_out_of_reach_are_counted_apart() -> TestR
     an_open_deferred_row(&db, "s-deferred", CLOSED_RECENTLY)?;
     a_cut(&db, ("c-deferred-old", "s-deferred-old"), ok, released)?;
     an_open_deferred_row(&db, "s-deferred-old", CLOSED_TWO_DAYS_BEFORE)?;
+    a_cut(
+        &db,
+        ("c-deferred-closed", "s-deferred-closed"),
+        ok,
+        released,
+    )?;
+    an_open_deferred_row(&db, "s-deferred-closed", CLOSED_RECENTLY)?;
+    a_cut(&db, ("c-closed-later", "s-closed-later"), ok, released)?;
+    an_open_deferred_row(&db, "s-closed-later", CLOSED_RECENTLY)?;
+    for (story, closed) in [
+        ("s-deferred-closed", CLOSED_RECENTLY),
+        ("s-closed-later", AFTER_AT),
+    ] {
+        db.execute(
+            "INSERT INTO deferred_closed (deferred_id, run_id, closed_as, closed_at)
+             SELECT deferred_id, ?1, 'held', ?2 FROM deferred WHERE story_id = ?3",
+            [CUT_RUN, closed, story],
+        )?;
+    }
+    a_cut(&db, ("c-deferred-later", "s-deferred-later"), ok, released)?;
+    an_open_deferred_row(&db, "s-deferred-later", AFTER_AT)?;
     let young = (200, CLOSED_RECENTLY);
     a_cut(
         &db,
@@ -900,7 +922,7 @@ fn cuts_held_at_the_limit_and_released_out_of_reach_are_counted_apart() -> TestR
             shown(held),
             shown(unreachable)
         ),
-        (Some(2), Some(5), Some("2".to_owned()), Some("5".to_owned()))
+        (Some(2), Some(7), Some("2".to_owned()), Some("7".to_owned()))
     );
     Ok(())
 }
