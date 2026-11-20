@@ -880,8 +880,16 @@ fn carry<A: Archive>(
     let open = archive.open_deferred(&source)?;
     let released = archive.released_cuts(&source, body_limit, now - CARRY_LIMIT)?;
     let (carried, mut queued) = carry_deferred(provider, archive, open, now)?;
+    let carrying: BTreeSet<&str> = carried
+        .iter()
+        .filter(|item| item.queued)
+        .filter_map(|item| item.story_id.as_deref())
+        .collect();
     let mut reasked = BTreeSet::new();
     for cut in released {
+        if carrying.contains(cut.story_id.as_str()) {
+            continue;
+        }
         let target = TargetWindow::new(&cut.target_window);
         let Some(request) = provider.carried(&target, &cut.url, cut.listed_date.as_deref()) else {
             continue;

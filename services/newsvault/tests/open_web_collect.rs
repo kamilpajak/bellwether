@@ -3342,6 +3342,46 @@ fn a_released_cut_is_asked_on_a_run_with_no_open_deferred_rows() -> TestResult {
     Ok(())
 }
 
+/// Section 11.1: a re-ask the cap or the deadline deferred is carried by its open row alone, so the
+/// next run fetches it once, not once for the row and again as a released cut. Mutation
+/// 2026-11-20 in §8 row R23.
+#[test]
+fn a_deferred_reask_is_fetched_once_by_the_next_run() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let (listing, unlisted) = (Gnw::day()?, gnw_without_release_0()?);
+    let server = over_the_limit_server(root.path())?;
+    let page = server.url(&release_0_path()?);
+    poll(
+        root.path(),
+        RUN_AT,
+        "first",
+        &relayed(root.path(), &listing, page.clone())?,
+    )?;
+    server.seen()?;
+    as_if_cut_under_the_old_limit(root.path())?;
+    let story = release_0_story()?;
+    an_open_row(
+        root.path(),
+        &release_url(0)?,
+        Some(&story),
+        None,
+        instant(LATER_THE_SAME_DAY),
+    )?;
+    let not_listed = relayed(root.path(), &unlisted, page)?;
+    poll(root.path(), LATER_THE_SAME_DAY, "second", &not_listed)?;
+    let fetched = server.seen()?.len();
+    server.finish()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    let attempts: i64 = db.query_row(
+        "SELECT COUNT(*) FROM attempts WHERE story_id = ?1",
+        [&story],
+        |row| row.get(0),
+    )?;
+    assert_eq!((fetched, attempts), (1, 2));
+    Ok(())
+}
+
 /// Section 11.4, §8 R21: a transient failure holds nothing, so after the run's own retries run out
 /// the next poll asks again. Mutation 2026-11-15, `transient_failure` added to the held verdicts:
 /// red.
