@@ -213,8 +213,9 @@ pub struct SourceRow {
     /// raised above the cut. 0 for a source with no registered limit.
     pub cuts_held_at_limit: i64,
     /// Section 11.1: permanent document failures stored cut below the current limit, closed more
-    /// than `CARRY_LIMIT` before `--at` and still their story's latest attempt: released, too old
-    /// for `carry` to ask, and read again only if an index lists the story.
+    /// than `CARRY_LIMIT` before `--at`, still their story's latest attempt, and with no open
+    /// `deferred` row of the story younger than `CARRY_LIMIT` at `--at` (whose carry would ask it):
+    /// released, too old for `carry` to ask, and read again only if an index lists the story.
     pub cuts_released_unreachable: i64,
     /// Section 8 row R15, decision 10: `relisted` rows, one per live index attempt and held story
     /// listed under another minute than its kept item's, so k polls count k. 0 also before
@@ -745,6 +746,13 @@ fn grouped_attempts(
                                              AND later.story_id = attempts.story_id
                                              AND later.rowid > attempts.rowid
                                              AND later.opened_at <= ?1)
+                          AND COALESCE((SELECT MIN(d.deferred_at) FROM deferred d
+                                         WHERE d.source = attempts.source
+                                           AND d.story_id = attempts.story_id
+                                           AND d.deferred_at <= ?1
+                                           AND NOT EXISTS (SELECT 1 FROM deferred_closed c
+                                                            WHERE c.deferred_id = d.deferred_id
+                                                              AND c.closed_at <= ?1)), ?2) <= ?2
                      THEN 1 ELSE 0 END)
          FROM attempts WHERE opened_at <= ?1
          GROUP BY run_id, source, state

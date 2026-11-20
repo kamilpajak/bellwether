@@ -760,6 +760,22 @@ const CUT_RUN: &str = "run-0703-a";
 const CUT_CLOSED: &str = "2026-07-03T00:40:00.000000Z";
 /// Under `CARRY_LIMIT` (24 h) before `AT`.
 const CLOSED_RECENTLY: &str = "2026-07-30T12:00:00.000000Z";
+/// Exactly `CARRY_LIMIT` before `AT`, and two days before it.
+const CLOSED_AT_THE_CARRY_LIMIT: &str = "2026-07-30T00:00:00.000000Z";
+const CLOSED_TWO_DAYS_BEFORE: &str = "2026-07-29T00:00:00.000000Z";
+/// A day after `AT`.
+const AFTER_AT: &str = "2026-08-01T00:00:00.000000Z";
+
+/// An open `deferred` document row of `story` deferred at `deferred_at`.
+fn an_open_deferred_row(db: &Connection, story: &str, deferred_at: &str) -> TestResult {
+    db.execute(
+        "INSERT INTO deferred (run_id, source, target_window, url, phase, story_id, reason,
+                               deferred_at)
+         VALUES (?1, ?2, ?3, 'https://example.test/cut', 'document', ?4, 'follow_up_cap', ?5)",
+        rusqlite::params![CUT_RUN, EDGAR, FAILED_DAY, story, deferred_at],
+    )?;
+    Ok(())
+}
 
 /// One edgar Document attempt in `CUT_RUN` closed `permanent_failure` with `status` at `closed`,
 /// its body a blob of `bytes` linked `truncated` when set; no link when `bytes` is `None`.
@@ -793,19 +809,18 @@ fn a_cut(
 
 /// Section 11.1, owner decision of 2026-11-20: a cut at the limit in force is counted held, and a
 /// cut below it that is over `CARRY_LIMIT` old and still its story's latest attempt is counted
-/// released but unreachable; a 3xx cut, a young cut, a re-asked cut and a whole body are neither.
-/// Mutations 2026-11-20 in §8 row R23.
+/// released but unreachable, at the limit's edge too, and when its story's next attempt opens after
+/// `--at` or its carry row is over the limit; a 3xx cut, a young cut (by `closed_at`), a re-asked
+/// cut, one an open young `deferred` row carries and a whole body are neither. 2 held against 5
+/// released, so the two counters cannot swap. Mutations 2026-11-20 in §8 row R23.
 #[test]
 fn cuts_held_at_the_limit_and_released_out_of_reach_are_counted_apart() -> TestResult {
     let root = fixture()?;
     let db = Connection::open(root.path().join(COMMIT_LOG))?;
     let ok = (200, CUT_CLOSED);
-    a_cut(
-        &db,
-        ("c-held", "s-held"),
-        ok,
-        Some((EDGAR_BODY_LIMIT, true)),
-    )?;
+    for (attempt, story) in [("c-held", "s-held"), ("c-held-2", "s-held-2")] {
+        a_cut(&db, (attempt, story), ok, Some((EDGAR_BODY_LIMIT, true)))?;
+    }
     let moved = (301, CUT_CLOSED);
     a_cut(
         &db,
@@ -813,13 +828,29 @@ fn cuts_held_at_the_limit_and_released_out_of_reach_are_counted_apart() -> TestR
         moved,
         Some((EDGAR_BODY_LIMIT, true)),
     )?;
+    a_cut(&db, ("c-old-before", "s-old"), ok, None)?;
     a_cut(&db, ("c-old", "s-old"), ok, Some((OLD_BODY_LIMIT, true)))?;
+    let released = Some((OLD_BODY_LIMIT, true));
+    let at_the_limit = (200, CLOSED_AT_THE_CARRY_LIMIT);
+    a_cut(&db, ("c-at-limit", "s-at-limit"), at_the_limit, released)?;
+    let two_days = (200, CLOSED_TWO_DAYS_BEFORE);
+    a_cut(&db, ("c-two-days", "s-two-days"), two_days, released)?;
+    a_cut(&db, ("c-later", "s-later"), ok, released)?;
+    a_cut(&db, ("c-later-again", "s-later"), (200, AFTER_AT), None)?;
+    a_cut(&db, ("c-deferred", "s-deferred"), ok, released)?;
+    an_open_deferred_row(&db, "s-deferred", CLOSED_RECENTLY)?;
+    a_cut(&db, ("c-deferred-old", "s-deferred-old"), ok, released)?;
+    an_open_deferred_row(&db, "s-deferred-old", CLOSED_TWO_DAYS_BEFORE)?;
     let young = (200, CLOSED_RECENTLY);
     a_cut(
         &db,
         ("c-young", "s-young"),
         young,
         Some((OLD_BODY_LIMIT, true)),
+    )?;
+    db.execute(
+        "UPDATE attempts SET opened_at = ?1 WHERE attempt_id = 'c-young'",
+        [CUT_CLOSED],
     )?;
     a_cut(
         &db,
@@ -869,7 +900,7 @@ fn cuts_held_at_the_limit_and_released_out_of_reach_are_counted_apart() -> TestR
             shown(held),
             shown(unreachable)
         ),
-        (Some(1), Some(1), Some("1".to_owned()), Some("1".to_owned()))
+        (Some(2), Some(5), Some("2".to_owned()), Some("5".to_owned()))
     );
     Ok(())
 }
