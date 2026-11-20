@@ -3376,7 +3376,14 @@ fn a_deferred_reask_is_fetched_once_by_the_next_run() -> TestResult {
         [&story],
         |row| row.get(0),
     )?;
-    assert_eq!((fetched, attempts), (1, 2));
+    let closed: Vec<String> = closed_rows(root.path())?
+        .into_iter()
+        .map(|row| row.1)
+        .collect();
+    assert_eq!(
+        (fetched, attempts, closed),
+        (1, 2, vec!["answered".to_owned()])
+    );
     Ok(())
 }
 
