@@ -3387,6 +3387,99 @@ fn a_deferred_reask_is_fetched_once_by_the_next_run() -> TestResult {
     Ok(())
 }
 
+/// Release 0 cut through the real open-web `Wire` by a `RUN_AT` poll that lists it, then standing
+/// in for a cut under `OLD_BODY_LIMIT`: released, and no longer listed.
+fn a_released_cut_of_release_0(root: &Path) -> Result<Gnw, Box<dyn Error>> {
+    seed_gnw(root, &hosts(), ROBOTS_EARLIER)?;
+    let listing = Gnw::day()?;
+    let server = over_the_limit_server(root)?;
+    let page = server.url(&release_0_path()?);
+    poll(root, RUN_AT, "first", &relayed(root, &listing, page)?)?;
+    server.finish()?;
+    as_if_cut_under_the_old_limit(root)?;
+    gnw_without_release_0()
+}
+
+/// Section 11.1: a re-ask answered whole is asked under the cut's window, listed time and listing,
+/// and commits one item timed by the listing. Mutations 2026-11-20 in §8 row R23.
+#[test]
+fn a_reask_answered_whole_commits_one_item_under_the_cut_s_window_and_listing() -> TestResult {
+    let root = TempDir::new()?;
+    let unlisted = a_released_cut_of_release_0(root.path())?;
+    poll(root.path(), LATER_THE_SAME_DAY, "second", &unlisted)?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    let story = release_0_story()?;
+    let asked: Vec<(String, Option<String>, Option<String>, String)> = db
+        .prepare(
+            "SELECT a.target_window, p.listed_date, a.listed_by, a.verdict FROM attempts a
+               JOIN payloads p ON p.attempt_id = a.attempt_id
+              WHERE a.story_id = ?1 ORDER BY a.rowid",
+        )?
+        .query_map([&story], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    let items: Vec<(Option<String>, Option<String>)> = db
+        .prepare("SELECT valid_minute, valid_refused FROM items WHERE story_id = ?1")?
+        .query_map([&story], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let [cut, reask] = asked.as_slice() else {
+        return Err(format!("release 0's attempts: {asked:?}").into());
+    };
+    assert_eq!(
+        (
+            (&reask.0, &reask.1, &reask.2, reask.3.as_str()),
+            cut.1.is_some() && cut.2.is_some(),
+            items
+        ),
+        (
+            (&cut.0, &cut.1, &cut.2, "usable"),
+            true,
+            vec![(Some("2026-11-14T19:00:00.000000Z".to_owned()), None)]
+        )
+    );
+    Ok(())
+}
+
+/// Section 11.1: a released cut is its story's latest attempt even when an attempt came before it;
+/// here three transient ones, then the cut. Mutation 2026-11-20 in §8 row R23.
+#[test]
+fn a_released_cut_after_an_earlier_attempt_of_its_story_is_asked_once() -> TestResult {
+    let root = TempDir::new()?;
+    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
+    let tries = 1 + news_provider::MAX_TRANSIENT_RETRIES as usize;
+    let failing = Gnw::day()?.answering(&release_url(0)?, &vec![UNAVAILABLE; tries]);
+    poll(root.path(), RUN_AT, "first", &failing)?;
+    let (listing, unlisted) = (Gnw::day()?, gnw_without_release_0()?);
+    let server = over_the_limit_server(root.path())?;
+    let page = server.url(&release_0_path()?);
+    let listed = relayed(root.path(), &listing, page.clone())?;
+    poll(root.path(), LATER_THE_SAME_DAY, "second", &listed)?;
+    let cut = server.seen()?.len();
+    as_if_cut_under_the_old_limit(root.path())?;
+    let not_listed = relayed(root.path(), &unlisted, page)?;
+    poll(root.path(), A_LITTLE_LATER, "third", &not_listed)?;
+    let reasked = server.seen()?.len();
+    server.finish()?;
+    assert_eq!((cut, reasked), (1, 1));
+    Ok(())
+}
+
+/// Section 11.1: a re-ask is queued like a carried request, so one answered 503 is asked again
+/// within the run. Mutation 2026-11-20 in §8 row R23.
+#[test]
+fn a_reask_that_fails_transiently_is_retried_within_the_run() -> TestResult {
+    let root = TempDir::new()?;
+    let unlisted = a_released_cut_of_release_0(root.path())?;
+    let failing_once = unlisted.answering(&release_url(0)?, &[UNAVAILABLE]);
+    poll(root.path(), LATER_THE_SAME_DAY, "second", &failing_once)?;
+    let (sent, _) = failing_once.sent();
+    let release_0 = release_url(0)?;
+    let times = sent.iter().filter(|url| **url == release_0).count();
+    assert_eq!(times, 2);
+    Ok(())
+}
+
 /// Section 11.4, §8 R21: a transient failure holds nothing, so after the run's own retries run out
 /// the next poll asks again. Mutation 2026-11-15, `transient_failure` added to the held verdicts:
 /// red.
