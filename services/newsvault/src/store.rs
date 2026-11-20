@@ -108,9 +108,6 @@ const BLOB_SPACE: &str = "sha256";
 const OUTCOME_OK: &str = "ok";
 /// Statuses a permanent failure is not held under: owner decision of 2026-11-15 (§10).
 const REDIRECTS: std::ops::RangeInclusive<u16> = 300..=399;
-/// A story's bodies stored cut at `body_limit` before a permanent failure holds it: owner decision
-/// of 2026-11-20 (§11.1). 2, so one fetch again; each costs up to the limit in a stored blob.
-const CUT_BODIES_HELD_AT: i64 = 2;
 
 /// Per connection, so set on every open and never part of a schema version.
 const CONNECTION: &str = "
@@ -1520,13 +1517,7 @@ impl Committer {
              WHERE source = ?1 AND story_id IS NOT NULL AND closed_at IS NOT NULL
                AND verdict IN (?2, ?3, ?4)
                AND NOT (verdict = ?4 AND COALESCE(transport_status, 0) BETWEEN ?5 AND ?6)
-               AND NOT (verdict = ?2 AND COALESCE(listing_unusable, 0) > 0)
-               AND NOT (verdict = ?4
-                        AND EXISTS (SELECT 1 FROM payloads p
-                                     WHERE p.attempt_id = attempts.attempt_id AND p.truncated = 1)
-                        AND (SELECT COUNT(*) FROM attempts o
-                               JOIN payloads q ON q.attempt_id = o.attempt_id
-                              WHERE o.story_id = attempts.story_id AND q.truncated = 1) < ?7)",
+               AND NOT (verdict = ?2 AND COALESCE(listing_unusable, 0) > 0)",
         )?;
         let held = statement
             .query_map(
@@ -1536,8 +1527,7 @@ impl Committer {
                     Verdict::Empty.name(),
                     Verdict::PermanentFailure.name(),
                     REDIRECTS.start(),
-                    REDIRECTS.end(),
-                    CUT_BODIES_HELD_AT
+                    REDIRECTS.end()
                 ],
                 |row| row.get::<_, String>(0),
             )?
@@ -6394,64 +6384,6 @@ mod tests {
         assert_eq!(
             held,
             ["400", "404", "no status", "usable"]
-                .map(|story| story_hex(SOURCE, story))
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>()
-        );
-        Ok(())
-    }
-
-    /// A Document attempt answered 200, closed under `verdict` and linked to a body stored cut when
-    /// `cut`, as `collect` stores a `BodyOverLimit` answer.
-    fn a_document_stored(
-        store: &mut Committer,
-        (source_item_id, ordinal): (&str, u32),
-        (verdict, cut): (Verdict, bool),
-    ) -> TestResult {
-        let slot = document_slot(store, (SOURCE, WINDOW), source_item_id, ordinal)?;
-        let failed = TransportError::new(slot.attempt_id().clone(), at(2), at(3), String::new())
-            .with_status(STATUS_OK);
-        let outcome = Outcome::decide(
-            &verdict,
-            Counts {
-                vendor_rows: 0,
-                listing_unusable: 0,
-                robots_disallowed: 0,
-            },
-            &Baseline::from_trailing_ok(&TRAILING_OK),
-        );
-        let closed = slot.close(store, outcome, &Err(failed), at(4))?;
-        let raw = store.put_blob(PAYLOAD)?;
-        let payload = Payload {
-            truncated: cut,
-            ..a_payload(&raw)
-        };
-        store.record(closed, Some(&payload), &[], at(5))?;
-        Ok(())
-    }
-
-    /// Section 11.1, owner decision of 2026-11-20: a permanent failure whose body was stored cut
-    /// holds nothing until the story's second cut body; a body stored whole is not counted, and a
-    /// permanent one holds. Mutations in §11.1.
-    #[test]
-    fn a_body_stored_cut_holds_nothing_until_the_story_s_second_cut_body() -> TestResult {
-        let temp = TempDir::new()?;
-        let mut store = open(&temp)?;
-        let (cut, whole) = (
-            (Verdict::PermanentFailure, true),
-            (Verdict::PermanentFailure, false),
-        );
-        a_document_stored(&mut store, ("cut once", 0), cut)?;
-        a_document_stored(&mut store, ("cut twice", 1), cut)?;
-        a_document_stored(&mut store, ("cut twice", 2), cut)?;
-        a_document_stored(&mut store, ("whole", 3), whole)?;
-        let transient = (Verdict::TransientFailure, false);
-        a_document_stored(&mut store, ("transient, then cut", 4), transient)?;
-        a_document_stored(&mut store, ("transient, then cut", 5), cut)?;
-        let held = store.held_story_ids(&SourceId::new(SOURCE))?;
-        assert_eq!(
-            held,
-            ["cut twice", "whole"]
                 .map(|story| story_hex(SOURCE, story))
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>()

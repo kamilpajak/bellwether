@@ -3141,60 +3141,6 @@ fn a_body_cut_at_the_limit_counts_in_the_envelope_s_blobs_and_bytes_written() ->
     Ok(())
 }
 
-/// Section 11.1, owner decision of 2026-11-20: a 200 whose body is over open-web's `BODY_LIMIT`,
-/// through the real open-web `Wire`, is a permanent failure stored cut that holds nothing, so the
-/// second poll asks again; its second cut body holds the story, so the third asks nothing.
-#[test]
-fn a_page_over_the_limit_is_fetched_by_the_next_poll_once_and_then_held() -> TestResult {
-    let root = TempDir::new()?;
-    seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
-    let release = release_url(0)?;
-    let path = release_0_path()?;
-    let gnw = Gnw::day()?;
-    let ask = ask(root.path(), cmd_collect::TODAY);
-    let opened = cmd_collect::open_provider(&ask)?;
-    let over = usize::try_from(opened.provider.transport().body_limit)? + 1;
-    let server = loopback::Loopback::redirecting(loopback::REDIRECT_TARGET, vec![b'x'; over])?;
-    let exchange = loopback::Relay {
-        stub: &gnw,
-        wire: cmd_collect::wire_for(&ask, &opened),
-        relayed: BTreeMap::from([(release.clone(), server.url(&path))]),
-        asked: RefCell::default(),
-    };
-    let mut fetched = Vec::new();
-    for (at, schedule) in [
-        (RUN_AT, "first"),
-        (LATER_THE_SAME_DAY, "second"),
-        (LATEST_THE_SAME_DAY, "third"),
-    ] {
-        poll(root.path(), at, schedule, &exchange)?;
-        let sent = exchange.sent();
-        fetched.push((
-            sent.iter().filter(|url| **url == release).count(),
-            server.seen()?,
-        ));
-    }
-    server.finish()?;
-    let limit = usize::try_from(OPEN_WEB_BODY_LIMIT)?;
-    assert_eq!(
-        (
-            fetched,
-            first_attempt_of(root.path(), 0)?,
-            first_payload_of(root.path(), 0)?.map(|row| (row.0, row.1, row.2))
-        ),
-        (
-            vec![(1, vec![path.clone()]), (1, vec![path]), (0, Vec::new())],
-            (Some(i64::from(OK)), "permanent_failure".to_owned()),
-            Some((
-                true,
-                OPEN_WEB_BODY_LIMIT,
-                canon::FileDigest::of(&vec![b'x'; limit]).hex().to_owned()
-            )),
-        )
-    );
-    Ok(())
-}
-
 /// Section 11.4, §8 R21: a transient failure holds nothing, so after the run's own retries run out
 /// the next poll asks again. Mutation 2026-11-15, `transient_failure` added to the held verdicts:
 /// red.
