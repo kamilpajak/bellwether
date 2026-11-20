@@ -107,7 +107,7 @@ const BLOB_SPACE: &str = "sha256";
 /// One constant for the label `record` writes and `ok_vendor_rows` reads, so the two cannot drift.
 const OUTCOME_OK: &str = "ok";
 /// Statuses a permanent failure is not held under: owner decision of 2026-11-15 (§10).
-const REDIRECTS: std::ops::RangeInclusive<u16> = 300..=399;
+pub(crate) const REDIRECTS: std::ops::RangeInclusive<u16> = 300..=399;
 
 /// Per connection, so set on every open and never part of a schema version.
 const CONNECTION: &str = "

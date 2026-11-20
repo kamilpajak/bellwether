@@ -71,7 +71,7 @@ const FORBIDDEN: u16 = 403;
 const VENDOR_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 /// Full daily indexes read 1,057,192 B and 1,520,327 B (2026-11-10, 2026-11-12; read as received
 /// by `probes/observation_lag/probe.py` on 2026-11-13). Construction: architecture.md §10.
-const BODY_LIMIT: u64 = 8 * 1_024 * 1_024;
+pub const BODY_LIMIT: u64 = 8 * 1_024 * 1_024;
 /// 1 s / 10 requests. SEC's fair-access ceiling is 10 requests a second per IP as the
 /// predecessor's vendor-quota table states it (read 2026-11-13 from
 /// `apps/alphalens-pipeline/CLAUDE.md`); nothing here has measured it, and this paces TO the

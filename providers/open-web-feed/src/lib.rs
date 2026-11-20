@@ -58,7 +58,7 @@ const NOT_PLAIN: [u8; 2] = *b"%#";
 const VENDOR_PATIENCE: Duration = Duration::from_secs(30);
 /// edgar-press's `BODY_LIMIT`, taken as is and not fitted to the pages it admits: at 2 MiB, 3 of
 /// 546 Yahoo pages of 2026-11-19 (largest read whole 1,961,714 B) were stored cut (§11.1).
-const BODY_LIMIT: u64 = 8 * 1_024 * 1_024;
+pub const BODY_LIMIT: u64 = 8 * 1_024 * 1_024;
 /// Section 11.1's floor, as `per_host` for every host (§8 row R19 hole 7): `newsvault collect`
 /// refuses a host whose robots Crawl-delay is above it (owner decision 1, 2026-11-16). No per-IP
 /// pace: each host is its own queue (owner decision 1, 2026-11-17, §10). 7 s: owner, 2026-11-19.

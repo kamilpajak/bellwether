@@ -2567,11 +2567,13 @@ fn every_registered_cadence_is_the_one_its_provider_declares() -> TestResult {
 
 /// The table's credential name is the one the provider's own User-Agent asks `Wire` for; a
 /// mismatch stores the contact where `Wire::send` never reads it. Mutation 2026-11-15: the
-/// open-web entry naming edgar's credential was green before this.
+/// open-web entry naming edgar's credential was green before this. The table's body limit is the
+/// one the provider's `Wire` cuts at, which `ledger` compares cut bodies with (§8 row R23).
 #[test]
 fn every_registered_credential_is_the_one_its_providers_user_agent_names() -> TestResult {
     let root = TempDir::new()?;
     let mut named = Vec::new();
+    let mut limits = Vec::new();
     for ask in [
         ask(root.path(), A_LISTED_SESSION),
         open_web_ask(root.path(), SATURDAY_AT),
@@ -2581,10 +2583,17 @@ fn every_registered_credential_is_the_one_its_providers_user_agent_names() -> Te
             opened.provider.transport().user_agent,
             HeaderValue::FromCredential(CredentialRef::new(opened.registered.credential())),
         ));
+        limits.push((
+            opened.provider.transport().body_limit,
+            opened.registered.body_limit(),
+        ));
     }
     assert_eq!(named.len(), cmd_collect::Registered::ALL.len());
     for (asked_for, held_under) in named {
         assert_eq!(asked_for, held_under);
+    }
+    for (sent_under, ledgered_under) in limits {
+        assert_eq!(sent_under, ledgered_under);
     }
     Ok(())
 }

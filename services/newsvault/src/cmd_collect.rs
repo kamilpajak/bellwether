@@ -349,6 +349,16 @@ impl Registered {
         }
     }
 
+    /// The provider's `transport().body_limit`, readable without opening it: `ledger` compares
+    /// a cut body with it (section 11.1).
+    #[must_use]
+    pub const fn body_limit(self) -> u64 {
+        match self {
+            Self::EdgarPress => edgar_press::BODY_LIMIT,
+            Self::OpenWebWires => open_web_feed::BODY_LIMIT,
+        }
+    }
+
     /// Each provider's contact from a variable of its own, never another vendor's.
     #[must_use]
     pub const fn contact_variable(self) -> &'static str {
