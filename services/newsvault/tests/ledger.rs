@@ -752,6 +752,181 @@ fn a_body_stored_cut_at_the_limit_is_counted_for_its_source_and_day() -> TestRes
     Ok(())
 }
 
+/// edgar-press's body limit (`providers/edgar-press/src/lib.rs`), and the 2 MiB open-web cut its
+/// pages at on 2026-11-19.
+const EDGAR_BODY_LIMIT: i64 = 8 * 1_024 * 1_024;
+const OLD_BODY_LIMIT: i64 = 2 * 1_024 * 1_024;
+const CUT_RUN: &str = "run-0703-a";
+const CUT_CLOSED: &str = "2026-07-03T00:40:00.000000Z";
+/// Under `CARRY_LIMIT` (24 h) before `AT`.
+const CLOSED_RECENTLY: &str = "2026-07-30T12:00:00.000000Z";
+/// Exactly `CARRY_LIMIT` before `AT`, and two days before it.
+const CLOSED_AT_THE_CARRY_LIMIT: &str = "2026-07-30T00:00:00.000000Z";
+const CLOSED_TWO_DAYS_BEFORE: &str = "2026-07-29T00:00:00.000000Z";
+/// A day after `AT`.
+const AFTER_AT: &str = "2026-08-01T00:00:00.000000Z";
+
+/// An open `deferred` document row of `story` deferred at `deferred_at`.
+fn an_open_deferred_row(db: &Connection, story: &str, deferred_at: &str) -> TestResult {
+    db.execute(
+        "INSERT INTO deferred (run_id, source, target_window, url, phase, story_id, reason,
+                               deferred_at)
+         VALUES (?1, ?2, ?3, 'https://example.test/cut', 'document', ?4, 'follow_up_cap', ?5)",
+        rusqlite::params![CUT_RUN, EDGAR, FAILED_DAY, story, deferred_at],
+    )?;
+    Ok(())
+}
+
+/// One edgar Document attempt in `CUT_RUN` closed `permanent_failure` with `status` at `closed`,
+/// its body a blob of `bytes` linked `truncated` when set; no link when `bytes` is `None`.
+fn a_cut(
+    db: &Connection,
+    (attempt, story): (&str, &str),
+    (status, closed): (u16, &str),
+    bytes: Option<(i64, bool)>,
+) -> TestResult {
+    db.execute(
+        "INSERT INTO attempts (attempt_id, run_id, source, target_window, filter_params,
+                               universe_version, opened_at, closed_at, transport_status,
+                               outcome, verdict, story_id)
+         VALUES (?1, ?2, ?3, ?4, 'fp', 'uv', ?5, ?5, ?6, 'failed', 'permanent_failure', ?7)",
+        rusqlite::params![attempt, CUT_RUN, EDGAR, FAILED_DAY, closed, status, story],
+    )?;
+    if let Some((bytes, truncated)) = bytes {
+        let blob = format!("b-{attempt}");
+        db.execute(
+            "INSERT INTO blobs (digest, bytes, first_indexed_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![blob, bytes, closed],
+        )?;
+        db.execute(
+            "INSERT INTO payloads (attempt_id, url, phase, raw_blob, headers, truncated)
+             VALUES (?1, 'https://example.test/cut', 'document', ?2, '[]', ?3)",
+            rusqlite::params![attempt, blob, truncated],
+        )?;
+    }
+    Ok(())
+}
+
+/// Section 11.1, owner decision of 2026-11-20: a cut at the limit in force is counted held, and a
+/// cut below it that is over `CARRY_LIMIT` old and still its story's latest attempt is counted
+/// released but unreachable, at the limit's edge too, and when its story's next attempt opens after
+/// `--at` or its carry row is over the limit; a 3xx cut, a young cut (by `closed_at`), a re-asked
+/// cut, one an open young `deferred` row carries and a whole body are neither; a young row closed
+/// by `--at` or deferred after it carries nothing, one closed after `--at` still carries. 2 held against 7 released, so the two counters
+/// cannot swap. Mutations 2026-11-20 and 2026-11-21 in §8 row R23.
+#[test]
+fn cuts_held_at_the_limit_and_released_out_of_reach_are_counted_apart() -> TestResult {
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    let ok = (200, CUT_CLOSED);
+    for (attempt, story) in [("c-held", "s-held"), ("c-held-2", "s-held-2")] {
+        a_cut(&db, (attempt, story), ok, Some((EDGAR_BODY_LIMIT, true)))?;
+    }
+    let moved = (301, CUT_CLOSED);
+    a_cut(
+        &db,
+        ("c-3xx", "s-3xx"),
+        moved,
+        Some((EDGAR_BODY_LIMIT, true)),
+    )?;
+    a_cut(&db, ("c-old-before", "s-old"), ok, None)?;
+    a_cut(&db, ("c-old", "s-old"), ok, Some((OLD_BODY_LIMIT, true)))?;
+    let released = Some((OLD_BODY_LIMIT, true));
+    let at_the_limit = (200, CLOSED_AT_THE_CARRY_LIMIT);
+    a_cut(&db, ("c-at-limit", "s-at-limit"), at_the_limit, released)?;
+    let two_days = (200, CLOSED_TWO_DAYS_BEFORE);
+    a_cut(&db, ("c-two-days", "s-two-days"), two_days, released)?;
+    a_cut(&db, ("c-later", "s-later"), ok, released)?;
+    a_cut(&db, ("c-later-again", "s-later"), (200, AFTER_AT), None)?;
+    a_cut(&db, ("c-deferred", "s-deferred"), ok, released)?;
+    an_open_deferred_row(&db, "s-deferred", CLOSED_RECENTLY)?;
+    a_cut(&db, ("c-deferred-old", "s-deferred-old"), ok, released)?;
+    an_open_deferred_row(&db, "s-deferred-old", CLOSED_TWO_DAYS_BEFORE)?;
+    a_cut(
+        &db,
+        ("c-deferred-closed", "s-deferred-closed"),
+        ok,
+        released,
+    )?;
+    an_open_deferred_row(&db, "s-deferred-closed", CLOSED_RECENTLY)?;
+    a_cut(&db, ("c-closed-later", "s-closed-later"), ok, released)?;
+    an_open_deferred_row(&db, "s-closed-later", CLOSED_RECENTLY)?;
+    for (story, closed) in [
+        ("s-deferred-closed", CLOSED_RECENTLY),
+        ("s-closed-later", AFTER_AT),
+    ] {
+        db.execute(
+            "INSERT INTO deferred_closed (deferred_id, run_id, closed_as, closed_at)
+             SELECT deferred_id, ?1, 'held', ?2 FROM deferred WHERE story_id = ?3",
+            [CUT_RUN, closed, story],
+        )?;
+    }
+    a_cut(&db, ("c-deferred-later", "s-deferred-later"), ok, released)?;
+    an_open_deferred_row(&db, "s-deferred-later", AFTER_AT)?;
+    let young = (200, CLOSED_RECENTLY);
+    a_cut(
+        &db,
+        ("c-young", "s-young"),
+        young,
+        Some((OLD_BODY_LIMIT, true)),
+    )?;
+    db.execute(
+        "UPDATE attempts SET opened_at = ?1 WHERE attempt_id = 'c-young'",
+        [CUT_CLOSED],
+    )?;
+    a_cut(
+        &db,
+        ("c-asked", "s-asked"),
+        ok,
+        Some((OLD_BODY_LIMIT, true)),
+    )?;
+    a_cut(&db, ("c-asked-again", "s-asked"), young, None)?;
+    a_cut(
+        &db,
+        ("c-whole", "s-whole"),
+        ok,
+        Some((OLD_BODY_LIMIT, false)),
+    )?;
+    drop(db);
+    let json = over(&root, FAILED_DAY, FAILED_DAY)?.json()?;
+    let counted = |field: &str| {
+        per_source(&json, FAILED_DAY, EDGAR)
+            .and_then(|row| row.get(field))
+            .and_then(Value::as_i64)
+    };
+    let human = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .arg("ledger")
+        .args(["--store", &root.path().to_string_lossy()])
+        .args(["--at", AT, "--format", "human"])
+        .args(["--from", FAILED_DAY, "--to", FAILED_DAY])
+        .output()?
+        .stdout;
+    let line = String::from_utf8(human)?
+        .lines()
+        .find(|line| line.trim_start().starts_with(EDGAR))
+        .map(str::to_owned)
+        .ok_or("no human line names the source")?;
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let shown = |field: &str| {
+        words
+            .iter()
+            .position(|word| *word == field)
+            .and_then(|at| words.get(at + 1))
+            .map(|word| (*word).to_owned())
+    };
+    let (held, unreachable) = ("cuts_held_at_limit", "cuts_released_unreachable");
+    assert_eq!(
+        (
+            counted(held),
+            counted(unreachable),
+            shown(held),
+            shown(unreachable)
+        ),
+        (Some(2), Some(7), Some("2".to_owned()), Some("7".to_owned()))
+    );
+    Ok(())
+}
+
 /// Section 8 row R15, decision 10: a held story re-listed under another minute counts for the
 /// source and day of the index attempt it was recorded on, in the JSON row and on the human line.
 #[test]

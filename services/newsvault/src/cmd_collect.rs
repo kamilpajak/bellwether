@@ -19,7 +19,8 @@ use news_provider::request::RequestPhase;
 use news_provider::{
     stamp_of, Archive, ArchiveError, AttemptReceipt, AttemptRow, Clock, Closing, CollectError,
     Collected, CollectedItem, Committed, Credentials, DeferReason, Deferred, Exchange, Exit,
-    Headers, OpenDeferred, Payload, Provider, Relisted, Run, RunId, SourceId, TargetWindow, Wire,
+    Headers, OpenDeferred, Payload, Provider, ReleasedCut, Relisted, Run, RunId, SourceId,
+    TargetWindow, Wire,
 };
 use open_web_feed::{
     Basis, Continuity, CrossChecker, DirectAnswer, Generation, HostRobots, OpenWebFeed, Paging,
@@ -345,6 +346,16 @@ impl Registered {
         match self {
             Self::EdgarPress => edgar_press::CONTACT_CREDENTIAL,
             Self::OpenWebWires => open_web_feed::CONTACT_CREDENTIAL,
+        }
+    }
+
+    /// The provider's `transport().body_limit`, readable without opening it: `ledger` compares
+    /// a cut body with it (section 11.1).
+    #[must_use]
+    pub const fn body_limit(self) -> u64 {
+        match self {
+            Self::EdgarPress => edgar_press::BODY_LIMIT,
+            Self::OpenWebWires => open_web_feed::BODY_LIMIT,
         }
     }
 
@@ -2108,8 +2119,10 @@ impl Archive for Committer {
     fn held_story_ids(
         &self,
         source: &SourceId,
+        body_limit: u64,
     ) -> Result<std::collections::BTreeSet<String>, ArchiveError> {
-        Committer::held_story_ids(self, source).map_err(|why| refused("read the held set", &why))
+        Committer::held_story_ids(self, source, body_limit)
+            .map_err(|why| refused("read the held set", &why))
     }
 
     fn record_planned_coverage(
@@ -2143,6 +2156,15 @@ impl Archive for Committer {
     fn open_deferred(&self, source: &SourceId) -> Result<Vec<OpenDeferred>, ArchiveError> {
         Committer::open_deferred(self, source)
             .map_err(|why| refused("read the deferred rows", &why))
+    }
+
+    fn released_cuts(
+        &self,
+        source: &SourceId,
+        body_limit: u64,
+    ) -> Result<Vec<ReleasedCut>, ArchiveError> {
+        Committer::released_cuts(self, source, body_limit)
+            .map_err(|why| refused("read the released cuts", &why))
     }
 
     fn close_deferred(

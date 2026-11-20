@@ -13,12 +13,13 @@ use chrono::{DateTime, Days, NaiveDate, Utc};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
+use crate::cmd_collect::Registered;
 use crate::cmd_robots::ROBOTS_SOURCE;
 use crate::store::{
     coverage_up_to, newest_visible_publication, require_current_version, unpublished_seq_ranges,
-    SeqRange, WindowCoverage, COMMIT_LOG, RUNS_DIR,
+    SeqRange, WindowCoverage, COMMIT_LOG, REDIRECTS, RUNS_DIR,
 };
-use news_provider::{Closing, DeferReason};
+use news_provider::{Closing, DeferReason, Verdict, CARRY_LIMIT};
 use open_web_feed::Continuity;
 
 pub const SCHEMA: &str = "newsvault.ledger/1";
@@ -207,6 +208,15 @@ pub struct SourceRow {
     /// `payloads.truncated`. 0 for an attempt closed before user_version 6, which stored no
     /// over-limit body, so 0 there does not mean none was over.
     pub bodies_truncated: i64,
+    /// Section 11.1: permanent document failures stored cut at or above the source's current body
+    /// limit (`Registered::body_limit`), not 3xx: their stories are held until the limit is
+    /// raised above the cut. 0 for a source with no registered limit.
+    pub cuts_held_at_limit: i64,
+    /// Section 11.1: permanent document failures stored cut below the current limit, closed more
+    /// than `CARRY_LIMIT` before `--at`, still their story's latest attempt, and with no open
+    /// `deferred` row of the story younger than `CARRY_LIMIT` at `--at` (whose carry would ask it):
+    /// released, too old for `carry` to ask, and read again only if an index lists the story.
+    pub cuts_released_unreachable: i64,
     /// Section 8 row R15, decision 10: `relisted` rows, one per live index attempt and held story
     /// listed under another minute than its kept item's, so k polls count k. 0 also before
     /// user_version 7 and for a listing R15 does not compare, so 0 does not mean no dispute.
@@ -499,6 +509,8 @@ struct Grouped {
     held: i64,
     listing_unusable: i64,
     bodies_truncated: i64,
+    cuts_held_at_limit: i64,
+    cuts_released_unreachable: i64,
     relisted_disputed: i64,
     relisted_compared: i64,
     robots_disallowed: i64,
@@ -523,7 +535,7 @@ pub fn read(root: &Path, ask: &Ask) -> Result<Report, LedgerReadError> {
     require_current_version(&db)?;
     let at = stamp(ask.at);
     let (envelopes, unreadable_runs) = read_envelopes(&root.join(RUNS_DIR), ask.at);
-    let grouped = grouped_attempts(&db, &at)?;
+    let grouped = grouped_attempts(&db, &at, &stamp(ask.at - CARRY_LIMIT))?;
     let in_flight = in_flight_attempts(&db, &at)?;
     let answers = answers_per_attempt(&db, &at)?;
     let deferred = deferred_per_run(&db, &at)?;
@@ -676,11 +688,30 @@ fn code_of(failure: &serde_json::Error) -> &'static str {
 /// The one GROUP BY, across every target window. This is the question the colleague project
 /// answers with three HTTP calls at decision time: "is this vendor down for every name, or is
 /// this one name quiet?" - one aggregate over rows already on disk answers it for every name.
-fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerReadError> {
+fn grouped_attempts(
+    db: &Connection,
+    at: &str,
+    carried_since: &str,
+) -> Result<Vec<Grouped>, LedgerReadError> {
     let [complete, boundary, no_previous, first, unread, id_unread, range_unread] =
         Continuity::ALL.map(Continuity::name);
+    let limits = Registered::ALL
+        .map(|entry| format!("('{}', {})", entry.source(), entry.body_limit()))
+        .join(", ");
+    let permanent = Verdict::PermanentFailure.name();
+    let (low, high) = (REDIRECTS.start(), REDIRECTS.end());
+    let cut_below = |compare: &str| {
+        format!(
+            "EXISTS (SELECT 1 FROM payloads p JOIN blobs b ON b.digest = p.raw_blob
+                      JOIN limits l ON l.source = attempts.source
+                     WHERE p.attempt_id = attempts.attempt_id AND p.truncated = 1
+                       AND b.bytes {compare} l.body_limit)"
+        )
+    };
+    let (held_cut, released_cut) = (cut_below(">="), cut_below("<"));
     let mut statement = db.prepare(&format!(
-        "SELECT run_id, source, COALESCE(outcome, '{IN_FLIGHT}') AS state, COUNT(*),
+        "WITH limits (source, body_limit) AS (VALUES {limits})
+         SELECT run_id, source, COALESCE(outcome, '{IN_FLIGHT}') AS state, COUNT(*),
                 SUM(COALESCE(vendor_rows, 0)), SUM(COALESCE(items_new, 0)),
                 SUM(CASE WHEN vendor_rows IS NOT NULL THEN COALESCE(held, 0) ELSE 0 END),
                 SUM(CASE WHEN vendor_rows IS NOT NULL THEN COALESCE(listing_unusable, 0) ELSE 0 END),
@@ -704,13 +735,31 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
                 SUM(continuity IS '{range_unread}' AND walk_unread IS NOT NULL),
                 SUM(COALESCE(walk_gone, 0)),
                 SUM(COALESCE(walk_other_language, 0)),
-                SUM(COALESCE(walk_unread, 0))
+                SUM(COALESCE(walk_unread, 0)),
+                SUM(CASE WHEN story_id IS NOT NULL AND verdict = '{permanent}'
+                          AND COALESCE(transport_status, 0) NOT BETWEEN {low} AND {high}
+                          AND {held_cut} THEN 1 ELSE 0 END),
+                SUM(CASE WHEN story_id IS NOT NULL AND verdict = '{permanent}'
+                          AND closed_at <= ?2 AND {released_cut}
+                          AND NOT EXISTS (SELECT 1 FROM attempts later
+                                           WHERE later.source = attempts.source
+                                             AND later.story_id = attempts.story_id
+                                             AND later.rowid > attempts.rowid
+                                             AND later.opened_at <= ?1)
+                          AND COALESCE((SELECT MIN(d.deferred_at) FROM deferred d
+                                         WHERE d.source = attempts.source
+                                           AND d.story_id = attempts.story_id
+                                           AND d.deferred_at <= ?1
+                                           AND NOT EXISTS (SELECT 1 FROM deferred_closed c
+                                                            WHERE c.deferred_id = d.deferred_id
+                                                              AND c.closed_at <= ?1)), ?2) <= ?2
+                     THEN 1 ELSE 0 END)
          FROM attempts WHERE opened_at <= ?1
          GROUP BY run_id, source, state
          ORDER BY run_id, source, state"
     ))?;
     let rows = statement
-        .query_map([at], |row| {
+        .query_map([at, carried_since], |row| {
             Ok(Grouped {
                 run_id: row.get(0)?,
                 source: row.get(1)?,
@@ -721,6 +770,8 @@ fn grouped_attempts(db: &Connection, at: &str) -> Result<Vec<Grouped>, LedgerRea
                 held: row.get(6)?,
                 listing_unusable: row.get(7)?,
                 bodies_truncated: row.get(8)?,
+                cuts_held_at_limit: row.get(28)?,
+                cuts_released_unreachable: row.get(29)?,
                 relisted_disputed: row.get(9)?,
                 relisted_compared: row.get(10)?,
                 robots_disallowed: row.get(11)?,
@@ -1062,6 +1113,8 @@ fn day_row(date: NaiveDate, envelopes: &[Envelope], read: &Read, ask: &Ask) -> D
         row.held += entry.held;
         row.listing_unusable += entry.listing_unusable;
         row.bodies_truncated += entry.bodies_truncated;
+        row.cuts_held_at_limit += entry.cuts_held_at_limit;
+        row.cuts_released_unreachable += entry.cuts_released_unreachable;
         row.relisted_disputed += entry.relisted_disputed;
         row.relisted_compared += entry.relisted_compared;
         row.robots_disallowed += entry.robots_disallowed;
@@ -1171,6 +1224,8 @@ impl SourceRow {
             held: 0,
             listing_unusable: 0,
             bodies_truncated: 0,
+            cuts_held_at_limit: 0,
+            cuts_released_unreachable: 0,
             relisted_disputed: 0,
             relisted_compared: 0,
             robots_disallowed: 0,
@@ -1326,6 +1381,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 out,
                 "  {:<14} ok {} empty {} failed {} interrupted {} in-flight {} \
                  vendor_rows {} held {} listing_unusable {} bodies_truncated {} \
+                 cuts_held_at_limit {} cuts_released_unreachable {} \
                  relisted_disputed {} relisted_compared {} robots_disallowed {} \
                  continuity_complete {} continuity_boundary_no_shared_key {} \
                  continuity_no_previous_key {} continuity_first_poll {} \
@@ -1346,6 +1402,8 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 row.held,
                 row.listing_unusable,
                 row.bodies_truncated,
+                row.cuts_held_at_limit,
+                row.cuts_released_unreachable,
                 row.relisted_disputed,
                 row.relisted_compared,
                 row.robots_disallowed,

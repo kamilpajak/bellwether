@@ -85,7 +85,7 @@ use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use news_provider::request::RequestPhase;
 use news_provider::{
     AttemptEvent, AttemptReceipt, Closing, Cost, Deferred, LedgerError, OpenDeferred, OutcomeKind,
-    Payload, Relisted, RunId, Sink, SourceId, TargetWindow, ValidSource, Verdict,
+    Payload, ReleasedCut, Relisted, RunId, Sink, SourceId, TargetWindow, ValidSource, Verdict,
 };
 use pit::datedness::{Datedness, Published};
 use pit::{ObservationTime, Visibility};
@@ -107,7 +107,7 @@ const BLOB_SPACE: &str = "sha256";
 /// One constant for the label `record` writes and `ok_vendor_rows` reads, so the two cannot drift.
 const OUTCOME_OK: &str = "ok";
 /// Statuses a permanent failure is not held under: owner decision of 2026-11-15 (§10).
-const REDIRECTS: std::ops::RangeInclusive<u16> = 300..=399;
+pub(crate) const REDIRECTS: std::ops::RangeInclusive<u16> = 300..=399;
 
 /// Per connection, so set on every open and never part of a schema version.
 const CONNECTION: &str = "
@@ -1506,8 +1506,13 @@ impl Committer {
     }
 
     /// Section 11.1's held read. A NULL status or count is held through the `COALESCE`s: without
-    /// them SQLite evaluates the `NOT (...)` to NULL and drops the row.
-    pub fn held_story_ids(&self, source: &SourceId) -> Result<BTreeSet<String>, StoreError> {
+    /// them SQLite evaluates the `NOT (...)` to NULL and drops the row. `body_limit` is the
+    /// body limit in force now: a cut body is exactly the limit it was cut at (section 3.9).
+    pub fn held_story_ids(
+        &self,
+        source: &SourceId,
+        body_limit: u64,
+    ) -> Result<BTreeSet<String>, StoreError> {
         let mut statement = self.db.prepare(
             "SELECT i.story_id FROM items i
              JOIN attempts a ON a.attempt_id = i.attempt_id
@@ -1517,6 +1522,10 @@ impl Committer {
              WHERE source = ?1 AND story_id IS NOT NULL AND closed_at IS NOT NULL
                AND verdict IN (?2, ?3, ?4)
                AND NOT (verdict = ?4 AND COALESCE(transport_status, 0) BETWEEN ?5 AND ?6)
+               AND NOT (verdict = ?4 AND EXISTS (
+                        SELECT 1 FROM payloads p JOIN blobs b ON b.digest = p.raw_blob
+                         WHERE p.attempt_id = attempts.attempt_id AND p.truncated = 1
+                           AND b.bytes < ?7))
                AND NOT (verdict = ?2 AND COALESCE(listing_unusable, 0) > 0)",
         )?;
         let held = statement
@@ -1527,7 +1536,8 @@ impl Committer {
                     Verdict::Empty.name(),
                     Verdict::PermanentFailure.name(),
                     REDIRECTS.start(),
-                    REDIRECTS.end()
+                    REDIRECTS.end(),
+                    i64::try_from(body_limit).unwrap_or(i64::MAX)
                 ],
                 |row| row.get::<_, String>(0),
             )?
@@ -1670,6 +1680,59 @@ impl Committer {
             )?
             .collect::<Result<Vec<OpenDeferred>, _>>()?;
         Ok(rows)
+    }
+
+    /// Section 11.1's released cuts: each story of `source` whose latest attempt (by rowid, the
+    /// order attempts are opened in) is a permanent failure stored cut shorter than
+    /// `body_limit`. A later attempt of the story, whatever its answer, ends the release, so a
+    /// re-ask is asked once.
+    pub fn released_cuts(
+        &self,
+        source: &SourceId,
+        body_limit: u64,
+    ) -> Result<Vec<ReleasedCut>, StoreError> {
+        let mut statement = self.db.prepare(
+            "SELECT a.story_id, a.target_window, p.url, p.listed_date, a.listed_by, a.closed_at
+               FROM attempts a
+               JOIN payloads p ON p.attempt_id = a.attempt_id
+               JOIN blobs b ON b.digest = p.raw_blob
+              WHERE a.source = ?1 AND a.story_id IS NOT NULL AND a.verdict = ?2
+                AND p.truncated = 1 AND b.bytes < ?3
+                AND NOT EXISTS (SELECT 1 FROM attempts later
+                                 WHERE later.source = a.source AND later.story_id = a.story_id
+                                   AND later.rowid > a.rowid)
+              ORDER BY a.closed_at, a.attempt_id",
+        )?;
+        let released = statement
+            .query_map(
+                params![
+                    source.as_str(),
+                    Verdict::PermanentFailure.name(),
+                    i64::try_from(body_limit).unwrap_or(i64::MAX),
+                ],
+                |row| {
+                    let at: String = row.get(5)?;
+                    let closed_at = DateTime::parse_from_rfc3339(&at)
+                        .map_err(|failure| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Text,
+                                Box::new(failure),
+                            )
+                        })?
+                        .with_timezone(&Utc);
+                    Ok(ReleasedCut {
+                        story_id: row.get(0)?,
+                        target_window: row.get(1)?,
+                        url: row.get(2)?,
+                        listed_date: row.get(3)?,
+                        listed_by: row.get(4)?,
+                        closed_at,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<ReleasedCut>, _>>()?;
+        Ok(released)
     }
 
     /// One `deferred_closed` row per id under this store's run, in one transaction; a row closed
@@ -6347,7 +6410,7 @@ mod tests {
         store.record(closed, None, &[], at(10))?;
         let in_flight = document_slot(&mut store, here, "in flight", 6)?;
         drop(in_flight);
-        let held = store.held_story_ids(&SourceId::new(SOURCE))?;
+        let held = store.held_story_ids(&SourceId::new(SOURCE), LIMIT_NOW)?;
         assert_eq!(
             held,
             [STORY, "usable, no item", "empty", "permanent"]
@@ -6380,13 +6443,94 @@ mod tests {
             a_document_answered(&mut store, here, (story, ordinal), failed, status)?;
         }
         a_document_closed(&mut store, here, "usable", 6, Verdict::Usable)?;
-        let held = store.held_story_ids(&SourceId::new(SOURCE))?;
+        let held = store.held_story_ids(&SourceId::new(SOURCE), LIMIT_NOW)?;
         assert_eq!(
             held,
             ["400", "404", "no status", "usable"]
                 .map(|story| story_hex(SOURCE, story))
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>()
+        );
+        Ok(())
+    }
+
+    /// The body limit in force for the held read's tests: only its relation to a cut's length
+    /// matters, and a body of exactly the limit is read whole (`news_provider::wire::read_up_to`).
+    const LIMIT_NOW: u64 = 1_024;
+    const STATUS_NOT_FOUND: u16 = 404;
+
+    /// A status, the body answered with it, and whether that body is stored cut.
+    type Failed<'body> = (u16, &'body [u8], bool);
+
+    /// A Document attempt under (SOURCE, WINDOW) closed `permanent_failure` with `status`, its
+    /// `body` linked as its payload and marked cut when `truncated`.
+    fn a_document_failed_with_body(
+        store: &mut Committer,
+        (source_item_id, ordinal): (&str, u32),
+        (status, body, truncated): Failed,
+    ) -> TestResult {
+        let slot = document_slot(store, (SOURCE, WINDOW), source_item_id, ordinal)?;
+        let attempt = slot.attempt_id().clone();
+        let answer = Ok(RawResponse::new(
+            attempt,
+            status,
+            body.to_vec(),
+            at(2),
+            at(3),
+        ));
+        let outcome = Outcome::decide(
+            &Verdict::PermanentFailure,
+            Counts {
+                vendor_rows: 0,
+                listing_unusable: 0,
+                robots_disallowed: 0,
+            },
+            &Baseline::from_trailing_ok(&TRAILING_OK),
+        );
+        let closed = slot.close(store, outcome, &answer, at(4))?;
+        let raw = store.put_blob(body)?;
+        let payload = Payload {
+            truncated,
+            ..a_payload(&raw)
+        };
+        store.record(closed, Some(&payload), &[], at(5))?;
+        Ok(())
+    }
+
+    /// Section 11.1, owner decision of 2026-11-20: a permanent failure stored cut holds its story
+    /// while the limit in force is at most the cut's length, and nothing once a larger one is; a
+    /// whole body holds at any length. Mutations 2026-11-20 in §8 row R23.
+    #[test]
+    fn a_cut_body_is_held_until_a_limit_above_its_length_is_in_force() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let limit = usize::try_from(LIMIT_NOW)?;
+        let at_the_limit = vec![b'x'; limit];
+        let at_half = vec![b'y'; limit / 2];
+        let bodies: [(&str, Failed); 3] = [
+            ("cut at the limit", (STATUS_OK, &at_the_limit, true)),
+            ("cut at half", (STATUS_OK, &at_half, true)),
+            ("whole, 404", (STATUS_NOT_FOUND, b"gone", false)),
+        ];
+        for ((story, failed), ordinal) in bodies.into_iter().zip(0..) {
+            a_document_failed_with_body(&mut store, (story, ordinal), failed)?;
+        }
+        let source = SourceId::new(SOURCE);
+        let named = |stories: &[&str]| -> std::collections::BTreeSet<String> {
+            stories
+                .iter()
+                .map(|story| story_hex(SOURCE, story))
+                .collect()
+        };
+        assert_eq!(
+            (
+                store.held_story_ids(&source, LIMIT_NOW)?,
+                store.held_story_ids(&source, LIMIT_NOW / 2)?
+            ),
+            (
+                named(&["cut at the limit", "whole, 404"]),
+                named(&["cut at the limit", "cut at half", "whole, 404"])
+            )
         );
         Ok(())
     }
@@ -6413,7 +6557,7 @@ mod tests {
             "UPDATE attempts SET listing_unusable = NULL WHERE story_id = ?1",
             params![story_hex(SOURCE, "usable, listing count NULL")],
         )?;
-        let held = store.held_story_ids(&SourceId::new(SOURCE))?;
+        let held = store.held_story_ids(&SourceId::new(SOURCE), LIMIT_NOW)?;
         assert_eq!(
             held,
             ["usable, listing count NULL", "usable, page unusable"]
@@ -6482,7 +6626,7 @@ mod tests {
             4,
             failed,
         )?;
-        let held = store.held_story_ids(&SourceId::new(SOURCE))?;
+        let held = store.held_story_ids(&SourceId::new(SOURCE), LIMIT_NOW)?;
         assert_eq!(
             held,
             [STORY, "yesterday", "today"]
@@ -6493,22 +6637,60 @@ mod tests {
         Ok(())
     }
 
+    /// Parameters the guard below lets through, each with why it is no row cap and no slice.
+    const NOT_A_ROW_CAP_OR_SLICE: [&str; 2] = [
+        // A byte length compared with a stored cut's `blobs.bytes` (section 11.1).
+        "body_limit: u64",
+        // The partition key, matched by equality: the day a request targets, not a run of rows.
+        "target: &TargetWindow",
+    ];
+
+    /// Each top-level parameter of the `(...)` that opens `signature`, trimmed.
+    fn parameters(signature: &str) -> Vec<String> {
+        let (mut depth, mut current, mut found) = (0_i32, String::new(), Vec::new());
+        for character in signature.chars().skip_while(|c| *c != '(') {
+            match character {
+                '(' | '<' | '[' => depth += 1,
+                ')' | '>' | ']' => depth -= 1,
+                _ => {}
+            }
+            if (character == ',' && depth == 1) || depth == 0 {
+                found.push(current.trim().trim_start_matches('(').trim().to_owned());
+                current.clear();
+            } else {
+                current.push(character);
+            }
+            if depth == 0 {
+                break;
+            }
+        }
+        found.retain(|parameter| !parameter.is_empty());
+        found
+    }
+
+    /// The store never takes a row count or a slice; the caller slices and states how (731a027,
+    /// `ok_vendor_rows`). Checks each `pub fn` parameter's name and type, lowercased, not fn
+    /// names or return types. Mutations 2026-11-20 in §8 row R23.
     #[test]
-    fn the_public_write_api_has_no_limit_or_window_parameter() {
+    fn no_public_store_fn_takes_a_row_cap_or_a_slice_parameter() {
         let marker = format!("#[cfg({})]", "test");
         let production = include_str!("store.rs")
             .split(&marker)
             .next()
             .unwrap_or_default()
             .to_owned();
-        let mut carrying: Vec<&str> = Vec::new();
+        let mut carrying: Vec<String> = Vec::new();
         for item in production.split("pub fn ").skip(1) {
             let signature = item.split('{').next().unwrap_or_default();
-            if signature.contains("limit") || signature.contains("window") {
-                carrying.push(signature);
+            for parameter in parameters(signature) {
+                let lowered = parameter.to_lowercase();
+                let named = lowered.contains("limit") || lowered.contains("window");
+                if named && !NOT_A_ROW_CAP_OR_SLICE.contains(&parameter.as_str()) {
+                    carrying.push(parameter);
+                }
             }
         }
-        assert_eq!(carrying, Vec::<&str>::new());
+        assert_eq!(carrying, Vec::<String>::new());
     }
 
     #[test]

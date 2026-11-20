@@ -16,6 +16,7 @@ use newsvault::cmd_collect::Registered;
 use newsvault::cmd_ledger;
 use newsvault::cmd_robots::{self, Ask, Emitted, RobotsError, RobotsExit, ROBOTS_SOURCE};
 use newsvault::store::{StoreError, COMMIT_LOG, RUNS_DIR};
+use open_web_feed::BODY_LIMIT;
 use pit::ObservationTime;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
@@ -523,8 +524,6 @@ fn refused_robots_redirect(truncated: bool, bytes: i64) -> Refreshed {
 
 /// The loopback 301's body, `b"moved"` in `tests/loopback/mod.rs`.
 const MOVED_BODY_BYTES: i64 = 5;
-/// open-web's `BODY_LIMIT` (2 MiB, `providers/open-web-feed/src/lib.rs`), private to that crate.
-const OPEN_WEB_BODY_LIMIT: i64 = 2 * 1_024 * 1_024;
 
 /// Section 11.2, §11.5 step 5: the refresh's open-web `Wire` refuses a robots.txt 3xx, so the
 /// target, which serves the pinned body, is never fetched. Mutations 2026-11-15, open-web following
@@ -545,7 +544,7 @@ fn a_robots_redirect_is_a_permanent_failure_with_no_robots_row_and_its_target_ne
 fn a_robots_redirect_whose_body_is_over_the_limit_keeps_its_status() -> TestResult {
     assert_eq!(
         refreshed_through_a_redirect(true)?,
-        refused_robots_redirect(true, OPEN_WEB_BODY_LIMIT)
+        refused_robots_redirect(true, i64::try_from(BODY_LIMIT)?)
     );
     Ok(())
 }

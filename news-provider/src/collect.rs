@@ -213,6 +213,18 @@ pub struct OpenDeferred {
     pub listed_by: Option<String>,
 }
 
+/// A story whose latest attempt is a permanent failure stored cut shorter than the limit in force
+/// (section 11.1): what [`carry`] needs to ask it once more, read from that attempt and its payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleasedCut {
+    pub story_id: String,
+    pub target_window: String,
+    pub url: String,
+    pub listed_date: Option<String>,
+    pub listed_by: Option<String>,
+    pub closed_at: DateTime<Utc>,
+}
+
 /// How an open `deferred` row is closed (S7-D5), stored by its [`Closing::name`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Closing {
@@ -344,11 +356,13 @@ pub trait Archive: Sink {
 
     /// The story ids this archive holds under `source` across EVERY target window: a committed
     /// item, or a closed Document attempt whose verdict was usable, empty or permanent. A transient
-    /// failure, a permanent failure answered with a 3xx, a usable attempt with an unusable row the
-    /// index row decided, a swept attempt and one in flight hold nothing (section 11.1).
+    /// failure, a permanent failure answered with a 3xx, a permanent failure whose body was stored
+    /// cut shorter than `body_limit` (the limit in force now), a usable attempt with an unusable
+    /// row the index row decided, a swept attempt and one in flight hold nothing (section 11.1).
     fn held_story_ids(
         &self,
         source: &SourceId,
+        body_limit: u64,
     ) -> Result<std::collections::BTreeSet<String>, ArchiveError>;
 
     /// Records how many in-universe follow-ups an index attempt named: the denominator the coverage
@@ -380,6 +394,14 @@ pub trait Archive: Sink {
 
     /// S7-D5's reader: the source's open `Document` rows, oldest `deferred_at` first.
     fn open_deferred(&self, source: &SourceId) -> Result<Vec<OpenDeferred>, ArchiveError>;
+
+    /// Section 11.1: each story of `source` whose LATEST attempt is a permanent failure stored cut
+    /// shorter than `body_limit`, oldest first; [`carry`] applies [`CARRY_LIMIT`].
+    fn released_cuts(
+        &self,
+        source: &SourceId,
+        body_limit: u64,
+    ) -> Result<Vec<ReleasedCut>, ArchiveError>;
 
     /// Closes each of `deferred_ids` as `closing` at `at`; a row is closed once, never updated.
     fn close_deferred(
@@ -694,11 +716,16 @@ pub fn collect<A: Archive>(
         baseline: &baseline,
     };
     let started = clock.now();
-    let (carried, carrying) = carry(provider, archive, started)?;
+    let CarryPlan {
+        carried,
+        queued: carrying,
+        reasked,
+    } = carry(provider, archive, started)?;
     let mut issued: BTreeSet<String> = carried
         .iter()
         .filter(|item| item.queued)
         .filter_map(|item| item.story_id.clone())
+        .chain(reasked)
         .collect();
     collected.carried = carried;
     let mut queue = HostQueue::of(plan.requests, provider.follow_up_cap());
@@ -830,20 +857,70 @@ pub fn collect<A: Archive>(
     Ok(collected)
 }
 
+/// What [`carry`] hands the run: every carried item, the requests it queued, and the stories of
+/// the released cuts among them.
+struct CarryPlan {
+    carried: Vec<Carried>,
+    queued: Vec<Queued>,
+    reasked: BTreeSet<String>,
+}
+
 /// S7-D5: the source's open `Document` rows, one item per url in the order of its oldest row. An
 /// item whose story the archive holds is closed `held`; the provider rebuilds each other item
-/// younger than [`CARRY_LIMIT`], and [`close_uncarried`] decides the rest at the run's end.
+/// younger than [`CARRY_LIMIT`], and [`close_uncarried`] decides the rest at the run's end. Then
+/// each [`ReleasedCut`] younger than [`CARRY_LIMIT`] is rebuilt and queued once, with no
+/// `deferred` row, and its story returned so no listing of this run issues it again (§11.1).
 fn carry<A: Archive>(
     provider: &dyn Provider,
     archive: &mut A,
     now: DateTime<Utc>,
-) -> Result<(Vec<Carried>, Vec<Queued>), CollectError> {
+) -> Result<CarryPlan, CollectError> {
     let source = provider.source();
+    let body_limit = provider.transport().body_limit;
     let open = archive.open_deferred(&source)?;
+    let released = archive.released_cuts(&source, body_limit)?;
+    let (carried, mut queued) = carry_deferred(provider, archive, open, now)?;
+    let carrying: BTreeSet<&str> = carried
+        .iter()
+        .filter(|item| item.queued)
+        .filter_map(|item| item.story_id.as_deref())
+        .collect();
+    let mut reasked = BTreeSet::new();
+    for cut in released {
+        if now - cut.closed_at >= CARRY_LIMIT || carrying.contains(cut.story_id.as_str()) {
+            continue;
+        }
+        let target = TargetWindow::new(&cut.target_window);
+        let Some(request) = provider.carried(&target, &cut.url, cut.listed_date.as_deref()) else {
+            continue;
+        };
+        reasked.insert(cut.story_id);
+        queued.push(Queued {
+            counted: !provider.is_walk_id(&request),
+            request,
+            retries: 0,
+            carried: Vec::new(),
+            listed_by: cut.listed_by,
+        });
+    }
+    Ok(CarryPlan {
+        carried,
+        queued,
+        reasked,
+    })
+}
+
+fn carry_deferred<A: Archive>(
+    provider: &dyn Provider,
+    archive: &mut A,
+    open: Vec<OpenDeferred>,
+    now: DateTime<Utc>,
+) -> Result<(Vec<Carried>, Vec<Queued>), CollectError> {
     if open.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let held = archive.held_story_ids(&source)?;
+    let source = provider.source();
+    let held = archive.held_story_ids(&source, provider.transport().body_limit)?;
     let mut items: Vec<(String, Vec<OpenDeferred>)> = Vec::new();
     for row in open {
         match items.iter_mut().find(|(url, _)| *url == row.url) {
@@ -1352,7 +1429,7 @@ fn attempt_once<A: Archive>(
                 archive.record_planned_coverage(&attempt_id, matched)?;
                 archive.covered_story_ids(&request.source, &request.target_window)?
             } else {
-                archive.held_story_ids(&request.source)?
+                archive.held_story_ids(&request.source, provider.transport().body_limit)?
             };
             let in_run: BTreeSet<String> = issued.difference(&stories).cloned().collect();
             stories.extend(issued.iter().cloned());
