@@ -5614,17 +5614,28 @@ fn capped_run_carrying(
     extra: usize,
     carried: &[(&str, Option<&str>)],
 ) -> Result<CappedRun, Box<dyn Error>> {
+    capped_run_seeded(extra, &|store| {
+        for (url, listed) in carried {
+            an_open_row(
+                store,
+                url,
+                None,
+                *listed,
+                instant(MONDAY_AT) - TimeDelta::hours(1),
+            )?;
+        }
+        Ok(())
+    })
+}
+
+/// [`capped_run`] over a store `seed` writes to before the run.
+fn capped_run_seeded(
+    extra: usize,
+    seed: &dyn Fn(&Path) -> TestResult,
+) -> Result<CappedRun, Box<dyn Error>> {
     let root = TempDir::new()?;
     seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
-    for (url, listed) in carried {
-        an_open_row(
-            root.path(),
-            url,
-            None,
-            *listed,
-            instant(MONDAY_AT) - TimeDelta::hours(1),
-        )?;
-    }
+    seed(root.path())?;
     let (sitemap, urls) = cnw_sitemap_with(extra)?;
     let mut exchange = Gnw::five_hosts()?;
     exchange.pages.insert(CNW_INDEX.to_owned(), sitemap);
@@ -5701,6 +5712,54 @@ fn a_run_of_exactly_300_follow_ups_asks_every_one_and_defers_none() -> TestResul
             stored_deferred(root.path())?.len(),
         ),
         (Exit::Ok, FOLLOW_UP_CAP, Some(0), 0)
+    );
+    Ok(())
+}
+
+/// A CNW release no sitemap lists, stored cut under `OLD_BODY_LIMIT` an hour before `MONDAY_AT`.
+fn a_released_cnw_cut(store: &Path) -> TestResult {
+    let url = format!("{CNW_RELEASE_PREFIX}released-cut-799999999.html");
+    let story = digest(canon::digest::story_id(
+        SOURCE,
+        url.trim_start_matches("https://"),
+    ));
+    let closed = micros(instant(MONDAY_AT) - TimeDelta::hours(1));
+    let cut = canon::FileDigest::of(&vec![b'x'; OLD_BODY_LIMIT]);
+    let blob = cut.hex();
+    let db = Connection::open(store.join(COMMIT_LOG))?;
+    db.execute(
+        "INSERT INTO attempts (attempt_id, run_id, source, target_window, filter_params,
+                               universe_version, opened_at, closed_at, transport_status,
+                               outcome, verdict, story_id)
+         VALUES ('released-cut', ?1, ?2, '2026-11-16', 'fp', 'uv', ?3, ?3, 200, 'failed',
+                 'permanent_failure', ?4)",
+        rusqlite::params![EARLIER_RUN, SOURCE, closed, story],
+    )?;
+    db.execute(
+        "INSERT INTO blobs (digest, bytes, first_indexed_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![blob, i64::try_from(OLD_BODY_LIMIT)?, closed],
+    )?;
+    db.execute(
+        "INSERT INTO payloads (attempt_id, url, phase, raw_blob, headers, truncated)
+         VALUES ('released-cut', ?1, 'document', ?2, '[]', 1)",
+        rusqlite::params![url, blob],
+    )?;
+    Ok(())
+}
+
+/// Section 11.1, S7-D6: a re-ask counts against the follow-up cap, so beside 300 listed
+/// follow-ups one is deferred `follow_up_cap`. Mutation 2026-11-21 in §8 row R23.
+#[test]
+fn a_reask_counts_against_the_follow_up_cap() -> TestResult {
+    let extra = FOLLOW_UP_CAP - READMITTED_FOLLOW_UPS;
+    let (root, answer, _, _) = capped_run_seeded(extra, &a_released_cnw_cut)?;
+    let reasons: Vec<String> = stored_deferred(root.path())?
+        .into_iter()
+        .map(|row| row.8)
+        .collect();
+    assert_eq!(
+        (document_attempts(&answer.envelope), reasons),
+        (FOLLOW_UP_CAP, vec!["follow_up_cap".to_owned()])
     );
     Ok(())
 }
