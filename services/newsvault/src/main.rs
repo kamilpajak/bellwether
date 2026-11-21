@@ -958,15 +958,32 @@ fn run_blobs(action: BlobsAction) -> anyhow::Result<Verdict> {
         BlobsAction::Verify { store, limit, .. } => cmd_blobs::verify(&vault_root(store), limit)
             .map(|report| {
                 let sound = report.is_sound();
+                let indexed = report.indexed.map_or_else(
+                    || " indexed -".to_owned(),
+                    |indexed| {
+                        format!(
+                            " indexed rows {} absent {} length differs {}",
+                            indexed.rows, indexed.absent, indexed.length_differs
+                        )
+                    },
+                );
+                let shown: String = report
+                    .failures
+                    .iter()
+                    .map(|failure| format!("\nfailure {} {}", failure.code, failure.blob))
+                    .collect();
                 (
                     serde_json::to_value(&report),
                     format!(
-                        "{} blobs {} verified {} failed {} both copies {}",
+                        "{} blobs {} verified {} failed {} listing failed {} both copies {} \
+                         staging leftovers {}{indexed}{shown}",
                         report.store,
                         report.blobs,
                         report.verified,
                         report.failed,
-                        report.both_copies
+                        report.listing_failed,
+                        report.both_copies,
+                        report.staging_leftovers,
                     ),
                     if sound {
                         Verdict::Ok
@@ -992,10 +1009,12 @@ fn run_blobs(action: BlobsAction) -> anyhow::Result<Verdict> {
             (
                 serde_json::to_value(&report),
                 format!(
-                    "{} raw {} compressed {} failed {} bytes {} -> {}{}",
+                    "{} raw {} compressed {} replaced {} staging removed {} failed {} bytes {} -> {}{}",
                     report.store,
                     report.raw_found,
                     report.compressed,
+                    report.replaced,
+                    report.staging_removed,
                     report.failed,
                     report.raw_bytes,
                     report.compressed_stored_bytes,
@@ -1454,7 +1473,7 @@ fn print_schema(format: Format) {
                 "output": cmd_blobs::VERIFY_SCHEMA,
                 "exits": {
                     "0": "every blob reads back to its digest and every blobs row names a file of its length",
-                    "1": "the answer is no: failures, indexed.absent or indexed.length_differs is not 0",
+                    "1": "the answer is no: failed, listing_failed, indexed.absent or indexed.length_differs is not 0",
                     "2": "input_schema_mismatch, io_failed",
                     "4": "input_absent: no store directory"
                 },
@@ -1462,7 +1481,7 @@ fn print_schema(format: Format) {
             },
             {
                 "path": ["blobs", "compress"],
-                "summary": "Rewrites every raw blob as one zstd frame with the active dictionary, under the store's lease; removes the raw file only after the compressed copy is renamed, fsynced and read back to the digest. Idempotent and resumable.",
+                "summary": "Rewrites every raw blob as one zstd frame with the active dictionary, under the store's LOCK lease; first removes staging files a crash left; removes a raw file only after the compressed copy is renamed, fsynced and read back to the digest, and rewrites a compressed copy left beside it that does not read back. Idempotent and resumable. The backup's tar does not take LOCK: run it under the host lock the systemd units take.",
                 "options": [
                     {"name": "store", "type": "path"},
                     {"name": "allow_no_dictionary", "type": "flag",
@@ -1501,7 +1520,7 @@ fn print_schema(format: Format) {
                 "output": cmd_blobs::DICTIONARY_SCHEMA,
                 "exits": {
                     "0": "trained; changed false when that dictionary was already the active one",
-                    "2": "input_unparseable (zstd refused to train), input_schema_mismatch, io_failed",
+                    "2": "invalid_argument (--samples or --holdout 0), input_unparseable (zstd refused to train), input_schema_mismatch, io_failed",
                     "4": "input_absent: no commit log, or fewer payloads than samples plus holdout",
                     "7": "lease_held"
                 },

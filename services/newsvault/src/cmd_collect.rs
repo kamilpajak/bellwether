@@ -1407,13 +1407,16 @@ fn read_failure(code: &str, message: String) -> Value {
     json!({"code": code, "message": message})
 }
 
+/// Through the writer's own `BlobStore`, so each dictionary is loaded once per run.
 fn read_blob(store: &Committer, hex: &str) -> Result<Vec<u8>, Value> {
-    match crate::store::blob_bytes(store.root(), hex) {
-        Ok(Some(bytes)) => Ok(bytes),
-        Ok(None) => Err(read_failure(
+    let Some(digest) = store.blobs().named(hex) else {
+        return Err(read_failure(
             "blob_absent",
             format!("no blob is stored under {hex}"),
-        )),
+        ));
+    };
+    match store.blobs().read_verified(&digest) {
+        Ok(bytes) => Ok(bytes),
         Err(failure @ StoreError::BlobAltered { .. }) => {
             Err(read_failure("blob_altered", failure.to_string()))
         }

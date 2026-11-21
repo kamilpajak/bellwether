@@ -1576,14 +1576,22 @@ impl Committer {
         &self.blobs
     }
 
+    /// Removes every staging file in the blob tree: under this lease no other write is in
+    /// flight, so each is what a crash or a failed write left (§3.9, `blobs compress`).
+    pub fn remove_staging_leftovers(&self) -> Result<usize, StoreError> {
+        self.blobs.remove_staging_files()
+    }
+
     /// Files a dictionary already stored by [`BlobStore::store_dictionary`] and makes it the one
-    /// `put` compresses with. `false` when it was already the active one.
+    /// `put` compresses with. `false` when it was already the active one. The file is loaded
+    /// first, so no activation row ever names a dictionary the store does not hold.
     pub fn record_dictionary(
         &mut self,
         dictionary: &Dictionary,
         trained: &Trained,
         at: DateTime<Utc>,
     ) -> Result<bool, StoreError> {
+        self.blobs.load_dictionary(dictionary.hex())?;
         let stamped = stamp(at);
         let transaction = self.db.transaction()?;
         transaction.execute(
@@ -6909,7 +6917,7 @@ mod tests {
         let mut store = open(&temp)?;
         let closed = closed_attempt(&mut store, 0, Verdict::Usable)?;
         let stored = rows(&store, 1)?;
-        fs::remove_file(store.blobs.compressed_path_of(&stored[0].raw_blob))?;
+        fs::remove_file(store.blobs.path_of(&stored[0].raw_blob))?;
         let refused = store.record(closed, None, &stored, at(5));
         assert!(
             matches!(refused, Err(StoreError::BlobAbsent { .. })),
@@ -6923,7 +6931,7 @@ mod tests {
         let temp = TempDir::new()?;
         let store = open(&temp)?;
         let digest = store.put_blob(PAYLOAD)?;
-        fs::remove_file(store.blobs.compressed_path_of(&digest))?;
+        fs::remove_file(store.blobs.path_of(&digest))?;
         let staging = store.blobs.staging_path(RUN, &digest);
         fs::write(&staging, SENTINEL)?;
         let refused = store.put_blob(PAYLOAD);
@@ -6938,9 +6946,9 @@ mod tests {
         let temp = TempDir::new()?;
         let store = open(&temp)?;
         let first = store.put_blob(PAYLOAD)?;
-        let before = fs::metadata(store.blobs.compressed_path_of(&first))?.ino();
+        let before = fs::metadata(store.blobs.path_of(&first))?.ino();
         let second = store.put_blob(PAYLOAD)?;
-        let after = fs::metadata(store.blobs.compressed_path_of(&second))?.ino();
+        let after = fs::metadata(store.blobs.path_of(&second))?.ino();
         assert_eq!((first, before), (second, after));
         Ok(())
     }

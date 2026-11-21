@@ -369,6 +369,273 @@ fn the_bytes_a_reader_gets_are_the_same_before_and_after_the_rewrite() -> TestRe
     Ok(())
 }
 
+fn zst_path(store: &Path, hex: &str) -> PathBuf {
+    let mut path = raw_path(store, hex).into_os_string();
+    path.push(".zst");
+    PathBuf::from(path)
+}
+
+/// A valid `.zst` file holding `payload` with no dictionary: what `compress_raw` writes for it.
+fn frame_of(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+    let scratch = TempDir::new()?;
+    let blobs = store::blob_store(scratch.path());
+    let digest = blobs.put("scratch", payload)?;
+    blobs.compress_raw("scratch", &digest)?;
+    Ok(std::fs::read(blobs.compressed_path_of(&digest))?)
+}
+
+fn user_version(store: &Path) -> Result<i64, Box<dyn Error>> {
+    let db = Connection::open(store.join(COMMIT_LOG))?;
+    Ok(db.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+}
+
+/// A walk that could not read part of the tree has not verified it. Mutation 2026-11-21,
+/// `is_sound` ignoring `listing_failed`: red.
+#[test]
+fn verify_answers_no_for_a_file_in_the_tree_that_names_no_digest() -> TestResult {
+    let (root, pages, _) = compressed_store()?;
+    let leaf = raw_path(root.path(), &sha256(&pages[0]));
+    let stray = leaf.with_file_name("notes.txt");
+    std::fs::write(&stray, b"x")?;
+    let output = newsvault(root.path(), &["blobs", "verify"])?;
+    let report = answered(&output)?;
+    assert_eq!(
+        (
+            output.status.code(),
+            report["failed"].as_u64(),
+            report["listing_failed"].as_u64(),
+            report["failures"][0]["code"].as_str(),
+        ),
+        (Some(1), Some(0), Some(1), Some("blob_stray"))
+    );
+    Ok(())
+}
+
+/// A `blobs` row whose file is gone in both forms is the answer no, in both renderings.
+/// Mutation 2026-11-21, `is_sound` ignoring `indexed.absent`: red.
+#[test]
+fn verify_answers_no_for_a_row_whose_file_is_gone() -> TestResult {
+    let (root, pages, _) = compressed_store()?;
+    std::fs::remove_file(zst_path(root.path(), &sha256(&pages[0])))?;
+    let output = newsvault(root.path(), &["blobs", "verify"])?;
+    let report = answered(&output)?;
+    let human = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .args(["blobs", "verify", "--store"])
+        .arg(root.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert_eq!(
+        (
+            output.status.code(),
+            report["indexed"]["absent"].as_u64(),
+            report["failed"].as_u64(),
+            human.status.code(),
+            String::from_utf8_lossy(&human.stdout).contains(" absent 1 "),
+        ),
+        (Some(1), Some(1), Some(0), Some(1), true)
+    );
+    Ok(())
+}
+
+/// The bulk read re-hashes: a valid frame of other bytes, and a bad `.zst` left beside a good
+/// raw file, are each `blob_altered`. Mutations 2026-11-21, `stream` decoding without
+/// re-hashing, and verify skipping the second copy of a digest held twice: red, each.
+#[test]
+fn verify_answers_no_for_a_frame_of_other_bytes_in_either_place() -> TestResult {
+    let (root, pages, _) = compressed_store()?;
+    let altered = sha256(&pages[0]);
+    std::fs::write(zst_path(root.path(), &altered), frame_of(b"other bytes")?)?;
+    let alone = newsvault(root.path(), &["blobs", "verify"])?;
+    let (root, pages) = legacy_store()?;
+    let beside = sha256(&pages[0]);
+    std::fs::write(zst_path(root.path(), &beside), frame_of(b"other bytes")?)?;
+    let twice = newsvault(root.path(), &["blobs", "verify"])?;
+    let (alone_report, twice_report) = (answered(&alone)?, answered(&twice)?);
+    assert_eq!(
+        (
+            (alone.status.code(), twice.status.code()),
+            alone_report["failures"][0]["code"].as_str(),
+            alone_report["failures"][0]["blob"].as_str(),
+            twice_report["failures"][0]["code"].as_str(),
+            twice_report["failures"][0]["blob"].as_str(),
+            twice_report["both_copies"].as_u64(),
+        ),
+        (
+            (Some(1), Some(1)),
+            Some("blob_altered"),
+            Some(altered.as_str()),
+            Some("blob_altered"),
+            Some(beside.as_str()),
+            Some(1)
+        )
+    );
+    Ok(())
+}
+
+/// A retrain activates the new dictionary: the newest activation is the one a writer uses.
+/// Mutation 2026-11-21, `active_dictionary` ordering by `activation ASC`: red.
+#[test]
+fn a_second_dictionary_trained_is_the_one_every_later_write_names() -> TestResult {
+    let (root, _) = legacy_store()?;
+    let first = answered(&train(root.path(), &[])?)?;
+    let second = answered(&newsvault(
+        root.path(),
+        &[
+            "blobs",
+            "dictionary",
+            "train",
+            "--samples",
+            "30",
+            "--holdout",
+            HOLDOUT,
+        ],
+    )?)?;
+    let committer = Committer::open(root.path(), &RunId::new("a-collect"))?;
+    let digest = committer.put_blob(b"<html><p>a page after the retrain</p></html>")?;
+    let read = committer.blobs().read_copy(&digest, Encoding::Zstd)?;
+    assert_eq!(
+        (
+            first["dictionary"] == second["dictionary"],
+            second["active"] == second["dictionary"],
+            read.dictionary.as_deref(),
+            counted(root.path(), "dictionary_activations")?,
+        ),
+        (false, true, second["dictionary"].as_str(), 2)
+    );
+    Ok(())
+}
+
+/// The read-only commands work on a store from before user_version 16 while a writer holds the
+/// lease, and leave its version alone. Mutations 2026-11-21, the `holds_table` guards removed;
+/// the compress dry run and the train dry run opening a `Committer`: red, each.
+#[test]
+fn verify_and_both_dry_runs_read_a_v15_store_under_a_held_lease_without_migrating_it() -> TestResult
+{
+    let (root, _) = legacy_store()?;
+    Connection::open(root.path().join(COMMIT_LOG))?.execute_batch(
+        "DROP TABLE dictionary_activations; DROP TABLE dictionaries; PRAGMA user_version = 15;",
+    )?;
+    let lease = std::fs::File::open(root.path().join("LOCK"))?;
+    lease.try_lock()?;
+    let runs = [
+        newsvault(root.path(), &["blobs", "verify"])?,
+        train(root.path(), &["--dry-run"])?,
+        newsvault(
+            root.path(),
+            &["blobs", "compress", "--dry-run", "--allow-no-dictionary"],
+        )?,
+    ];
+    drop(lease);
+    assert_eq!(
+        (
+            runs.map(|run| run.status.code()),
+            user_version(root.path())?
+        ),
+        ([Some(0); 3], 15)
+    );
+    Ok(())
+}
+
+/// A blob that fails its rewrite keeps its raw file and the run says so with exit 8. Here the
+/// raw file no longer hashes to its name. Mutation 2026-11-21, `is_complete` always true: red.
+#[test]
+fn compress_exits_eight_when_a_blob_fails_and_keeps_its_raw_file() -> TestResult {
+    let (root, pages) = legacy_store()?;
+    train(root.path(), &[])?;
+    let damaged = raw_path(root.path(), &sha256(&pages[0]));
+    std::fs::write(&damaged, b"other bytes")?;
+    let output = newsvault(root.path(), &["blobs", "compress"])?;
+    let report = answered(&output)?;
+    assert_eq!(
+        (
+            output.status.code(),
+            report["failed"].as_u64(),
+            report["failures"][0]["code"].as_str(),
+            std::fs::read(&damaged)?,
+        ),
+        (
+            Some(8),
+            Some(1),
+            Some("blob_altered"),
+            b"other bytes".to_vec()
+        )
+    );
+    Ok(())
+}
+
+/// Under its lease compress removes the staging files a crash left, which the backup's tar
+/// would otherwise carry, and replaces a leftover `.zst` that does not decode. Mutation
+/// 2026-11-21, compress not calling `remove_staging_leftovers`: red.
+#[test]
+fn compress_removes_staging_leftovers_and_replaces_a_bad_leftover_copy() -> TestResult {
+    let (root, pages) = legacy_store()?;
+    train(root.path(), &[])?;
+    let staging = root.path().join("blobs/sha256/.tmp-crashed-run-0");
+    std::fs::write(&staging, b"part")?;
+    let hex = sha256(&pages[0]);
+    std::fs::write(zst_path(root.path(), &hex), &pages[0])?;
+    let output = newsvault(root.path(), &["blobs", "compress"])?;
+    let report = answered(&output)?;
+    assert_eq!(
+        (
+            output.status.code(),
+            report["staging_removed"].as_u64(),
+            report["replaced"].as_u64(),
+            staging.exists(),
+            store::blob_bytes(root.path(), &hex)?,
+        ),
+        (Some(0), Some(1), Some(1), false, Some(pages[0].clone()))
+    );
+    Ok(())
+}
+
+/// No activation row names a dictionary file the store does not hold: a crash between the two
+/// would stop every later `Committer::open` with `DictionaryAbsent`. Mutation 2026-11-21,
+/// `record_dictionary` without its load of the file: red.
+#[test]
+fn a_dictionary_is_recorded_only_once_its_file_is_in_the_store() -> TestResult {
+    let (root, _) = legacy_store()?;
+    let mut committer = Committer::open(root.path(), &RunId::new("a-train"))?;
+    let stored = committer
+        .blobs()
+        .store_dictionary("a-train", b"a dictionary's bytes")?;
+    std::fs::remove_file(committer.blobs().dictionary_path(stored.hex()))?;
+    let trained = store::Trained {
+        samples: 1,
+        sample_bytes: 1,
+    };
+    let at = "2026-11-21T00:00:00Z".parse::<chrono::DateTime<chrono::Utc>>()?;
+    let recorded = committer.record_dictionary(&stored, &trained, at);
+    drop(committer);
+    assert!(
+        matches!(&recorded, Err(StoreError::DictionaryAbsent { .. })),
+        "{recorded:?}"
+    );
+    assert_eq!(counted(root.path(), "dictionary_activations")?, 0);
+    Ok(())
+}
+
+/// A count of 0 is a usage error before the store is read, not "too few payloads".
+#[test]
+fn training_on_zero_samples_or_zero_held_out_is_a_usage_error() -> TestResult {
+    let (root, _) = legacy_store()?;
+    let mut seen = Vec::new();
+    for flag in ["--samples", "--holdout"] {
+        let output = newsvault(
+            root.path(),
+            &["blobs", "dictionary", "train", flag, "0", "--dry-run"],
+        )?;
+        let error: Value = serde_json::from_slice(&output.stderr)?;
+        seen.push((
+            output.status.code(),
+            error["code"].as_str().map(str::to_owned),
+        ));
+    }
+    let usage = (Some(2), Some("invalid_argument".to_owned()));
+    assert_eq!(seen, [usage.clone(), usage]);
+    Ok(())
+}
+
 /// The manifest is hand-written and the parser derived, so each flag `--help` lists is named.
 #[test]
 fn every_option_the_blob_parsers_take_is_in_the_machine_readable_schema() -> TestResult {

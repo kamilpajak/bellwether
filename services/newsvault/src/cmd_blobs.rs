@@ -11,7 +11,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-use crate::blobs::{BlobStore, Encoding, ReadBack, DICTIONARY_BYTES, LEVEL};
+use crate::blobs::{BlobStore, Encoding, Listed, ReadBack, DICTIONARY_BYTES, LEVEL};
 use crate::store::{self, Committer, DictionaryRow, StoreError, Trained, COMMIT_LOG};
 
 pub const VERIFY_SCHEMA: &str = "newsvault.blobs.verify/1";
@@ -21,7 +21,8 @@ pub const DICTIONARY_SCHEMA: &str = "newsvault.blobs.dictionary/1";
 /// 2026-11-21 measurement on the VPS trained on (section 3.9).
 pub const DEFAULT_SAMPLES: usize = 2_000;
 pub const DEFAULT_HOLDOUT: usize = 500;
-/// Each sample's first bytes only, so training holds at most 2,000 × 128 KiB = 256 MiB.
+/// Each sample's first bytes only: the samples are held once, in one buffer, at most
+/// `--samples` × 128 KiB (256 MiB at the default); held-out payloads are read one at a time.
 pub const SAMPLE_PREFIX: usize = 131_072;
 pub const DEFAULT_FAILURES_SHOWN: usize = 20;
 
@@ -38,6 +39,8 @@ pub enum BlobsError {
     NoActiveDictionary,
     #[error("training takes {needed} stored payloads (samples plus held-out) and the store holds {found}")]
     TooFewPayloads { needed: usize, found: usize },
+    #[error("--{0} must be at least 1")]
+    ZeroCount(&'static str),
     #[error("zstd refused to train a dictionary: {0}")]
     TrainingRefused(String),
     #[error(transparent)]
@@ -54,7 +57,7 @@ impl BlobsError {
             Self::StoreAbsent(_)
             | Self::TooFewPayloads { .. }
             | Self::Store(StoreError::DictionaryAbsent { .. }) => "input_absent",
-            Self::NoActiveDictionary => "invalid_argument",
+            Self::NoActiveDictionary | Self::ZeroCount(_) => "invalid_argument",
             Self::TrainingRefused(_) | Self::Store(StoreError::DictionaryAltered { .. }) => {
                 "input_unparseable"
             }
@@ -166,6 +169,9 @@ pub struct VerifyReport {
     pub blobs: u64,
     pub verified: u64,
     pub failed: u64,
+    /// Walk failures: a directory that could not be listed, or a file in the tree that names no
+    /// digest. Either is a part of the store no blob count covers.
+    pub listing_failed: u64,
     /// Every copy read, by the file it was read from: `raw` and `zstd`.
     pub by_encoding: BTreeMap<&'static str, Tally>,
     pub by_dictionary: Vec<DictionaryTally>,
@@ -180,10 +186,11 @@ pub struct VerifyReport {
 }
 
 impl VerifyReport {
-    /// Every blob read back to its digest and every row matches the tree.
+    /// Every blob read back to its digest, the whole tree was walked, and every row matches it.
     #[must_use]
     pub fn is_sound(&self) -> bool {
         self.failed == 0
+            && self.listing_failed == 0
             && self
                 .indexed
                 .is_none_or(|indexed| indexed.absent == 0 && indexed.length_differs == 0)
@@ -210,7 +217,7 @@ pub fn verify(root: &std::path::Path, limit: usize) -> Result<VerifyReport, Blob
     };
     let mut by_encoding: BTreeMap<&'static str, Tally> = BTreeMap::new();
     let mut by_dictionary: BTreeMap<Option<String>, Tally> = BTreeMap::new();
-    let (mut digests, mut verified, mut both_copies) = (0, 0, 0);
+    let (mut digests, mut verified, mut both_copies, mut listing_failed) = (0, 0, 0, 0);
     for streamed in blobs.stream() {
         let streamed = match streamed {
             Ok(streamed) => streamed,
@@ -219,6 +226,7 @@ pub fn verify(root: &std::path::Path, limit: usize) -> Result<VerifyReport, Blob
                     StoreError::BlobStray { path } => path.display().to_string(),
                     _ => root.display().to_string(),
                 };
+                listing_failed += 1;
                 failures.add(blob, &failure);
                 continue;
             }
@@ -292,6 +300,7 @@ pub fn verify(root: &std::path::Path, limit: usize) -> Result<VerifyReport, Blob
         blobs: digests,
         verified,
         failed: digests - verified,
+        listing_failed,
         by_encoding,
         by_dictionary,
         both_copies,
@@ -324,6 +333,11 @@ pub struct CompressReport {
     pub compressed: u64,
     /// Of `compressed`, those whose `.zst` copy an earlier run had already renamed into place.
     pub resumed: u64,
+    /// Of `compressed`, those whose `.zst` copy was there and did not read back to the digest:
+    /// rewritten from the raw copy.
+    pub replaced: u64,
+    /// Staging files removed before the rewrite: what a crash or a failed write left.
+    pub staging_removed: u64,
     pub compressed_stored_bytes: u64,
     pub failed: u64,
     pub failures: Vec<Failure>,
@@ -338,8 +352,9 @@ impl CompressReport {
     }
 }
 
-/// Rewrites every raw copy as `.zst` under the writer's lease, the one `collect` and the backup
-/// take. Running it again rewrites only what is still raw.
+/// Rewrites every raw copy as `.zst` under the store's `LOCK` lease, the one `collect` and
+/// `snapshot` take. The backup's tar of `blobs/` holds only the host lock the systemd units take,
+/// so a manual run goes under that lock too (§3.9). Running it again rewrites only what is raw.
 pub fn compress(ask: &CompressAsk) -> Result<CompressReport, BlobsError> {
     if !ask.store.join(COMMIT_LOG).is_file() {
         return Err(BlobsError::StoreAbsent(ask.store.join(COMMIT_LOG)));
@@ -361,6 +376,8 @@ pub fn compress(ask: &CompressAsk) -> Result<CompressReport, BlobsError> {
         raw_bytes: 0,
         compressed: 0,
         resumed: 0,
+        replaced: 0,
+        staging_removed: 0,
         compressed_stored_bytes: 0,
         failed: 0,
         failures: Vec::new(),
@@ -371,6 +388,9 @@ pub fn compress(ask: &CompressAsk) -> Result<CompressReport, BlobsError> {
         let run = RunId::new(format!("blobs-compress-{}", stamped(ask.at)));
         let committer = Committer::open(&ask.store, &run)?;
         report.dictionary = committer.blobs().active_dictionary();
+        report.staging_removed =
+            u64::try_from(committer.remove_staging_leftovers()?).unwrap_or(u64::MAX);
+        report.changed = report.staging_removed > 0;
         return rewrite(committer.blobs(), run.as_str(), report, failures);
     }
     let blobs = store::blob_store(&ask.store);
@@ -415,6 +435,7 @@ fn rewrite(
                 report.raw_bytes += rewritten.logical_bytes;
                 report.compressed += 1;
                 report.resumed += u64::from(rewritten.resumed);
+                report.replaced += u64::from(rewritten.replaced);
                 report.compressed_stored_bytes += rewritten.stored_bytes;
                 report.changed = true;
             }
@@ -465,6 +486,11 @@ pub struct TrainReport {
 /// The first `samples` digests in hex order train and the next `holdout` measure: a sha256 orders
 /// payloads as a random draw would, and the same store gives the same split on every run.
 pub fn train(ask: &TrainAsk) -> Result<TrainReport, BlobsError> {
+    for (flag, count) in [("samples", ask.samples), ("holdout", ask.holdout)] {
+        if count == 0 {
+            return Err(BlobsError::ZeroCount(flag));
+        }
+    }
     if !ask.store.join(COMMIT_LOG).is_file() {
         return Err(BlobsError::StoreAbsent(ask.store.join(COMMIT_LOG)));
     }
@@ -476,36 +502,42 @@ pub fn train(ask: &TrainAsk) -> Result<TrainReport, BlobsError> {
         Some(Committer::open(&ask.store, &run)?)
     };
     let reader = store::blob_store(&ask.store);
-    let needed = ask.samples + ask.holdout;
-    let mut samples: Vec<Vec<u8>> = Vec::with_capacity(ask.samples);
-    let mut held_out: Vec<Vec<u8>> = Vec::with_capacity(ask.holdout);
-    for streamed in reader.stream() {
-        if samples.len() + held_out.len() == needed {
+    let needed = ask.samples.saturating_add(ask.holdout);
+    // One buffer, as `zstd::dict::from_continuous` takes it: `from_samples` copies every sample
+    // into a second one (zstd 0.14.3, `dict.rs`), which held the samples twice.
+    let mut samples: Vec<u8> = Vec::new();
+    let mut sizes: Vec<usize> = Vec::new();
+    let mut held_out: Vec<Listed> = Vec::new();
+    for listed in reader.listing() {
+        if sizes.len() + held_out.len() == needed {
             break;
         }
-        let payload = match streamed {
-            Ok(streamed) => streamed.read?.payload,
+        let listed = match listed {
+            Ok(listed) => listed,
             Err(StoreError::BlobStray { .. }) => continue,
             Err(failure) => return Err(failure.into()),
         };
-        if samples.len() < ask.samples {
-            samples.push(payload.get(..SAMPLE_PREFIX).unwrap_or(&payload).to_vec());
+        if sizes.len() < ask.samples {
+            let payload = reader.read_listed(&listed)?.payload;
+            let sample = payload.get(..SAMPLE_PREFIX).unwrap_or(&payload);
+            samples.extend_from_slice(sample);
+            sizes.push(sample.len());
         } else {
-            held_out.push(payload);
+            held_out.push(listed);
         }
     }
-    let found = samples.len() + held_out.len();
-    if found < needed || ask.holdout == 0 {
+    let found = sizes.len() + held_out.len();
+    if found < needed {
         return Err(BlobsError::TooFewPayloads { needed, found });
     }
-    let trained = zstd::dict::from_samples(&samples, DICTIONARY_BYTES)
+    let trained = zstd::dict::from_continuous(&samples, &sizes, DICTIONARY_BYTES)
         .map_err(|failure| BlobsError::TrainingRefused(failure.to_string()))?;
-    let holdout = measure(&held_out, &trained)?;
-    let sample_bytes = samples.iter().map(Vec::len).sum::<usize>();
     let counts = Trained {
-        samples: u64::try_from(samples.len()).unwrap_or(u64::MAX),
-        sample_bytes: u64::try_from(sample_bytes).unwrap_or(u64::MAX),
+        samples: u64::try_from(sizes.len()).unwrap_or(u64::MAX),
+        sample_bytes: u64::try_from(samples.len()).unwrap_or(u64::MAX),
     };
+    drop(samples);
+    let holdout = measure(&reader, &held_out, &trained)?;
     let (digest, active, changed) = match committer.as_mut() {
         None => (
             const_hex::encode(Sha256::digest(&trained)),
@@ -537,16 +569,22 @@ pub fn train(ask: &TrainAsk) -> Result<TrainReport, BlobsError> {
     })
 }
 
-fn measure(held_out: &[Vec<u8>], dictionary: &[u8]) -> Result<Holdout, BlobsError> {
+/// Each held-out payload read, compressed twice and dropped: one payload in memory at a time.
+fn measure(
+    reader: &BlobStore,
+    held_out: &[Listed],
+    dictionary: &[u8],
+) -> Result<Holdout, BlobsError> {
     let mut plain = zstd::bulk::Compressor::new(LEVEL).map_err(StoreError::Io)?;
     let mut primed =
         zstd::bulk::Compressor::with_dictionary(LEVEL, dictionary).map_err(StoreError::Io)?;
     let (mut logical, mut without, mut with) = (0_u64, 0_u64, 0_u64);
-    for payload in held_out {
+    for listed in held_out {
+        let payload = reader.read_listed(listed)?.payload;
         let size = |bytes: Vec<u8>| u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         logical += u64::try_from(payload.len()).unwrap_or(u64::MAX);
-        without += size(plain.compress(payload).map_err(StoreError::Io)?);
-        with += size(primed.compress(payload).map_err(StoreError::Io)?);
+        without += size(plain.compress(&payload).map_err(StoreError::Io)?);
+        with += size(primed.compress(&payload).map_err(StoreError::Io)?);
     }
     let ratio = |stored: u64| {
         if stored == 0 {

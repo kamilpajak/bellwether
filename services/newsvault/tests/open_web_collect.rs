@@ -823,16 +823,6 @@ fn blob_files(store: &Path) -> Result<std::collections::BTreeSet<String>, Box<dy
     Ok(names)
 }
 
-/// Writes `payload` compressed, as `put` writes it, over the `.zst` file at `path`: a stored file
-/// whose bytes decode to a payload its name does not hash.
-fn overwrite_compressed(path: &Path, payload: &[u8]) -> Result<(), Box<dyn Error>> {
-    let scratch = TempDir::new()?;
-    let blobs = newsvault::store::blob_store(scratch.path());
-    let digest = blobs.put("scratch", payload)?;
-    std::fs::copy(blobs.compressed_path_of(&digest), path)?;
-    Ok(())
-}
-
 /// `(url, phase, listed_date is set, truncated, headers)` of each collect attempt's link row,
 /// `None` where the attempt has none.
 type Linked = (String, Option<(String, bool, bool, String)>);
@@ -1557,7 +1547,7 @@ fn run_over_a_damaged_feed(damage: Damage) -> Result<DamagedRun, Box<dyn Error>>
         let digest = listed?.digest;
         let bytes = stored.read_verified(&digest)?;
         if bytes == feed {
-            damage(&stored.compressed_path_of(&digest), &bytes)?;
+            damage(&stored.path_of(&digest), &bytes)?;
             damaged += 1;
         }
     }
@@ -1589,7 +1579,7 @@ fn run_over_a_damaged_feed(damage: Damage) -> Result<DamagedRun, Box<dyn Error>>
 /// `BlobAltered` and left `finished_at` null; a missing one silently added no titles.
 #[test]
 fn a_damaged_direct_blob_is_a_cross_check_error_and_the_run_finishes() -> TestResult {
-    let altered: Damage = |file, bytes| overwrite_compressed(file, &[bytes, b" "].concat());
+    let altered: Damage = |file, bytes| Ok(std::fs::write(file, [bytes, b" "].concat())?);
     let removed: Damage = |file, _| Ok(std::fs::remove_file(file)?);
     let mut seen = Vec::new();
     for damage in [altered, removed] {
@@ -2062,7 +2052,7 @@ fn gnw_blob(store: &Path) -> PathBuf {
         .join("blobs/sha256")
         .join(&GNW_PIN[..2])
         .join(&GNW_PIN[2..4])
-        .join(format!("{GNW_PIN}{}", blobs::COMPRESSED_SUFFIX))
+        .join(GNW_PIN)
 }
 
 /// The pinned blob is re-hashed when read: bytes changed on disk are not the pin, and a later
@@ -2072,7 +2062,7 @@ fn gnw_blob(store: &Path) -> PathBuf {
 fn a_pinned_robots_blob_changed_on_disk_is_refused_and_suggests_no_refresh() -> TestResult {
     let root = TempDir::new()?;
     seed_gnw(root.path(), &hosts(), ROBOTS_EARLIER)?;
-    overwrite_compressed(&gnw_blob(root.path()), CHANGED_ROBOTS)?;
+    std::fs::write(gnw_blob(root.path()), CHANGED_ROBOTS)?;
     seed_gnw(root.path(), &hosts(), ROBOTS_LATER)?;
     let found = canon::FileDigest::of(CHANGED_ROBOTS).hex().to_owned();
     let output = Command::new(env!("CARGO_BIN_EXE_newsvault"))
