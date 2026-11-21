@@ -121,8 +121,21 @@ fn is_raw(rules: &[TextRule], relative: &str) -> bool {
         .is_some_and(|rule| rule.raw)
 }
 
+/// Whether a walk lists a file whose own name starts with `.`. A directory whose name does is
+/// never entered: `.git` and local worktrees in hidden directories are whole trees of their own.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HiddenFiles {
+    Skipped,
+    Listed,
+}
+
 /// Every non-hidden file under `root` outside `target/`, as `/`-separated relative paths, sorted.
 fn tree_files(root: &Path) -> Result<Vec<String>, String> {
+    walk_files(root, HiddenFiles::Skipped)
+}
+
+/// [`tree_files`], with hidden files listed when `hidden` says so.
+pub(crate) fn walk_files(root: &Path, hidden: HiddenFiles) -> Result<Vec<String>, String> {
     let mut found = Vec::new();
     let mut pending: Vec<PathBuf> = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
@@ -130,10 +143,10 @@ fn tree_files(root: &Path) -> Result<Vec<String>, String> {
             .map_err(|why| format!("{} could not be listed: {why}", directory.display()))?;
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
+            let child = entry.path();
+            if name.starts_with('.') && (hidden == HiddenFiles::Skipped || child.is_dir()) {
                 continue;
             }
-            let child = entry.path();
             if child.is_dir() {
                 if name != BUILD_DIRECTORY {
                     pending.push(child);

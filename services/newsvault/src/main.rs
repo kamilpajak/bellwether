@@ -11,6 +11,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use news_provider::{Clock, RunId, SystemClock};
+use newsvault::cmd_blobs::{self, BlobsError};
 use newsvault::cmd_collect::{self, CollectRunError};
 use newsvault::cmd_items;
 use newsvault::cmd_ledger::{self, Ask, LedgerReadError, Report};
@@ -209,6 +210,11 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
+    /// The payload store: read every blob back, rewrite raw ones compressed, train a dictionary.
+    Blobs {
+        #[command(subcommand)]
+        action: BlobsAction,
+    },
     /// Machine-readable description of this tool.
     Schema {
         #[arg(long, value_enum, default_value_t = Format::Json)]
@@ -233,6 +239,69 @@ enum RobotsAction {
         #[arg(long)]
         store: Option<PathBuf>,
         /// Plans one url per row and mutates nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Accepted and does nothing: no command here prompts or reads stdin.
+        #[arg(long)]
+        non_interactive: bool,
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
+    },
+}
+
+#[derive(Subcommand)]
+enum BlobsAction {
+    /// Reads every blob back, decoded, against its digest, and every `blobs` row against the
+    /// tree. Exit 1 when any does not match. Mutates nothing and takes no lease.
+    Verify {
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Caps the failures listed. Never the blobs read or counted.
+        #[arg(long, default_value_t = cmd_blobs::DEFAULT_FAILURES_SHOWN)]
+        limit: usize,
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
+    },
+    /// Rewrites every raw blob as one zstd frame with the active dictionary, under the store's
+    /// lease. A raw file is removed only after its compressed copy reads back to its digest.
+    Compress {
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Compresses without a dictionary when none is active. Refused otherwise: a file
+        /// written now keeps its dictionary for good.
+        #[arg(long)]
+        allow_no_dictionary: bool,
+        /// Counts the raw blobs a run would rewrite and writes nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Accepted and does nothing: no command here prompts or reads stdin.
+        #[arg(long)]
+        non_interactive: bool,
+        #[arg(long, default_value_t = cmd_blobs::DEFAULT_FAILURES_SHOWN)]
+        limit: usize,
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
+    },
+    /// zstd dictionaries, kept in the store and never deleted.
+    Dictionary {
+        #[command(subcommand)]
+        action: DictionaryAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DictionaryAction {
+    /// Trains a dictionary on stored payloads, stores it under its digest and activates it.
+    Train {
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Payloads trained on, the first in digest order, each cut to its first 128 KiB.
+        #[arg(long, default_value_t = cmd_blobs::DEFAULT_SAMPLES)]
+        samples: usize,
+        /// The payloads after the samples, compressed with and without the dictionary.
+        #[arg(long, default_value_t = cmd_blobs::DEFAULT_HOLDOUT)]
+        holdout: usize,
+        /// Trains and measures on the held-out payloads; stores and activates nothing.
         #[arg(long)]
         dry_run: bool,
         /// Accepted and does nothing: no command here prompts or reads stdin.
@@ -591,6 +660,7 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 }
             }
         }
+        Command::Blobs { action } => run_blobs(action),
         Command::Publish { at, store, format } => {
             let at = instant(&at, "--at");
             let root = vault_root(store);
@@ -860,6 +930,163 @@ fn emit_snapshot_error(
         "message": refused.to_string(),
         "retryable": refused.retryable(),
         "details": {"store": ask.store.display().to_string(), "out": ask.out.display().to_string()},
+        "suggestions": if refused.retryable() {
+            vec![std::env::args().collect::<Vec<String>>()]
+        } else {
+            Vec::new()
+        },
+    });
+    let err = std::io::stderr();
+    let mut err = err.lock();
+    match format {
+        Format::Json => writeln!(err, "{object}")?,
+        Format::Human => writeln!(err, "error: {refused} ({})", refused.code())?,
+    }
+    Ok(())
+}
+
+fn run_blobs(action: BlobsAction) -> anyhow::Result<Verdict> {
+    let format_of = |action: &BlobsAction| match action {
+        BlobsAction::Verify { format, .. }
+        | BlobsAction::Compress { format, .. }
+        | BlobsAction::Dictionary {
+            action: DictionaryAction::Train { format, .. },
+        } => *format,
+    };
+    let format = format_of(&action);
+    let answered = match action {
+        BlobsAction::Verify { store, limit, .. } => cmd_blobs::verify(&vault_root(store), limit)
+            .map(|report| {
+                let sound = report.is_sound();
+                let indexed = report.indexed.map_or_else(
+                    || " indexed -".to_owned(),
+                    |indexed| {
+                        format!(
+                            " indexed rows {} absent {} length differs {}",
+                            indexed.rows, indexed.absent, indexed.length_differs
+                        )
+                    },
+                );
+                let shown: String = report
+                    .failures
+                    .iter()
+                    .map(|failure| format!("\nfailure {} {}", failure.code, failure.blob))
+                    .collect();
+                (
+                    serde_json::to_value(&report),
+                    format!(
+                        "{} blobs {} verified {} failed {} listing failed {} both copies {} \
+                         staging leftovers {}{indexed}{shown}",
+                        report.store,
+                        report.blobs,
+                        report.verified,
+                        report.failed,
+                        report.listing_failed,
+                        report.both_copies,
+                        report.staging_leftovers,
+                    ),
+                    if sound {
+                        Verdict::Ok
+                    } else {
+                        Verdict::No(EXIT_NO)
+                    },
+                )
+            }),
+        BlobsAction::Compress {
+            store,
+            allow_no_dictionary,
+            dry_run,
+            limit,
+            ..
+        } => cmd_blobs::compress(&cmd_blobs::CompressAsk {
+            store: vault_root(store),
+            at: SystemClock.now(),
+            allow_no_dictionary,
+            dry_run,
+            limit,
+        })
+        .map(|report| {
+            (
+                serde_json::to_value(&report),
+                format!(
+                    "{} raw {} compressed {} replaced {} staging removed {} failed {} bytes {} -> {}{}",
+                    report.store,
+                    report.raw_found,
+                    report.compressed,
+                    report.replaced,
+                    report.staging_removed,
+                    report.failed,
+                    report.raw_bytes,
+                    report.compressed_stored_bytes,
+                    if report.dry_run { " (dry run)" } else { "" }
+                ),
+                if report.is_complete() {
+                    Verdict::Ok
+                } else {
+                    Verdict::No(EXIT_INCOMPLETE)
+                },
+            )
+        }),
+        BlobsAction::Dictionary {
+            action:
+                DictionaryAction::Train {
+                    store,
+                    samples,
+                    holdout,
+                    dry_run,
+                    ..
+                },
+        } => cmd_blobs::train(&cmd_blobs::TrainAsk {
+            store: vault_root(store),
+            at: SystemClock.now(),
+            samples,
+            holdout,
+            dry_run,
+        })
+        .map(|report| {
+            (
+                serde_json::to_value(&report),
+                format!(
+                    "{} dictionary {} ({} B) held-out ratio {:.2} without, {:.2} with{}",
+                    report.store,
+                    report.dictionary,
+                    report.dictionary_bytes,
+                    report.holdout.ratio_without,
+                    report.holdout.ratio_with,
+                    if report.dry_run { " (dry run)" } else { "" }
+                ),
+                Verdict::Ok,
+            )
+        }),
+    };
+    match answered {
+        Ok((object, line, verdict)) => {
+            let out = std::io::stdout();
+            let mut out = out.lock();
+            match format {
+                Format::Json => {
+                    serde_json::to_writer_pretty(&mut out, &object?)?;
+                    writeln!(out)?;
+                }
+                Format::Human => writeln!(out, "{line}")?,
+            }
+            Ok(verdict)
+        }
+        Err(refused) => {
+            emit_blobs_error(&refused, format)?;
+            Ok(Verdict::No(refused.exit()))
+        }
+    }
+}
+
+/// A refusal on stderr with stdout empty; a retryable one suggests the same argv again.
+fn emit_blobs_error(refused: &BlobsError, format: Format) -> anyhow::Result<()> {
+    let object = serde_json::json!({
+        "schema": "newsvault.error/1",
+        "code": refused.code(),
+        "message": refused.to_string(),
+        "retryable": refused.retryable(),
+        "details": {},
         "suggestions": if refused.retryable() {
             vec![std::env::args().collect::<Vec<String>>()]
         } else {
@@ -1229,6 +1456,73 @@ fn print_schema(format: Format) {
                     "2": "invalid_argument (out exists), input_unparseable (the copy fails quick_check), io_failed",
                     "4": "input_absent: no commit log, or out's directory does not exist",
                     "7": "lease_held: a writer holds the store"
+                },
+                "mutates": true
+            },
+            {
+                "path": ["blobs", "verify"],
+                "summary": "Reads every blob back (raw or zstd, any dictionary) against its sha256, and every blobs row against the tree. The real-path reader of BlobStore::stream, the bulk read a re-extraction pass makes.",
+                "options": [
+                    {"name": "store", "type": "path"},
+                    {"name": "limit", "type": "integer", "default": cmd_blobs::DEFAULT_FAILURES_SHOWN,
+                     "doc": "caps the failures listed, never the blobs read or counted"},
+                    {"name": "format", "type": "enum", "values": ["human", "json"]}
+                ],
+                "env": [{"name": "BELLWETHER_VAULT",
+                         "doc": "the store when --store is not given, then ~/.bellwether/vault"}],
+                "output": cmd_blobs::VERIFY_SCHEMA,
+                "exits": {
+                    "0": "every blob reads back to its digest and every blobs row names a file of its length",
+                    "1": "the answer is no: failed, listing_failed, indexed.absent or indexed.length_differs is not 0",
+                    "2": "input_schema_mismatch, io_failed",
+                    "4": "input_absent: no store directory"
+                },
+                "mutates": false
+            },
+            {
+                "path": ["blobs", "compress"],
+                "summary": "Rewrites every raw blob as one zstd frame with the active dictionary, under the store's LOCK lease; first removes staging files a crash left; removes a raw file only after the compressed copy is renamed, fsynced and read back to the digest, and rewrites a compressed copy left beside it that does not read back. Idempotent and resumable. The backup's tar does not take LOCK: run it under the host lock the systemd units take.",
+                "options": [
+                    {"name": "store", "type": "path"},
+                    {"name": "allow_no_dictionary", "type": "flag",
+                     "doc": "compress with no dictionary when none is active; refused otherwise"},
+                    {"name": "dry_run", "type": "flag",
+                     "doc": "counts the raw blobs and their bytes, names the dictionary, writes nothing and takes no lease"},
+                    {"name": "non_interactive", "type": "flag",
+                     "doc": "accepted and does nothing: no command here prompts or reads stdin"},
+                    {"name": "limit", "type": "integer", "default": cmd_blobs::DEFAULT_FAILURES_SHOWN},
+                    {"name": "format", "type": "enum", "values": ["human", "json"]}
+                ],
+                "output": cmd_blobs::COMPRESS_SCHEMA,
+                "exits": {
+                    "0": "every raw blob is compressed, or none was left (changed false)",
+                    "2": "invalid_argument (no active dictionary without --allow-no-dictionary), input_schema_mismatch, io_failed",
+                    "4": "input_absent: no commit log, or the active dictionary's file",
+                    "7": "lease_held",
+                    "8": "a blob failed; it keeps its raw file and is listed in failures"
+                },
+                "mutates": true
+            },
+            {
+                "path": ["blobs", "dictionary", "train"],
+                "summary": "Trains a zstd dictionary on the first samples stored payloads in digest order, measures it on the next holdout ones, stores it under blobs/dictionaries/<sha256> and activates it for every later write.",
+                "options": [
+                    {"name": "store", "type": "path"},
+                    {"name": "samples", "type": "integer", "default": cmd_blobs::DEFAULT_SAMPLES,
+                     "doc": "each cut to its first 131072 bytes"},
+                    {"name": "holdout", "type": "integer", "default": cmd_blobs::DEFAULT_HOLDOUT},
+                    {"name": "dry_run", "type": "flag",
+                     "doc": "trains and reports the held-out ratio; stores and activates nothing"},
+                    {"name": "non_interactive", "type": "flag",
+                     "doc": "accepted and does nothing: no command here prompts or reads stdin"},
+                    {"name": "format", "type": "enum", "values": ["human", "json"]}
+                ],
+                "output": cmd_blobs::DICTIONARY_SCHEMA,
+                "exits": {
+                    "0": "trained; changed false when that dictionary was already the active one",
+                    "2": "invalid_argument (--samples or --holdout 0), input_unparseable (zstd refused to train), input_schema_mismatch, io_failed",
+                    "4": "input_absent: no commit log, or fewer payloads than samples plus holdout",
+                    "7": "lease_held"
                 },
                 "mutates": true
             },

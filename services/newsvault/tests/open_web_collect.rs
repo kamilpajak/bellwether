@@ -16,6 +16,7 @@ use news_provider::{
     Exit, Headers, LedgerError, PlanRefusal, RawResponse, Request, RunId, SendFailure, SendPermit,
     Sink, SourceId, TargetWindow, TransportError,
 };
+use newsvault::blobs;
 use newsvault::cmd_collect::{self, Ask, CollectRunError};
 use newsvault::cmd_items::{self, PerStory};
 use newsvault::store::{Committer, StoreError, COMMIT_LOG, RUNS_DIR, SCHEMA_VERSION};
@@ -804,13 +805,18 @@ fn an_open_web_run_collects_a_globenewswire_day_end_to_end() -> TestResult {
     Ok(())
 }
 
-/// Every blob file under `<store>/blobs/sha256`, by the hex it is named by.
+/// Every blob file under `<store>/blobs/sha256`, by the hex it is named by, either form.
 fn blob_files(store: &Path) -> Result<std::collections::BTreeSet<String>, Box<dyn Error>> {
     let mut names = std::collections::BTreeSet::new();
     for first in std::fs::read_dir(store.join("blobs/sha256"))? {
         for second in std::fs::read_dir(first?.path())? {
             for file in std::fs::read_dir(second?.path())? {
-                names.insert(file?.file_name().to_string_lossy().into_owned());
+                let name = file?.file_name().to_string_lossy().into_owned();
+                names.insert(
+                    name.strip_suffix(blobs::COMPRESSED_SUFFIX)
+                        .unwrap_or(&name)
+                        .to_owned(),
+                );
             }
         }
     }
@@ -1521,7 +1527,7 @@ fn a_direct_answer_received_exactly_one_lead_before_the_earliest_row_is_read() -
     Ok(())
 }
 
-type Damage = fn(&Path, &[u8]) -> std::io::Result<()>;
+type Damage = fn(&Path, &[u8]) -> Result<(), Box<dyn Error>>;
 /// How many blobs were damaged, the run's exit, its cross-check, and (envelopes, any unfinished).
 type DamagedRun = (usize, Exit, Value, (usize, bool));
 
@@ -1536,10 +1542,12 @@ fn run_over_a_damaged_feed(damage: Damage) -> Result<DamagedRun, Box<dyn Error>>
     )?;
     let feed = std::fs::read(provider_dir().join("tests/fixtures/fed/press_all_3_items.xml"))?;
     let mut damaged = 0;
-    for file in blob_paths(&root.path().join("blobs"))? {
-        let bytes = std::fs::read(&file)?;
+    let stored = newsvault::store::blob_store(root.path());
+    for listed in stored.listing() {
+        let digest = listed?.digest;
+        let bytes = stored.read_verified(&digest)?;
         if bytes == feed {
-            damage(&file, &bytes)?;
+            damage(&stored.path_of(&digest), &bytes)?;
             damaged += 1;
         }
     }
@@ -1571,8 +1579,8 @@ fn run_over_a_damaged_feed(damage: Damage) -> Result<DamagedRun, Box<dyn Error>>
 /// `BlobAltered` and left `finished_at` null; a missing one silently added no titles.
 #[test]
 fn a_damaged_direct_blob_is_a_cross_check_error_and_the_run_finishes() -> TestResult {
-    let altered: Damage = |file, bytes| std::fs::write(file, [bytes, b" "].concat());
-    let removed: Damage = |file, _| std::fs::remove_file(file);
+    let altered: Damage = |file, bytes| Ok(std::fs::write(file, [bytes, b" "].concat())?);
+    let removed: Damage = |file, _| Ok(std::fs::remove_file(file)?);
     let mut seen = Vec::new();
     for damage in [altered, removed] {
         let (damaged, exit, checked, envelopes) = run_over_a_damaged_feed(damage)?;
@@ -1604,22 +1612,6 @@ fn a_damaged_direct_blob_is_a_cross_check_error_and_the_run_finishes() -> TestRe
         ]
     );
     Ok(())
-}
-
-fn blob_paths(dir: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
-    let mut found = Vec::new();
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        for entry in std::fs::read_dir(&dir)? {
-            let path = entry?.path();
-            if path.is_dir() {
-                pending.push(path);
-            } else {
-                found.push(path);
-            }
-        }
-    }
-    Ok(found)
 }
 
 /// The committed hosts file on Monday, on a fresh store: each attempt's url and id, in order.
@@ -4679,6 +4671,8 @@ fn an_unreadable_stored_header_text_is_store_unreadable_and_records_no_continuit
     Ok(())
 }
 
+/// The tables `MIGRATIONS[15]` adds, which every store before user_version 16 lacks.
+const DICTIONARY_TABLES: &str = "DROP TABLE dictionary_activations; DROP TABLE dictionaries;";
 /// The columns `MIGRATIONS[14]` adds, which a v14 store lacks; a v13 `deferred` holds neither.
 const LISTED_BY: &str = "ALTER TABLE attempts DROP COLUMN listed_by;";
 const LISTED_BY_DEFERRED: &str = "ALTER TABLE deferred DROP COLUMN listed_by;";
@@ -4720,12 +4714,26 @@ fn a_v10_to_v14_store_keeps_its_basis_for_the_run_that_migrates_it() -> TestResu
     for (version, dropped) in [
         (
             10,
-            format!("{LISTED_BY}{DEFERRED_TABLE}{WALK_COLUMNS}{BOUNDARY_COLUMNS}"),
+            format!(
+                "{DICTIONARY_TABLES}{LISTED_BY}{DEFERRED_TABLE}{WALK_COLUMNS}{BOUNDARY_COLUMNS}"
+            ),
         ),
-        (11, format!("{LISTED_BY}{DEFERRED_TABLE}{WALK_COLUMNS}")),
-        (12, format!("{LISTED_BY}{DEFERRED_TABLE}")),
-        (13, format!("{LISTED_BY}{CLOSED_TABLE}{V13_DEFERRED}")),
-        (14, format!("{LISTED_BY}{LISTED_BY_DEFERRED}")),
+        (
+            11,
+            format!("{DICTIONARY_TABLES}{LISTED_BY}{DEFERRED_TABLE}{WALK_COLUMNS}"),
+        ),
+        (
+            12,
+            format!("{DICTIONARY_TABLES}{LISTED_BY}{DEFERRED_TABLE}"),
+        ),
+        (
+            13,
+            format!("{DICTIONARY_TABLES}{LISTED_BY}{CLOSED_TABLE}{V13_DEFERRED}"),
+        ),
+        (
+            14,
+            format!("{DICTIONARY_TABLES}{LISTED_BY}{LISTED_BY_DEFERRED}"),
+        ),
     ] {
         let root = TempDir::new()?;
         seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;

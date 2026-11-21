@@ -5,7 +5,8 @@
 //! Row G1 is this file, in two halves because inheriting a table says nothing about what it
 //! holds. Row R4's manifest half is [`clients`], its clock half [`clocks`] and its no-sink half
 //! [`sinks`]; the size step's own precondition is [`layout`]. Row R2's doc-test switch is
-//! [`doctests`]. Row G2, no `\r` outside a `-text` path, is [`line_ends`].
+//! [`doctests`]. Row G2, no `\r` outside a `-text` path, is [`line_ends`]. Row B2, no committed
+//! zstd dictionary, is [`dictionaries`].
 //!
 //! The member set comes from `cargo metadata`, never from `workspace.members`: measured
 //! 2026-11-12 on cargo 1.99.1, a crate reached only by a `path` dependency from inside the
@@ -19,6 +20,7 @@ use std::process::Command;
 
 pub mod clients;
 pub mod clocks;
+pub mod dictionaries;
 pub mod doctests;
 pub mod layout;
 pub mod line_ends;

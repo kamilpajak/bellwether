@@ -1030,7 +1030,12 @@ fn every_body_an_edgar_run_stores_is_indexed_and_linked_to_its_attempt() -> Test
     for first in std::fs::read_dir(root.path().join("blobs/sha256"))? {
         for second in std::fs::read_dir(first?.path())? {
             for file in std::fs::read_dir(second?.path())? {
-                on_disk.insert(file?.file_name().to_string_lossy().into_owned());
+                let name = file?.file_name().to_string_lossy().into_owned();
+                on_disk.insert(
+                    name.strip_suffix(newsvault::blobs::COMPRESSED_SUFFIX)
+                        .unwrap_or(&name)
+                        .to_owned(),
+                );
             }
         }
     }
