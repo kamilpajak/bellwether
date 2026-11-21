@@ -415,10 +415,8 @@ impl BlobStore {
         }
     }
 
-    /// Every digest on disk read back through [`BlobStore::read_copy`]: one payload in memory at a
-    /// time, each dictionary loaded once. The bulk read a re-extraction pass makes (§3.9, P11).
-    /// Takes no lease: a raw copy `blobs compress` removes after the listing is read from the
-    /// `.zst` copy it left.
+    /// Every digest on disk read back through [`BlobStore::read_listed`], one payload in memory at
+    /// a time, each dictionary loaded once: the bulk read a re-extraction pass makes (§3.9, P11).
     pub fn stream(&self) -> impl Iterator<Item = Result<StreamedBlob, StoreError>> + '_ {
         self.listing().map(move |listed| {
             listed.map(|listed| StreamedBlob {

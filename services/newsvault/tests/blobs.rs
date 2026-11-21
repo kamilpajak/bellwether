@@ -56,7 +56,7 @@ fn train(store: &Path, extra: &[&str]) -> Result<Output, Box<dyn Error>> {
     )
 }
 
-/// Every `open-web-feed` fixture page, file by file: 56 payloads on 2026-11-21.
+/// Every file of five `open-web-feed` fixture directories: 57 payloads on 2026-11-21.
 fn pages() -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
     let root =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../providers/open-web-feed/tests/fixtures");
