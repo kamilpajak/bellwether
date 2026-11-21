@@ -1,12 +1,13 @@
 //! No zstd dictionary is committed: one trained on the VPS store is built from vendor pages, and
 //! this repository is public. A dictionary is found by zstd's dictionary magic number at offset 0
 //! (`ZSTD_MAGIC_DICTIONARY`, which every trained dictionary opens with) or by the store directory
-//! it lives in. Unguarded: a raw-content dictionary, which carries no magic number, and a file
-//! under a hidden directory, which the shared tree walk skips. Row: architecture.md §8 B2.
+//! it lives in. Hidden files are read too. Unguarded: a raw-content dictionary, which carries no
+//! magic number, and a file under a hidden directory (`.github/` too), which the walk never enters.
+//! Row: architecture.md §8 B2.
 
 use std::path::Path;
 
-use crate::line_ends::tree_files;
+use crate::line_ends::{walk_files, HiddenFiles};
 
 const ROW: &str = "docs/design/architecture.md section 8 row B2";
 /// `ZSTD_MAGIC_DICTIONARY`, 0xEC30A437, as it is written on disk.
@@ -18,7 +19,7 @@ const STORE_DIRECTORY: &str = "blobs/dictionaries/";
 pub fn committed_dictionary_failure(root: &Path) -> Option<String> {
     let checked = || -> Result<Vec<String>, String> {
         let mut offenders = Vec::new();
-        for relative in tree_files(root)? {
+        for relative in walk_files(root, HiddenFiles::Listed)? {
             let bytes = std::fs::read(root.join(&relative))
                 .map_err(|why| format!("{relative} could not be read: {why}"))?;
             if bytes.starts_with(&DICTIONARY_MAGIC) {
@@ -87,16 +88,18 @@ mod tests {
         let dir = tree(&[
             ("fixtures/page.html", b"<html></html>"),
             ("fixtures/trained.dict", &[0x37, 0xA4, 0x30, 0xEC, 1, 2, 3]),
+            ("docs/.hidden.dict", &[0x37, 0xA4, 0x30, 0xEC, 1, 2]),
             ("vault/blobs/dictionaries/ab12", b"raw content"),
         ])?;
         let failure = committed_dictionary_failure(dir.path()).unwrap_or_default();
         assert_eq!(
             (
                 failure.contains("fixtures/trained.dict opens"),
+                failure.contains("docs/.hidden.dict opens"),
                 failure.contains("vault/blobs/dictionaries/ab12 is under"),
                 failure.contains("page.html"),
             ),
-            (true, true, false)
+            (true, true, true, false)
         );
         Ok(())
     }
