@@ -122,7 +122,7 @@ fn is_raw(rules: &[TextRule], relative: &str) -> bool {
 }
 
 /// Whether a walk lists a file whose own name starts with `.`. A directory whose name does is
-/// never entered: `.git` and the agent worktrees under `.claude` are whole trees of their own.
+/// never entered: `.git` and local worktrees in hidden directories are whole trees of their own.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HiddenFiles {
     Skipped,
