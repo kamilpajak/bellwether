@@ -91,7 +91,7 @@ use pit::datedness::{Datedness, Published};
 use pit::{ObservationTime, Visibility};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
-use crate::blobs::{BlobDigest, BlobStore};
+use crate::blobs::{BlobDigest, BlobStore, Dictionary};
 use crate::cmd_robots::ROBOTS_SOURCE;
 
 const LOCK_FILE: &str = "LOCK";
@@ -103,7 +103,6 @@ pub const ITEMS_DIR: &str = "items";
 /// measured lag keeps the bytes that stated it.
 pub const POLICY_DIR: &str = "policy";
 const BLOB_DIR: &str = "blobs";
-const BLOB_SPACE: &str = "sha256";
 /// One constant for the label `record` writes and `ok_vendor_rows` reads, so the two cannot drift.
 const OUTCOME_OK: &str = "ok";
 /// Statuses a permanent failure is not held under: owner decision of 2026-11-15 (§10).
@@ -116,11 +115,11 @@ PRAGMA synchronous = FULL;
 ";
 
 /// The `PRAGMA user_version` this build writes, and the only one a read-only reader accepts.
-pub const SCHEMA_VERSION: i32 = 15;
+pub const SCHEMA_VERSION: i32 = 16;
 
 /// Version `i + 1` is reached from version `i` by `MIGRATIONS[i]`, run by [`migrate`] with
 /// foreign keys off, as SQLite's twelve-step table rebuild (lang_altertable.html) requires.
-const MIGRATIONS: [&str; 15] = [
+const MIGRATIONS: [&str; 16] = [
     "
 -- The hosts file a run was admitted under: architecture.md section 2's `hosts_version` row. NULL
 -- for a provider that reads no hosts file.
@@ -389,6 +388,25 @@ CREATE TABLE deferred_closed (
 ALTER TABLE attempts ADD COLUMN listed_by TEXT REFERENCES attempts (attempt_id);
 ALTER TABLE deferred ADD COLUMN listed_by TEXT REFERENCES attempts (attempt_id);
 ",
+    "
+-- Section 3.9's compression row: each zstd dictionary `blobs dictionary train` stored as
+-- `blobs/dictionaries/<digest>`, and every activation of one; `put` compresses with the newest.
+-- Neither table is updated or deleted from, and no file they name is ever removed.
+CREATE TABLE dictionaries (
+    digest       TEXT PRIMARY KEY,
+    bytes        INTEGER NOT NULL,
+    samples      INTEGER NOT NULL,
+    sample_bytes INTEGER NOT NULL,
+    run_id       TEXT NOT NULL,
+    trained_at   TEXT NOT NULL
+);
+CREATE TABLE dictionary_activations (
+    activation   INTEGER PRIMARY KEY AUTOINCREMENT,
+    digest       TEXT NOT NULL REFERENCES dictionaries (digest),
+    run_id       TEXT NOT NULL,
+    activated_at TEXT NOT NULL
+);
+",
 ];
 
 /// The frozen user_version 0 DDL; how a store reaches user_version 1: architecture.md §3.1.
@@ -547,6 +565,17 @@ pub enum StoreError {
     /// `BlobStore::put` keeps a file that exists, so a refresh cannot repair this one.
     #[error("the blob stored under {digest} now hashes to {found}")]
     BlobAltered { digest: String, found: String },
+    /// A `.zst` copy whose header or frame zstd cannot read back to one payload.
+    #[error("the compressed blob {digest} cannot be decoded: {why}")]
+    BlobUndecodable { digest: String, why: String },
+    /// A file in the blob tree named neither `<digest>` nor `<digest>.zst`.
+    #[error("{} is in the blob tree and names no digest", .path.display())]
+    BlobStray { path: PathBuf },
+    /// A dictionary a blob or the activation log names is not on disk; never read as "none".
+    #[error("the zstd dictionary {dictionary} is not in the store")]
+    DictionaryAbsent { dictionary: String },
+    #[error("the zstd dictionary stored under {dictionary} now hashes to {found}")]
+    DictionaryAltered { dictionary: String, found: String },
     /// `record_robots`' replay rule; a robots attempt carries no items, so it is not
     /// `ReplayWithDifferentItems`. Each side is `host answer [digest]`.
     #[error("robots attempt {attempt} was recorded as {recorded}, and its replay says {replayed}")]
@@ -894,11 +923,89 @@ pub fn hold_lease_to_copy(root: &Path) -> Result<Option<File>, StoreError> {
 /// Read without the commit log: the pinned robots body `collect` parses (section 11.2). Bytes
 /// that no longer hash to `hex` are `BlobAltered`.
 pub fn blob_bytes(root: &Path, hex: &str) -> Result<Option<Vec<u8>>, StoreError> {
-    let blobs = BlobStore::new(root.join(BLOB_DIR).join(BLOB_SPACE));
+    let blobs = BlobStore::new(root.join(BLOB_DIR));
     match blobs.named(hex) {
         Some(digest) => Ok(Some(blobs.read_verified(&digest)?)),
         None => Ok(None),
     }
+}
+
+/// The blob tree of the store at `root`, with no dictionary active: a reader's.
+#[must_use]
+pub fn blob_store(root: &Path) -> BlobStore {
+    BlobStore::new(root.join(BLOB_DIR))
+}
+
+/// How a dictionary was trained, as `dictionaries` records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Trained {
+    pub samples: u64,
+    pub sample_bytes: u64,
+}
+
+/// The dictionary `put` compresses with: the newest activation, `None` before the first one and
+/// in a log from before user_version 16, which holds no activation table.
+fn active_dictionary(db: &Connection) -> Result<Option<String>, StoreError> {
+    if !holds_table(db, "dictionary_activations")? {
+        return Ok(None);
+    }
+    Ok(db
+        .query_row(
+            "SELECT digest FROM dictionary_activations ORDER BY activation DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// One `dictionaries` row and when it was last activated.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DictionaryRow {
+    pub digest: String,
+    pub bytes: i64,
+    pub samples: i64,
+    pub sample_bytes: i64,
+    pub run_id: String,
+    pub trained_at: String,
+    pub last_activated_at: Option<String>,
+}
+
+/// What the commit log at `root` records about dictionaries, read-only: the active one and every
+/// row. Empty with no log or a log from before user_version 16; a log a writer would refuse is
+/// refused here too.
+pub fn recorded_dictionaries(
+    root: &Path,
+) -> Result<(Option<String>, Vec<DictionaryRow>), StoreError> {
+    refuse_an_unreadable_version(root)?;
+    let log = root.join(COMMIT_LOG);
+    if !log.exists() {
+        return Ok((None, Vec::new()));
+    }
+    let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let active = active_dictionary(&db)?;
+    if !holds_table(&db, "dictionaries")? {
+        return Ok((active, Vec::new()));
+    }
+    let rows = db
+        .prepare(
+            "SELECT d.digest, d.bytes, d.samples, d.sample_bytes, d.run_id, d.trained_at,
+                    (SELECT MAX(a.activated_at) FROM dictionary_activations a
+                      WHERE a.digest = d.digest)
+               FROM dictionaries d ORDER BY d.trained_at, d.digest",
+        )?
+        .query_map([], |row| {
+            Ok(DictionaryRow {
+                digest: row.get(0)?,
+                bytes: row.get(1)?,
+                samples: row.get(2)?,
+                sample_bytes: row.get(3)?,
+                run_id: row.get(4)?,
+                trained_at: row.get(5)?,
+                last_activated_at: row.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((active, rows))
 }
 
 /// The first `PRAGMA user_version` whose attempts record a continuity: `MIGRATIONS[9]`.
@@ -1142,7 +1249,7 @@ fn robots_answer(
 
 impl RobotsLedger {
     pub fn open(root: &Path) -> Result<Self, StoreError> {
-        let blobs = BlobStore::new(root.join(BLOB_DIR).join(BLOB_SPACE));
+        let blobs = BlobStore::new(root.join(BLOB_DIR));
         let log = root.join(COMMIT_LOG);
         if !log.exists() {
             return Ok(Self {
@@ -1365,8 +1472,12 @@ impl Committer {
         let mut db = Connection::open(root.join(COMMIT_LOG))?;
         db.execute_batch(CONNECTION)?;
         migrate(&mut db)?;
+        let blobs = BlobStore::new(root.join(BLOB_DIR));
+        if let Some(hex) = active_dictionary(&db)? {
+            blobs.activate(&blobs.load_dictionary(&hex)?)?;
+        }
         Ok(Self {
-            blobs: BlobStore::new(root.join(BLOB_DIR).join(BLOB_SPACE)),
+            blobs,
             root,
             run: run.clone(),
             db,
@@ -1457,6 +1568,47 @@ impl Committer {
     /// Stores a payload under its own digest, before any transaction opens.
     pub fn put_blob(&self, payload: &[u8]) -> Result<BlobDigest, StoreError> {
         self.blobs.put(self.run.as_str(), payload)
+    }
+
+    /// The blob tree this writer puts into, under its lease.
+    #[must_use]
+    pub fn blobs(&self) -> &BlobStore {
+        &self.blobs
+    }
+
+    /// Files a dictionary already stored by [`BlobStore::store_dictionary`] and makes it the one
+    /// `put` compresses with. `false` when it was already the active one.
+    pub fn record_dictionary(
+        &mut self,
+        dictionary: &Dictionary,
+        trained: &Trained,
+        at: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        let stamped = stamp(at);
+        let transaction = self.db.transaction()?;
+        transaction.execute(
+            "INSERT INTO dictionaries (digest, bytes, samples, sample_bytes, run_id, trained_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(digest) DO NOTHING",
+            params![
+                dictionary.hex(),
+                i64::try_from(dictionary.bytes().len()).unwrap_or(i64::MAX),
+                i64::try_from(trained.samples).unwrap_or(i64::MAX),
+                i64::try_from(trained.sample_bytes).unwrap_or(i64::MAX),
+                self.run.as_str(),
+                stamped
+            ],
+        )?;
+        let changed = active_dictionary(&transaction)?.as_deref() != Some(dictionary.hex());
+        if changed {
+            transaction.execute(
+                "INSERT INTO dictionary_activations (digest, run_id, activated_at)
+                 VALUES (?1, ?2, ?3)",
+                params![dictionary.hex(), self.run.as_str(), stamped],
+            )?;
+        }
+        transaction.commit()?;
+        self.blobs.activate(dictionary)?;
+        Ok(changed)
     }
 
     /// A payload this store already holds, named by its hex.
@@ -6757,7 +6909,7 @@ mod tests {
         let mut store = open(&temp)?;
         let closed = closed_attempt(&mut store, 0, Verdict::Usable)?;
         let stored = rows(&store, 1)?;
-        fs::remove_file(store.blobs.path_of(&stored[0].raw_blob))?;
+        fs::remove_file(store.blobs.compressed_path_of(&stored[0].raw_blob))?;
         let refused = store.record(closed, None, &stored, at(5));
         assert!(
             matches!(refused, Err(StoreError::BlobAbsent { .. })),
@@ -6771,7 +6923,7 @@ mod tests {
         let temp = TempDir::new()?;
         let store = open(&temp)?;
         let digest = store.put_blob(PAYLOAD)?;
-        fs::remove_file(store.blobs.path_of(&digest))?;
+        fs::remove_file(store.blobs.compressed_path_of(&digest))?;
         let staging = store.blobs.staging_path(RUN, &digest);
         fs::write(&staging, SENTINEL)?;
         let refused = store.put_blob(PAYLOAD);
@@ -6786,9 +6938,9 @@ mod tests {
         let temp = TempDir::new()?;
         let store = open(&temp)?;
         let first = store.put_blob(PAYLOAD)?;
-        let before = fs::metadata(store.blobs.path_of(&first))?.ino();
+        let before = fs::metadata(store.blobs.compressed_path_of(&first))?.ino();
         let second = store.put_blob(PAYLOAD)?;
-        let after = fs::metadata(store.blobs.path_of(&second))?.ino();
+        let after = fs::metadata(store.blobs.compressed_path_of(&second))?.ino();
         assert_eq!((first, before), (second, after));
         Ok(())
     }

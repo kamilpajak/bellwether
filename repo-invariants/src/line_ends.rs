@@ -122,7 +122,7 @@ fn is_raw(rules: &[TextRule], relative: &str) -> bool {
 }
 
 /// Every non-hidden file under `root` outside `target/`, as `/`-separated relative paths, sorted.
-fn tree_files(root: &Path) -> Result<Vec<String>, String> {
+pub(crate) fn tree_files(root: &Path) -> Result<Vec<String>, String> {
     let mut found = Vec::new();
     let mut pending: Vec<PathBuf> = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
