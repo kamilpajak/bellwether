@@ -619,6 +619,63 @@ mod tests {
         Ok(())
     }
 
+    const LAST_SEND: &str = "2026-11-10T13:00:00Z";
+    const ONE_MICROSECOND_SHORT: &str = "2026-11-10T13:00:00.999999Z";
+    const ONE_INTERVAL_ON: &str = "2026-11-10T13:00:01Z";
+    const ONE_MICROSECOND: Duration = Duration::from_micros(1);
+
+    /// A tolerance of 1 ms or 10 ms at the comparison passed every other test (2026-11-22).
+    #[test]
+    fn a_stamp_one_microsecond_short_of_the_interval_is_owed_it_and_one_on_it_is_sent(
+    ) -> Result<(), String> {
+        let store = tempfile::tempdir().map_err(|why| why.to_string())?;
+        let host = HostKey::new(SEC).map_err(|why| why.to_string())?;
+        let gates =
+            [
+                SendGate::beside_the_store(
+                    store.path(),
+                    &BudgetScope::PerHost(host),
+                    GATE_INTERVAL,
+                )
+                .map_err(|why| why.to_string())?,
+            ];
+        let at = |read: &str| read.parse::<DateTime<Utc>>().map_err(|why| why.to_string());
+        SendGate::stamp(&gates, at(LAST_SEND)?).map_err(|why| why.to_string())?;
+        let short = SendGate::stamp(&gates, at(ONE_MICROSECOND_SHORT)?);
+        let on_it = SendGate::stamp(&gates, at(ONE_INTERVAL_ON)?);
+        assert_eq!(
+            (short, on_it),
+            (
+                Ok(Stamped::Owed(ONE_MICROSECOND)),
+                Ok(Stamped::Sent(at(ONE_INTERVAL_ON)?))
+            )
+        );
+        Ok(())
+    }
+
+    const A_READ_WITH_NANOSECONDS: &str = "2026-11-10T13:00:00.123456789Z";
+    const THAT_READ_IN_MICROSECONDS: &str = "2026-11-10T13:00:00.123456Z";
+
+    /// `requested_at` is this instant, and the ledger keeps microseconds.
+    #[test]
+    fn a_stamp_keeps_the_microseconds_of_its_clock_read() -> Result<(), String> {
+        let store = tempfile::tempdir().map_err(|why| why.to_string())?;
+        let host = HostKey::new(SEC).map_err(|why| why.to_string())?;
+        let gates =
+            [
+                SendGate::beside_the_store(
+                    store.path(),
+                    &BudgetScope::PerHost(host),
+                    GATE_INTERVAL,
+                )
+                .map_err(|why| why.to_string())?,
+            ];
+        let at = |read: &str| read.parse::<DateTime<Utc>>().map_err(|why| why.to_string());
+        let stamped = SendGate::stamp(&gates, at(A_READ_WITH_NANOSECONDS)?);
+        assert_eq!(stamped, Ok(Stamped::Sent(at(THAT_READ_IN_MICROSECONDS)?)));
+        Ok(())
+    }
+
     #[test]
     fn a_host_key_in_upper_case_is_normalised_to_one_lowercase_bucket() {
         assert_eq!(HostKey::new(SHOUTED), Ok(HostKey(SEC.to_owned())));

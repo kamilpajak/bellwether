@@ -3223,6 +3223,49 @@ mod tests {
         Ok(())
     }
 
+    /// The second send waits at the gate; unless that send is written to the gate file, the third
+    /// is compared with the first and leaves 8.93 s after the second.
+    #[test]
+    fn a_send_that_waited_at_the_gate_is_the_one_the_next_send_is_spaced_from() -> Checked {
+        let store = tempfile::tempdir()?;
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let wire = Wire::with_sleeper(
+            hosts_only_profile(),
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        let first = reserved_then_sent(&wire, &clock, FIRST_ATTEMPT, LOCALHOST, ROW_OPENED_IN)?;
+        let second = reserved_then_sent(&wire, &clock, SECOND_ATTEMPT, LOCALHOST, NO_WAIT)?;
+        let third = reserved_then_sent(&wire, &clock, SECOND_ATTEMPT + 1, LOCALHOST, NO_WAIT)?;
+        assert_eq!(
+            ((second - first).to_std()?, (third - second).to_std()?),
+            (FLOOR, FLOOR)
+        );
+        Ok(())
+    }
+
+    /// edgar's shape, both paces: a call to another host is still spaced from the last call on
+    /// our address, which only the per-IP gate file knows once the first left its slot late.
+    #[test]
+    fn two_hosts_under_a_per_ip_pace_are_its_interval_apart_however_late_the_first_left() -> Checked
+    {
+        let store = tempfile::tempdir()?;
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let wire = Wire::with_sleeper(
+            polite_profile(),
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        let first = reserved_then_sent(&wire, &clock, FIRST_ATTEMPT, REFUSED, IP_ROW_OPENED_IN)?;
+        let second = reserved_then_sent(&wire, &clock, SECOND_ATTEMPT, LOCALHOST, NO_WAIT)?;
+        assert_eq!((second - first).to_std()?, TEST_INTERVAL);
+        Ok(())
+    }
+
     /// S7-D7: `Retry-After: 315360000` holds A 24 h, not 10 years, and is recorded; a value past
     /// what `DateTime` or the hold file can hold is held and recorded the same way.
     #[test]
