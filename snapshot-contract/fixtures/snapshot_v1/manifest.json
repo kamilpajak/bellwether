@@ -1,0 +1,13 @@
+{
+  "cutoff": "2026-07-05T00:00:00.000000Z",
+  "data_sha256": "fcd7eba01afbb737e1ea9860868ba74395ce9514d1e7cefe97f46aa4eeedf928",
+  "items": 3,
+  "provenance_counts": {
+    "bulk_dataset": 0,
+    "live_ingest": 2,
+    "vendor_archive": 1
+  },
+  "schema": "snapshot.manifest/1",
+  "seq_high_water": 4,
+  "snapshot_id": "66c8a50b5450abc747c7abef236118aba9bd3e3ee0e27c6b1024d2ac5db54eb2"
+}

@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use news_provider::{Clock, RunId, SystemClock};
 use newsvault::cmd_blobs::{self, BlobsError};
 use newsvault::cmd_collect::{self, CollectRunError};
+use newsvault::cmd_cut::{self, CutError};
 use newsvault::cmd_items;
 use newsvault::cmd_ledger::{self, Ask, LedgerReadError, Report};
 use newsvault::cmd_robots::{self, RobotsError};
@@ -193,6 +194,30 @@ enum Command {
     Robots {
         #[command(subcommand)]
         action: RobotsAction,
+    },
+    /// The section 3.0 Snapshot for derive: every row visible at --at within a seq prefix, as
+    /// <out>/<snapshot_id>/ with manifest.json and snapshot.parquet. Never rewrites one.
+    Cut {
+        /// The cutoff (RFC 3339), at microsecond precision and not after the clock's now.
+        #[arg(long)]
+        at: String,
+        /// An existing directory the snapshot directory is created in. Required unless --dry-run.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// The seq bound, from an earlier manifest's seq_high_water, to rebuild that cut.
+        /// Defaults to the store's highest seq.
+        #[arg(long)]
+        through_seq: Option<i64>,
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Selects and digests, reports the id and counts, reads no body and writes nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Accepted and does nothing: no command here prompts or reads stdin.
+        #[arg(long)]
+        non_interactive: bool,
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
     },
     /// One consistent copy of the commit log, for the daily backup. Writes only --out.
     Snapshot {
@@ -660,6 +685,35 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 }
             }
         }
+        Command::Cut {
+            at,
+            out,
+            through_seq,
+            store,
+            dry_run,
+            non_interactive: _,
+            format,
+        } => {
+            let ask = cmd_cut::Ask {
+                store: vault_root(store),
+                out,
+                at: instant(&at, "--at"),
+                now: SystemClock.now(),
+                through_seq,
+                dry_run,
+                busy_wait: cmd_cut::BUSY_WAIT,
+            };
+            match cmd_cut::run(&ask, &Fsync) {
+                Ok(report) => {
+                    emit_cut(&report, format)?;
+                    Ok(Verdict::Ok)
+                }
+                Err(refused) => {
+                    emit_cut_error(&refused, format)?;
+                    Ok(Verdict::No(refused.exit()))
+                }
+            }
+        }
         Command::Blobs { action } => run_blobs(action),
         Command::Publish { at, store, format } => {
             let at = instant(&at, "--at");
@@ -935,6 +989,39 @@ fn emit_snapshot_error(
         } else {
             Vec::new()
         },
+    });
+    let err = std::io::stderr();
+    let mut err = err.lock();
+    match format {
+        Format::Json => writeln!(err, "{object}")?,
+        Format::Human => writeln!(err, "error: {refused} ({})", refused.code())?,
+    }
+    Ok(())
+}
+
+fn emit_cut(report: &cmd_cut::Report, format: Format) -> anyhow::Result<()> {
+    let out = std::io::stdout();
+    let mut out = out.lock();
+    match format {
+        Format::Json => {
+            serde_json::to_writer_pretty(&mut out, report)?;
+            writeln!(out)?;
+        }
+        Format::Human => cmd_cut::render_human(report, &mut out)?,
+    }
+    Ok(())
+}
+
+/// A refusal on stderr with stdout empty. No suggestion: `lease_held` is the same argv again
+/// (`retryable`), and `staging_left` is a removal the owner decides.
+fn emit_cut_error(refused: &CutError, format: Format) -> anyhow::Result<()> {
+    let object = serde_json::json!({
+        "schema": "newsvault.error/1",
+        "code": refused.code(),
+        "message": refused.to_string(),
+        "retryable": refused.retryable(),
+        "details": refused.details(),
+        "suggestions": Vec::<Vec<String>>::new(),
     });
     let err = std::io::stderr();
     let mut err = err.lock();
@@ -1436,6 +1523,38 @@ fn print_schema(format: Format) {
                 "mutates": true
             },
             {
+                "path": ["cut"],
+                "summary": "The section 3.0 Snapshot for derive: every row of the seq prefix through seq_high_water that is visible at at, written once as out/<snapshot_id>/ with manifest.json (snapshot.manifest/1) and snapshot.parquet (snapshot.data/1, ZSTD), staged, fsynced, validated by snapshot-contract and renamed. Not the backup copy: that is snapshot.",
+                "options": [
+                    {"name": "at", "type": "rfc3339", "required": true,
+                     "doc": "the cutoff; microsecond precision; after the clock's now is invalid_argument"},
+                    {"name": "out", "type": "path", "required_unless": "dry_run",
+                     "doc": "an existing directory outside the store; the cut is out/<snapshot_id>/ and a standing one that validates is left as it is (changed false, its own manifest's seq_high_water, items and provenance_counts reported)"},
+                    {"name": "through_seq", "type": "integer",
+                     "doc": "the seq bound from an earlier manifest's seq_high_water; defaults to the store's highest seq; below 1 or above it is invalid_argument"},
+                    {"name": "store", "type": "path"},
+                    {"name": "dry_run", "type": "flag",
+                     "doc": "selects and digests, reports snapshot_id, the counts and body_bytes, reads no body and writes nothing"},
+                    {"name": "non_interactive", "type": "flag",
+                     "doc": "accepted and does nothing: no command here prompts or reads stdin"},
+                    {"name": "format", "type": "enum", "values": ["human", "json"]}
+                ],
+                "env": [{"name": "BELLWETHER_VAULT",
+                         "doc": "the store when --store is not given, then ~/.bellwether/vault"}],
+                "output": cmd_cut::SCHEMA,
+                "output_fields": [
+                    {"name": "open_attempts",
+                     "doc": "attempts opened at or before at, neither closed nor abandoned at the read: a later cut at the same at without through_seq may hold more rows"}
+                ],
+                "exits": {
+                    "0": "written, or already standing and admissible (changed false), or a dry run",
+                    "2": "invalid_argument (--out inside the store included), input_schema_mismatch, input_unparseable (a stored time or an attempt's opened_at, a body not UTF-8 or not hashing to its digest, a staged or standing directory that does not validate), staging_left (details.path: an earlier cut did not finish), io_failed",
+                    "4": "input_absent (no commit log, a selected body or its dictionary), provenance_unrecorded, nothing_visible",
+                    "7": "lease_held (a writer kept the commit log locked past 30 s; retryable)"
+                },
+                "mutates": true
+            },
+            {
                 "path": ["snapshot"],
                 "summary": "One consistent copy of the commit log (SQLite online backup, one step, under the store's lease), checked by PRAGMA quick_check.",
                 "options": [
@@ -1553,7 +1672,10 @@ fn print_schema(format: Format) {
             {"code": "vendor_refused_all", "exit": 8, "retryable": false},
             {"code": "commit_failed", "exit": 8, "retryable": false},
             {"code": "robots_unverified", "exit": 4, "retryable": false},
-            {"code": "robots_refused", "exit": 2, "retryable": false}
+            {"code": "robots_refused", "exit": 2, "retryable": false},
+            {"code": "provenance_unrecorded", "exit": 4, "retryable": false},
+            {"code": "nothing_visible", "exit": 4, "retryable": false},
+            {"code": "staging_left", "exit": 2, "retryable": false}
         ],
         // Decision D1's companion rule, which `news_provider::Exit` holds as one function.
         "stdout_carries_the_result_for_exits": [0, 1, 8]

@@ -1,7 +1,8 @@
 {
-  "schema": "panel.manifest/1",
+  "schema": "panel.manifest/2",
   "panel_id": "sha256:4c89809b862a4dbbbe431ac60c3086f1ff241c1e7eba460ec480406895065adf",
-  "snapshot_id": "sha256:cb519346bd0f7b617b5e9c7bde68dd42427b976b99aa1e762ddcf208a6b08c74",
+  "snapshot_id": "cb519346bd0f7b617b5e9c7bde68dd42427b976b99aa1e762ddcf208a6b08c74",
+  "seq_high_water": 4373,
   "rule_version": "sha256:65598ce2157aa8f506b26e09f0e544f00af5ca8de2ee95f251350b07a3705b70",
   "calendar_version": "sha256:e3482711a21299ccb68539c10b5a32bde34bd373615c3ec6a0b96c315c7ca2fd",
   "cutoff": "2026-08-14T20:00:00Z",

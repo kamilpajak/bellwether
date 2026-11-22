@@ -1,6 +1,7 @@
-//! The eight digests, each a field list over the form in `lib.rs`. `docs/design/architecture.md`
-//! section 2's rows state the order of `item_id`, `story_id` and `snapshot_id`, section 3.2's that
-//! of `filter_params` and `result_digest`; only the code below states `doc_id` and `attempt_id`.
+//! The nine digests, each a field list over the form in `lib.rs`. `docs/design/architecture.md`
+//! section 2's rows state the order of `item_id`, `story_id`, `snapshot_row` and `snapshot_id`,
+//! section 3.2's that of `filter_params` and `result_digest`; only the code below states `doc_id`
+//! and `attempt_id`.
 
 use crate::{sha256_canon, CanonError, Digest, Domain, Field, Stamp};
 use chrono::{DateTime, Utc};
@@ -103,17 +104,51 @@ pub fn result_digest(ids: &[&str]) -> Result<Digest, CanonError> {
     sha256_canon(Domain::ResultDigest, &[Field::List(&set)])
 }
 
-/// architecture.md section 2 row `snapshot_id`. The ids are taken in the caller's ascending `seq`
-/// order and not re-sorted.
+/// One snapshot row's columns, in the order architecture.md section 2's `snapshot_row` row states
+/// them: every column of `snapshot.data/1` but `seq` and the body text, which `body_blob` names.
+#[derive(Debug, Clone, Copy)]
+pub struct SnapshotRowFields<'a> {
+    pub item_id: &'a str,
+    pub story_id: &'a str,
+    pub doc_id: Option<&'a str>,
+    pub source: &'a str,
+    pub provenance: &'a str,
+    pub valid: Stamp,
+    /// The calendar a `day` value closes in; `Stamp::Day` carries no zone.
+    pub valid_tz: Option<&'a str>,
+    pub observed_at: DateTime<Utc>,
+    pub body_blob: Option<&'a str>,
+}
+
+/// architecture.md section 2 row `snapshot_row`.
+pub fn snapshot_row(fields: &SnapshotRowFields) -> Result<Digest, CanonError> {
+    sha256_canon(
+        Domain::SnapshotRow,
+        &[
+            Field::Text(fields.item_id),
+            Field::Text(fields.story_id),
+            fields.doc_id.map_or(Field::Absent, Field::Text),
+            Field::Text(fields.source),
+            Field::Text(fields.provenance),
+            Field::Stamp(fields.valid),
+            fields.valid_tz.map_or(Field::Absent, Field::Text),
+            Field::Stamp(Stamp::Instant(fields.observed_at)),
+            fields.body_blob.map_or(Field::Absent, Field::Text),
+        ],
+    )
+}
+
+/// architecture.md section 2 row `snapshot_id`: the cutoff, then each row's [`snapshot_row`] hex
+/// in the caller's ascending `seq` order, neither re-sorted nor deduplicated.
 pub fn snapshot_id(
     cutoff: DateTime<Utc>,
-    item_ids_in_seq_order: &[&str],
+    rows_in_seq_order: &[&str],
 ) -> Result<Digest, CanonError> {
     sha256_canon(
         Domain::SnapshotId,
         &[
             Field::Stamp(Stamp::Instant(cutoff)),
-            Field::List(item_ids_in_seq_order),
+            Field::List(rows_in_seq_order),
         ],
     )
 }
@@ -139,7 +174,7 @@ pub fn extract_version(
 mod tests {
     use super::{
         attempt_id, doc_id, extract_version, filter_params, item_id, result_digest, snapshot_id,
-        story_id, ItemFields, Param, ParamValue,
+        snapshot_row, story_id, ItemFields, Param, ParamValue, SnapshotRowFields,
     };
     use crate::{CanonError, Digest, Stamp};
     use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
@@ -159,7 +194,7 @@ mod tests {
     const MIDNIGHT_MICROS: i64 = 1_782_864_000_000_000;
     /// Every file in `vectors/` is read by the loop below; the count is here so that deleting one
     /// is a failure rather than a smaller pass.
-    const VECTOR_COUNT: usize = 17;
+    const VECTOR_COUNT: usize = 23;
 
     fn at(micros: i64) -> DateTime<Utc> {
         DateTime::UNIX_EPOCH + TimeDelta::microseconds(micros)
@@ -372,7 +407,26 @@ mod tests {
                 let Ok(cutoff) = text(input, "cutoff").parse::<DateTime<Utc>>() else {
                     return "unreadable: cutoff".to_string();
                 };
-                snapshot_id(cutoff, &strings(input, "item_ids"))
+                snapshot_id(cutoff, &strings(input, "rows"))
+            }
+            "snapshot_row" => {
+                let (Some(valid), Ok(observed_at)) = (
+                    stamp(&input["valid"]),
+                    text(input, "observed_at").parse::<DateTime<Utc>>(),
+                ) else {
+                    return "unreadable: valid or observed_at".to_string();
+                };
+                snapshot_row(&SnapshotRowFields {
+                    item_id: text(input, "item_id"),
+                    story_id: text(input, "story_id"),
+                    doc_id: input["doc_id"].as_str(),
+                    source: text(input, "source"),
+                    provenance: text(input, "provenance"),
+                    valid,
+                    valid_tz: input["valid_tz"].as_str(),
+                    observed_at,
+                    body_blob: input["body_blob"].as_str(),
+                })
             }
             "extract_version" => {
                 let Some(sources) = input["sources"].as_array().and_then(|members| {

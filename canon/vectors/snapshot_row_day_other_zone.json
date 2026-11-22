@@ -1,0 +1,19 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "snapshot_row",
+  "note": "snapshot_row_day_precision.json with the day in UTC instead of New York: the same date closes four hours earlier, so the digest must differ.",
+  "input": {
+    "item_id": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+    "story_id": "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d",
+    "doc_id": "2e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6",
+    "source": "edgar_press",
+    "provenance": "vendor_archive",
+    "valid": {
+      "day": "2026-07-01"
+    },
+    "valid_tz": "UTC",
+    "observed_at": "2026-07-03T02:21:22.000000Z",
+    "body_blob": "18ac3e7343f016890c510e93f935261169d9e3f565436429830faf0934f4f8e4"
+  },
+  "sha256": "8479685c8615f71c198daff5bef2e6cdd9331da8aacc4d1ef8fad2b65ff28ae6"
+}

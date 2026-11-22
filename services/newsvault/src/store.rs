@@ -7579,6 +7579,28 @@ mod tests {
         Ok(())
     }
 
+    /// The CHECK `snapshot_contract::visible_at` relies on to answer `Ok(false)` only for a refused
+    /// row (§8 row R13). Mutation 2026-11-22, `= 1` made `<= 1` in `MIGRATIONS[0]`: red.
+    #[test]
+    fn a_row_with_no_publication_value_and_no_refusal_is_refused_by_the_schema() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let closed = closed_attempt(&mut store, 0, Verdict::Usable)?;
+        store.record(closed, None, &[row(&store, &spec(STORY))?], at(5))?;
+        let neither = store.db.execute(
+            INSERTED_BY_HAND,
+            params![
+                Option::<String>::None,
+                Option::<String>::None,
+                stamped(OBSERVED_AT),
+                ValidSource::VendorPublished.name()
+            ],
+        );
+        assert!(neither.is_err(), "{neither:?}");
+        assert_eq!(count(&store, "items")?, 1);
+        Ok(())
+    }
+
     #[test]
     fn a_valid_source_no_variant_names_is_refused_by_the_schema() -> TestResult {
         let temp = TempDir::new()?;

@@ -5,6 +5,7 @@
 pub mod blobs;
 pub mod cmd_blobs;
 pub mod cmd_collect;
+pub mod cmd_cut;
 pub mod cmd_items;
 pub mod cmd_ledger;
 pub mod cmd_robots;

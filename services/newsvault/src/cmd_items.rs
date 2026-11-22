@@ -10,10 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDate, Utc};
-use pit::datedness::{end_of_day, Datedness, Minute};
-use pit::{Cutoff, ObservationTime, ValidTime, Visibility};
+use pit::Cutoff;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Map, Value};
+use snapshot_contract::{visible_at, Rule, StoredTimes, TimeError};
 
 use crate::store::{require_current_version, StoreError, COMMIT_LOG, VALID_DATE};
 
@@ -48,6 +48,9 @@ pub enum ItemsError {
     RangeInverted { from: NaiveDate, to: NaiveDate },
     #[error("--fields names {0}, which is not a field of this output")]
     UnknownField(String),
+    /// A stored time the predicate cannot answer for: `input_unparseable`, never a hidden row.
+    #[error("seq {seq}: {error}")]
+    StoredTime { seq: i64, error: TimeError },
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -132,11 +135,17 @@ pub fn read(root: &Path, ask: &Ask) -> Result<Report, ItemsError> {
     let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     require_current_version(&db)?;
     let cutoff = Cutoff::new(ask.at);
-    let mut visible: Vec<Row> = rows(&db)?
-        .into_iter()
-        .filter(|row| in_range(row, ask))
-        .filter(|row| visible_at(row, cutoff))
-        .collect();
+    let mut visible: Vec<Row> = Vec::new();
+    for row in rows(&db)?.into_iter().filter(|row| in_range(row, ask)) {
+        if visible_at(Rule::CURRENT, &times(&row), cutoff).map_err(|error| {
+            ItemsError::StoredTime {
+                seq: row.seq,
+                error,
+            }
+        })? {
+            visible.push(row);
+        }
+    }
     let rows_visible = visible.len();
     let stories_visible = visible
         .iter()
@@ -224,44 +233,16 @@ fn in_range(row: &Row, ask: &Ask) -> bool {
     after && before && sourced
 }
 
-/// Every predicate comes from `pit`: instant via `Visibility`, minute via `Datedness::of_minute`,
-/// day via `end_of_day` in the row's own calendar (architecture.md section 3.1). The zone is a
-/// stored string, not the `&'static str` `Datedness::DayDated` needs, so no `DayDated` is built.
-fn visible_at(row: &Row, cutoff: Cutoff) -> bool {
-    if let Some(minute) = &row.valid_minute {
-        let (Some(minute), Some(observed)) = (
-            instant(minute).and_then(|starts| Minute::new(starts).ok()),
-            instant(&row.observed_at),
-        ) else {
-            return false;
-        };
-        return Datedness::of_minute(minute, ObservationTime::new(observed)).visible_at(cutoff);
+/// The predicate is `snapshot_contract::visible_at`, the one `cut` and the snapshot validator
+/// call (architecture.md section 3.0).
+fn times(row: &Row) -> StoredTimes<'_> {
+    StoredTimes {
+        valid_at: row.valid_at.as_deref(),
+        valid_minute: row.valid_minute.as_deref(),
+        valid_day: row.valid_day.as_deref(),
+        valid_tz: row.valid_tz.as_deref(),
+        observed_at: &row.observed_at,
     }
-    if let (Some(day), Some(zone)) = (&row.valid_day, &row.valid_tz) {
-        let (Ok(day), Some(observed)) = (day.parse::<NaiveDate>(), instant(&row.observed_at))
-        else {
-            return false;
-        };
-        return match end_of_day(day, zone) {
-            Some(closes) => cutoff.inner() >= closes && cutoff.inner() >= observed,
-            None => false,
-        };
-    }
-    let (Some(valid), Some(observed)) = (
-        row.valid_at.as_deref().and_then(instant),
-        instant(&row.observed_at),
-    ) else {
-        // A refused publication value is visible at no cutoff: architecture.md section 5 row 4.
-        return false;
-    };
-    match Visibility::from_live(ValidTime::new(valid), ObservationTime::new(observed)) {
-        Ok(window) => window.visible_at(cutoff),
-        Err(_) => false,
-    }
-}
-
-fn instant(text: &str) -> Option<DateTime<Utc>> {
-    text.parse().ok()
 }
 
 /// The highest `seq` among the visible rows sharing a `story_id`, which keeps the ordering free of

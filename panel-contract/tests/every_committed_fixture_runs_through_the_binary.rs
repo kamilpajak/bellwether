@@ -8,7 +8,7 @@
 //! where a produced panel's manifest sits on disk (section 3.4 names no layout, and the two
 //! consumers take a file and a directory). A CI step would have bought one thing more - validating
 //! a panel that `probes/panel_recount.py` actually produced - and that one needs the layout
-//! decided and the probe emitting a `panel.manifest/1` first, which is requirement R9's work.
+//! decided and the probe emitting a `panel.manifest/2` first, which is requirement R9's work.
 //!
 //! What it pins beyond "the binary runs": the exit status **is** the verdict, the binary and the
 //! library agree on every committed fixture, and a fixture cannot be added without being run.

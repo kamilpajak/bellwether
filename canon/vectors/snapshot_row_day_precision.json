@@ -1,0 +1,19 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "snapshot_row",
+  "note": "A day publication value and the calendar it closes in. canon's day stamp carries no zone, so valid_tz is its own field. Pair with snapshot_row_day_other_zone.json.",
+  "input": {
+    "item_id": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+    "story_id": "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d",
+    "doc_id": "2e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6",
+    "source": "edgar_press",
+    "provenance": "vendor_archive",
+    "valid": {
+      "day": "2026-07-01"
+    },
+    "valid_tz": "America/New_York",
+    "observed_at": "2026-07-03T02:21:22.000000Z",
+    "body_blob": "18ac3e7343f016890c510e93f935261169d9e3f565436429830faf0934f4f8e4"
+  },
+  "sha256": "8ea3eb39f68198ab375fd3338f29df0be706eb80ff0bb742dbb407862f1b7288"
+}

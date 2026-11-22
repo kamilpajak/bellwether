@@ -1,0 +1,16 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "snapshot_row",
+  "note": "A minute publication value with no doc_id, no valid_tz and no body: each absent field contributes an empty string and keeps its place.",
+  "input": {
+    "item_id": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+    "story_id": "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d",
+    "source": "open_web_wires",
+    "provenance": "live_ingest",
+    "valid": {
+      "minute": "2026-11-14T19:00:00.000000Z"
+    },
+    "observed_at": "2026-11-14T19:00:30.000000Z"
+  },
+  "sha256": "90f9a6658eb05b468913d06584a59a24c21fc3f864c1b84164c6345e985de685"
+}

@@ -1,10 +1,13 @@
 {
   "schema": "canon.vector/1",
   "digest": "snapshot_id",
-  "note": "The ids keep their ascending seq order, which here is also code-point order. Pair with snapshot_id_locale_ordered.json.",
+  "note": "The rows keep their ascending seq order, which here is also code-point order. Production rows are snapshot_row hexes; any text digests the same way. Pair with snapshot_id_locale_ordered.json.",
   "input": {
     "cutoff": "2026-07-01T21:00:00.000000Z",
-    "item_ids": ["zebra-item", "ärger-item"]
+    "rows": [
+      "zebra-item",
+      "ärger-item"
+    ]
   },
   "sha256": "94c5c36d7c5d94c632800b230b7a9acbe54d1a778da993e1cba6a04724d3594d"
 }

@@ -63,6 +63,7 @@ keep passing.
 | `news-provider/` | the provider seam: the coverage ledger's write half, the one HTTP client — a send consumes a permit that only a written attempt row hands out — and the driver that opens and closes every slot |
 | `providers/` | one crate per vendor adapter. Each declares no HTTP dependency at all |
 | `services/newsvault/` | the archive: the commit log, the coverage reader and the segment export, in Rust |
+| `snapshot-contract/` | the Snapshot contract `vault` hands `derive`: the column list, the manifest, the visibility predicate every reader of stored times calls, the writer and the validator `newsvault cut` runs before it renames a cut into place |
 | `panel-contract/` | the panel manifest contract: the shape the statistics tier may read, and the validator that refuses a row count that is really a product |
 | `repo-invariants/` | the one invariant that is a property of the repository rather than of a crate |
 

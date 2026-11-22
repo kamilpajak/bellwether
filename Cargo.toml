@@ -19,6 +19,7 @@ members = [
     "providers/*",
     "repo-invariants",
     "services/*",
+    "snapshot-contract",
 ]
 resolver = "2"
 

@@ -1,0 +1,14 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "snapshot_id",
+  "note": "snapshot_id.json with its first row repeated: the list is neither deduplicated nor sorted, so a repeated row (an A to B to A revert repeats an item_id) is a different set and a different digest.",
+  "input": {
+    "cutoff": "2026-07-01T21:00:00.000000Z",
+    "rows": [
+      "zebra-item",
+      "zebra-item",
+      "ärger-item"
+    ]
+  },
+  "sha256": "108a7c7cc2ff8162b4b5ef75e64cbfe23c1fbb496d4ab0a0d7cabe391fe63eea"
+}
