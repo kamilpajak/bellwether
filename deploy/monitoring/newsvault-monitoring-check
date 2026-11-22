@@ -97,7 +97,7 @@ body=$(curl -fsS --max-time 10 -G --data-urlencode "rule_group[]=$group" --data-
     "$prometheus/api/v1/rules") || { echo "Prometheus at $prometheus did not answer" >&2; exit 7; }
 # Compact JSON split at , { and [: a key at a line's start is never inside a string, whose quotes
 # are escaped.
-fields=$(printf '%s' "$body" | tr ',{[' '\n\n\n')
+fields=$(printf '%s\n' "$body" | awk '{ gsub(/[,{[]/, "\n"); print }')
 value() {
     printf '%s\n' "$fields" | sed -n "s/^\"$1\":\"\\([^\"]*\\)\".*/\\1/p"
 }
