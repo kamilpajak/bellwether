@@ -70,6 +70,7 @@ pub enum Domain {
     ResultDigest,
     SnapshotId,
     ExtractVersion,
+    SnapshotRow,
 }
 
 impl Domain {
@@ -84,6 +85,7 @@ impl Domain {
             Self::ResultDigest => "result_digest",
             Self::SnapshotId => "snapshot_id",
             Self::ExtractVersion => "extract_version",
+            Self::SnapshotRow => "snapshot_row",
         }
     }
 }
@@ -146,6 +148,20 @@ impl std::fmt::Display for Digest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
+}
+
+/// Lower-case hex characters in a sha256, which is the text form of both [`Digest`] and
+/// [`FileDigest`].
+const DIGEST_HEX_LEN: usize = 64;
+
+/// Whether `text` is the text form [`Digest::hex`] prints: 64 lower-case hex characters, no
+/// prefix. For a reader of a digest it did not compute, such as a manifest field.
+#[must_use]
+pub fn is_digest_hex(text: &str) -> bool {
+    text.len() == DIGEST_HEX_LEN
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Every caller-supplied value passes through here before it reaches the form.
@@ -221,7 +237,7 @@ pub fn sha256_canon(domain: Domain, fields: &[Field]) -> Result<Digest, CanonErr
 
 #[cfg(test)]
 mod tests {
-    use super::{canon, sha256_canon, CanonError, Domain, Field, FileDigest, Stamp};
+    use super::{canon, is_digest_hex, sha256_canon, CanonError, Domain, Field, FileDigest, Stamp};
 
     /// Any one domain: these tests are about the form, and the form is the same under each.
     const ANY: Domain = Domain::ItemId;
@@ -267,6 +283,15 @@ mod tests {
     fn a_file_digest_is_the_plain_sha256_of_the_bytes_and_moves_with_one_of_them() {
         assert_eq!(FileDigest::of(b"a").hex(), SHA256_OF_ONE_LETTER_A);
         assert_ne!(FileDigest::of(b"a"), FileDigest::of(b"b"));
+    }
+
+    #[test]
+    fn only_sixty_four_lower_case_hex_characters_are_a_digests_text_form() {
+        let upper = SHA256_OF_ONE_LETTER_A.to_uppercase();
+        let prefixed = format!("sha256:{SHA256_OF_ONE_LETTER_A}");
+        let short = &SHA256_OF_ONE_LETTER_A[1..];
+        let verdicts = [SHA256_OF_ONE_LETTER_A, &upper, &prefixed, short].map(is_digest_hex);
+        assert_eq!(verdicts, [true, false, false, false]);
     }
 
     #[test]

@@ -1,0 +1,18 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "snapshot_row",
+  "note": "Every field present: an instant publication value, a doc_id and a body. valid_tz is absent because only a day value has a calendar.",
+  "input": {
+    "item_id": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+    "story_id": "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d",
+    "doc_id": "2e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6",
+    "source": "open_web_wires",
+    "provenance": "live_ingest",
+    "valid": {
+      "instant": "2026-07-01T13:30:00.000000Z"
+    },
+    "observed_at": "2026-07-01T13:31:05.250000Z",
+    "body_blob": "18ac3e7343f016890c510e93f935261169d9e3f565436429830faf0934f4f8e4"
+  },
+  "sha256": "7dd342776f4dc76a707d48f4c5f2dccc0be72bb03657f01e23e6f3f3b3c28d86"
+}
