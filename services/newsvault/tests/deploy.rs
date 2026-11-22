@@ -37,7 +37,7 @@ const SQLITE_JOBS: [(&str, &str); 3] = [
 ];
 const SQLITE_CHECK: &str = r"--show libsqlite3-0 | grep -E '^3\.45\.'";
 /// Each validator `deploy.yml` runs, by job, as the tail of its `run` line.
-const VALIDATORS: [(&str, &str); 7] = [
+const VALIDATORS: [(&str, &str); 9] = [
     (
         "prometheus-rules",
         "--entrypoint /bin/promtool \"$PROMETHEUS\" check rules newsvault.rules.yml",
@@ -65,8 +65,13 @@ const VALIDATORS: [(&str, &str); 7] = [
     ),
     (
         "monitoring-check",
-        "ALERTMANAGER_CONFIG=/etc/alertmanager/unrouted.yml sh \
-         deploy/monitoring/newsvault-monitoring-check || status=$?; test \"$status\" -eq 1",
+        "sh deploy/monitoring/newsvault-monitoring-check >\"$RUNNER_TEMP/drift.out\" || status=$?",
+    ),
+    ("monitoring-check", "test \"$status\" -eq 1"),
+    (
+        "monitoring-check",
+        "grep -Ec '^drift (prometheus_reload|route NewsvaultHostHeld|repeat_interval):' \
+         \"$RUNNER_TEMP/drift.out\" | grep -x 3",
     ),
 ];
 const IMAGE_IDENTITY: &str =

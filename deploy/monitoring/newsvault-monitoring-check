@@ -1,12 +1,14 @@
 #!/bin/sh
 # Compares bellwether's three touchpoints in the VPS's shared monitoring stack with this repository
-# (architecture.md section 10, V4): the installed rule file's sha256, its prometheus.yml rule_files
-# entry, the rules Prometheus loaded and their health, and Alertmanager's route for every alert.
-# Reads only. Never prints alertmanager.yml or amtool's errors: its receivers hold the chat's
-# credentials. Exits: 0 no drift, 1 drift found, 2 setup, 4 an absent input, 7 Prometheus or
-# Alertmanager did not answer.
+# (architecture.md section 8 row A1; section 11.5 step 7, "Alerting"). Reads only. Never prints the
+# Alertmanager config, amtool's errors or docker's: the receivers hold the chat's credentials.
+# Exits: 0 no drift, 1 drift found, 2 setup, 4 an absent input, 7 no drift found but Prometheus or
+# Alertmanager did not answer, or a rule is not evaluated yet.
 set -u
 export LC_ALL=C
+for tool in curl docker sha256sum date awk sed grep sort wc tr dirname; do
+    command -v "$tool" >/dev/null || { echo "$tool is not on PATH" >&2; exit 2; }
+done
 here=$(dirname "$0")
 rules="$here/../prometheus/newsvault.rules.yml"
 rule_files="$here/prometheus.rule_files.yml"
@@ -14,12 +16,9 @@ route="$here/alertmanager.route.yml"
 monitoring=${MONITORING_DIR:-$HOME/monitoring}
 prometheus=${PROMETHEUS_URL:-http://127.0.0.1:9090}
 container=${ALERTMANAGER_CONTAINER:-alertmanager}
-am_config=${ALERTMANAGER_CONFIG:-/etc/alertmanager/alertmanager.yml}
+alertmanager=${ALERTMANAGER_URL:-http://127.0.0.1:9093}
 muted=blackhole
 
-for tool in curl docker sha256sum awk sed grep sort; do
-    command -v "$tool" >/dev/null || { echo "$tool is not on PATH" >&2; exit 2; }
-done
 case $monitoring in
     /*) ;;
     *) echo "MONITORING_DIR is not an absolute path: '$monitoring'" >&2; exit 2 ;;
@@ -46,6 +45,27 @@ need rule_group "$group"
 need route_matcher "$regex"
 need repeat_interval "$repeat"
 need alert "$alerts"
+# Seconds of a duration in d and h, the units Alertmanager writes 49h in (2d1h); -1 otherwise.
+seconds='function seconds(d,   total, part) {
+    total = 0
+    while (match(d, /^[0-9]+[dh]/)) {
+        part = substr(d, 1, RLENGTH); d = substr(d, RLENGTH + 1)
+        total += (part + 0) * (part ~ /d$/ ? 86400 : 3600)
+    }
+    return d == "" ? total : -1
+}'
+want_repeat=$(awk -v d="$repeat" "$seconds"' BEGIN { print seconds(d) }')
+[ "$want_repeat" -ge 0 ] || { echo "the route's repeat_interval '$repeat' is not in d and h" >&2; exit 2; }
+
+# docker's error text is matched, never printed.
+if ! state=$(docker container inspect --format '{{.State.Running}}' "$container" 2>&1); then
+    case $(printf '%s' "$state" | tr '[:upper:]' '[:lower:]') in
+        *"no such container"* | *"no such object"*) echo "no container $container" >&2; exit 4 ;;
+        *"permission denied"*) echo "the docker daemon refused this user" >&2; exit 2 ;;
+        *) state="not answering" ;;
+    esac
+fi
+
 # Lines of $2 that $1 lacks.
 lacking() {
     HAVE=$1 awk 'BEGIN { n = split(ENVIRON["HAVE"], h, "\n"); for (i = 1; i <= n; i++) seen[h[i]] = 1 }
@@ -53,22 +73,51 @@ lacking() {
 $2
 EOF
 }
-
-# Seconds of a Prometheus duration such as 49h or 2d1h; -1 for anything else.
-seconds='function seconds(d,   total, part, unit) {
-    total = 0
-    while (match(d, /^[0-9]+(ms|[ywdhms])/)) {
-        part = substr(d, 1, RLENGTH); d = substr(d, RLENGTH + 1)
-        unit = part; sub(/^[0-9]+/, "", unit)
-        total += (part + 0) * (unit == "y" ? 31536000 : unit == "w" ? 604800 : unit == "d" ? 86400 : unit == "h" ? 3600 : unit == "m" ? 60 : unit == "s" ? 1 : 0)
+# Each scalar of a JSON text as depth, key, value and the id of its object, tab-separated.
+walk='{ s = s $0 "\n" }
+END {
+    n = length(s)
+    for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (c == "{") { depth++; id[depth] = ++objects; key = "" }
+        else if (c == "[") { depth++; id[depth] = 0; key = "" }
+        else if (c == "}" || c == "]") { depth--; key = "" }
+        else if (c == "\"") {
+            v = ""
+            for (i++; i <= n && (c = substr(s, i, 1)) != "\""; i++) {
+                if (c == "\\") { i++; c = substr(s, i, 1) }
+                v = v c
+            }
+            for (j = i + 1; substr(s, j, 1) ~ /[ \t\r\n]/; j++) ;
+            if (substr(s, j, 1) == ":") key = v
+            else { print depth "\t" key "\t" v "\t" id[depth]; key = "" }
+        } else if (c ~ /[-0-9a-z]/) {
+            v = c
+            while (substr(s, i + 1, 1) ~ /[-+.0-9a-zA-Z]/) { i++; v = v substr(s, i, 1) }
+            print depth "\t" key "\t" v "\t" id[depth]; key = ""
+        }
     }
-    return d == "" ? total : -1
 }'
-want_repeat=$(awk -v d="$repeat" "$seconds"' BEGIN { print seconds(d) }')
+# pick DEPTH KEY: the values at that depth and key of $fields.
+pick() {
+    printf '%s\n' "$fields" | awk -F '\t' -v d="$1" -v k="$2" '$1 == d && $2 == k { print $3 }'
+}
+# Seconds since the epoch of an RFC 3339 time as Go writes it, its fraction dropped.
+epoch='function epoch(t,   y, mo, d, off, era, yoe, doy) {
+    y = substr(t, 1, 4) + 0; mo = substr(t, 6, 2) + 0; d = substr(t, 9, 2) + 0
+    off = substr(t, 12, 2) * 3600 + substr(t, 15, 2) * 60 + substr(t, 18, 2)
+    t = substr(t, 20); sub(/^\.[0-9]+/, "", t)
+    if (t ~ /^[+-][0-9][0-9]:[0-9][0-9]$/) off -= (substr(t, 1, 1) "1") * (substr(t, 2, 2) * 3600 + substr(t, 5, 2) * 60)
+    y -= (mo <= 2); era = int(y / 400); yoe = y - era * 400
+    doy = int((153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5) + d - 1
+    return (era * 146097 + yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy - 719468) * 86400 + off
+}'
 
 drift=0
+unanswered=0
 ok() { echo "ok $*"; }
 no() { echo "drift $*"; drift=$((drift + 1)); }
+not_answered() { echo "$*" >&2; unanswered=$((unanswered + 1)); }
 
 installed="$monitoring/prometheus/$entry"
 want=$(sha256sum <"$rules" | awk '{ print $1 }')
@@ -93,90 +142,115 @@ else
     no "rule_files: prometheus.yml lists no $entry under rule_files"
 fi
 
-body=$(curl -fsS --max-time 10 -G --data-urlencode "rule_group[]=$group" --data-urlencode type=alert \
-    "$prometheus/api/v1/rules") || { echo "Prometheus at $prometheus did not answer" >&2; exit 7; }
-# Compact JSON split at , { and [: a key at a line's start is never inside a string, whose quotes
-# are escaped.
-fields=$(printf '%s\n' "$body" | awk '{ gsub(/[,{[]/, "\n"); print }')
-value() {
-    printf '%s\n' "$fields" | sed -n "s/^\"$1\":\"\\([^\"]*\\)\".*/\\1/p"
-}
-files=$(value file)
-loaded=$(value name | sed 1d | sort)
-count=$(printf '%s\n' "$alerts" | wc -l | tr -d ' ')
-healthy=$(value health | grep -cx ok)
-health_lines=$(value health | grep -c .)
-case $files in
-    *"
-"* | '') no "prometheus: $(printf '%s\n' "$files" | grep -c .) rule files answer for group $group, not one" ;;
-    */"$entry")
-        if [ "$(value name | sed -n 1p)" = "$group" ] && [ "$loaded" = "$alerts" ] &&
-            [ "$healthy" = "$count" ] && [ "$health_lines" = "$count" ]; then
-            ok "prometheus: group $group from $files, $count rules, all health ok"
-        else
-            no "prometheus: group $group from $files holds $(printf '%s\n' "$loaded" | grep -c .) of the repository's $count rules, $healthy health ok"
-            lacking "$loaded" "$alerts" | sed 's/^/  not loaded: /'
-            lacking "$alerts" "$loaded" | sed 's/^/  not in the repository: /'
-        fi
-        ;;
-    *) no "prometheus: group $group is read from $files, not from $entry" ;;
-esac
+if body=$(curl -fsS --max-time 10 -G --data-urlencode "rule_group[]=$group" --data-urlencode type=alert \
+    "$prometheus/api/v1/rules"); then
+    # Depth 4 is a group, 6 a rule; an alert's labels sit deeper.
+    fields=$(printf '%s\n' "$body" | awk "$walk")
+    files=$(pick 4 file)
+    loaded=$(pick 6 name | sort)
+    count=$(printf '%s\n' "$alerts" | wc -l | tr -d ' ')
+    unhealthy=$(printf '%s\n' "$fields" | awk -F '\t' '$1 == 6 && $2 == "name" { name[$4] = $3 }
+        $1 == 6 && $2 == "health" && $3 != "ok" { health[$4] = $3 }
+        END { for (rule in health) print name[rule] " " health[rule] }' | sort)
+    if [ "${files##*/}" != "$entry" ]; then
+        no "prometheus: group $group is read from '$files', not from $entry"
+    elif [ "$loaded" != "$alerts" ]; then
+        no "prometheus: group $group from $files holds $(printf '%s\n' "$loaded" | grep -c .) of the repository's $count rules"
+        lacking "$loaded" "$alerts" | sed 's/^/  not loaded: /'
+        lacking "$alerts" "$loaded" | sed 's/^/  not in the repository: /'
+    elif [ -z "$unhealthy" ]; then
+        ok "prometheus: group $group from $files, $count rules, all health ok"
+    elif printf '%s\n' "$unhealthy" | grep -qv ' unknown$'; then
+        no "prometheus: group $group from $files, rules not healthy:"
+        printf '%s\n' "$unhealthy" | sed 's/^/  health of /'
+    else
+        not_answered "Prometheus has not evaluated $(printf '%s' "$unhealthy" | tr '\n' ' ')yet; run again after one evaluation_interval"
+    fi
+else
+    not_answered "Prometheus at $prometheus did not answer for its rules"
+fi
+
+if [ ! -f "$installed" ]; then
+    :
+elif info=$(curl -fsS --max-time 10 "$prometheus/api/v1/status/runtimeinfo"); then
+    fields=$(printf '%s\n' "$info" | awk "$walk")
+    changed=$(date -r "$installed" +%s)
+    reload=$(printf '%s\n' "$fields" | awk -F '\t' -v changed="$changed" "$epoch"'
+        $1 == 2 && $2 == "reloadConfigSuccess" { success = $3 }
+        $1 == 2 && $2 == "lastConfigTime" { at = epoch($3) }
+        END { print (success != "true" ? "failed" : at >= changed ? "after" : "before") }')
+    case $reload in
+        after) ok "prometheus_reload: the last config load succeeded after $installed changed" ;;
+        before) no "prometheus_reload: $installed changed after Prometheus last loaded its config" ;;
+        *) no "prometheus_reload: Prometheus's last config reload failed" ;;
+    esac
+else
+    not_answered "Prometheus at $prometheus did not answer for its runtime info"
+fi
 
 amtool() {
-    docker exec "$container" amtool "$@" 2>/dev/null
+    docker exec "$container" amtool "--alertmanager.url=$alertmanager" "$@" 2>/dev/null
 }
-for alert in $alerts; do
-    tree=$(amtool config routes test "--config.file=$am_config" --tree "alertname=$alert") ||
-        { echo "amtool in container $container did not route $alert" >&2; exit 7; }
-    receivers=$(printf '%s\n' "$tree" | sed -n '$p')
-    matched=no
-    if printf '%s\n' "$tree" | sed '$d' | grep -qF "$regex"; then matched=yes; fi
-    expected=no
-    if printf '%s\n' "$alert" | grep -qxE "$regex"; then expected=yes; fi
-    case ,$receivers, in
-        ,, | *,"$muted",*) no "route $alert: receivers '$receivers'" ;;
-        *)
-            if [ "$matched" = "$expected" ]; then
-                ok "route $alert: $receivers, run_date route $matched"
-            else
-                no "route $alert: $receivers, run_date route $matched, expected $expected"
-            fi
-            ;;
-    esac
-done
-
-shown=$(amtool config show --alertmanager.url=http://127.0.0.1:9093) ||
-    { echo "Alertmanager in container $container did not show its running config" >&2; exit 7; }
-# The repeat_interval at the key column of the route item whose matcher holds the regex.
-repeats=$(printf '%s\n' "$shown" | awk -v regex="$regex" "$seconds"'
-    function indent(s) { match(s, /^ */); return RLENGTH }
-    { line[NR] = $0 }
-    END {
-        for (i = 1; i <= NR; i++) {
-            if (index(line[i], regex) == 0 || line[i] !~ /^ *- /) continue
-            k = -1
-            for (j = i; j >= 1; j--) if (p = index(line[j], "matchers:")) { k = p - 1; break }
-            if (k < 0) continue
-            found = "unset"
-            for (j = i + 1; j <= NR; j++) {
-                if (line[j] ~ /^ *$/) continue
-                if (indent(line[j]) < k) break
-                if (indent(line[j]) == k && line[j] ~ /^ *repeat_interval:/) {
-                    d = line[j]; sub(/^ *repeat_interval: */, "", d); gsub(/["'"'"' ]/, "", d)
-                    found = seconds(d); break
-                }
-            }
-            print found
-        }
-    }')
-if [ "$repeats" = "$want_repeat" ]; then
-    ok "repeat_interval: the running run_date route repeats every $repeat"
+if [ "$state" != true ]; then
+    not_answered "the container $container is $state, not running"
 else
-    no "repeat_interval: the running config's run_date routes repeat at '$(printf '%s' "$repeats" | tr '\n' ' ')' s, not $want_repeat s ($repeat)"
+    for alert in $alerts; do
+        tree=$(amtool config routes test --tree "alertname=$alert") ||
+            { not_answered "Alertmanager at $alertmanager did not route $alert"; break; }
+        # amtool prints the receivers after a blank line; $(...) strips an empty receivers line.
+        receivers=$(printf '%s\n' "$tree" | awk '{ before = last; last = $0 } END { if (before == "") print last }')
+        matched=no
+        if printf '%s\n' "$tree" | grep -qF "$regex"; then matched=yes; fi
+        expected=no
+        if printf '%s\n' "$alert" | grep -qxE "$regex"; then expected=yes; fi
+        case ,$receivers, in
+            ,, | *,"$muted",*) no "route $alert: receivers '$receivers'" ;;
+            *)
+                if [ "$matched" = "$expected" ]; then
+                    ok "route $alert: $receivers, run_date route $matched"
+                else
+                    no "route $alert: $receivers, run_date route $matched, expected $expected"
+                fi
+                ;;
+        esac
+    done
+    if shown=$(amtool config show); then
+        # The repeat_interval at the key column of the route whose matcher is the snippet's.
+        repeats=$(printf '%s\n' "$shown" | MATCHER="alertname=~\"$regex\"" awk "$seconds"'
+            function indent(s) { match(s, /^ */); return RLENGTH }
+            { line[NR] = $0 }
+            END {
+                for (i = 1; i <= NR; i++) {
+                    if (index(line[i], ENVIRON["MATCHER"]) == 0) continue
+                    k = -1
+                    for (j = i; j >= 1; j--) if (p = index(line[j], "matchers:")) { k = p - 1; break }
+                    found = "unset"
+                    for (j = i + 1; j <= NR; j++) {
+                        if (indent(line[j]) < k) break
+                        if (indent(line[j]) == k && line[j] ~ /^ *repeat_interval:/) {
+                            d = line[j]; sub(/^ *repeat_interval: */, "", d)
+                            found = seconds(d); break
+                        }
+                    }
+                    print found
+                }
+            }')
+        if [ "$repeats" = "$want_repeat" ]; then
+            ok "repeat_interval: the running run_date route repeats every $repeat"
+        else
+            no "repeat_interval: the running config's run_date routes repeat at '$(printf '%s' "$repeats" | tr '\n' ' ')' s, not $want_repeat s ($repeat)"
+        fi
+    else
+        not_answered "Alertmanager at $alertmanager did not show its running config"
+    fi
 fi
 
 if [ "$drift" -gt 0 ]; then
     echo "$drift drift(s) found"
     exit 1
+fi
+if [ "$unanswered" -gt 0 ]; then
+    echo "no drift found, $unanswered check(s) unanswered" >&2
+    exit 7
 fi
 echo "no drift"

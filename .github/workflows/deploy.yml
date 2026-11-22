@@ -80,5 +80,14 @@ jobs:
             sleep 1
           done
       - run: MONITORING_DIR="$RUNNER_TEMP/monitoring" sh deploy/monitoring/newsvault-monitoring-check
-      - if: ${{ !cancelled() }}
-        run: status=0; MONITORING_DIR="$RUNNER_TEMP/monitoring" ALERTMANAGER_CONFIG=/etc/alertmanager/unrouted.yml sh deploy/monitoring/newsvault-monitoring-check || status=$?; test "$status" -eq 1
+      # The running Alertmanager reloaded without the route, and the rule file changed after
+      # Prometheus loaded it: exit 1 and a drift line from each of the three checks.
+      - run: |
+          stack="$RUNNER_TEMP/monitoring"
+          cp "$stack/alertmanager/unrouted.yml" "$stack/alertmanager/alertmanager.yml"
+          curl -fsS -X POST http://127.0.0.1:9093/-/reload
+          touch "$stack/prometheus/newsvault.rules"
+          status=0; MONITORING_DIR="$stack" sh deploy/monitoring/newsvault-monitoring-check >"$RUNNER_TEMP/drift.out" || status=$?
+          cat "$RUNNER_TEMP/drift.out"
+          test "$status" -eq 1
+          grep -Ec '^drift (prometheus_reload|route NewsvaultHostHeld|repeat_interval):' "$RUNNER_TEMP/drift.out" | grep -x 3
