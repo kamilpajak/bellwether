@@ -2085,6 +2085,8 @@ impl Archive for Committer {
         observed: ObservationTime,
     ) -> Result<Committed, ArchiveError> {
         let raw_blob = payload.map(|payload| payload.raw_blob.as_str());
+        self.labelled_as_attempt(closed.attempt_id().hex(), items)
+            .map_err(|why| refused("build an item row", &why))?;
         let rows = self
             .rows_of(items, raw_blob, observed)
             .map_err(|why| refused("build an item row", &why))?;
@@ -2189,6 +2191,31 @@ fn refused(act: &'static str, why: &StoreError) -> ArchiveError {
 }
 
 impl Committer {
+    /// Refuses the first item whose provenance is not its attempt's stored one. Reads no row
+    /// when there is no item, so an unknown attempt stays `record`'s refusal.
+    fn labelled_as_attempt(
+        &self,
+        attempt: &str,
+        items: &[CollectedItem],
+    ) -> Result<(), StoreError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let recorded = self.provenance_of(attempt)?;
+        match items
+            .iter()
+            .find(|item| recorded.as_deref() != Some(item.provenance.name()))
+        {
+            Some(item) => Err(StoreError::ProvenanceDiffersFromAttempt {
+                attempt: attempt.to_owned(),
+                item: item.source_item_id.clone(),
+                offered: item.provenance.name(),
+                recorded,
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// One provider row as an archive row: the body is a blob of its own, because `item_id`'s
     /// `body_ref` is that blob's digest and an edit to the body has to move the identity.
     fn rows_of(
@@ -2271,13 +2298,13 @@ fn named(
 
 #[cfg(test)]
 mod tests {
-    use super::{Committer, Provenance, StoreError};
+    use super::{Archive, ArchiveError, Committer, Provenance, StoreError};
     use crate::store::COMMIT_LOG;
     use canon::FileDigest;
     use news_provider::provider::CollectedItem;
     use news_provider::{
-        AttemptSlot, Baseline, Counts, Outcome, RawResponse, Request, RequestPhase, RunId,
-        SourceId, TargetWindow, ValidSource, Verdict,
+        AttemptReceipt, AttemptSlot, Baseline, Counts, Headers, Outcome, Payload, RawResponse,
+        Request, RequestPhase, RunId, SourceId, TargetWindow, ValidSource, Verdict,
     };
     use pit::datedness::Published;
     use pit::{ObservationTime, ValidTime};
@@ -2461,6 +2488,133 @@ mod tests {
                 ValidSource::OurExtraction.name().to_owned()
             )
         );
+        Ok(())
+    }
+    fn live_request() -> Request {
+        Request {
+            source: SourceId::new(SOURCE),
+            target_window: TargetWindow::new(WINDOW),
+            phase: RequestPhase::Index,
+            provenance: Provenance::LiveIngest,
+            url: "https://example.test/a".to_owned(),
+            headers: Vec::new(),
+            params: Vec::new(),
+            universe_version: FileDigest::of(b"{}"),
+            listed_date: None,
+            names_ticker: false,
+            hosts_version: None,
+            extract_version: None,
+        }
+    }
+
+    /// Opens attempt 0 of [`live_request`], answers it usable with one row and closes it.
+    fn closed_live_attempt(
+        store: &mut Committer,
+    ) -> Result<AttemptReceipt, Box<dyn std::error::Error>> {
+        let at = ObservationTime::new(instant(FETCHED_AT));
+        let slot = AttemptSlot::open(store, &live_request(), None, &RunId::new(RUN), 0, at)?;
+        let answer = RawResponse::new(slot.attempt_id().clone(), 200, b"payload".to_vec(), at, at);
+        let outcome = Outcome::decide(
+            &Verdict::Usable,
+            Counts {
+                vendor_rows: 1,
+                listing_unusable: 0,
+                robots_disallowed: 0,
+            },
+            &Baseline::from_trailing_ok(&[1]),
+        );
+        Ok(slot.close(store, outcome, &Ok(answer), at)?)
+    }
+
+    fn a_payload(store: &Committer) -> Result<Payload, Box<dyn std::error::Error>> {
+        Ok(Payload {
+            raw_blob: Committer::put_blob(store, b"payload")?.hex().to_owned(),
+            url: "https://example.test/a".to_owned(),
+            phase: RequestPhase::Index,
+            listed_date: None,
+            headers: Headers::default(),
+            truncated: false,
+        })
+    }
+
+    /// Commits `item` under a closed live attempt through the driver's door, `Archive::commit`.
+    fn commit_under_a_live_attempt(
+        store: &mut Committer,
+        item: CollectedItem,
+    ) -> Result<Result<u32, ArchiveError>, Box<dyn std::error::Error>> {
+        let closed = closed_live_attempt(store)?;
+        let payload = a_payload(store)?;
+        let fetched = ObservationTime::new(instant(FETCHED_AT));
+        Ok(
+            Archive::commit(store, closed, &[item], Some(&payload), fetched)
+                .map(|committed| committed.items_committed),
+        )
+    }
+
+    fn refusal(
+        offered: Provenance,
+        recorded: Option<&str>,
+    ) -> Result<Result<u32, ArchiveError>, Box<dyn std::error::Error>> {
+        let attempt =
+            canon::digest::attempt_id(RUN, SOURCE, WINDOW, 0).map_err(|why| why.to_string())?;
+        Ok(Err(ArchiveError {
+            act: "build an item row",
+            detail: StoreError::ProvenanceDiffersFromAttempt {
+                attempt: attempt.hex().to_owned(),
+                item: ITEM.to_owned(),
+                offered: offered.name(),
+                recorded: recorded.map(str::to_owned),
+            }
+            .to_string(),
+        }))
+    }
+
+    /// §8 row R10's record-time check: the item's label, which picked its `observed_at`, is the
+    /// attempt's stored one, and a matching item still commits.
+    #[test]
+    fn an_item_whose_provenance_differs_from_its_attempt_is_refused(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (differing, matching) = (TempDir::new()?, TempDir::new()?);
+        let placed = ObservationTime::new(instant(PUBLISHED_AT + 7_200));
+        let mut store = Committer::open(differing.path(), &RunId::new(RUN))?;
+        let refused = commit_under_a_live_attempt(&mut store, archived(Some(placed)))?;
+        let mut store = Committer::open(matching.path(), &RunId::new(RUN))?;
+        let live = CollectedItem {
+            provenance: Provenance::LiveIngest,
+            ..archived(None)
+        };
+        let committed = commit_under_a_live_attempt(&mut store, live)?;
+        assert_eq!(
+            (refused, committed),
+            (
+                refusal(Provenance::VendorArchive, Some("live_ingest"))?,
+                Ok(1)
+            )
+        );
+        Ok(())
+    }
+
+    /// An attempt whose label is not recorded (an `edgar_press` row from before user_version 17)
+    /// takes no item, and is never read as live.
+    #[test]
+    fn an_item_under_an_attempt_with_no_recorded_provenance_is_refused(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let mut store = Committer::open(temp.path(), &RunId::new(RUN))?;
+        let attempt =
+            canon::digest::attempt_id(RUN, SOURCE, WINDOW, 0).map_err(|why| why.to_string())?;
+        Connection::open(temp.path().join(COMMIT_LOG))?.execute(
+            "INSERT INTO attempts (attempt_id, run_id, source, target_window, filter_params,
+                 universe_version, opened_at)
+             VALUES (?1, ?2, ?3, ?4, 'f', 'u', '2025-11-13T02:13:20.000000Z')",
+            [attempt.hex(), RUN, SOURCE, WINDOW],
+        )?;
+        let live = CollectedItem {
+            provenance: Provenance::LiveIngest,
+            ..archived(None)
+        };
+        let refused = commit_under_a_live_attempt(&mut store, live)?;
+        assert_eq!(refused, refusal(Provenance::LiveIngest, None)?);
         Ok(())
     }
 }

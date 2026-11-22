@@ -9,6 +9,7 @@ use canon::digest::attempt_id;
 use canon::{CanonError, Digest, FileDigest};
 use pit::ObservationTime;
 
+use crate::provider::Provenance;
 use crate::request::{Request, RunId, SourceId, TargetWindow};
 use crate::wire::{RawResponse, TransportError};
 
@@ -73,6 +74,9 @@ pub enum AttemptEvent {
         hosts_version: Option<FileDigest>,
         /// Read off the request for the same reason; never inside `filter_params`.
         extract_version: Option<Digest>,
+        /// Read off the request for the same reason: the attempt's own label, which every item it
+        /// commits must carry (architecture.md section 3.2's `provenance` row).
+        provenance: Provenance,
         /// The story a Document request fetches, named before the socket so a swept attempt still
         /// says what it was fetching; None for an index or robots request (section 11.1).
         story_id: Option<Digest>,
@@ -387,6 +391,7 @@ impl AttemptSlot {
             universe_version: request.universe_version.clone(),
             hosts_version: request.hosts_version.clone(),
             extract_version: request.extract_version.clone(),
+            provenance: request.provenance,
             story_id: story.cloned(),
             listed_by: listed_by.map(str::to_owned),
             opened_at: at,

@@ -115,11 +115,11 @@ PRAGMA synchronous = FULL;
 ";
 
 /// The `PRAGMA user_version` this build writes, and the only one a read-only reader accepts.
-pub const SCHEMA_VERSION: i32 = 16;
+pub const SCHEMA_VERSION: i32 = 17;
 
 /// Version `i + 1` is reached from version `i` by `MIGRATIONS[i]`, run by [`migrate`] with
 /// foreign keys off, as SQLite's twelve-step table rebuild (lang_altertable.html) requires.
-const MIGRATIONS: [&str; 16] = [
+const MIGRATIONS: [&str; 17] = [
     "
 -- The hosts file a run was admitted under: architecture.md section 2's `hosts_version` row. NULL
 -- for a provider that reads no hosts file.
@@ -407,6 +407,22 @@ CREATE TABLE dictionary_activations (
     activated_at TEXT NOT NULL
 );
 ",
+    "
+-- `news_provider::Provenance::name`, from `Request.provenance` via `Opened` (section 3.2). NULL
+-- means not recorded: nullable, because a default would be an invented value.
+ALTER TABLE attempts ADD COLUMN provenance TEXT
+    CHECK (provenance IN ('live_ingest', 'vendor_archive', 'bulk_dataset'));
+-- Code facts: `OpenWebFeed::provenance` and `cmd_robots`' request return `LiveIngest` on every
+-- path. `edgar_press` rows stay NULL: its rule reads the run's `--at`, which no table stores.
+UPDATE attempts SET provenance = 'live_ingest' WHERE source IN ('open_web_wires', 'robots');
+-- Set once: a NULL may still be recorded, a recorded label never changes (section 3.2).
+CREATE TRIGGER attempts_provenance_set_once
+BEFORE UPDATE OF provenance ON attempts
+WHEN OLD.provenance IS NOT NULL AND NEW.provenance IS NOT OLD.provenance
+BEGIN
+    SELECT RAISE(ABORT, 'attempts.provenance is set once');
+END;
+",
 ];
 
 /// The frozen user_version 0 DDL; how a store reaches user_version 1: architecture.md §3.1.
@@ -539,6 +555,18 @@ pub enum StoreError {
     /// would carry archive content under an attempt nobody measured.
     #[error("attempt {attempt} was abandoned, so it may not carry items")]
     ItemsUnderAbandonedAttempt { attempt: String },
+    /// The item's label picks its `observed_at` (`cmd_collect`'s `rows_of`) and the attempt's is
+    /// the stored one (section 3.2), so the two may not disagree. `None`: not recorded.
+    #[error(
+        "item {item} is {offered} and its attempt {attempt} is {}",
+        .recorded.as_deref().unwrap_or("not recorded")
+    )]
+    ProvenanceDiffersFromAttempt {
+        attempt: String,
+        item: String,
+        offered: &'static str,
+        recorded: Option<String>,
+    },
     /// An item with no publication value has no identity to take over it, which is why its
     /// producer files such a row as a `news_provider::UnusableRow`. The door refuses one rather
     /// than inventing a value for the column the schema requires.
@@ -2309,6 +2337,21 @@ impl Committer {
         Ok(filed == offered)
     }
 
+    /// The attempt's stored `provenance`, `None` when it is not recorded (section 3.2); an
+    /// attempt with no row here is `AttemptNotOpened`, never "not recorded".
+    pub fn provenance_of(&self, attempt: &str) -> Result<Option<String>, StoreError> {
+        self.db
+            .query_row(
+                "SELECT provenance FROM attempts WHERE attempt_id = ?1",
+                params![attempt],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::AttemptNotOpened {
+                attempt: attempt.to_owned(),
+            })
+    }
+
     fn was_opened(&self, attempt: &str) -> Result<bool, StoreError> {
         let opened: Option<String> = self
             .db
@@ -2360,6 +2403,7 @@ impl Committer {
             universe_version,
             hosts_version,
             extract_version,
+            provenance,
             story_id,
             listed_by,
             opened_at,
@@ -2368,8 +2412,8 @@ impl Committer {
             self.db.execute(
                 "INSERT INTO attempts
                      (attempt_id, run_id, source, target_window, filter_params, universe_version,
-                      opened_at, hosts_version, story_id, extract_version, listed_by)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                      opened_at, hosts_version, story_id, extract_version, listed_by, provenance)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT(attempt_id) DO NOTHING",
                 params![
                     attempt_id.hex(),
@@ -2382,7 +2426,8 @@ impl Committer {
                     hosts_version.as_ref().map(FileDigest::hex),
                     story_id.as_ref().map(Digest::hex),
                     extract_version.as_ref().map(Digest::hex),
-                    listed_by
+                    listed_by,
+                    provenance.name()
                 ],
             )?;
         }
@@ -5485,6 +5530,270 @@ mod tests {
         assert_eq!(
             (refused, read_only, user_version(&db)?),
             (expected.clone(), expected, 14)
+        );
+        Ok(())
+    }
+
+    /// A v16 store: the v14 fixture, `MIGRATIONS[14]` and `[15]`, an `edgar_press` and a `robots`
+    /// attempt beside the fixture's `open_web_wires` one, and one dictionary row. No activation:
+    /// `Committer::open` reads the active dictionary's file, which this fixture has none of.
+    fn a_store_at_user_version_sixteen(temp: &TempDir) -> TestResult {
+        a_store_at_user_version_fourteen(temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch(MIGRATIONS[14])?;
+        db.execute_batch(MIGRATIONS[15])?;
+        db.pragma_update(None, "user_version", 16)?;
+        db.execute_batch(
+            "INSERT INTO attempts (attempt_id, run_id, source, target_window, filter_params,
+                 universe_version, opened_at)
+             VALUES ('a v16 edgar attempt', 'a v16 run', 'edgar_press', '2026-11-20', 'f', 'u',
+                     't'),
+                    ('a v16 robots attempt', 'a v16 run', 'robots', 'example.test', 'f', 'u',
+                     't');
+             INSERT INTO dictionaries VALUES ('a v16 dictionary', 1, 2, 3, 'a v16 run', 't');",
+        )?;
+        Ok(())
+    }
+
+    const V16_TABLES: [&str; 12] = [
+        "attempts",
+        "blobs",
+        "items",
+        "seq_reservations",
+        "published",
+        "robots",
+        "payloads",
+        "relisted",
+        "deferred",
+        "deferred_closed",
+        "dictionaries",
+        "dictionary_activations",
+    ];
+
+    /// The down-migration §3.1 names for a v17 store. Without its `DROP TRIGGER`, SQLite 3.54.0
+    /// drops the column and keeps the trigger, and the next upgrade fails on its name.
+    const ROLLBACK_TO_SIXTEEN: &str = "DROP TRIGGER attempts_provenance_set_once;
+         ALTER TABLE attempts DROP COLUMN provenance;
+         PRAGMA user_version = 16;";
+
+    fn sources_and_provenance(
+        db: &Connection,
+    ) -> Result<Vec<(String, Option<String>)>, StoreError> {
+        let mut statement = db.prepare("SELECT source, provenance FROM attempts ORDER BY rowid")?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// §8 rows M1 and R10 from 16: the backfill labels `open_web_wires` and `robots` attempts
+    /// live, leaves `edgar_press` NULL (not recorded), and a new attempt carries its request's.
+    #[test]
+    fn a_store_at_user_version_sixteen_migrates_to_seventeen_and_marks_open_web_and_robots_attempts_live_and_leaves_edgar_null(
+    ) -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_sixteen(&temp)?;
+        let mut store = open(&temp)?;
+        let archive = Request {
+            provenance: Provenance::VendorArchive,
+            ..request()
+        };
+        let _opened = AttemptSlot::open(&mut store, &archive, None, &RunId::new(RUN), 0, at(1))?;
+        let live = Some("live_ingest".to_owned());
+        assert_eq!(
+            (
+                user_version(&store.db)?,
+                sources_and_provenance(&store.db)?,
+                super::columns_of(&store.db, "attempts")?.remove("provenance"),
+            ),
+            (
+                SCHEMA_VERSION,
+                vec![
+                    ("open_web_wires".to_owned(), live.clone()),
+                    ("edgar_press".to_owned(), None),
+                    ("robots".to_owned(), live),
+                    (SOURCE.to_owned(), Some("vendor_archive".to_owned())),
+                ],
+                Some(("TEXT".to_owned(), false, None, 0)),
+            )
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the carried half from user_version 16: every column of every row of every v16
+    /// table, compared by `quote()`.
+    #[test]
+    fn a_v16_store_keeps_every_v16_column_of_every_row() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_sixteen(&temp)?;
+        let v16 = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let before = quoted_rows(&v16, 16, &V16_TABLES)?;
+        drop(v16);
+        assert!(super::refuse_an_unreadable_version(temp.path()).is_ok());
+        let store = open(&temp)?;
+        let after = quoted_rows(&store.db, 16, &V16_TABLES)?;
+        let dictionary_rows = before
+            .iter()
+            .filter(|row| row.starts_with("dictionar"))
+            .count();
+        assert_eq!((after, dictionary_rows), (before, 1));
+        Ok(())
+    }
+
+    /// §8 row M1, the per-version shape check at user_version 16.
+    #[test]
+    fn a_v16_store_whose_columns_differ_is_refused_and_left_at_user_version_sixteen() -> TestResult
+    {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_sixteen(&temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch("ALTER TABLE dictionaries DROP COLUMN trained_at;")?;
+        drop(db);
+        let read_only = match super::refuse_an_unreadable_version(temp.path()) {
+            Err(StoreError::ShapeDiffers { found: 16, columns }) => columns,
+            other => vec![format!("{other:?}")],
+        };
+        let refused = match open(&temp) {
+            Err(StoreError::ShapeDiffers { found: 16, columns }) => columns,
+            other => vec![format!("{other:?}")],
+        };
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let expected = vec!["dictionaries.trained_at".to_owned()];
+        assert_eq!(
+            (refused, read_only, user_version(&db)?),
+            (expected.clone(), expected, 16)
+        );
+        Ok(())
+    }
+
+    /// The rollback in §3.1 runs on this SQLite, keeps every v16 row, leaves a store the v16
+    /// shape check accepts, and the next upgrade migrates it to 17 again.
+    #[test]
+    fn the_rollback_to_sixteen_keeps_every_v16_row_and_the_store_upgrades_again() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_sixteen(&temp)?;
+        let v16 = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let before = quoted_rows(&v16, 16, &V16_TABLES)?;
+        drop(v16);
+        drop(open(&temp)?);
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch(ROLLBACK_TO_SIXTEEN)?;
+        let shape = super::refuse_another_shape(&db, 16);
+        let rolled_back = (user_version(&db)?, quoted_rows(&db, 16, &V16_TABLES)?);
+        drop(db);
+        let upgraded = open(&temp).and_then(|store| user_version(&store.db));
+        assert_eq!(
+            (
+                shape.map_err(|failure| failure.to_string()),
+                rolled_back,
+                upgraded.map_err(|failure| failure.to_string()),
+            ),
+            (Ok(()), (16, before), Ok(SCHEMA_VERSION))
+        );
+        Ok(())
+    }
+
+    /// §8 row R10: the label `Opened` read off the request reaches the column, each by its name.
+    #[test]
+    fn the_opened_row_carries_the_provenance_its_request_was_planned_with() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let labels = [
+            Provenance::LiveIngest,
+            Provenance::VendorArchive,
+            Provenance::BulkDataset,
+        ];
+        for (ordinal, provenance) in (0..).zip(labels) {
+            let planned = Request {
+                provenance,
+                ..request()
+            };
+            let _opened =
+                AttemptSlot::open(&mut store, &planned, None, &RunId::new(RUN), ordinal, at(1))?;
+        }
+        let stored: Vec<Option<String>> = sources_and_provenance(&store.db)?
+            .into_iter()
+            .map(|(_, provenance)| provenance)
+            .collect();
+        let named: Vec<Option<String>> = labels
+            .iter()
+            .map(|provenance| Some(provenance.name().to_owned()))
+            .collect();
+        assert_eq!(stored, named);
+        Ok(())
+    }
+
+    /// §3.2's `provenance` CHECK: each `Provenance::name` is taken and any other text refused.
+    #[test]
+    fn a_provenance_no_variant_names_is_refused_by_the_schema() -> TestResult {
+        let temp = TempDir::new()?;
+        let store = open(&temp)?;
+        let insert = |label: &str| {
+            store
+                .db
+                .execute(
+                    "INSERT INTO attempts (attempt_id, run_id, source, target_window,
+                         filter_params, universe_version, opened_at, provenance)
+                     VALUES (?1, 'r', 's', 'w', 'f', 'u', 't', ?1)",
+                    params![label],
+                )
+                .is_ok()
+        };
+        let named: Vec<bool> = [
+            Provenance::LiveIngest,
+            Provenance::VendorArchive,
+            Provenance::BulkDataset,
+        ]
+        .iter()
+        .map(|provenance| insert(provenance.name()))
+        .collect();
+        assert_eq!((named, insert("scraped")), (vec![true; 3], false));
+        Ok(())
+    }
+
+    /// §3.2's `provenance` row: a recorded label never changes, not even to NULL;
+    /// a NULL one may be recorded once; rewriting the same value is no change.
+    #[test]
+    fn a_recorded_provenance_is_never_changed_and_an_unrecorded_one_is_recorded_once() -> TestResult
+    {
+        let temp = TempDir::new()?;
+        let mut store = open(&temp)?;
+        let slot = AttemptSlot::open(&mut store, &request(), None, &RunId::new(RUN), 0, at(1))?;
+        let recorded = slot.attempt_id().hex().to_owned();
+        store.db.execute_batch(
+            "INSERT INTO attempts (attempt_id, run_id, source, target_window, filter_params,
+                 universe_version, opened_at)
+             VALUES ('unrecorded', 'r', 'edgar_press', 'w', 'f', 'u', 't');",
+        )?;
+        let set = |attempt: &str, label: Option<&str>| {
+            store
+                .db
+                .execute(
+                    "UPDATE attempts SET provenance = ?2 WHERE attempt_id = ?1",
+                    params![attempt, label],
+                )
+                .is_ok()
+        };
+        let answers = [
+            set(&recorded, Some("vendor_archive")),
+            set(&recorded, None),
+            set(&recorded, Some("live_ingest")),
+            set("unrecorded", Some("vendor_archive")),
+            set("unrecorded", Some("live_ingest")),
+        ];
+        let stored: Vec<Option<String>> = sources_and_provenance(&store.db)?
+            .into_iter()
+            .map(|(_, provenance)| provenance)
+            .collect();
+        assert_eq!(
+            (answers, stored),
+            (
+                [false, false, true, true, false],
+                vec![
+                    Some("live_ingest".to_owned()),
+                    Some("vendor_archive".to_owned())
+                ]
+            )
         );
         Ok(())
     }
