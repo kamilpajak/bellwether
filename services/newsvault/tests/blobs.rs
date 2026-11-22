@@ -513,7 +513,8 @@ fn verify_and_both_dry_runs_read_a_v15_store_under_a_held_lease_without_migratin
 {
     let (root, _) = legacy_store()?;
     Connection::open(root.path().join(COMMIT_LOG))?.execute_batch(
-        "DROP TABLE dictionary_activations; DROP TABLE dictionaries; PRAGMA user_version = 15;",
+        "DROP TRIGGER attempts_provenance_set_once; ALTER TABLE attempts DROP COLUMN provenance;
+         DROP TABLE dictionary_activations; DROP TABLE dictionaries; PRAGMA user_version = 15;",
     )?;
     let lease = std::fs::File::open(root.path().join("LOCK"))?;
     lease.try_lock()?;

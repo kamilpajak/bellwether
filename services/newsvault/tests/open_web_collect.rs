@@ -4671,6 +4671,9 @@ fn an_unreadable_stored_header_text_is_store_unreadable_and_records_no_continuit
     Ok(())
 }
 
+/// The column and trigger `MIGRATIONS[16]` adds, which every store before user_version 17 lacks.
+const PROVENANCE: &str = "DROP TRIGGER attempts_provenance_set_once;
+     ALTER TABLE attempts DROP COLUMN provenance;";
 /// The tables `MIGRATIONS[15]` adds, which every store before user_version 16 lacks.
 const DICTIONARY_TABLES: &str = "DROP TABLE dictionary_activations; DROP TABLE dictionaries;";
 /// The columns `MIGRATIONS[14]` adds, which a v14 store lacks; a v13 `deferred` holds neither.
@@ -4715,24 +4718,24 @@ fn a_v10_to_v14_store_keeps_its_basis_for_the_run_that_migrates_it() -> TestResu
         (
             10,
             format!(
-                "{DICTIONARY_TABLES}{LISTED_BY}{DEFERRED_TABLE}{WALK_COLUMNS}{BOUNDARY_COLUMNS}"
+                "{PROVENANCE}{DICTIONARY_TABLES}{LISTED_BY}{DEFERRED_TABLE}{WALK_COLUMNS}{BOUNDARY_COLUMNS}"
             ),
         ),
         (
             11,
-            format!("{DICTIONARY_TABLES}{LISTED_BY}{DEFERRED_TABLE}{WALK_COLUMNS}"),
+            format!("{PROVENANCE}{DICTIONARY_TABLES}{LISTED_BY}{DEFERRED_TABLE}{WALK_COLUMNS}"),
         ),
         (
             12,
-            format!("{DICTIONARY_TABLES}{LISTED_BY}{DEFERRED_TABLE}"),
+            format!("{PROVENANCE}{DICTIONARY_TABLES}{LISTED_BY}{DEFERRED_TABLE}"),
         ),
         (
             13,
-            format!("{DICTIONARY_TABLES}{LISTED_BY}{CLOSED_TABLE}{V13_DEFERRED}"),
+            format!("{PROVENANCE}{DICTIONARY_TABLES}{LISTED_BY}{CLOSED_TABLE}{V13_DEFERRED}"),
         ),
         (
             14,
-            format!("{DICTIONARY_TABLES}{LISTED_BY}{LISTED_BY_DEFERRED}"),
+            format!("{PROVENANCE}{DICTIONARY_TABLES}{LISTED_BY}{LISTED_BY_DEFERRED}"),
         ),
     ] {
         let root = TempDir::new()?;
