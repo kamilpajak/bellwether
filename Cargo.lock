@@ -1161,6 +1161,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "snapshot-contract",
  "tempfile",
  "thiserror",
  "zstd",
@@ -1801,6 +1802,25 @@ name = "snap"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
+
+[[package]]
+name = "snapshot-contract"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "canon",
+ "chrono",
+ "chrono-tz",
+ "clap",
+ "const-hex",
+ "parquet",
+ "pit",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "sqlite-wasm-rs"
