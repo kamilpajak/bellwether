@@ -701,6 +701,7 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 now: SystemClock.now(),
                 through_seq,
                 dry_run,
+                busy_wait: cmd_cut::BUSY_WAIT,
             };
             match cmd_cut::run(&ask, &Fsync) {
                 Ok(report) => {
@@ -1011,14 +1012,14 @@ fn emit_cut(report: &cmd_cut::Report, format: Format) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A refusal on stderr with stdout empty. No suggestion: no cut refusal is cured by running the
-/// same argv again.
+/// A refusal on stderr with stdout empty. No suggestion: `lease_held` is the same argv again
+/// (`retryable`), and `staging_left` is a removal the owner decides.
 fn emit_cut_error(refused: &CutError, format: Format) -> anyhow::Result<()> {
     let object = serde_json::json!({
         "schema": "newsvault.error/1",
         "code": refused.code(),
         "message": refused.to_string(),
-        "retryable": false,
+        "retryable": refused.retryable(),
         "details": refused.details(),
         "suggestions": Vec::<Vec<String>>::new(),
     });
@@ -1528,7 +1529,7 @@ fn print_schema(format: Format) {
                     {"name": "at", "type": "rfc3339", "required": true,
                      "doc": "the cutoff; microsecond precision; after the clock's now is invalid_argument"},
                     {"name": "out", "type": "path", "required_unless": "dry_run",
-                     "doc": "an existing directory; the cut is out/<snapshot_id>/ and a standing one that validates is left as it is (changed false)"},
+                     "doc": "an existing directory outside the store; the cut is out/<snapshot_id>/ and a standing one that validates is left as it is (changed false, its own manifest's seq_high_water, items and provenance_counts reported)"},
                     {"name": "through_seq", "type": "integer",
                      "doc": "the seq bound from an earlier manifest's seq_high_water; defaults to the store's highest seq; below 1 or above it is invalid_argument"},
                     {"name": "store", "type": "path"},
@@ -1547,8 +1548,9 @@ fn print_schema(format: Format) {
                 ],
                 "exits": {
                     "0": "written, or already standing and admissible (changed false), or a dry run",
-                    "2": "invalid_argument, input_schema_mismatch, input_unparseable (a stored time, a body not UTF-8 or not hashing to its digest, a staged or standing directory that does not validate), io_failed (a staging directory left by an earlier cut included)",
-                    "4": "input_absent (no commit log, a selected body or its dictionary), provenance_unrecorded, nothing_visible"
+                    "2": "invalid_argument (--out inside the store included), input_schema_mismatch, input_unparseable (a stored time or an attempt's opened_at, a body not UTF-8 or not hashing to its digest, a staged or standing directory that does not validate), staging_left (details.path: an earlier cut did not finish), io_failed",
+                    "4": "input_absent (no commit log, a selected body or its dictionary), provenance_unrecorded, nothing_visible",
+                    "7": "lease_held (a writer kept the commit log locked past 30 s; retryable)"
                 },
                 "mutates": true
             },
@@ -1672,7 +1674,8 @@ fn print_schema(format: Format) {
             {"code": "robots_unverified", "exit": 4, "retryable": false},
             {"code": "robots_refused", "exit": 2, "retryable": false},
             {"code": "provenance_unrecorded", "exit": 4, "retryable": false},
-            {"code": "nothing_visible", "exit": 4, "retryable": false}
+            {"code": "nothing_visible", "exit": 4, "retryable": false},
+            {"code": "staging_left", "exit": 2, "retryable": false}
         ],
         // Decision D1's companion rule, which `news_provider::Exit` holds as one function.
         "stdout_carries_the_result_for_exits": [0, 1, 8]

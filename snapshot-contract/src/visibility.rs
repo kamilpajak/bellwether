@@ -303,10 +303,9 @@ mod tests {
         Ok(())
     }
 
-    /// The case `Ok(false)` stays for: no publication value. The items CHECK (store.rs
-    /// `MIGRATIONS[0]`, §8 row R13: exactly one of `valid_at`, `valid_day`, `valid_minute`,
-    /// `valid_refused` is set) makes "none of the three and not refused" unstorable, so a row
-    /// reaching this arm is a refused one. Mutation 2026-11-22, the arm answering `Shape`: red.
+    /// No publication value is `Ok(false)`: the items CHECK makes such a row a refused one (§8 row
+    /// R13, `a_row_with_no_publication_value_and_no_refusal_is_refused_by_the_schema`).
+    /// Mutation 2026-11-22, the arm answering `Shape`: red.
     #[test]
     fn a_refused_row_is_visible_at_no_cutoff_and_is_not_an_error() -> TestResult {
         let refused = StoredTimes {

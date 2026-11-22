@@ -38,6 +38,8 @@ const PAYLOAD: &[u8] = b"<rss>synthetic</rss>";
 const ROSTER: &[u8] = b"{}";
 const STATUS_OK: u16 = 200;
 const NEW_YORK: &str = "America/New_York";
+/// The bodies of the rows `five` makes visible at `CUTOFF`; the minute row has none.
+const VISIBLE_BODIES: [&str; 2] = ["synthetic body", "synthetic day body"];
 /// The cutoff every test below cuts at, and the clock's now in `ask`.
 const CUTOFF: &str = "2026-07-05T00:00:00Z";
 const NOW: &str = "2026-07-06T00:00:00Z";
@@ -78,15 +80,12 @@ fn stamp_of(published: Published) -> Stamp {
     }
 }
 
-/// One item under one closed attempt, the only door into the archive.
-fn commit(store: &mut Committer, ordinal: u32, seed: &Seed) -> TestResult {
-    let run = RunId::new(store.run().as_str());
-    let observed = ObservationTime::new(at(seed.observed)?);
-    let request = Request {
+fn request(provenance: Provenance) -> Request {
+    Request {
         source: SourceId::new(SOURCE),
         target_window: TargetWindow::new(WINDOW),
         phase: RequestPhase::Index,
-        provenance: seed.provenance,
+        provenance,
         url: URL.to_owned(),
         headers: Vec::new(),
         params: Vec::new(),
@@ -95,8 +94,21 @@ fn commit(store: &mut Committer, ordinal: u32, seed: &Seed) -> TestResult {
         names_ticker: false,
         hosts_version: None,
         extract_version: None,
-    };
-    let slot = AttemptSlot::open(store, &request, None, &run, ordinal, observed)?;
+    }
+}
+
+/// One item under one closed attempt, the only door into the archive.
+fn commit(store: &mut Committer, ordinal: u32, seed: &Seed) -> TestResult {
+    let run = RunId::new(store.run().as_str());
+    let observed = ObservationTime::new(at(seed.observed)?);
+    let slot = AttemptSlot::open(
+        store,
+        &request(seed.provenance),
+        None,
+        &run,
+        ordinal,
+        observed,
+    )?;
     let answer = RawResponse::new(
         slot.attempt_id().clone(),
         STATUS_OK,
@@ -213,6 +225,7 @@ fn ask(root: &Path, out: &Path) -> TestResult<Ask> {
         now: at(NOW)?,
         through_seq: None,
         dry_run: false,
+        busy_wait: cmd_cut::BUSY_WAIT,
     })
 }
 
@@ -576,7 +589,8 @@ fn a_standing_directory_that_does_not_validate_is_refused_and_left_as_found() ->
 }
 
 #[test]
-fn a_staging_directory_left_by_an_earlier_cut_is_refused_and_never_removed() -> TestResult {
+fn a_staging_directory_left_by_an_earlier_cut_is_refused_by_its_own_code_and_never_removed(
+) -> TestResult {
     let root = TempDir::new()?;
     drop(five(root.path())?);
     let out = TempDir::new()?;
@@ -590,7 +604,7 @@ fn a_staging_directory_left_by_an_earlier_cut_is_refused_and_never_removed() -> 
     std::fs::write(leftover.join("sentinel"), b"left by a crash")?;
     let refused = cut(&ask(root.path(), out.path())?);
     assert!(
-        matches!(&refused, Err(error @ CutError::StagingExists(_)) if error.code() == "io_failed"),
+        matches!(&refused, Err(error @ CutError::StagingLeft { after: None, .. }) if error.code() == "staging_left"),
         "{refused:?}"
     );
     assert_eq!(
@@ -698,6 +712,19 @@ fn a_stored_time_nobody_can_parse_stops_items_and_cut_by_its_seq() -> TestResult
         matches!(items, Err(cmd_items::ItemsError::StoredTime { seq: 2, .. })),
         "{items:?}"
     );
+    let listed = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .args(["items", "--at", CUTOFF, "--store"])
+        .arg(root.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert_eq!(
+        (
+            listed.status.code(),
+            listed.stdout.is_empty(),
+            String::from_utf8(listed.stderr)?.starts_with("error: seq 2: ")
+        ),
+        (Some(2), true, true)
+    );
     let out = TempDir::new()?;
     let answered = binary(
         root.path(),
@@ -727,6 +754,7 @@ fn a_written_cut_reports_its_envelope_on_stdout_and_validates() -> TestResult {
             envelope["schema"].as_str(),
             envelope["items"].as_u64(),
             envelope["provenance_counts"].clone(),
+            envelope["body_bytes"].as_u64(),
             answered.stderr.is_empty(),
         ),
         (
@@ -734,6 +762,9 @@ fn a_written_cut_reports_its_envelope_on_stdout_and_validates() -> TestResult {
             Some(cmd_cut::SCHEMA),
             Some(3),
             serde_json::json!({"bulk_dataset": 0, "live_ingest": 2, "vendor_archive": 1}),
+            Some(u64::try_from(
+                VISIBLE_BODIES.iter().map(|text| text.len()).sum::<usize>()
+            )?),
             true,
         )
     );
@@ -765,5 +796,219 @@ fn the_cut_command_and_its_codes_are_in_schema() -> TestResult {
     assert_eq!(cut["output"].as_str(), Some(cmd_cut::SCHEMA));
     assert!(codes.contains(&("provenance_unrecorded", 4)), "{codes:?}");
     assert!(codes.contains(&("nothing_visible", 4)), "{codes:?}");
+    Ok(())
+}
+
+/// `open_attempts` counts an attempt opened at or before the cutoff and neither closed nor swept.
+/// Mutation 2026-11-22, the count replaced by 0: red.
+#[test]
+fn open_attempts_counts_only_attempts_still_open_at_the_cutoff() -> TestResult {
+    let root = TempDir::new()?;
+    let mut store = five(root.path())?;
+    let run = RunId::new(store.run().as_str());
+    let base = ordinals(root.path())?;
+    let opened = [
+        "2026-07-04T00:00:00Z",
+        "2026-07-05T00:00:01Z",
+        "2026-07-03T00:00:00Z",
+    ];
+    for (ordinal, when) in (base..).zip(opened) {
+        let _left_open = AttemptSlot::open(
+            &mut store,
+            &request(Provenance::LiveIngest),
+            None,
+            &run,
+            ordinal,
+            ObservationTime::new(at(when)?),
+        )?;
+    }
+    drop(store);
+    let swept = Connection::open(root.path().join(COMMIT_LOG))?.execute(
+        "UPDATE attempts SET noticed_at = opened_at, noticed_by = run_id
+         WHERE closed_at IS NULL AND opened_at LIKE '2026-07-03%'",
+        [],
+    )?;
+    let out = TempDir::new()?;
+    let report = cut(&Ask {
+        dry_run: true,
+        ..ask(root.path(), out.path())?
+    })?;
+    assert_eq!((swept, report.open_attempts), (1, 1));
+    Ok(())
+}
+
+/// Before 2026-11-22 an unreadable `opened_at` was counted as open, with no error.
+#[test]
+fn an_open_attempt_whose_opened_at_does_not_parse_stops_the_cut_by_its_id() -> TestResult {
+    let root = TempDir::new()?;
+    let mut store = five(root.path())?;
+    let run = RunId::new(store.run().as_str());
+    let ordinal = ordinals(root.path())?;
+    let slot = AttemptSlot::open(
+        &mut store,
+        &request(Provenance::LiveIngest),
+        None,
+        &run,
+        ordinal,
+        ObservationTime::new(at("2026-07-04T00:00:00Z")?),
+    )?;
+    let id = slot.attempt_id().hex().to_owned();
+    drop(store);
+    Connection::open(root.path().join(COMMIT_LOG))?.execute(
+        "UPDATE attempts SET opened_at = 'not a time' WHERE attempt_id = ?1",
+        [&id],
+    )?;
+    let out = TempDir::new()?;
+    let refused = cut(&Ask {
+        dry_run: true,
+        ..ask(root.path(), out.path())?
+    });
+    assert!(
+        matches!(&refused, Err(error @ CutError::AttemptTime { attempt_id, .. })
+            if *attempt_id == id && error.code() == "input_unparseable"),
+        "{refused:?}"
+    );
+    Ok(())
+}
+
+/// A standing cut reports the bound its own manifest records, which a panel copies (§3.4), not the
+/// asked one. Mutation 2026-11-22, the asked bound kept: red.
+#[test]
+fn a_standing_cut_reports_the_bound_its_own_manifest_records() -> TestResult {
+    let root = TempDir::new()?;
+    let mut store = five(root.path())?;
+    let out = TempDir::new()?;
+    let first = cut(&ask(root.path(), out.path())?)?;
+    seeded(
+        &mut store,
+        root.path(),
+        &[instant(
+            "2026-07-05T10:00:00Z",
+            "2026-07-05T10:00:01Z",
+            "invisible-at-the-cutoff",
+        )?],
+    )?;
+    drop(store);
+    let again = cut(&Ask {
+        through_seq: Some(first.seq_high_water + 1),
+        ..ask(root.path(), out.path())?
+    })?;
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(the_path(&again)?.join(MANIFEST_FILE))?)?;
+    assert_eq!(
+        (
+            again.changed,
+            &again.snapshot_id,
+            Some(again.seq_high_water)
+        ),
+        (
+            false,
+            &first.snapshot_id,
+            manifest["seq_high_water"].as_i64()
+        )
+    );
+    Ok(())
+}
+
+/// Mutation 2026-11-22, the `OutMissing` arm removed: exit 0 with nothing written, red.
+#[test]
+fn a_cut_with_no_out_and_no_dry_run_or_an_out_that_is_a_file_is_refused() -> TestResult {
+    let root = TempDir::new()?;
+    drop(five(root.path())?);
+    let out = TempDir::new()?;
+    let a_file = out.path().join("a file");
+    std::fs::write(&a_file, b"")?;
+    let missing = binary(root.path(), &["--at", CUTOFF])?;
+    let file = binary(
+        root.path(),
+        &["--at", CUTOFF, "--out", &a_file.display().to_string()],
+    )?;
+    for answered in [&missing, &file] {
+        let (exit, code, empty, _) = refusal(answered)?;
+        assert_eq!(
+            (exit, code.as_str(), empty),
+            (Some(2), "invalid_argument", true)
+        );
+    }
+    assert_eq!(std::fs::read_dir(out.path())?.count(), 1);
+    Ok(())
+}
+
+/// Section 3.0 keeps a cut outside the store. Mutation 2026-11-22, the check removed: red.
+#[test]
+fn a_cut_into_the_store_or_its_blob_tree_is_refused() -> TestResult {
+    let root = TempDir::new()?;
+    drop(five(root.path())?);
+    let blobs = root.path().join("blobs");
+    let before = std::fs::read_dir(&blobs)?.count();
+    for inside in [root.path(), blobs.as_path()] {
+        let refused = cut(&ask(root.path(), inside)?);
+        assert!(
+            matches!(&refused, Err(error @ CutError::OutInsideStore { .. }) if error.code() == "invalid_argument"),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(std::fs::read_dir(&blobs)?.count(), before);
+    Ok(())
+}
+
+/// A writer's lock past the wait is `lease_held`, exit 7, retryable, and the same ask passes once
+/// it is released. Before 2026-11-22: `io_failed`, exit 2, not retryable, after rusqlite's 5 s.
+#[test]
+fn a_writers_lock_held_past_the_wait_is_lease_held_and_the_same_ask_then_passes() -> TestResult {
+    let root = TempDir::new()?;
+    drop(five(root.path())?);
+    let out = TempDir::new()?;
+    let blocker = Connection::open(root.path().join(COMMIT_LOG))?;
+    blocker.execute_batch("BEGIN EXCLUSIVE")?;
+    let asked = Ask {
+        busy_wait: std::time::Duration::from_millis(100),
+        ..ask(root.path(), out.path())?
+    };
+    let refused = cut(&asked);
+    let Err(error) = &refused else {
+        return Err(format!("expected a refusal, got {refused:?}").into());
+    };
+    assert_eq!(
+        (error.code(), error.exit(), error.retryable()),
+        ("lease_held", 7, true)
+    );
+    blocker.execute_batch("ROLLBACK")?;
+    assert!(cut(&asked)?.changed);
+    Ok(())
+}
+
+/// Fails the first `sync_file`, the data file's, as a full disk would.
+struct FailingSync;
+
+impl Durability for FailingSync {
+    fn sync_file(&self, _file: &File) -> std::io::Result<()> {
+        Err(std::io::Error::other("a synthetic fsync failure"))
+    }
+
+    fn sync_dir(&self, directory: &Path) -> std::io::Result<()> {
+        Fsync.sync_dir(directory)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        Fsync.rename(from, to)
+    }
+}
+
+/// A failure after the staging directory exists removes it, so the same argv runs again; only a
+/// staged cut with findings is left for inspection. Mutation 2026-11-22, the removal skipped:
+/// the second run is `staging_left`, red.
+#[test]
+fn a_cut_that_fails_after_staging_removes_its_own_staging_directory() -> TestResult {
+    let root = TempDir::new()?;
+    drop(five(root.path())?);
+    let out = TempDir::new()?;
+    let failed = cmd_cut::run(&ask(root.path(), out.path())?, &FailingSync);
+    assert!(
+        matches!(&failed, Err(error) if error.code() == "io_failed"),
+        "{failed:?}"
+    );
+    assert_eq!(std::fs::read_dir(out.path())?.count(), 0);
+    assert!(cut(&ask(root.path(), out.path())?)?.changed);
     Ok(())
 }

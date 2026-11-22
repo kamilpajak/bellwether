@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::{DateTime, Timelike, Utc};
 use pit::Cutoff;
@@ -31,6 +32,8 @@ pub const SCHEMA: &str = "newsvault.cut/1";
 const CHUNK_ROWS: i64 = 512;
 const STAGING_PREFIX: &str = ".tmp-";
 const NANOS_PER_MICRO: u32 = 1_000;
+/// How long a read waits on a writer's lock before `lease_held`; `cmd_snapshot`'s wait.
+pub const BUSY_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct Ask {
@@ -42,6 +45,8 @@ pub struct Ask {
     pub now: DateTime<Utc>,
     pub through_seq: Option<i64>,
     pub dry_run: bool,
+    /// [`BUSY_WAIT`] in the binary; a test waits less.
+    pub busy_wait: Duration,
 }
 
 /// The `newsvault.cut/1` envelope.
@@ -75,6 +80,8 @@ pub enum CutError {
     OutMissing,
     #[error("--out {0} is not an existing directory")]
     OutNotADirectory(PathBuf),
+    #[error("--out {} is inside the store {}, which its backup would copy", .out.display(), .store.display())]
+    OutInsideStore { out: PathBuf, store: PathBuf },
     #[error(
         "--at {at} is after the clock's now {now}: rows not yet collected would be outside the cut"
     )]
@@ -91,6 +98,8 @@ pub enum CutError {
     StoreAbsent(PathBuf),
     #[error("seq {seq}: {error}")]
     StoredTime { seq: i64, error: TimeError },
+    #[error("attempt {attempt_id}: opened_at {value:?} is not an RFC 3339 instant")]
+    AttemptTime { attempt_id: String, value: String },
     #[error("seq {seq}: no digest over the row: {why}")]
     RowDigest { seq: i64, why: String },
     #[error("seq {seq}: its body blob {digest} is not in the store")]
@@ -119,8 +128,12 @@ pub enum CutError {
         path: PathBuf,
         findings: Vec<Finding>,
     },
-    #[error("a staging directory {} is left by a cut that did not finish; it is never removed here", .0.display())]
-    StagingExists(PathBuf),
+    /// `after`: the failure of this run that could not remove its own staging directory.
+    #[error("a staging directory {} is left by a cut that did not finish{}; remove it once no cut of this set runs", .path.display(), .after.as_ref().map(|why| format!(" ({why})")).unwrap_or_default())]
+    StagingLeft {
+        path: PathBuf,
+        after: Option<String>,
+    },
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -136,10 +149,14 @@ pub enum CutError {
 impl CutError {
     /// The section 5.1 registry code.
     #[must_use]
-    pub const fn code(&self) -> &'static str {
+    pub fn code(&self) -> &'static str {
         match self {
+            Self::Sqlite(failure) | Self::Store(StoreError::Sqlite(failure)) if busy(failure) => {
+                "lease_held"
+            }
             Self::OutMissing
             | Self::OutNotADirectory(_)
+            | Self::OutInsideStore { .. }
             | Self::AtInTheFuture { .. }
             | Self::AtBelowMicrosecond(_)
             | Self::ThroughSeqBelowOne(_)
@@ -148,6 +165,7 @@ impl CutError {
                 "input_absent"
             }
             Self::StoredTime { .. }
+            | Self::AttemptTime { .. }
             | Self::RowDigest { .. }
             | Self::BodyUnreadable { .. }
             | Self::BodyNotText { .. }
@@ -156,21 +174,26 @@ impl CutError {
             Self::ProvenanceUnrecorded { .. } => "provenance_unrecorded",
             Self::NothingVisible { .. } => "nothing_visible",
             Self::Store(StoreError::SchemaVersion { .. }) => "input_schema_mismatch",
-            Self::StagingExists(_)
-            | Self::Store(_)
-            | Self::Sqlite(_)
-            | Self::Parquet(_)
-            | Self::Json(_)
-            | Self::Io(_) => "io_failed",
+            Self::StagingLeft { .. } => "staging_left",
+            Self::Store(_) | Self::Sqlite(_) | Self::Parquet(_) | Self::Json(_) | Self::Io(_) => {
+                "io_failed"
+            }
         }
     }
 
     #[must_use]
-    pub const fn exit(&self) -> u8 {
-        match self.code().as_bytes() {
-            b"input_absent" | b"provenance_unrecorded" | b"nothing_visible" => 4,
+    pub fn exit(&self) -> u8 {
+        match self.code() {
+            "input_absent" | "provenance_unrecorded" | "nothing_visible" => 4,
+            "lease_held" => 7,
             _ => 2,
         }
+    }
+
+    /// Only a writer's lock passes by itself; every other refusal returns on the same argv.
+    #[must_use]
+    pub fn retryable(&self) -> bool {
+        self.code() == "lease_held"
     }
 
     /// The facts a caller branches on, beside the free-text message.
@@ -186,9 +209,15 @@ impl CutError {
             Self::StagedInvalid { path, findings } | Self::StandingInvalid { path, findings } => {
                 json!({"path": shown(path), "findings": findings})
             }
-            Self::StagingExists(path) | Self::OutNotADirectory(path) | Self::StoreAbsent(path) => {
+            Self::StagingLeft { path, .. }
+            | Self::OutNotADirectory(path)
+            | Self::StoreAbsent(path) => {
                 json!({"path": shown(path)})
             }
+            Self::OutInsideStore { out, store } => {
+                json!({"out": shown(out), "store": shown(store)})
+            }
+            Self::AttemptTime { attempt_id, .. } => json!({"attempt_id": attempt_id}),
             Self::StoredTime { seq, .. }
             | Self::RowDigest { seq, .. }
             | Self::BodyAbsent { seq, .. }
@@ -205,6 +234,13 @@ impl CutError {
             _ => json!({}),
         }
     }
+}
+
+fn busy(failure: &rusqlite::Error) -> bool {
+    matches!(
+        failure.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
 }
 
 /// One stored row as both passes read it: the row, its attempt's provenance (`None`: not
@@ -227,7 +263,11 @@ pub fn run(ask: &Ask, durability: &dyn Durability) -> Result<Report, CutError> {
     if !log.is_file() {
         return Err(CutError::StoreAbsent(log));
     }
+    if let Some(out) = ask.out.as_deref().filter(|_| !ask.dry_run) {
+        refuse_out_inside(out, &ask.store)?;
+    }
     let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    db.busy_timeout(ask.busy_wait)?;
     require_current_version(&db)?;
     let cutoff = Cutoff::new(ask.at);
     let highest: i64 = db.query_row("SELECT COALESCE(MAX(seq), 0) FROM items", [], |row| {
@@ -278,6 +318,9 @@ pub fn run(ask: &Ask, durability: &dyn Durability) -> Result<Report, CutError> {
             });
         }
         let manifest: Manifest = serde_json::from_slice(&fs::read(standing.join(MANIFEST_FILE))?)?;
+        report.seq_high_water = manifest.seq_high_water;
+        report.items = manifest.items;
+        report.provenance_counts = manifest.provenance_counts;
         report.data_sha256 = Some(manifest.data_sha256);
         report.bytes = Some(fs::metadata(standing.join(DATA_FILE))?.len());
         report.path = Some(standing.display().to_string());
@@ -287,40 +330,18 @@ pub fn run(ask: &Ask, durability: &dyn Durability) -> Result<Report, CutError> {
     match fs::create_dir(&staging) {
         Ok(()) => {}
         Err(failure) if failure.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(CutError::StagingExists(staging))
+            return Err(CutError::StagingLeft {
+                path: staging,
+                after: None,
+            })
         }
         Err(failure) => return Err(failure.into()),
     }
-    write_data(
-        &db,
-        ask,
-        &selection,
-        &staging.join(DATA_FILE),
-        &snapshot_id,
-        durability,
-    )?;
-    let (data_sha256, bytes) = file_sha256(&staging.join(DATA_FILE))?;
-    let manifest = Manifest {
-        schema: MANIFEST_SCHEMA.to_owned(),
-        snapshot_id: snapshot_id.clone(),
-        cutoff: report.cutoff.clone(),
-        seq_high_water,
-        items: report.items,
-        provenance_counts: selection.provenance_counts,
-        data_sha256: data_sha256.clone(),
+    let (data_sha256, bytes) = match staged(&db, ask, &selection, &staging, &report, durability) {
+        Ok(written) => written,
+        Err(failure @ CutError::StagedInvalid { .. }) => return Err(failure),
+        Err(failure) => return Err(abandoned(staging, failure)),
     };
-    let mut file = File::create_new(staging.join(MANIFEST_FILE))?;
-    file.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
-    durability.sync_file(&file)?;
-    drop(file);
-    let findings = validated(&staging)?;
-    if !findings.is_empty() {
-        return Err(CutError::StagedInvalid {
-            path: staging,
-            findings,
-        });
-    }
-    durability.sync_dir(&staging)?;
     durability.rename(&staging, &standing)?;
     durability.sync_dir(out)?;
     report.changed = true;
@@ -328,6 +349,70 @@ pub fn run(ask: &Ask, durability: &dyn Durability) -> Result<Report, CutError> {
     report.data_sha256 = Some(data_sha256);
     report.bytes = Some(bytes);
     Ok(report)
+}
+
+/// Steps 3 and 4 of section 3.0's write sequence and the staging directory's sync: the data file,
+/// the manifest, the validator. Answers the data file's sha256 and length.
+fn staged(
+    db: &Connection,
+    ask: &Ask,
+    selection: &Selection,
+    staging: &Path,
+    report: &Report,
+    durability: &dyn Durability,
+) -> Result<(String, u64), CutError> {
+    write_data(
+        db,
+        ask,
+        selection,
+        &staging.join(DATA_FILE),
+        &report.snapshot_id,
+        durability,
+    )?;
+    let (data_sha256, bytes) = file_sha256(&staging.join(DATA_FILE))?;
+    let manifest = Manifest {
+        schema: MANIFEST_SCHEMA.to_owned(),
+        snapshot_id: report.snapshot_id.clone(),
+        cutoff: report.cutoff.clone(),
+        seq_high_water: report.seq_high_water,
+        items: report.items,
+        provenance_counts: report.provenance_counts.clone(),
+        data_sha256: data_sha256.clone(),
+    };
+    let mut file = File::create_new(staging.join(MANIFEST_FILE))?;
+    file.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
+    durability.sync_file(&file)?;
+    drop(file);
+    let findings = validated(staging)?;
+    if !findings.is_empty() {
+        return Err(CutError::StagedInvalid {
+            path: staging.to_path_buf(),
+            findings,
+        });
+    }
+    durability.sync_dir(staging)?;
+    Ok((data_sha256, bytes))
+}
+
+/// This run's own staging directory, removed after a failure other than a finding, so the same
+/// argv can run again; one it cannot remove is named instead of the failure being lost.
+fn abandoned(staging: PathBuf, failure: CutError) -> CutError {
+    match fs::remove_dir_all(&staging) {
+        Ok(()) => failure,
+        Err(_) => CutError::StagingLeft {
+            path: staging,
+            after: Some(failure.to_string()),
+        },
+    }
+}
+
+/// Section 3.0: a cut is kept outside the store, whose backup would otherwise copy it.
+fn refuse_out_inside(out: &Path, store: &Path) -> Result<(), CutError> {
+    let (out, store) = (fs::canonicalize(out)?, fs::canonicalize(store)?);
+    if out.starts_with(&store) {
+        return Err(CutError::OutInsideStore { out, store });
+    }
+    Ok(())
 }
 
 fn refuse_arguments(ask: &Ask) -> Result<(), CutError> {
@@ -553,20 +638,20 @@ fn body_of(root: &Path, seq: i64, digest: &str) -> Result<String, CutError> {
 
 /// Attempts opened at or before `at` with no `closed_at` and no sweep's `noticed_at`.
 fn open_attempts(db: &Connection, at: DateTime<Utc>) -> Result<u64, CutError> {
-    let mut statement = db
-        .prepare("SELECT opened_at FROM attempts WHERE closed_at IS NULL AND noticed_at IS NULL")?;
-    let opened: Vec<String> = statement
-        .query_map([], |row| row.get(0))?
+    let mut statement = db.prepare(
+        "SELECT attempt_id, opened_at FROM attempts WHERE closed_at IS NULL AND noticed_at IS NULL",
+    )?;
+    let opened: Vec<(String, String)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<_, _>>()?;
-    Ok(opened
-        .iter()
-        .filter(|text| {
-            text.parse::<DateTime<Utc>>()
-                .map_or(true, |opened| opened <= at)
-        })
-        .count()
-        .try_into()
-        .unwrap_or(u64::MAX))
+    let mut count = 0_u64;
+    for (attempt_id, value) in opened {
+        let Ok(opened) = value.parse::<DateTime<Utc>>() else {
+            return Err(CutError::AttemptTime { attempt_id, value });
+        };
+        count += u64::from(opened <= at);
+    }
+    Ok(count)
 }
 
 /// The human rendering of the envelope.
