@@ -37,6 +37,9 @@ pub enum Shape {
     /// A non-negative integer. A count arriving as `78460.0` is rejected: a row count that went
     /// through a float has been through arithmetic that can lose it.
     Count,
+    /// An integer of at least 1: a `seq` bound, which `snapshot.manifest/1` and `newsvault cut
+    /// --through-seq` both refuse at 0.
+    SeqBound,
     /// A non-negative number that need not be an integer: a measured ratio, carried by the two
     /// deferred fields only.
     Ratio,
@@ -50,6 +53,7 @@ impl Shape {
             Self::Text => value.as_str().is_some_and(|text| !text.trim().is_empty()),
             Self::Digest => value.as_str().is_some_and(canon::is_digest_hex),
             Self::Count => value.as_u64().is_some(),
+            Self::SeqBound => value.as_u64().is_some_and(|bound| bound >= 1),
             Self::Ratio => value.as_f64().is_some_and(|number| number >= 0.0),
             Self::List => value.is_array(),
             Self::Table => value.is_object(),
@@ -62,6 +66,7 @@ impl Shape {
             Self::Text => "a non-empty string",
             Self::Digest => "64 lower-case hex characters, canon's digest text form",
             Self::Count => "a non-negative integer",
+            Self::SeqBound => "an integer of at least 1",
             Self::Ratio => "a non-negative number",
             Self::List => "an array",
             Self::Table => "an object",
@@ -114,7 +119,7 @@ pub const FIELDS: &[Field] = &[
     },
     Field {
         name: "seq_high_water",
-        shape: Shape::Count,
+        shape: Shape::SeqBound,
         need: Need::Always,
         why: "the seq bound of the cited snapshot, beside its id and cutoff: a snapshot directory \
               is kept outside the backup, and `newsvault cut --at <cutoff> --through-seq <this>` \
@@ -885,6 +890,20 @@ mod tests {
             let findings = validate(&manifest);
             assert_eq!(codes(&findings), vec!["wrong_type"], "{written}");
         }
+    }
+
+    /// The generic missing-field test walks `FIELDS`, so it cannot see an entry deleted from it.
+    /// Mutations 2026-11-22, the `seq_high_water` entry deleted / `SeqBound` accepting 0: red each.
+    #[test]
+    fn a_panel_without_a_usable_seq_high_water_is_refused() {
+        let mut absent = fixture("corrected_panel_78460.json");
+        absent.as_object_mut().unwrap().remove("seq_high_water");
+        let mut zero = fixture("corrected_panel_78460.json");
+        zero.as_object_mut()
+            .unwrap()
+            .insert("seq_high_water".to_owned(), Value::from(0));
+        assert_eq!(codes(&validate(&absent)), vec!["missing_field"]);
+        assert_eq!(codes(&validate(&zero)), vec!["wrong_type"]);
     }
 
     #[test]
