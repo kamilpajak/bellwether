@@ -17,7 +17,8 @@ use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
 use pit::ObservationTime;
 
 use crate::budget::{
-    host_of, BudgetError, BudgetScope, Hold, HostKey, Pace, RequestBudget, Reserved,
+    host_of, BudgetError, BudgetScope, Hold, HostKey, Pace, RequestBudget, Reserved, SendGate,
+    Stamped,
 };
 use crate::clock::{Clock, Sleeper, ThreadSleeper};
 use crate::ledger::{AttemptId, SendPermit};
@@ -457,6 +458,7 @@ pub struct Wire {
     pace: Option<Pace>,
     /// Where a per-host pace file is opened, one per remote host a request names.
     store: PathBuf,
+    source: SourceId,
     sleeper: Box<dyn Sleeper>,
     /// Held in memory: one `Wire` is one run, and a second process sees only the host slot granted.
     backoff: RefCell<BTreeMap<HostKey, Backoff>>,
@@ -469,6 +471,9 @@ pub struct Wire {
 }
 
 const USER_AGENT: &str = "User-Agent";
+/// Each try past the first follows a wait the clock did not see pass, or another caller's send
+/// on the bucket during it; a bound so a clock that never advances refuses instead of spinning.
+const GATE_TRIES: u32 = 8;
 
 impl Wire {
     /// One `Wire` is one vendor's conversation, so the pace file is named by `source` and the
@@ -526,6 +531,7 @@ impl Wire {
             credentials,
             pace,
             store: store.to_path_buf(),
+            source: source.clone(),
             sleeper,
             backoff: RefCell::default(),
             reserved: RefCell::default(),
@@ -625,7 +631,7 @@ impl Wire {
             }
         }
         let host = self.paced_host(&request.url)?;
-        let requested_at = ObservationTime::new(clock.now());
+        let requested_at = ObservationTime::new(self.clear_to_send(host.as_ref(), clock)?);
         let answered = self.exchange(&request.url, &headers);
         let received_at = ObservationTime::new(clock.now());
         if let Some(host) = host {
@@ -711,8 +717,7 @@ impl Wire {
                 by_server: false,
             }));
         };
-        let backoff = self.backoff.borrow().get(host).copied().unwrap_or_default();
-        let interval = ordinary.saturating_mul(2_u32.saturating_pow(backoff.doublings));
+        let interval = self.host_interval(host, ordinary);
         let scope = BudgetScope::PerHost(host.clone());
         let pace = Pace::beside_the_store(&self.store, &scope, interval);
         let held = Hold::beside_the_store(&self.store, host).until()?;
@@ -730,6 +735,49 @@ impl Wire {
                 by_server: deadline.is_some_and(|deadline| ordinary_at <= deadline),
             })),
         }
+    }
+
+    /// `ordinary` doubled once per slow-down answer this run read from `host`.
+    fn host_interval(&self, host: &HostKey, ordinary: Duration) -> Duration {
+        let backoff = self.backoff.borrow().get(host).copied().unwrap_or_default();
+        ordinary.saturating_mul(2_u32.saturating_pow(backoff.doublings))
+    }
+
+    /// The `requested_at` of a call, read once the last call through its host's bucket and its
+    /// per-IP bucket is a full interval ago, and written to both under their locks. Without a
+    /// gate (a url no host keys, under a hosts-only profile) it is one clock read.
+    fn clear_to_send(
+        &self,
+        host: Option<&HostKey>,
+        clock: &dyn Clock,
+    ) -> Result<DateTime<Utc>, BudgetError> {
+        let mut gates = Vec::new();
+        if let (Some(host), Some(ordinary)) = (host, self.profile.budget.per_host) {
+            let scope = BudgetScope::PerHost(host.clone());
+            let interval = self.host_interval(host, ordinary);
+            gates.push(SendGate::beside_the_store(&self.store, &scope, interval)?);
+        }
+        if let Some(interval) = self.profile.budget.min_interval {
+            let scope = BudgetScope::PerIp(self.source.clone());
+            gates.push(SendGate::beside_the_store(&self.store, &scope, interval)?);
+        }
+        if gates.is_empty() {
+            return Ok(clock.now());
+        }
+        let mut owed = Duration::ZERO;
+        for _ in 0..GATE_TRIES {
+            match SendGate::stamp(&gates, clock.now())? {
+                Stamped::Sent(at) => return Ok(at),
+                Stamped::Owed(wait) => {
+                    owed = wait;
+                    self.sleeper.sleep(wait);
+                }
+            }
+        }
+        Err(BudgetError::NeverCleared {
+            tries: GATE_TRIES,
+            owed,
+        })
     }
 
     /// The url's host when the profile paces hosts. ureq 3.5.2 parses a url with this same
@@ -911,7 +959,7 @@ mod tests {
     use super::{
         retry_after, CappedHold, Credentials, DateTime, Headers, RawResponse, Reservation,
         SendFailure, Slowed, Timeouts, TransportError, TransportKind, TransportProfile, Unreserved,
-        Utc, Wire, USER_AGENT,
+        Utc, Wire, GATE_TRIES, USER_AGENT,
     };
     use crate::budget::{BudgetError, RequestBudget};
     use crate::clock::testing::{StepClock, WaitRecorder, WaitedClock};
@@ -952,6 +1000,8 @@ mod tests {
     const SIXTY_MS_LATER: &str = "2026-11-10T13:00:00.060Z";
     const REQUESTED_AT: &str = "2026-11-10T13:00:01Z";
     const RECEIVED_AT: &str = "2026-11-10T13:00:02Z";
+    const A_MINUTE_ON_REQUESTED: &str = "2026-11-10T13:01:01Z";
+    const A_MINUTE_ON_RECEIVED: &str = "2026-11-10T13:01:02Z";
     const BEFORE_IT_WAS_REQUESTED: &str = "2026-11-10T12:59:59Z";
     const OK_STATUS: u16 = 200;
     /// The reservation and both instants, and nothing else, come out of the clock during one send.
@@ -989,6 +1039,8 @@ mod tests {
     const PACE_DIR: &str = "pace";
     const SOURCE_PACE_FILE: &str = "edgar_press.per-ip";
     const HOST_PACE_FILE: &str = "localhost.per-host";
+    const HOST_SENT_FILE: &str = "localhost.per-host.sent";
+    const SOURCE_SENT_FILE: &str = "edgar_press.per-ip.sent";
     const ANOTHER_SOURCE: &str = "another_source";
     /// Any roster bytes: these tests are about the socket.
     const ROSTER: &[u8] = b"{\"320193\":\"AAPL\"}";
@@ -1068,11 +1120,25 @@ mod tests {
         )
     }
 
+    /// The two instants of a send reserved at `reserved`: a send reserved after `RESERVED_AT` is
+    /// requested a minute on, past every interval here, since `send` stamps no two calls on one
+    /// bucket closer than its interval (`SendGate`).
+    fn sent_after(reserved: &str) -> [&str; 2] {
+        if reserved == RESERVED_AT {
+            [REQUESTED_AT, RECEIVED_AT]
+        } else {
+            [A_MINUTE_ON_REQUESTED, A_MINUTE_ON_RECEIVED]
+        }
+    }
+
     /// One clock read for the reservation and two for the instants, per send.
     fn clock_over(sends: &[&str]) -> StepClock {
         let reads: Vec<&str> = sends
             .iter()
-            .flat_map(|reserved| [*reserved, REQUESTED_AT, RECEIVED_AT])
+            .flat_map(|reserved| {
+                let [requested, received] = sent_after(reserved);
+                [*reserved, requested, received]
+            })
             .collect();
         StepClock::over(&reads)
     }
@@ -1114,7 +1180,10 @@ mod tests {
     fn polite_clock(sends: &[(&str, &str)]) -> StepClock {
         let reads: Vec<&str> = sends
             .iter()
-            .flat_map(|(host, ip)| [*host, *ip, REQUESTED_AT, RECEIVED_AT])
+            .flat_map(|(host, ip)| {
+                let [requested, received] = sent_after(host);
+                [*host, *ip, requested, received]
+            })
             .collect();
         StepClock::over(&reads)
     }
@@ -1430,7 +1499,12 @@ mod tests {
             (waits.waits(), files),
             (
                 vec![NO_WAIT, NO_WAIT, HOST_WAIT, NO_WAIT],
-                vec![SOURCE_PACE_FILE.to_owned(), HOST_PACE_FILE.to_owned()]
+                vec![
+                    SOURCE_PACE_FILE.to_owned(),
+                    SOURCE_SENT_FILE.to_owned(),
+                    HOST_PACE_FILE.to_owned(),
+                    HOST_SENT_FILE.to_owned()
+                ]
             )
         );
         Ok(())
@@ -2450,7 +2524,9 @@ mod tests {
         Ok(())
     }
 
-    /// The doubling binds the answering host alone: another host asked before keeps its 1 s.
+    /// The doubling binds the answering host alone: another host asked before keeps its 1 s. The
+    /// last wait is at the socket: `localhost`'s earlier send left its host slot `EXPECTED_WAIT`
+    /// late, behind the per-IP wait.
     #[test]
     fn a_doubled_interval_slows_only_the_host_that_answered() -> Checked {
         let answers = vec![(NO_RETRY_AFTER.to_owned(), Vec::new())];
@@ -2464,7 +2540,8 @@ mod tests {
                 OTHER_HOST_UNDOUBLED,
                 NO_WAIT,
                 ANSWERING_HOST_DOUBLED,
-                NO_WAIT
+                NO_WAIT,
+                EXPECTED_WAIT
             ]
         );
         Ok(())
@@ -2530,6 +2607,7 @@ mod tests {
     const LOOPBACK_IP: &str = "127.0.0.1";
     const LOOPBACK_NAME: &str = "localhost";
     const LOOPBACK_HOST_PACE_FILE: &str = "127.0.0.1.per-host";
+    const LOOPBACK_HOST_SENT_FILE: &str = "127.0.0.1.per-host.sent";
     /// Where host A's 120 s `Retry-After` is held, beside its pace file (S7-D7).
     const LOOPBACK_HOLD_FILE: &str = "127.0.0.1.hold";
 
@@ -2594,7 +2672,9 @@ mod tests {
             vec![
                 LOOPBACK_HOLD_FILE.to_owned(),
                 LOOPBACK_HOST_PACE_FILE.to_owned(),
-                HOST_PACE_FILE.to_owned()
+                LOOPBACK_HOST_SENT_FILE.to_owned(),
+                HOST_PACE_FILE.to_owned(),
+                HOST_SENT_FILE.to_owned()
             ]
         );
         Ok(())
@@ -2619,6 +2699,8 @@ mod tests {
     }
 
     /// edgar's shape: the same sends still pay the per-IP pace across hosts (host, then IP wait).
+    /// B's last send owes `TEST_INTERVAL` more at its socket: the per-IP wait left B's previous
+    /// send that long after its host slot, which hole 6 of row R19 let through until 2026-11-22.
     #[test]
     fn a_profile_with_a_per_ip_pace_still_spaces_two_hosts_by_it() -> Checked {
         let (waits, files) = two_hosts_one_held(polite_profile())?;
@@ -2635,7 +2717,8 @@ mod tests {
                     NO_WAIT,
                     TEST_INTERVAL,
                     HOST_WAIT_LATER,
-                    NO_WAIT
+                    NO_WAIT,
+                    TEST_INTERVAL
                 ],
                 true
             )
@@ -2993,6 +3076,193 @@ mod tests {
             (reservation, clock.waits()),
             (Reservation::Go, vec![NO_WAIT, NO_WAIT, FLOOR])
         );
+        Ok(())
+    }
+
+    /// What `collect` does between `reserve` and `send`: open the attempt row. Not measured on its
+    /// own; 1.07 s is the 7 s pace less the 5.93 s gap of 2026-11-20/21.
+    const ROW_OPENED_IN: Duration = Duration::from_millis(1_070);
+    /// The first send's delay between its reservation and its socket, under the 100 ms per-IP pace.
+    const IP_ROW_OPENED_IN: Duration = Duration::from_millis(60);
+
+    /// The instant `send` stamped as `requested_at`, which the ledger keeps per attempt.
+    fn requested_at(
+        wire: &Wire,
+        clock: &dyn Clock,
+        ordinal: u32,
+        url: &str,
+    ) -> Result<DateTime<Utc>, Box<dyn std::error::Error>> {
+        let mut sink = Recorder::default();
+        let Some(permit) = permit(&mut sink, ordinal) else {
+            return Err("no permit".into());
+        };
+        let asked = Request {
+            url: url.to_owned(),
+            ..request()
+        };
+        match wire.send(permit, &asked, clock) {
+            Ok(answer) => Ok(answer.requested_at().inner()),
+            Err(SendFailure::Transport(failed)) => Ok(failed.requested_at().inner()),
+            Err(other) => Err(format!("{other:?}").into()),
+        }
+    }
+
+    /// `collect`'s order for one request: reserve, `opening` for the attempt row, then send.
+    fn reserved_then_sent(
+        wire: &Wire,
+        clock: &WaitedClock,
+        ordinal: u32,
+        url: &str,
+        opening: Duration,
+    ) -> Result<DateTime<Utc>, Box<dyn std::error::Error>> {
+        let asked = Request {
+            url: url.to_owned(),
+            ..request()
+        };
+        if wire.reserve(&asked, clock, None)? != Reservation::Go {
+            return Err("not reserved".into());
+        }
+        clock.elapse(opening);
+        requested_at(wire, clock, ordinal, url)
+    }
+
+    /// R19, measured 2026-11-20/21 on production: 5.93 s between two `requested_at` of one host
+    /// paced at 7 s. The slot is counted from the reservation, and the first send left 1.07 s
+    /// after its own while the second left at once.
+    #[test]
+    fn two_sends_to_one_host_are_its_interval_apart_however_late_the_first_left_its_slot() -> Checked
+    {
+        let store = tempfile::tempdir()?;
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let wire = Wire::with_sleeper(
+            hosts_only_profile(),
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        let first = reserved_then_sent(&wire, &clock, FIRST_ATTEMPT, LOCALHOST, ROW_OPENED_IN)?;
+        let second = reserved_then_sent(&wire, &clock, SECOND_ATTEMPT, LOCALHOST, NO_WAIT)?;
+        assert_eq!((second - first).to_std()?, FLOOR);
+        Ok(())
+    }
+
+    /// The same gap across two `Wire`s on one store, as two processes or two runs share it.
+    #[test]
+    fn a_send_counts_its_interval_from_another_wire_s_send_on_the_store() -> Checked {
+        let store = tempfile::tempdir()?;
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let on_the_store = || {
+            Wire::with_sleeper(
+                hosts_only_profile(),
+                held(),
+                store.path(),
+                &SourceId::new(SOURCE),
+                Box::new(clock.clone()),
+            )
+        };
+        let (earlier_run, later_run) = (on_the_store(), on_the_store());
+        let first = reserved_then_sent(
+            &earlier_run,
+            &clock,
+            FIRST_ATTEMPT,
+            LOCALHOST,
+            ROW_OPENED_IN,
+        )?;
+        let second = reserved_then_sent(&later_run, &clock, SECOND_ATTEMPT, LOCALHOST, NO_WAIT)?;
+        assert_eq!((second - first).to_std()?, FLOOR);
+        Ok(())
+    }
+
+    /// `GATE_TRIES` waits, then a refusal: `StepClock` answers the epoch past its sequence, so
+    /// the gate's wait never passes on this clock.
+    #[test]
+    fn a_gate_whose_wait_the_clock_never_sees_pass_refuses_after_its_tries() -> Checked {
+        let store = tempfile::tempdir()?;
+        let waits = WaitRecorder::default();
+        let wire = wire(held(), store.path(), &waits);
+        send_through(&wire, &clock_over(&[RESERVED_AT]), FIRST_ATTEMPT)?;
+        let stuck = StepClock::over(&[SIXTY_MS_LATER, REQUESTED_AT]);
+        let mut sink = Recorder::default();
+        let Some(permit) = permit(&mut sink, SECOND_ATTEMPT) else {
+            return Err("no permit".into());
+        };
+        let refused = wire.send(permit, &request(), &stuck).err();
+        // The first send's per-IP wait, then the second's, then the gate's.
+        let tries = u32::try_from(waits.waits().len().saturating_sub(2))?;
+        assert_eq!(
+            (
+                matches!(
+                    refused,
+                    Some(SendFailure::Budget(BudgetError::NeverCleared { tries, .. }))
+                        if tries == GATE_TRIES
+                ),
+                tries
+            ),
+            (true, GATE_TRIES)
+        );
+        Ok(())
+    }
+
+    /// edgar's per-IP pace: the same reservation-to-socket delay, on our address's bucket.
+    #[test]
+    fn two_sends_through_one_per_ip_pace_are_its_interval_apart_however_late_the_first_left(
+    ) -> Checked {
+        let store = tempfile::tempdir()?;
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let wire = Wire::with_sleeper(
+            profile(),
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        let first = reserved_then_sent(&wire, &clock, FIRST_ATTEMPT, REFUSED, IP_ROW_OPENED_IN)?;
+        let second = reserved_then_sent(&wire, &clock, SECOND_ATTEMPT, REFUSED, NO_WAIT)?;
+        assert_eq!((second - first).to_std()?, TEST_INTERVAL);
+        Ok(())
+    }
+
+    /// The second send waits at the gate; unless that send is written to the gate file, the third
+    /// is compared with the first and leaves 8.93 s after the second.
+    #[test]
+    fn a_send_that_waited_at_the_gate_is_the_one_the_next_send_is_spaced_from() -> Checked {
+        let store = tempfile::tempdir()?;
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let wire = Wire::with_sleeper(
+            hosts_only_profile(),
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        let first = reserved_then_sent(&wire, &clock, FIRST_ATTEMPT, LOCALHOST, ROW_OPENED_IN)?;
+        let second = reserved_then_sent(&wire, &clock, SECOND_ATTEMPT, LOCALHOST, NO_WAIT)?;
+        let third = reserved_then_sent(&wire, &clock, SECOND_ATTEMPT + 1, LOCALHOST, NO_WAIT)?;
+        assert_eq!(
+            ((second - first).to_std()?, (third - second).to_std()?),
+            (FLOOR, FLOOR)
+        );
+        Ok(())
+    }
+
+    /// edgar's shape, both paces: a call to another host is still spaced from the last call on
+    /// our address, which only the per-IP gate file knows once the first left its slot late.
+    #[test]
+    fn two_hosts_under_a_per_ip_pace_are_its_interval_apart_however_late_the_first_left() -> Checked
+    {
+        let store = tempfile::tempdir()?;
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let wire = Wire::with_sleeper(
+            polite_profile(),
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        let first = reserved_then_sent(&wire, &clock, FIRST_ATTEMPT, REFUSED, IP_ROW_OPENED_IN)?;
+        let second = reserved_then_sent(&wire, &clock, SECOND_ATTEMPT, LOCALHOST, NO_WAIT)?;
+        assert_eq!((second - first).to_std()?, TEST_INTERVAL);
         Ok(())
     }
 

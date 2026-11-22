@@ -15,7 +15,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
+use chrono::{DateTime, SecondsFormat, SubsecRound, TimeDelta, Utc};
 
 use crate::request::SourceId;
 
@@ -102,14 +102,14 @@ enum Held {
 }
 
 /// How fast one vendor may be called. Stated by the provider, like the timeouts beside it. A call
-/// owing both paces waits out the host's and then our address's, so two calls to one host leave at
-/// least `per_host` less the per-IP wait owed after the host wait apart (row R19, hole 6).
+/// owing both paces waits out the host's and then our address's, then [`SendGate`] holds each
+/// bucket's consecutive `requested_at` at least its interval apart (row R19).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestBudget {
     /// The smallest gap between two calls leaving our address for this vendor, when the vendor
     /// counts one; `None` paces each host alone (owner decision 1, 2026-11-17, §10).
     pub min_interval: Option<Duration>,
-    /// The gap between two host reservations to one remote host, when the vendor states one.
+    /// The gap between two calls to one remote host, when the vendor states one.
     pub per_host: Option<Duration>,
 }
 
@@ -136,6 +136,9 @@ pub enum BudgetError {
     /// A budget with neither a per-IP nor a per-host pace: refused, not sent unpaced.
     #[error("the profile states neither a per-IP nor a per-host pace")]
     NoPace,
+    /// The send gate still owed a wait after this many tries (`SendGate`, row R19).
+    #[error("the send gate still owed {owed:?} after {tries} tries")]
+    NeverCleared { tries: u32, owed: Duration },
 }
 
 /// The directory the pace file sits in, under the store root the run writes to.
@@ -363,6 +366,109 @@ impl Hold {
     }
 }
 
+/// `<store>/pace/<bucket file>.sent`: the `requested_at` of the last call through one bucket. A
+/// slot counts from its reservation, and a call leaves after its attempt row is written: two
+/// consecutive `requested_at` of one 7 s host were 5.93 s apart on production, 2026-11-20/21.
+#[derive(Debug)]
+pub struct SendGate {
+    path: PathBuf,
+    interval: TimeDelta,
+}
+
+/// What [`SendGate::stamp`] answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stamped {
+    /// Written to every gate: the call's `requested_at`.
+    Sent(DateTime<Utc>),
+    /// Nothing written: the last call through some gate was this long too recent.
+    Owed(Duration),
+}
+
+impl SendGate {
+    pub fn beside_the_store(
+        store: &Path,
+        scope: &BudgetScope,
+        interval: Duration,
+    ) -> Result<Self, BudgetError> {
+        let path = store
+            .join(PACE_DIR)
+            .join(format!("{}.sent", scope.file_name()));
+        let interval = TimeDelta::from_std(interval)
+            .map_err(|why| unusable(&path, "read as an interval", &why))?;
+        Ok(Self { path, interval })
+    }
+
+    /// Locks every gate in the order given, then writes `now`, cut to the file's microseconds,
+    /// to all of them, or to none when any one's last call is less than its interval ago.
+    pub fn stamp(gates: &[Self], now: DateTime<Utc>) -> Result<Stamped, BudgetError> {
+        let now = now.trunc_subsecs(STAMP_DIGITS);
+        let mut locked = Vec::with_capacity(gates.len());
+        let mut stamped = Ok(Stamped::Sent(now));
+        for gate in gates {
+            let file = match open_for_update(&gate.path) {
+                Ok(file) => file,
+                Err(why) => {
+                    stamped = Err(why);
+                    break;
+                }
+            };
+            if let Err(why) = file.lock() {
+                stamped = Err(unusable(&gate.path, "locked", &why));
+                break;
+            }
+            locked.push((gate, file));
+        }
+        if stamped.is_ok() {
+            stamped = Self::stamp_locked(&locked, now);
+        }
+        for (gate, file) in &locked {
+            let unlocked = file
+                .unlock()
+                .map_err(|why| unusable(&gate.path, "unlocked", &why));
+            if stamped.is_ok() {
+                unlocked?;
+            }
+        }
+        stamped
+    }
+
+    fn stamp_locked(locked: &[(&Self, File)], now: DateTime<Utc>) -> Result<Stamped, BudgetError> {
+        let mut owed = TimeDelta::zero();
+        for (gate, file) in locked {
+            let mut file: &File = file;
+            let mut held = String::new();
+            file.read_to_string(&mut held)
+                .map_err(|why| unusable(&gate.path, "read", &why))?;
+            if let Some(last) = read_stamp(&gate.path, &held)? {
+                let opens = last.checked_add_signed(gate.interval).ok_or_else(|| {
+                    unusable(
+                        &gate.path,
+                        "advanced",
+                        &"past the last representable instant",
+                    )
+                })?;
+                owed = owed.max(opens - now);
+            }
+        }
+        if owed > TimeDelta::zero() {
+            return Ok(Stamped::Owed(owed.to_std().unwrap_or(Duration::ZERO)));
+        }
+        for (gate, file) in locked {
+            let mut file: &File = file;
+            file.set_len(0)
+                .map_err(|why| unusable(&gate.path, "truncated", &why))?;
+            file.seek(SeekFrom::Start(0))
+                .map_err(|why| unusable(&gate.path, "rewound", &why))?;
+            file.write_all(stamp(now).as_bytes())
+                .map_err(|why| unusable(&gate.path, "written", &why))?;
+        }
+        Ok(Stamped::Sent(now))
+    }
+}
+
+/// The digits of a second [`stamp`] writes, so an instant read back is the instant compared.
+const STAMP_DIGITS: u16 = 6;
+
 /// Opened read-write, created with its directory when absent, never truncated on open.
 fn open_for_update(path: &Path) -> Result<File, BudgetError> {
     if let Some(parent) = path.parent() {
@@ -413,7 +519,7 @@ mod tests {
 
     use chrono::{DateTime, Utc};
 
-    use super::{BudgetError, BudgetScope, Hold, HostKey, Pace};
+    use super::{BudgetError, BudgetScope, Hold, HostKey, Pace, SendGate, Stamped};
     use crate::request::SourceId;
 
     const SHOUTED: &str = "WWW.SEC.GOV";
@@ -477,6 +583,96 @@ mod tests {
             ),
             "{first:?}"
         );
+        Ok(())
+    }
+
+    /// Two clock reads a nanosecond-precise clock gives, a hair over one interval apart.
+    const FIRST_SEND: &str = "2026-11-10T13:00:00.000000500Z";
+    const A_HAIR_PAST_ONE_INTERVAL: &str = "2026-11-10T13:00:01.000000200Z";
+    const GATE_INTERVAL: Duration = Duration::from_secs(1);
+
+    /// The gate compares the instant it reads back, cut to the file's microseconds, so the
+    /// instant it hands out must be that one: an uncut first send leaves 999,999,700 ns here.
+    #[test]
+    fn two_stamps_through_one_gate_are_never_closer_than_its_interval() -> Result<(), String> {
+        let store = tempfile::tempdir().map_err(|why| why.to_string())?;
+        let host = HostKey::new(SEC).map_err(|why| why.to_string())?;
+        let gate =
+            SendGate::beside_the_store(store.path(), &BudgetScope::PerHost(host), GATE_INTERVAL)
+                .map_err(|why| why.to_string())?;
+        let gates = [gate];
+        let mut sent = Vec::new();
+        for read in [FIRST_SEND, A_HAIR_PAST_ONE_INTERVAL] {
+            let now = read
+                .parse::<DateTime<Utc>>()
+                .map_err(|why| why.to_string())?;
+            match SendGate::stamp(&gates, now).map_err(|why| why.to_string())? {
+                Stamped::Sent(at) => sent.push(at),
+                Stamped::Owed(wait) => return Err(format!("owed {wait:?} at {read}")),
+            }
+        }
+        let gap = match sent.as_slice() {
+            [first, second] => (*second - *first).to_std().map_err(|why| why.to_string())?,
+            other => return Err(format!("{other:?}")),
+        };
+        assert_eq!(gap, GATE_INTERVAL);
+        Ok(())
+    }
+
+    const LAST_SEND: &str = "2026-11-10T13:00:00Z";
+    const ONE_MICROSECOND_SHORT: &str = "2026-11-10T13:00:00.999999Z";
+    const ONE_INTERVAL_ON: &str = "2026-11-10T13:00:01Z";
+    const ONE_MICROSECOND: Duration = Duration::from_micros(1);
+
+    /// A tolerance of 1 ms or 10 ms at the comparison passed every other test (2026-11-22).
+    #[test]
+    fn a_stamp_one_microsecond_short_of_the_interval_is_owed_it_and_one_on_it_is_sent(
+    ) -> Result<(), String> {
+        let store = tempfile::tempdir().map_err(|why| why.to_string())?;
+        let host = HostKey::new(SEC).map_err(|why| why.to_string())?;
+        let gates =
+            [
+                SendGate::beside_the_store(
+                    store.path(),
+                    &BudgetScope::PerHost(host),
+                    GATE_INTERVAL,
+                )
+                .map_err(|why| why.to_string())?,
+            ];
+        let at = |read: &str| read.parse::<DateTime<Utc>>().map_err(|why| why.to_string());
+        SendGate::stamp(&gates, at(LAST_SEND)?).map_err(|why| why.to_string())?;
+        let short = SendGate::stamp(&gates, at(ONE_MICROSECOND_SHORT)?);
+        let on_it = SendGate::stamp(&gates, at(ONE_INTERVAL_ON)?);
+        assert_eq!(
+            (short, on_it),
+            (
+                Ok(Stamped::Owed(ONE_MICROSECOND)),
+                Ok(Stamped::Sent(at(ONE_INTERVAL_ON)?))
+            )
+        );
+        Ok(())
+    }
+
+    const A_READ_WITH_NANOSECONDS: &str = "2026-11-10T13:00:00.123456789Z";
+    const THAT_READ_IN_MICROSECONDS: &str = "2026-11-10T13:00:00.123456Z";
+
+    /// `requested_at` is this instant, and the ledger keeps microseconds.
+    #[test]
+    fn a_stamp_keeps_the_microseconds_of_its_clock_read() -> Result<(), String> {
+        let store = tempfile::tempdir().map_err(|why| why.to_string())?;
+        let host = HostKey::new(SEC).map_err(|why| why.to_string())?;
+        let gates =
+            [
+                SendGate::beside_the_store(
+                    store.path(),
+                    &BudgetScope::PerHost(host),
+                    GATE_INTERVAL,
+                )
+                .map_err(|why| why.to_string())?,
+            ];
+        let at = |read: &str| read.parse::<DateTime<Utc>>().map_err(|why| why.to_string());
+        let stamped = SendGate::stamp(&gates, at(A_READ_WITH_NANOSECONDS)?);
+        assert_eq!(stamped, Ok(Stamped::Sent(at(THAT_READ_IN_MICROSECONDS)?)));
         Ok(())
     }
 

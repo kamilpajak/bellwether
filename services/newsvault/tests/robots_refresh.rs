@@ -552,6 +552,8 @@ fn a_robots_redirect_whose_body_is_over_the_limit_keeps_its_status() -> TestResu
 /// The second refresh's clock: an hour after `NOW`, so its `Wire` owes no wait on `NOW`'s grant.
 const AN_HOUR_LATER: &str = "2026-11-15T11:00:00Z";
 const LOOPBACK_HOST_PACE_FILE: &str = "127.0.0.1.per-host";
+/// The host's send gate beside it, which stamps the `requested_at` of its last call.
+const LOOPBACK_HOST_SENT_FILE: &str = "127.0.0.1.per-host.sent";
 const PACE_DIR: &str = "pace";
 
 struct At(&'static str);
@@ -626,13 +628,15 @@ fn a_robots_refresh_and_a_collect_on_one_store_reserve_one_pace_file_per_host() 
     cmd_robots::run(&ask, &feed, &by_collect, &At(AN_HOUR_LATER))?;
     let after_collect_wire = pace_grants(root.path())?;
     server.finish()?;
-    let file = LOOPBACK_HOST_PACE_FILE.to_owned();
+    let both_at = |at| {
+        vec![
+            (LOOPBACK_HOST_PACE_FILE.to_owned(), at),
+            (LOOPBACK_HOST_SENT_FILE.to_owned(), at),
+        ]
+    };
     assert_eq!(
         (after_refresh, after_collect_wire),
-        (
-            vec![(file.clone(), Fixed.now())],
-            vec![(file, At(AN_HOUR_LATER).now())]
-        )
+        (both_at(Fixed.now()), both_at(At(AN_HOUR_LATER).now()))
     );
     Ok(())
 }
