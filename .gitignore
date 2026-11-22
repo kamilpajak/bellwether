@@ -4,5 +4,8 @@ target/
 # `services/newsvault/tests/parity.rs`, so a clone without it has a gate that cannot run; 44 KB
 # over 11 files, rebuilt by `probes/newsvault_parity.py --write-corpus`.
 !probes/newsvault_parity/lake/**/*.parquet
+# And the V1 snapshot fixture: 3 synthetic rows, the input of
+# `snapshot_contract::validate::tests::a_v1_snapshot_written_on_2026_11_22_still_validates`.
+!snapshot-contract/fixtures/snapshot_v1/snapshot.parquet
 .DS_Store
 probes/**/vendor_probe_results.json

@@ -296,3 +296,72 @@ fn batch(rows: &[SnapshotRow]) -> Result<RecordBatch, arrow::error::ArrowError> 
     ];
     RecordBatch::try_new(data_schema(), columns)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use serde_json::Value;
+
+    use crate::SnapshotRow;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn text(value: &Value) -> Option<String> {
+        value.as_str().map(str::to_owned)
+    }
+
+    /// canon's committed `snapshot_row` vectors, reached through the mapping the producer and the
+    /// validator share. Mutations 2026-11-22, one at a time: `valid_tz` dropped, `body_blob`
+    /// dropped, a minute digested as an instant: red each.
+    #[test]
+    fn every_snapshot_row_vector_reproduces_through_the_rows_own_digest() -> TestResult {
+        let vectors = Path::new(env!("CARGO_MANIFEST_DIR")).join("../canon/vectors");
+        let mut precisions = std::collections::BTreeSet::new();
+        let (mut zoned, mut bodied) = (false, false);
+        for entry in std::fs::read_dir(vectors)? {
+            let path = entry?.path();
+            let vector: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            if vector["digest"] != "snapshot_row" {
+                continue;
+            }
+            let input = &vector["input"];
+            let valid = &input["valid"];
+            let row = SnapshotRow {
+                seq: 1,
+                item_id: text(&input["item_id"]).unwrap_or_default(),
+                story_id: text(&input["story_id"]).unwrap_or_default(),
+                doc_id: text(&input["doc_id"]),
+                source: text(&input["source"]).unwrap_or_default(),
+                provenance: text(&input["provenance"]).unwrap_or_default(),
+                valid_at: text(&valid["instant"]),
+                valid_minute: text(&valid["minute"]),
+                valid_day: text(&valid["day"]),
+                valid_tz: text(&input["valid_tz"]),
+                observed_at: text(&input["observed_at"]).unwrap_or_default(),
+                body_blob: text(&input["body_blob"]),
+                body: None,
+            };
+            precisions.extend(
+                valid
+                    .as_object()
+                    .into_iter()
+                    .flat_map(|keys| keys.keys().cloned()),
+            );
+            zoned |= row.valid_tz.is_some();
+            bodied |= row.body_blob.is_some();
+            assert_eq!(
+                Some(row.digest()?.hex()),
+                vector["sha256"].as_str(),
+                "{}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            precisions.into_iter().collect::<Vec<_>>(),
+            ["day", "instant", "minute"]
+        );
+        assert!(zoned && bodied);
+        Ok(())
+    }
+}

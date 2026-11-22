@@ -14,7 +14,7 @@ use parquet::basic::Compression;
 use serde_json::{Map, Value};
 
 use crate::{
-    cutoff_text, data_schema, file_sha256, snapshot_id_of, visible_at, Rule, SnapshotRow,
+    cutoff_text, data_schema, file_sha256, snapshot_id_of, visible_at, RowError, Rule, SnapshotRow,
     DATA_FILE, MANIFEST_FILE, MANIFEST_SCHEMA, PROVENANCES, SCHEMA_KEY, SNAPSHOT_ID_KEY,
 };
 
@@ -23,7 +23,7 @@ const READ_BATCH_ROWS: usize = 1024;
 
 /// Every code [`validate`] can emit, in check order; `snapshot-contract schema` prints it and
 /// `every_finding_code_is_reached_by_a_named_case` reaches each one.
-pub const FINDING_CODES: [&str; 20] = [
+pub const FINDING_CODES: [&str; 21] = [
     "manifest_absent",
     "manifest_unparseable",
     "unknown_schema",
@@ -40,6 +40,7 @@ pub const FINDING_CODES: [&str; 20] = [
     "precision_shape",
     "not_visible",
     "time_unparseable",
+    "row_undigestable",
     "body_digest_mismatch",
     "count_mismatch",
     "provenance_counts",
@@ -485,8 +486,12 @@ fn check_row(row: &SnapshotRow, rule: Rule, stated: Option<&Stated>, pass: &mut 
         Ok(digest) => pass.digests.push(digest.hex().to_owned()),
         Err(why) => {
             pass.digest_failed = true;
+            let code = match why {
+                RowError::Time(_) => "time_unparseable",
+                RowError::Canon(_) => "row_undigestable",
+            };
             if !time_failed {
-                tally(pass, "time_unparseable", seq, || why.to_string());
+                tally(pass, code, seq, || why.to_string());
             }
         }
     }
@@ -812,8 +817,8 @@ mod tests {
     }
 
     /// One case per check: each corrupts one thing in a sound pair and names the codes it must
-    /// raise; a code no case reaches is red too. Mutations 2026-11-22, eleven checks disabled one
-    /// at a time: red each (architecture.md section 8 row S1 lists them).
+    /// raise; a code no case reaches is red too. Mutations 2026-11-22, one check disabled at a
+    /// time: red each (architecture.md section 8 row S1 lists them).
     #[test]
     fn each_check_names_exactly_its_own_defect() -> TestResult {
         let id = id_of(&sound())?;
@@ -963,9 +968,27 @@ mod tests {
                 vec!["time_unparseable"],
             ),
             (
-                "body_digest_mismatch",
+                "precision_shape: a valid_tz beside a minute",
+                with_row(|row| row.valid_tz = Some(NEW_YORK.to_owned()))?,
+                vec!["precision_shape"],
+            ),
+            (
+                "row_undigestable: a separator in item_id",
+                with_row(|row| row.item_id = "item\u{1f}2".to_owned())?,
+                vec!["row_undigestable"],
+            ),
+            (
+                "body_digest_mismatch: a body with no blob",
                 with_row(|row| {
                     row.body = Some("a body with no blob".to_owned());
+                })?,
+                vec!["body_digest_mismatch"],
+            ),
+            (
+                "body_digest_mismatch: a blob naming another text",
+                with_row(|row| {
+                    (row.body_blob, row.body) = body("synthetic text A");
+                    row.body = Some("synthetic text B".to_owned());
                 })?,
                 vec!["body_digest_mismatch"],
             ),
@@ -1019,6 +1042,17 @@ mod tests {
         )?;
         writer.write(&RecordBatch::try_new(schema, vec![column])?)?;
         writer.close()?;
+        Ok(())
+    }
+
+    /// A V1 pair this crate wrote on 2026-11-22 from `sound()`, committed. A change to the
+    /// columns, the metadata keys or the V1 predicate that breaks a file already written is red
+    /// here: it needs a new `snapshot.data/N`. Mutations 2026-11-22, `valid_at` and `valid_minute`
+    /// swapped in `data_schema`, `body` renamed: red each.
+    #[test]
+    fn a_v1_snapshot_written_on_2026_11_22_still_validates() -> TestResult {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/snapshot_v1");
+        assert_eq!(codes(&fixture)?, Vec::<&str>::new());
         Ok(())
     }
 
