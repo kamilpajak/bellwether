@@ -1,5 +1,6 @@
 # The files under deploy/ checked by the tool that will read them: promtool for the alert rules,
-# kubeconform for the Kubernetes manifest, systemd-analyze for the user units. What `cargo test`
+# kubeconform for the Kubernetes manifest, systemd-analyze for the user units, and the monitoring
+# check against a real Prometheus and Alertmanager. What `cargo test`
 # holds them to (the schedule, the timeout, the metric families) is services/newsvault/tests/deploy.rs.
 
 name: deploy
@@ -40,7 +41,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: shellcheck deploy/systemd/newsvault-watchdog deploy/systemd/newsvault-backup deploy/systemd/newsvault-unit-result
+      - run: shellcheck deploy/systemd/newsvault-watchdog deploy/systemd/newsvault-backup deploy/systemd/newsvault-unit-result deploy/monitoring/newsvault-monitoring-check
       # verify resolves %h and checks each Exec program exists, so the scripts and the env file
       # are put where the units name them, as the install does.
       - if: ${{ !cancelled() }}
@@ -50,3 +51,34 @@ jobs:
           install -D -m 0755 deploy/systemd/newsvault-unit-result "$HOME/.local/lib/bellwether/newsvault-unit-result"
           install -D -m 0600 deploy/systemd/newsvault.env "$HOME/.config/bellwether/newsvault.env"
           systemd-analyze --user --man=no verify deploy/systemd/*.service deploy/systemd/*.timer
+
+  monitoring-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PROMETHEUS: prom/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
+      # prom/alertmanager v0.34.2, published 2026-10-29.
+      ALERTMANAGER: prom/alertmanager:v0.34.2@sha256:39d8bb3966c694a124428a3a88fbcffd40bd069129ecd47c059f8a3f17c55f3b
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # A stand-in for the VPS's ~/monitoring built from deploy/monitoring/'s two snippets, and a
+      # second Alertmanager config without the run_date route.
+      - run: |
+          stack="$RUNNER_TEMP/monitoring"
+          mkdir -p "$stack/prometheus" "$stack/alertmanager"
+          cp deploy/prometheus/newsvault.rules.yml "$stack/prometheus/newsvault.rules"
+          { printf 'global:\n  evaluation_interval: 1s\n'; cat deploy/monitoring/prometheus.rule_files.yml; } >"$stack/prometheus/prometheus.yml"
+          receivers='receivers:\n  - name: telegram\n    webhook_configs:\n      - url: http://127.0.0.1:9/\n  - name: blackhole\n'
+          { printf 'route:\n  receiver: telegram\n  routes:\n'; sed 's/^/    /' deploy/monitoring/alertmanager.route.yml; printf "$receivers"; } >"$stack/alertmanager/alertmanager.yml"
+          { printf 'route:\n  receiver: telegram\n'; printf "$receivers"; } >"$stack/alertmanager/unrouted.yml"
+          docker run -d --name prometheus --network host --volume "$stack/prometheus:/etc/prometheus:ro" "$PROMETHEUS"
+          docker run -d --name alertmanager --network host --volume "$stack/alertmanager:/etc/alertmanager:ro" "$ALERTMANAGER"
+          for _ in $(seq 60); do
+            if curl -fsS http://127.0.0.1:9093/-/ready >/dev/null && rules=$(curl -fsS http://127.0.0.1:9090/api/v1/rules); then
+              case $rules in *'"health":"unknown"'*) ;; *'"health":"ok"'*) break ;; esac
+            fi
+            sleep 1
+          done
+      - run: MONITORING_DIR="$RUNNER_TEMP/monitoring" sh deploy/monitoring/newsvault-monitoring-check
+      - if: ${{ !cancelled() }}
+        run: status=0; MONITORING_DIR="$RUNNER_TEMP/monitoring" ALERTMANAGER_CONFIG=/etc/alertmanager/unrouted.yml sh deploy/monitoring/newsvault-monitoring-check || status=$?; test "$status" -eq 1

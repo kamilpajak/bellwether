@@ -1,0 +1,7 @@
+# The child route bellwether adds under route.routes of the VPS's shared alertmanager.yml; no
+# receiver, so it inherits the top route's. The alerts keyed on run_date stay firing while their day
+# is in the watchdog's two-day range, up to 48 h after the event: 49 h sends one message per event.
+# newsvault-monitoring-check reads the matcher and the interval from here.
+- matchers:
+    - alertname=~"Newsvault(DeferredExpired|HostHeld|HoldsCapped|WalkRangeUnreadPersistent|WallTimeOverBound|HostBusyOverBound|RunsMissed|RowsZero)"
+  repeat_interval: 49h

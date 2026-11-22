@@ -1,0 +1,5 @@
+# The entry bellwether adds to rule_files of the VPS's shared prometheus.yml, beside the entries of
+# other projects; deploy/prometheus/newsvault.rules.yml is installed under this name in the same
+# directory. newsvault-monitoring-check reads the name from here.
+rule_files:
+  - newsvault.rules
