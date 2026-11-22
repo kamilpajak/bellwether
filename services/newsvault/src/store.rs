@@ -412,13 +412,13 @@ CREATE TABLE dictionary_activations (
 -- means not recorded: nullable, because a default would be an invented value.
 ALTER TABLE attempts ADD COLUMN provenance TEXT
     CHECK (provenance IN ('live_ingest', 'vendor_archive', 'bulk_dataset'));
--- Code facts: `OpenWebFeed::provenance` and `cmd_robots`' request return `LiveIngest` on every
--- path. `edgar_press` rows stay NULL: its rule reads the run's `--at`, which no table stores.
+-- Code facts: every open-web and robots `Request` is built with a `LiveIngest` literal (section
+-- 3.1). `edgar_press` rows stay NULL: its rule reads the run's `--at`, which no table stores.
 UPDATE attempts SET provenance = 'live_ingest' WHERE source IN ('open_web_wires', 'robots');
--- Set once: a NULL may still be recorded, a recorded label never changes (section 3.2).
+-- Set once, by the opening INSERT: no UPDATE changes the value, a NULL one included (section 3.2).
 CREATE TRIGGER attempts_provenance_set_once
 BEFORE UPDATE OF provenance ON attempts
-WHEN OLD.provenance IS NOT NULL AND NEW.provenance IS NOT OLD.provenance
+WHEN NEW.provenance IS NOT OLD.provenance
 BEGIN
     SELECT RAISE(ABORT, 'attempts.provenance is set once');
 END;
@@ -5751,11 +5751,11 @@ mod tests {
         Ok(())
     }
 
-    /// §3.2's `provenance` row: a recorded label never changes, not even to NULL;
-    /// a NULL one may be recorded once; rewriting the same value is no change.
+    /// §3.2's `provenance` row: a recorded label never changes, not even to NULL, a NULL one
+    /// is never filled in, and rewriting the same value is no change.
     #[test]
-    fn a_recorded_provenance_is_never_changed_and_an_unrecorded_one_is_recorded_once() -> TestResult
-    {
+    fn a_recorded_provenance_is_never_changed_and_an_unrecorded_one_is_never_filled_in(
+    ) -> TestResult {
         let temp = TempDir::new()?;
         let mut store = open(&temp)?;
         let slot = AttemptSlot::open(&mut store, &request(), None, &RunId::new(RUN), 0, at(1))?;
@@ -5779,7 +5779,7 @@ mod tests {
             set(&recorded, None),
             set(&recorded, Some("live_ingest")),
             set("unrecorded", Some("vendor_archive")),
-            set("unrecorded", Some("live_ingest")),
+            set("unrecorded", None),
         ];
         let stored: Vec<Option<String>> = sources_and_provenance(&store.db)?
             .into_iter()
@@ -5788,11 +5788,8 @@ mod tests {
         assert_eq!(
             (answers, stored),
             (
-                [false, false, true, true, false],
-                vec![
-                    Some("live_ingest".to_owned()),
-                    Some("vendor_archive".to_owned())
-                ]
+                [false, false, true, false, true],
+                vec![Some("live_ingest".to_owned()), None]
             )
         );
         Ok(())

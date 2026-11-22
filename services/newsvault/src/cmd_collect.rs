@@ -2315,6 +2315,7 @@ mod tests {
     const SOURCE: &str = "edgar_press";
     const WINDOW: &str = "2025-11-10";
     const ITEM: &str = "0000320193-26-000071";
+    const SECOND_ITEM: &str = "0000320193-26-000072";
     const VALID_RAW: &str = "20251110213215";
     const VALID_FIELD: &str = "ACCEPTANCE-DATETIME";
     const PUBLISHED_AT: i64 = 1_762_810_335;
@@ -2537,33 +2538,66 @@ mod tests {
         })
     }
 
-    /// Commits `item` under a closed live attempt through the driver's door, `Archive::commit`.
-    fn commit_under_a_live_attempt(
+    /// Commits `items` under `closed` into `store` through the driver's door, `Archive::commit`.
+    fn commit_into(
         store: &mut Committer,
-        item: CollectedItem,
+        closed: AttemptReceipt,
+        items: &[CollectedItem],
     ) -> Result<Result<u32, ArchiveError>, Box<dyn std::error::Error>> {
-        let closed = closed_live_attempt(store)?;
         let payload = a_payload(store)?;
         let fetched = ObservationTime::new(instant(FETCHED_AT));
         Ok(
-            Archive::commit(store, closed, &[item], Some(&payload), fetched)
+            Archive::commit(store, closed, items, Some(&payload), fetched)
                 .map(|committed| committed.items_committed),
         )
+    }
+
+    /// Commits `items` under a closed live attempt of the same store.
+    fn commit_under_a_live_attempt(
+        store: &mut Committer,
+        items: &[CollectedItem],
+    ) -> Result<Result<u32, ArchiveError>, Box<dyn std::error::Error>> {
+        let closed = closed_live_attempt(store)?;
+        commit_into(store, closed, items)
+    }
+
+    fn attempt_hex() -> Result<String, Box<dyn std::error::Error>> {
+        let attempt =
+            canon::digest::attempt_id(RUN, SOURCE, WINDOW, 0).map_err(|why| why.to_string())?;
+        Ok(attempt.hex().to_owned())
+    }
+
+    fn refusal_of(
+        item: &str,
+        offered: Provenance,
+        recorded: Option<&str>,
+    ) -> Result<Result<u32, ArchiveError>, Box<dyn std::error::Error>> {
+        Ok(Err(ArchiveError {
+            act: "build an item row",
+            detail: StoreError::ProvenanceDiffersFromAttempt {
+                attempt: attempt_hex()?,
+                item: item.to_owned(),
+                offered: offered.name(),
+                recorded: recorded.map(str::to_owned),
+            }
+            .to_string(),
+        }))
     }
 
     fn refusal(
         offered: Provenance,
         recorded: Option<&str>,
     ) -> Result<Result<u32, ArchiveError>, Box<dyn std::error::Error>> {
-        let attempt =
-            canon::digest::attempt_id(RUN, SOURCE, WINDOW, 0).map_err(|why| why.to_string())?;
+        refusal_of(ITEM, offered, recorded)
+    }
+
+    fn not_opened(
+        act: &'static str,
+    ) -> Result<Result<u32, ArchiveError>, Box<dyn std::error::Error>> {
         Ok(Err(ArchiveError {
-            act: "build an item row",
-            detail: StoreError::ProvenanceDiffersFromAttempt {
-                attempt: attempt.hex().to_owned(),
-                item: ITEM.to_owned(),
-                offered: offered.name(),
-                recorded: recorded.map(str::to_owned),
+            act,
+            detail: StoreError::AttemptNotOpened {
+                attempt: attempt_hex()?,
             }
             .to_string(),
         }))
@@ -2577,13 +2611,13 @@ mod tests {
         let (differing, matching) = (TempDir::new()?, TempDir::new()?);
         let placed = ObservationTime::new(instant(PUBLISHED_AT + 7_200));
         let mut store = Committer::open(differing.path(), &RunId::new(RUN))?;
-        let refused = commit_under_a_live_attempt(&mut store, archived(Some(placed)))?;
+        let refused = commit_under_a_live_attempt(&mut store, &[archived(Some(placed))])?;
         let mut store = Committer::open(matching.path(), &RunId::new(RUN))?;
         let live = CollectedItem {
             provenance: Provenance::LiveIngest,
             ..archived(None)
         };
-        let committed = commit_under_a_live_attempt(&mut store, live)?;
+        let committed = commit_under_a_live_attempt(&mut store, &[live])?;
         assert_eq!(
             (refused, committed),
             (
@@ -2613,8 +2647,64 @@ mod tests {
             provenance: Provenance::LiveIngest,
             ..archived(None)
         };
-        let refused = commit_under_a_live_attempt(&mut store, live)?;
+        let refused = commit_under_a_live_attempt(&mut store, &[live])?;
         assert_eq!(refused, refusal(Provenance::LiveIngest, None)?);
+        Ok(())
+    }
+    /// Each committed item is checked, not only the first: a differing item after a matching
+    /// one is the one the refusal names.
+    #[test]
+    fn a_differing_item_after_a_matching_one_is_the_one_refused(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let mut store = Committer::open(temp.path(), &RunId::new(RUN))?;
+        let matching = CollectedItem {
+            provenance: Provenance::LiveIngest,
+            ..archived(None)
+        };
+        let differing = CollectedItem {
+            source_item_id: SECOND_ITEM.to_owned(),
+            url: "https://example.test/b".to_owned(),
+            canonical_url: "/b".to_owned(),
+            ..archived(Some(ObservationTime::new(instant(PUBLISHED_AT + 7_200))))
+        };
+        let refused = commit_under_a_live_attempt(&mut store, &[matching, differing])?;
+        assert_eq!(
+            refused,
+            refusal_of(SECOND_ITEM, Provenance::VendorArchive, Some("live_ingest"))?
+        );
+        Ok(())
+    }
+
+    /// An attempt this store has no row for is `AttemptNotOpened`, never a "not recorded"
+    /// label: the receipt comes from another store.
+    #[test]
+    fn an_item_under_an_attempt_this_store_never_opened_is_refused_as_not_opened(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (elsewhere, here) = (TempDir::new()?, TempDir::new()?);
+        let closed =
+            closed_live_attempt(&mut Committer::open(elsewhere.path(), &RunId::new(RUN))?)?;
+        let mut store = Committer::open(here.path(), &RunId::new(RUN))?;
+        let live = CollectedItem {
+            provenance: Provenance::LiveIngest,
+            ..archived(None)
+        };
+        let refused = commit_into(&mut store, closed, &[live])?;
+        assert_eq!(refused, not_opened("build an item row")?);
+        Ok(())
+    }
+
+    /// With no item the provenance check reads nothing, so an unknown attempt is refused by
+    /// `record`'s own door, under its own act.
+    #[test]
+    fn an_empty_commit_under_an_attempt_this_store_never_opened_is_records_refusal(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (elsewhere, here) = (TempDir::new()?, TempDir::new()?);
+        let closed =
+            closed_live_attempt(&mut Committer::open(elsewhere.path(), &RunId::new(RUN))?)?;
+        let mut store = Committer::open(here.path(), &RunId::new(RUN))?;
+        let refused = commit_into(&mut store, closed, &[])?;
+        assert_eq!(refused, not_opened("commit")?);
         Ok(())
     }
 }
