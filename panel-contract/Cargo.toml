@@ -12,6 +12,8 @@ publish = false
 # file (the ceiling that follows is architecture.md section 8 row R8's), and a time crate,
 # because `cutoff` is required to be present and is not parsed.
 [dependencies]
+# For `canon::is_digest_hex` alone: `snapshot_id` is checked against the form canon prints.
+canon = { path = "../canon" }
 clap = { version = "4.6.7", features = ["derive"] }
 serde_json = "1.0.154"
 

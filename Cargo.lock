@@ -1235,6 +1235,7 @@ dependencies = [
 name = "panel-contract"
 version = "0.1.0"
 dependencies = [
+ "canon",
  "clap",
  "serde_json",
 ]

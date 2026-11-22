@@ -11,7 +11,10 @@ use serde_json::{Map, Value};
 
 /// The one schema version this validator knows. Any other value is rejected rather than read
 /// optimistically, because field meanings are what change between versions.
-pub const SCHEMA: &str = "panel.manifest/1";
+/// Version 2 since 2026-11-22: `seq_high_water` became required and `snapshot_id` must be canon's
+/// digest text form. Both refuse a manifest version 1 admitted, and no producer of version 1
+/// exists (`derive` has no code), so no written manifest is stranded.
+pub const SCHEMA: &str = "panel.manifest/2";
 
 const ROW: &str = "docs/design/architecture.md section 8 row R8";
 const MEMO: &str = "docs/design/successor_system_design_2026_11_11.md section 1.8";
@@ -28,6 +31,9 @@ const ATTESTATION_CHARS: usize = 40;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shape {
     Text,
+    /// canon's digest text form, 64 lower-case hex characters with no prefix
+    /// (`canon::is_digest_hex`), which `snapshot.manifest/1` writes.
+    Digest,
     /// A non-negative integer. A count arriving as `78460.0` is rejected: a row count that went
     /// through a float has been through arithmetic that can lose it.
     Count,
@@ -42,6 +48,7 @@ impl Shape {
     fn fits(self, value: &Value) -> bool {
         match self {
             Self::Text => value.as_str().is_some_and(|text| !text.trim().is_empty()),
+            Self::Digest => value.as_str().is_some_and(canon::is_digest_hex),
             Self::Count => value.as_u64().is_some(),
             Self::Ratio => value.as_f64().is_some_and(|number| number >= 0.0),
             Self::List => value.is_array(),
@@ -53,6 +60,7 @@ impl Shape {
     fn name(self) -> &'static str {
         match self {
             Self::Text => "a non-empty string",
+            Self::Digest => "64 lower-case hex characters, canon's digest text form",
             Self::Count => "a non-negative integer",
             Self::Ratio => "a non-negative number",
             Self::List => "an array",
@@ -84,7 +92,7 @@ pub struct Field {
     pub why: &'static str,
 }
 
-/// The whole field table of `panel.manifest/1`.
+/// The whole field table of `panel.manifest/2`.
 pub const FIELDS: &[Field] = &[
     Field {
         name: "schema",
@@ -100,9 +108,17 @@ pub const FIELDS: &[Field] = &[
     },
     Field {
         name: "snapshot_id",
-        shape: Shape::Text,
+        shape: Shape::Digest,
         need: Need::Always,
         why: "the input set. A date range is not reproducible, because the archive grows under it",
+    },
+    Field {
+        name: "seq_high_water",
+        shape: Shape::Count,
+        need: Need::Always,
+        why: "the seq bound of the cited snapshot, beside its id and cutoff: a snapshot directory \
+              is kept outside the backup, and `newsvault cut --at <cutoff> --through-seq <this>` \
+              rebuilds a deleted one",
     },
     Field {
         name: "rule_version",
@@ -662,6 +678,9 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures")
     }
 
+    /// A digest-shaped `snapshot_id` for the hand-built manifests below.
+    const SNAPSHOT_HEX: &str = "cb519346bd0f7b617b5e9c7bde68dd42427b976b99aa1e762ddcf208a6b08c74";
+
     fn codes(findings: &[Finding]) -> Vec<&str> {
         findings.iter().map(|f| f.code).collect()
     }
@@ -842,10 +861,30 @@ mod tests {
         let mut manifest = fixture("corrected_panel_78460.json");
         manifest.as_object_mut().unwrap().insert(
             "schema".to_owned(),
-            Value::String("panel.manifest/2".to_owned()),
+            Value::String("panel.manifest/1".to_owned()),
         );
         let findings = validate(&manifest);
         assert_eq!(codes(&findings), vec!["unknown_schema"]);
+    }
+
+    /// The form `snapshot.manifest/1` writes and nothing looser: the `sha256:` prefix every
+    /// fixture carried until 2026-11-22 and an upper-case digest are both refused. Mutation
+    /// 2026-11-22, `Shape::Digest` accepting any non-empty string: red.
+    #[test]
+    fn a_snapshot_id_not_in_canons_digest_form_is_the_wrong_type() {
+        for written in [
+            format!("sha256:{SNAPSHOT_HEX}"),
+            SNAPSHOT_HEX.to_uppercase(),
+            "y".to_owned(),
+        ] {
+            let mut manifest = fixture("corrected_panel_78460.json");
+            manifest
+                .as_object_mut()
+                .unwrap()
+                .insert("snapshot_id".to_owned(), Value::String(written.clone()));
+            let findings = validate(&manifest);
+            assert_eq!(codes(&findings), vec!["wrong_type"], "{written}");
+        }
     }
 
     #[test]
@@ -968,7 +1007,7 @@ mod tests {
     fn a_product_of_two_cardinalities_among_three_is_recognised_and_named() {
         let findings = validate(&serde_json::json!({
             "schema": SCHEMA,
-            "panel_id": "sha256:x", "snapshot_id": "sha256:y",
+            "panel_id": "sha256:x", "snapshot_id": SNAPSHOT_HEX, "seq_high_water": 1,
             "rule_version": "sha256:z", "calendar_version": "sha256:w",
             "cutoff": "2026-08-14T20:00:00Z",
             "rows": 200,
@@ -994,7 +1033,7 @@ mod tests {
     fn a_product_stated_as_one_pre_multiplied_cardinality_is_still_a_product() {
         let findings = validate(&serde_json::json!({
             "schema": SCHEMA,
-            "panel_id": "sha256:x", "snapshot_id": "sha256:y",
+            "panel_id": "sha256:x", "snapshot_id": SNAPSHOT_HEX, "seq_high_water": 1,
             "rule_version": "sha256:z", "calendar_version": "sha256:w",
             "cutoff": "2026-08-14T20:00:00Z",
             "rows": 78584,
@@ -1017,7 +1056,7 @@ mod tests {
     fn attrition_larger_than_the_product_does_not_underflow() {
         let findings = validate(&serde_json::json!({
             "schema": SCHEMA,
-            "panel_id": "sha256:x", "snapshot_id": "sha256:y",
+            "panel_id": "sha256:x", "snapshot_id": SNAPSHOT_HEX, "seq_high_water": 1,
             "rule_version": "sha256:z", "calendar_version": "sha256:w",
             "cutoff": "2026-08-14T20:00:00Z",
             "rows": 5,
