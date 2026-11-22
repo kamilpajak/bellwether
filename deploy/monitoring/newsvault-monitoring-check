@@ -74,6 +74,7 @@ $2
 EOF
 }
 # Each scalar of a JSON text as depth, key, value and the id of its object, tab-separated.
+# shellcheck disable=SC2016 # an awk program: its $0 is awk's
 walk='{ s = s $0 "\n" }
 END {
     n = length(s)
