@@ -142,11 +142,12 @@ fn commit(store: &mut Committer, ordinal: u32, seed: &Seed) -> TestResult {
     Ok(())
 }
 
-fn seeded(root: &Path, seeds: &[Seed]) -> TestResult {
-    let mut store = Committer::open(root, &RunId::new(RUN))?;
+/// Commits `seeds` under `store`, which the caller keeps open: a second `Committer::open` in one
+/// test answered `LeaseHeld` once in a full `cargo test` run (macOS, 2026-11-22), cause unknown.
+fn seeded(store: &mut Committer, root: &Path, seeds: &[Seed]) -> TestResult {
     let base = ordinals(root)?;
     for (ordinal, seed) in (base..).zip(seeds) {
-        commit(&mut store, ordinal, seed)?;
+        commit(store, ordinal, seed)?;
     }
     Ok(())
 }
@@ -163,10 +164,12 @@ fn ordinals(root: &Path) -> TestResult<u32> {
 }
 
 /// Five rows: visible as an instant, a minute and a New York day; a refused one; one observed
-/// after the cutoff.
-fn five(root: &Path) -> TestResult {
+/// after the cutoff. The store stays open for a test that commits more.
+fn five(root: &Path) -> TestResult<Committer> {
+    let mut store = Committer::open(root, &RunId::new(RUN))?;
     let minute = Minute::new(at("2026-07-02T19:00:00Z")?)?;
     seeded(
+        &mut store,
         root,
         &[
             instant(
@@ -198,7 +201,8 @@ fn five(root: &Path) -> TestResult {
                 "observed-after",
             )?,
         ],
-    )
+    )?;
+    Ok(store)
 }
 
 fn ask(root: &Path, out: &Path) -> TestResult<Ask> {
@@ -287,8 +291,9 @@ fn refusal(output: &Output) -> TestResult<(Option<i32>, String, bool, Value)> {
 fn a_cut_holds_exactly_the_rows_items_returns_at_the_same_at_through_its_high_water() -> TestResult
 {
     let root = TempDir::new()?;
-    five(root.path())?;
+    let mut store = five(root.path())?;
     seeded(
+        &mut store,
         root.path(),
         &[instant(
             "2026-07-01T09:00:00Z",
@@ -296,6 +301,7 @@ fn a_cut_holds_exactly_the_rows_items_returns_at_the_same_at_through_its_high_wa
             "above-the-bound",
         )?],
     )?;
+    drop(store);
     let out = TempDir::new()?;
     let report = cut(&Ask {
         through_seq: Some(5),
@@ -343,10 +349,11 @@ fn a_cut_holds_exactly_the_rows_items_returns_at_the_same_at_through_its_high_wa
 fn a_row_committed_after_the_cut_with_an_observation_before_it_is_absent_from_a_rebuild_at_the_recorded_high_water(
 ) -> TestResult {
     let root = TempDir::new()?;
-    five(root.path())?;
+    let mut store = five(root.path())?;
     let out = TempDir::new()?;
     let first = cut(&ask(root.path(), out.path())?)?;
     seeded(
+        &mut store,
         root.path(),
         &[instant(
             "2026-07-04T10:00:00Z",
@@ -354,6 +361,7 @@ fn a_row_committed_after_the_cut_with_an_observation_before_it_is_absent_from_a_
             "late-commit",
         )?],
     )?;
+    drop(store);
     let rebuilt = cut(&Ask {
         through_seq: Some(first.seq_high_water),
         dry_run: true,
@@ -372,7 +380,7 @@ fn a_row_committed_after_the_cut_with_an_observation_before_it_is_absent_from_a_
 #[test]
 fn a_through_seq_above_the_store_or_below_one_is_refused() -> TestResult {
     let root = TempDir::new()?;
-    five(root.path())?;
+    drop(five(root.path())?);
     let out = TempDir::new()?;
     let out_text = out.path().display().to_string();
     let above = binary(
@@ -395,7 +403,7 @@ fn a_through_seq_above_the_store_or_below_one_is_refused() -> TestResult {
 #[test]
 fn a_cutoff_in_the_future_or_below_the_microsecond_is_refused() -> TestResult {
     let root = TempDir::new()?;
-    five(root.path())?;
+    drop(five(root.path())?);
     let out = TempDir::new()?;
     let future = cut(&Ask {
         at: at("2026-07-06T00:00:01Z")?,
@@ -421,7 +429,7 @@ fn a_cutoff_in_the_future_or_below_the_microsecond_is_refused() -> TestResult {
 #[test]
 fn a_selection_holding_an_unrecorded_provenance_exits_four_by_name() -> TestResult {
     let root = TempDir::new()?;
-    five(root.path())?;
+    drop(five(root.path())?);
     Connection::open(root.path().join(COMMIT_LOG))?.execute_batch(
         "DROP TRIGGER attempts_provenance_set_once;
          UPDATE attempts SET provenance = NULL
@@ -462,7 +470,7 @@ fn body_path(root: &Path, seq: i64) -> TestResult<PathBuf> {
 #[test]
 fn a_selected_body_blob_absent_on_disk_exits_four_and_writes_nothing() -> TestResult {
     let root = TempDir::new()?;
-    five(root.path())?;
+    drop(five(root.path())?);
     std::fs::remove_file(body_path(root.path(), 1)?)?;
     let out = TempDir::new()?;
     let answered = binary(
@@ -481,12 +489,12 @@ fn a_selected_body_blob_absent_on_disk_exits_four_and_writes_nothing() -> TestRe
 #[test]
 fn a_body_whose_bytes_differ_from_its_digest_refuses_the_cut() -> TestResult {
     let root = TempDir::new()?;
-    five(root.path())?;
+    drop(five(root.path())?);
     let path = body_path(root.path(), 3)?;
     let mut permissions = std::fs::metadata(&path)?.permissions();
     #[allow(
         clippy::permissions_set_readonly_false,
-        reason = "a test rewriting a blob on purpose"
+        reason = "the test rewrites a stored blob so that it no longer hashes to its digest"
     )]
     permissions.set_readonly(false);
     std::fs::set_permissions(&path, permissions)?;
@@ -503,7 +511,7 @@ fn a_body_whose_bytes_differ_from_its_digest_refuses_the_cut() -> TestResult {
 #[test]
 fn an_empty_selection_exits_four_and_writes_nothing() -> TestResult {
     let root = TempDir::new()?;
-    five(root.path())?;
+    drop(five(root.path())?);
     let out = TempDir::new()?;
     let answered = binary(
         root.path(),
@@ -527,7 +535,7 @@ fn an_empty_selection_exits_four_and_writes_nothing() -> TestResult {
 #[test]
 fn a_second_cut_of_the_same_set_writes_nothing_and_reports_unchanged() -> TestResult {
     let root = TempDir::new()?;
-    five(root.path())?;
+    drop(five(root.path())?);
     let out = TempDir::new()?;
     let first = cut(&ask(root.path(), out.path())?)?;
     let before = std::fs::read(the_path(&first)?.join(DATA_FILE))?;
@@ -553,7 +561,7 @@ fn a_second_cut_of_the_same_set_writes_nothing_and_reports_unchanged() -> TestRe
 #[test]
 fn a_standing_directory_that_does_not_validate_is_refused_and_left_as_found() -> TestResult {
     let root = TempDir::new()?;
-    five(root.path())?;
+    drop(five(root.path())?);
     let out = TempDir::new()?;
     let first = cut(&ask(root.path(), out.path())?)?;
     let manifest = the_path(&first)?.join(MANIFEST_FILE);
@@ -570,7 +578,7 @@ fn a_standing_directory_that_does_not_validate_is_refused_and_left_as_found() ->
 #[test]
 fn a_staging_directory_left_by_an_earlier_cut_is_refused_and_never_removed() -> TestResult {
     let root = TempDir::new()?;
-    five(root.path())?;
+    drop(five(root.path())?);
     let out = TempDir::new()?;
     let id = cut(&Ask {
         dry_run: true,
@@ -626,7 +634,7 @@ impl Durability for Journal {
 #[test]
 fn the_staged_cut_is_validated_before_its_rename() -> TestResult {
     let root = TempDir::new()?;
-    five(root.path())?;
+    drop(five(root.path())?);
     let out = TempDir::new()?;
     let journal = Journal {
         corrupt: true,
@@ -652,7 +660,7 @@ fn the_staged_cut_is_validated_before_its_rename() -> TestResult {
 #[test]
 fn a_cut_renames_only_after_both_files_and_the_directory_are_synced() -> TestResult {
     let root = TempDir::new()?;
-    five(root.path())?;
+    drop(five(root.path())?);
     let out = TempDir::new()?;
     let journal = Journal::default();
     let report = cmd_cut::run(&ask(root.path(), out.path())?, &journal)?;
@@ -669,7 +677,7 @@ fn a_cut_renames_only_after_both_files_and_the_directory_are_synced() -> TestRes
 #[test]
 fn a_stored_time_nobody_can_parse_stops_items_and_cut_by_its_seq() -> TestResult {
     let root = TempDir::new()?;
-    five(root.path())?;
+    drop(five(root.path())?);
     Connection::open(root.path().join(COMMIT_LOG))?.execute(
         "UPDATE items SET observed_at = 'the next morning' WHERE seq = 2",
         [],
@@ -706,7 +714,7 @@ fn a_stored_time_nobody_can_parse_stops_items_and_cut_by_its_seq() -> TestResult
 #[test]
 fn a_written_cut_reports_its_envelope_on_stdout_and_validates() -> TestResult {
     let root = TempDir::new()?;
-    five(root.path())?;
+    drop(five(root.path())?);
     let out = TempDir::new()?;
     let answered = binary(
         root.path(),
