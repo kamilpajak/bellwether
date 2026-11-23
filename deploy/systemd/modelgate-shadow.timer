@@ -1,0 +1,14 @@
+# Every 30 minutes, one minute after a 30-minute slot's collect has stopped (slot + 14:30 and its
+# 30 s patience) and 4 minutes before 01:20's roster, the nearest other start;
+# services/newsvault/tests/deploy.rs derives both. No Persistent=: the next firing is 30 min away.
+[Unit]
+Description=modelgate shadow run, every 30 minutes (UTC)
+Documentation=https://github.com/kamilpajak/bellwether/blob/main/docs/design/architecture.md
+
+[Timer]
+OnCalendar=*-*-* *:16,46:00 UTC
+AccuracySec=1s
+Unit=modelgate-shadow.service
+
+[Install]
+WantedBy=timers.target

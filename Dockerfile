@@ -1,4 +1,5 @@
-# newsvault as an OCI image (S7-D10, option C): docs/design/architecture.md section 11.5 step 7.
+# newsvault and modelgate as one OCI image (S7-D10, option C): docs/design/architecture.md section
+# 11.5 step 7; modelgate is run with `--entrypoint /usr/bin/tini` (deploy/systemd/modelgate-shadow).
 # Both stages are Ubuntu 24.04, whose system SQLite (3.45) is the one CI's runner links: no
 # `bundled` SQLite before step 8. The tag is dated and the digest pins it.
 ARG UBUNTU=ubuntu:noble-20261024.1@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
@@ -28,17 +29,18 @@ WORKDIR /src
 COPY rust-toolchain.toml .
 RUN rustup toolchain install
 COPY . .
-RUN cargo build --locked --release -p newsvault
+RUN cargo build --locked --release -p newsvault -p modelgate
 
 FROM ${UBUNTU}
 RUN apt-get update \
  && apt-get install -y --no-install-recommends libsqlite3-0 tini \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin newsvault
-COPY --from=build /src/target/release/newsvault /usr/local/bin/newsvault
+COPY --from=build /src/target/release/newsvault /src/target/release/modelgate /usr/local/bin/
 COPY providers/open-web-feed/hosts/open_web_wires.hosts.json \
      providers/open-web-feed/rules/open-web-feed.rules.json \
      /usr/share/bellwether/
+COPY services/modelgate/questions/ripple-shadow-0.json /usr/share/bellwether/questions/
 ENV BELLWETHER_VAULT=/vault
 USER 10001
 # tini as PID 1, so a SIGTERM from `docker stop` or the kubelet reaches newsvault.

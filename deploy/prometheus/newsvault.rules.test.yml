@@ -426,3 +426,83 @@ tests:
             exp_annotations:
               summary: no newsvault roster fetch has ended for over a day, or none ever.
 
+  # The shadow: a success stamp at 1 h, then exit 8 with a cap reached from 2 h on. Stale once more
+  # than 5,190 s have passed since the stamp (3,600 s + 5,190 s = 2h26m30s).
+  - interval: 1m
+    input_series:
+      - series: 'modelgate_shadow_last_success_timestamp_seconds'
+        values: '3600x240'
+      - series: 'newsvault_unit_result_success{unit="shadow"}'
+        values: '1x119 0x120'
+      - series: 'modelgate_shadow_cost_cap_reached'
+        values: '0x119 1x120'
+      - series: 'modelgate_shadow_spent_micro_usd{scope="total"}'
+        values: '11999999x119 12000000x120'
+      - series: 'modelgate_shadow_spent_micro_usd{scope="day"}'
+        values: '14000000x240'
+      - series: 'modelgate_shadow_cap_micro_usd{scope="total"}'
+        values: '15000000x240'
+      - series: 'modelgate_shadow_cap_micro_usd{scope="day"}'
+        values: '1000000x240'
+    alert_rule_test:
+      - eval_time: 1h59m
+        alertname: ModelgateShadowFailed
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: ModelgateShadowFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              unit: shadow
+            exp_annotations:
+              summary: the last modelgate shadow run failed; its envelope in the journal names why.
+      - eval_time: 2h
+        alertname: NewsvaultCollectFailed
+        exp_alerts: []
+      - eval_time: 1h59m
+        alertname: ModelgateShadowCostCapReached
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: ModelgateShadowCostCapReached
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: a cost cap refused a call in the last modelgate shadow run; nothing is labelled until the cap's scope ends or the timer is stopped.
+      - eval_time: 1h59m
+        alertname: ModelgateShadowSpendNearTotalCap
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: ModelgateShadowSpendNearTotalCap
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: the modelgate store has spent 12 USD, at least 80% of its total cap.
+      - eval_time: 2h26m
+        alertname: ModelgateShadowStale
+        exp_alerts: []
+      - eval_time: 2h27m
+        alertname: ModelgateShadowStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: no modelgate shadow run has ended at exit 0 for over 86 min, or none ever.
+
+  # No shadow run ever is stale, not silent.
+  - interval: 1h
+    input_series:
+      - series: 'up{job="node"}'
+        values: '1'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: ModelgateShadowStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: no modelgate shadow run has ended at exit 0 for over 86 min, or none ever.
+      - eval_time: 0m
+        alertname: ModelgateShadowFailed
+        exp_alerts: []

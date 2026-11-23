@@ -1,5 +1,6 @@
 # Readers of the textfiles deploy/systemd/ writes: the hourly watchdog's newsvault.prom/1, the units'
-# results and the backup's last copy. A per-day count is aggregated without days_ago, so one day's
+# results, the backup's last copy and the shadow run's spend (the Modelgate* alerts; one group, as
+# newsvault-monitoring-check reads one). A per-day count is aggregated without days_ago, so one day's
 # alert keeps its labels (run_date) across UTC midnight. Thresholds: architecture.md S7-D8 and N1.
 groups:
   - name: newsvault
@@ -147,3 +148,40 @@ groups:
           severity: critical
         annotations:
           summary: no newsvault roster fetch has ended for over a day, or none ever.
+
+      # The shadow unit's last ExecStopPost: a failed unit is the script's exit 8 (the envelope
+      # names why), 2, 4, docker's 125 or a timeout; exit 7 succeeds (architecture.md section 3.5).
+      - alert: ModelgateShadowFailed
+        expr: max by (unit) (newsvault_unit_result_success{unit="shadow"} == 0)
+        labels:
+          severity: critical
+        annotations:
+          summary: the last modelgate shadow run failed; its envelope in the journal names why.
+
+      # Two 1,800 s intervals plus one run's bound (TimeoutStartSec 1,500 s + 90 s stop timeout): the
+      # stamp is written when a run ends at exit 0, so only a third firing without one is stale.
+      - alert: ModelgateShadowStale
+        expr: |
+          (time() - max(modelgate_shadow_last_success_timestamp_seconds)) > 5190
+          or absent(modelgate_shadow_last_success_timestamp_seconds)
+        labels:
+          severity: critical
+        annotations:
+          summary: no modelgate shadow run has ended at exit 0 for over 86 min, or none ever.
+
+      - alert: ModelgateShadowCostCapReached
+        expr: max(modelgate_shadow_cost_cap_reached) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: a cost cap refused a call in the last modelgate shadow run; nothing is labelled until the cap's scope ends or the timer is stopped.
+
+      # 80% of the total cap, chosen 2026-11-23 before any spend: at 15 USD it leaves 3 USD.
+      - alert: ModelgateShadowSpendNearTotalCap
+        expr: |
+          max(modelgate_shadow_spent_micro_usd{scope="total"}) / 1e6
+          >= 0.8 * max(modelgate_shadow_cap_micro_usd{scope="total"}) / 1e6
+        labels:
+          severity: warning
+        annotations:
+          summary: the modelgate store has spent {{ $value }} USD, at least 80% of its total cap.
