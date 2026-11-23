@@ -100,12 +100,14 @@ do not prove: `probes/newsvault_parity/PREREGISTRATION.md`.
 
 ## Running a collection
 
-Two commands fetch from a vendor and write what came back to the store:
+Three commands fetch from a vendor and write what came back to the store:
 
 - `collect`: items, attempt rows, blobs and a run envelope. Every input it reads is a file whose
   digest the run envelope names, so a second reader can reproduce what the run filtered by.
 - `robots refresh`: attempt rows, `robots` rows, blobs, a run envelope and pace files; never the
   hosts file.
+- `roster fetch`: SEC's daily company file as received, after SEC's robots.txt, under attempt rows
+  of its own; no item rows. `roster show --at` names the copy current at an instant.
 - An open-web `collect`, dry run included, is refused `robots_unverified` (exit 4) until a
   `robots refresh` without `--dry-run` has ledgered a fetch of each admitted host matching its pin.
 
@@ -127,6 +129,8 @@ cargo run -p newsvault -- robots refresh --source open_web_wires \
 cargo run -p newsvault -- collect --source open_web_wires --window today \
   --hosts providers/open-web-feed/hosts/open_web_wires.hosts.json \
   --rules providers/open-web-feed/rules/open-web-feed.rules.json --dry-run --format json
+cargo run -p newsvault -- roster fetch --dry-run --format json
+cargo run -p newsvault -- roster show --at 2026-11-23T02:00:00Z --format json
 ```
 
 `robots refresh` fetches each hosts-file row's robots.txt under the ledger and compares it with the

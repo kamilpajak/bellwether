@@ -128,3 +128,22 @@ groups:
           severity: warning
         annotations:
           summary: the last newsvault backup run failed; at exit 8 the copy is up and old copies were not deleted, otherwise no copy was made.
+
+      # The roster unit's last ExecStopPost: a failed fetch, exit 8 included, is a roster day lost.
+      - alert: NewsvaultRosterFailed
+        expr: max by (unit) (newsvault_unit_result_success{unit="roster"} == 0)
+        labels:
+          severity: critical
+        annotations:
+          summary: newsvault's last roster fetch failed; that day's roster is not kept.
+
+      # One daily interval plus one run's bound (86,400 s + TimeoutStartSec 180 s + 90 s stop
+      # timeout): the stamp is written when a run ends, so a run that ends late stays quiet.
+      - alert: NewsvaultRosterMissed
+        expr: |
+          (time() - max(newsvault_unit_result_timestamp_seconds{unit="roster"})) > 86670
+          or absent(newsvault_unit_result_timestamp_seconds{unit="roster"})
+        labels:
+          severity: critical
+        annotations:
+          summary: no newsvault roster fetch has ended for over a day, or none ever.

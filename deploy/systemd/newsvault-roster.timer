@@ -1,0 +1,14 @@
+# Daily at 01:20 UTC: inside the 01:18-02:00 gap the collect slots leave (services/newsvault/tests/
+# deploy.rs derives it), hours after SEC's observed 21:54 GMT rebuild of the file. No Persistent=: a
+# run late at boot could hold the lock over a slot; NewsvaultRosterMissed names a missed day.
+[Unit]
+Description=newsvault roster fetch, daily (UTC)
+Documentation=https://github.com/kamilpajak/bellwether/blob/main/docs/design/architecture.md
+
+[Timer]
+OnCalendar=*-*-* 01:20:00 UTC
+AccuracySec=1s
+Unit=newsvault-roster.service
+
+[Install]
+WantedBy=timers.target

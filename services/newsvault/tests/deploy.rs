@@ -78,11 +78,12 @@ const IMAGE_IDENTITY: &str =
     "docker inspect --format '{{.Config.User}} {{json .Config.Entrypoint}}'";
 const IMAGE_IDENTITY_EXPECTED: &str =
     "| grep -Fx '10001 [\"/usr/bin/tini\",\"--\",\"/usr/local/bin/newsvault\"]'";
-const SERVICES: [&str; 4] = [
+const SERVICES: [&str; 5] = [
     "newsvault-collect.service",
     "newsvault-robots-refresh.service",
     "newsvault-watchdog.service",
     "newsvault-backup.service",
+    "newsvault-roster.service",
 ];
 const ENV_FILE: &str = "%h/.config/bellwether/newsvault.env";
 /// systemd's `DefaultTimeoutStopSec`: the stop a start past its timeout is given before SIGKILL.
@@ -113,10 +114,9 @@ const BACKUP_FAMILIES: [&str; 2] = [
     "newsvault_backup_last_success_bytes",
 ];
 /// Written for a person reading the textfile or a dashboard; no alert reads them.
-const UNREAD_FAMILIES: [&str; 2] = [
-    "newsvault_unit_result_timestamp_seconds",
-    "newsvault_backup_last_success_bytes",
-];
+const UNREAD_FAMILIES: [&str; 1] = ["newsvault_backup_last_success_bytes"];
+/// The roster fetch's requests: one robots.txt and one file (`cmd_roster::FILES`).
+const ROSTER_REQUESTS: i32 = 2;
 const DAY_S: i64 = 86_400;
 const SCRIPTS: &str = "%h/.local/lib/bellwether";
 
@@ -412,27 +412,32 @@ fn container_shape(unit: &str) -> (Vec<String>, Option<String>) {
     (shape, name)
 }
 
-/// S7-D10's scheduler lock: a refresh and a collect take one lock and run one container shape, so
-/// neither writes the store while the other does.
+/// S7-D10's scheduler lock: a refresh, a roster fetch and a collect take one lock and run one
+/// container shape, so none writes the store while another does.
 #[test]
 fn the_collect_and_refresh_units_share_one_lock_and_one_container_shape() -> TestResult {
     let (collect, collect_name) =
         container_shape(&read("deploy/systemd/newsvault-collect.service")?);
     let (refresh, refresh_name) =
         container_shape(&read("deploy/systemd/newsvault-robots-refresh.service")?);
+    let (roster, roster_name) = container_shape(&read("deploy/systemd/newsvault-roster.service")?);
     let shape = collect.join(" ");
     assert_eq!(
         (
             collect == refresh,
+            collect == roster,
             collect_name,
             refresh_name,
+            roster_name,
             shape.starts_with(STORE_LOCK),
             shape.contains(CONTACT_MOUNT),
         ),
         (
             true,
+            true,
             Some("newsvault-collect".to_owned()),
             Some("newsvault-robots-refresh".to_owned()),
+            Some("newsvault-roster".to_owned()),
             true,
             true
         )
@@ -475,6 +480,7 @@ fn no_unit_or_script_mounts_a_host_path_with_volume() -> TestResult {
     for file in [
         "deploy/systemd/newsvault-collect.service",
         "deploy/systemd/newsvault-robots-refresh.service",
+        "deploy/systemd/newsvault-roster.service",
         "deploy/systemd/newsvault-watchdog",
         "deploy/systemd/newsvault-backup",
     ] {
@@ -693,6 +699,7 @@ fn each_timer_starts_its_own_service() -> TestResult {
         "newsvault-collect.timer",
         "newsvault-watchdog.timer",
         "newsvault-backup.timer",
+        "newsvault-roster.timer",
     ] {
         let unit = read(&format!("deploy/systemd/{timer}"))?;
         started.push((timer, unit_values(&unit, "Unit")));
@@ -711,6 +718,10 @@ fn each_timer_starts_its_own_service() -> TestResult {
             (
                 "newsvault-backup.timer",
                 vec!["newsvault-backup.service".to_owned()]
+            ),
+            (
+                "newsvault-roster.timer",
+                vec!["newsvault-roster.service".to_owned()]
             ),
         ]
     );
@@ -745,8 +756,8 @@ fn result_line(label: &str) -> String {
     format!("-{SCRIPTS}/newsvault-unit-result {label}")
 }
 
-/// A timed-out run's container is removed by the name it runs under, a collect's result is
-/// written first, and a collect starts only on an NTP-synchronised clock.
+/// A timed-out run's container is removed by the name it runs under, a collect's and a roster
+/// fetch's result is written first, and each starts only on an NTP-synchronised clock.
 #[test]
 fn a_timed_out_container_is_removed_by_its_own_name_and_a_collect_needs_a_synced_clock(
 ) -> TestResult {
@@ -755,6 +766,7 @@ fn a_timed_out_container_is_removed_by_its_own_name_and_a_collect_needs_a_synced
     for (service, result) in [
         ("newsvault-collect.service", Some("collect")),
         ("newsvault-robots-refresh.service", None),
+        ("newsvault-roster.service", Some("roster")),
     ] {
         let unit = read(&format!("deploy/systemd/{service}"))?;
         let name = container_shape(&unit).1.unwrap_or_default();
@@ -769,9 +781,18 @@ fn a_timed_out_container_is_removed_by_its_own_name_and_a_collect_needs_a_synced
         ));
     }
     let collect = read("deploy/systemd/newsvault-collect.service")?;
+    let roster = read("deploy/systemd/newsvault-roster.service")?;
     assert_eq!(
-        (removals, unit_values(&collect, "ExecStartPre")),
-        (expected, vec![NTP_CHECK.to_owned()])
+        (
+            removals,
+            unit_values(&collect, "ExecStartPre"),
+            unit_values(&roster, "ExecStartPre")
+        ),
+        (
+            expected,
+            vec![NTP_CHECK.to_owned()],
+            vec![NTP_CHECK.to_owned()]
+        )
     );
     Ok(())
 }
@@ -2216,5 +2237,96 @@ fn the_templates_textfile_placeholder_is_refused_by_every_script_before_it_runs(
         .map(|(script, _)| (*script, Some(2), true, false, Vec::<String>::new()))
         .collect();
     assert_eq!((placeholder.starts_with('/'), seen), (false, expected));
+    Ok(())
+}
+
+/// The roster fetch's bound: SEC's patience for each of its requests plus the margin, derived,
+/// never fitted. Exit 8 fails it: a partial roster day is lost and `NewsvaultRosterFailed` says so.
+/// Its whole argument list is read: a `--dry-run` there exits 0 daily and keeps no copy.
+#[test]
+fn the_roster_bound_is_each_requests_patience_plus_two_minutes_and_exit_8_fails() -> TestResult {
+    let unit = read("deploy/systemd/newsvault-roster.service")?;
+    let patience = TimeDelta::from_std(edgar_press::sec_transport().timeouts.global)?;
+    let args = container_args(&unit);
+    assert_eq!(
+        (
+            integers(&unit_values(&unit, "TimeoutStartSec")),
+            unit_values(&unit, "SuccessExitStatus").len(),
+            unit_values(&unit, "Restart").len(),
+            usize::try_from(ROSTER_REQUESTS)? == newsvault::cmd_roster::FILES.len() + 1,
+            args,
+        ),
+        (
+            vec![(patience * ROSTER_REQUESTS + TIMEOUT_MARGIN).num_seconds()],
+            0,
+            0,
+            true,
+            ["roster", "fetch", "--non-interactive", "--format", "json"]
+                .map(str::to_owned)
+                .to_vec(),
+        )
+    );
+    Ok(())
+}
+
+/// The roster runs once a day inside a gap the collect slots leave, as the backup does, never in
+/// the backup's own window, never run late.
+#[test]
+fn the_roster_runs_once_a_day_inside_a_gap_the_collect_runs_and_the_backup_leave() -> TestResult {
+    let timer = read("deploy/systemd/newsvault-roster.timer")?;
+    let bound = integers(&unit_values(
+        &read("deploy/systemd/newsvault-roster.service")?,
+        "TimeoutStartSec",
+    ));
+    let backup_at = daily_times(&read("deploy/systemd/newsvault-backup.timer")?);
+    let backup_bound = integers(&unit_values(
+        &read("deploy/systemd/newsvault-backup.service")?,
+        "TimeoutStartSec",
+    ));
+    let gaps = gaps(derived_timeout()? + DEFAULT_TIMEOUT_STOP_S);
+    let mut fitting = Vec::new();
+    for (at, bound) in daily_times(&timer).iter().flatten().zip(&bound) {
+        let end = at + bound + DEFAULT_TIMEOUT_STOP_S;
+        let in_gap = gaps.iter().any(|(from, next)| *from <= *at && end <= *next);
+        let meets_backup = backup_at
+            .iter()
+            .flatten()
+            .zip(&backup_bound)
+            .any(|(start, run)| *at < start + run + DEFAULT_TIMEOUT_STOP_S && *start < end);
+        fitting.push((in_gap, meets_backup));
+    }
+    assert_eq!(
+        (
+            fitting,
+            unit_values(&timer, "AccuracySec"),
+            unit_values(&timer, "RandomizedDelaySec").len(),
+            unit_values(&timer, "Persistent").len(),
+        ),
+        (vec![(true, false)], vec!["1s".to_owned()], 0, 0)
+    );
+    Ok(())
+}
+
+/// One daily interval plus one run's bound: the stamp is written when a run ends, so the longest
+/// quiet stretch between two runs that both ran is a day plus one run's bound.
+#[test]
+fn the_roster_missed_threshold_is_one_daily_interval_plus_one_runs_bound() -> TestResult {
+    let rules = read("deploy/prometheus/newsvault.rules.yml")?;
+    let bound = integers(&unit_values(
+        &read("deploy/systemd/newsvault-roster.service")?,
+        "TimeoutStartSec",
+    ));
+    assert_eq!(
+        (
+            threshold(&rules, "NewsvaultRosterMissed"),
+            daily_times(&read("deploy/systemd/newsvault-roster.timer")?).len(),
+        ),
+        (
+            bound
+                .first()
+                .map(|bound| DAY_S + bound + DEFAULT_TIMEOUT_STOP_S),
+            1
+        )
+    );
     Ok(())
 }

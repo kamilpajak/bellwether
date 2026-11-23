@@ -10,9 +10,10 @@ use std::time::Duration;
 use canon::FileDigest;
 use chrono::{DateTime, Utc};
 use news_provider::{
-    AttemptSlot, Baseline, BudgetError, Clock, Counts, Credentials, Exchange, Exit, LedgerError,
-    Outcome, OutcomeKind, Payload, Provenance, Provider, RawResponse, Request, RequestPhase, RunId,
-    SendFailure, SourceId, Tally, TargetWindow, TransportError, TransportKind, Verdict, Wire,
+    AttemptId, AttemptSlot, Baseline, BudgetError, Clock, Counts, Credentials, Exchange, Exit,
+    LedgerError, Outcome, OutcomeKind, Payload, Provenance, Provider, RawResponse, Request,
+    RequestPhase, RunId, SendFailure, SourceId, Tally, TargetWindow, TransportError, TransportKind,
+    Verdict, Wire,
 };
 use open_web_feed::{HostPin, OpenWebFeed};
 use pit::ObservationTime;
@@ -206,13 +207,15 @@ pub fn wire_for(ask: &Ask, feed: &OpenWebFeed) -> Wire {
 }
 
 /// What one row's fetch left: `None` fields on a dry run, which asks nothing.
-struct Fetched {
-    attempt_id: Option<String>,
-    transport_status: Option<u16>,
-    verdict: Option<Verdict>,
-    outcome: Option<OutcomeKind>,
-    robots: Option<RobotsAnswer>,
-    parse_verdict: Option<&'static str>,
+pub(crate) struct Fetched {
+    pub(crate) attempt_id: Option<String>,
+    pub(crate) transport_status: Option<u16>,
+    pub(crate) verdict: Option<Verdict>,
+    pub(crate) outcome: Option<OutcomeKind>,
+    pub(crate) robots: Option<RobotsAnswer>,
+    pub(crate) parse_verdict: Option<&'static str>,
+    /// The answered body of a `present` row, which `roster fetch` reads its rules from.
+    pub(crate) body: Option<Vec<u8>>,
 }
 
 /// Asks each row's robots.txt once, in hosts-file order. No retry and no startup sweep.
@@ -238,6 +241,7 @@ pub fn run(
                 outcome: None,
                 robots: None,
                 parse_verdict: None,
+                body: None,
             })
             .collect::<Vec<Fetched>>();
         return Ok(answer_of(ask, feed, &run_id, started, &rows, &planned));
@@ -262,11 +266,11 @@ pub fn run(
     let mut fetched = Vec::with_capacity(rows.len());
     let interval = feed.transport().budget.per_host;
     for (ordinal, row) in (0_u32..).zip(&rows) {
-        let request = request_for(row, feed.hosts_version());
+        let request = request_for(&row.host, Some(feed.hosts_version()));
         let asked = Asked {
             run: &run,
             ordinal,
-            row,
+            host: &row.host,
             request: &request,
             interval,
         };
@@ -282,38 +286,87 @@ pub fn run(
     Ok(answer_of(ask, feed, &run_id, started, &rows, &fetched))
 }
 
-fn request_for(row: &HostPin, hosts_version: &FileDigest) -> Request {
+/// A robots fetch of `host`; `hosts_version` is `None` for a caller that reads no hosts file.
+pub(crate) fn request_for(host: &str, hosts_version: Option<&FileDigest>) -> Request {
     Request {
         source: SourceId::new(ROBOTS_SOURCE),
-        target_window: TargetWindow::new(&row.host),
+        target_window: TargetWindow::new(host),
         phase: RequestPhase::Index,
         provenance: Provenance::LiveIngest,
-        url: url_of(row),
+        url: url_of(host),
         headers: Vec::new(),
         params: Vec::new(),
         universe_version: FileDigest::of(&[]),
         listed_date: None,
         names_ticker: false,
-        hosts_version: Some(hosts_version.clone()),
+        hosts_version: hosts_version.cloned(),
         extract_version: None,
     }
 }
 
-fn url_of(row: &HostPin) -> String {
-    format!("https://{}{ROBOTS_PATH}", row.host)
+fn url_of(host: &str) -> String {
+    format!("https://{host}{ROBOTS_PATH}")
 }
 
-/// One row's fetch as `run` asks it; `interval` is the per-host pace the parse verdict compares a
+/// The attempt a run opened and has not closed, for [`or_abandon`].
+pub(crate) struct Opened<'a> {
+    pub(crate) attempt_id: &'a str,
+    pub(crate) run: &'a RunId,
+    pub(crate) clock: &'a dyn Clock,
+}
+
+/// A send's answer, or the error that sent nothing: a transport error is an answer to record.
+pub(crate) fn sent(
+    send: Result<RawResponse, SendFailure>,
+) -> Result<Result<RawResponse, TransportError>, RobotsError> {
+    match send {
+        Ok(response) => Ok(Ok(response)),
+        Err(SendFailure::Transport(failed)) => Ok(Err(failed)),
+        Err(SendFailure::CredentialMissing(name)) => Err(RobotsError::Credential(name)),
+        Err(SendFailure::Budget(why)) => Err(RobotsError::Budget(why)),
+    }
+}
+
+/// An error between an attempt's open and its close closes it as abandoned first: left open, the
+/// next collect's startup sweep closes it and counts it as that collect's interruption (exit 8).
+pub(crate) fn or_abandon<T, E, R>(
+    result: Result<T, E>,
+    store: &mut Committer,
+    opened: &Opened<'_>,
+) -> Result<T, R>
+where
+    R: From<E> + From<RobotsError>,
+{
+    match result {
+        Ok(value) => Ok(value),
+        Err(why) => {
+            let at = ObservationTime::new(opened.clock.now());
+            let closed = news_provider::abandon(
+                store,
+                AttemptId::recorded(opened.attempt_id),
+                at,
+                opened.run,
+            )
+            .map_err(RobotsError::from)?;
+            store
+                .record(closed, None, &[], at)
+                .map_err(RobotsError::from)?;
+            Err(R::from(why))
+        }
+    }
+}
+
+/// One host's fetch as a run asks it; `interval` is the per-host pace the parse verdict compares a
 /// Crawl-delay with.
-struct Asked<'a> {
-    run: &'a RunId,
-    ordinal: u32,
-    row: &'a HostPin,
-    request: &'a Request,
-    interval: Option<Duration>,
+pub(crate) struct Asked<'a> {
+    pub(crate) run: &'a RunId,
+    pub(crate) ordinal: u32,
+    pub(crate) host: &'a str,
+    pub(crate) request: &'a Request,
+    pub(crate) interval: Option<Duration>,
 }
 
-fn fetch(
+pub(crate) fn fetch(
     store: &mut Committer,
     exchange: &dyn Exchange,
     clock: &dyn Clock,
@@ -322,28 +375,36 @@ fn fetch(
     let Asked {
         run,
         ordinal,
-        row,
+        host,
         request,
         interval,
     } = *asked;
     let opened_at = ObservationTime::new(clock.now());
     let mut slot = AttemptSlot::open(store, request, None, run, ordinal, opened_at)?;
     let attempt_id = slot.attempt_id().hex().to_owned();
-    let permit = slot.take_permit()?;
-    let answer = match exchange.send(permit, request, clock) {
-        Ok(response) => Ok(response),
-        Err(SendFailure::Transport(failed)) => Err(failed),
-        Err(SendFailure::CredentialMissing(name)) => return Err(RobotsError::Credential(name)),
-        Err(SendFailure::Budget(why)) => return Err(RobotsError::Budget(why)),
+    let opened = Opened {
+        attempt_id: &attempt_id,
+        run,
+        clock,
     };
+    let permit = or_abandon::<_, _, RobotsError>(slot.take_permit(), store, &opened)?;
+    let answer = or_abandon::<_, _, RobotsError>(
+        sent(exchange.send(permit, request, clock)),
+        store,
+        &opened,
+    )?;
     let verdict = verdict_of(&answer);
     // Every body is stored and linked, a 403 page and a cut body included (P10, section 3.9).
     let payload = Payload::stored(request, &answer, |body| {
         store.put_blob(body).map(|digest| digest.hex().to_owned())
-    })?;
+    });
+    let payload = or_abandon::<_, _, RobotsError>(payload, store, &opened)?;
     let robots = match (&payload, verdict) {
         (Some(stored), Verdict::Usable) => {
-            Some(RobotsAnswer::Present(store.blob_named(&stored.raw_blob)?))
+            let read = store.blob_named(&stored.raw_blob);
+            Some(RobotsAnswer::Present(or_abandon::<_, _, RobotsError>(
+                read, store, &opened,
+            )?))
         }
         (Some(_), Verdict::Empty) => Some(RobotsAnswer::Absent),
         _ => None,
@@ -368,7 +429,7 @@ fn fetch(
     let at = closed.closed_at();
     match (&robots, &payload) {
         (Some(answered), Some(stored)) => {
-            store.record_robots(closed, &row.host, answered, stored, at)?
+            store.record_robots(closed, host, answered, stored, at)?
         }
         (_, stored) => store.record(closed, stored.as_ref(), &[], at)?,
     };
@@ -380,6 +441,10 @@ fn fetch(
         },
         verdict: Some(verdict),
         outcome: Some(kind),
+        body: match (&robots, &answer) {
+            (Some(RobotsAnswer::Present(_)), Ok(response)) => Some(response.body().to_vec()),
+            _ => None,
+        },
         robots,
         parse_verdict,
     })
@@ -476,7 +541,7 @@ fn answer_of(
         "rows": rows.iter().zip(fetched).map(|(row, one)| json!({
             "host": row.host,
             "status": if row.admitted { "admitted" } else { "candidate" },
-            "url": url_of(row),
+            "url": url_of(&row.host),
             "attempt_id": one.attempt_id,
             "transport_status": one.transport_status,
             "outcome": one.outcome.map(OutcomeKind::name),
