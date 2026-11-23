@@ -1,0 +1,23 @@
+# One shadow run (architecture.md section 3.5, "The shadow run on the VPS"): the script cuts under
+# the store lock and labels with no lock held. services/newsvault/tests/deploy.rs reads
+# TimeoutStartSec, SuccessExitStatus and the ExecStopPost lines; services/modelgate/tests/deploy.rs
+# runs the script.
+[Unit]
+Description=modelgate shadow run over a cut of the store at now
+Documentation=https://github.com/kamilpajak/bellwether/blob/main/docs/design/architecture.md
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/bellwether/newsvault.env
+# The cutoff and each attempt's instants are the clock's, as a collect's observation time is.
+ExecStartPre=/bin/sh -c 'test "$$(timedatectl show --property=NTPSynchronized --value)" = yes || { echo "the clock is not NTP-synchronised" >&2; exit 1; }'
+ExecStart=%h/.local/lib/bellwether/modelgate-shadow
+# The input of ModelgateShadowFailed; first and `-`, as the collect unit's.
+ExecStopPost=-%h/.local/lib/bellwether/newsvault-unit-result shadow
+ExecStopPost=-/bin/sh -c 'if [ "$$SERVICE_RESULT" = timeout ]; then /usr/bin/docker rm --force modelgate-shadow-cut; fi'
+ExecStopPost=-/bin/sh -c 'if [ "$$SERVICE_RESULT" = timeout ]; then /usr/bin/docker rm --force modelgate-shadow; fi'
+# Exit 7 is retryable and the next firing retries it; ModelgateShadowStale names a run of them.
+SuccessExitStatus=7
+# With systemd's 90 s stop timeout, 210 s before the next firing; no Restart=. The script sends at
+# most MODELGATE_LIMIT requests in a timer run; nothing else keeps a run inside this bound.
+TimeoutStartSec=1500

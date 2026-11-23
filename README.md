@@ -147,5 +147,7 @@ row's `robots` pin; it never writes the hosts file. Exit 1 means a pin differs.
 - Early.
 - Of the five services named in the design, `vault` exists and `modelgate` has `decide` calls and a
   record-only shadow command (2026-11-23) that has sent nothing to a model. The other three have no code.
+- The shadow's image, wrapper, unit, timer and alerts are written under `deploy/` and not installed
+  (2026-11-23).
 - The design is a draft with decisions still open, including which news vendor the archive is built
   on, and the handover criterion that, with build steps 3 and 6, decides when the predecessor may stop.

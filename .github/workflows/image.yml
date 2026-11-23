@@ -1,6 +1,7 @@
 # The newsvault image (S7-D10, option C; docs/design/architecture.md section 11.5 step 7): built
 # and smoke-run on every pull request; built, smoke-run and pushed to GHCR on a version tag. No
-# third-party action: the runner's own docker builds, logs in and pushes.
+# third-party action: the runner's own docker builds, logs in and pushes. It carries modelgate too:
+# its smoke is a dry run over the committed snapshot fixture, which reads no key and sends nothing.
 
 name: image
 
@@ -29,6 +30,8 @@ jobs:
         run: docker run --rm --entrypoint dpkg-query newsvault:ci --showformat '${Version}' --show libsqlite3-0 | grep -E '^3\.45\.'
       - name: the image runs as user 10001 under tini
         run: docker inspect --format '{{.Config.User}} {{json .Config.Entrypoint}}' newsvault:ci | grep -Fx '10001 ["/usr/bin/tini","--","/usr/local/bin/newsvault"]'
+      - name: modelgate's dry run (read-only root, no network, the shipped question file)
+        run: docker run --rm --read-only --network none --user 1000:1000 --entrypoint /usr/bin/tini --mount "type=bind,src=$PWD/snapshot-contract/fixtures/snapshot_v1,dst=/cut,readonly" newsvault:ci -- /usr/local/bin/modelgate shadow run --snapshot /cut --questions /usr/share/bellwether/questions/ripple-shadow-1.json --model example/decide-1-20261014 --run-cap-usd 0.01 --day-cap-usd 0.01 --total-cap-usd 0.01 --input-price-per-mtok 0.042 --give-up-after-hours 24 --store /none --dry-run --format json | jq -e '.dry_run and .question_document == "ripple-shadow/1"'
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -60,6 +63,7 @@ jobs:
       - run: docker run --rm --read-only --user 1000:1000 "$IMAGE:$GITHUB_REF_NAME" schema --format json | jq -e '.schema == "newsvault.schema/1"'
       - run: docker run --rm --entrypoint dpkg-query "$IMAGE:$GITHUB_REF_NAME" --showformat '${Version}' --show libsqlite3-0 | grep -E '^3\.45\.'
       - run: docker inspect --format '{{.Config.User}} {{json .Config.Entrypoint}}' "$IMAGE:$GITHUB_REF_NAME" | grep -Fx '10001 ["/usr/bin/tini","--","/usr/local/bin/newsvault"]'
+      - run: docker run --rm --read-only --network none --user 1000:1000 --entrypoint /usr/bin/tini --mount "type=bind,src=$PWD/snapshot-contract/fixtures/snapshot_v1,dst=/cut,readonly" "$IMAGE:$GITHUB_REF_NAME" -- /usr/local/bin/modelgate shadow run --snapshot /cut --questions /usr/share/bellwether/questions/ripple-shadow-1.json --model example/decide-1-20261014 --run-cap-usd 0.01 --day-cap-usd 0.01 --total-cap-usd 0.01 --input-price-per-mtok 0.042 --give-up-after-hours 24 --store /none --dry-run --format json | jq -e '.dry_run and .question_document == "ripple-shadow/1"'
       - env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s' "$TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
