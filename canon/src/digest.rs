@@ -1,7 +1,7 @@
-//! The nine digests, each a field list over the form in `lib.rs`. `docs/design/architecture.md`
+//! The eleven digests, each a field list over the form in `lib.rs`. `docs/design/architecture.md`
 //! section 2's rows state the order of `item_id`, `story_id`, `snapshot_row` and `snapshot_id`,
-//! section 3.2's that of `filter_params` and `result_digest`; only the code below states `doc_id`
-//! and `attempt_id`.
+//! section 3.2's that of `filter_params` and `result_digest`, section 3.5's that of
+//! `question_version` and `model_request`; only the code below states `doc_id` and `attempt_id`.
 
 use crate::{sha256_canon, CanonError, Digest, Domain, Field, Stamp};
 use chrono::{DateTime, Utc};
@@ -170,11 +170,68 @@ pub fn extract_version(
     sha256_canon(Domain::ExtractVersion, &fields)
 }
 
+/// One question of a question document, as `question_version` reads it.
+#[derive(Debug, Clone, Copy)]
+pub struct QuestionFields<'a> {
+    pub id: &'a str,
+    /// The answer primitive's name, as the document spells it.
+    pub kind: &'a str,
+    pub instructions: &'a str,
+    /// Option ids and their descriptions, in the document's order and paired by position.
+    pub option_ids: &'a [&'a str],
+    pub option_descriptions: &'a [&'a str],
+}
+
+/// architecture.md section 3.5 `question_version`: the document's name, then each question in the
+/// caller's order as id, type, instructions, option ids, option descriptions. Nothing is sorted:
+/// a reordered question or option list is another version.
+pub fn question_version(name: &str, questions: &[QuestionFields]) -> Result<Digest, CanonError> {
+    let mut fields = Vec::with_capacity(1 + questions.len() * 5);
+    fields.push(Field::Text(name));
+    for question in questions {
+        fields.push(Field::Text(question.id));
+        fields.push(Field::Text(question.kind));
+        fields.push(Field::Text(question.instructions));
+        fields.push(Field::List(question.option_ids));
+        fields.push(Field::List(question.option_descriptions));
+    }
+    sha256_canon(Domain::QuestionVersion, &fields)
+}
+
+/// `model_request`'s inputs, in the order architecture.md section 3.5's `idempotency_key` row
+/// states them.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelRequestFields<'a> {
+    pub kind: &'a str,
+    /// Names the rule that turns these fields into request bytes: truncation and JSON layout.
+    pub request_format: &'a str,
+    pub question_version: &'a str,
+    pub state_digest: &'a str,
+    pub model: &'a str,
+    pub repeat_index: u32,
+}
+
+/// architecture.md section 3.5 `idempotency_key`.
+pub fn model_request(fields: &ModelRequestFields) -> Result<Digest, CanonError> {
+    sha256_canon(
+        Domain::ModelRequest,
+        &[
+            Field::Text(fields.kind),
+            Field::Text(fields.request_format),
+            Field::Text(fields.question_version),
+            Field::Text(fields.state_digest),
+            Field::Text(fields.model),
+            Field::Text(&fields.repeat_index.to_string()),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        attempt_id, doc_id, extract_version, filter_params, item_id, result_digest, snapshot_id,
-        snapshot_row, story_id, ItemFields, Param, ParamValue, SnapshotRowFields,
+        attempt_id, doc_id, extract_version, filter_params, item_id, model_request,
+        question_version, result_digest, snapshot_id, snapshot_row, story_id, ItemFields,
+        ModelRequestFields, Param, ParamValue, QuestionFields, SnapshotRowFields,
     };
     use crate::{CanonError, Digest, Stamp};
     use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
@@ -194,7 +251,7 @@ mod tests {
     const MIDNIGHT_MICROS: i64 = 1_782_864_000_000_000;
     /// Every file in `vectors/` is read by the loop below; the count is here so that deleting one
     /// is a failure rather than a smaller pass.
-    const VECTOR_COUNT: usize = 23;
+    const VECTOR_COUNT: usize = 25;
 
     fn at(micros: i64) -> DateTime<Utc> {
         DateTime::UNIX_EPOCH + TimeDelta::microseconds(micros)
@@ -439,6 +496,46 @@ mod tests {
                 };
                 extract_version(text(input, "rules_version"), &sources)
             }
+            "question_version" => {
+                let Some(members) = input["questions"].as_array() else {
+                    return "unreadable: questions".to_string();
+                };
+                let options: Vec<(Vec<&str>, Vec<&str>)> = members
+                    .iter()
+                    .map(|member| {
+                        let listed = member["options"].as_array();
+                        let pick = |key: &str| -> Vec<&str> {
+                            listed
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|option| option[key].as_str())
+                                .collect()
+                        };
+                        (pick("id"), pick("description"))
+                    })
+                    .collect();
+                let questions: Vec<QuestionFields> = members
+                    .iter()
+                    .zip(&options)
+                    .map(|(member, (ids, descriptions))| QuestionFields {
+                        id: text(member, "id"),
+                        kind: text(member, "type"),
+                        instructions: text(member, "instructions"),
+                        option_ids: ids,
+                        option_descriptions: descriptions,
+                    })
+                    .collect();
+                question_version(text(input, "name"), &questions)
+            }
+            "model_request" => model_request(&ModelRequestFields {
+                kind: text(input, "kind"),
+                request_format: text(input, "request_format"),
+                question_version: text(input, "question_version"),
+                state_digest: text(input, "state_digest"),
+                model: text(input, "model"),
+                repeat_index: u32::try_from(input["repeat_index"].as_u64().unwrap_or_default())
+                    .unwrap_or_default(),
+            }),
             other => return format!("unreadable: digest {other}"),
         };
         hex(computed)

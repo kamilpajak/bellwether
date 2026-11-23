@@ -1,0 +1,41 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "question_version",
+  "note": "The document's name, then each question in the document's own order as id, type, instructions, option ids and option descriptions. Nothing is sorted: swapping the two options of `scope` is another digest. Reproduced with Python 3 hashlib on 2026-11-23.",
+  "input": {
+    "name": "example/0",
+    "questions": [
+      {
+        "id": "is_material",
+        "type": "noul",
+        "instructions": "Does the text state a new fact?",
+        "options": [
+          {
+            "id": "true",
+            "description": "It states one."
+          },
+          {
+            "id": "false",
+            "description": "It states none."
+          }
+        ]
+      },
+      {
+        "id": "scope",
+        "type": "choice",
+        "instructions": "Whom does the event concern?",
+        "options": [
+          {
+            "id": "issuer_only",
+            "description": "Only the company that published it."
+          },
+          {
+            "id": "whole_category",
+            "description": "A whole category of companies."
+          }
+        ]
+      }
+    ]
+  },
+  "sha256": "321548859a9e285aa568099763f31eddd33996167d06000009187293c1d3a802"
+}

@@ -71,6 +71,8 @@ pub enum Domain {
     SnapshotId,
     ExtractVersion,
     SnapshotRow,
+    QuestionVersion,
+    ModelRequest,
 }
 
 impl Domain {
@@ -86,6 +88,8 @@ impl Domain {
             Self::SnapshotId => "snapshot_id",
             Self::ExtractVersion => "extract_version",
             Self::SnapshotRow => "snapshot_row",
+            Self::QuestionVersion => "question_version",
+            Self::ModelRequest => "model_request",
         }
     }
 }
