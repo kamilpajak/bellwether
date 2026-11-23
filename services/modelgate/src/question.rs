@@ -718,6 +718,9 @@ pub(crate) mod tests {
             let in_design = |line: &str| line.starts_with(&row) && line.ends_with(&cell);
             assert!(DESIGN.lines().any(in_design), "{row} … {cell}");
         }
+        let excluded = "Not a charge against an officer alone, a private claim a court hears, \
+                        a refused approval, or a rule for a whole industry.";
+        assert!(description(&doc, "spillover_channel", "state_action").contains(excluded));
         let signed: Vec<&str> = CHANNEL_SIGNS
             .iter()
             .filter_map(|row| row.1.map(|_| row.0))
