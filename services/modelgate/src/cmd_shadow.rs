@@ -1082,7 +1082,7 @@ mod tests {
         Ok(())
     }
 
-    /// Section 8 row MG4. Mutation 2026-11-23, `story_state` answering `(false, false)`: red.
+    /// Section 8 row MG4. Mutation 2026-11-23, `story_state` answering `NeverAsked`: red.
     #[test]
     fn a_request_already_answered_is_not_sent_again() -> TestResult {
         let (bench, stub) = (Bench::new()?, Stub::default());
@@ -1195,7 +1195,7 @@ mod tests {
         Ok(())
     }
 
-    /// B4. Mutation 2026-11-23, `request_answered` in `label` answering false: red (two sends).
+    /// B4. Mutation 2026-11-23, `request_outcome` ignored in `label`: red (two sends).
     #[test]
     fn two_stories_with_one_body_get_two_label_rows_and_one_request() -> TestResult {
         let (bench, stub) = (Bench::new()?, Stub::default());
