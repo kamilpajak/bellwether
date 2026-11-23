@@ -206,13 +206,15 @@ pub fn wire_for(ask: &Ask, feed: &OpenWebFeed) -> Wire {
 }
 
 /// What one row's fetch left: `None` fields on a dry run, which asks nothing.
-struct Fetched {
-    attempt_id: Option<String>,
-    transport_status: Option<u16>,
-    verdict: Option<Verdict>,
-    outcome: Option<OutcomeKind>,
-    robots: Option<RobotsAnswer>,
-    parse_verdict: Option<&'static str>,
+pub(crate) struct Fetched {
+    pub(crate) attempt_id: Option<String>,
+    pub(crate) transport_status: Option<u16>,
+    pub(crate) verdict: Option<Verdict>,
+    pub(crate) outcome: Option<OutcomeKind>,
+    pub(crate) robots: Option<RobotsAnswer>,
+    pub(crate) parse_verdict: Option<&'static str>,
+    /// The answered body of a `present` row, which `roster fetch` reads its rules from.
+    pub(crate) body: Option<Vec<u8>>,
 }
 
 /// Asks each row's robots.txt once, in hosts-file order. No retry and no startup sweep.
@@ -238,6 +240,7 @@ pub fn run(
                 outcome: None,
                 robots: None,
                 parse_verdict: None,
+                body: None,
             })
             .collect::<Vec<Fetched>>();
         return Ok(answer_of(ask, feed, &run_id, started, &rows, &planned));
@@ -262,11 +265,11 @@ pub fn run(
     let mut fetched = Vec::with_capacity(rows.len());
     let interval = feed.transport().budget.per_host;
     for (ordinal, row) in (0_u32..).zip(&rows) {
-        let request = request_for(row, feed.hosts_version());
+        let request = request_for(&row.host, Some(feed.hosts_version()));
         let asked = Asked {
             run: &run,
             ordinal,
-            row,
+            host: &row.host,
             request: &request,
             interval,
         };
@@ -282,38 +285,39 @@ pub fn run(
     Ok(answer_of(ask, feed, &run_id, started, &rows, &fetched))
 }
 
-fn request_for(row: &HostPin, hosts_version: &FileDigest) -> Request {
+/// A robots fetch of `host`; `hosts_version` is `None` for a caller that reads no hosts file.
+pub(crate) fn request_for(host: &str, hosts_version: Option<&FileDigest>) -> Request {
     Request {
         source: SourceId::new(ROBOTS_SOURCE),
-        target_window: TargetWindow::new(&row.host),
+        target_window: TargetWindow::new(host),
         phase: RequestPhase::Index,
         provenance: Provenance::LiveIngest,
-        url: url_of(row),
+        url: url_of(host),
         headers: Vec::new(),
         params: Vec::new(),
         universe_version: FileDigest::of(&[]),
         listed_date: None,
         names_ticker: false,
-        hosts_version: Some(hosts_version.clone()),
+        hosts_version: hosts_version.cloned(),
         extract_version: None,
     }
 }
 
-fn url_of(row: &HostPin) -> String {
-    format!("https://{}{ROBOTS_PATH}", row.host)
+fn url_of(host: &str) -> String {
+    format!("https://{host}{ROBOTS_PATH}")
 }
 
-/// One row's fetch as `run` asks it; `interval` is the per-host pace the parse verdict compares a
+/// One host's fetch as a run asks it; `interval` is the per-host pace the parse verdict compares a
 /// Crawl-delay with.
-struct Asked<'a> {
-    run: &'a RunId,
-    ordinal: u32,
-    row: &'a HostPin,
-    request: &'a Request,
-    interval: Option<Duration>,
+pub(crate) struct Asked<'a> {
+    pub(crate) run: &'a RunId,
+    pub(crate) ordinal: u32,
+    pub(crate) host: &'a str,
+    pub(crate) request: &'a Request,
+    pub(crate) interval: Option<Duration>,
 }
 
-fn fetch(
+pub(crate) fn fetch(
     store: &mut Committer,
     exchange: &dyn Exchange,
     clock: &dyn Clock,
@@ -322,7 +326,7 @@ fn fetch(
     let Asked {
         run,
         ordinal,
-        row,
+        host,
         request,
         interval,
     } = *asked;
@@ -368,7 +372,7 @@ fn fetch(
     let at = closed.closed_at();
     match (&robots, &payload) {
         (Some(answered), Some(stored)) => {
-            store.record_robots(closed, &row.host, answered, stored, at)?
+            store.record_robots(closed, host, answered, stored, at)?
         }
         (_, stored) => store.record(closed, stored.as_ref(), &[], at)?,
     };
@@ -380,6 +384,10 @@ fn fetch(
         },
         verdict: Some(verdict),
         outcome: Some(kind),
+        body: match (&robots, &answer) {
+            (Some(RobotsAnswer::Present(_)), Ok(response)) => Some(response.body().to_vec()),
+            _ => None,
+        },
         robots,
         parse_verdict,
     })
@@ -476,7 +484,7 @@ fn answer_of(
         "rows": rows.iter().zip(fetched).map(|(row, one)| json!({
             "host": row.host,
             "status": if row.admitted { "admitted" } else { "candidate" },
-            "url": url_of(row),
+            "url": url_of(&row.host),
             "attempt_id": one.attempt_id,
             "transport_status": one.transport_status,
             "outcome": one.outcome.map(OutcomeKind::name),

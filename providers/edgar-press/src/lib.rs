@@ -78,6 +78,35 @@ pub const BODY_LIMIT: u64 = 8 * 1_024 * 1_024;
 /// ceiling with no margin under it, which row R19 names as the open question it is.
 const SEC_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// SEC's transport, one home for every caller of `www.sec.gov`: this provider and `newsvault
+/// roster fetch` (architecture.md section 10, the roster). The pace's per-host bucket is keyed on
+/// the host and its per-IP bucket on the `SourceId` a `Wire` is built with, so a second SEC caller
+/// shares both only when it passes [`SOURCE`].
+#[must_use]
+pub fn sec_transport() -> TransportProfile {
+    TransportProfile {
+        user_agent: HeaderValue::FromCredential(CredentialRef::new(CONTACT_CREDENTIAL)),
+        timeouts: Timeouts {
+            global: VENDOR_PATIENCE,
+            per_call: VENDOR_PATIENCE,
+            resolve: VENDOR_PATIENCE,
+            connect: VENDOR_PATIENCE,
+            send_request: VENDOR_PATIENCE,
+            await_100: VENDOR_PATIENCE,
+            send_body: VENDOR_PATIENCE,
+            recv_response: VENDOR_PATIENCE,
+            recv_body: VENDOR_PATIENCE,
+        },
+        body_limit: BODY_LIMIT,
+        // Per IP, because the contact above does not scope the quota; per host as well, keyed
+        // on `www.sec.gov` and not on this source, so a second SEC source shares the bucket.
+        budget: RequestBudget {
+            min_interval: Some(SEC_MIN_INTERVAL),
+            per_host: Some(SEC_MIN_INTERVAL),
+        },
+    }
+}
+
 /// Why no request may be made at all. Every one of these is raised BEFORE the first request, so a
 /// broken input is never a vendor event in the coverage ledger.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -445,27 +474,7 @@ impl Provider for EdgarPress {
     }
 
     fn transport(&self) -> TransportProfile {
-        TransportProfile {
-            user_agent: HeaderValue::FromCredential(CredentialRef::new(CONTACT_CREDENTIAL)),
-            timeouts: Timeouts {
-                global: VENDOR_PATIENCE,
-                per_call: VENDOR_PATIENCE,
-                resolve: VENDOR_PATIENCE,
-                connect: VENDOR_PATIENCE,
-                send_request: VENDOR_PATIENCE,
-                await_100: VENDOR_PATIENCE,
-                send_body: VENDOR_PATIENCE,
-                recv_response: VENDOR_PATIENCE,
-                recv_body: VENDOR_PATIENCE,
-            },
-            body_limit: BODY_LIMIT,
-            // Per IP, because the contact above does not scope the quota; per host as well, keyed
-            // on `www.sec.gov` and not on this source, so a second SEC source shares the bucket.
-            budget: RequestBudget {
-                min_interval: Some(SEC_MIN_INTERVAL),
-                per_host: Some(SEC_MIN_INTERVAL),
-            },
-        }
+        sec_transport()
     }
 
     /// Per REQUEST. A day the run is in is a live ingest; an earlier day is read after the fact
