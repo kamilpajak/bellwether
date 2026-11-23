@@ -2242,6 +2242,7 @@ fn the_templates_textfile_placeholder_is_refused_by_every_script_before_it_runs(
 
 /// The roster fetch's bound: SEC's patience for each of its requests plus the margin, derived,
 /// never fitted. Exit 8 fails it: a partial roster day is lost and `NewsvaultRosterFailed` says so.
+/// Its whole argument list is read: a `--dry-run` there exits 0 daily and keeps no copy.
 #[test]
 fn the_roster_bound_is_each_requests_patience_plus_two_minutes_and_exit_8_fails() -> TestResult {
     let unit = read("deploy/systemd/newsvault-roster.service")?;
@@ -2253,14 +2254,16 @@ fn the_roster_bound_is_each_requests_patience_plus_two_minutes_and_exit_8_fails(
             unit_values(&unit, "SuccessExitStatus").len(),
             unit_values(&unit, "Restart").len(),
             usize::try_from(ROSTER_REQUESTS)? == newsvault::cmd_roster::FILES.len() + 1,
-            args.get(..2).map(<[String]>::to_vec),
+            args,
         ),
         (
             vec![(patience * ROSTER_REQUESTS + TIMEOUT_MARGIN).num_seconds()],
             0,
             0,
             true,
-            Some(vec!["roster".to_owned(), "fetch".to_owned()]),
+            ["roster", "fetch", "--non-interactive", "--format", "json"]
+                .map(str::to_owned)
+                .to_vec(),
         )
     );
     Ok(())

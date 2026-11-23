@@ -376,29 +376,30 @@ tests:
             exp_annotations:
               summary: "open_web_wires: 3 request(s) deferred host_held, run date 2026-11-17."
 
-  # A roster run ending at t=0, the file re-read each 5 min: quiet through one day and one run's
-  # bound, missed after; the next day's failed run alerts as failed.
+  # A roster run ending at 24 h, the file re-read each 5 min: quiet through one day and one run's
+  # bound, missed after; the next day's failed run alerts as failed. A non-zero stamp, so a rule
+  # reading the 0/1 success gauge instead fires at 48h04m.
   - interval: 5m
     input_series:
       - series: 'newsvault_unit_result_timestamp_seconds{unit="roster"}'
-        values: '0x300'
+        values: '86400x600'
       - series: 'newsvault_unit_result_success{unit="roster"}'
-        values: '1x287 0x12'
+        values: '1x575 0x24'
     alert_rule_test:
-      - eval_time: 24h04m
+      - eval_time: 48h04m
         alertname: NewsvaultRosterMissed
         exp_alerts: []
-      - eval_time: 24h05m
+      - eval_time: 48h05m
         alertname: NewsvaultRosterMissed
         exp_alerts:
           - exp_labels:
               severity: critical
             exp_annotations:
               summary: no newsvault roster fetch has ended for over a day, or none ever.
-      - eval_time: 23h55m
+      - eval_time: 47h55m
         alertname: NewsvaultRosterFailed
         exp_alerts: []
-      - eval_time: 24h
+      - eval_time: 48h
         alertname: NewsvaultRosterFailed
         exp_alerts:
           - exp_labels:
@@ -406,7 +407,7 @@ tests:
               unit: roster
             exp_annotations:
               summary: newsvault's last roster fetch failed; that day's roster is not kept.
-      - eval_time: 24h
+      - eval_time: 48h
         alertname: NewsvaultCollectFailed
         exp_alerts: []
 
