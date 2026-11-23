@@ -8,9 +8,9 @@ use serde::Deserialize;
 
 pub const QUESTIONS_SCHEMA: &str = "modelgate.questions/1";
 /// Bytes the encoded `questions` object may reach. Fixed apart from the state budget
-/// (`request.rs`), so a longer document never shortens the text the model reads. Why 21,000:
+/// (`request.rs`), so a longer document never shortens the text the model reads. Why 22,600:
 /// section 3.5, `request_format`.
-pub const MAX_QUESTIONS_BYTES: usize = 21_000;
+pub const MAX_QUESTIONS_BYTES: usize = 22_600;
 const NOUL_OPTIONS: [&str; 2] = ["true", "false"];
 const MIN_CHOICE_OPTIONS: usize = 2;
 
@@ -493,7 +493,7 @@ pub(crate) mod tests {
     fn every_expected_reading_of_a_synthetic_example_is_an_option_of_the_committed_document(
     ) -> TestResult {
         let (doc, examples) = (committed()?, examples()?);
-        assert_eq!(examples.len(), 11);
+        assert_eq!(examples.len(), 17);
         for example in &examples {
             let expected = example["expect"].as_object().ok_or("no expect object")?;
             assert!(!expected.is_empty(), "{example}");
@@ -588,6 +588,82 @@ pub(crate) mod tests {
                 &serde_json::json!(reading),
                 "{example}: {question}"
             );
+        }
+        Ok(())
+    }
+
+    /// Section 3.5, "The channel to other companies": the sign code reads from each channel.
+    const CHANNEL_SIGNS: [(&str, Option<&str>); 7] = [
+        ("state_action", Some("adverse")),
+        ("demand_rises", Some("favourable")),
+        ("demand_falls", Some("adverse")),
+        ("contagion", Some("adverse")),
+        ("rival_weakened", Some("favourable")),
+        ("none_of_these", None),
+        ("cannot_tell", None),
+    ];
+
+    /// Section 8 row MG14, where the mutations of 2026-11-23 are listed: the channel is asked
+    /// beside the stance, and an example's direction for the others is its channel's sign.
+    #[test]
+    fn each_channel_to_other_companies_fixes_their_sign_or_has_none() -> TestResult {
+        let (doc, examples) = (committed()?, examples()?);
+        let channels: Vec<&str> = CHANNEL_SIGNS.iter().map(|(channel, _)| *channel).collect();
+        assert_eq!(option_ids(&doc, "spillover_channel"), channels);
+        assert_eq!(
+            option_ids(&doc, "spillover_effect"),
+            ["favourable", "adverse", "neutral", "cannot_tell"]
+        );
+        assert_eq!(
+            option_ids(&doc, "stance_to_category"),
+            [
+                "validates",
+                "lowers_cost_or_barrier",
+                "opens_market",
+                "threatens_to_absorb",
+                "substitutes",
+                "undermines_category",
+                "neutral",
+                "cannot_tell"
+            ]
+        );
+        let channel = texts(&doc, "spillover_channel");
+        assert!(channel.contains("state_action first, then a demand option"));
+        assert!(texts(&doc, "spillover_effect").contains("other than the company reported on"));
+        let held = [
+            ("export_ban_on_one_company", "state_action"),
+            ("customer_signs_a_long_supply_contract", "demand_rises"),
+            (
+                "customer_lowers_its_forecast_and_its_orders",
+                "demand_falls",
+            ),
+            ("bank_loses_a_quarter_of_its_deposits", "contagion"),
+            ("chip_maker_delays_its_next_product", "rival_weakened"),
+            ("share_repurchase_with_no_channel", "none_of_these"),
+            ("platform_enters_the_category", "none_of_these"),
+        ];
+        for (example, reading) in held {
+            assert_eq!(
+                expected(&examples, example, "spillover_channel"),
+                &serde_json::json!([reading]),
+                "{example}"
+            );
+        }
+        for (channel, sign) in CHANNEL_SIGNS {
+            let reading = serde_json::json!([channel]);
+            let mut shown = 0;
+            for example in &examples {
+                if example["expect"]["spillover_channel"] != reading {
+                    continue;
+                }
+                shown += 1;
+                let effect = &example["expect"]["spillover_effect"];
+                assert!(effect.is_array(), "{example}");
+                if let Some(sign) = sign {
+                    assert_eq!(effect, &serde_json::json!([sign]), "{example}");
+                }
+            }
+            assert!(shown > 0 || channel == "cannot_tell", "{channel}");
         }
         Ok(())
     }

@@ -41,6 +41,12 @@
     ],
     "as_others_small_or_specialised": [
      "true"
+    ],
+    "spillover_channel": [
+     "none_of_these"
+    ],
+    "spillover_effect": [
+     "favourable"
     ]
    }
   },
@@ -206,6 +212,12 @@
     ],
     "as_names_category_as_purpose": [
      "true"
+    ],
+    "spillover_channel": [
+     "none_of_these"
+    ],
+    "spillover_effect": [
+     "favourable"
     ]
    }
   },
@@ -238,6 +250,12 @@
     ],
     "as_issuer_opens_what_others_need": [
      "false"
+    ],
+    "spillover_channel": [
+     "none_of_these"
+    ],
+    "spillover_effect": [
+     "adverse"
     ]
    }
   },
@@ -326,6 +344,130 @@
     ],
     "cx_state_body_acts_against": [
      "false"
+    ]
+   }
+  },
+  {
+   "id": "customer_lowers_its_forecast_and_its_orders",
+   "text": "Fonemaker Inc. (NASDAQ: FONE) today lowered its revenue forecast for the quarter by about a tenth. It said it sold fewer handsets than planned and has reduced its component orders for the next two quarters.",
+   "expect": {
+    "event_class": [
+     "guidance_cut_or_warning"
+    ],
+    "ev_guidance_cut_or_warning": [
+     "true"
+    ],
+    "issuer_effect": [
+     "adverse"
+    ],
+    "spillover_channel": [
+     "demand_falls"
+    ],
+    "spillover_effect": [
+     "adverse"
+    ]
+   }
+  },
+  {
+   "id": "customer_signs_a_long_supply_contract",
+   "text": "Gridco Energy (NYSE: GRDC) today signed a 20-year agreement to sell the whole output of one generating station to Cloudhost Corporation. Cloudhost said its new data centres need more electricity than its present suppliers can deliver, and that it is seeking further agreements of this kind.",
+   "expect": {
+    "event_class": [
+     "contract_or_customer_win"
+    ],
+    "issuer_effect": [
+     "favourable"
+    ],
+    "spillover_channel": [
+     "demand_rises"
+    ],
+    "spillover_effect": [
+     "favourable"
+    ]
+   }
+  },
+  {
+   "id": "bank_loses_a_quarter_of_its_deposits",
+   "text": "Coastal Savings Bank (NASDAQ: CSTL) today said customers withdrew a quarter of its deposits in two days and that it sold bonds at a loss to pay them. Most of its deposits are above the insured limit, and most of its assets are long-dated bonds bought before interest rates rose, as is common among banks of its size. It is seeking emergency funding.",
+   "expect": {
+    "issuer_effect": [
+     "adverse"
+    ],
+    "issuer_significance": [
+     "major",
+     "critical"
+    ],
+    "cx_state_body_acts_against": [
+     "false"
+    ],
+    "spillover_channel": [
+     "contagion"
+    ],
+    "spillover_effect": [
+     "adverse"
+    ]
+   }
+  },
+  {
+   "id": "chip_maker_delays_its_next_product",
+   "text": "Bigchip Corporation (NASDAQ: BGCP) today said its next generation of processors will ship six months later than planned because of a defect in its own manufacturing process. Customers that cannot wait may buy from other makers in the meantime, it said.",
+   "expect": {
+    "issuer_effect": [
+     "adverse"
+    ],
+    "cause_scope": [
+     "issuer_specific"
+    ],
+    "cx_state_body_acts_against": [
+     "false"
+    ],
+    "spillover_channel": [
+     "rival_weakened"
+    ],
+    "spillover_effect": [
+     "favourable"
+    ]
+   }
+  },
+  {
+   "id": "export_ban_on_one_company",
+   "text": "The trade ministry today barred domestic companies from selling components or software to Farphone Ltd. without a licence, effective immediately. Farphone buys about a fifth of its components from domestic suppliers.",
+   "expect": {
+    "source_role": [
+     "regulator_or_exchange"
+    ],
+    "cx_state_body_acts_against": [
+     "true"
+    ],
+    "issuer_effect": [
+     "adverse"
+    ],
+    "spillover_channel": [
+     "state_action"
+    ],
+    "spillover_effect": [
+     "adverse"
+    ]
+   }
+  },
+  {
+   "id": "share_repurchase_with_no_channel",
+   "text": "Midco Inc. (NYSE: MDCO) today said its board authorised the repurchase of up to $200 million of its shares over the next two years.",
+   "expect": {
+    "event_class": [
+     "buyback"
+    ],
+    "scope": [
+     "issuer_only"
+    ],
+    "category_significance": [
+     "none"
+    ],
+    "spillover_channel": [
+     "none_of_these"
+    ],
+    "spillover_effect": [
+     "neutral"
     ]
    }
   }

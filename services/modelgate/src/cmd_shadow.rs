@@ -1100,7 +1100,7 @@ mod tests {
         let stub = Stub::scripted(readings.iter().map(|e| full_reading(&doc, e)).collect());
         let done = bench.go(&bench.args(snapshot.path()), &stub)?;
         let asked = u64::try_from(doc.questions().len())?;
-        assert_eq!(asked, 62);
+        assert_eq!(asked, 64);
         assert_eq!(at(&done.envelope, "/stories/labelled"), 5);
         assert_eq!(at(&done.envelope, "/questions/answered"), asked * 5);
         assert_eq!(at(&done.envelope, "/questions/missing"), 0);

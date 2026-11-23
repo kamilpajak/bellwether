@@ -13,9 +13,9 @@ pub const REQUEST_FORMAT: &str = "modelgate.request/2";
 /// Bytes the state may take once JSON-escaped, quotes excluded. Independent of the question
 /// document, so two documents read the same cut of one story.
 pub const STATE_BUDGET_BYTES: usize = 13_000;
-/// The whole body stays under this. Why 34,200, and what it no longer bounds: section 3.5,
+/// The whole body stays under this. Why 35,800, and what it no longer bounds: section 3.5,
 /// `request_format` and "Not verified".
-pub const REQUEST_CEILING_BYTES: usize = 34_200;
+pub const REQUEST_CEILING_BYTES: usize = 35_800;
 const MODEL_KEY: &str = "{\"model\":";
 const STATE_KEY: &str = ",\"state\":";
 const QUESTIONS_KEY: &str = ",\"questions\":";
@@ -194,14 +194,14 @@ mod tests {
                 MAX_QUESTIONS_BYTES,
                 REQUEST_CEILING_BYTES
             ),
-            ("modelgate.request/2", 13_000, 21_000, 34_200)
+            ("modelgate.request/2", 13_000, 22_600, 35_800)
         );
         let design = include_str!("../../../docs/design/architecture.md");
         for named in [
             "`modelgate.request/2` (2026-11-23)",
             "13,000 JSON-escaped bytes",
-            "21,000-byte bound",
-            "34,200-byte ceiling",
+            "22,600-byte bound",
+            "35,800-byte ceiling",
         ] {
             assert!(design.contains(named), "{named}");
         }

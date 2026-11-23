@@ -1155,6 +1155,64 @@
      "description": "The text does not say."
     }
    ]
+  },
+  {
+   "id": "spillover_channel",
+   "type": "choice",
+   "instructions": "According to the text, how does the reported event most affect companies other than the company reported on? Where two fit: state_action first, then a demand option.",
+   "options": [
+    {
+     "id": "state_action",
+     "description": "A state body restricts or acts against that company, which also hurts its suppliers, its customers, or similar companies the body may act against next."
+    },
+    {
+     "id": "demand_rises",
+     "description": "That company or its customer orders, contracts or plans to spend more, or expects to sell more: more demand for suppliers and for other sellers of the same thing."
+    },
+    {
+     "id": "demand_falls",
+     "description": "That company or its customer orders or plans to spend less, or expects to sell less: less demand for suppliers and for other sellers of the same thing."
+    },
+    {
+     "id": "contagion",
+     "description": "That company's trouble may sit in similar companies too: the same kind of assets, funding, customers or exposure."
+    },
+    {
+     "id": "rival_weakened",
+     "description": "That company's trouble is its own (a delay, a failure, an outage), so its competitors can take its business."
+    },
+    {
+     "id": "none_of_these",
+     "description": "It affects other companies in another way, or affects none."
+    },
+    {
+     "id": "cannot_tell",
+     "description": "The text does not say enough to tell."
+    }
+   ]
+  },
+  {
+   "id": "spillover_effect",
+   "type": "choice",
+   "instructions": "According to the text, what does the reported event mean for the companies, other than the company reported on, that it affects most?",
+   "options": [
+    {
+     "id": "favourable",
+     "description": "It improves their business, finances or standing."
+    },
+    {
+     "id": "adverse",
+     "description": "It harms their business, finances or standing."
+    },
+    {
+     "id": "neutral",
+     "description": "It changes neither, or it affects no other company."
+    },
+    {
+     "id": "cannot_tell",
+     "description": "The text does not say enough to tell."
+    }
+   ]
   }
  ]
 }
