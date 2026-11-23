@@ -5,7 +5,7 @@ edition = "2021"
 description = "Our own forward news feed over public wire and outlet pages: architecture.md section 11."
 publish = false
 
-# No HTTP client and no clock (section 11.1), so row R4's one-crate allowlist and clock scan cover
+# No HTTP client and no clock (section 11.1), so row R4's allowlist and clock scan cover
 # it as they cover edgar-press. Cost, measured 2026-11-15 by
 # `cargo tree -e normal,build --workspace --prefix none | sed 's/ (\*)$//' | sort -u | wc -l`:
 # 161 before the two parsers, 192 after. roxmltree adds itself and nothing; scraper adds 30

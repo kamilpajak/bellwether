@@ -2,12 +2,12 @@
 name = "news-provider"
 version = "0.1.0"
 edition = "2021"
-description = "The provider seam: the coverage ledger's write half, and the only HTTP client in the workspace."
+description = "The provider seam: the coverage ledger's write half, and the only HTTP client that talks to a news vendor."
 publish = false
 
-# `ureq` is here and in no other manifest, which is what makes the one-crate HTTP allowlist a
-# question `cargo metadata` can answer completely (docs/design/architecture.md section 8 row R4's
-# first hole). Cost, measured 2026-11-13 by
+# `ureq` is here and in `services/modelgate` only (since 2026-11-23), which is what makes the
+# HTTP allowlist a question `cargo metadata` can answer completely (docs/design/architecture.md
+# section 8 row R4's first hole). Cost, measured 2026-11-13 by
 # `cargo tree -e normal,build --workspace --prefix none | sed 's/ (\*)$//' | sort -u | wc -l`:
 # 130 build units before this member, 151 after - this crate plus 20 packages, which is exactly the
 # +20 the design measured for ureq alone. `ring` and `httparse` are the only C or build-script

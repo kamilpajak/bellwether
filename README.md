@@ -60,9 +60,10 @@ keep passing.
 | `docs/inherited/` | two documents carried from the predecessor: the mandatory research gates, and the postmortem of eleven closed strategy paradigms |
 | `pit/` | the point-in-time contract: two instants that are separate types, and the arm that keeps a publication **date** from being assumed into an instant |
 | `canon/` | the canonical form every identity is hashed over, with the vectors a second reader in another language must reproduce |
-| `news-provider/` | the provider seam: the coverage ledger's write half, the one HTTP client — a send consumes a permit that only a written attempt row hands out — and the driver that opens and closes every slot |
+| `news-provider/` | the provider seam: the coverage ledger's write half, the one HTTP client that talks to a news vendor — a send consumes a permit that only a written attempt row hands out — and the driver that opens and closes every slot |
 | `providers/` | one crate per vendor adapter. Each declares no HTTP dependency at all |
 | `services/newsvault/` | the archive: the commit log, the coverage reader and the segment export, in Rust |
+| `services/modelgate/` | the only exit to a language model: `decide` calls behind an attempt ledger, a cost cap and a pinned build, and the record-only `shadow run`. Nothing has been sent to a model |
 | `snapshot-contract/` | the Snapshot contract `vault` hands `derive`: the column list, the manifest, the visibility predicate every reader of stored times calls, the writer and the validator `newsvault cut` runs before it renames a cut into place |
 | `panel-contract/` | the panel manifest contract: the shape the statistics tier may read, and the validator that refuses a row count that is really a product |
 | `repo-invariants/` | the one invariant that is a property of the repository rather than of a crate |
@@ -143,6 +144,8 @@ row's `robots` pin; it never writes the hosts file. Exit 1 means a pin differs.
 
 ## Status
 
-Early. One of the five services named in the design exists, and the design itself is a draft with
-decisions still open — including which news vendor the archive is built on, and the handover
-criterion that, with build steps 3 and 6, decides when the predecessor may stop.
+- Early.
+- Of the five services named in the design, `vault` exists and `modelgate` has `decide` calls and a
+  record-only shadow command (2026-11-23) that has sent nothing to a model. The other three have no code.
+- The design is a draft with decisions still open, including which news vendor the archive is built
+  on, and the handover criterion that, with build steps 3 and 6, decides when the predecessor may stop.
