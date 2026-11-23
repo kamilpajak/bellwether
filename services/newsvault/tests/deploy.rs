@@ -127,7 +127,7 @@ const SHADOW_INTERVAL_S: i64 = 1_800;
 /// The image jobs' modelgate smoke: the wrapper's container flags, then a dry run's envelope.
 const MODELGATE_SMOKE: (&str, &str) = (
     "run: docker run --rm --read-only --network none --user 1000:1000 --entrypoint /usr/bin/tini ",
-    "--dry-run --format json | jq -e '.dry_run and .question_document == \"ripple-shadow/0\"'",
+    "--dry-run --format json | jq -e '.dry_run and .question_document == \"ripple-shadow/1\"'",
 );
 /// Written for a person reading the textfile or a dashboard; no alert reads them.
 const UNREAD_FAMILIES: [&str; 1] = ["newsvault_backup_last_success_bytes"];
@@ -2572,7 +2572,7 @@ fn the_image_carries_modelgate_and_its_question_file_and_each_image_job_dry_runs
                 line.contains(MODELGATE_SMOKE.0)
                     && line.contains("-- /usr/local/bin/modelgate shadow run")
                     && line.contains(
-                        "--questions /usr/share/bellwether/questions/ripple-shadow-0.json",
+                        "--questions /usr/share/bellwether/questions/ripple-shadow-1.json",
                     )
                     && line.ends_with(MODELGATE_SMOKE.1)
             })
@@ -2592,7 +2592,7 @@ fn the_image_carries_modelgate_and_its_question_file_and_each_image_job_dry_runs
                  /src/target/release/modelgate /usr/local/bin/"
             ),
             held(
-                "COPY services/modelgate/questions/ripple-shadow-0.json \
+                "COPY services/modelgate/questions/ripple-shadow-1.json \
                  /usr/share/bellwether/questions/"
             ),
             smoked,
@@ -2603,7 +2603,7 @@ fn the_image_carries_modelgate_and_its_question_file_and_each_image_job_dry_runs
             true,
             true,
             vec![true, true],
-            vec!["/usr/share/bellwether/questions/ripple-shadow-0.json"]
+            vec!["/usr/share/bellwether/questions/ripple-shadow-1.json"]
         )
     );
     Ok(())

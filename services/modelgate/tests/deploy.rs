@@ -14,7 +14,7 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 const UNIT_SHELL: &str = "/bin/dash";
 /// Dated before the fixture's observations of 2026-07-01 to 2026-07-03.
 const MODEL: &str = "example/decide-1-20260101";
-const QUESTIONS: &str = "/usr/share/bellwether/questions/ripple-shadow-0.json";
+const QUESTIONS: &str = "/usr/share/bellwether/questions/ripple-shadow-1.json";
 const SETTINGS: [(&str, &str); 8] = [
     ("MODELGATE_MODEL", MODEL),
     ("MODELGATE_RUN_CAP_USD", "0.40"),
@@ -264,7 +264,7 @@ fn shadow(setup: Setup, interrupt: Option<&str>) -> TestResult<Ran> {
         )
         .env(
             "STUB_QUESTIONS",
-            repo("services/modelgate/questions/ripple-shadow-0.json"),
+            repo("services/modelgate/questions/ripple-shadow-1.json"),
         )
         .env("STUB_MODELGATE", env!("CARGO_BIN_EXE_modelgate"))
         .env("STUB_CUT_EXIT", setup.cut_exit.to_string())
@@ -329,7 +329,7 @@ fn shadow(setup: Setup, interrupt: Option<&str>) -> TestResult<Ran> {
     })
 }
 
-/// Section 8 row MG12. The cut: under the store lock without waiting and under its bound, no
+/// Section 8 row MG15. The cut: under the store lock without waiting and under its bound, no
 /// network, the vault read-only, its cutoff the UTC clock's on a host in another zone. The run:
 /// no lock, the default bridge, the key file read-only, every value from the settings. Mutations
 /// 2026-11-23, each alone: the cut's `--network none` removed; the cut's flock removed; the key
@@ -451,7 +451,7 @@ type Case = (
     &'static [&'static str],
 );
 
-/// Section 8 row MG13: whatever ends a run, its cut is gone, and only an envelope with its cost
+/// Section 8 row MG16: whatever ends a run, its cut is gone, and only an envelope with its cost
 /// rewrites the metrics. Mutations 2026-11-23, each alone: the `EXIT` trap removed; the cut's
 /// 124 passed through; the success stamp not carried over an exit 8; an envelope without a cost
 /// written as empty samples; a 137 before the bound read as the bound; the directory count
@@ -763,7 +763,7 @@ fn template() -> TestResult<Vec<(String, String)>> {
     )
 }
 
-/// Section 8 row MG14: no cap, price, model, age limit or request limit has a default, each
+/// Section 8 row MG17: no cap, price, model, age limit or request limit has a default, each
 /// template placeholder is refused by name, a total above the owner's 15 USD is refused, and no
 /// argument can restate a setting; all before any docker call. Mutations 2026-11-23, each alone:
 /// a `${MODELGATE_RUN_CAP_USD:-1}` default; the ceiling test removed; the argument check removed;

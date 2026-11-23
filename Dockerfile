@@ -40,7 +40,7 @@ COPY --from=build /src/target/release/newsvault /src/target/release/modelgate /u
 COPY providers/open-web-feed/hosts/open_web_wires.hosts.json \
      providers/open-web-feed/rules/open-web-feed.rules.json \
      /usr/share/bellwether/
-COPY services/modelgate/questions/ripple-shadow-0.json /usr/share/bellwether/questions/
+COPY services/modelgate/questions/ripple-shadow-1.json /usr/share/bellwether/questions/
 ENV BELLWETHER_VAULT=/vault
 USER 10001
 # tini as PID 1, so a SIGTERM from `docker stop` or the kubelet reaches newsvault.
