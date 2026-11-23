@@ -254,7 +254,7 @@ mod tests {
     /// wrongly (section 3.5). Mutations 2026-11-23: see section 8 row MG12.
     #[test]
     fn a_tag_is_a_ticker_after_an_accepted_exchange_inside_one_pair_of_parentheses() {
-        let read: [(&str, &[&str]); 27] = [
+        let read: [(&str, &[&str]); 28] = [
             ("Largeplat Corp. (NASDAQ: LRGP) today", &["LRGP"]),
             ("Largeplat (Nasdaq:LRGP) and (NasdaqGS : LRGP)", &["LRGP"]),
             ("One company (NASDAQ: LRGP) (NYSE: LRGP)", &["LRGP"]),
@@ -286,6 +286,7 @@ mod tests {
             ("Brackets [NYSE: BRK]", &[]),
             ("Foreign (TSX: FOR) and (LSE: FOR)", &[]),
             ("A bare ticker after a foreign venue (TSX: FOR, FORX)", &[]),
+            ("A bare word before any venue (ACME, NYSE: ABC)", &["ABC"]),
             (
                 "Lower case (NASDAQ: lrgp), a bare word (NYSE: ABC, Inc)",
                 &["ABC"],
