@@ -8,6 +8,7 @@
 //! through a client crate whose name is not in [`CLIENT_CRATES`]. The names are a list, and a list
 //! is not a closure.
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
 use crate::{array_at, cargo_metadata, string_at, ROW_R4};
@@ -132,14 +133,17 @@ pub fn http_client_allowlist_failure(root_manifest: &Path) -> Option<String> {
     ))
 }
 
-/// Row MG10: `None` when the model's owner declares no dependency on the news side and no member
-/// declares one on it. A manifest question, so a file read through `std::fs` passes it.
+/// Row MG10: `None` when the model's owner reaches no crate of the news side, directly or through
+/// another member, and no member declares a dependency on it. A manifest question, so a file read
+/// through `std::fs` passes it.
 pub fn model_owner_isolation_failure(root_manifest: &Path) -> Option<String> {
     let read = || -> Result<Vec<String>, String> {
         let json = cargo_metadata(root_manifest)?;
         let meta: serde_json::Value = serde_json::from_slice(&json)
             .map_err(|why| format!("`cargo metadata` printed something that is not JSON: {why}"))?;
         let mut problems = Vec::new();
+        // Member name to the (name, is under providers/) of each dependency it declares.
+        let mut declared: BTreeMap<String, Vec<(String, bool)>> = BTreeMap::new();
         for package in array_at(&meta, "packages")? {
             let member = string_at(package, "name")?;
             for dependency in array_at(package, "dependencies")? {
@@ -148,12 +152,32 @@ pub fn model_owner_isolation_failure(root_manifest: &Path) -> Option<String> {
                     .get("path")
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|path| path.replace('\\', "/").contains(PROVIDER_DIR));
-                if member == MODEL_OWNER && (NEWS_SIDE.contains(&name.as_str()) || from_providers) {
-                    problems.push(format!("    * {MODEL_OWNER} depends on `{name}`"));
-                }
                 if name == MODEL_OWNER {
                     problems.push(format!("    * {member} depends on `{MODEL_OWNER}`"));
                 }
+                declared
+                    .entry(member.clone())
+                    .or_default()
+                    .push((name, from_providers));
+            }
+        }
+        // Breadth first from the owner over member-to-member edges; `via` is the member that
+        // declares the edge.
+        let mut seen = BTreeSet::from([MODEL_OWNER.to_owned()]);
+        let mut pending = VecDeque::from([MODEL_OWNER.to_owned()]);
+        while let Some(via) = pending.pop_front() {
+            for (name, from_providers) in declared.get(&via).into_iter().flatten() {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                if NEWS_SIDE.contains(&name.as_str()) || *from_providers {
+                    problems.push(if via == MODEL_OWNER {
+                        format!("    * {MODEL_OWNER} depends on `{name}`")
+                    } else {
+                        format!("    * {MODEL_OWNER} reaches `{name}` through `{via}`")
+                    });
+                }
+                pending.push_back(name.clone());
             }
         }
         problems.sort();
@@ -212,7 +236,8 @@ mod tests {
 
     /// Mutations 2026-11-23 on this workspace's own manifests, each red in the test above:
     /// `news-provider` added to `services/modelgate/Cargo.toml`; `modelgate` added to
-    /// `services/newsvault/Cargo.toml`.
+    /// `services/newsvault/Cargo.toml`; `news-provider` added to `snapshot-contract/Cargo.toml`,
+    /// which `modelgate` depends on.
     #[test]
     fn a_news_side_dependency_of_the_model_owner_and_a_dependant_of_it_are_each_named() {
         const TWO: &str =
@@ -243,6 +268,28 @@ mod tests {
         let failure = model_owner_isolation_failure(&reached.root_manifest()).unwrap_or_default();
         assert!(
             failure.contains("newsvault depends on `modelgate`"),
+            "{failure}"
+        );
+        const THREE: &str = "[workspace]\nmembers = [\"services/modelgate\", \"services/newsvault\", \"between\"]\nresolver = \"2\"\n";
+        let through = Tree::new(THREE)
+            .crate_at(
+                "services/modelgate",
+                &manifest(
+                    "modelgate",
+                    "\n[dependencies]\nbetween = { path = \"../../between\" }\n\n[lints]\nworkspace = true\n",
+                ),
+            )
+            .crate_at(
+                "between",
+                &manifest(
+                    "between",
+                    "\n[dependencies]\nnewsvault = { path = \"../services/newsvault\" }\n\n[lints]\nworkspace = true\n",
+                ),
+            )
+            .crate_at("services/newsvault", &manifest("newsvault", INHERITS));
+        let failure = model_owner_isolation_failure(&through.root_manifest()).unwrap_or_default();
+        assert!(
+            failure.contains("modelgate reaches `newsvault` through `between`"),
             "{failure}"
         );
     }
