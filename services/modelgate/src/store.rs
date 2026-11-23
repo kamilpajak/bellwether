@@ -13,7 +13,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use crate::cap::Spent;
 use crate::question::QuestionDoc;
 use crate::request::DecideRequest;
-use crate::response::{Outcome, Reading, ANSWERED_OUTCOMES};
+use crate::response::{Outcome, Reading};
 
 pub const DB_FILE: &str = "gate.sqlite";
 pub const BLOB_DIR: &str = "blobs";
@@ -97,10 +97,34 @@ pub fn stamp(at: DateTime<Utc>) -> String {
     at.format(INSTANT_FORMAT).to_string()
 }
 
+/// A blob that is on disk under its sha256. Its field is private and only [`Store::put_blob`]
+/// builds one, so a row naming a response blob cannot be written before the blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredBlob(String);
+
+impl StoredBlob {
+    #[must_use]
+    pub fn hex(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Where a story stands under one question version, build and repeat index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoryState {
+    /// No request linked to it was ever opened: unlinked, or linked and refused by the cap.
+    NeverAsked,
+    /// A linked request has an attempt and none closed with an answer.
+    Asked,
+    /// A linked request closed with this outcome; `Ok` wins over the two unusable ones.
+    Answered(Outcome),
+}
+
 /// One finalised attempt of a run, as the envelope reads it back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Closed {
     pub outcome: String,
+    pub cost_micro_usd: Option<i64>,
     pub response_sha256: Option<String>,
     pub answering_model: Option<String>,
     pub sent_model: String,
@@ -174,13 +198,13 @@ impl Store {
 
     /// Stores `bytes` under their sha256: staged, fsynced, renamed, and the directory fsynced. A
     /// standing file must already hold these bytes.
-    pub fn put_blob(&self, bytes: &[u8]) -> Result<String, StoreError> {
+    pub fn put_blob(&self, bytes: &[u8]) -> Result<StoredBlob, StoreError> {
         let dir = self.blobs.as_ref().ok_or(StoreError::NoBlobs)?;
         let hex = FileDigest::of(bytes).hex().to_owned();
         let path = dir.join(&hex);
         if path.exists() {
             self.read_blob(&hex)?;
-            return Ok(hex);
+            return Ok(StoredBlob(hex));
         }
         let staging = dir.join(format!("{STAGING_PREFIX}{hex}"));
         let mut file = File::create(&staging).map_err(io(&staging))?;
@@ -190,7 +214,7 @@ impl Store {
         File::open(dir)
             .and_then(|dir| dir.sync_all())
             .map_err(io(dir))?;
-        Ok(hex)
+        Ok(StoredBlob(hex))
     }
 
     /// The blob's bytes, refused when they no longer hash to their name.
@@ -271,6 +295,21 @@ impl Store {
             .optional()?)
     }
 
+    /// Whether `run_id` broke the cost estimate (`None`: it did not) and, if so, whether a run has
+    /// acknowledged it.
+    pub fn cost_break(&self, run_id: &str) -> Result<Option<bool>, StoreError> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM run_events a WHERE a.event = 'cost_model_acked'
+                                AND json_extract(a.detail, '$.acknowledges') = b.run_id)
+                   FROM run_events b WHERE b.event = 'cost_estimate_broken' AND b.run_id = ?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// Runs with a `started` row and no `ended` one: killed, or still running under another lease.
     pub fn runs_left_open(&self, but_not: &str) -> Result<u64, StoreError> {
         let open: i64 = self.db.query_row(
@@ -330,32 +369,44 @@ impl Store {
         Ok(())
     }
 
-    /// Whether an attempt of this request closed with an answer (`Outcome::answered`).
-    pub fn request_answered(&self, idempotency_key: &str) -> Result<bool, StoreError> {
-        Ok(self.db.query_row(
-            "SELECT EXISTS (SELECT 1 FROM attempt_events o
+    /// The answer an attempt of this request closed with, by `Outcome::answered`; `Ok` first.
+    pub fn request_outcome(&self, idempotency_key: &str) -> Result<Option<Outcome>, StoreError> {
+        let mut statement = self.db.prepare_cached(
+            "SELECT f.outcome FROM attempt_events o
                JOIN attempt_events f ON f.attempt_id = o.attempt_id AND f.event = 'finalised'
-               WHERE o.event = 'opened' AND o.idempotency_key = ?1
-                 AND f.outcome IN (?2, ?3, ?4))",
-            params![
-                idempotency_key,
-                ANSWERED_OUTCOMES[0],
-                ANSWERED_OUTCOMES[1],
-                ANSWERED_OUTCOMES[2]
-            ],
+              WHERE o.event = 'opened' AND o.idempotency_key = ?1",
+        )?;
+        let names: Vec<String> = statement
+            .query_map([idempotency_key], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        let mut answers = names
+            .iter()
+            .filter_map(|name| Outcome::named(name))
+            .filter(|outcome| outcome.answered());
+        let first = answers.next();
+        Ok(if answers.any(|outcome| outcome == Outcome::Ok) {
+            Some(Outcome::Ok)
+        } else {
+            first
+        })
+    }
+
+    fn request_asked(&self, idempotency_key: &str) -> Result<bool, StoreError> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM attempt_events
+                             WHERE event = 'opened' AND idempotency_key = ?1)",
+            [idempotency_key],
             |row| row.get(0),
         )?)
     }
 
-    /// `(linked, answered)` for a story under one question version, build and repeat index:
-    /// whether any request was ever linked to it, and whether one of them closed with an answer.
     pub fn story_state(
         &self,
         story_id: &str,
         question_version: &str,
         model: &str,
         repeat_index: u32,
-    ) -> Result<(bool, bool), StoreError> {
+    ) -> Result<StoryState, StoreError> {
         let mut statement = self.db.prepare_cached(
             "SELECT l.idempotency_key FROM labels l
                JOIN requests r ON r.idempotency_key = l.idempotency_key
@@ -368,12 +419,29 @@ impl Store {
                 |row| row.get(0),
             )?
             .collect::<Result<_, _>>()?;
+        let (mut unusable, mut asked) = (None, false);
         for key in &keys {
-            if self.request_answered(key)? {
-                return Ok((true, true));
+            match self.request_outcome(key)? {
+                Some(Outcome::Ok) => return Ok(StoryState::Answered(Outcome::Ok)),
+                Some(other) => unusable = Some(other),
+                None => asked |= self.request_asked(key)?,
             }
         }
-        Ok((!keys.is_empty(), false))
+        Ok(match unusable {
+            Some(outcome) => StoryState::Answered(outcome),
+            None if asked => StoryState::Asked,
+            None => StoryState::NeverAsked,
+        })
+    }
+
+    /// Runs `work` in one transaction: a process killed inside it leaves none of its rows.
+    pub(crate) fn atomically(
+        &self,
+        work: impl FnOnce() -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let transaction = self.db.unchecked_transaction()?;
+        work()?;
+        Ok(transaction.commit()?)
     }
 
     pub(crate) fn write_opened(
@@ -405,7 +473,7 @@ impl Store {
         received_at: DateTime<Utc>,
         http_status: Option<u16>,
         transport_failure: Option<&str>,
-        response_sha256: Option<&str>,
+        response: Option<&StoredBlob>,
     ) -> Result<(), StoreError> {
         self.db.execute(
             "INSERT INTO attempt_events (attempt_id, event, at, requested_at, http_status,
@@ -416,7 +484,7 @@ impl Store {
                 stamp(requested_at),
                 http_status,
                 transport_failure,
-                response_sha256
+                response.map(StoredBlob::hex)
             ],
         )?;
         Ok(())
@@ -516,7 +584,7 @@ impl Store {
     /// Every attempt this run closed, in the order it opened them.
     pub fn closed_by(&self, run_id: &str) -> Result<Vec<Closed>, StoreError> {
         let mut statement = self.db.prepare(
-            "SELECT f.outcome, a.response_sha256, f.answering_model, r.model
+            "SELECT f.outcome, f.cost_micro_usd, a.response_sha256, f.answering_model, r.model
                FROM attempt_events o
                JOIN attempt_events f ON f.attempt_id = o.attempt_id AND f.event = 'finalised'
                LEFT JOIN attempt_events a ON a.attempt_id = o.attempt_id AND a.event = 'answered'
@@ -527,9 +595,10 @@ impl Store {
             .query_map([run_id], |row| {
                 Ok(Closed {
                     outcome: row.get(0)?,
-                    response_sha256: row.get(1)?,
-                    answering_model: row.get(2)?,
-                    sent_model: row.get(3)?,
+                    cost_micro_usd: row.get(1)?,
+                    response_sha256: row.get(2)?,
+                    answering_model: row.get(3)?,
+                    sent_model: row.get(4)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -539,25 +608,21 @@ impl Store {
     /// `(observed_at, received_at)` per story whose request this run closed with an answer.
     pub fn label_times(&self, run_id: &str) -> Result<Vec<(String, String)>, StoreError> {
         let mut statement = self.db.prepare(
-            "SELECT l.observed_at, a.at
+            "SELECT l.observed_at, a.at, f.outcome
                FROM attempt_events o
                JOIN attempt_events a ON a.attempt_id = o.attempt_id AND a.event = 'answered'
                JOIN attempt_events f ON f.attempt_id = o.attempt_id AND f.event = 'finalised'
                JOIN labels l ON l.idempotency_key = o.idempotency_key
-              WHERE o.event = 'opened' AND o.run_id = ?1 AND f.outcome IN (?2, ?3, ?4)",
+              WHERE o.event = 'opened' AND o.run_id = ?1",
         )?;
-        let times = statement
-            .query_map(
-                params![
-                    run_id,
-                    ANSWERED_OUTCOMES[0],
-                    ANSWERED_OUTCOMES[1],
-                    ANSWERED_OUTCOMES[2]
-                ],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?
+        let times: Vec<(String, String, String)> = statement
+            .query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<Result<_, _>>()?;
-        Ok(times)
+        Ok(times
+            .into_iter()
+            .filter(|(_, _, outcome)| Outcome::named(outcome).is_some_and(Outcome::answered))
+            .map(|(observed_at, received_at, _)| (observed_at, received_at))
+            .collect())
     }
 }
 
@@ -579,7 +644,7 @@ fn create(db: &Connection) -> Result<(), StoreError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Store, StoreError, BLOB_DIR, DB_FILE, TABLES};
+    use super::{Store, StoreError, BLOB_DIR, DB_FILE, TABLES, USER_VERSION};
     use chrono::{DateTime, Utc};
     use rusqlite::Connection;
     use tempfile::TempDir;
@@ -605,13 +670,23 @@ mod tests {
         Ok(())
     }
 
-    /// Section 8 row MG9. Mutation 2026-11-23, the `DELETE` trigger loop skipped: red.
+    /// Section 8 row MG9. The table list is read from the database, so a table `SCHEMA` creates
+    /// and `TABLES` omits is red. Mutations 2026-11-23, each red: the `DELETE` trigger loop
+    /// skipped; `floors` dropped from `TABLES`.
     #[test]
     fn an_update_or_delete_of_any_gate_table_is_refused() -> TestResult {
         let root = TempDir::new()?;
         seeded(&root)?;
         let raw = Connection::open(root.path().join(DB_FILE))?;
-        for table in TABLES {
+        let mut created: Vec<String> = raw
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        created.sort();
+        let mut listed = TABLES.to_vec();
+        listed.sort_unstable();
+        assert_eq!(created, listed);
+        for table in &created {
             let rows: i64 =
                 raw.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
             assert_eq!(rows, 1, "{table}");
@@ -626,6 +701,32 @@ mod tests {
                     "{statement}"
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// Mutations 2026-11-23, each red: any `user_version` accepted by `open`; the `foreign_keys`
+    /// pragma removed; `read_only` opening an existing database read-write.
+    #[test]
+    fn another_schema_version_an_unknown_request_and_a_write_through_the_dry_door_are_refused(
+    ) -> TestResult {
+        let (root, newer) = (TempDir::new()?, TempDir::new()?);
+        let store = Store::open(root.path())?;
+        let orphan = store.link_label("story", "item", 1, "o", "no-such-request", "run");
+        assert!(matches!(orphan, Err(StoreError::Sqlite(_))), "{orphan:?}");
+        drop(store);
+        let dry = Store::read_only(root.path())?;
+        let written = dry.set_floor("v", "m", 0, "run");
+        assert!(matches!(written, Err(StoreError::Sqlite(_))), "{written:?}");
+        Connection::open(newer.path().join(DB_FILE))?.pragma_update(
+            None,
+            "user_version",
+            USER_VERSION + 1,
+        )?;
+        for opened in [Store::open(newer.path()), Store::read_only(newer.path())] {
+            assert!(
+                matches!(opened, Err(StoreError::SchemaVersion { found, .. }) if found == USER_VERSION + 1)
+            );
         }
         Ok(())
     }
@@ -648,12 +749,13 @@ mod tests {
     fn a_blob_whose_bytes_changed_is_refused_on_read_and_on_a_second_put() -> TestResult {
         let root = TempDir::new()?;
         let store = Store::open(root.path())?;
-        let hex = store.put_blob(b"as received")?;
-        assert_eq!(store.put_blob(b"as received")?, hex);
-        assert_eq!(store.read_blob(&hex)?, b"as received");
-        std::fs::write(root.path().join(BLOB_DIR).join(&hex), b"edited")?;
+        let blob = store.put_blob(b"as received")?;
+        let hex = blob.hex();
+        assert_eq!(store.put_blob(b"as received")?, blob);
+        assert_eq!(store.read_blob(hex)?, b"as received");
+        std::fs::write(root.path().join(BLOB_DIR).join(hex), b"edited")?;
         assert!(matches!(
-            store.read_blob(&hex),
+            store.read_blob(hex),
             Err(StoreError::BlobAltered { .. })
         ));
         assert!(matches!(
@@ -665,7 +767,8 @@ mod tests {
 
     /// Section 8 row MG3, the half the comparison cannot see. Mutations 2026-11-23: the
     /// `LEFT JOIN` made an inner join (an open attempt drops out of `spent`): red; `COALESCE`
-    /// reduced to `f.cost_micro_usd` (a cost-less close counts as free): red.
+    /// reduced to `f.cost_micro_usd` (a cost-less close counts as free): red; the day scope
+    /// summing this run only: red (run `prior` is the same day and another run).
     #[test]
     fn an_open_an_abandoned_and_a_costless_attempt_each_count_at_their_worst_case() -> TestResult {
         use crate::response::{Outcome, Reading};
@@ -688,13 +791,15 @@ mod tests {
         };
         store.write_opened("old#0", "k", "old", 1_000, yesterday)?;
         close("old#0", Outcome::Ok, Some(300))?;
+        store.write_opened("prior#0", "k", "prior", 1_000, today)?;
+        close("prior#0", Outcome::Ok, Some(40))?;
         store.write_opened("run#0", "k", "run", 1_000, today)?;
         close("run#0", Outcome::Ok, Some(250))?;
         store.write_opened("run#1", "k", "run", 1_000, today)?;
         close("run#1", Outcome::Failed, None)?;
         store.write_opened("run#2", "k", "run", 1_000, today)?;
         let spent = store.spent("run", today)?;
-        assert_eq!((spent.run, spent.day, spent.total), (2_250, 2_250, 2_550));
+        assert_eq!((spent.run, spent.day, spent.total), (2_250, 2_290, 2_590));
         assert_eq!(store.sweep(today, "next")?, 1);
         assert_eq!(store.spent("run", today)?, spent);
         Ok(())
@@ -713,8 +818,11 @@ mod tests {
         store.run_event("run-2", "cost_model_acked", noon, &other)?;
         assert_eq!(store.unacked_cost_break()?.as_deref(), Some("run-1"));
         let this = serde_json::json!({"acknowledges": "run-1"});
+        assert_eq!(store.cost_break("run-1")?, Some(false));
         store.run_event("run-3", "cost_model_acked", noon, &this)?;
         assert_eq!(store.unacked_cost_break()?, None);
+        assert_eq!(store.cost_break("run-1")?, Some(true));
+        assert_eq!(store.cost_break("run-0")?, None);
         Ok(())
     }
 }

@@ -1,5 +1,6 @@
-//! The `modelgate` binary's contract: streams, exits and the error object. No test here leaves a
-//! dry run or reaches a refusal later than the key file, so none opens a socket.
+//! The `modelgate` binary's contract: streams, exits and the error object. No test here opens a
+//! socket: each is a dry run, or is refused at the key file, and the three key cases also name
+//! an alias model, which is refused before any row if a key defect ever lets one through.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -104,10 +105,10 @@ fn help_carries_the_fixed_headings_at_both_levels() -> TestResult {
 }
 
 /// The committed instrument over the committed fixture: seq 1 and 4 carry a body, seq 2 does not.
+/// No key variable is set: mutation 2026-11-23, the key read before the `dry_run` branch: red.
 #[test]
-fn a_dry_run_over_the_committed_fixture_plans_two_requests_and_creates_no_store() -> TestResult {
+fn a_dry_run_over_the_committed_fixture_plans_two_requests_and_needs_no_key() -> TestResult {
     let dir = TempDir::new()?;
-    let key = key_file(&dir, 0o600)?;
     let store = dir.path().join("gate");
     let (snapshot, questions) = (
         repo("snapshot-contract/fixtures/snapshot_v1"),
@@ -118,10 +119,7 @@ fn a_dry_run_over_the_committed_fixture_plans_two_requests_and_creates_no_store(
         snapshot.to_string_lossy(),
         questions.to_string_lossy(),
     );
-    let output = modelgate(
-        &run_args(&store_text, &snapshot, &questions, MODEL),
-        Some(&key),
-    )?;
+    let output = modelgate(&run_args(&store_text, &snapshot, &questions, MODEL), None)?;
     let envelope: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(output.status.code(), Some(0), "{:?}", output.stderr);
     assert!(output.stderr.is_empty());
@@ -145,25 +143,15 @@ fn each_refusal_before_the_store_has_an_empty_stdout_its_code_and_its_exit() -> 
     let questions = repo("services/modelgate/questions/ripple-shadow-0.json");
     let questions = questions.to_string_lossy();
     let absent = dir.path().join("no-key");
+    let sending = || {
+        let mut args = run_args(&store, &snapshot, &questions, "~example/decide-latest");
+        args.retain(|word| *word != "--dry-run");
+        args
+    };
     let cases: [(Vec<&str>, Option<&Path>, &str, i32); 5] = [
-        (
-            run_args(&store, &snapshot, &questions, MODEL),
-            None,
-            "credential_key_missing",
-            2,
-        ),
-        (
-            run_args(&store, &snapshot, &questions, MODEL),
-            Some(&exposed),
-            "credential_key_exposed",
-            2,
-        ),
-        (
-            run_args(&store, &snapshot, &questions, MODEL),
-            Some(&absent),
-            "input_absent",
-            4,
-        ),
+        (sending(), None, "credential_key_missing", 2),
+        (sending(), Some(&exposed), "credential_key_exposed", 2),
+        (sending(), Some(&absent), "input_absent", 4),
         (
             run_args(&store, &snapshot, &questions, "~example/decide-latest"),
             Some(&sound),
@@ -182,6 +170,38 @@ fn each_refusal_before_the_store_has_an_empty_stdout_its_code_and_its_exit() -> 
         assert_eq!(output.status.code(), Some(exit), "{code}");
         assert!(output.stdout.is_empty(), "{code}");
         assert_eq!(error_code(&output)?, code);
+    }
+    assert!(!dir.path().join("gate").exists());
+    Ok(())
+}
+
+/// C4: no cap, price or age limit has a default. Under `--json` the parser's refusal is the
+/// error object. Mutations 2026-11-23, each red: a `default_value` on `--total-cap-usd`;
+/// `Cli::parse` in place of `try_parse` and `usage`.
+#[test]
+fn leaving_out_a_required_option_is_a_usage_error_object_under_json() -> TestResult {
+    let dir = TempDir::new()?;
+    let store = dir.path().join("gate").to_string_lossy().into_owned();
+    let snapshot = repo("snapshot-contract/fixtures/snapshot_v1");
+    let snapshot = snapshot.to_string_lossy();
+    let questions = repo("services/modelgate/questions/ripple-shadow-0.json");
+    let questions = questions.to_string_lossy();
+    for option in [
+        "--run-cap-usd",
+        "--day-cap-usd",
+        "--total-cap-usd",
+        "--input-price-per-mtok",
+        "--give-up-after-hours",
+    ] {
+        let mut args = run_args(&store, &snapshot, &questions, MODEL);
+        let Some(at) = args.iter().position(|word| *word == option) else {
+            return Err(format!("{option} is not in the base arguments").into());
+        };
+        args.drain(at..at + 2);
+        let output = modelgate(&args, None)?;
+        assert_eq!(output.status.code(), Some(2), "{option}");
+        assert!(output.stdout.is_empty(), "{option}");
+        assert_eq!(error_code(&output)?, "invalid_argument", "{option}");
     }
     assert!(!dir.path().join("gate").exists());
     Ok(())

@@ -15,7 +15,10 @@ use modelgate::cmd_shadow::{
     self, Args, Env, ShadowError, ERROR_SCHEMA, EXIT_INCOMPLETE, EXIT_NOT_FOUND, EXIT_OK,
     EXIT_TRANSIENT, EXIT_USAGE,
 };
-use modelgate::wire::{ApiKey, KeyError, ModelWire, ENDPOINT, KEY_FILE_VARIABLE};
+use modelgate::ledger::SendPermit;
+use modelgate::wire::{
+    ApiKey, Exchanged, KeyError, ModelExchange, ModelWire, ENDPOINT, KEY_FILE_VARIABLE,
+};
 
 const STORE_VARIABLE: &str = "BELLWETHER_MODELGATE";
 const DEFAULT_STORE: &str = ".bellwether/modelgate";
@@ -54,15 +57,17 @@ OPTIONS:
 
 OUTPUT:
   stdout: one modelgate.shadow_run/1 object for exits 0 and 8, nothing otherwise.
-  stderr: one modelgate.error/1 object for exits 2, 4 and 7 under --format json.
+  stderr: one modelgate.error/1 object for exits 2, 4 and 7 under --format json;
+          otherwise `error: <text> (<code>)`, then the details when there are any.
 
 EXIT CODES:
-  0  every selected story has an answered request, or nothing was new, or a dry run
+  0  no attempt of this run failed or closed unusable, or nothing was new, or a dry run
   2  invalid_argument, input_unparseable, input_schema_mismatch, credential_key_missing,
      credential_key_exposed, io_failed
   4  input_absent
   7  vendor_unreachable, lease_held (retryable)
-  8  cost_cap_reached, cost_estimate_broken, partial_shadow; the envelope names which
+  8  store_failed, cost_estimate_broken, cost_cap_reached, partial_shadow, unusable_answer;
+     the envelope names which
 
 EXAMPLES:
   modelgate shadow run --snapshot /cuts/3f2a --questions ripple-shadow-0.json \\
@@ -150,7 +155,7 @@ struct RunArgs {
     /// The run id whose cost_estimate_broken this run acknowledges.
     #[arg(long)]
     ack_cost_model: Option<String>,
-    /// Validate, select and plan; send nothing and write nothing.
+    /// Validate, select and plan; send nothing, write nothing and read no key.
     #[arg(long)]
     dry_run: bool,
     /// Accepted and does nothing: no command here prompts or reads stdin.
@@ -188,7 +193,8 @@ fn schema_doc() -> Value {
                      "doc": "over the whole store per UTC day"},
                     {"name": "total_cap_usd", "type": "usd", "required": true,
                      "doc": "over the whole store's lifetime"},
-                    {"name": "input_price_per_mtok", "type": "usd", "required": true},
+                    {"name": "input_price_per_mtok", "type": "usd", "required": true,
+                     "doc": "above zero; 0 is invalid_argument"},
                     {"name": "give_up_after_hours", "type": "integer", "required": true},
                     {"name": "store", "type": "path"},
                     {"name": "from_seq", "type": "integer",
@@ -196,27 +202,29 @@ fn schema_doc() -> Value {
                     {"name": "limit", "type": "integer"},
                     {"name": "sample_only", "type": "flag"},
                     {"name": "repeat_index", "type": "integer", "default": 0},
-                    {"name": "ack_cost_model", "type": "string"},
+                    {"name": "ack_cost_model", "type": "string",
+                     "doc": "a run id with a cost_estimate_broken row, else invalid_argument; one already acknowledged writes nothing"},
                     {"name": "dry_run", "type": "flag",
-                     "doc": "validates, selects and plans; opens no attempt, writes no row and no blob, sends nothing"},
+                     "doc": "validates, selects and plans; opens no attempt, writes no row and no blob, sends nothing, and neither needs nor reads the key file"},
                     {"name": "non_interactive", "type": "flag",
                      "doc": "accepted and does nothing: no command here prompts or reads stdin"},
-                    {"name": "format", "type": "enum", "values": ["human", "json"]},
+                    {"name": "format", "type": "enum", "values": ["human", "json"],
+                     "default": "human"},
                     {"name": "json", "type": "flag", "doc": "alias of --format json"}
                 ],
                 "env": [
                     {"name": KEY_FILE_VARIABLE,
-                     "doc": "names a file holding the API key, mode 0600; there is no variable for the value"},
+                     "doc": "names a file holding the API key, mode 0600; there is no variable for the value; not read under --dry-run"},
                     {"name": STORE_VARIABLE,
                      "doc": "the store when --store is not given, then ~/.bellwether/modelgate"}
                 ],
                 "output": cmd_shadow::SCHEMA,
                 "exits": {
-                    "0": "every selected story has an answered request, or nothing was new, or a dry run",
+                    "0": "no attempt of this run failed or closed unusable, or nothing was new, or a dry run",
                     "2": "invalid_argument, input_unparseable, input_schema_mismatch, credential_key_missing, credential_key_exposed, io_failed",
                     "4": "input_absent: the snapshot, the question file or the key file",
                     "7": "vendor_unreachable (nothing answered, every failure transient), lease_held",
-                    "8": "cost_cap_reached, cost_estimate_broken or partial_shadow, named in the envelope's exit.error_code"
+                    "8": "store_failed, cost_estimate_broken, cost_cap_reached, partial_shadow or unusable_answer, named in the envelope's exit.error_code"
                 },
                 "mutates": true,
                 "spends_money": true,
@@ -225,7 +233,8 @@ fn schema_doc() -> Value {
             {"path": ["schema"], "summary": "This document, or one command of it.",
              "options": [
                  {"name": "command", "type": "words"},
-                 {"name": "format", "type": "enum", "values": ["human", "json"]}
+                 {"name": "format", "type": "enum", "values": ["human", "json"],
+                  "default": "json"}
              ],
              "mutates": false}
         ],
@@ -248,7 +257,9 @@ fn schema_doc() -> Value {
             {"code": "vendor_unreachable", "exit": EXIT_TRANSIENT, "retryable": true},
             {"code": "cost_cap_reached", "exit": EXIT_INCOMPLETE, "retryable": false},
             {"code": "cost_estimate_broken", "exit": EXIT_INCOMPLETE, "retryable": false},
-            {"code": "partial_shadow", "exit": EXIT_INCOMPLETE, "retryable": false}
+            {"code": "partial_shadow", "exit": EXIT_INCOMPLETE, "retryable": false},
+            {"code": "unusable_answer", "exit": EXIT_INCOMPLETE, "retryable": false},
+            {"code": "store_failed", "exit": EXIT_INCOMPLETE, "retryable": false}
         ],
         "stdout_carries_the_result_for_exits": [EXIT_OK, EXIT_INCOMPLETE]
     })
@@ -280,14 +291,35 @@ fn fail(
             json!([])
         },
     });
-    let mut err = std::io::stderr().lock();
-    let written = match format {
-        Format::Json => writeln!(err, "{object}"),
-        Format::Human => writeln!(err, "error: {message} ({code})"),
-    };
+    let written = writeln!(std::io::stderr().lock(), "{}", error_text(&object, format));
     // A closed stderr must not change the verdict.
     match written {
         Ok(()) | Err(_) => exit,
+    }
+}
+
+/// The human form carries the details too: on exit 7 they are the run's envelope, which no
+/// other stream holds.
+fn error_text(object: &Value, format: Format) -> String {
+    let text = |key: &str| object[key].as_str().unwrap_or_default();
+    let details = &object["details"];
+    match format {
+        Format::Json => object.to_string(),
+        Format::Human if details.as_object().is_some_and(|map| !map.is_empty()) => {
+            format!("error: {} ({})\n{details:#}", text("message"), text("code"))
+        }
+        Format::Human => format!("error: {} ({})", text("message"), text("code")),
+    }
+}
+
+/// What a dry run is handed in place of the wire: no key and no socket. `cmd_shadow` returns
+/// before a send under `--dry-run`, so a call here could only be a defect, and it answers as one.
+struct NoWire;
+
+impl ModelExchange for NoWire {
+    fn send(&self, permit: SendPermit, _body: &[u8]) -> Exchanged {
+        let now = Utc::now();
+        Exchanged::new(permit, now, now, Err("no_wire"))
     }
 }
 
@@ -317,21 +349,24 @@ fn shadow_run(run: RunArgs) -> u8 {
             format,
         );
     };
-    let key = match ApiKey::read(|name| std::env::var_os(name)) {
-        Ok(key) => key,
-        Err(failure) => {
-            let exit = key_exit(&failure);
-            return fail(
-                failure.code(),
-                exit,
-                false,
-                &failure.to_string(),
-                &json!({}),
-                format,
-            );
+    let wire: Box<dyn ModelExchange> = if run.dry_run {
+        Box::new(NoWire)
+    } else {
+        match ApiKey::read(|name| std::env::var_os(name)) {
+            Ok(key) => Box::new(ModelWire::new(key)),
+            Err(failure) => {
+                let exit = key_exit(&failure);
+                return fail(
+                    failure.code(),
+                    exit,
+                    false,
+                    &failure.to_string(),
+                    &json!({}),
+                    format,
+                );
+            }
         }
     };
-    let wire = ModelWire::new(key);
     let args = Args {
         snapshot: run.snapshot,
         questions: run.questions,
@@ -350,7 +385,7 @@ fn shadow_run(run: RunArgs) -> u8 {
         dry_run: run.dry_run,
     };
     let env = Env {
-        exchange: &wire,
+        exchange: wire.as_ref(),
         now: &Utc::now,
         sleep: &std::thread::sleep,
     };
@@ -410,8 +445,39 @@ fn schema(command: &[String], format: Format) -> u8 {
     }
 }
 
+fn wants_json(argv: &[String]) -> bool {
+    let named = |pair: &[String]| pair[0] == "--format" && pair[1] == "json";
+    argv.iter()
+        .any(|word| word == "--json" || word == "--format=json")
+        || argv.windows(2).any(named)
+}
+
+/// A refusal by the parser. Under `--json` it is the same error object as any other refusal;
+/// help, version and the human form stay clap's own.
+fn usage(refusal: &clap::Error) -> u8 {
+    let argv: Vec<String> = std::env::args_os()
+        .map(|word| word.to_string_lossy().into_owned())
+        .collect();
+    if refusal.use_stderr() && wants_json(&argv) {
+        let message = refusal.to_string();
+        return fail(
+            "invalid_argument",
+            EXIT_USAGE,
+            false,
+            message.trim_end(),
+            &json!({}),
+            Format::Json,
+        );
+    }
+    refusal.exit()
+}
+
 fn main() -> ExitCode {
-    let exit = match Cli::parse().command {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(refusal) => return ExitCode::from(usage(&refusal)),
+    };
+    let exit = match cli.command {
         Command::Shadow(Shadow::Run(run)) => shadow_run(*run),
         Command::Schema { command, format } => schema(&command, format),
     };
@@ -422,9 +488,27 @@ fn main() -> ExitCode {
 mod tests {
     use clap::CommandFactory;
 
-    use super::{schema_doc, Cli};
+    use serde_json::{json, Value};
 
-    /// Help and schema are two renderings; this holds them to one option list.
+    use super::{error_text, schema_doc, wants_json, Cli, Format};
+
+    /// `(name, required, default)` of an option as the schema states it.
+    fn stated(option: &Value) -> (String, bool, Option<String>) {
+        let default = match &option["default"] {
+            Value::Null => None,
+            Value::String(text) => Some(text.clone()),
+            other => Some(other.to_string()),
+        };
+        (
+            option["name"].as_str().unwrap_or_default().to_owned(),
+            option["required"] == true,
+            default,
+        )
+    }
+
+    /// Help and schema are two renderings; this holds them to one option list, with what is
+    /// required and what has a default. Mutation 2026-11-23, a `default_value` on
+    /// `--total-cap-usd`: red.
     #[test]
     fn every_option_the_parser_takes_is_in_the_schema_and_no_other() {
         let doc = schema_doc();
@@ -442,22 +526,57 @@ mod tests {
                     }
                 };
             }
-            let mut parsed: Vec<String> = command
+            let mut parsed: Vec<(String, bool, Option<String>)> = command
                 .get_arguments()
-                .map(|argument| argument.get_id().to_string())
-                .filter(|id| id != "help" && id != "version")
+                .filter(|argument| !["help", "version"].contains(&argument.get_id().as_str()))
+                .map(|argument| {
+                    let default = argument
+                        .get_default_values()
+                        .first()
+                        .filter(|_| argument.get_action().takes_values())
+                        .map(|value| value.to_string_lossy().into_owned());
+                    (
+                        argument.get_id().to_string(),
+                        argument.is_required_set(),
+                        default,
+                    )
+                })
                 .collect();
-            let mut stated: Vec<String> = entry["options"]
+            let mut in_schema: Vec<(String, bool, Option<String>)> = entry["options"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter_map(|option| option["name"].as_str().map(str::to_owned))
+                .map(stated)
                 .collect();
             parsed.sort();
-            stated.sort();
-            assert_eq!(parsed, stated, "{}", entry["path"]);
+            in_schema.sort();
+            assert_eq!(parsed, in_schema, "{}", entry["path"]);
             checked += 1;
         }
         assert_eq!(checked, 2);
+    }
+
+    /// Exit 7 carries the run's envelope under `details`, and no binary test reaches a send.
+    /// Mutation 2026-11-23, the details arm of `error_text` removed: red.
+    #[test]
+    fn the_human_error_text_carries_the_details_and_json_is_asked_for_in_three_spellings() {
+        let object = json!({"code": "vendor_unreachable", "message": "nothing answered",
+                            "details": {"requests": {"sent": 9}}});
+        let human = error_text(&object, Format::Human);
+        assert!(human.starts_with("error: nothing answered (vendor_unreachable)\n{"));
+        assert!(human.contains("\"sent\": 9"), "{human}");
+        let bare = json!({"code": "lease_held", "message": "held", "details": {}});
+        assert_eq!(error_text(&bare, Format::Human), "error: held (lease_held)");
+        assert_eq!(error_text(&bare, Format::Json), bare.to_string());
+        let argv = |words: &[&str]| {
+            words
+                .iter()
+                .map(|word| (*word).to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(wants_json(&argv(&["shadow", "run", "--json"])));
+        assert!(wants_json(&argv(&["shadow", "run", "--format=json"])));
+        assert!(wants_json(&argv(&["shadow", "run", "--format", "json"])));
+        assert!(!wants_json(&argv(&["shadow", "run", "--format", "human"])));
     }
 }

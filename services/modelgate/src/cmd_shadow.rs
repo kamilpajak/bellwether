@@ -17,7 +17,7 @@ use crate::model::ModelId;
 use crate::question::QuestionDoc;
 use crate::request::{build, DecideRequest};
 use crate::response::{buckets, read, Buckets, Outcome, Reading};
-use crate::store::{stamp, Store, StoreError};
+use crate::store::{stamp, Store, StoreError, StoryState};
 use crate::wire::ModelExchange;
 
 pub const SCHEMA: &str = "modelgate.shadow_run/1";
@@ -157,9 +157,11 @@ struct Stories {
     no_body: u64,
     build_postdates_story: u64,
     already_labelled: u64,
+    already_unusable: u64,
     gave_up: u64,
     selected: u64,
     labelled: u64,
+    unusable: u64,
     truncated: u64,
     left: u64,
 }
@@ -195,10 +197,12 @@ struct Run<'a> {
     consecutive_failed: u32,
     every_failure_transient: bool,
     stopped_by: Option<&'static str>,
+    /// A store failure after a paid send: the run ends through `finish`, not as an error.
+    store_failure: Option<String>,
 }
 
 enum Sent {
-    Answered,
+    Answered(Outcome),
     Failed,
     Refused,
 }
@@ -267,6 +271,11 @@ pub fn run(args: &Args, env: &Env) -> Result<Finished, ShadowError> {
         total: parse_usd(&args.total_cap_usd).map_err(invalid)?,
     };
     let price = parse_usd(&args.input_price_per_mtok).map_err(invalid)?;
+    if price == 0 {
+        return Err(invalid(
+            "--input-price-per-mtok 0 makes every worst case 0, so no cap could refuse a call",
+        ));
+    }
     let file = read_input(&args.questions)?;
     let doc = QuestionDoc::parse(&file)
         .map_err(|why| ShadowError::InputUnparseable(format!("--questions: {why}")))?;
@@ -290,6 +299,18 @@ pub fn run(args: &Args, env: &Env) -> Result<Finished, ShadowError> {
         (Some(fixed), _) => fixed,
         (None, asked) => asked.unwrap_or(manifest.seq_high_water),
     };
+    let mut acknowledges = None;
+    if let Some(named) = &args.ack_cost_model {
+        match store.cost_break(named)? {
+            None => {
+                return Err(invalid(format!(
+                    "--ack-cost-model {named}: no run of that id broke the cost estimate"
+                )))
+            }
+            Some(false) => acknowledges = Some(named),
+            Some(true) => {}
+        }
+    }
     let mut swept = 0;
     if !args.dry_run {
         swept = store.sweep(started, &run_id)?;
@@ -306,7 +327,7 @@ pub fn run(args: &Args, env: &Env) -> Result<Finished, ShadowError> {
                 "input_price_micro_usd_per_mtok": price,
             }),
         )?;
-        if let Some(acknowledged) = &args.ack_cost_model {
+        if let Some(acknowledged) = acknowledges {
             let detail = json!({ "acknowledges": acknowledged });
             store.run_event(&run_id, "cost_model_acked", started, &detail)?;
         }
@@ -335,10 +356,21 @@ pub fn run(args: &Args, env: &Env) -> Result<Finished, ShadowError> {
         consecutive_failed: 0,
         every_failure_transient: true,
         stopped_by,
+        store_failure: None,
     };
     let first = first_sightings(&args.snapshot)?;
     for row in snapshot_contract::rows(&args.snapshot).map_err(unreadable)? {
-        run.consider(&row.map_err(unreadable)?, &first)?;
+        let considered = row
+            .map_err(unreadable)
+            .and_then(|row| run.consider(&row, &first));
+        match considered {
+            Err(ShadowError::Store(why)) if run.requests.sent > 0 => {
+                run.store_failure = Some(why.to_string());
+                run.stopped_by = Some("store_failed");
+                break;
+            }
+            other => other?,
+        }
     }
     run.finish(&manifest, stored_floor.is_none(), swept)
 }
@@ -363,17 +395,16 @@ impl Run<'_> {
         } else if !self.model.predates(instant(&row.observed_at)?) {
             &mut self.stories.build_postdates_story
         } else {
-            let (linked, answered) =
-                self.store
-                    .story_state(&row.story_id, &version, &model, repeat)?;
+            let state = self
+                .store
+                .story_state(&row.story_id, &version, &model, repeat)?;
             let age = self.started - instant(&row.observed_at)?;
             let limit = i64::from(self.args.give_up_after_hours) * SECONDS_PER_HOUR;
-            if answered {
-                &mut self.stories.already_labelled
-            } else if linked && age.num_seconds() > limit {
-                &mut self.stories.gave_up
-            } else {
-                return self.label(row);
+            match state {
+                StoryState::Answered(Outcome::Ok) => &mut self.stories.already_labelled,
+                StoryState::Answered(_) => &mut self.stories.already_unusable,
+                StoryState::Asked if age.num_seconds() > limit => &mut self.stories.gave_up,
+                StoryState::Asked | StoryState::NeverAsked => return self.label(row),
             }
         };
         *counted += 1;
@@ -397,9 +428,9 @@ impl Run<'_> {
         let request = build(&self.doc, &self.model, body, self.args.repeat_index)
             .map_err(|why| ShadowError::InputUnparseable(why.to_string()))?;
         self.stories.truncated += u64::from(request.state_truncated);
-        if self.store.request_answered(&request.idempotency_key)? {
+        if let Some(outcome) = self.store.request_outcome(&request.idempotency_key)? {
             self.requests.already_answered += 1;
-            self.stories.labelled += 1;
+            self.answered(outcome);
             return self.link(row, &request);
         }
         let worst = worst_case(request.bytes.len(), self.price);
@@ -418,8 +449,8 @@ impl Run<'_> {
             .insert_request(&request, self.doc.version(), self.model.as_str())?;
         self.link(row, &request)?;
         match self.send(&request, worst)? {
-            Sent::Answered => {
-                self.stories.labelled += 1;
+            Sent::Answered(outcome) => {
+                self.answered(outcome);
                 self.consecutive_failed = 0;
             }
             Sent::Refused => self.stories.left += 1,
@@ -434,6 +465,15 @@ impl Run<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Only `ok` is a label. An `empty` or `unparseable` answer is final and counted apart.
+    fn answered(&mut self, outcome: Outcome) {
+        if outcome == Outcome::Ok {
+            self.stories.labelled += 1;
+        } else {
+            self.stories.unusable += 1;
+        }
     }
 
     fn link(&self, row: &SnapshotRow, request: &DecideRequest) -> Result<(), ShadowError> {
@@ -497,7 +537,7 @@ impl Run<'_> {
                 }
             }
             if reading.outcome.answered() {
-                return Ok(Sent::Answered);
+                return Ok(Sent::Answered(reading.outcome));
             }
             let (retryable, wait) = match &exchanged.answer {
                 Err(_) => (true, None),
@@ -568,11 +608,19 @@ impl Run<'_> {
                 let bytes = i128::from(bytes);
                 i64::try_from((i128::from(cost) * planned + bytes - 1) / bytes).unwrap_or(i64::MAX)
             });
-        let answered_none = self.stories.labelled == 0;
+        let closed_unusable = count(Outcome::Empty) + count(Outcome::Unparseable);
+        let costless = closed
+            .iter()
+            .filter(|c| Outcome::named(&c.outcome).is_some_and(Outcome::answered))
+            .filter(|c| c.cost_micro_usd.is_none())
+            .count();
+        let answered_none = self.stories.labelled == 0 && closed_unusable == 0;
         let error_code = match self.stopped_by {
+            Some("store_failed") => Some("store_failed"),
             Some("cost_estimate_broken") => Some("cost_estimate_broken"),
             Some("cost_cap_reached") => Some("cost_cap_reached"),
             _ if self.requests.failed_stories > 0 => Some("partial_shadow"),
+            _ if closed_unusable > 0 => Some("unusable_answer"),
             _ => None,
         };
         let unreachable =
@@ -604,8 +652,10 @@ impl Run<'_> {
                 "below_floor": stories.below_floor, "outside_sample": stories.outside_sample,
                 "no_body": stories.no_body,
                 "build_postdates_story": stories.build_postdates_story,
-                "already_labelled": stories.already_labelled, "gave_up": stories.gave_up,
+                "already_labelled": stories.already_labelled,
+                "already_unusable": stories.already_unusable, "gave_up": stories.gave_up,
                 "selected": stories.selected, "labelled": stories.labelled,
+                "unusable": stories.unusable,
                 "truncated": stories.truncated, "left": stories.left,
             },
             "requests": {
@@ -613,6 +663,7 @@ impl Run<'_> {
                 "sent": requests.sent, "already_answered": requests.already_answered,
                 "ok": count(Outcome::Ok), "empty": count(Outcome::Empty),
                 "unparseable": count(Outcome::Unparseable), "failed": count(Outcome::Failed),
+                "costless": costless,
                 "failed_stories": requests.failed_stories,
                 "refused_by_cap": requests.refused_by_cap,
             },
@@ -632,6 +683,7 @@ impl Run<'_> {
             "store": {
                 "attempts_abandoned_by_sweep": swept,
                 "runs_left_open": self.store.runs_left_open(&self.run_id)?,
+                "failure": self.store_failure,
             },
             "stopped_by": self.stopped_by,
             "exit": { "code": if unreachable { EXIT_TRANSIENT } else { exit },
@@ -971,6 +1023,65 @@ mod tests {
         Ok(())
     }
 
+    /// Section 8 row MG3, the day and total scopes over two runs. Mutations 2026-11-23, each red:
+    /// `spent` starting from zero in `run`; the day scope of `Store::spent` summing this run only.
+    #[test]
+    fn a_later_run_is_refused_by_what_an_earlier_run_spent() -> TestResult {
+        let (bench, stub) = (Bench::new()?, Stub::default());
+        let snapshot = cut(&three_stories(), CUTOFF)?;
+        let mut args = bench.args(snapshot.path());
+        args.limit = Some(1);
+        bench.go(&args, &stub)?;
+        assert_eq!(stub.sends(), 1);
+        args.limit = None;
+        // 5 micro-USD spent by the first run; the next worst case is 16; a cap of 20 refuses it.
+        args.day_cap_usd = "0.00002".to_owned();
+        let done = bench.go(&args, &stub)?;
+        assert_eq!(stub.sends(), 1);
+        assert_eq!(at(&done.envelope, "/stopped_by"), "cost_cap_reached");
+        assert_eq!(at(&done.envelope, "/cost_micro_usd/run"), 0);
+        assert_eq!(at(&done.envelope, "/cost_micro_usd/day"), 5);
+        Ok(())
+    }
+
+    /// A stated cost of 0 counts at the worst case of 16: a cap of 20 admits one call, not
+    /// three. Mutation 2026-11-23, the `> 0` filter removed from `response::read`: red (3 sends).
+    #[test]
+    fn a_vendor_cost_of_zero_does_not_make_a_call_free_against_the_cap() -> TestResult {
+        let bench = Bench::new()?;
+        let free = || status(200, &answer_json(MODEL, 0.0));
+        let stub = Stub::scripted(vec![free(), free(), free()]);
+        let snapshot = cut(&three_stories(), CUTOFF)?;
+        let mut args = bench.args(snapshot.path());
+        args.run_cap_usd = "0.00002".to_owned();
+        let done = bench.go(&args, &stub)?;
+        assert_eq!((done.exit, stub.sends()), (8, 1));
+        assert_eq!(at(&done.envelope, "/exit/error_code"), "cost_cap_reached");
+        assert_eq!(at(&done.envelope, "/cost_micro_usd/run"), 16);
+        assert_eq!(at(&done.envelope, "/requests/costless"), 1);
+        Ok(())
+    }
+
+    /// The first story a cap refuses is linked and never asked, so its age cannot give it up.
+    /// Mutation 2026-11-23, `StoryState::Asked` returned for a linked request with no attempt:
+    /// red (`gave_up` 1, two sends).
+    #[test]
+    fn a_story_the_cap_refused_is_asked_by_a_later_run_whatever_its_age() -> TestResult {
+        let (bench, stub) = (Bench::new()?, Stub::default());
+        let snapshot = cut(&three_stories(), CUTOFF)?;
+        let mut args = bench.args(snapshot.path());
+        args.run_cap_usd = "0.00001".to_owned();
+        let capped = bench.go(&args, &stub)?;
+        assert_eq!((capped.exit, stub.sends()), (8, 0));
+        assert_eq!(bench.count("SELECT COUNT(*) FROM labels")?, 1);
+        bench.now.set("2026-11-21T10:00:01Z".parse()?);
+        let later = bench.go(&bench.args(snapshot.path()), &stub)?;
+        assert_eq!((later.exit, stub.sends()), (0, 3));
+        assert_eq!(at(&later.envelope, "/stories/gave_up"), 0);
+        assert_eq!(at(&later.envelope, "/stories/labelled"), 3);
+        Ok(())
+    }
+
     /// Section 8 row MG4. Mutation 2026-11-23, `story_state` answering `(false, false)`: red.
     #[test]
     fn a_request_already_answered_is_not_sent_again() -> TestResult {
@@ -983,6 +1094,104 @@ mod tests {
         assert_eq!(at(&again.envelope, "/requests/sent"), 0);
         assert_eq!(at(&again.envelope, "/changed"), false);
         assert_eq!(bench.count("SELECT COUNT(*) FROM requests")?, 3);
+        Ok(())
+    }
+
+    /// Section 8 row MG4: `empty` is final, reported with exit 8 by the run that paid for it and
+    /// never asked again. Mutations 2026-11-23, each red: `Outcome::answered` true for `Ok`
+    /// only; the `unusable_answer` arm removed from `finish`.
+    #[test]
+    fn an_empty_answer_is_reported_once_and_never_asked_again() -> TestResult {
+        let bench = Bench::new()?;
+        let stub = Stub::scripted(vec![status(200, "{\"model\":\"m\",\"answers\":{}}")]);
+        let snapshot = cut(&three_stories()[..1], CUTOFF)?;
+        let first = bench.go(&bench.args(snapshot.path()), &stub)?;
+        assert_eq!((first.exit, stub.sends()), (8, 1));
+        assert_eq!(at(&first.envelope, "/exit/error_code"), "unusable_answer");
+        assert_eq!(at(&first.envelope, "/stories/labelled"), 0);
+        assert_eq!(at(&first.envelope, "/stories/unusable"), 1);
+        let second = bench.go(&bench.args(snapshot.path()), &stub)?;
+        assert_eq!((second.exit, stub.sends()), (0, 1));
+        assert_eq!(at(&second.envelope, "/stories/already_unusable"), 1);
+        assert_eq!(at(&second.envelope, "/stories/already_labelled"), 0);
+        Ok(())
+    }
+
+    /// A 2xx body that carries a vendor error is a failed attempt: nothing is labelled, the run
+    /// exits 8 and a later run asks again. Mutation 2026-11-23, the `error` arm of
+    /// `response::read` removed: red (exit code `unusable_answer`, run two sends nothing).
+    #[test]
+    fn a_vendor_error_served_with_a_200_is_a_failed_attempt_and_is_asked_again() -> TestResult {
+        let bench = Bench::new()?;
+        let limited = || {
+            status(
+                200,
+                "{\"error\":{\"code\":429,\"message\":\"Rate limit exceeded\"}}",
+            )
+        };
+        let stub = Stub::scripted(vec![limited(), limited(), limited()]);
+        let snapshot = cut(&three_stories(), CUTOFF)?;
+        let first = bench.go(&bench.args(snapshot.path()), &stub)?;
+        assert_eq!((first.exit, stub.sends()), (8, 3));
+        assert_eq!(at(&first.envelope, "/exit/error_code"), "partial_shadow");
+        assert_eq!(at(&first.envelope, "/stories/labelled"), 0);
+        assert_eq!(at(&first.envelope, "/requests/failed"), 3);
+        assert_eq!(at(&first.envelope, "/requests/empty"), 0);
+        let second = bench.go(&bench.args(snapshot.path()), &stub)?;
+        assert_eq!((second.exit, stub.sends()), (0, 6));
+        assert_eq!(at(&second.envelope, "/stories/labelled"), 3);
+        Ok(())
+    }
+
+    /// Section 8 row MG4. An attempt a dead process left open is no answer. Mutations
+    /// 2026-11-23, each red: `abandoned` read as an answer; the sweep not run.
+    #[test]
+    fn a_story_whose_only_open_attempt_was_abandoned_is_asked_again() -> TestResult {
+        let bench = Bench::new()?;
+        let stub = Stub::scripted(vec![status(400, "{}")]);
+        let snapshot = cut(&three_stories()[..1], CUTOFF)?;
+        bench.go(&bench.args(snapshot.path()), &stub)?;
+        assert_eq!(stub.sends(), 1);
+        Connection::open(bench.store().join(DB_FILE))?.execute(
+            "INSERT INTO attempt_events (attempt_id, event, at, idempotency_key, run_id,
+                 worst_case_micro_usd)
+             SELECT 'dead#0', 'opened', '2026-11-20T23:00:00.000000Z', idempotency_key,
+                    'dead', 16 FROM requests",
+            [],
+        )?;
+        let done = bench.go(&bench.args(snapshot.path()), &stub)?;
+        assert_eq!(at(&done.envelope, "/store/attempts_abandoned_by_sweep"), 1);
+        assert_eq!(stub.sends(), 2);
+        assert_eq!(at(&done.envelope, "/stories/labelled"), 1);
+        Ok(())
+    }
+
+    /// Section 8 row MG11. Mutations 2026-11-23, each red: `story_state` ignoring the build;
+    /// ignoring the question version; `Store::floor` ignoring the build; `record_question_doc`
+    /// not called.
+    #[test]
+    fn a_second_build_and_a_second_document_each_label_the_story_again() -> TestResult {
+        let (bench, stub) = (Bench::new()?, Stub::default());
+        let snapshot = cut(&three_stories()[..1], CUTOFF)?;
+        let mut args = bench.args(snapshot.path());
+        bench.go(&args, &stub)?;
+        args.model = "example/decide-2-20261015".to_owned();
+        let other_build = bench.go(&args, &stub)?;
+        assert_eq!(at(&other_build.envelope, "/stories/labelled"), 1);
+        let reworded = TWO_QUESTIONS.replace("It does.", "Yes, it does.");
+        std::fs::write(bench.root.path().join("questions.json"), &reworded)?;
+        let other_doc = bench.go(&args, &stub)?;
+        assert_eq!(at(&other_doc.envelope, "/stories/labelled"), 1);
+        assert_eq!(stub.sends(), 3);
+        assert_eq!(bench.count("SELECT COUNT(*) FROM question_docs")?, 2);
+        assert_eq!(bench.count("SELECT COUNT(*) FROM floors")?, 3);
+        for file in [TWO_QUESTIONS, reworded.as_str()] {
+            let named = bench
+                .store()
+                .join(BLOB_DIR)
+                .join(FileDigest::of(file.as_bytes()).hex());
+            assert_eq!(std::fs::read(named)?, file.as_bytes());
+        }
         Ok(())
     }
 
@@ -1182,12 +1391,104 @@ mod tests {
         Ok(())
     }
 
+    /// Section 8 row MG6: a refused call's body and a 200 with spaces, a newline and unsorted
+    /// keys are each on disk byte for byte. Mutations 2026-11-23, each red: the blob stored for
+    /// a 2xx only; the body parsed and written back before `put_blob`.
+    #[test]
+    fn a_refusal_and_an_oddly_spaced_answer_are_each_stored_byte_for_byte() -> TestResult {
+        let bench = Bench::new()?;
+        let refusal = "{\"error\":\"bad request\"}";
+        let spaced = "{ \"usage\": {\"cost\": 0.000005},\n  \"model\": \"m\", \"answers\": {\"b\": 1, \"a\": 2} }\n";
+        let stub = Stub::scripted(vec![status(400, refusal), status(200, spaced)]);
+        let snapshot = cut(&three_stories()[..2], CUTOFF)?;
+        bench.go(&bench.args(snapshot.path()), &stub)?;
+        let db = Connection::open(bench.store().join(DB_FILE))?;
+        let mut statement = db.prepare(
+            "SELECT response_sha256 FROM attempt_events WHERE event = 'answered' ORDER BY rowid",
+        )?;
+        let named: Vec<Option<String>> = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        let stored: Vec<Vec<u8>> = named
+            .iter()
+            .flatten()
+            .map(|hex| std::fs::read(bench.store().join(BLOB_DIR).join(hex)))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(stored, [refusal.as_bytes(), spaced.as_bytes()]);
+        Ok(())
+    }
+
+    /// Reads the store from inside a send, the way a second process would.
+    struct Watching {
+        db: PathBuf,
+        seen: RefCell<Vec<(i64, i64)>>,
+    }
+
+    impl ModelExchange for Watching {
+        fn send(&self, permit: SendPermit, _body: &[u8]) -> Exchanged {
+            let count = |sql: &str| {
+                Connection::open(&self.db)
+                    .and_then(|db| db.query_row(sql, [], |row| row.get(0)))
+                    .unwrap_or(-1)
+            };
+            self.seen.borrow_mut().push((
+                count("SELECT COUNT(*) FROM attempt_events WHERE event = 'opened'"),
+                count("SELECT COUNT(*) FROM attempt_events WHERE event <> 'opened'"),
+            ));
+            let at: DateTime<Utc> = NOW.parse().unwrap_or_default();
+            Exchanged::new(permit, at, at, status(200, &answer_json(MODEL, COST_USD)))
+        }
+    }
+
+    /// Section 8 row MG1. Mutation 2026-11-23, `AttemptSlot::open` keeping its fields and
+    /// `close` writing the `opened` row after the answer: red (no row while the call is out).
+    #[test]
+    fn the_opened_row_is_in_the_store_while_the_call_is_out() -> TestResult {
+        let bench = Bench::new()?;
+        let watching = Watching {
+            db: bench.store().join(DB_FILE),
+            seen: RefCell::default(),
+        };
+        let snapshot = cut(&three_stories()[..1], CUTOFF)?;
+        bench.go(&bench.args(snapshot.path()), &watching)?;
+        assert_eq!(*watching.seen.borrow(), [(1, 0)]);
+        Ok(())
+    }
+
+    /// A store failure after a paid send still ends the run: an envelope, exit 8 and an `ended`
+    /// row. The planted file makes `put_blob` refuse the answer's bytes. Mutation 2026-11-23,
+    /// the `store_failed` arm of the row loop in `run` removed: red (an `io_failed` error).
+    #[test]
+    fn a_store_failure_after_a_send_ends_the_run_with_an_envelope_and_exit_eight() -> TestResult {
+        let (bench, stub) = (Bench::new()?, Stub::default());
+        let answer = answer_json(MODEL, COST_USD);
+        let blobs = bench.store().join(BLOB_DIR);
+        std::fs::create_dir_all(&blobs)?;
+        std::fs::write(blobs.join(FileDigest::of(answer.as_bytes()).hex()), "other")?;
+        let snapshot = cut(&three_stories(), CUTOFF)?;
+        let done = bench.go(&bench.args(snapshot.path()), &stub)?;
+        assert_eq!((done.exit, stub.sends()), (8, 1));
+        assert_eq!(at(&done.envelope, "/exit/error_code"), "store_failed");
+        assert_eq!(at(&done.envelope, "/stopped_by"), "store_failed");
+        let failure = at(&done.envelope, "/store/failure");
+        assert!(
+            failure.as_str().is_some_and(|text| text.contains("blob")),
+            "{failure}"
+        );
+        assert_eq!(
+            bench.count("SELECT COUNT(*) FROM run_events WHERE event = 'ended'")?,
+            1
+        );
+        Ok(())
+    }
+
     /// B9 and section 8 row MG7. The answering id is stored raw and compared when read; the
     /// answer is kept. Mutation 2026-11-23, `answering_model` written as the id sent: red.
     #[test]
     fn an_answer_from_another_id_is_kept_and_counted_when_read() -> TestResult {
         let bench = Bench::new()?;
-        let undated = "example/decide-1";
+        // Mixed case: mutation 2026-11-23, the id lower-cased before it is stored: red.
+        let undated = "Example/Decide-1";
         let stub = Stub::scripted(vec![status(200, &answer_json(undated, COST_USD))]);
         let snapshot = cut(&three_stories()[..2], CUTOFF)?;
         let done = bench.go(&bench.args(snapshot.path()), &stub)?;
@@ -1288,9 +1589,17 @@ mod tests {
         assert_eq!((latched.exit, stub.sends()), (8, 1));
         assert_eq!(at(&latched.envelope, "/stories/left"), 2);
         let mut args = bench.args(snapshot.path());
+        let acks = "SELECT COUNT(*) FROM run_events WHERE event = 'cost_model_acked'";
+        // Mutation 2026-11-23, the `cost_break` check removed from `run`: red (a row is written).
+        args.ack_cost_model = Some("no-such-run".to_owned());
+        let unknown = bench.go(&args, &stub).err();
+        assert_eq!(unknown.map(|why| why.code()), Some("invalid_argument"));
+        assert_eq!(bench.count(acks)?, 0);
         args.ack_cost_model = at(&broke.envelope, "/run_id").as_str().map(str::to_owned);
         let acked = bench.go(&args, &stub)?;
         assert_eq!((acked.exit, stub.sends()), (0, 3));
+        let again = bench.go(&args, &stub)?;
+        assert_eq!((again.exit, bench.count(acks)?), (0, 1));
         Ok(())
     }
 
@@ -1323,6 +1632,13 @@ mod tests {
         assert_eq!(at(&planned.envelope, "/changed"), false);
         assert_eq!(at(&planned.envelope, "/requests/planned"), 2);
         assert_eq!(at(&planned.envelope, "/stories/already_labelled"), 1);
+        // A build with no floor yet: mutation 2026-11-23, `set_floor` moved out of the
+        // `!dry_run` block: red, alone (a read-only refusal) and with a read-write dry door.
+        args.model = "example/decide-2-20261015".to_owned();
+        let other_build = bench.go(&args, &stub)?;
+        assert_eq!(bench.files()?, before);
+        assert_eq!(at(&other_build.envelope, "/requests/planned"), 3);
+        assert_eq!(at(&other_build.envelope, "/changed"), false);
         Ok(())
     }
 
@@ -1384,6 +1700,10 @@ mod tests {
                 run_cap_usd: "1e3".to_owned(),
                 ..base.clone()
             },
+            Args {
+                input_price_per_mtok: "0".to_owned(),
+                ..base.clone()
+            },
         ];
         let refusals: Vec<(&str, u8)> = cases
             .iter()
@@ -1397,6 +1717,7 @@ mod tests {
                 ("input_schema_mismatch", 2),
                 ("input_absent", 4),
                 ("input_unparseable", 2),
+                ("invalid_argument", 2),
                 ("invalid_argument", 2),
             ]
         );

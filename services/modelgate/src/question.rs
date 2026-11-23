@@ -345,6 +345,11 @@ pub(crate) mod tests {
         let long = TWO_QUESTIONS.replace("It does.", &"x".repeat(MAX_QUESTIONS_BYTES));
         let separator = TWO_QUESTIONS.replace("It does.", "It\\u001fdoes.");
         let extra = TWO_QUESTIONS.replace("\"name\"", "\"threshold\": 0.5, \"name\"");
+        // Mutations 2026-11-23, each red: `deny_unknown_fields` removed from `Question`; from
+        // `QuestionOption`.
+        let in_question = TWO_QUESTIONS.replace("\"type\"", "\"threshold\": 0.5, \"type\"");
+        let in_option =
+            TWO_QUESTIONS.replace("\"description\"", "\"threshold\": 0.5, \"description\"");
         assert_eq!(
             error_of(&noul_options),
             Some(QuestionError::NoulOptions("states_fact".to_owned()))
@@ -364,7 +369,12 @@ pub(crate) mod tests {
         assert!(matches!(error_of(&schema), Some(QuestionError::Schema(_))));
         assert!(matches!(error_of(&long), Some(QuestionError::TooLong(_))));
         assert_eq!(error_of(&separator), Some(QuestionError::Separator));
-        assert!(matches!(error_of(&extra), Some(QuestionError::Shape(_))));
+        for unknown_field in [&extra, &in_question, &in_option] {
+            assert!(
+                matches!(error_of(unknown_field), Some(QuestionError::Shape(_))),
+                "{unknown_field}"
+            );
+        }
     }
 
     /// The committed instrument parses, fits the budget, and its version is the one section 3.5

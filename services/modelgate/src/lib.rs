@@ -28,6 +28,22 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! A permit built by hand, from outside the crate:
+//!
+//! ```compile_fail
+//! use modelgate::ledger::SendPermit;
+//! let _forged = SendPermit { attempt_id: String::new() }; // E0451: the field is private
+//! ```
+//!
+//! **The positive control for the block above.** Same `use` line, and the type only named.
+//!
+//! ```no_run
+//! use modelgate::ledger::SendPermit;
+//! fn _held(permit: SendPermit) -> SendPermit {
+//!     permit
+//! }
+//! ```
 
 pub mod cap;
 pub mod cmd_shadow;
@@ -47,6 +63,9 @@ mod tests {
     const NO_RUN: &str = "no_run";
     const SEND_WITHOUT_A_PERMIT: &str = "wire.send(body)";
     const SEND_WITH_A_PERMIT: &str = "wire.send(permit, body)";
+    const PERMIT_IMPORT: &str = "use modelgate::ledger::SendPermit;";
+    const PERMIT_BUILT_BY_HAND: &str = "SendPermit { attempt_id";
+    const PERMIT_ONLY_NAMED: &str = "permit: SendPermit";
 
     /// The header's fenced blocks, in order. The fence is assembled, so this function's own text
     /// does not split the file it reads.
@@ -81,5 +100,23 @@ mod tests {
         assert_eq!(annotation(&control), NO_RUN, "{control}");
         assert!(control.contains(DOC_IMPORT), "{control}");
         assert!(control.contains(SEND_WITH_A_PERMIT), "{control}");
+    }
+
+    /// Mutation 2026-11-23, `SendPermit::attempt_id` made `pub`: red (the block compiles).
+    #[test]
+    fn a_permit_built_by_hand_does_not_compile() {
+        let forged = block(2);
+        assert_eq!(annotation(&forged), COMPILE_FAIL, "{forged}");
+        assert!(forged.contains(PERMIT_IMPORT), "{forged}");
+        assert!(forged.contains(PERMIT_BUILT_BY_HAND), "{forged}");
+    }
+
+    #[test]
+    fn the_positive_control_for_that_block_only_names_the_permit_type_and_compiles() {
+        let control = block(3);
+        assert_eq!(annotation(&control), NO_RUN, "{control}");
+        assert!(control.contains(PERMIT_IMPORT), "{control}");
+        assert!(control.contains(PERMIT_ONLY_NAMED), "{control}");
+        assert!(!control.contains(PERMIT_BUILT_BY_HAND), "{control}");
     }
 }

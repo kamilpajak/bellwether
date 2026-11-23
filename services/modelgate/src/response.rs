@@ -12,16 +12,31 @@ use crate::question::{QuestionDoc, QuestionKind};
 pub enum Outcome {
     /// 2xx, a JSON object, a non-empty `answers` object.
     Ok,
-    /// 2xx, a JSON object, no answer in it.
+    /// 2xx, a JSON object, no answer in it and no `error` member.
     Empty,
     /// 2xx and not a JSON object. The bytes are kept.
     Unparseable,
-    /// No 2xx: a transport failure or another status.
+    /// No 2xx (a transport failure or another status), or a 2xx object that carries an `error`
+    /// member and no answer.
     Failed,
     Abandoned,
 }
 
 impl Outcome {
+    pub const ALL: [Self; 5] = [
+        Self::Ok,
+        Self::Empty,
+        Self::Unparseable,
+        Self::Failed,
+        Self::Abandoned,
+    ];
+
+    /// The outcome a `finalised` row names.
+    #[must_use]
+    pub fn named(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|outcome| outcome.name() == name)
+    }
+
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -33,21 +48,20 @@ impl Outcome {
         }
     }
 
-    /// Whether the request needs no further send. A failed or abandoned attempt is retried by a
-    /// later run.
+    /// Whether the request needs no further send. `Empty` and `Unparseable` are final: paid once,
+    /// bytes kept, reported, never asked again (section 8 row MG4). A failed or abandoned attempt
+    /// is retried by a later run. The store's queries read this function, not a second list.
     #[must_use]
     pub const fn answered(self) -> bool {
         matches!(self, Self::Ok | Self::Empty | Self::Unparseable)
     }
 }
 
-/// The names of the outcomes for which [`Outcome::answered`] holds, for the store's queries.
-pub const ANSWERED_OUTCOMES: [&str; 3] = ["ok", "empty", "unparseable"];
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reading {
     pub outcome: Outcome,
-    /// The vendor's `usage.cost`, rounded up. `None` when it sent none.
+    /// The vendor's `usage.cost`, rounded up. `None` when it sent none or stated zero: a call
+    /// stated free would otherwise leave every cap unarmed, so it counts at its worst case.
     pub cost_micro_usd: Option<i64>,
     /// The vendor's `model` string, raw. Compared with the id sent at read time only.
     pub answering_model: Option<String>,
@@ -63,7 +77,8 @@ pub fn read(status: u16, body: &[u8]) -> Reading {
     let cost_micro_usd = parsed
         .as_ref()
         .and_then(|value| value["usage"]["cost"].as_f64())
-        .and_then(micros_of);
+        .and_then(micros_of)
+        .filter(|micros| *micros > 0);
     let answering_model = parsed
         .as_ref()
         .and_then(|value| value["model"].as_str())
@@ -73,6 +88,7 @@ pub fn read(status: u16, body: &[u8]) -> Reading {
         None => Outcome::Unparseable,
         Some(value) => match value["answers"].as_object() {
             Some(answers) if !answers.is_empty() => Outcome::Ok,
+            _ if !value["error"].is_null() => Outcome::Failed,
             _ => Outcome::Empty,
         },
     };
@@ -129,7 +145,8 @@ mod tests {
       "answers":{"scope":{"type":"choice","choice":"issuer_only","probabilities":{"issuer_only":0.9,"whole_category":0.1}},
                  "states_fact":{"type":"noul","noul":0.8}}}"#;
 
-    /// A failed call, an empty one and an unreadable one never arrive as one answer.
+    /// A failed call, an empty one and an unreadable one never arrive as one answer. Mutation
+    /// 2026-11-23, the `error` arm of `read` removed: red (a 200 carrying an error reads `empty`).
     #[test]
     fn each_kind_of_answer_reads_as_its_own_outcome() {
         let outcomes = [
@@ -138,6 +155,11 @@ mod tests {
             read(200, br#"{"model":"m"}"#),
             read(200, b"<html>gateway</html>"),
             read(200, b"[1]"),
+            read(
+                200,
+                br#"{"error":{"code":429,"message":"Rate limit exceeded"}}"#,
+            ),
+            read(200, br#"{"error":"overloaded","answers":{}}"#),
             read(429, br#"{"error":"slow down"}"#),
             read(500, ANSWERED.as_bytes()),
         ]
@@ -150,6 +172,8 @@ mod tests {
                 Outcome::Empty,
                 Outcome::Unparseable,
                 Outcome::Unparseable,
+                Outcome::Failed,
+                Outcome::Failed,
                 Outcome::Failed,
                 Outcome::Failed,
             ]
@@ -166,6 +190,23 @@ mod tests {
         );
         let bare = read(200, br#"{"answers":{"a":{}}}"#);
         assert_eq!((bare.cost_micro_usd, bare.answering_model), (None, None));
+    }
+
+    /// Mutation 2026-11-23, the `> 0` filter removed from `read`: red.
+    #[test]
+    fn a_stated_cost_of_zero_reads_as_no_cost_stated() {
+        let free = read(200, br#"{"usage":{"cost":0.0},"answers":{"a":{}}}"#);
+        assert_eq!(free.cost_micro_usd, None);
+    }
+
+    #[test]
+    fn every_outcome_is_found_again_by_its_name_and_three_of_the_five_are_final() {
+        for outcome in Outcome::ALL {
+            assert_eq!(Outcome::named(outcome.name()), Some(outcome));
+        }
+        assert_eq!(Outcome::named("collapsed"), None);
+        let last = Outcome::ALL.map(Outcome::answered);
+        assert_eq!(last, [true, true, true, false, false]);
     }
 
     #[test]
