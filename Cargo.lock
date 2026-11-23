@@ -1123,6 +1123,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "modelgate"
+version = "0.1.0"
+dependencies = [
+ "canon",
+ "chrono",
+ "clap",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "snapshot-contract",
+ "tempfile",
+ "thiserror",
+ "ureq",
+]
+
+[[package]]
 name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

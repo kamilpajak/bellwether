@@ -1,0 +1,14 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "model_request",
+  "note": "The idempotency key of one decide call: kind, request format, question version, state digest, dated build, repeat index. No story field: two stories with one body share one request. Reproduced with Python 3 hashlib on 2026-11-23.",
+  "input": {
+    "kind": "decide",
+    "request_format": "modelgate.request/1",
+    "question_version": "321548859a9e285aa568099763f31eddd33996167d06000009187293c1d3a802",
+    "state_digest": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+    "model": "example/decide-1-20260101",
+    "repeat_index": 0
+  },
+  "sha256": "68d8468289f939704da7a7263357e5a24faee693aa519053cb1e01c7e7f8eee5"
+}

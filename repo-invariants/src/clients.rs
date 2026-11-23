@@ -1,12 +1,14 @@
-//! The one-crate HTTP allowlist: `docs/design/architecture.md` section 8 row R4's first hole.
-//! Only the seam crate may DECLARE an HTTP or model client, asked of `cargo metadata` for the
-//! same reason row G1 asks it there - `workspace.members` is not the member set.
+//! The HTTP allowlist: `docs/design/architecture.md` section 8 row R4's first hole. Only the two
+//! conversation owners may DECLARE an HTTP or model client, asked of `cargo metadata` for the
+//! same reason row G1 asks it there - `workspace.members` is not the member set. Beside it, the
+//! isolation of the model's owner from the news side (row MG10).
 //!
 //! What a manifest question cannot see, stated so the row does not claim it: a call site. A member
 //! may still reach a socket through `std::net`, through `std::process::Command` running curl, or
 //! through a client crate whose name is not in [`CLIENT_CRATES`]. The names are a list, and a list
 //! is not a closure.
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
 use crate::{array_at, cargo_metadata, string_at, ROW_R4};
@@ -37,9 +39,18 @@ pub const CLIENT_CRATES: [&str; 20] = [
     "ureq",
 ];
 
-/// The members allowed to declare one. One name, which is what makes the check complete rather
-/// than a convention: `news-provider::wire` is the only module in the workspace holding a client.
-pub const CLIENT_ALLOWLIST: [&str; 1] = ["news-provider"];
+/// The members allowed to declare one: one per kind of conversation, each sending only through
+/// a permit its own ledger hands out. `news-provider::wire` talks to news vendors and
+/// `modelgate::wire` to a model (decision D7 of section 3.5, 2026-11-23). A third name is an
+/// edit to R4.
+pub const CLIENT_ALLOWLIST: [&str; 2] = ["modelgate", "news-provider"];
+
+/// The model's owner, and the crates it may not reach: the news seam, its adapters and the
+/// vault. It reads news only as a snapshot file (section 3.5).
+pub const MODEL_OWNER: &str = "modelgate";
+const NEWS_SIDE: [&str; 2] = ["news-provider", "newsvault"];
+const PROVIDER_DIR: &str = "providers/";
+const ROW_MG10: &str = "docs/design/architecture.md section 8 row MG10";
 
 /// One declared edge from a workspace member to a client crate.
 #[derive(Debug, PartialEq, Eq)]
@@ -122,6 +133,67 @@ pub fn http_client_allowlist_failure(root_manifest: &Path) -> Option<String> {
     ))
 }
 
+/// Row MG10: `None` when the model's owner reaches no crate of the news side, directly or through
+/// another member, and no member declares a dependency on it. A manifest question, so a file read
+/// through `std::fs` passes it.
+pub fn model_owner_isolation_failure(root_manifest: &Path) -> Option<String> {
+    let read = || -> Result<Vec<String>, String> {
+        let json = cargo_metadata(root_manifest)?;
+        let meta: serde_json::Value = serde_json::from_slice(&json)
+            .map_err(|why| format!("`cargo metadata` printed something that is not JSON: {why}"))?;
+        let mut problems = Vec::new();
+        // Member name to the (name, is under providers/) of each dependency it declares.
+        let mut declared: BTreeMap<String, Vec<(String, bool)>> = BTreeMap::new();
+        for package in array_at(&meta, "packages")? {
+            let member = string_at(package, "name")?;
+            for dependency in array_at(package, "dependencies")? {
+                let name = string_at(dependency, "name")?;
+                let from_providers = dependency
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|path| path.replace('\\', "/").contains(PROVIDER_DIR));
+                if name == MODEL_OWNER {
+                    problems.push(format!("    * {member} depends on `{MODEL_OWNER}`"));
+                }
+                declared
+                    .entry(member.clone())
+                    .or_default()
+                    .push((name, from_providers));
+            }
+        }
+        // Breadth first from the owner over member-to-member edges; `via` is the member that
+        // declares the edge.
+        let mut seen = BTreeSet::from([MODEL_OWNER.to_owned()]);
+        let mut pending = VecDeque::from([MODEL_OWNER.to_owned()]);
+        while let Some(via) = pending.pop_front() {
+            for (name, from_providers) in declared.get(&via).into_iter().flatten() {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                if NEWS_SIDE.contains(&name.as_str()) || *from_providers {
+                    problems.push(if via == MODEL_OWNER {
+                        format!("    * {MODEL_OWNER} depends on `{name}`")
+                    } else {
+                        format!("    * {MODEL_OWNER} reaches `{name}` through `{via}`")
+                    });
+                }
+                pending.push_back(name.clone());
+            }
+        }
+        problems.sort();
+        Ok(problems)
+    };
+    match read() {
+        Err(why) => Some(format!("{why}\n\nThe invariant is {ROW_MG10}.\n")),
+        Ok(problems) if problems.is_empty() => None,
+        Ok(problems) => Some(format!(
+            "The model's owner is not isolated ({ROW_MG10}):\n\n{}\n\n`{MODEL_OWNER}` reads news \
+             only as a snapshot file, and nothing links the crate that spends money.\n",
+            problems.join("\n")
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -134,25 +206,91 @@ mod tests {
     const SEAM: &str = "news-provider";
 
     /// Row R4 over this workspace. The mutation is in the architecture's own cell: adding
-    /// `ureq` to `panel-contract/Cargo.toml` turns this red, measured 2026-11-13.
+    /// `ureq` to `panel-contract/Cargo.toml` turns this red, measured 2026-11-13 and again
+    /// 2026-11-23 with two names allowed.
     #[test]
     fn only_the_seam_crate_declares_an_http_client() {
         let failure = http_client_allowlist_failure(&root_manifest()).unwrap_or_default();
         assert!(failure.is_empty(), "\n\n{failure}\n");
     }
 
-    /// The seam crate is on the allowlist because it holds the client, so the gate has to stay
-    /// green over the one member that really does declare one.
+    /// Each allowed member is on the list because it holds a client, so the gate has to stay
+    /// green over the two members that really do declare one, and the list holds no spare name.
     #[test]
-    fn the_seam_crate_declares_the_only_client_this_workspace_holds() {
+    fn the_two_conversation_owners_declare_the_only_clients_this_workspace_holds() {
         let declared = declared_clients(&root_manifest()).unwrap();
-        assert_eq!(
-            declared,
-            vec![DeclaredClient {
-                member: SEAM.to_owned(),
-                dependency: "ureq".to_owned(),
-                kind: "normal".to_owned(),
-            }]
+        let edge = |member: &str| DeclaredClient {
+            member: member.to_owned(),
+            dependency: "ureq".to_owned(),
+            kind: "normal".to_owned(),
+        };
+        assert_eq!(declared, vec![edge(MODEL_OWNER), edge(SEAM)]);
+        assert_eq!(CLIENT_ALLOWLIST, [MODEL_OWNER, SEAM]);
+    }
+
+    /// Row MG10 over this workspace.
+    #[test]
+    fn the_model_owner_depends_on_nothing_of_the_news_side_and_nothing_depends_on_it() {
+        assert_eq!(model_owner_isolation_failure(&root_manifest()), None);
+    }
+
+    /// Mutations 2026-11-23 on this workspace's own manifests, each red in the test above:
+    /// `news-provider` added to `services/modelgate/Cargo.toml`; `modelgate` added to
+    /// `services/newsvault/Cargo.toml`; `news-provider` added to `snapshot-contract/Cargo.toml`,
+    /// which `modelgate` depends on.
+    #[test]
+    fn a_news_side_dependency_of_the_model_owner_and_a_dependant_of_it_are_each_named() {
+        const TWO: &str =
+            "[workspace]\nmembers = [\"services/modelgate\", \"services/newsvault\"]\nresolver = \"2\"\n";
+        let reaches = Tree::new(TWO)
+            .crate_at(
+                "services/modelgate",
+                &manifest(
+                    "modelgate",
+                    "\n[dependencies]\nnewsvault = { path = \"../newsvault\" }\n\n[lints]\nworkspace = true\n",
+                ),
+            )
+            .crate_at("services/newsvault", &manifest("newsvault", INHERITS));
+        let failure = model_owner_isolation_failure(&reaches.root_manifest()).unwrap_or_default();
+        assert!(
+            failure.contains("modelgate depends on `newsvault`"),
+            "{failure}"
+        );
+        let reached = Tree::new(TWO)
+            .crate_at("services/modelgate", &manifest("modelgate", INHERITS))
+            .crate_at(
+                "services/newsvault",
+                &manifest(
+                    "newsvault",
+                    "\n[dependencies]\nmodelgate = { path = \"../modelgate\" }\n\n[lints]\nworkspace = true\n",
+                ),
+            );
+        let failure = model_owner_isolation_failure(&reached.root_manifest()).unwrap_or_default();
+        assert!(
+            failure.contains("newsvault depends on `modelgate`"),
+            "{failure}"
+        );
+        const THREE: &str = "[workspace]\nmembers = [\"services/modelgate\", \"services/newsvault\", \"between\"]\nresolver = \"2\"\n";
+        let through = Tree::new(THREE)
+            .crate_at(
+                "services/modelgate",
+                &manifest(
+                    "modelgate",
+                    "\n[dependencies]\nbetween = { path = \"../../between\" }\n\n[lints]\nworkspace = true\n",
+                ),
+            )
+            .crate_at(
+                "between",
+                &manifest(
+                    "between",
+                    "\n[dependencies]\nnewsvault = { path = \"../services/newsvault\" }\n\n[lints]\nworkspace = true\n",
+                ),
+            )
+            .crate_at("services/newsvault", &manifest("newsvault", INHERITS));
+        let failure = model_owner_isolation_failure(&through.root_manifest()).unwrap_or_default();
+        assert!(
+            failure.contains("modelgate reaches `newsvault` through `between`"),
+            "{failure}"
         );
     }
 

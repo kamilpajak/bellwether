@@ -559,7 +559,7 @@ fn report_rows(pass: RowPass, stated: Option<&Stated>, findings: &mut Vec<Findin
 }
 
 /// The batch's rows; the columns are already known to equal [`data_schema`].
-fn rows_of(batch: &RecordBatch) -> Result<Vec<SnapshotRow>, String> {
+pub(crate) fn rows_of(batch: &RecordBatch) -> Result<Vec<SnapshotRow>, String> {
     let seq = batch
         .column(0)
         .as_any()
