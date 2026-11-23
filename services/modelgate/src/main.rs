@@ -70,7 +70,7 @@ EXIT CODES:
      the envelope names which
 
 EXAMPLES:
-  modelgate shadow run --snapshot /cuts/3f2a --questions ripple-shadow-0.json \\
+  modelgate shadow run --snapshot /cuts/3f2a --questions ripple-shadow-1.json \\
       --model typesafe/jev-1.14-20261014 --run-cap-usd 0.40 --day-cap-usd 1.50 \\
       --total-cap-usd 40 --input-price-per-mtok 0.042 --give-up-after-hours 24 \\
       --dry-run --format json

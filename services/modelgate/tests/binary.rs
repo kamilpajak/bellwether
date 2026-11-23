@@ -112,7 +112,7 @@ fn a_dry_run_over_the_committed_fixture_plans_two_requests_and_needs_no_key() ->
     let store = dir.path().join("gate");
     let (snapshot, questions) = (
         repo("snapshot-contract/fixtures/snapshot_v1"),
-        repo("services/modelgate/questions/ripple-shadow-0.json"),
+        repo("services/modelgate/questions/ripple-shadow-1.json"),
     );
     let (store_text, snapshot, questions) = (
         store.to_string_lossy(),
@@ -127,7 +127,7 @@ fn a_dry_run_over_the_committed_fixture_plans_two_requests_and_needs_no_key() ->
     assert_eq!(envelope["dry_run"], true);
     assert_eq!(envelope["requests"]["planned"], 2);
     assert_eq!(envelope["stories"]["no_body"], 1);
-    assert_eq!(envelope["question_document"], "ripple-shadow/0");
+    assert_eq!(envelope["question_document"], "ripple-shadow/1");
     assert!(!store.exists());
     Ok(())
 }
@@ -140,7 +140,7 @@ fn each_refusal_before_the_store_has_an_empty_stdout_its_code_and_its_exit() -> 
     let store = dir.path().join("gate").to_string_lossy().into_owned();
     let snapshot = repo("snapshot-contract/fixtures/snapshot_v1");
     let snapshot = snapshot.to_string_lossy();
-    let questions = repo("services/modelgate/questions/ripple-shadow-0.json");
+    let questions = repo("services/modelgate/questions/ripple-shadow-1.json");
     let questions = questions.to_string_lossy();
     let absent = dir.path().join("no-key");
     let sending = || {
@@ -184,7 +184,7 @@ fn leaving_out_a_required_option_is_a_usage_error_object_under_json() -> TestRes
     let store = dir.path().join("gate").to_string_lossy().into_owned();
     let snapshot = repo("snapshot-contract/fixtures/snapshot_v1");
     let snapshot = snapshot.to_string_lossy();
-    let questions = repo("services/modelgate/questions/ripple-shadow-0.json");
+    let questions = repo("services/modelgate/questions/ripple-shadow-1.json");
     let questions = questions.to_string_lossy();
     for option in [
         "--run-cap-usd",

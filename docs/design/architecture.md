@@ -657,7 +657,7 @@
 
 ### 3.5 `ModelRequest` / `ModelResponse` — the only exit to a model (amended 2026-11-23)
 
-- Built: `services/modelgate`, `decide` calls only, and one command, `modelgate shadow run` (§8 rows MG1 to MG11). `generate` is design, no code.
+- Built: `services/modelgate`, `decide` calls only, and one command, `modelgate shadow run` (§8 rows MG1 to MG13). `generate` is design, no code.
 - Nothing has been sent to a model: every test runs against a stub or a `127.0.0.1` listener. "Not verified", below, lists what the first paid call decides.
 
 | request | notes |
@@ -667,7 +667,7 @@
 | `model` | a dated build id, `<id>-YYYYMMDD` with a real date. An alias (a leading `~`, or no date suffix) is refused before any row or socket (`modelgate::model::ModelId`) |
 | `state` | the text the model reads: a story's `body` from a snapshot (§3.0), cut at a character boundary to 13,000 JSON-escaped bytes (`STATE_BUDGET_BYTES`). `state_digest` is the sha256 of the text sent |
 | `schema` | `decide`: question id to `noul` (yes/no) or `choice` (named options, each described). `generate`: text and choice. **No schema has a numeric or date type: a model cannot be asked for a price, a return, a magnitude, a count, a date or a threshold.** A `score` type (2 to 10 described levels, never a number) is design, no code |
-| `request_format` | `modelgate.request/1`: the JSON layout, the state budget, the 16,500-byte bound on the encoded questions (`MAX_QUESTIONS_BYTES`) and the 30,000-byte ceiling on the whole body. The two budgets are independent, so two documents read the same cut of one story (`two_documents_of_different_length_cut_one_body_at_the_same_point`) |
+| `request_format` | `modelgate.request/2` (2026-11-23): the JSON layout, the state budget, the 20,000-byte bound on the encoded questions (`MAX_QUESTIONS_BYTES`) and the 33,200-byte ceiling on the whole body (`REQUEST_CEILING_BYTES`: 36 bytes of layout + a 128-byte model id + the two budgets = 33,164). The two budgets are independent, so two documents read the same cut of one story (`two_documents_of_different_length_cut_one_body_at_the_same_point`). `modelgate.request/1` (16,500 and 30,000) named no stored row: nothing was sent under it. Rejected, keeping 30,000 by cutting the state: `ripple-shadow/1` is 19,627 bytes, which leaves a state of 10,209, and D17 already asks whether 13,000 is too little. Cost: the largest request grows from 29,664 to 33,164 bytes, so its worst case grows by 11.8%. What the ceiling no longer bounds: "Not verified", the size limit; decision D19 |
 | `idempotency_key` | `canon::digest::model_request` over (kind, request_format, question_version, state_digest, model, repeat_index). No story field: two stories with one body share one request, and each gets its own `labels` row. An ANSWERED request is never sent again; a process killed between the send and the commit of `answered` and `finalised` pays once more |
 | `repeat_index` | `decide`: 0 is the label; 1 and above repeat the same bytes and are instrument noise. `generate`: the draw index (design) |
 
@@ -706,10 +706,12 @@ The store (`~/.bellwether/modelgate`, or `BELLWETHER_MODELGATE`; never the vault
 | `run_events` | (`run_id`, event) | `started` (snapshot, caps and price in force), `ended`, `cost_estimate_broken`, `cost_model_acked` |
 | `requests` | `idempotency_key` | digests, byte counts, `state_truncated`; no story field |
 | `labels` | (`story_id`, `idempotency_key`) | the story's first-sighted row: `item_id`, `seq`, `observed_at` |
+| `prior_coverage` | (`story_id`, `coverage_version`) | "Prior coverage", below: the cut it was counted over, `tag_count`, the tags and the three window counts, both NULL when `tag_count` is 0 |
 | `attempt_events` | (`attempt_id`, event) | `opened` (worst-case cost), `answered` (status or transport failure kind, response sha256, both instants), `finalised` (outcome, cost, answering id), `abandoned` |
 
 - Every table refuses `UPDATE` and `DELETE` by trigger; `PRAGMA synchronous=FULL`; one writer under a `LOCK` file.
-- Order of writes for one call: `requests` and the request blob, `labels`, `opened`, permit, send, response blob, then `answered` and `finalised` in one transaction.
+- Order of writes for one call: `prior_coverage`, `requests` and the request blob, `labels`, `opened`, permit, send, response blob, then `answered` and `finalised` in one transaction.
+- `user_version` is 2 since `prior_coverage` (2026-11-23). A store of version 1 is refused with `input_schema_mismatch`; none holds a row, because no run has written one.
 - `Store::write_answered` takes a `StoredBlob`, which only `Store::put_blob` returns, so the row cannot be written before the blob it names.
 - No `answers` table and no `shadow stats` command: both are derivable from the blobs at any time.
 
@@ -740,29 +742,93 @@ The key:
 - **Stated tension:** a decision model is close to deterministic. It is the measuring instrument. The non-deterministic part of the direction, a generative model proposing affected company profiles, arrives with candidate retrieval and is not built.
 - **Where a new effect can be:** issuer-level reactions to bad news are documented signals. The issuer layer is an instrument check. The hypothesis is the category layer.
 
-| judgment | model | primitive | in `ripple-shadow/0` |
+| judgment | model | primitive | in `ripple-shadow/1` |
 |---|---|---|---|
 | source role | decision | choice | `source_role` |
-| materiality | decision | choice + noul | `materiality`, `states_concrete_fact` |
+| kind of content | decision | choice + noul | `content_kind`, `states_concrete_fact` |
 | scope | decision | choice + noul | `scope`, `names_a_category_of_companies` |
 | issuer event class, 36 classes, 21 of them adverse | decision | choice + noul | `event_class`, `any_listed_event_fits` |
 | co-occurring adverse events (a release bundles results, a guidance cut and a departure) | decision | one noul per adverse class | 21 × `ev_<class>` |
 | key-person circumstances | decision | noul × 9 | `kp_*`: departure, appointment, chief executive or founder, chief financial officer, long tenure, successor named, immediate, benign reason, linked to an investigation |
 | issuer direction (comparison arm only) | decision | choice | `issuer_effect` |
+| significance for the issuer, 4 ordered levels | decision | choice | `issuer_significance`: `none`, `minor`, `major`, `critical` |
+| circumstances, asked whatever the class | decision | noul × 9 | `cx_*`: a state body is involved, criminal or national-security allegations, forced or under pressure, international reach, a magnitude is stated, previously announced or expected, an interim successor, an investigation open, the issuer calls it material |
+| a stated magnitude, in words | decision | choice | `cx_magnitude_size`: `none_stated`, `small` (under about a tenth of what it changes), `large` (about a tenth or more) |
 | stance toward a category, 6 stances + neutral + cannot tell | decision | choice, and 5 atomic nouls beside it | `stance_to_category`, `st_*` |
+| significance for a category of other companies, the same 4 levels | decision | choice | `category_significance` |
+| asymmetry between the issuer and the category | decision | noul × 4 | `as_*`: it matters more to others, the issuer is large or leading and the others smaller or specialised, the issuer opens or standardises what others need, the text names the category or its problem as the purpose |
 | cause scope | decision | choice | `cause_scope` |
 | relation typing for an (event, candidate) pair | decision | choice + noul | not asked: nothing produces candidates |
 | affected company profiles, supporting span | generative | text | not asked: `generate` is design |
 
-- The document: `services/modelgate/questions/ripple-shadow-0.json`, 45 questions (7 choice, 38 noul), 16,280 encoded bytes (from `planned_bytes` of a `--dry-run` over `snapshot-contract/fixtures/snapshot_v1`, 2026-11-23).
-- `question_version` `b640ef308e78176fc1b2e7577f1c13d1abaefe08d0284e8139da779f64a8cb07`; `the_committed_ripple_shadow_document_parses_and_has_the_version_the_design_names` reads this line, so an edit to the file without an edit here is red.
+- The document: `services/modelgate/questions/ripple-shadow-1.json`, 61 questions (10 choice, 51 noul), 19,627 encoded bytes (`QuestionDoc::wire().len()`, 2026-11-23).
+- `question_version` `9793b743ce2b4e4dd73a77475dd13c030b64c49117422faaed3fb8642f554e40`; `the_committed_ripple_shadow_document_parses_and_has_the_version_the_design_names` reads this line and the size above, so an edit to the file without an edit here is red.
+- `ripple-shadow/0` (45 questions, 16,280 bytes) was never sent and its file is deleted.
+
+| from version 0 to 1 | encoded bytes |
+|---|---|
+| the 45 questions of version 0, reworded: "the company the text is mainly about" is "the text's main company", the `ev_*` and `kp_*` lead-ins are shorter, a noul whose two descriptions said only yes and no says `Yes.` and `No.` | 16,280 to 15,152 |
+| 16 new questions: `issuer_significance`, `category_significance`, 4 `as_*`, 9 `cx_*` nouls, `cx_magnitude_size` | 4,476, with their separators |
+
+- The owner's point, 2026-11-23: an event's weight depends on its circumstances. A chief executive forced out under an international scandal is not a planned retirement; an outlook lowered by 2% is not one lowered by 40%. The class label carries neither.
+
+| part of the weight | who answers | state |
+|---|---|---|
+| the company's weight: market capitalisation, rank, the size ratio between the issuer and the affected companies | code, with the price collector | not built |
+| scale and circumstances the text states | the model: the two significance questions, `cx_*`, `as_*` | asked in `ripple-shadow/1` |
+| surprise: what the archive already said about the company | code: "Prior coverage", below | built; the company only, the matter is not matched |
+
+- **Significance is relative** (owner, 2026-11-23): a large platform company releasing open AI models for calibrating quantum processors is minor for the issuer and major for small quantum companies.
+  - It is asked twice, `issuer_significance` and `category_significance`, on one scale, and never as one "materiality".
+  - Version 0's `materiality` asked the kind of content. It is `content_kind` now, and its instruction says a release is a new event however ordinary for its maker.
+  - `category_significance` tells the model to judge the other companies alone: an event ordinary for the main company can matter greatly to them.
+- **Nothing is gated on the issuer's significance.** Every question is asked of every selected story (`every_question_is_asked_of_every_story_and_prior_coverage_is_recorded_and_never_sent`). A later gate to candidate retrieval reads `category_significance`, never `issuer_significance`.
+- `as_issuer_large_others_smaller` records what the text says of size. The size ratio itself is data for code and is not asked.
+- The boundary of `cx_magnitude_size`, a tenth of what the event changes, was written 2026-11-23 before any answer and is fitted to nothing.
+- `kp_successor_named` and `kp_linked_to_investigation_or_dispute` stay beside `cx_interim_successor_named` and `cx_investigation_open`: each pair is a consistency check (K7).
+- Examples: `services/modelgate/tests/fixtures/ripple-shadow-1.examples.json`, 5 synthetic stories, each with the options its author expects (the release above; a forced departure under charges in two countries; a planned retirement; an outlook lowered by 2% and by 40%). Hand-written; no model has read them; comparing a build's answers with them is not built.
 - The repository is public, so the answer spaces and the hypothesis are public (owner decision D15, open).
-- All 45 questions are asked of every story in one request. Unverified: the predecessor's client states the vendor judges each question independently against the same state.
-- The 15 classes that are not adverse have no `ev_` noul: with a noul for all but `routine_or_promotional` the encoded document measured 19,792 bytes (Python `json.dumps`, compact, 2026-11-23), above its 16,500-byte bound.
+- All 61 questions are asked of every story in one request. Unverified: the predecessor's client states the vendor judges each question independently against the same state.
+- The 15 classes that are not adverse have no `ev_` noul: with a noul for all but `routine_or_promotional` the encoded document measured 19,792 bytes (Python `json.dumps`, compact, 2026-11-23), above the 16,500-byte bound of that day.
 - `shared_bad_news` and `rival_weakened` are not options: they are the predicted direction for peers, which is the hypothesis. Code derives them from `cause_scope` × an adverse class.
 - `undermines_category` is a stance: neither "absorbs" nor "substitutes" describes a statement that a category is years from usefulness.
 - No question names the subject company: a decision model returns no text. Issuer resolution is code over the stored body, not built, so the issuer layer is not an alert.
-- **Coverage, carried into any later claim:** the wires carry no NVIDIA product releases (16 hits for the name since 2026-11-19 are law-firm alerts; production store, read 2026-11-23). A chief executive's departure at a large company reaches this archive only through a wire release or an 8-K. The shadow would not have seen the owner's own example.
+- **Coverage, carried into any later claim:** the wires carry no NVIDIA product releases (16 hits for the name since 2026-11-19 are law-firm alerts; production store, read 2026-11-23). A chief executive's departure at a large company reaches this archive only through a wire release or an 8-K. The shadow would not have seen either of the owner's own examples.
+
+#### Prior coverage (`modelgate::coverage`, built 2026-11-23; not run on production)
+
+- Per labelled story: how many earlier stories of the same cut carry one of its exchange-ticker tags. Code computes it; no request carries it.
+- Written when a story is selected and its request built (`cmd_shadow::Run::cover`), from the row's whole `body`, not the cut state.
+- Earlier: a row of the SAME cut whose `observed_at` is strictly before the story's first `observed_at` and at or after the window's start. Windows: 1, 7 and 30 days.
+- Count: distinct other `story_id`s whose body carries at least one of the story's tags.
+- `complete` is false when the cut's earliest `observed_at` is after the window's start; the count is then a floor. The archive starts 2026-11-19, so every 30-day count is a floor until 2026-12-19.
+- A story with no tag is stored as `tag_count` 0 with NULL counts, never as three zeros; a `CHECK` on the table refuses the mixed forms.
+- One row per (`story_id`, `coverage_version`), and the first written stays: a later cut that holds a late-visible earlier row does not rewrite it. `snapshot_id` names the cut counted over.
+- `coverage_version`: `prior-coverage/1(ticker-tag/1;NASDAQ=NASDAQ,NASDAQGS,NASDAQGM,NASDAQCM;NYSE=NYSE;NYSEAMERICAN=NYSEAMERICAN,NYSEMKT,AMEX;NYSEARCA=NYSEARCA;OTC=OTC,OTCQB,OTCQX,OTCPINK,OTCMKTS;days=1,7,30)`, built from the exchange table and the windows, so a change of either is another token and never pools with these rows. The parenthesis rule, the separators and the ticker shape are named `ticker-tag/1` by hand.
+
+| `ticker-tag/1` | rule |
+|---|---|
+| group | the text between a `(` and the next `)`, holding no `(` and at most 120 bytes |
+| piece | the group split at `;` and `,` |
+| pair | a piece split at its first `:` into exchange and ticker; any other piece is skipped |
+| exchange | upper-cased, spaces removed, then one of: `NASDAQ`, `NASDAQGS`, `NASDAQGM`, `NASDAQCM` (family `NASDAQ`); `NYSE`; `NYSEAMERICAN`, `NYSEMKT`, `AMEX` (family `NYSEAMERICAN`); `NYSEARCA`; `OTC`, `OTCQB`, `OTCQX`, `OTCPINK`, `OTCMKTS` (family `OTC`) |
+| ticker | 1 to 5 upper-case ASCII letters, then optionally `.` or `-` and 1 or 2 more; case is not folded |
+| tag | `FAMILY:TICKER`, as in `NASDAQ:LRGP` |
+
+| not seen, or seen wrongly | effect |
+|---|---|
+| a release with no tag, a tag outside parentheses or in brackets | `no_tag` |
+| a listing on an exchange outside the table: TSX, LSE, every other non-US venue | `no_tag`, or the US listing alone |
+| a company named without a ticker, which is most third-party text about a large company | not counted as an earlier story |
+| one company written under two families | two tags, counted apart |
+| a ticker passed to another company within 30 days | counted as one company |
+| an earlier row with no body, or in no cut | not counted |
+| the source of the earlier story | not read: a law-firm alert counts like a release |
+| the matter | not matched: the count is about the company, not the event |
+| visibility at the story's own instant | not asked: the order is `observed_at` within one cut, so a day-dated row observed earlier and visible only later counts when the cut holds it |
+
+- The grammar is written from the wire convention and measured against nothing. The share of `no_tag` on production is unknown until the first dry run reports it.
+- Reader: the envelope's `prior_coverage`: `version`, `stories`, `no_tag`, `tagged`, and per window `none` (tagged stories with no earlier story), `some`, `max` and `incomplete`. A run reads back the rows it wrote; a dry run reports the records it would write.
 
 #### The shadow run (`modelgate shadow run`, built 2026-11-23; not run)
 
@@ -800,28 +866,30 @@ The key:
 | 2 | `invalid_argument`, `input_unparseable`, `input_schema_mismatch`, `credential_key_missing`, `credential_key_exposed`, `io_failed` | empty |
 
 - `--dry-run` validates, selects, builds every request and applies the caps; it opens the store read-only, takes no lease, reads no key, and writes and sends nothing. `planned_estimate` is null until 100 costed attempts of the same version and build exist.
-- The envelope reads the store back: outcomes, `requests.costless`, the three spends, label lag (p50, p90, max of `received − observed_at`), the answering ids, and `questions.answered` / `not_answered` / `missing` parsed from this run's `ok` response blobs.
+- The envelope reads the store back: outcomes, `requests.costless`, the three spends, label lag (p50, p90, max of `received − observed_at`), the answering ids, `questions.answered` / `not_answered` / `missing` parsed from this run's `ok` response blobs, and `prior_coverage` ("Prior coverage").
 - `stories.labelled` counts `ok` answers only; `stories.unusable` counts the `empty` and `unparseable` ones.
 
 What the shadow measures. A number is read per `question_version` and never across two; a threshold marked "owner" is written here before the first paid call (D10), with the least number of sessions a version must have before it is read.
 
 | # | measurement | how | kills or changes the plan |
 |---|---|---|---|
-| K1 | frequency of category events | stories per week: `source_role` `issuer_own`, `materiality` `new_fact`, `scope` `whole_category`, stance not `neutral` or `cannot_tell` | owner: not set |
+| K1 | frequency of category events | stories per week: `source_role` `issuer_own`, `content_kind` `new_fact`, `scope` `whole_category`, stance not `neutral` or `cannot_tell` | owner: not set |
 | K2 | frequency of adverse issuer events | stories per week with an adverse class, `issuer_own`, per class | owner: not set |
 | K3 | repeat noise | `--repeat-index 1` and `2` on the sample: top-option flip rate, mean absolute probability difference | owner: not set |
 | K4 | determinism | share of byte-identical responses to byte-identical requests, with the gap between the sends: a repeat seconds later may be a cache hit | none; decides whether repeats continue |
 | K5 | order sensitivity | a second document with another option order, on the sample | owner: not set |
 | K6 | wording sensitivity | a reworded document on the sample | owner: not set |
-| K7 | self-consistency | `stance_to_category` against the `st_*` nouls; `event_class` against `ev_*` and `any_listed_event_fits` | owner: not set |
+| K7 | self-consistency | `stance_to_category` against the `st_*` nouls; `event_class` against `ev_*` and `any_listed_event_fits`; `category_significance` `none` against `scope` and `names_a_category_of_companies`; `cx_magnitude_size` `none_stated` against `cx_magnitude_stated`; `kp_successor_named` against `cx_interim_successor_named`; `kp_linked_to_investigation_or_dispute` against `cx_investigation_open` | owner: not set |
 | K8 | class list fit | share of `issuer_own` + `new_fact` stories whose `any_listed_event_fits` is below one half | none; a high share revises the list (a new version) |
 | K9 | noise share | share of `third_party_solicitation` and `not_a_company_event` | none; sizes the gate |
 | K10 | time | label lag p50, p90 | owner: not set |
 | K11 | cost | vendor cost per story against the estimate | owner: the yearly budget |
 | K12 | instrument health | `failed`, `empty`, `unparseable`, `not_answered`, `truncated`, `answered_by_another_id` | a build that stops answering |
-| K13 | hand check | the owner labels 50 sampled shadow stories blind for `scope`, `issuer_effect`, stance | owner: not set |
+| K13 | hand check | the owner labels 50 sampled shadow stories blind for `scope`, `issuer_effect`, stance, `issuer_significance`, `category_significance` | owner: not set |
+| K14 | frequency of asymmetric events | stories per week: `issuer_significance` `none` or `minor`, and `category_significance` `major` or `critical` | owner: not set |
+| K15 | reach of prior coverage | share of `no_tag`; per window `none`, `some`, `incomplete` | none; a high `no_tag` share revises the grammar (a new `coverage_version`) |
 
-- K1 to K9 and K13 need the answers read out of the blobs; no command does that yet. The envelope carries K10 to K12 per run.
+- K1 to K9, K13 and K14 need the answers read out of the blobs; no command does that yet. The envelope carries K10 to K12 and K15 per run.
 - "How much has already moved" reads returns and is not a shadow measurement.
 
 Runbook, in order. No step has been executed.
@@ -844,7 +912,7 @@ Not verified, because it needs a paid call or the VPS; the write path stores raw
 - whether a dated request echoes its dated id;
 - billed tokens against request bytes, and whether the state is billed once or once per question;
 - whether a byte-identical request returns identical bytes; the rate limit; how long a dated build is served;
-- the size limit: the predecessor's one non-transport refusal in 23,823 calls was an HTTP 400 on a 180,725-character title against the vendor's 32,000-token limit (its `2026_10_jev_feature_layer.py`, read 2026-11-23). The 30,000-byte ceiling is below that under any tokenisation of at least one byte per token;
+- the size limit: the predecessor's one non-transport refusal in 23,823 calls was an HTTP 400 on a 180,725-character title against the vendor's 32,000-token limit (its `2026_10_jev_feature_layer.py`, read 2026-11-23). The 33,200-byte ceiling is above 32,000, so it is under that limit only if a token averages at least 1.04 bytes (33,200 ÷ 32,000); the 30,000 it replaces held at one byte per token. An inference, not a measurement: the predecessor's 32,000-character states and their questions passed that limit. A full-length story refused here closes `failed` with a 400, final for the run, and shows in K12;
 - body sizes in the production store, so the truncated share; the predecessor measured its harder question gaining about 6 AUC points up to a 32,000-character cap, above this budget of 13,000 bytes;
 - the size and duration of a production `newsvault cut`; distinct stories per day.
 
@@ -858,6 +926,9 @@ Not built, and why it can wait:
 | a daily fixed synthetic request compared across days | would detect a build re-served under its id; until then that is unguarded |
 | units, wrapper, image | a deploy change; nothing is installed by an agent |
 | `generate`, `score`, spans, candidate retrieval, relation typing, the sign tables, returns | no producer |
+| company weight (market capitalisation, rank) and the size ratio between an issuer and the affected companies | data for code; arrives with the price collector |
+| a gate from the shadow's answers to candidate retrieval | no retrieval exists; when built it reads `category_significance` |
+| prior coverage by matter, by source role, or for a company with no tag | needs the answers read out of the blobs, and issuer resolution |
 | company newsrooms, 8-K items, spoken statements | new sources with their own robots and budget decisions |
 
 Owner decisions needed before a paid call:
@@ -879,8 +950,10 @@ Owner decisions needed before a paid call:
 | D13 | new sources | none before the shadow ends |
 | D15 | the question document is public | confirm |
 | D16 | `--give-up-after-hours` | 24 |
-| D17 | the state budget of 13,000 bytes against the predecessor's 32,000 characters | measure the truncated share first; a change is `modelgate.request/2` |
+| D17 | the state budget of 13,000 bytes against the predecessor's 32,000 characters | measure the truncated share first; a change is `modelgate.request/3` |
 | D18 | whether `empty` and `unparseable` stay final | yes until D12 shows the response shape; the alternative, asking again, pays for the same bytes on every run while the shape is misread |
+| D19 | the request ceiling of 33,200 bytes, above the vendor's 32,000 tokens at one byte per token | proposed by this change, so merging it is the yes; D12 on a full-length story settles it. The alternatives: a state of 10,209 bytes under the old ceiling, or fewer questions |
+| D20 | the boundary of `cx_magnitude_size` (a tenth) and the four significance levels | confirm before the first paid call; a change is a new question version |
 
 ### 3.6 `Brief` — `propose` to a person
 
@@ -1488,10 +1561,12 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | MG5 | **the API key reaches no row, blob, envelope, error or debug output** | `cmd_shadow::tests::the_key_appears_in_no_row_blob_envelope_or_error`: the real `ModelWire` against a `127.0.0.1` listener with a sentinel key over 200, 401, 500, an unfollowed 302, a dropped connection and a closed port; the `Authorization` header is asserted to arrive, every file of both stores and every rendered form is searched (mutations 2026-11-23, the key appended to a returned body / `max_redirects` raised to 1: red each)<br>`wire::tests::the_keys_debug_form_prints_no_byte_of_it` (mutation, `Debug` derived: red)<br>file: `wire::tests::each_unusable_key_file_is_refused_with_its_own_code_and_no_byte_of_the_key` (mutation, the mode check removed: red) | **enforced over what the test reaches**<br>unguarded: the binary's own stdout and stderr on a paid path (no binary test sends); a TLS failure's text (the listener is plain HTTP; `kind_of` keeps a kind name only); the key's bytes are not zeroed in memory; the endpoint constant is asserted by no test; the loopback listener blocks in `accept`, so a run that sends fewer requests than it serves hangs this test instead of failing it (seen 2026-11-23 under the mutation `failed` read as an answer) |
 | MG6 | **the response is stored as received before the row that names it** | `AttemptSlot::close` calls `Store::put_blob` (staged, fsynced, renamed, directory fsynced) before `write_answered`: `cmd_shadow::tests::the_stored_response_blob_hashes_to_response_sha256_even_when_it_does_not_parse` (mutation 2026-11-23, the blob write skipped: red); byte for byte, a 400 body and a 200 with spaces, a newline and unsorted keys: `…::a_refusal_and_an_oddly_spaced_answer_are_each_stored_byte_for_byte` (mutations 2026-11-23, the blob stored for a 2xx only / the body parsed and written back: red each); `store::tests::a_blob_whose_bytes_changed_is_refused_on_read_and_on_a_second_put` (mutation, the hash check removed from `read_blob`: red)<br>order, by type: `Store::write_answered` takes a `StoredBlob` only `put_blob` returns (mutation 2026-11-23, one built by hand in `ledger.rs`: E0603, does not compile)<br>a store failure after a paid send: `…::a_store_failure_after_a_send_ends_the_run_with_an_envelope_and_exit_eight` (mutation 2026-11-23, the arm removed from `run`: red) | **enforced**<br>unguarded: the fsync itself (no test crashes the process); a blob file deleted outside the program is found only when read; a store failure inside `finish` (the read-back or the `ended` row) is still `io_failed` 2 with no envelope; a response whose sha256 names a standing blob with other bytes stops every run after one paid call with `store_failed` until the blob is repaired by hand |
 | MG7 | **the answering id is stored raw and a mismatch never drops an answer** | `cmd_shadow::tests::an_answer_from_another_id_is_kept_and_counted_when_read`, a mixed-case id (mutations 2026-11-23, the id sent written in its place / the id lower-cased before storing: red each) | **enforced as a count**<br>no gate keeps two builds' answers apart in a later analysis: nothing reads answers yet (§3.5, "Not built") |
-| MG8 | **no question type carries a number or a date, and the order of a document is part of its version** | `question::tests::a_question_of_an_unknown_type_does_not_parse` (mutation 2026-11-23, a `Number` variant with the two match arms the compiler then demands: red); `…::each_malformed_document_is_refused_with_its_own_reason` (an unknown field such as `threshold` at the top level, inside a question and inside an option; mutations 2026-11-23, `deny_unknown_fields` removed from `Question` / from `QuestionOption`: red each); `…::a_reordered_option_list_or_question_list_is_another_question_version` (mutation, option ids sorted before the digest: red); exact bytes: `…::the_wire_form_is_json_with_the_documents_order` (mutation, `encode` through a `serde_json::Map`: red); budgets: `request::tests::a_long_body_is_cut_at_a_character_boundary_inside_the_state_budget` (mutation, the budget counted in raw bytes: red) | **enforced on the request side**<br>unguarded: an instruction's wording can still ask for a number in prose; whether the vendor keeps a JSON object's key order (§3.5, "Not verified") |
-| MG9 | **the gate's tables are insert-only** | `BEFORE UPDATE` and `BEFORE DELETE` triggers on the six tables of `store::TABLES`: `store::tests::an_update_or_delete_of_any_gate_table_is_refused`, which reads the table names from `sqlite_master` and holds `TABLES` to them (mutations 2026-11-23, the `DELETE` triggers not created / `floors` dropped from `TABLES`: red each); one writer: `…::a_second_writer_is_refused_while_the_first_holds_the_lease`; a dry run: `cmd_shadow::tests::a_dry_run_sends_nothing_and_writes_nothing`, also for a build with no floor yet (mutations, the writer's door used / `set_floor` moved out of the `!dry_run` block, alone and with a read-write dry door: red each); `store::tests::another_schema_version_an_unknown_request_and_a_write_through_the_dry_door_are_refused` (mutations 2026-11-23, any `user_version` accepted / the `foreign_keys` pragma removed / the dry door opened read-write: red each); the document on record: `cmd_shadow::tests::a_second_build_and_a_second_document_each_label_the_story_again` asserts the `question_docs` rows and the file blobs (mutation, `record_question_doc` not called: red) | **enforced against a statement through SQLite**<br>unguarded: `DROP TRIGGER`, a replaced database file, the blob files, which no trigger covers<br>no code reader yet: `labels.item_id`, `labels.seq`, `labels.run_id`, every column of `question_docs`, `floors.run_id`, `requests.state_digest`, `state_bytes`, `body_bytes`, `state_truncated`, `request_sha256`, `attempt_events.http_status`, `transport_failure`, `requested_at`; written for the reader of §3.5's "Not built" row 1 |
+| MG8 | **no question type carries a number or a date, and the order of a document is part of its version** | `question::tests::a_question_of_an_unknown_type_does_not_parse` (mutation 2026-11-23, a `Number` variant with the two match arms the compiler then demands: red); `…::each_malformed_document_is_refused_with_its_own_reason` (an unknown field such as `threshold` at the top level, inside a question and inside an option; mutations 2026-11-23, `deny_unknown_fields` removed from `Question` / from `QuestionOption`: red each); `…::a_reordered_option_list_or_question_list_is_another_question_version` (mutation, option ids sorted before the digest: red); exact bytes: `…::the_wire_form_is_json_with_the_documents_order` (mutation, `encode` through a `serde_json::Map`: red); budgets: `request::tests::a_long_body_is_cut_at_a_character_boundary_inside_the_state_budget` (mutation, the budget counted in raw bytes: red); `…::the_committed_document_and_a_full_state_fit_the_ceiling_with_the_state_uncut` (mutations 2026-11-23, `REQUEST_CEILING_BYTES` put back to 30,000: E0080, does not compile / `MAX_QUESTIONS_BYTES` put back to 16,500: red) | **enforced on the request side**<br>unguarded: an instruction's wording can still ask for a number in prose; whether the vendor keeps a JSON object's key order (§3.5, "Not verified") |
+| MG9 | **the gate's tables are insert-only** | `BEFORE UPDATE` and `BEFORE DELETE` triggers on the seven tables of `store::TABLES`: `store::tests::an_update_or_delete_of_any_gate_table_is_refused`, which reads the table names from `sqlite_master` and holds `TABLES` to them (mutations 2026-11-23, the `DELETE` triggers not created / `floors` dropped from `TABLES`: red each); one writer: `…::a_second_writer_is_refused_while_the_first_holds_the_lease`; a dry run: `cmd_shadow::tests::a_dry_run_sends_nothing_and_writes_nothing`, also for a build with no floor yet (mutations, the writer's door used / `set_floor` moved out of the `!dry_run` block, alone and with a read-write dry door: red each); `store::tests::another_schema_version_an_unknown_request_and_a_write_through_the_dry_door_are_refused` (mutations 2026-11-23, any `user_version` accepted / the `foreign_keys` pragma removed / the dry door opened read-write: red each); the document on record: `cmd_shadow::tests::a_second_build_and_a_second_document_each_label_the_story_again` asserts the `question_docs` rows and the file blobs (mutation, `record_question_doc` not called: red) | **enforced against a statement through SQLite**<br>unguarded: `DROP TRIGGER`, a replaced database file, the blob files, which no trigger covers<br>no code reader yet: `labels.item_id`, `labels.seq`, `labels.run_id`, every column of `question_docs`, `floors.run_id`, `requests.state_digest`, `state_bytes`, `body_bytes`, `state_truncated`, `request_sha256`, `attempt_events.http_status`, `transport_failure`, `requested_at`, `prior_coverage.snapshot_id`, `tag_count`; written for the reader of §3.5's "Not built" row 1 |
 | MG10 | **`modelgate` reads news only as a snapshot file, and nothing links the crate that spends money** | `repo_invariants::clients::model_owner_isolation_failure` over `cargo metadata`: `…::the_model_owner_depends_on_nothing_of_the_news_side_and_nothing_depends_on_it` (mutations 2026-11-23, `news-provider` added to `services/modelgate/Cargo.toml` / `modelgate` added to `services/newsvault/Cargo.toml` / `news-provider` added to `snapshot-contract/Cargo.toml`, which `modelgate` depends on: red each); the walk over member-to-member edges on a synthetic tree: `…::a_news_side_dependency_of_the_model_owner_and_a_dependant_of_it_are_each_named` | **enforced as a manifest question**<br>unguarded: `modelgate` opening a file under the vault through `std::fs`; a returns file read the same way; the wrapper that removes a cut after a run does not exist |
 | MG11 | **every story of a cut above the floor is labelled once, on its first-sighted row, whenever its row becomes visible, and a failed one is asked again until its age limit** (§3.5, "The shadow run") | anti-join in `cmd_shadow::Run::consider` over `Store::story_state`: `cmd_shadow::tests::a_row_that_becomes_visible_late_is_still_labelled` (mutation 2026-11-23, selection above the highest labelled `seq`: red), `…::only_the_first_sighted_row_of_a_story_is_labelled`, `…::a_failed_story_is_retried_by_a_later_run_until_the_age_limit` (mutations that day, `failed` counted as answered / the age test dropped: red each), `…::a_story_the_cap_refused_is_asked_by_a_later_run_whatever_its_age` (mutations 2026-11-23, a linked request with no attempt read as asked / a never-asked story given up by its age: red each), `…::the_first_run_fixes_the_floor_and_a_later_from_seq_cannot_move_it`; per build and per document: `…::a_second_build_and_a_second_document_each_label_the_story_again` (mutations 2026-11-23, `story_state` ignoring the build / ignoring the question version / `Store::floor` ignoring the build: red each); reader of the cut: `snapshot_contract::read::tests::the_committed_fixture_reads_back_as_its_three_rows_and_its_manifest` (mutation, the body column dropped: red) | **enforced over synthetic cuts**<br>never labelled, and counted: a row with no body, an `Undated` row (in no cut), a story observed on or before the build's date, a story given up on<br>unmeasured: the share of each on production |
+| MG12 | **prior coverage is counted point in time, a story with no tag is never a zero, and no request carries the count** (§3.5, "Prior coverage") | grammar vectors: `coverage::tests::a_tag_is_an_accepted_exchange_and_a_ticker_inside_one_pair_of_parentheses` (mutations 2026-11-23, exchange names not upper-cased / the ticker upper-cased before its shape test / the `(` test on a group removed / pieces split at `;` only: red each)<br>point in time: `…::only_distinct_stories_observed_before_the_story_and_inside_the_window_are_counted` (mutations 2026-11-23, `<` to `<=` on the story's instant / the upper bound removed / the window's start removed / the story's own id counted / rows counted instead of stories: red each)<br>no tag, and a floor: `…::no_tag_is_not_zero_and_a_window_the_cut_does_not_reach_back_over_is_marked` (mutations, `NoTag` returned as three zeros / `complete` always true: red each); `store::tests::a_coverage_row_is_no_tag_or_counts_never_both_and_the_first_record_stays` (mutations, the `CHECK` removed / `INSERT OR REPLACE` / `coverage_by` ignoring the version: red each)<br>the token: `coverage::tests::the_version_token_is_built_from_the_tables_and_is_the_one_the_design_names` (mutations, a spelling added to the exchange table / a window of 31 days: red each)<br>on the run's path: `cmd_shadow::tests::every_question_is_asked_of_every_story_and_prior_coverage_is_recorded_and_never_sent` (mutations 2026-11-23, `cover` not called / `cover` reading the cut state / `finish` summarising the dry list in a real run / a dry run keeping no record / a fourth key in the request: red each) | **enforced over synthetic cuts**<br>unguarded: a change to the parenthesis rule or the ticker shape that keeps the vectors green pools under the same token; the `has_coverage` read before the count has no test of its own (`INSERT OR IGNORE` keeps the first row without it)<br>unmeasured: the share of `no_tag` on production; every limit in §3.5's table |
+| MG13 | **significance is asked for the issuer and for the category apart, and no question is withheld from a story for what its issuer makes of it** (§3.5, "ripple/2") | the document: `question::tests::significance_is_two_questions_on_one_ordered_scale_and_none_is_called_materiality` (mutations 2026-11-23, `category_significance` renamed in the file / one of its options renamed / `content_kind` renamed back to `materiality` / the sentence on releases cut from its instructions: red each); `…::every_expected_reading_of_a_synthetic_example_is_an_option_of_the_committed_document` (mutation, `lowers_cost_or_barrier` renamed in the file: red); the file against this document: `…::the_committed_ripple_shadow_document_parses_and_has_the_version_the_design_names` (mutation, one word of an instruction changed: red)<br>no gate: `cmd_shadow::tests::every_question_is_asked_of_every_story_and_prior_coverage_is_recorded_and_never_sent`, all 61 ids in every sent body (mutation 2026-11-23, `label` returning before the send for a body naming an open licence: red) | **enforced on what is asked**<br>not claimed: that a build reads the example as its author does; no model has answered a question<br>unguarded: an instruction's wording beyond the three phrases the test names; a later gate reading `issuer_significance`, since no gate exists to test |
 
 ---
 

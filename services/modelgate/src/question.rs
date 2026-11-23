@@ -8,8 +8,9 @@ use serde::Deserialize;
 
 pub const QUESTIONS_SCHEMA: &str = "modelgate.questions/1";
 /// Bytes the encoded `questions` object may reach. Fixed apart from the state budget
-/// (`request.rs`), so a longer document never shortens the text the model reads.
-pub const MAX_QUESTIONS_BYTES: usize = 16_500;
+/// (`request.rs`), so a longer document never shortens the text the model reads. Why 20,000:
+/// section 3.5, `request_format`.
+pub const MAX_QUESTIONS_BYTES: usize = 20_000;
 const NOUL_OPTIONS: [&str; 2] = ["true", "false"];
 const MIN_CHOICE_OPTIONS: usize = 2;
 
@@ -377,16 +378,109 @@ pub(crate) mod tests {
         }
     }
 
-    /// The committed instrument parses, fits the budget, and its version is the one section 3.5
-    /// names; an edit to the file without an edit there is red.
+    const COMMITTED: &[u8] = include_bytes!("../questions/ripple-shadow-1.json");
+    const DESIGN: &str = include_str!("../../../docs/design/architecture.md");
+    const LEVELS: [&str; 4] = ["none", "minor", "major", "critical"];
+
+    pub(crate) fn committed() -> Result<QuestionDoc, QuestionError> {
+        QuestionDoc::parse(COMMITTED)
+    }
+
+    /// The synthetic stories of `tests/fixtures`, each with the reading its author expects: per
+    /// question id, the options that would not be a surprise. Hand-written, measured by nothing.
+    pub(crate) fn examples() -> Result<Vec<serde_json::Value>, serde_json::Error> {
+        let file: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/ripple-shadow-1.examples.json"
+        ))?;
+        Ok(file["examples"].as_array().cloned().unwrap_or_default())
+    }
+
+    fn option_ids<'a>(doc: &'a QuestionDoc, id: &str) -> Vec<&'a str> {
+        let asked = doc.questions().iter().find(|question| question.id == id);
+        asked.map_or_else(Vec::new, |question| {
+            question.options.iter().map(|o| o.id.as_str()).collect()
+        })
+    }
+
+    /// The committed instrument parses, and section 3.5 names its version and its encoded size;
+    /// an edit to the file without an edit there is red.
     #[test]
     fn the_committed_ripple_shadow_document_parses_and_has_the_version_the_design_names(
     ) -> TestResult {
-        let bytes = include_bytes!("../questions/ripple-shadow-0.json");
-        let doc = QuestionDoc::parse(bytes)?;
-        let design = include_str!("../../../docs/design/architecture.md");
-        assert_eq!(doc.name(), "ripple-shadow/0");
-        assert!(design.contains(doc.version()), "{}", doc.version());
+        let doc = committed()?;
+        let bytes = doc.wire().len();
+        let size = format!("{},{:03} encoded bytes", bytes / 1_000, bytes % 1_000);
+        assert_eq!(doc.name(), "ripple-shadow/1");
+        assert!(DESIGN.contains(doc.version()), "{}", doc.version());
+        assert!(DESIGN.contains(&size), "{size}");
+        Ok(())
+    }
+
+    /// Section 8 row MG13: significance is asked twice, for the issuer and for the category, on
+    /// one ordered scale, and no question is called materiality. Mutations 2026-11-23, each red:
+    /// `category_significance` renamed in the file; one of its options renamed; `content_kind`
+    /// renamed back to `materiality`; the sentence on releases cut from its instructions.
+    #[test]
+    fn significance_is_two_questions_on_one_ordered_scale_and_none_is_called_materiality(
+    ) -> TestResult {
+        let doc = committed()?;
+        assert_eq!(option_ids(&doc, "issuer_significance"), LEVELS);
+        assert_eq!(option_ids(&doc, "category_significance"), LEVELS);
+        assert_eq!(
+            option_ids(&doc, "cx_magnitude_size"),
+            ["none_stated", "small", "large"]
+        );
+        let texts = |id: &str| -> String {
+            let asked = doc.questions().iter().filter(|question| question.id == id);
+            asked
+                .map(|question| question.instructions.as_str())
+                .collect()
+        };
+        assert!(doc
+            .questions()
+            .iter()
+            .all(|q| !q.id.contains("material") || q.id == "cx_issuer_calls_it_material"));
+        assert!(texts("content_kind").contains("release is a new event, however ordinary"));
+        assert!(texts("category_significance").contains("ordinary for the main company"));
+        assert!(texts("issuer_significance").contains("that company alone"));
+        Ok(())
+    }
+
+    /// Every expected reading is inside the committed answer spaces, and the first example is the
+    /// owner's of 2026-11-23: minor for its publisher, major for a category. Mutation that day,
+    /// `lowers_cost_or_barrier` renamed in the file: red.
+    #[test]
+    fn every_expected_reading_of_a_synthetic_example_is_an_option_of_the_committed_document(
+    ) -> TestResult {
+        let (doc, examples) = (committed()?, examples()?);
+        assert_eq!(examples.len(), 5);
+        for example in &examples {
+            let expected = example["expect"].as_object().ok_or("no expect object")?;
+            assert!(!expected.is_empty(), "{example}");
+            for (id, wanted) in expected {
+                let offered = option_ids(&doc, id);
+                let wanted = wanted.as_array().ok_or("an expectation is not a list")?;
+                assert!(!wanted.is_empty(), "{id}");
+                for option in wanted {
+                    let named = option.as_str().unwrap_or_default();
+                    assert!(offered.contains(&named), "{id}: {named}");
+                }
+            }
+        }
+        let asymmetric = &examples[0]["expect"];
+        assert_eq!(
+            asymmetric["issuer_significance"],
+            serde_json::json!(LEVELS[..2])
+        );
+        assert_eq!(
+            asymmetric["category_significance"],
+            serde_json::json!(LEVELS[2..])
+        );
+        assert_eq!(asymmetric["scope"], serde_json::json!(["whole_category"]));
+        assert_eq!(
+            asymmetric["stance_to_category"],
+            serde_json::json!(["validates", "lowers_cost_or_barrier"])
+        );
         Ok(())
     }
 }

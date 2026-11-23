@@ -1,6 +1,6 @@
 {
  "schema": "modelgate.questions/1",
- "name": "ripple-shadow/0",
+ "name": "ripple-shadow/1",
  "questions": [
   {
    "id": "source_role",
@@ -30,9 +30,9 @@
    ]
   },
   {
-   "id": "materiality",
+   "id": "content_kind",
    "type": "choice",
-   "instructions": "What kind of content does the text carry?",
+   "instructions": "What kind of content does the text carry? A product, research or technology release is a new event, however ordinary it is for the company that makes it.",
    "options": [
     {
      "id": "new_fact",
@@ -104,7 +104,7 @@
   {
    "id": "event_class",
    "type": "choice",
-   "instructions": "Which single option best describes the main event the text reports for the company the text is mainly about?",
+   "instructions": "Which single option best describes the main event the text reports for its main company?",
    "options": [
     {
      "id": "equity_offering_dilutive",
@@ -259,333 +259,333 @@
    "options": [
     {
      "id": "true",
-     "description": "One of them fits."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "None fits."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_equity_offering_dilutive",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? It sells new shares, warrants or convertibles, or registers them for sale.",
+   "instructions": "Does the text report this about its main company? It sells new shares, warrants or convertibles, or registers them for sale.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_reverse_split",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? It announces or completes a reverse share split.",
+   "instructions": "Does the text report this about its main company? It announces or completes a reverse share split.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_going_concern_doubt",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? It or its auditor states doubt that it can continue as a going concern.",
+   "instructions": "Does the text report this about its main company? It or its auditor states doubt that it can continue as a going concern.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_listing_deficiency_or_delisting",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? An exchange notifies it of a listing deficiency, or it is to be delisted.",
+   "instructions": "Does the text report this about its main company? An exchange notifies it of a listing deficiency, or it is to be delisted.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_guidance_cut_or_warning",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? It lowers or withdraws its own outlook, or warns results will miss it.",
+   "instructions": "Does the text report this about its main company? It lowers or withdraws its own outlook, or warns results will miss it.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_restatement_or_nonreliance",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? It will restate past results, or says past statements cannot be relied on.",
+   "instructions": "Does the text report this about its main company? It will restate past results, or says past statements cannot be relied on.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_fraud_or_misconduct_allegation",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? It or its management is accused of fraud or misconduct, or opens an internal investigation.",
+   "instructions": "Does the text report this about its main company? It or its management is accused of fraud or misconduct, or opens an internal investigation.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_auditor_exit",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? Its auditor resigns or is dismissed.",
+   "instructions": "Does the text report this about its main company? Its auditor resigns or is dismissed.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_cfo_exit",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? Its chief financial officer leaves or is removed.",
+   "instructions": "Does the text report this about its main company? Its chief financial officer leaves or is removed.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_key_person_departure",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? Its chief executive, founder or chair leaves, is removed or dies.",
+   "instructions": "Does the text report this about its main company? Its chief executive, founder or chair leaves, is removed or dies.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_regulatory_or_legal_action_against",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? A regulator, prosecutor or court acts against it: a charge, a fine, a ban, a subpoena, an adverse ruling.",
+   "instructions": "Does the text report this about its main company? A regulator, prosecutor or court acts against it: a charge, a fine, a ban, a subpoena, an adverse ruling.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_major_customer_or_contract_loss",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? It loses a major customer, contract, licence or partner.",
+   "instructions": "Does the text report this about its main company? It loses a major customer, contract, licence or partner.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_product_failure_or_recall",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? Its product fails, is recalled, or is halted for safety or quality.",
+   "instructions": "Does the text report this about its main company? Its product fails, is recalled, or is halted for safety or quality.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_clinical_or_regulatory_setback",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? Its trial misses its endpoint or is put on hold, or a regulator rejects or delays its product.",
+   "instructions": "Does the text report this about its main company? Its trial misses its endpoint or is put on hold, or a regulator rejects or delays its product.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_short_seller_report",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? A short seller publishes a report against it, or it answers one.",
+   "instructions": "Does the text report this about its main company? A short seller publishes a report against it, or it answers one.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_default_or_bankruptcy",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? It misses a debt payment, breaches a covenant, or files for bankruptcy protection.",
+   "instructions": "Does the text report this about its main company? It misses a debt payment, breaches a covenant, or files for bankruptcy protection.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_dividend_cut_or_suspension",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? It cuts or suspends its dividend.",
+   "instructions": "Does the text report this about its main company? It cuts or suspends its dividend.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_layoffs_or_restructuring",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? It cuts jobs, closes sites or announces a restructuring.",
+   "instructions": "Does the text report this about its main company? It cuts jobs, closes sites or announces a restructuring.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_cyber_incident",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? It reports a breach, an attack or an outage of its systems.",
+   "instructions": "Does the text report this about its main company? It reports a breach, an attack or an outage of its systems.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_credit_rating_downgrade",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? A rating agency lowers its rating or outlook.",
+   "instructions": "Does the text report this about its main company? A rating agency lowers its rating or outlook.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "ev_trading_halt",
    "type": "noul",
-   "instructions": "Does the text report this about the company the text is mainly about? Trading in its shares is halted or suspended.",
+   "instructions": "Does the text report this about its main company? Trading in its shares is halted or suspended.",
    "options": [
     {
      "id": "true",
-     "description": "It reports it."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
   {
    "id": "issuer_effect",
    "type": "choice",
-   "instructions": "Which situation does the text describe for the company the text is mainly about?",
+   "instructions": "Which situation does the text describe for its main company?",
    "options": [
     {
      "id": "favourable",
@@ -606,9 +606,186 @@
    ]
   },
   {
+   "id": "issuer_significance",
+   "type": "choice",
+   "instructions": "How much does the reported event change the business, finances or standing of the text's main company? Judge that company alone, not other companies.",
+   "options": [
+    {
+     "id": "none",
+     "description": "No change: a routine, administrative or promotional notice."
+    },
+    {
+     "id": "minor",
+     "description": "A small or ordinary change, one of many in its normal course."
+    },
+    {
+     "id": "major",
+     "description": "A large change to its results, leadership, financing or legal position."
+    },
+    {
+     "id": "critical",
+     "description": "Its control, its survival or the core of its business is at stake."
+    }
+   ]
+  },
+  {
+   "id": "cx_state_body_involved",
+   "type": "noul",
+   "instructions": "Is a state body involved in the reported event: a government, a regulator, a prosecutor, an intelligence service or a court?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "cx_criminal_or_security_allegation",
+   "type": "noul",
+   "instructions": "Does the text state criminal or national-security allegations?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "cx_forced_or_under_pressure",
+   "type": "noul",
+   "instructions": "Is the reported departure or action forced or made under pressure, not voluntary?",
+   "options": [
+    {
+     "id": "true",
+     "description": "It is forced or under pressure."
+    },
+    {
+     "id": "false",
+     "description": "It is voluntary, or the text does not say."
+    }
+   ]
+  },
+  {
+   "id": "cx_international_reach",
+   "type": "noul",
+   "instructions": "Does the matter reach beyond one country: several governments, jurisdictions or national markets?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "cx_magnitude_stated",
+   "type": "noul",
+   "instructions": "Does the text state how large the reported event is: an amount, a percentage, a count or a share?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "cx_magnitude_size",
+   "type": "choice",
+   "instructions": "If the text states how large the reported event is, how large is it against what it changes: the revenue, outlook, workforce, shares, assets or debt it is a part of?",
+   "options": [
+    {
+     "id": "none_stated",
+     "description": "No size is stated, or nothing to compare it with."
+    },
+    {
+     "id": "small",
+     "description": "Under about a tenth of what it changes, or the text calls it not material."
+    },
+    {
+     "id": "large",
+     "description": "About a tenth or more of what it changes, or the text calls it substantial or material."
+    }
+   ]
+  },
+  {
+   "id": "cx_previously_announced_or_expected",
+   "type": "noul",
+   "instructions": "Does the text say the reported event was announced earlier, planned or expected?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "cx_interim_successor_named",
+   "type": "noul",
+   "instructions": "Does the text name an interim or acting successor, not a permanent one?",
+   "options": [
+    {
+     "id": "true",
+     "description": "It names an interim or acting one."
+    },
+    {
+     "id": "false",
+     "description": "It names a permanent one, or none, or no person changes."
+    }
+   ]
+  },
+  {
+   "id": "cx_investigation_open",
+   "type": "noul",
+   "instructions": "Does the board or the company state that an investigation is opened or ongoing?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "cx_issuer_calls_it_material",
+   "type": "noul",
+   "instructions": "Does the text's main company itself call the reported event material or significant to its business or results?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
    "id": "kp_departure_announced",
    "type": "noul",
-   "instructions": "This question is about a change of a senior person at the company the text is mainly about. Does the text report that a senior person leaves, is removed or dies?",
+   "instructions": "About a senior person changing at the text's main company: does the text report that a senior person leaves, is removed or dies?",
    "options": [
     {
      "id": "true",
@@ -623,7 +800,7 @@
   {
    "id": "kp_appointment_announced",
    "type": "noul",
-   "instructions": "This question is about a change of a senior person at the company the text is mainly about. Does the text report that a senior person is appointed?",
+   "instructions": "About a senior person changing at the text's main company: does the text report that a senior person is appointed?",
    "options": [
     {
      "id": "true",
@@ -638,7 +815,7 @@
   {
    "id": "kp_is_chief_executive_or_founder",
    "type": "noul",
-   "instructions": "This question is about a change of a senior person at the company the text is mainly about. Is the person who changes the chief executive or a founder?",
+   "instructions": "About a senior person changing at the text's main company: is the person who changes the chief executive or a founder?",
    "options": [
     {
      "id": "true",
@@ -653,7 +830,7 @@
   {
    "id": "kp_role_is_cfo",
    "type": "noul",
-   "instructions": "This question is about a change of a senior person at the company the text is mainly about. Is the person who changes the chief financial officer?",
+   "instructions": "About a senior person changing at the text's main company: is the person who changes the chief financial officer?",
    "options": [
     {
      "id": "true",
@@ -668,7 +845,7 @@
   {
    "id": "kp_long_tenure_stated",
    "type": "noul",
-   "instructions": "This question is about a change of a senior person at the company the text is mainly about. Does the text state that the person held the role for ten years or more?",
+   "instructions": "About a senior person changing at the text's main company: does the text state that the person held the role for ten years or more?",
    "options": [
     {
      "id": "true",
@@ -683,7 +860,7 @@
   {
    "id": "kp_successor_named",
    "type": "noul",
-   "instructions": "This question is about a change of a senior person at the company the text is mainly about. Does the text name a permanent successor?",
+   "instructions": "About a senior person changing at the text's main company: does the text name a permanent successor?",
    "options": [
     {
      "id": "true",
@@ -698,7 +875,7 @@
   {
    "id": "kp_effective_immediately",
    "type": "noul",
-   "instructions": "This question is about a change of a senior person at the company the text is mainly about. Does the change take effect immediately or within days?",
+   "instructions": "About a senior person changing at the text's main company: does the change take effect immediately or within days?",
    "options": [
     {
      "id": "true",
@@ -713,7 +890,7 @@
   {
    "id": "kp_reason_is_benign",
    "type": "noul",
-   "instructions": "This question is about a change of a senior person at the company the text is mainly about. Does the text give a planned retirement, a planned succession or a personal reason?",
+   "instructions": "About a senior person changing at the text's main company: does the text give a planned retirement, a planned succession or a personal reason?",
    "options": [
     {
      "id": "true",
@@ -728,7 +905,7 @@
   {
    "id": "kp_linked_to_investigation_or_dispute",
    "type": "noul",
-   "instructions": "This question is about a change of a senior person at the company the text is mainly about. Does the text link the change to an investigation, a dispute with the board, or misconduct?",
+   "instructions": "About a senior person changing at the text's main company: does the text link the change to an investigation, a dispute with the board, or misconduct?",
    "options": [
     {
      "id": "true",
@@ -786,11 +963,11 @@
    "options": [
     {
      "id": "true",
-     "description": "It does."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
@@ -801,11 +978,11 @@
    "options": [
     {
      "id": "true",
-     "description": "It does."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
@@ -816,11 +993,11 @@
    "options": [
     {
      "id": "true",
-     "description": "It does."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
@@ -831,11 +1008,11 @@
    "options": [
     {
      "id": "true",
-     "description": "It does."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
     }
    ]
   },
@@ -846,11 +1023,94 @@
    "options": [
     {
      "id": "true",
-     "description": "It does."
+     "description": "Yes."
     },
     {
      "id": "false",
-     "description": "It does not."
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "category_significance",
+   "type": "choice",
+   "instructions": "How much does the reported event matter to a category of companies other than the text's main company? Judge those companies alone: an event that is ordinary for the main company can matter greatly to them.",
+   "options": [
+    {
+     "id": "none",
+     "description": "The text describes no such category, or the event does not bear on one."
+    },
+    {
+     "id": "minor",
+     "description": "It bears on such a category in a small or incidental way."
+    },
+    {
+     "id": "major",
+     "description": "It changes what those companies can build, sell or charge, or what they compete with."
+    },
+    {
+     "id": "critical",
+     "description": "It removes or creates a main obstacle to what those companies do."
+    }
+   ]
+  },
+  {
+   "id": "as_matters_more_to_others",
+   "type": "noul",
+   "instructions": "Does the reported event matter more to other companies than to the text's main company?",
+   "options": [
+    {
+     "id": "true",
+     "description": "It matters more to others."
+    },
+    {
+     "id": "false",
+     "description": "It does not, or it concerns no other companies."
+    }
+   ]
+  },
+  {
+   "id": "as_issuer_large_others_smaller",
+   "type": "noul",
+   "instructions": "Does the text show its main company as large or leading, and the other companies the event bears on as smaller or specialised in one field?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "as_issuer_opens_what_others_need",
+   "type": "noul",
+   "instructions": "Does the text's main company give away, open or standardise something other companies need: open models, tools, interfaces or reference designs?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "as_names_category_as_purpose",
+   "type": "noul",
+   "instructions": "Does the text name a category of other companies, or a problem they face, as the purpose of what is released or done?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
     }
    ]
   },

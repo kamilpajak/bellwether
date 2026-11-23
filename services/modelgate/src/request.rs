@@ -9,12 +9,13 @@ use crate::model::{ModelId, MAX_MODEL_ID_BYTES};
 use crate::question::{QuestionDoc, MAX_QUESTIONS_BYTES};
 
 pub const KIND_DECIDE: &str = "decide";
-pub const REQUEST_FORMAT: &str = "modelgate.request/1";
+pub const REQUEST_FORMAT: &str = "modelgate.request/2";
 /// Bytes the state may take once JSON-escaped, quotes excluded. Independent of the question
 /// document, so two documents read the same cut of one story.
 pub const STATE_BUDGET_BYTES: usize = 13_000;
-/// The whole body stays under this. Why 30,000: section 3.5, "Not verified".
-pub const REQUEST_CEILING_BYTES: usize = 30_000;
+/// The whole body stays under this. Why 33,200, and what it no longer bounds: section 3.5,
+/// `request_format` and "Not verified".
+pub const REQUEST_CEILING_BYTES: usize = 33_200;
 const MODEL_KEY: &str = "{\"model\":";
 const STATE_KEY: &str = ",\"state\":";
 const QUESTIONS_KEY: &str = ",\"questions\":";
@@ -109,10 +110,10 @@ pub fn build(
 
 #[cfg(test)]
 mod tests {
-    use super::{build, escaped_len, REQUEST_CEILING_BYTES, STATE_BUDGET_BYTES};
-    use crate::model::ModelId;
-    use crate::question::tests::TWO_QUESTIONS;
-    use crate::question::QuestionDoc;
+    use super::{build, escaped_len, ENVELOPE_BYTES, REQUEST_CEILING_BYTES, STATE_BUDGET_BYTES};
+    use crate::model::{ModelId, MAX_MODEL_ID_BYTES};
+    use crate::question::tests::{committed, TWO_QUESTIONS};
+    use crate::question::{QuestionDoc, MAX_QUESTIONS_BYTES};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -176,6 +177,27 @@ mod tests {
             assert_eq!(request.state_bytes, state.len());
             assert_eq!(request.body_bytes, body.len());
         }
+        Ok(())
+    }
+
+    /// The budgets against the committed document: the longest id, a body over the state budget
+    /// and all its questions stay under the ceiling, and the state is not shortened for them.
+    /// Mutation 2026-11-23, `REQUEST_CEILING_BYTES` put back to 30,000: E0080, the constant
+    /// assertion of this file does not compile.
+    #[test]
+    fn the_committed_document_and_a_full_state_fit_the_ceiling_with_the_state_uncut() -> TestResult
+    {
+        let doc = committed()?;
+        let id = format!("{}-20260101", "m".repeat(MAX_MODEL_ID_BYTES - 9));
+        let body = "x".repeat(STATE_BUDGET_BYTES + 1);
+        let request = build(&doc, &ModelId::parse(&id)?, &body, 0)?;
+        assert_eq!(request.state_bytes, STATE_BUDGET_BYTES);
+        assert!(doc.wire().len() <= MAX_QUESTIONS_BYTES);
+        assert!(request.bytes.len() <= REQUEST_CEILING_BYTES);
+        assert_eq!(
+            request.bytes.len(),
+            ENVELOPE_BYTES + MAX_MODEL_ID_BYTES + STATE_BUDGET_BYTES + doc.wire().len()
+        );
         Ok(())
     }
 

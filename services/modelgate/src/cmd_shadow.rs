@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use snapshot_contract::{SnapshotRow, ValidateError};
 
 use crate::cap::{parse_usd, refusal, worst_case, Caps, Spent};
+use crate::coverage::{self, Mentions, PriorCoverage};
 use crate::ledger::{AttemptSlot, Opening};
 use crate::model::ModelId;
 use crate::question::QuestionDoc;
@@ -199,6 +200,10 @@ struct Run<'a> {
     stopped_by: Option<&'static str>,
     /// A store failure after a paid send: the run ends through `finish`, not as an error.
     store_failure: Option<String>,
+    snapshot_id: String,
+    mentions: Mentions,
+    /// A dry run's prior-coverage records, which no store row holds.
+    planned_coverage: Vec<PriorCoverage>,
 }
 
 enum Sent {
@@ -246,11 +251,18 @@ fn unreadable(why: snapshot_contract::ReadError) -> ShadowError {
     ShadowError::InputUnparseable(why.to_string())
 }
 
-/// Per story, the `seq` of its first-sighted row: lowest `observed_at`, then lowest `seq`.
-fn first_sightings(dir: &std::path::Path) -> Result<HashMap<String, i64>, ShadowError> {
+/// Per story, the `seq` of its first-sighted row (lowest `observed_at`, then lowest `seq`), and
+/// every row's exchange-ticker tags for the prior-coverage record.
+fn survey(dir: &std::path::Path) -> Result<(HashMap<String, i64>, Mentions), ShadowError> {
     let mut first: HashMap<String, (String, i64)> = HashMap::new();
+    let mut mentions = Mentions::default();
     for row in snapshot_contract::rows(dir).map_err(unreadable)? {
         let row = row.map_err(unreadable)?;
+        mentions.add(
+            &row.story_id,
+            instant(&row.observed_at)?,
+            row.body.as_deref(),
+        );
         let sighting = (row.observed_at, row.seq);
         match first.get_mut(&row.story_id) {
             Some(kept) if *kept <= sighting => {}
@@ -260,7 +272,8 @@ fn first_sightings(dir: &std::path::Path) -> Result<HashMap<String, i64>, Shadow
             }
         }
     }
-    Ok(first.into_iter().map(|(id, (_, seq))| (id, seq)).collect())
+    let first = first.into_iter().map(|(id, (_, seq))| (id, seq)).collect();
+    Ok((first, mentions))
 }
 
 pub fn run(args: &Args, env: &Env) -> Result<Finished, ShadowError> {
@@ -337,6 +350,7 @@ pub fn run(args: &Args, env: &Env) -> Result<Finished, ShadowError> {
     }
     let stopped_by = store.unacked_cost_break()?.map(|_| "cost_estimate_broken");
     let spent = store.spent(&run_id, started)?;
+    let (first, mentions) = survey(&args.snapshot)?;
     let mut run = Run {
         args,
         env,
@@ -357,8 +371,10 @@ pub fn run(args: &Args, env: &Env) -> Result<Finished, ShadowError> {
         every_failure_transient: true,
         stopped_by,
         store_failure: None,
+        snapshot_id: manifest.snapshot_id.clone(),
+        mentions,
+        planned_coverage: Vec::new(),
     };
-    let first = first_sightings(&args.snapshot)?;
     for row in snapshot_contract::rows(&args.snapshot).map_err(unreadable)? {
         let considered = row
             .map_err(unreadable)
@@ -428,6 +444,7 @@ impl Run<'_> {
         let request = build(&self.doc, &self.model, body, self.args.repeat_index)
             .map_err(|why| ShadowError::InputUnparseable(why.to_string()))?;
         self.stories.truncated += u64::from(request.state_truncated);
+        self.cover(row)?;
         if let Some(outcome) = self.store.request_outcome(&request.idempotency_key)? {
             self.requests.already_answered += 1;
             self.answered(outcome);
@@ -465,6 +482,31 @@ impl Run<'_> {
             }
         }
         Ok(())
+    }
+
+    /// The story's prior-coverage record, from the whole body and never from the cut state. Once
+    /// per story and coverage version: a later cut does not rewrite it.
+    fn cover(&mut self, row: &SnapshotRow) -> Result<(), ShadowError> {
+        let version = coverage::version();
+        if self.store.has_coverage(&row.story_id, &version)? {
+            return Ok(());
+        }
+        let record = self.mentions.prior(
+            &row.story_id,
+            instant(&row.observed_at)?,
+            row.body.as_deref().unwrap_or_default(),
+        );
+        if self.args.dry_run {
+            self.planned_coverage.push(record);
+            return Ok(());
+        }
+        Ok(self.store.insert_coverage(
+            &row.story_id,
+            &version,
+            &self.snapshot_id,
+            &self.run_id,
+            &record,
+        )?)
     }
 
     /// Only `ok` is a label. An `empty` or `unparseable` answer is final and counted apart.
@@ -608,6 +650,11 @@ impl Run<'_> {
                 let bytes = i128::from(bytes);
                 i64::try_from((i128::from(cost) * planned + bytes - 1) / bytes).unwrap_or(i64::MAX)
             });
+        let covered = if self.args.dry_run {
+            self.planned_coverage.clone()
+        } else {
+            self.store.coverage_by(&self.run_id, &coverage::version())?
+        };
         let closed_unusable = count(Outcome::Empty) + count(Outcome::Unparseable);
         let costless = closed
             .iter()
@@ -680,6 +727,7 @@ impl Run<'_> {
             "answering_models": answering,
             "answered_by_another_id": another_id,
             "label_lag_seconds": { "p50": rank(50), "p90": rank(90), "max": lags.last() },
+            "prior_coverage": coverage::summary(&covered),
             "store": {
                 "attempts_abandoned_by_sweep": swept,
                 "runs_left_open": self.store.runs_left_open(&self.run_id)?,
@@ -720,8 +768,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{in_sample, run, Args, Env, Finished, ShadowError, FAILED_STORIES_BEFORE_STOP};
+    use crate::coverage;
     use crate::ledger::SendPermit;
-    use crate::question::tests::TWO_QUESTIONS;
+    use crate::question::tests::{committed, examples, TWO_QUESTIONS};
+    use crate::question::{QuestionDoc, QuestionKind};
     use crate::store::{BLOB_DIR, DB_FILE};
     use crate::wire::tests::{http, sentinel, Loopback, SENTINEL_KEY};
     use crate::wire::{Exchanged, HttpAnswer, ModelExchange, ModelWire};
@@ -958,6 +1008,144 @@ mod tests {
             json!({"code": 0, "error_code": null})
         );
         assert_eq!(bench.count("SELECT COUNT(*) FROM run_events")?, 2);
+        Ok(())
+    }
+
+    /// A 200 answering every question of `doc`: the first option `expect` lists for a question,
+    /// else the first the document offers.
+    fn full_reading(doc: &QuestionDoc, expect: &Value) -> Result<HttpAnswer, &'static str> {
+        let answers: serde_json::Map<String, Value> = doc
+            .questions()
+            .iter()
+            .map(|question| {
+                let wanted = expect[question.id.as_str()][0].as_str();
+                let answer = match question.kind {
+                    QuestionKind::Noul if wanted == Some("true") => json!({"noul": 0.9}),
+                    QuestionKind::Noul => json!({"noul": 0.1}),
+                    QuestionKind::Choice => {
+                        json!({"choice": wanted.unwrap_or(question.options[0].id.as_str())})
+                    }
+                };
+                let mut answer = answer;
+                answer["type"] = json!(question.kind.name());
+                (question.id.clone(), answer)
+            })
+            .collect();
+        let body = json!({"model": MODEL, "usage": {"cost": COST_USD}, "answers": answers});
+        status(200, &body.to_string())
+    }
+
+    /// Section 8 rows MG12 and MG13, over the committed document and the synthetic examples: an
+    /// earlier note, an untagged story, the release that is minor for its publisher, and the
+    /// forced departure, and a story tagged past the state budget. Mutations 2026-11-23, each
+    /// red: `label` returning before the send for a body naming an open licence; `cover` not
+    /// called; `cover` reading the cut state in place of the body; `finish` summarising
+    /// `planned_coverage` in a real run; a dry run keeping no record; a fourth key in the request.
+    #[test]
+    fn every_question_is_asked_of_every_story_and_prior_coverage_is_recorded_and_never_sent(
+    ) -> TestResult {
+        let (doc, examples) = (committed()?, examples()?);
+        let text = |index: usize| examples[index]["text"].as_str().unwrap_or_default();
+        let tail_tagged = format!("{}(NYSE: SMQ)", "word ".repeat(3_000));
+        let rows = [
+            story(
+                1,
+                "note",
+                "2026-11-18T09:00:00.000000Z",
+                Some("A note (Nasdaq: LRGP)."),
+            ),
+            story(
+                2,
+                "bare",
+                "2026-11-19T09:00:00.000000Z",
+                Some("No company is tagged."),
+            ),
+            story(3, "release", DAY_ONE, Some(text(0))),
+            story(4, "departure", "2026-11-20T12:00:00.000000Z", Some(text(1))),
+            story(5, "long", "2026-11-20T13:00:00.000000Z", Some(&tail_tagged)),
+        ];
+        let snapshot = cut(&rows, CUTOFF)?;
+        let expected = json!({
+            "version": coverage::version(), "stories": 5, "no_tag": 1, "tagged": 4,
+            "windows": [
+                {"days": 1, "none": 3, "some": 1, "max": 1, "incomplete": 1},
+                {"days": 7, "none": 2, "some": 2, "max": 2, "incomplete": 4},
+                {"days": 30, "none": 2, "some": 2, "max": 2, "incomplete": 4},
+            ],
+        });
+        let dry = Bench::new()?;
+        std::fs::write(
+            dry.root.path().join("questions.json"),
+            super::read_input(
+                &Path::new(env!("CARGO_MANIFEST_DIR")).join("questions/ripple-shadow-1.json"),
+            )?,
+        )?;
+        let mut planned = dry.args(snapshot.path());
+        planned.dry_run = true;
+        let planned = dry.go(&planned, &Stub::default())?;
+        assert_eq!(at(&planned.envelope, "/prior_coverage"), expected);
+        assert!(!dry.store().exists());
+
+        let bench = Bench::new()?;
+        std::fs::copy(
+            dry.root.path().join("questions.json"),
+            bench.root.path().join("questions.json"),
+        )?;
+        let none = json!({});
+        let readings = [
+            &none,
+            &none,
+            &examples[0]["expect"],
+            &examples[1]["expect"],
+            &none,
+        ];
+        let stub = Stub::scripted(readings.iter().map(|e| full_reading(&doc, e)).collect());
+        let done = bench.go(&bench.args(snapshot.path()), &stub)?;
+        let asked = u64::try_from(doc.questions().len())?;
+        assert_eq!(asked, 61);
+        assert_eq!(at(&done.envelope, "/stories/labelled"), 5);
+        assert_eq!(at(&done.envelope, "/questions/answered"), asked * 5);
+        assert_eq!(at(&done.envelope, "/questions/missing"), 0);
+        assert_eq!(at(&done.envelope, "/prior_coverage"), expected);
+        for body in stub.bodies.borrow().iter() {
+            let sent: Value = serde_json::from_slice(body)?;
+            let keys: Vec<&String> = sent.as_object().ok_or("not an object")?.keys().collect();
+            assert_eq!(keys, ["model", "questions", "state"]);
+            let ids = sent["questions"].as_object().ok_or("no questions")?;
+            assert!(doc.questions().iter().all(|q| ids.contains_key(&q.id)));
+            assert_eq!(u64::try_from(ids.len())?, asked);
+        }
+        let db = Connection::open(bench.store().join(DB_FILE))?;
+        let stored = |story: &str| {
+            db.query_row(
+                "SELECT tag_count, tags, windows, snapshot_id FROM prior_coverage
+                  WHERE story_id = ?1 AND coverage_version = ?2",
+                [story, &coverage::version()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+        };
+        let departure: (i64, Option<String>, Option<String>, String) = stored("departure")?;
+        assert_eq!(departure.0, 1);
+        assert_eq!(departure.1.as_deref(), Some(r#"["NASDAQ:LRGP"]"#));
+        assert_eq!(
+            serde_json::from_str::<Value>(departure.2.as_deref().unwrap_or_default())?,
+            json!([{"days": 1, "stories": 1, "complete": true},
+                   {"days": 7, "stories": 2, "complete": false},
+                   {"days": 30, "stories": 2, "complete": false}])
+        );
+        assert_eq!(
+            json!(departure.3),
+            at(&done.envelope, "/snapshot/snapshot_id")
+        );
+        assert_eq!(stored("bare")?, (0, None, None, departure.3));
+        assert_eq!(stored("long")?.0, 1);
         Ok(())
     }
 

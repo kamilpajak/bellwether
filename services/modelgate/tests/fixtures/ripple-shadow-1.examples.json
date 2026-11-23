@@ -1,0 +1,171 @@
+{
+ "schema": "modelgate.examples/1",
+ "document": "ripple-shadow/1",
+ "examples": [
+  {
+   "id": "open_models_for_a_category",
+   "text": "Largeplat Corporation (NASDAQ: LRGP), the largest maker of accelerated computing platforms, today released Calibra, a family of open AI models for calibrating quantum processors. The models are free to download under an open licence. Calibration is the main obstacle small builders of quantum hardware face before every run, the company said, and Calibra is built to shorten it for them from days to hours. Largeplat does not build quantum processors, and the release does not change its financial outlook.",
+   "expect": {
+    "content_kind": [
+     "new_fact"
+    ],
+    "event_class": [
+     "product_or_technology_release"
+    ],
+    "issuer_significance": [
+     "none",
+     "minor"
+    ],
+    "category_significance": [
+     "major",
+     "critical"
+    ],
+    "scope": [
+     "whole_category"
+    ],
+    "stance_to_category": [
+     "validates",
+     "lowers_cost_or_barrier"
+    ],
+    "as_matters_more_to_others": [
+     "true"
+    ],
+    "as_issuer_large_others_smaller": [
+     "true"
+    ],
+    "as_issuer_opens_what_others_need": [
+     "true"
+    ],
+    "as_names_category_as_purpose": [
+     "true"
+    ]
+   }
+  },
+  {
+   "id": "chief_executive_forced_out_under_charges",
+   "text": "Largeplat Corporation (NASDAQ: LRGP) today said its founder and chief executive resigned at the request of the board, effective immediately, after prosecutors in two countries charged him with bribery and with breaking export controls. The board has opened an independent investigation. The chief operating officer becomes interim chief executive. The company said the matter is material to its business.",
+   "expect": {
+    "event_class": [
+     "key_person_departure"
+    ],
+    "issuer_significance": [
+     "major",
+     "critical"
+    ],
+    "cx_state_body_involved": [
+     "true"
+    ],
+    "cx_criminal_or_security_allegation": [
+     "true"
+    ],
+    "cx_forced_or_under_pressure": [
+     "true"
+    ],
+    "cx_international_reach": [
+     "true"
+    ],
+    "cx_previously_announced_or_expected": [
+     "false"
+    ],
+    "cx_interim_successor_named": [
+     "true"
+    ],
+    "cx_investigation_open": [
+     "true"
+    ],
+    "cx_issuer_calls_it_material": [
+     "true"
+    ],
+    "kp_is_chief_executive_or_founder": [
+     "true"
+    ],
+    "kp_reason_is_benign": [
+     "false"
+    ]
+   }
+  },
+  {
+   "id": "chief_executive_planned_retirement",
+   "text": "Midco Inc. (NYSE: MDCO) today said its chief executive will retire at the end of next year, completing the succession plan the company announced in March. The board has named the chief operating officer as his permanent successor.",
+   "expect": {
+    "event_class": [
+     "key_person_departure"
+    ],
+    "issuer_significance": [
+     "none",
+     "minor"
+    ],
+    "cx_state_body_involved": [
+     "false"
+    ],
+    "cx_criminal_or_security_allegation": [
+     "false"
+    ],
+    "cx_forced_or_under_pressure": [
+     "false"
+    ],
+    "cx_previously_announced_or_expected": [
+     "true"
+    ],
+    "cx_interim_successor_named": [
+     "false"
+    ],
+    "cx_investigation_open": [
+     "false"
+    ],
+    "kp_successor_named": [
+     "true"
+    ],
+    "kp_reason_is_benign": [
+     "true"
+    ]
+   }
+  },
+  {
+   "id": "outlook_lowered_by_a_fiftieth",
+   "text": "Midco Inc. (NYSE: MDCO) today lowered its full-year revenue outlook by about two percent, citing the timing of one shipment.",
+   "expect": {
+    "event_class": [
+     "guidance_cut_or_warning"
+    ],
+    "ev_guidance_cut_or_warning": [
+     "true"
+    ],
+    "cx_magnitude_stated": [
+     "true"
+    ],
+    "cx_magnitude_size": [
+     "small"
+    ],
+    "issuer_significance": [
+     "minor"
+    ]
+   }
+  },
+  {
+   "id": "outlook_lowered_by_two_fifths",
+   "text": "Midco Inc. (NYSE: MDCO) today lowered its full-year revenue outlook by about forty percent after its largest customer ended its supply contract.",
+   "expect": {
+    "event_class": [
+     "guidance_cut_or_warning"
+    ],
+    "ev_guidance_cut_or_warning": [
+     "true"
+    ],
+    "ev_major_customer_or_contract_loss": [
+     "true"
+    ],
+    "cx_magnitude_stated": [
+     "true"
+    ],
+    "cx_magnitude_size": [
+     "large"
+    ],
+    "issuer_significance": [
+     "major",
+     "critical"
+    ]
+   }
+  }
+ ]
+}
