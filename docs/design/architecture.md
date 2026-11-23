@@ -658,6 +658,7 @@
 ### 3.5 `ModelRequest` / `ModelResponse` — the only exit to a model (amended 2026-11-23)
 
 - Built: `services/modelgate`, `decide` calls only, and one command, `modelgate shadow run` (§8 rows MG1 to MG11). `generate` is design, no code.
+- Built, not installed: the image's second binary, the wrapper, the unit, the timer and four alerts ("The shadow run on the VPS" below; §8 rows MG12 to MG15).
 - Nothing has been sent to a model: every test runs against a stub or a `127.0.0.1` listener. "Not verified", below, lists what the first paid call decides.
 
 | request | notes |
@@ -824,16 +825,7 @@ What the shadow measures. A number is read per `question_version` and never acro
 - K1 to K9 and K13 need the answers read out of the blobs; no command does that yet. The envelope carries K10 to K12 per run.
 - "How much has already moved" reads returns and is not a shadow measurement.
 
-Runbook, in order. No step has been executed.
-
-| step | who | what |
-|---|---|---|
-| 1 | owner | decisions D1 to D16 below; the K thresholds into the table above |
-| 2 | owner | a separate vendor key with a vendor-side spend limit near the shadow total, in a file of mode 0600 |
-| 3 | owner, by hand | one paid smoke call (D12): `shadow run --limit 1` over a cut; then read the stored response blob against "Not verified". Exit 8 with `unusable_answer` or `partial_shadow` there means the response is not the shape this build reads |
-| 4 | a deploy change, not written | the image builds `modelgate` and carries the question file; a unit and a wrapper: `newsvault cut`, `modelgate shadow run`, removal of the cut on every exit |
-| 5 | owner | `--dry-run` on the VPS over a real cut: `planned`, `planned_bytes`, `truncated`, the cut's size and duration. Needs no key, so it can run before step 2 |
-| 6 | owner | enable the timer; read the first day's envelopes; set `--total-cap-usd` for 20 sessions |
+- Runbook: "The shadow run on the VPS" below. No step has been executed.
 
 Not verified, because it needs a paid call or the VPS; the write path stores raw bytes so none of these can lose a label:
 
@@ -846,7 +838,7 @@ Not verified, because it needs a paid call or the VPS; the write path stores raw
 - whether a byte-identical request returns identical bytes; the rate limit; how long a dated build is served;
 - the size limit: the predecessor's one non-transport refusal in 23,823 calls was an HTTP 400 on a 180,725-character title against the vendor's 32,000-token limit (its `2026_10_jev_feature_layer.py`, read 2026-11-23). The 30,000-byte ceiling is below that under any tokenisation of at least one byte per token;
 - body sizes in the production store, so the truncated share; the predecessor measured its harder question gaining about 6 AUC points up to a 32,000-character cap, above this budget of 13,000 bytes;
-- the size and duration of a production `newsvault cut`; distinct stories per day.
+- the size and duration of a production `newsvault cut` beyond §3.0's first real one (4,333 items, 1.05 s, 2026-11-22); distinct stories per day.
 
 Not built, and why it can wait:
 
@@ -856,31 +848,132 @@ Not built, and why it can wait:
 | repeats, another option order, a reworded document | need only the same build still served: `--repeat-index`, `--sample-only`, a second `--questions` file |
 | a second build in parallel | a second timer line; lost only if that build is retired before it starts |
 | a daily fixed synthetic request compared across days | would detect a build re-served under its id; until then that is unguarded |
-| units, wrapper, image | a deploy change; nothing is installed by an agent |
 | `generate`, `score`, spans, candidate retrieval, relation typing, the sign tables, returns | no producer |
 | company newsrooms, 8-K items, spoken statements | new sources with their own robots and budget decisions |
 
-Owner decisions needed before a paid call:
+Owner decisions; the last column is the owner's of 2026-11-23, `open` where none was given:
 
-| # | decision | recommendation |
+| # | decision | recommendation | decided 2026-11-23 |
+|---|---|---|---|
+| D1 | where the key lives | a file of mode 0600 named by `BELLWETHER_MODEL_KEY_FILE`, bound read-only into the container | yes: `~/.config/bellwether/model-key`, mode 0600, written by the operator; no file, unit or script of this repository names or reads a predecessor's path |
+| D2 | a separate vendor key with its own spend limit | yes, mandatory: a second stop if the cap has a defect | not taken: the operator copies the key the VPS already holds. Whether that key has a vendor-side limit is not recorded here, so the stops are the three caps and the wrapper's ceiling (§8 row MG14) |
+| D3 | the pinned build | one dated before 2026-11-19, the first item's day | the operator supplies it in `MODELGATE_MODEL`; expected `typesafe/jev-1.13-20260917` |
+| D4 | a second build in parallel | not before week 2 | open |
+| D5 | a reworded document on the sample | after the first week | open |
+| D6 | the three caps and the price argument | the owner's numbers; the caps are store-wide | total: 15 USD for the whole shadow, hard; the wrapper refuses a higher `MODELGATE_TOTAL_CAP_USD`. Run cap, day cap and price: no number given; each is required in the env file |
+| D7 | two HTTP owners (edits row R4) | proposed by this change, so merging it is the yes; reversible by removing the crate and the second allowlist name | merged, PR #72 |
+| D8 | this section's rule change | proposed by this change, so merging it is the yes | merged, PR #72 |
+| D9 | start point | forward only: no `--from-seq` | open; the wrapper passes `--from-seq` only beside `--dry-run` |
+| D10 | the K thresholds, per question version, with a minimum number of sessions | before the first paid call | open: the shadow may start, and no threshold is written. A K number is not read against the plan until its threshold is in the table |
+| D11 | cadence | every 30 minutes, between the collect slots | the shadow may start; built at :16 and :46 UTC |
+| D12 | one paid smoke call | yes; it must settle the first five "Not verified" bullets | runbook step 7 |
+| D13 | new sources | none before the shadow ends | open |
+| D15 | the question document is public | confirm | open |
+| D16 | `--give-up-after-hours` | 24 | open; required in the env file, no default |
+| D17 | the state budget of 13,000 bytes against the predecessor's 32,000 characters | measure the truncated share first; a change is `modelgate.request/2` | open |
+| D18 | whether `empty` and `unparseable` stay final | yes until D12 shows the response shape; the alternative, asking again, pays for the same bytes on every run while the shape is misread | open |
+
+#### The shadow run on the VPS (`deploy/systemd/modelgate-shadow`, built 2026-11-23; not installed, not run)
+
+- Image: one image, two binaries. `Dockerfile` builds `-p newsvault -p modelgate`, copies both to `/usr/local/bin/` and `ripple-shadow-0.json` to `/usr/share/bellwether/questions/`.
+  - The entrypoint stays `tini -- newsvault`; `modelgate` is started with `--entrypoint /usr/bin/tini <image> -- /usr/local/bin/modelgate`.
+  - Rejected: a second image. Symptom: a second digest in `newsvault.env` and a second publish job, kept in step with the first by hand, for one binary on the same base.
+  - `image.yml`, both jobs: a dry run of the image's `modelgate` over `snapshot-contract/fixtures/snapshot_v1` with a read-only root, `--network none` and user 1000, asserting `dry_run` and `question_document` `ripple-shadow/0`.
+  - Not measured: the image's size with the second binary.
+- One run is `deploy/systemd/modelgate-shadow`, POSIX sh, installed as `~/.local/lib/bellwether/modelgate-shadow`:
+
+  | step | what | lock and network |
+  |---|---|---|
+  | 1 | refuse, exit 2: a setting unset, still its template placeholder or malformed; `MODELGATE_TOTAL_CAP_USD` above 15; any argument but `--dry-run`, `--limit N`, `--ack-cost-model RUN_ID` and, beside `--dry-run`, `--from-seq N`. Exit 4: no vault, no gate directory, or for a live run no key file | before any docker call |
+  | 2 | `flock --nonblock` on `$XDG_RUNTIME_DIR/bellwether-shadow.lock`, exit 7 when held; then remove every `~/.cache/bellwether/shadow.*`, which under that lock is a killed run's; then `mktemp -d` this run's `shadow.XXXXXX` | the shadow's own lock, to the end of the run |
+  | 3 | container `modelgate-shadow-cut`: `newsvault cut --at <now> --out /cut`, the vault `readonly`, under `timeout --kill-after 30 180` | the store lock, `--nonblock --conflict-exit-code 7`; `--network none` |
+  | 4 | container `modelgate-shadow`: `modelgate shadow run --snapshot /cut/<snapshot_id> --store /modelgate` with the model, the three caps, the price, the age limit and the question path from the env file; the cut `readonly`; the key file `readonly` on `/run/secrets/model-key` | no store lock; `--network bridge`. A dry run: `--network none`, no key mount, the gate store `readonly` |
+  | 5 | a live run's exit 0 or 8: `cost_micro_usd` and `exit.error_code` of the envelope into `modelgate-shadow.prom`, written hidden and renamed; the envelope itself on stdout, so in the journal | none |
+  | 6 | `EXIT` trap: the run's directory removed; `INT` and `TERM`: exit 130 through that trap | none |
+
+  - Both containers: `--rm --pull never --user <uid>:<gid> --read-only --tmpfs /tmp:rw,size=16m --cap-drop ALL --security-opt no-new-privileges`, bind `--mount` only.
+  - The cut is `~/.cache/bellwether/shadow.XXXXXX/cut/<snapshot_id>/`, mode 0700 from `mktemp -d`, outside the vault, which `newsvault cut` requires of `--out`.
+  - **"Outbound HTTPS to the vendor only" is not enforced by the container**: `--network bridge` reaches any host. What holds: the binary's endpoint is a constant and redirects are off ("The key" above); the cut's container has no network. A firewall rule per container needs root and the vendor's addresses and is not built.
+  - A cut is the whole visible archive, written again by every run: 9.7 MB and 1.05 s for 4,333 items (§3.0, 2026-11-22). The 180 s bound is 171 times that measurement, about 743,000 items if the time is linear in items; linearity is not measured.
+
+  | exit | when | the unit | alert |
+  |---|---|---|---|
+  | 0 | the run's 0 | success | none; stamps `modelgate_shadow_last_success_timestamp_seconds` |
+  | 7 | either lock held; the cut's `lease_held`; the cut past its bound (`timeout`'s 124 or 137, then `docker rm --force modelgate-shadow-cut`); the run's 7 | success, by `SuccessExitStatus=7` | `ModelgateShadowStale` once 5,190 s pass with no exit 0 |
+  | 8 | the run's 8 | failed | `ModelgateShadowFailed`; `ModelgateShadowCostCapReached` when `exit.error_code` is `cost_cap_reached` |
+  | 2, 4 | step 1; the cut's or the run's own 2 or 4; an exit 0 whose envelope states no cost | failed | `ModelgateShadowFailed` |
+  | 130, 125, a timeout | a signal; docker's own failure; `TimeoutStartSec` | failed | `ModelgateShadowFailed` |
+
+- `modelgate-shadow.service`: `Type=oneshot`, the collect unit's NTP check, `ExecStart` the script, `SuccessExitStatus=7`, no `Restart=`, `TimeoutStartSec=1500`.
+  - 1,500 s + systemd's 90 s stop timeout = 1,590 s, 210 s before the next firing, which an active unit would swallow.
+  - `ExecStopPost`: `newsvault-unit-result shadow`, then on a timeout `docker rm --force` of each container name.
+  - A run stopped mid-send pays again for the request in flight (`idempotency_key` above).
+- `modelgate-shadow.timer`: `*-*-* *:16,46:00 UTC`, `AccuracySec=1s`, no `Persistent=`; `the_shadow_fires_every_30_minutes_and_frees_the_store_lock_before_any_other_start`:
+
+  | constraint | arithmetic | the test's value |
+  |---|---|---|
+  | start after a 30-minute slot's collect | the collect stops issuing at slot + 14 min 30 s and its last request has 30 s (§11.2): over by :15:00 and :45:00, 60 s before the firing | 0 firings inside slot + 15 min |
+  | release the store lock before the start of any unit that takes it without waiting | held at most 180 s + 30 s = 210 s. Nearest starts after a firing: the roster's 01:20, 240 s after 01:16; the backup's 22:55, 540 s after 22:46; a collect slot, 840 s | nearest 240 s, above 210 s |
+  | a 90-minute slot's collect may run to slot + 45 min | 8 firings a day fall inside it (23:46, 00:46, 02:16, 03:46, 05:16, 06:46, 08:16, 09:46) and exit 7 if that collect still holds the lock | 8 |
+
+  - Rejected :15 and :45: the collect's last possible second. Rejected :20 and :50: 01:20 is the roster's own start, and whichever takes the lock second exits 7; for the roster that is `NewsvaultRosterFailed` and a roster day lost.
+  - Not measured: how long a production collect holds the lock. "Over by slot + 15 min" is the stop deadline plus one patience, with nothing for the run's own writes after its last request.
+- Settings, appended to `deploy/systemd/newsvault.env`; none has a default and the script refuses each placeholder by name:
+
+  | name | value |
+  |---|---|
+  | `MODELGATE_MODEL` | a dated build id (D3) |
+  | `MODELGATE_RUN_CAP_USD`, `MODELGATE_DAY_CAP_USD`, `MODELGATE_TOTAL_CAP_USD` | USD, digits and at most one dot; the total at most 15 (D6) |
+  | `MODELGATE_INPUT_PRICE_PER_MTOK` | USD per million input tokens, for the worst case |
+  | `MODELGATE_GIVE_UP_AFTER_HOURS` | whole hours (D16) |
+  | `MODELGATE_QUESTIONS` | the image's `/usr/share/bellwether/questions/ripple-shadow-0.json`, the one line the template fills in |
+
+  - Fixed paths, no setting: the key `~/.config/bellwether/model-key`, the gate's store `~/.bellwether/modelgate`, the cuts under `~/.cache/bellwether`.
+- Metrics, `modelgate-shadow.prom` in `NEWSVAULT_TEXTFILE_DIR`, rewritten only by a live run's envelope that states its cost:
+
+  | family | from |
+  |---|---|
+  | `modelgate_shadow_spent_micro_usd{scope="run"\|"day"\|"total"}` | `cost_micro_usd.run`, `.day`, `.total` |
+  | `modelgate_shadow_cap_micro_usd{scope=…}` | `cost_micro_usd.run_cap`, `.day_cap`, `.total_cap` |
+  | `modelgate_shadow_cost_cap_reached` | 1 when `exit.error_code` is `cost_cap_reached`, else 0 |
+  | `modelgate_shadow_last_success_timestamp_seconds` | the clock at an exit 0; carried from the last file at an exit 8 |
+
+  - The unit's result is `newsvault_unit_result_success{unit="shadow"}` and its two siblings, from `newsvault-unit-result`; a run by hand writes none of the three.
+- Alerts, in the group `newsvault` of `deploy/prometheus/newsvault.rules.yml`:
+
+  | alert | expr | severity | construction |
+  |---|---|---|---|
+  | `ModelgateShadowFailed` | the shadow unit's last `SERVICE_RESULT` not `success` | critical | exits 8, 2, 4, 125, 130 and a timeout; never exit 7 |
+  | `ModelgateShadowStale` | `(time() - max(modelgate_shadow_last_success_timestamp_seconds)) > 5190`, or the series absent | critical | 2 × the 1,800 s interval + `TimeoutStartSec` 1,500 s + the 90 s stop timeout: the stamp is written when a run ends; `the_shadow_staleness_threshold_is_two_intervals_plus_one_runs_bound`. Also fires while a cap refuses every run |
+  | `ModelgateShadowCostCapReached` | `max(modelgate_shadow_cost_cap_reached) > 0` | critical | a cap of any scope refused a call in the last run that wrote an envelope |
+  | `ModelgateShadowSpendNearTotalCap` | total spent `>=` 0.8 × the total cap, both ÷ 10⁶ | warning | 80%, chosen 2026-11-23 before any spend: at 15 USD it fires at 12 and leaves 3 |
+
+  - One group and one file, because `newsvault-monitoring-check` reads one of each: its rule, health and route checks cover the four names with no change to the script or to `deploy/monitoring/` (§8 row A1).
+  - None of the four matches the run_date route, so each goes to the top route's receiver; the check holds that for each name.
+  - `promtool test rules`: each of the four on both sides of its threshold, and a stack with no shadow series (`ModelgateShadowStale` fires, `ModelgateShadowFailed` does not).
+- Unguarded:
+  - No test starts the unit or runs docker, `flock` or `timeout`: the script runs against stubs of the three under `/bin/dash`.
+  - `shellcheck`, `systemd-analyze verify`, `promtool` and the image's dry run execute only in CI.
+  - SIGKILL runs no trap: that run's cut stays until the next run's sweep, at most one interval later while the timer is enabled.
+  - The envelope is read with `sed` as one compact line. The exit-0 path is held to the real binary's dry-run envelope; the exit-8 envelope in the tests is a constant.
+  - An exit 7 with `vendor_unreachable` has opened attempts whose worst case counts as spent; the metrics show it at the next envelope.
+  - Run and day caps have no ceiling in the script.
+
+Runbook. No step has been executed. Steps 2 to 11 are the operator's, as the VPS user, from a checkout of the tagged commit. A run by hand starts where the timer would: at least 210 s before :00, :30, 22:55 and 01:20 UTC, since its cut holds the store lock those units take without waiting.
+
+| step | what | go on when |
 |---|---|---|
-| D1 | where the key lives | a file of mode 0600 named by `BELLWETHER_MODEL_KEY_FILE`, bound read-only into the container |
-| D2 | a separate vendor key with its own spend limit | yes, mandatory: a second stop if the cap has a defect |
-| D3 | the pinned build | one dated before 2026-11-19, the first item's day |
-| D4 | a second build in parallel | not before week 2 |
-| D5 | a reworded document on the sample | after the first week |
-| D6 | the three caps and the price argument | the owner's numbers; the caps are store-wide |
-| D7 | two HTTP owners (edits row R4) | proposed by this change, so merging it is the yes; reversible by removing the crate and the second allowlist name |
-| D8 | this section's rule change | proposed by this change, so merging it is the yes |
-| D9 | start point | forward only: no `--from-seq` |
-| D10 | the K thresholds, per question version, with a minimum number of sessions | before the first paid call |
-| D11 | cadence | every 30 minutes, between the collect slots |
-| D12 | one paid smoke call | yes; it must settle the first five "Not verified" bullets |
-| D13 | new sources | none before the shadow ends |
-| D15 | the question document is public | confirm |
-| D16 | `--give-up-after-hours` | 24 |
-| D17 | the state budget of 13,000 bytes against the predecessor's 32,000 characters | measure the truncated share first; a change is `modelgate.request/2` |
-| D18 | whether `empty` and `unparseable` stay final | yes until D12 shows the response shape; the alternative, asking again, pays for the same bytes on every run while the shape is misread |
+| 1 | Owner: a version tag on a commit of main that holds this change; `image.yml` prints the image and its digest | the publish job is green |
+| 2 | `docker pull "<image>@<digest>"`; `docker tag "<image>@<digest>" "<image>:<version>"`; `NEWSVAULT_IMAGE` in `~/.config/bellwether/newsvault.env` set to that tag and digest | `docker run --rm --network none --entrypoint /usr/local/bin/modelgate "<image>:<version>" schema --format json` names `modelgate.schema/1` |
+| 3 | `install -d -m 0700 ~/.bellwether/modelgate`; `install -m 0755 deploy/systemd/modelgate-shadow ~/.local/lib/bellwether/`; `install -m 0644 deploy/systemd/modelgate-shadow.service deploy/systemd/modelgate-shadow.timer ~/.config/systemd/user/`; `systemctl --user daemon-reload`; the seven `MODELGATE_*` lines of `deploy/systemd/newsvault.env` appended to `~/.config/bellwether/newsvault.env` and the six placeholders replaced (`MODELGATE_TOTAL_CAP_USD=15`; D3's build) | `grep -c '^MODELGATE_' ~/.config/bellwether/newsvault.env` prints 7 and `grep -c '^MODELGATE_.*<' …` prints 0 |
+| 4 | The key: `install -m 0600 /dev/null ~/.config/bellwether/model-key`, then the value written into it in an editor. Never as a command argument and never printed; no bellwether command reads the file it comes from | `stat -c '%a %s' ~/.config/bellwether/model-key` prints `600` and a size above 0 |
+| 5 | Dry run, no key and no network: `env $(grep -v '^#' ~/.config/bellwether/newsvault.env) ~/.local/lib/bellwether/modelgate-shadow --dry-run --from-seq 0`, under `time` | exit 0. Read `requests.planned`, `requests.planned_bytes`, `stories.truncated`, `stories.no_body`, `cost_micro_usd.planned_worst_case` (the whole archive at the price given, an upper bound: step 6 labels none of it), the cut's `newsvault.cut/1` line on stderr and the wall time against the 180 s bound |
+| 6 | First live run, sends nothing: the same command with `--limit 1` in place of the two dry-run arguments. It fixes the floor at the cut's `seq_high_water` | exit 0, `floor.set_by_this_run` true, `requests.sent` 0, `cost_micro_usd.total` 0 |
+| 7 | The paid smoke call (D12), after the next collect slot has committed a story: the `--limit 1` command again | `requests.sent` 1. Exit 0 with `requests.ok` 1 and `cost_micro_usd.run` above 0: go on. Exit 8 `unusable_answer` or `partial_shadow`, or `requests.costless` 1: stop here and read the response blob under `~/.bellwether/modelgate` against "Not verified" above; nothing below is run until a change reads that shape |
+| 8 | The rules: §11.5 step 7, "Alerting", install steps 1, 3 and 5. After step 7, so `ModelgateShadowStale` meets a stamp | `newsvault-monitoring-check` exits 0 with 21 rules |
+| 9 | `systemctl --user enable --now modelgate-shadow.timer` | `systemctl --user list-timers` shows the next :16 or :46 UTC; after it `newsvault-shadow-result.prom` is in the textfile directory |
+| 10 | To stop: `systemctl --user disable --now modelgate-shadow.timer`; a run in progress: `systemctl --user stop modelgate-shadow.service`, which pays again for a request in flight. The store, its labels and the key file stay. `ModelgateShadowStale` fires 5,190 s later: silence it, or end the shadow with a change that removes the four rules | `systemctl --user list-timers` lists no shadow timer |
+| 11 | After the first whole UTC day: `journalctl --user -u modelgate-shadow.service -o cat --since <day> --until <day + 1>`, one envelope per run that reached the gate | Read: `cost_micro_usd.day` and `.total` against the caps (K11; 15 USD over 20 sessions is 0.75 USD a session); `requests.sent`, `ok`, `failed`, `empty`, `unparseable`, `costless`, `refused_by_cap`; `stories.truncated` against `selected` (D17), `no_body`, `build_postdates_story`, `gave_up`; `label_lag_seconds` (K10); `answering_models`, `answered_by_another_id`, `questions.not_answered` and `missing` (K12); `store.runs_left_open`; the number of exit 7 runs and each cut's seconds from the journal's timestamps |
 
 ### 3.6 `Brief` — `propose` to a person
 
@@ -1492,6 +1585,10 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | MG9 | **the gate's tables are insert-only** | `BEFORE UPDATE` and `BEFORE DELETE` triggers on the six tables of `store::TABLES`: `store::tests::an_update_or_delete_of_any_gate_table_is_refused`, which reads the table names from `sqlite_master` and holds `TABLES` to them (mutations 2026-11-23, the `DELETE` triggers not created / `floors` dropped from `TABLES`: red each); one writer: `…::a_second_writer_is_refused_while_the_first_holds_the_lease`; a dry run: `cmd_shadow::tests::a_dry_run_sends_nothing_and_writes_nothing`, also for a build with no floor yet (mutations, the writer's door used / `set_floor` moved out of the `!dry_run` block, alone and with a read-write dry door: red each); `store::tests::another_schema_version_an_unknown_request_and_a_write_through_the_dry_door_are_refused` (mutations 2026-11-23, any `user_version` accepted / the `foreign_keys` pragma removed / the dry door opened read-write: red each); the document on record: `cmd_shadow::tests::a_second_build_and_a_second_document_each_label_the_story_again` asserts the `question_docs` rows and the file blobs (mutation, `record_question_doc` not called: red) | **enforced against a statement through SQLite**<br>unguarded: `DROP TRIGGER`, a replaced database file, the blob files, which no trigger covers<br>no code reader yet: `labels.item_id`, `labels.seq`, `labels.run_id`, every column of `question_docs`, `floors.run_id`, `requests.state_digest`, `state_bytes`, `body_bytes`, `state_truncated`, `request_sha256`, `attempt_events.http_status`, `transport_failure`, `requested_at`; written for the reader of §3.5's "Not built" row 1 |
 | MG10 | **`modelgate` reads news only as a snapshot file, and nothing links the crate that spends money** | `repo_invariants::clients::model_owner_isolation_failure` over `cargo metadata`: `…::the_model_owner_depends_on_nothing_of_the_news_side_and_nothing_depends_on_it` (mutations 2026-11-23, `news-provider` added to `services/modelgate/Cargo.toml` / `modelgate` added to `services/newsvault/Cargo.toml` / `news-provider` added to `snapshot-contract/Cargo.toml`, which `modelgate` depends on: red each); the walk over member-to-member edges on a synthetic tree: `…::a_news_side_dependency_of_the_model_owner_and_a_dependant_of_it_are_each_named` | **enforced as a manifest question**<br>unguarded: `modelgate` opening a file under the vault through `std::fs`; a returns file read the same way; the wrapper that removes a cut after a run does not exist |
 | MG11 | **every story of a cut above the floor is labelled once, on its first-sighted row, whenever its row becomes visible, and a failed one is asked again until its age limit** (§3.5, "The shadow run") | anti-join in `cmd_shadow::Run::consider` over `Store::story_state`: `cmd_shadow::tests::a_row_that_becomes_visible_late_is_still_labelled` (mutation 2026-11-23, selection above the highest labelled `seq`: red), `…::only_the_first_sighted_row_of_a_story_is_labelled`, `…::a_failed_story_is_retried_by_a_later_run_until_the_age_limit` (mutations that day, `failed` counted as answered / the age test dropped: red each), `…::a_story_the_cap_refused_is_asked_by_a_later_run_whatever_its_age` (mutations 2026-11-23, a linked request with no attempt read as asked / a never-asked story given up by its age: red each), `…::the_first_run_fixes_the_floor_and_a_later_from_seq_cannot_move_it`; per build and per document: `…::a_second_build_and_a_second_document_each_label_the_story_again` (mutations 2026-11-23, `story_state` ignoring the build / ignoring the question version / `Store::floor` ignoring the build: red each); reader of the cut: `snapshot_contract::read::tests::the_committed_fixture_reads_back_as_its_three_rows_and_its_manifest` (mutation, the body column dropped: red) | **enforced over synthetic cuts**<br>never labelled, and counted: a row with no body, an `Undated` row (in no cut), a story observed on or before the build's date, a story given up on<br>unmeasured: the share of each on production |
+| MG12 | **a shadow run's cut is taken under the store lock, bounded and with no network, and its labelling holds no lock and reads the cut and the key read-only, both as unprivileged containers on a read-only root** (§3.5, "The shadow run on the VPS") | `deploy/systemd/modelgate-shadow` run under `/bin/dash` against stub `docker`, `flock` and `timeout`, both docker calls compared word for word: `services/modelgate/tests/deploy.rs::a_run_cuts_under_the_store_lock_then_labels_with_the_real_binary_and_writes_its_spend` (mutations 2026-11-23, each alone by a script that applied one change, ran the named test and restored the file: the cut's `--network none` removed / the cut's `flock` removed / the key mount without `readonly` / the run without `--read-only` / without `--cap-drop ALL` / without `no-new-privileges` / the run on `--network none` / the leftover sweep removed: red each)<br>the wrapper's words against the parser: the stub hands them to the real `modelgate` as a dry run over `snapshot_v1`, so an option the binary does not take exits 2 there<br>dry run: `…::a_dry_run_has_no_network_and_no_key_and_writes_no_metric` (mutations that day, the dry branch given the live mounts / metrics written for a dry run: red each) | **enforced against stubs**<br>holes: docker, `flock` and `timeout` never run in a test; `--network bridge` reaches any host, so "the vendor only" rests on the binary's constant endpoint; `shellcheck` and `systemd-analyze verify` run in `deploy.yml` only |
+| MG13 | **a shadow run's cut is removed however the run ends, and only an envelope that states its cost rewrites the spend metrics** (§3.5, same) | `…::every_exit_path_removes_the_cut_and_only_an_envelope_with_its_cost_rewrites_the_metrics`, 11 endings: each lock held, the cut's 7 and 4, `timeout`'s 124 and 137, the run's 7 and 2, 8 with a cap reached, 8 and 0 with no cost (mutations 2026-11-23, the `EXIT` trap removed / 124 passed through / the success stamp not carried over an exit 8 / a cost-less envelope written as empty samples: red each); `…::a_terminated_run_exits_130_and_leaves_no_cut` (mutation, the `INT TERM` trap removed: red); the metric text from the real binary's envelope: MG12's first test (mutation, `--total-cap-usd` given the day cap: red) | **enforced against stubs**<br>holes: SIGKILL runs no trap, and that cut stays until the next run's sweep; the exit-8 envelope is a test constant; an exit 7 changes no metric |
+| MG14 | **no cap, price, build or age limit of the shadow has a default, and a total cap above the owner's 15 USD or an argument restating a setting is refused before any container starts** (§3.5, D6) | `…::each_setting_is_required_and_the_owners_ceiling_and_the_argument_list_are_held`, 24 refusals at exit 2 with no docker call: each of the 7 settings unset, 5 malformed (a total of 15.01 among them), each of the template's 6 placeholders, 6 argument lists; a missing key file exits 4 (mutations 2026-11-23, a `:-1` default on the run cap / the ceiling test removed / the argument check removed / `--from-seq` allowed in a live run / the key file check removed / a template placeholder made a value: red each); the textfile directory: `newsvault`'s `tests/deploy.rs::the_templates_textfile_placeholder_is_refused_by_every_script_before_it_runs` (mutation, the script's check removed: red) | **enforced for the script**<br>holes: the ceiling is a constant of the script, so a changed script raises it; run and day caps have no ceiling; the key's vendor-side limit is outside this repository (D2) |
+| MG15 | **the shadow never holds the store lock at another unit's start, ends before its own next firing, exits 7 without failing, and every metric it writes is read by a rule** (§3.5, same) | `services/newsvault/tests/deploy.rs`: `the_shadow_fires_every_30_minutes_and_frees_the_store_lock_before_any_other_start`, derived from `SLOTS`, the backup's and the roster's timers and the script's `cut_bound` and `cut_kill` (mutations 2026-11-23, the timer at :15,45 / :20,50 / :10,40 / hourly / with `Persistent=true` / `cut_bound=300`: red each); `the_shadow_unit_succeeds_on_exit_7_records_its_result_and_ends_before_its_next_firing` (mutations, `SuccessExitStatus` removed / made `7 8` / `TimeoutStartSec=1710` / the result line removed / the NTP check removed: red each); `the_shadow_staleness_threshold_is_two_intervals_plus_one_runs_bound` (mutation, 3,600: red); `every_metric_written_has_an_alert_rule_and_no_rule_reads_another` (mutations, the near-cap rule removed / the cap-reached rule reading nothing / a fifth family written: red each); `the_image_carries_modelgate_and_its_question_file_and_each_image_job_dry_runs_it` (mutations, the Dockerfile building `newsvault` only / without the question file / the publish job's dry run removed / the template naming another question path: red each); `the_deploy_workflow_runs_each_validator_on_its_file` (mutation, `shellcheck` without the script: red); the alerts' two sides: `promtool test rules` | **enforced as text; `promtool`, the image's dry run, `shellcheck` and `systemd-analyze` in CI only**<br>holes: the 180 s bound and "a collect is over by slot + 15 min" are arithmetic, not measurements of a run; `timeout`'s kill and the lock's release are never exercised; no unit is started; 8 firings a day can meet a 90-minute slot's collect |
 
 ---
 
@@ -2119,7 +2216,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - Disk criterion: the VPS's free space read and an alert on it, or an accepted risk recorded in N2. State: met (owner decision 2026-11-23).
   - Free space read 2026-11-22: 63 GB free of 193 GB (`df -h`, root filesystem, the one the store, a staging copy and 7 backups share, N1).
   - The alert is the VPS's shared host rule `LowDiskSpace` in `~/monitoring/prometheus/alert.rules`: `node_filesystem_avail_bytes / node_filesystem_size_bytes * 100 < 15` for 5m, routed to the same Telegram receiver; read on the VPS 2026-11-22.
-  - Not in this repository: the rule belongs to the shared monitoring stack (§11.5 step 7, "Alerting"); none of the 17 rules in `deploy/prometheus/newsvault.rules.yml` (15 before 2026-11-23) reads disk, and `newsvault-monitoring-check` does not check the shared rule.
+  - Not in this repository: the rule belongs to the shared monitoring stack (§11.5 step 7, "Alerting"); none of the 21 rules in `deploy/prometheus/newsvault.rules.yml` (17 before the shadow's four of 2026-11-23) reads disk, and `newsvault-monitoring-check` does not check the shared rule.
   - Unmeasured: the store's growth rate.
 - A missed `collect` day is mostly recovered late with a later `observed_at`, so it gives no cutoff inside that day: the PRN sitemap walk reads back to its last basis (sitemap depth about 70.5 h, measured 2026-11-17) and the GNW id walk to the highest id of the previous RSS read (§11.2). Lost as `live_ingest`: items of RSS-only hosts (the Fed, CNW) and of any outage longer than a host's list depth. Not tested on a real outage.
 
@@ -2128,7 +2225,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | V1 | a backup restores | newest pre-deploy copy into an empty directory; `blobs verify` exit 0; `ledger` for one day at a fixed `--at` before the copy was taken equal to the live store's, each read by a build that reads its schema | **met** 18:09-18:10Z: N1's drill table; 1 of 10,358 fields differs, the rows committed after the copy | 1 | the Mac sync of `Backups/bellwether` (N1) |
 | V2 | production runs v0.5.1 after a pre-deploy check on a restored copy | on V1's copy: migrate with a v0.5.1 writer (`publish`; `blobs compress` refuses with no active dictionary before it migrates); `items --at` exit 0; a real `cut`; `validate`; rehearse the SQL rollback (§3.1) and compare v0.4.0's `ledger`; then deploy | **met**: copy migrated 15 to 17 by `publish --at 2026-11-22T18:00Z` (attempts: `open_web_wires` 4,853, `robots` 5, all `live_ingest`); `items --at 2026-11-22T18:00Z` exit 0; `cut` exit 0 in 1.05 s; SQL rollback, then v0.4.0 `ledger` equal in every field but `unpublished_seq_ranges`; not rehearsed: production's 16 to 17 step with an active dictionary and `.zst` blobs, since the copy predates v0.4.0's migration and the dictionary (§3.9) and migrated with every blob raw; deployed 18:11Z, image `sha256:24e624e8…`; first run 18:30Z exit 0; user_version 17; 5,066 attempts `live_ingest`; 7 new blob files, all `.zst` | 1 | the SQL rollback on a store with an active dictionary is not rehearsed; production's own 16 to 17 step ran (user_version 17) |
 | V3 | a real cut over production data validates and rebuilds to the same bytes | `cut`; `snapshot-contract validate`; a second `cut` with `--through-seq` on a store that has grown; same `snapshot_id` and `data_sha256`; record peak RSS, file size and ZSTD ratio with no pass condition | **met**, peak RSS not measured: §3.0's first real cut; the rebuild ran on the live store after the deploy | 2 | peak RSS on a real cut |
-| V4 | a `vault` failure reaches the owner without anyone reading `ledger` | (a) `promtool check rules` and `test rules` cover the 17 rules, 15 before the roster's two of 2026-11-23 (`.github/workflows/deploy.yml`); (b) the VPS's Prometheus lists them healthy and one test alert reaches the owner and resolves; (c) a named heartbeat fires when Prometheus, Alertmanager or the route is down, or that absence is an accepted risk in N2 | (a) met: each rule has a case in `newsvault.rules.test.yml`; `deploy/` unchanged from v0.4.0 to v0.5.1. (b) met 2026-11-23: `newsvault-monitoring-check` on the VPS, 12:44Z after the roster rules were installed and Prometheus reloaded: exit 0, `no drift`, 17 rules each `health` `ok`, every Newsvault alert routed to `telegram`, the run_date route at 49h (11:26Z, before the install: exit 1 naming only the two roster rules not yet loaded); test alert `NewsvaultTest` added 11:27:52Z with `--start` and `--end` 11:37:52Z, the firing message reached the owner's Telegram at 11:28Z and the resolved one at 11:38Z (owner's screenshot). (c) not met: `NewsvaultWatchdogStale` uses `absent()` and catches a dead watchdog, not a dead Prometheus | 1 | (c): the owner picks an option below |
+| V4 | a `vault` failure reaches the owner without anyone reading `ledger` | (a) `promtool check rules` and `test rules` cover the 21 rules, 17 before the shadow's four of 2026-11-23, which are not installed (`.github/workflows/deploy.yml`); (b) the VPS's Prometheus lists them healthy and one test alert reaches the owner and resolves; (c) a named heartbeat fires when Prometheus, Alertmanager or the route is down, or that absence is an accepted risk in N2 | (a) met: each rule has a case in `newsvault.rules.test.yml`; `deploy/` unchanged from v0.4.0 to v0.5.1. (b) met 2026-11-23: `newsvault-monitoring-check` on the VPS, 12:44Z after the roster rules were installed and Prometheus reloaded: exit 0, `no drift`, 17 rules each `health` `ok`, every Newsvault alert routed to `telegram`, the run_date route at 49h (11:26Z, before the install: exit 1 naming only the two roster rules not yet loaded); test alert `NewsvaultTest` added 11:27:52Z with `--start` and `--end` 11:37:52Z, the firing message reached the owner's Telegram at 11:28Z and the resolved one at 11:38Z (owner's screenshot). (c) not met: `NewsvaultWatchdogStale` uses `absent()` and catches a dead watchdog, not a dead Prometheus | 1 | (c): the owner picks an option below |
 | V5 | the deployed build runs 7 clean days | `newsvault ledger --source open_web_wires --at <D+1 00:30Z> --from D --to D --expected-runs 31 --check` exit 0 for each day D of 7 consecutive full UTC days after the deploy day on v0.5.1; any other exit resets the count; no `vendor_archive` backfill during the window; per day record continuity, `walk_unread` and `listing_unusable` counts, with no pass condition | in progress: day 1 is 2026-11-23; no full v0.5.1 day yet; one earlier day, 2026-11-21, on v0.3.1 at least to 22:55Z (that hour's copy is at user_version 15; v0.4.0's writer migrates to 16): 31 of 31 runs, 323 attempts, 0 failed, 158 new items | none | after 21 days, by 2026-12-13, V5 is reported not met with its causes |
 | C2 | no `items` row with `seq <= seq_high_water` can change | a trigger refuses `UPDATE` and `DELETE` on `items`; a named test goes red without it (§8 rows R1, S1) | not met: owner decision 7 waits for the takedown design (decision i); no production path updates `items`; a changed row older than 7 days is not recoverable from the Nextcloud copies | 3 | design takedown, then the guard |
 | C3 | where each cut was written is recorded | a record of written cuts that decision i reads | not met: "Open since 2026-11-22" above | 3 | with decision i; a cadence once a timer is wanted |
@@ -3567,7 +3664,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
      7. chore(deploy): one pinned toolchain, the collect's exit metric, N1's daily Nextcloud copy (owner decisions 2026-11-18). Built 2026-11-18: the PR 7 bullets below.
      - PRs 2, 3 and 5 and the per-document robots check are the hard gates; the robots check is built (2026-11-17), PRs 2, 3 and 5 on 2026-11-18.
      - PR 6, built 2026-11-18 (files written and validated; nothing installed on the VPS, no tag pushed, no image published):
-       - Image: `Dockerfile`, both stages `ubuntu:noble-20261024.1` pinned by digest, whose `libsqlite3-0` (3.45) is the SQLite the gate links (`bundled` is step 8): every workflow job runs on `ubuntu-24.04` and `ci.yml` checks its `libsqlite3-0` is 3.45; rustup-init 1.29.3 checked against its published sha256; the toolchain `rust-toolchain.toml`'s, which `ci.yml` installs too (PR 7); `tini` as PID 1; user 10001; the hosts and rules files under `/usr/share/bellwether/`; no secret.
+       - Image: `Dockerfile`, both stages `ubuntu:noble-20261024.1` pinned by digest, whose `libsqlite3-0` (3.45) is the SQLite the gate links (`bundled` is step 8): every workflow job runs on `ubuntu-24.04` and `ci.yml` checks its `libsqlite3-0` is 3.45; rustup-init 1.29.3 checked against its published sha256; the toolchain `rust-toolchain.toml`'s, which `ci.yml` installs too (PR 7); `tini` as PID 1; user 10001; the hosts and rules files under `/usr/share/bellwether/`; no secret. Since 2026-11-23 it also holds `modelgate` and its question file (§3.5, "The shadow run on the VPS").
          - Rejected: an official `rust:*` builder: Debian bookworm's SQLite is 3.40, not CI's 3.45.
          - Rejected: `ci.yml` on `ubuntu-latest`: on 2026-11-18 that was 26.04 with SQLite 3.46.1 (run 44329718818's `Image: ubuntu-26.04`; Launchpad's resolute source 3.46.1-9ubuntu0.4), so the tests linked a library the image does not ship (PR #54 review).
        - Unpinned: the Ubuntu packages, installed at the version the archive serves on build day.
@@ -3615,6 +3712,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
          - The store lock is S7-D10's separate scheduler lock: the store's own lease already refuses a second writer (exit 7, `lease_held`); the outer lock decides before a container starts. Rejected: `flock --wait`; a waiting collect spends its own window.
          - `newsvault-watchdog.timer` (`*-*-* *:50:00 UTC`, hourly) and `.service`, running `deploy/systemd/newsvault-watchdog` installed as `~/.local/lib/bellwether/newsvault-watchdog`: `ledger --at <now> --from <yesterday> --to <today> --expected-runs 31 --check --format prometheus` in the image, the store bind-mounted `readonly`, `--network none`, written to `.newsvault.prom.<pid>` in `NEWSVAULT_TEXTFILE_DIR` and renamed to `newsvault.prom` for the ledger's exits 0, 1 and 8; any other exit leaves the last file, so the staleness alert fires. `--expected-runs 31`: a day with no run file states no expected count, so without it a day no run reached raised no `runs_below_expected`.
          - `newsvault.env`: the template of `~/.config/bellwether/newsvault.env`: `NEWSVAULT_IMAGE` (tag and digest) and `NEWSVAULT_TEXTFILE_DIR`; no secret.
+         - `modelgate-shadow.timer`, `.service` and the script `modelgate-shadow` (2026-11-23), with seven `MODELGATE_*` settings in `newsvault.env` and four `Modelgate*` alerts: §3.5, "The shadow run on the VPS", which holds their placement, exits, alert table and install steps.
            - Since 2026-11-19 `NEWSVAULT_TEXTFILE_DIR` is the placeholder `<node-exporter-textfile-directory>`, and the watchdog, backup and unit-result scripts refuse a value that is not an absolute path, exit 2 before docker runs or a file is written: `the_templates_textfile_placeholder_is_refused_by_every_script_before_it_runs` (mutations 2026-11-19, each script's check removed and the template a path again: each red). Rejected: a generic default path: the first install's directory was not the old default, and a path in a template reads as a fact about a machine.
        - Metrics: `newsvault ledger --format prometheus`, schema `newsvault.prom/1`, on stdout for the exits 0, 1 and 8 as JSON is; `cmd_ledger::PROMETHEUS_FAMILIES` lists the families. Rejected: a shell step converting the JSON with `jq`: the image holds no `jq`, and the conversion would be untested code beside the tested renderer.
        - Per-day families are labelled `source`, `run_date` and `days_ago` (0 today, 1 yesterday, from `--at`'s UTC date), so a rule can read yesterday's closed day apart from today's running one.
@@ -3740,7 +3838,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
            | the run_date route, `repeat_interval` 49 h | a child of the top route in `~/monitoring/alertmanager/alertmanager.yml` | `deploy/monitoring/alertmanager.route.yml` | 2026-11-21 |
 
          - Not bellwether's: the top route (receiver `telegram`, `group_by` `[alertname, job]`, `group_wait` 30 s, `group_interval` 5 min, `repeat_interval` 24 h), the receivers, `telegram.tmpl`, the other rule files (`alert.rules`, the shared host rules; `alphalens.rules`, rewritten hourly by AlphaLens's timer).
-         - Every Newsvault alert the run_date route does not match goes to the top route's receiver; no route reads `severity`.
+         - Every Newsvault alert the run_date route does not match, and each of the four Modelgate alerts, goes to the top route's receiver; no route reads `severity`.
          - AlphaLens's alerts are muted since 2026-11-22 (owner's request): a child route before bellwether's sends `alertname=~"Alphalens.*"` to `blackhole`, a receiver with no notifier; `amtool config routes test` read 2026-11-22: `NewsvaultDeferredExpired` and `NewsvaultCollectStale` `telegram`, `AlphalensJobStale` `blackhole`.
          - Install or update, as the deploy user from a checkout of the commit to install; back up each file first; never print `alertmanager.yml`, which names the chat:
            1. Rules: `install -m 0644 deploy/prometheus/newsvault.rules.yml ~/monitoring/prometheus/newsvault.rules`.
