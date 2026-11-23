@@ -17,6 +17,7 @@ use newsvault::cmd_cut::{self, CutError};
 use newsvault::cmd_items;
 use newsvault::cmd_ledger::{self, Ask, LedgerReadError, Report};
 use newsvault::cmd_robots::{self, RobotsError};
+use newsvault::cmd_roster::{self, RosterError};
 use newsvault::cmd_snapshot::{self, SnapshotError};
 use newsvault::contact::{self, ContactError};
 use newsvault::lake::{Day, LakeError, LakeReader};
@@ -195,6 +196,11 @@ enum Command {
         #[command(subcommand)]
         action: RobotsAction,
     },
+    /// The company roster: SEC's daily file, kept as received under the ledger.
+    Roster {
+        #[command(subcommand)]
+        action: RosterAction,
+    },
     /// The section 3.0 Snapshot for derive: every row visible at --at within a seq prefix, as
     /// <out>/<snapshot_id>/ with manifest.json and snapshot.parquet. Never rewrites one.
     Cut {
@@ -269,6 +275,35 @@ enum RobotsAction {
         /// Accepted and does nothing: no command here prompts or reads stdin.
         #[arg(long)]
         non_interactive: bool,
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
+    },
+}
+
+#[derive(Subcommand)]
+enum RosterAction {
+    /// Fetches each roster file once under an attempt row, after its host's robots.txt, and keeps
+    /// the bytes and headers as received. Parses nothing into tables.
+    Fetch {
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Plans one url per file and mutates nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Accepted and does nothing: no command here prompts or reads stdin.
+        #[arg(long)]
+        non_interactive: bool,
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
+    },
+    /// Per roster file, the newest copy visible at --at: its valid time (Last-Modified, else
+    /// Date) and its observation time (received) both at or before it. Exit 1 when a file has none.
+    Show {
+        /// The cutoff (RFC 3339). Required: a read with no cutoff is not a point-in-time read.
+        #[arg(long)]
+        at: String,
+        #[arg(long)]
+        store: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
@@ -455,6 +490,9 @@ fn exit_code(failure: &anyhow::Error) -> u8 {
             _ => EXIT_USAGE,
         };
     }
+    if let Some(roster) = failure.downcast_ref::<RosterError>() {
+        return roster.exit();
+    }
     if let Some(refused) = failure.downcast_ref::<ContactError>() {
         return match refused {
             ContactError::FileAbsent { .. } => EXIT_NOT_FOUND,
@@ -638,6 +676,7 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 code => Verdict::No(code),
             })
         }
+        Command::Roster { action } => run_roster(action),
         Command::Items {
             at,
             store,
@@ -763,6 +802,59 @@ fn contact(registered: cmd_collect::Registered) -> Result<String, ContactError> 
         registered.contact_file_variable(),
         |name| std::env::var_os(name),
     )
+}
+
+/// `roster fetch` reads the feed's contact: the one file the VPS mounts, which SEC has answered.
+fn run_roster(action: RosterAction) -> anyhow::Result<Verdict> {
+    match action {
+        RosterAction::Fetch {
+            store,
+            dry_run,
+            non_interactive: _,
+            format,
+        } => {
+            let ask = cmd_roster::Ask {
+                store: vault_root(store),
+                contact: contact(cmd_collect::Registered::OpenWebWires)?,
+                dry_run,
+            };
+            let wire = cmd_roster::wire_for(&ask);
+            let answer = cmd_roster::run(&ask, &wire, &SystemClock)?;
+            match answer.error_object(std::env::args().collect()) {
+                None => emit_value(&answer.report, format, cmd_roster::render_human)?,
+                Some(error) => emit_robots_error(&error, format)?,
+            }
+            Ok(match answer.exit.code() {
+                0 => Verdict::Ok,
+                code => Verdict::No(code),
+            })
+        }
+        RosterAction::Show { at, store, format } => {
+            let shown = cmd_roster::show(&vault_root(store), instant(&at, "--at"))?;
+            emit_value(&shown.report, format, cmd_roster::render_show_human)?;
+            Ok(if shown.every_file_visible {
+                Verdict::Ok
+            } else {
+                Verdict::No(EXIT_NO)
+            })
+        }
+    }
+}
+
+fn emit_value(
+    report: &serde_json::Value,
+    format: Format,
+    human: fn(&serde_json::Value, &mut std::io::StdoutLock<'static>) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    let mut out = std::io::stdout().lock();
+    match format {
+        Format::Json => {
+            serde_json::to_writer_pretty(&mut out, report)?;
+            writeln!(out)?;
+        }
+        Format::Human => human(report, &mut out)?,
+    }
+    Ok(())
 }
 
 fn emit_collect(envelope: &serde_json::Value, format: Format) -> anyhow::Result<()> {
@@ -1521,6 +1613,57 @@ fn print_schema(format: Format) {
                     "8": "a row failed"
                 },
                 "mutates": true
+            },
+            {
+                "path": ["roster", "fetch"],
+                "summary": "Fetches each roster file (SEC's company_tickers_exchange.json) once under an attempt row of source roster, after its host's robots.txt under one of source robots, and keeps the bytes and headers as an L2 payload. No item rows.",
+                "options": [
+                    {"name": "store", "type": "path"},
+                    {"name": "dry_run", "type": "flag",
+                     "doc": "plans one url per file and mutates nothing"},
+                    {"name": "non_interactive", "type": "flag",
+                     "doc": "accepted and does nothing: no command here prompts or reads stdin"},
+                    {"name": "format", "type": "enum", "values": ["human", "json"]}
+                ],
+                "env": [{"name": "BELLWETHER_FEED_CONTACT",
+                         "doc": "the contact address the User-Agent carries"},
+                        {"name": "BELLWETHER_FEED_CONTACT_FILE", "doc": CONTACT_FILE_DOC},
+                        {"name": "BELLWETHER_VAULT",
+                         "doc": "the store when --store is not given, then ~/.bellwether/vault"}],
+                "output": cmd_roster::SCHEMA,
+                "output_fields": [
+                    {"name": "files[].not_asked", "type": "enum",
+                     "values": ["robots_unverified", "robots_refused", "robots_disallowed"],
+                     "doc": "null when asked; no attempt row when set"},
+                    {"name": "files[].raw_blob",
+                     "doc": "sha256 of the body as received: the file's universe_version"}
+                ],
+                "exits": {
+                    "0": "every file answered usable",
+                    "2": "credential_contact_missing, a store of another version, io",
+                    "7": "every fetch failed transiently (vendor_unreachable), or another run holds the lease (lease_held)",
+                    "8": "a file failed, was empty, was another shape, or was not asked"
+                },
+                "mutates": true
+            },
+            {
+                "path": ["roster", "show"],
+                "summary": "Per roster file, the newest usable copy visible at at: valid time (Last-Modified, else Date) and observation time (received_at) both at or before it, and the newest attempt opened by then.",
+                "options": [
+                    {"name": "at", "type": "rfc3339", "required": true},
+                    {"name": "store", "type": "path"},
+                    {"name": "format", "type": "enum", "values": ["human", "json"]}
+                ],
+                "env": [{"name": "BELLWETHER_VAULT",
+                         "doc": "the store when --store is not given, then ~/.bellwether/vault"}],
+                "output": cmd_roster::SHOW_SCHEMA,
+                "exits": {
+                    "0": "every roster file has a copy visible at at",
+                    "1": "the answer is no: a file has none",
+                    "2": "input_schema_mismatch, input_unparseable (a stored time or header), io_failed",
+                    "4": "input_absent: no commit log"
+                },
+                "mutates": false
             },
             {
                 "path": ["cut"],

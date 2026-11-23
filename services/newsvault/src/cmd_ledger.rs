@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cmd_collect::Registered;
 use crate::cmd_robots::ROBOTS_SOURCE;
+use crate::cmd_roster::ROSTER_SOURCE;
 use crate::store::{
     coverage_up_to, newest_visible_publication, require_current_version, unpublished_seq_ranges,
     SeqRange, WindowCoverage, COMMIT_LOG, REDIRECTS, RUNS_DIR,
@@ -490,6 +491,7 @@ pub enum RunKind {
     #[default]
     Collect,
     RobotsRefresh,
+    RosterFetch,
 }
 
 impl RunKind {
@@ -1008,10 +1010,12 @@ fn freshness(
     at: &str,
     cutoff: DateTime<Utc>,
 ) -> Result<Freshness, LedgerReadError> {
-    // A robots fetch asks a host, not a source, so it says nothing about any source's freshness.
+    // A robots fetch asks a host, not a source, and a roster fetch asks once a day for no news,
+    // so neither says anything about the collector's freshness.
     let newest_request: Option<String> = db.query_row(
-        "SELECT MAX(requested_at) FROM attempts WHERE requested_at <= ?1 AND source <> ?2",
-        params![at, ROBOTS_SOURCE],
+        "SELECT MAX(requested_at) FROM attempts
+          WHERE requested_at <= ?1 AND source <> ?2 AND source <> ?3",
+        params![at, ROBOTS_SOURCE, ROSTER_SOURCE],
         |row| row.get(0),
     )?;
     // Both halves of the visibility question, which is the one `pit` exists for: a publication
