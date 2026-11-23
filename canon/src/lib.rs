@@ -73,6 +73,7 @@ pub enum Domain {
     SnapshotRow,
     QuestionVersion,
     ModelRequest,
+    EmbedRequest,
 }
 
 impl Domain {
@@ -90,6 +91,7 @@ impl Domain {
             Self::SnapshotRow => "snapshot_row",
             Self::QuestionVersion => "question_version",
             Self::ModelRequest => "model_request",
+            Self::EmbedRequest => "embed_request",
         }
     }
 }

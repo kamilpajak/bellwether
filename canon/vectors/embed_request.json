@@ -1,0 +1,16 @@
+{
+  "schema": "canon.vector/1",
+  "digest": "embed_request",
+  "note": "The idempotency key of one embed call: kind, embed format, model, provider slug, quantization, epoch, input digest, repeat index. No story field: two stories with one cut text share one vector. Reproduced with Python 3 hashlib on 2026-11-23.",
+  "input": {
+    "kind": "embed",
+    "embed_format": "modelgate.embed/1",
+    "model": "example/embed-1",
+    "provider": "example-host",
+    "quantization": "bf16",
+    "epoch": 1,
+    "input_digest": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+    "repeat_index": 0
+  },
+  "sha256": "058ee2e4ff85b27e3dfa1f8bda1e44a9dab5cf10f63c8022cc0e418230035a15"
+}

@@ -1,7 +1,7 @@
-//! The eleven digests, each a field list over the form in `lib.rs`. `docs/design/architecture.md`
+//! The twelve digests, each a field list over the form in `lib.rs`. `docs/design/architecture.md`
 //! section 2's rows state the order of `item_id`, `story_id`, `snapshot_row` and `snapshot_id`,
 //! section 3.2's that of `filter_params` and `result_digest`, section 3.5's that of
-//! `question_version` and `model_request`; only the code below states `doc_id` and `attempt_id`.
+//! `question_version`, `model_request` and `embed_request`; only the code below states `doc_id` and `attempt_id`.
 
 use crate::{sha256_canon, CanonError, Digest, Domain, Field, Stamp};
 use chrono::{DateTime, Utc};
@@ -226,12 +226,45 @@ pub fn model_request(fields: &ModelRequestFields) -> Result<Digest, CanonError> 
     )
 }
 
+/// `embed_request`'s inputs, in the order architecture.md section 3.5's "The `embed` kind" states
+/// them. No story field: two stories with one cut text share one vector.
+#[derive(Debug, Clone, Copy)]
+pub struct EmbedRequestFields<'a> {
+    pub kind: &'a str,
+    /// Names the rule that turns a body into request bytes: the cut, the layout, the encoding.
+    pub embed_format: &'a str,
+    pub model: &'a str,
+    pub provider: &'a str,
+    pub quantization: &'a str,
+    /// Bumped by the operator when the provider's serving is seen to change.
+    pub epoch: u32,
+    pub input_digest: &'a str,
+    pub repeat_index: u32,
+}
+
+/// architecture.md section 3.5, "The `embed` kind", `idempotency_key`.
+pub fn embed_request(fields: &EmbedRequestFields) -> Result<Digest, CanonError> {
+    sha256_canon(
+        Domain::EmbedRequest,
+        &[
+            Field::Text(fields.kind),
+            Field::Text(fields.embed_format),
+            Field::Text(fields.model),
+            Field::Text(fields.provider),
+            Field::Text(fields.quantization),
+            Field::Text(&fields.epoch.to_string()),
+            Field::Text(fields.input_digest),
+            Field::Text(&fields.repeat_index.to_string()),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        attempt_id, doc_id, extract_version, filter_params, item_id, model_request,
-        question_version, result_digest, snapshot_id, snapshot_row, story_id, ItemFields,
-        ModelRequestFields, Param, ParamValue, QuestionFields, SnapshotRowFields,
+        attempt_id, doc_id, embed_request, extract_version, filter_params, item_id, model_request,
+        question_version, result_digest, snapshot_id, snapshot_row, story_id, EmbedRequestFields,
+        ItemFields, ModelRequestFields, Param, ParamValue, QuestionFields, SnapshotRowFields,
     };
     use crate::{CanonError, Digest, Stamp};
     use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
@@ -251,7 +284,7 @@ mod tests {
     const MIDNIGHT_MICROS: i64 = 1_782_864_000_000_000;
     /// Every file in `vectors/` is read by the loop below; the count is here so that deleting one
     /// is a failure rather than a smaller pass.
-    const VECTOR_COUNT: usize = 25;
+    const VECTOR_COUNT: usize = 26;
 
     fn at(micros: i64) -> DateTime<Utc> {
         DateTime::UNIX_EPOCH + TimeDelta::microseconds(micros)
@@ -536,6 +569,21 @@ mod tests {
                 repeat_index: u32::try_from(input["repeat_index"].as_u64().unwrap_or_default())
                     .unwrap_or_default(),
             }),
+            "embed_request" => {
+                let number = |key: &str| {
+                    u32::try_from(input[key].as_u64().unwrap_or_default()).unwrap_or_default()
+                };
+                embed_request(&EmbedRequestFields {
+                    kind: text(input, "kind"),
+                    embed_format: text(input, "embed_format"),
+                    model: text(input, "model"),
+                    provider: text(input, "provider"),
+                    quantization: text(input, "quantization"),
+                    epoch: number("epoch"),
+                    input_digest: text(input, "input_digest"),
+                    repeat_index: number("repeat_index"),
+                })
+            }
             other => return format!("unreadable: digest {other}"),
         };
         hex(computed)
