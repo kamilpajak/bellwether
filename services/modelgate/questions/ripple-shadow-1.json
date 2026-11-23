@@ -1,0 +1,1222 @@
+{
+ "schema": "modelgate.questions/1",
+ "name": "ripple-shadow/1",
+ "questions": [
+  {
+   "id": "source_role",
+   "type": "choice",
+   "instructions": "Who published the text, and in what role?",
+   "options": [
+    {
+     "id": "issuer_own",
+     "description": "A company reporting its own news."
+    },
+    {
+     "id": "third_party_solicitation",
+     "description": "A law firm or agent seeking clients or claimants about another company."
+    },
+    {
+     "id": "third_party_research",
+     "description": "An analyst, a research seller or a media outlet writing about another company."
+    },
+    {
+     "id": "regulator_or_exchange",
+     "description": "A regulator, a central bank, a court or an exchange."
+    },
+    {
+     "id": "not_a_company_event",
+     "description": "None of these: no company's event is reported."
+    }
+   ]
+  },
+  {
+   "id": "content_kind",
+   "type": "choice",
+   "instructions": "What kind of content does the text carry? A product, research or technology release is a new event, however ordinary it is for the company that makes it.",
+   "options": [
+    {
+     "id": "new_fact",
+     "description": "It reports a specific new event or decision."
+    },
+    {
+     "id": "routine",
+     "description": "It is a scheduled or administrative notice with no new event."
+    },
+    {
+     "id": "promotional",
+     "description": "It promotes a company, a product or a view without a new event."
+    },
+    {
+     "id": "not_a_company_event",
+     "description": "It is not about a company's event."
+    }
+   ]
+  },
+  {
+   "id": "states_concrete_fact",
+   "type": "noul",
+   "instructions": "Does the text state a specific development with a date, an amount or a named counterparty attached?",
+   "options": [
+    {
+     "id": "true",
+     "description": "It names a dated action, an amount or a counterparty."
+    },
+    {
+     "id": "false",
+     "description": "It is commentary, promotion or a general statement."
+    }
+   ]
+  },
+  {
+   "id": "scope",
+   "type": "choice",
+   "instructions": "Whom does the reported event concern?",
+   "options": [
+    {
+     "id": "issuer_only",
+     "description": "Only the company reported on."
+    },
+    {
+     "id": "named_counterparties",
+     "description": "That company and other companies the text names."
+    },
+    {
+     "id": "whole_category",
+     "description": "A whole category of companies, such as an industry or the users of a technology."
+    }
+   ]
+  },
+  {
+   "id": "names_a_category_of_companies",
+   "type": "noul",
+   "instructions": "Does the text describe a category of companies, other than the company reported on, that the event bears on?",
+   "options": [
+    {
+     "id": "true",
+     "description": "It describes such a category."
+    },
+    {
+     "id": "false",
+     "description": "It describes no such category."
+    }
+   ]
+  },
+  {
+   "id": "event_class",
+   "type": "choice",
+   "instructions": "Which single option best describes the main event of the company reported on?",
+   "options": [
+    {
+     "id": "equity_offering_dilutive",
+     "description": "It sells new shares, warrants or convertibles, or registers them for sale."
+    },
+    {
+     "id": "reverse_split",
+     "description": "It announces or completes a reverse share split."
+    },
+    {
+     "id": "going_concern_doubt",
+     "description": "It or its auditor states doubt that it can continue as a going concern."
+    },
+    {
+     "id": "listing_deficiency_or_delisting",
+     "description": "An exchange notifies it of a listing deficiency, or it is to be delisted."
+    },
+    {
+     "id": "guidance_cut_or_warning",
+     "description": "It lowers or withdraws its own outlook, or warns results will miss it."
+    },
+    {
+     "id": "restatement_or_nonreliance",
+     "description": "It will restate past results, or says past statements cannot be relied on."
+    },
+    {
+     "id": "fraud_or_misconduct_allegation",
+     "description": "It or its management is accused of fraud or misconduct, or opens an internal investigation."
+    },
+    {
+     "id": "auditor_exit",
+     "description": "Its auditor resigns or is dismissed."
+    },
+    {
+     "id": "cfo_exit",
+     "description": "Its chief financial officer leaves or is removed."
+    },
+    {
+     "id": "key_person_departure",
+     "description": "Its chief executive, founder or chair leaves, is removed or dies."
+    },
+    {
+     "id": "regulatory_or_legal_action_against",
+     "description": "A regulator, prosecutor or court acts against it: a charge, a fine, a ban, a subpoena, an adverse ruling."
+    },
+    {
+     "id": "major_customer_or_contract_loss",
+     "description": "It loses a major customer, contract, licence or partner."
+    },
+    {
+     "id": "product_failure_or_recall",
+     "description": "Its product fails, is recalled, or is halted for safety or quality."
+    },
+    {
+     "id": "clinical_or_regulatory_setback",
+     "description": "Its trial misses its endpoint or is put on hold, or a regulator rejects or delays its product."
+    },
+    {
+     "id": "short_seller_report",
+     "description": "A short seller publishes a report against it, or it answers one."
+    },
+    {
+     "id": "default_or_bankruptcy",
+     "description": "It misses a debt payment, breaches a covenant, or files for bankruptcy protection."
+    },
+    {
+     "id": "dividend_cut_or_suspension",
+     "description": "It cuts or suspends its dividend."
+    },
+    {
+     "id": "layoffs_or_restructuring",
+     "description": "It cuts jobs, closes sites or announces a restructuring."
+    },
+    {
+     "id": "cyber_incident",
+     "description": "It reports a breach, an attack or an outage of its systems."
+    },
+    {
+     "id": "credit_rating_downgrade",
+     "description": "A rating agency lowers its rating or outlook."
+    },
+    {
+     "id": "trading_halt",
+     "description": "Trading in its shares is halted or suspended."
+    },
+    {
+     "id": "key_person_appointment",
+     "description": "It names a new chief executive, chair or chief financial officer, with no departure reported as the news."
+    },
+    {
+     "id": "guidance_raise",
+     "description": "It raises its own outlook."
+    },
+    {
+     "id": "contract_or_customer_win",
+     "description": "It wins a contract, an order, a customer or a partnership."
+    },
+    {
+     "id": "product_or_technology_release",
+     "description": "It launches or announces a product, a service or a technology."
+    },
+    {
+     "id": "clinical_or_regulatory_success",
+     "description": "Its trial meets its endpoint, or a regulator approves or clears its product."
+    },
+    {
+     "id": "acquisition_as_acquirer",
+     "description": "It agrees to buy, or completes buying, another company or business."
+    },
+    {
+     "id": "acquisition_as_target",
+     "description": "It agrees to be bought, receives an offer, or is the subject of a tender."
+    },
+    {
+     "id": "earnings_report",
+     "description": "It reports results for a period."
+    },
+    {
+     "id": "financing_non_dilutive",
+     "description": "It obtains debt, a credit line or a grant with no new shares."
+    },
+    {
+     "id": "buyback",
+     "description": "It announces or enlarges a share repurchase."
+    },
+    {
+     "id": "dividend_increase",
+     "description": "It raises its dividend or starts paying one."
+    },
+    {
+     "id": "strategic_alternatives_review",
+     "description": "It says it is reviewing strategic alternatives, including a sale."
+    },
+    {
+     "id": "activist_or_proxy_contest",
+     "description": "A shareholder campaigns against its board or management, or it answers one."
+    },
+    {
+     "id": "credit_rating_upgrade",
+     "description": "A rating agency raises its rating or outlook."
+    },
+    {
+     "id": "routine_or_promotional",
+     "description": "None of the above: a routine notice, a conference, an award, marketing."
+    }
+   ]
+  },
+  {
+   "id": "any_listed_event_fits",
+   "type": "noul",
+   "instructions": "Is the main event of the text one of: a financing, a listing or solvency problem, a change of outlook or results, an accounting or misconduct matter, a legal or regulatory action, a change of leadership, a customer, product, trial or deal event, a payout change, or a rating change?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_equity_offering_dilutive",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? It sells new shares, warrants or convertibles, or registers them for sale.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_reverse_split",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? It announces or completes a reverse share split.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_going_concern_doubt",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? It or its auditor states doubt that it can continue as a going concern.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_listing_deficiency_or_delisting",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? An exchange notifies it of a listing deficiency, or it is to be delisted.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_guidance_cut_or_warning",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? It lowers or withdraws its own outlook, or warns results will miss it.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_restatement_or_nonreliance",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? It will restate past results, or says past statements cannot be relied on.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_fraud_or_misconduct_allegation",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? It or its management is accused of fraud or misconduct, or opens an internal investigation.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_auditor_exit",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? Its auditor resigns or is dismissed.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_cfo_exit",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? Its chief financial officer leaves or is removed.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_key_person_departure",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? Its chief executive, founder or chair leaves, is removed or dies.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_regulatory_or_legal_action_against",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? A regulator, prosecutor or court acts against it: a charge, a fine, a ban, a subpoena, an adverse ruling.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_major_customer_or_contract_loss",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? It loses a major customer, contract, licence or partner.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_product_failure_or_recall",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? Its product fails, is recalled, or is halted for safety or quality.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_clinical_or_regulatory_setback",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? Its trial misses its endpoint or is put on hold, or a regulator rejects or delays its product.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_short_seller_report",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? A short seller publishes a report against it, or it answers one.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_default_or_bankruptcy",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? It misses a debt payment, breaches a covenant, or files for bankruptcy protection.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_dividend_cut_or_suspension",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? It cuts or suspends its dividend.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_layoffs_or_restructuring",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? It cuts jobs, closes sites or announces a restructuring.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_cyber_incident",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? It reports a breach, an attack or an outage of its systems.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_credit_rating_downgrade",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? A rating agency lowers its rating or outlook.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "ev_trading_halt",
+   "type": "noul",
+   "instructions": "Does the text report this of the company reported on? Trading in its shares is halted or suspended.",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "issuer_effect",
+   "type": "choice",
+   "instructions": "Which situation does the text describe for the company reported on?",
+   "options": [
+    {
+     "id": "favourable",
+     "description": "The reported event improves its business, finances or standing."
+    },
+    {
+     "id": "adverse",
+     "description": "The reported event harms its business, finances or standing."
+    },
+    {
+     "id": "neutral",
+     "description": "The reported event changes neither."
+    },
+    {
+     "id": "cannot_tell",
+     "description": "The text does not say enough to tell."
+    }
+   ]
+  },
+  {
+   "id": "issuer_significance",
+   "type": "choice",
+   "instructions": "According to the text, how large is the effect of the reported event on the company reported on? Judge that company alone, not other companies. Judge size, not direction.",
+   "options": [
+    {
+     "id": "none",
+     "description": "No effect on its business, finances or standing."
+    },
+    {
+     "id": "minor",
+     "description": "An ordinary effect, of a size it meets in its normal course."
+    },
+    {
+     "id": "major",
+     "description": "A large effect, beyond its normal course: its results, plans or standing change markedly."
+    },
+    {
+     "id": "critical",
+     "description": "Its survival, its control or most of its business changes, for better or worse."
+    },
+    {
+     "id": "cannot_tell",
+     "description": "The text reports on no one company, or does not say enough."
+    }
+   ]
+  },
+  {
+   "id": "cx_state_body_acts_against",
+   "type": "noul",
+   "instructions": "Does the text say a government, a regulator, a prosecutor, an intelligence service or a court acts against, investigates or charges the company reported on or its officers?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No, or a state body only approves, funds, buys or hears a private claim."
+    }
+   ]
+  },
+  {
+   "id": "cx_criminal_or_security_allegation",
+   "type": "noul",
+   "instructions": "Does the text state criminal or national-security allegations against the company reported on or its officers?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No, or the claims are civil only, or the company is the victim."
+    }
+   ]
+  },
+  {
+   "id": "cx_forced_by_another_party",
+   "type": "noul",
+   "instructions": "Does the text say the person or the company acted because another party required it: a board, a regulator, a court, a lender or an exchange?",
+   "options": [
+    {
+     "id": "true",
+     "description": "It says so."
+    },
+    {
+     "id": "false",
+     "description": "It acted by choice, or the text does not say."
+    }
+   ]
+  },
+  {
+   "id": "cx_international_reach",
+   "type": "noul",
+   "instructions": "Does the text say governments, regulators, prosecutors or courts of more than one country act in the matter?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No, or the company only sells or operates in several countries."
+    }
+   ]
+  },
+  {
+   "id": "cx_magnitude_stated",
+   "type": "noul",
+   "instructions": "Does the text state how large the reported event is: an amount, a percentage, a count or a share?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "cx_magnitude_size",
+   "type": "choice",
+   "instructions": "If the text states how large the reported event is, how large is it against what it is a part of: the revenue, outlook, workforce, shares, assets or debt the text gives? A stated percentage or share is that ratio.",
+   "options": [
+    {
+     "id": "not_stated",
+     "description": "The text states no size."
+    },
+    {
+     "id": "no_base",
+     "description": "It states a size and nothing to set it against."
+    },
+    {
+     "id": "small",
+     "description": "Under about a tenth of what it is a part of."
+    },
+    {
+     "id": "large",
+     "description": "About a tenth or more of what it is a part of."
+    }
+   ]
+  },
+  {
+   "id": "cx_previously_announced",
+   "type": "noul",
+   "instructions": "Does the text say the reported event was announced before this text, or completes a plan announced before it?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No, or it only schedules or forecasts something."
+    }
+   ]
+  },
+  {
+   "id": "cx_interim_successor_named",
+   "type": "noul",
+   "instructions": "Does the text name an interim or acting successor, not a permanent one?",
+   "options": [
+    {
+     "id": "true",
+     "description": "It names an interim or acting one."
+    },
+    {
+     "id": "false",
+     "description": "It names a permanent one, or none, or no person changes."
+    }
+   ]
+  },
+  {
+   "id": "cx_investigation_open",
+   "type": "noul",
+   "instructions": "Does the company reported on or its board (not another publisher of the text) state that an investigation is opened or ongoing?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "cx_issuer_calls_it_material",
+   "type": "noul",
+   "instructions": "Does the company reported on itself call the reported event material to its results or financial condition?",
+   "options": [
+    {
+     "id": "true",
+     "description": "It says it is material."
+    },
+    {
+     "id": "false",
+     "description": "It says not material, only praises the event, or does not say."
+    }
+   ]
+  },
+  {
+   "id": "kp_departure_announced",
+   "type": "noul",
+   "instructions": "About a senior person changing at the company reported on: does the text report that a senior person leaves, is removed or dies?",
+   "options": [
+    {
+     "id": "true",
+     "description": "It reports a departure."
+    },
+    {
+     "id": "false",
+     "description": "It reports none."
+    }
+   ]
+  },
+  {
+   "id": "kp_appointment_announced",
+   "type": "noul",
+   "instructions": "About a senior person changing at the company reported on: does the text report that a senior person is appointed?",
+   "options": [
+    {
+     "id": "true",
+     "description": "It reports an appointment."
+    },
+    {
+     "id": "false",
+     "description": "It reports none."
+    }
+   ]
+  },
+  {
+   "id": "kp_is_chief_executive_or_founder",
+   "type": "noul",
+   "instructions": "About a senior person changing at the company reported on: is the person who changes the chief executive or a founder?",
+   "options": [
+    {
+     "id": "true",
+     "description": "The person is one."
+    },
+    {
+     "id": "false",
+     "description": "The person is neither, or no person changes."
+    }
+   ]
+  },
+  {
+   "id": "kp_role_is_cfo",
+   "type": "noul",
+   "instructions": "About a senior person changing at the company reported on: is the person who changes the chief financial officer?",
+   "options": [
+    {
+     "id": "true",
+     "description": "The person is."
+    },
+    {
+     "id": "false",
+     "description": "The person is not, or no person changes."
+    }
+   ]
+  },
+  {
+   "id": "kp_long_tenure_stated",
+   "type": "noul",
+   "instructions": "About a senior person changing at the company reported on: does the text state that the person held the role for ten years or more?",
+   "options": [
+    {
+     "id": "true",
+     "description": "It states so."
+    },
+    {
+     "id": "false",
+     "description": "It does not."
+    }
+   ]
+  },
+  {
+   "id": "kp_successor_named",
+   "type": "noul",
+   "instructions": "About a senior person changing at the company reported on: does the text name a permanent successor?",
+   "options": [
+    {
+     "id": "true",
+     "description": "It names one."
+    },
+    {
+     "id": "false",
+     "description": "It names none, or names an interim one."
+    }
+   ]
+  },
+  {
+   "id": "kp_effective_immediately",
+   "type": "noul",
+   "instructions": "About a senior person changing at the company reported on: does the change take effect immediately or within days?",
+   "options": [
+    {
+     "id": "true",
+     "description": "It does."
+    },
+    {
+     "id": "false",
+     "description": "It takes effect later, or no date is given."
+    }
+   ]
+  },
+  {
+   "id": "kp_reason_is_benign",
+   "type": "noul",
+   "instructions": "About a senior person changing at the company reported on: does the text give a planned retirement, a planned succession or a personal reason?",
+   "options": [
+    {
+     "id": "true",
+     "description": "It gives one."
+    },
+    {
+     "id": "false",
+     "description": "It gives another reason or none."
+    }
+   ]
+  },
+  {
+   "id": "kp_linked_to_investigation_or_dispute",
+   "type": "noul",
+   "instructions": "About a senior person changing at the company reported on: does the text link the change to an investigation, a dispute with the board, or misconduct?",
+   "options": [
+    {
+     "id": "true",
+     "description": "It links it."
+    },
+    {
+     "id": "false",
+     "description": "It does not."
+    }
+   ]
+  },
+  {
+   "id": "stance_to_category",
+   "type": "choice",
+   "instructions": "According to the text, how does the reported event bear on a category of companies other than the company reported on?",
+   "options": [
+    {
+     "id": "validates",
+     "description": "It shows that what those companies sell or build works or is wanted."
+    },
+    {
+     "id": "lowers_cost_or_barrier",
+     "description": "It makes it cheaper or easier for those companies to operate."
+    },
+    {
+     "id": "opens_market",
+     "description": "It opens a market or a customer group to those companies."
+    },
+    {
+     "id": "threatens_to_absorb",
+     "description": "That company starts to do itself what those companies sell."
+    },
+    {
+     "id": "substitutes",
+     "description": "That company offers something that replaces what those companies sell."
+    },
+    {
+     "id": "undermines_category",
+     "description": "It states or shows that what those companies sell is far from useful or wanted."
+    },
+    {
+     "id": "neutral",
+     "description": "It bears on such a category in none of these ways."
+    },
+    {
+     "id": "cannot_tell",
+     "description": "The text names no such category, or does not say enough."
+    }
+   ]
+  },
+  {
+   "id": "st_lowers_cost_for_independents",
+   "type": "noul",
+   "instructions": "Does the text report something that lowers costs or barriers for companies other than the company reported on?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "st_issuer_enters_their_market",
+   "type": "noul",
+   "instructions": "Does the text report the company reported on entering a market other companies already serve?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "st_issuer_endorses_their_technology",
+   "type": "noul",
+   "instructions": "Does the text report the company reported on adopting, buying or endorsing a technology other companies supply?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "st_replaces_their_product",
+   "type": "noul",
+   "instructions": "Does the text report something offered as a replacement for what other companies sell?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "st_questions_category_viability",
+   "type": "noul",
+   "instructions": "Does the text state that a technology or product category is not ready, not useful or not wanted?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "category_significance",
+   "type": "choice",
+   "instructions": "According to the text, how large is the effect of the reported event on a category of companies other than the company reported on? Judge those companies alone, whatever the event means for that company. Single named companies are not a category. Judge size, not direction.",
+   "options": [
+    {
+     "id": "none",
+     "description": "The text describes no such category, or no effect on one."
+    },
+    {
+     "id": "minor",
+     "description": "An ordinary effect, of a size those companies meet in their normal course."
+    },
+    {
+     "id": "major",
+     "description": "A large effect, beyond their normal course: their results, plans or standing change markedly."
+    },
+    {
+     "id": "critical",
+     "description": "Their survival, their control or most of their business changes, for better or worse."
+    }
+   ]
+  },
+  {
+   "id": "as_matters_more_to_others",
+   "type": "noul",
+   "instructions": "According to the text, does the reported event matter more to other companies than to the company reported on?",
+   "options": [
+    {
+     "id": "true",
+     "description": "It matters more to others."
+    },
+    {
+     "id": "false",
+     "description": "It does not, or it concerns no other companies."
+    }
+   ]
+  },
+  {
+   "id": "as_issuer_described_as_large",
+   "type": "noul",
+   "instructions": "Does the text describe the company reported on as large or as a leader of its field?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "as_others_small_or_specialised",
+   "type": "noul",
+   "instructions": "Does the text describe the other companies the event bears on as small, early-stage or specialised in one field?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No, or it names no other companies."
+    }
+   ]
+  },
+  {
+   "id": "as_issuer_opens_what_others_need",
+   "type": "noul",
+   "instructions": "Does the text say the company reported on gives away, opens or standardises something other companies need: open models, tools, interfaces or reference designs?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "as_names_category_as_purpose",
+   "type": "noul",
+   "instructions": "Does the text name a category of other companies, or a problem they face, as the purpose of what is released or done?",
+   "options": [
+    {
+     "id": "true",
+     "description": "Yes."
+    },
+    {
+     "id": "false",
+     "description": "No."
+    }
+   ]
+  },
+  {
+   "id": "cause_scope",
+   "type": "choice",
+   "instructions": "According to the text, where does the cause of the reported event lie?",
+   "options": [
+    {
+     "id": "issuer_specific",
+     "description": "In the company reported on alone: its management, its accounts, its product, its contract."
+    },
+    {
+     "id": "industry_wide",
+     "description": "In a condition shared by its industry: demand, prices, regulation, a supplier, a technology."
+    },
+    {
+     "id": "cannot_tell",
+     "description": "The text does not say."
+    }
+   ]
+  },
+  {
+   "id": "spillover_channel",
+   "type": "choice",
+   "instructions": "Which of these does the text report about the company reported on? Where several fit, choose the one listed first.",
+   "options": [
+    {
+     "id": "state_action",
+     "description": "A government, a regulator, a prosecutor or a court restricts, penalises or charges that company. Not a charge against an officer alone, a private claim a court hears, a refused approval, or a rule for a whole industry."
+    },
+    {
+     "id": "rival_weakened",
+     "description": "A delay, a defect, a recall or an outage of what that company sells, from a cause inside that company."
+    },
+    {
+     "id": "demand_falls",
+     "description": "That company, or a buyer of what it sells, will order, buy or spend less than before, or that company expects to sell less."
+    },
+    {
+     "id": "demand_rises",
+     "description": "That company, or a buyer of what it sells, will order, buy or spend more than before, or that company expects to sell more."
+    },
+    {
+     "id": "contagion",
+     "description": "That company loses funding or deposits, takes losses on what it holds, or may be unable to pay what it owes."
+    },
+    {
+     "id": "none_of_these",
+     "description": "The text reports none of these."
+    },
+    {
+     "id": "cannot_tell",
+     "description": "The text is not clear enough to tell."
+    }
+   ]
+  },
+  {
+   "id": "spillover_effect",
+   "type": "choice",
+   "instructions": "According to the text, what does the reported event mean for the companies, other than the company reported on, that it affects most?",
+   "options": [
+    {
+     "id": "favourable",
+     "description": "It improves their business, finances or standing."
+    },
+    {
+     "id": "adverse",
+     "description": "It harms their business, finances or standing."
+    },
+    {
+     "id": "mixed",
+     "description": "It clearly improves these for some of them and harms them for others."
+    },
+    {
+     "id": "neutral",
+     "description": "It changes neither, or it affects no other company."
+    },
+    {
+     "id": "cannot_tell",
+     "description": "It affects other companies, but the text does not say enough to tell how."
+    }
+   ]
+  }
+ ]
+}

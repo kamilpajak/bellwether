@@ -1,0 +1,555 @@
+{
+ "schema": "modelgate.examples/1",
+ "document": "ripple-shadow/1",
+ "examples": [
+  {
+   "id": "open_models_for_a_category",
+   "text": "Largeplat Corporation (NASDAQ: LRGP), the largest maker of accelerated computing platforms, today released Calibra, a family of open AI models for calibrating quantum processors. The models are free to download under an open licence. Calibration is the main obstacle small builders of quantum hardware face before every run, the company said, and Calibra is built to shorten it for them from days to hours. Largeplat does not build quantum processors, and the release does not change its financial outlook.",
+   "expect": {
+    "content_kind": [
+     "new_fact"
+    ],
+    "event_class": [
+     "product_or_technology_release"
+    ],
+    "issuer_significance": [
+     "none",
+     "minor"
+    ],
+    "category_significance": [
+     "major",
+     "critical"
+    ],
+    "scope": [
+     "whole_category"
+    ],
+    "stance_to_category": [
+     "validates",
+     "lowers_cost_or_barrier"
+    ],
+    "as_matters_more_to_others": [
+     "true"
+    ],
+    "as_issuer_opens_what_others_need": [
+     "true"
+    ],
+    "as_names_category_as_purpose": [
+     "true"
+    ],
+    "as_issuer_described_as_large": [
+     "true"
+    ],
+    "as_others_small_or_specialised": [
+     "true"
+    ],
+    "spillover_channel": [
+     "none_of_these"
+    ],
+    "spillover_effect": [
+     "favourable"
+    ]
+   }
+  },
+  {
+   "id": "chief_executive_forced_out_under_charges",
+   "text": "Largeplat Corporation (NASDAQ: LRGP) today said its founder and chief executive resigned at the request of the board, effective immediately, after prosecutors in two countries charged him with bribery and with breaking export controls. The board has opened an independent investigation. The chief operating officer becomes interim chief executive. The company said the matter is material to its results.",
+   "expect": {
+    "event_class": [
+     "key_person_departure"
+    ],
+    "issuer_significance": [
+     "major",
+     "critical"
+    ],
+    "cx_state_body_acts_against": [
+     "true"
+    ],
+    "cx_criminal_or_security_allegation": [
+     "true"
+    ],
+    "cx_forced_by_another_party": [
+     "true"
+    ],
+    "cx_international_reach": [
+     "true"
+    ],
+    "cx_previously_announced": [
+     "false"
+    ],
+    "cx_interim_successor_named": [
+     "true"
+    ],
+    "cx_investigation_open": [
+     "true"
+    ],
+    "cx_issuer_calls_it_material": [
+     "true"
+    ],
+    "kp_is_chief_executive_or_founder": [
+     "true"
+    ],
+    "kp_reason_is_benign": [
+     "false"
+    ],
+    "spillover_channel": [
+     "none_of_these"
+    ]
+   }
+  },
+  {
+   "id": "chief_executive_planned_retirement",
+   "text": "Midco Inc. (NYSE: MDCO) today said its chief executive will retire at the end of next year, completing the succession plan the company announced in March. The board has named the chief operating officer as his permanent successor.",
+   "expect": {
+    "event_class": [
+     "key_person_departure"
+    ],
+    "issuer_significance": [
+     "none",
+     "minor"
+    ],
+    "cx_state_body_acts_against": [
+     "false"
+    ],
+    "cx_criminal_or_security_allegation": [
+     "false"
+    ],
+    "cx_forced_by_another_party": [
+     "false"
+    ],
+    "cx_previously_announced": [
+     "true"
+    ],
+    "cx_interim_successor_named": [
+     "false"
+    ],
+    "cx_investigation_open": [
+     "false"
+    ],
+    "kp_successor_named": [
+     "true"
+    ],
+    "kp_reason_is_benign": [
+     "true"
+    ],
+    "cx_magnitude_size": [
+     "not_stated"
+    ],
+    "spillover_channel": [
+     "none_of_these"
+    ]
+   }
+  },
+  {
+   "id": "outlook_lowered_by_a_fiftieth",
+   "text": "Midco Inc. (NYSE: MDCO) today lowered its full-year revenue outlook by about two percent, citing the timing of one shipment.",
+   "expect": {
+    "event_class": [
+     "guidance_cut_or_warning"
+    ],
+    "ev_guidance_cut_or_warning": [
+     "true"
+    ],
+    "cx_magnitude_stated": [
+     "true"
+    ],
+    "cx_magnitude_size": [
+     "small"
+    ],
+    "issuer_significance": [
+     "minor"
+    ],
+    "spillover_channel": [
+     "demand_falls"
+    ],
+    "spillover_effect": [
+     "adverse",
+     "neutral"
+    ]
+   }
+  },
+  {
+   "id": "outlook_lowered_by_two_fifths",
+   "text": "Midco Inc. (NYSE: MDCO) today lowered its full-year revenue outlook by about forty percent after its largest customer ended its supply contract.",
+   "expect": {
+    "event_class": [
+     "guidance_cut_or_warning"
+    ],
+    "ev_guidance_cut_or_warning": [
+     "true"
+    ],
+    "ev_major_customer_or_contract_loss": [
+     "true"
+    ],
+    "cx_magnitude_stated": [
+     "true"
+    ],
+    "cx_magnitude_size": [
+     "large"
+    ],
+    "issuer_significance": [
+     "major",
+     "critical"
+    ],
+    "spillover_channel": [
+     "demand_falls"
+    ],
+    "spillover_effect": [
+     "adverse"
+    ]
+   }
+  },
+  {
+   "id": "open_models_in_the_words_of_a_release",
+   "text": "Largeplat Corporation (NASDAQ: LRGP) today released Calibra, a family of open AI models for calibrating quantum processors, available now under an open licence. Calibrating a processor before a run takes days, and in tests with three hardware makers Calibra cut it to hours, the company said. \"Quantum builders can spend that time on experiments,\" said its vice president of research.",
+   "expect": {
+    "content_kind": [
+     "new_fact"
+    ],
+    "event_class": [
+     "product_or_technology_release"
+    ],
+    "issuer_significance": [
+     "none",
+     "minor"
+    ],
+    "category_significance": [
+     "major",
+     "critical"
+    ],
+    "scope": [
+     "whole_category"
+    ],
+    "stance_to_category": [
+     "validates",
+     "lowers_cost_or_barrier"
+    ],
+    "as_matters_more_to_others": [
+     "true"
+    ],
+    "as_issuer_opens_what_others_need": [
+     "true"
+    ],
+    "as_names_category_as_purpose": [
+     "true"
+    ],
+    "spillover_channel": [
+     "none_of_these"
+    ],
+    "spillover_effect": [
+     "favourable"
+    ]
+   }
+  },
+  {
+   "id": "platform_enters_the_category",
+   "text": "Largeplat Corporation (NASDAQ: LRGP) today said it will design and build its own quantum processors and sell them to its data-centre customers from next year. Until now it has bought quantum processors from specialist makers. The company said the programme does not change its outlook for this year.",
+   "expect": {
+    "event_class": [
+     "product_or_technology_release"
+    ],
+    "issuer_significance": [
+     "minor",
+     "major"
+    ],
+    "category_significance": [
+     "major",
+     "critical"
+    ],
+    "scope": [
+     "whole_category"
+    ],
+    "names_a_category_of_companies": [
+     "true"
+    ],
+    "stance_to_category": [
+     "threatens_to_absorb"
+    ],
+    "st_issuer_enters_their_market": [
+     "true"
+    ],
+    "as_issuer_opens_what_others_need": [
+     "false"
+    ],
+    "spillover_channel": [
+     "none_of_these"
+    ],
+    "spillover_effect": [
+     "adverse"
+    ]
+   }
+  },
+  {
+   "id": "investment_in_one_named_company",
+   "text": "Largeplat Corporation (NASDAQ: LRGP) today said it will invest $40 million in Smallq Inc. (NYSE: SMQ), a maker of quantum processors with 60 employees, and will buy its processors for three years.",
+   "expect": {
+    "scope": [
+     "named_counterparties"
+    ],
+    "category_significance": [
+     "none"
+    ],
+    "issuer_significance": [
+     "none",
+     "minor"
+    ],
+    "as_matters_more_to_others": [
+     "true"
+    ],
+    "as_others_small_or_specialised": [
+     "true"
+    ],
+    "cx_magnitude_stated": [
+     "true"
+    ],
+    "cx_magnitude_size": [
+     "no_base"
+    ],
+    "spillover_channel": [
+     "none_of_these"
+    ]
+   }
+  },
+  {
+   "id": "law_firm_alert",
+   "text": "Claimfirm LLP announces an investigation of Midco Inc. (NYSE: MDCO) on behalf of shareholders. A class action filed in federal court alleges that Midco made misleading statements about its outlook. Shareholders who lost money may contact the firm before the deadline.",
+   "expect": {
+    "source_role": [
+     "third_party_solicitation"
+    ],
+    "cx_state_body_acts_against": [
+     "false"
+    ],
+    "cx_criminal_or_security_allegation": [
+     "false"
+    ],
+    "cx_investigation_open": [
+     "false"
+    ],
+    "cx_issuer_calls_it_material": [
+     "false"
+    ],
+    "spillover_channel": [
+     "none_of_these"
+    ]
+   }
+  },
+  {
+   "id": "offering_of_a_stated_amount",
+   "text": "Smallq Inc. (NYSE: SMQ) today priced a registered public offering of common shares for gross proceeds of $50 million. The securities regulator declared the registration statement effective on Monday.",
+   "expect": {
+    "event_class": [
+     "equity_offering_dilutive"
+    ],
+    "ev_equity_offering_dilutive": [
+     "true"
+    ],
+    "cx_state_body_acts_against": [
+     "false"
+    ],
+    "cx_magnitude_stated": [
+     "true"
+    ],
+    "cx_magnitude_size": [
+     "no_base"
+    ],
+    "spillover_channel": [
+     "none_of_these"
+    ]
+   }
+  },
+  {
+   "id": "rule_for_a_whole_industry",
+   "text": "The central bank today published final rules that raise the capital every bank above a size threshold must hold from next year.",
+   "expect": {
+    "source_role": [
+     "regulator_or_exchange"
+    ],
+    "issuer_significance": [
+     "cannot_tell"
+    ],
+    "scope": [
+     "whole_category"
+    ],
+    "cx_state_body_acts_against": [
+     "false"
+    ],
+    "spillover_channel": [
+     "none_of_these"
+    ]
+   }
+  },
+  {
+   "id": "customer_lowers_its_forecast_and_its_orders",
+   "text": "Fonemaker Inc. (NASDAQ: FONE) today lowered its revenue forecast for the quarter by about a tenth. It said it sold fewer handsets than planned and has reduced its component orders for the next two quarters.",
+   "expect": {
+    "event_class": [
+     "guidance_cut_or_warning"
+    ],
+    "ev_guidance_cut_or_warning": [
+     "true"
+    ],
+    "issuer_effect": [
+     "adverse"
+    ],
+    "spillover_channel": [
+     "demand_falls"
+    ],
+    "spillover_effect": [
+     "adverse"
+    ]
+   }
+  },
+  {
+   "id": "customer_signs_a_long_supply_contract",
+   "text": "Gridco Energy (NYSE: GRDC) today signed a 20-year agreement to sell the whole output of one generating station to Cloudhost Corporation. The electricity will supply data centres Cloudhost is building, which will use more than it buys from all its suppliers today.",
+   "expect": {
+    "event_class": [
+     "contract_or_customer_win"
+    ],
+    "issuer_effect": [
+     "favourable"
+    ],
+    "spillover_channel": [
+     "demand_rises"
+    ],
+    "spillover_effect": [
+     "favourable"
+    ]
+   }
+  },
+  {
+   "id": "bank_loses_a_quarter_of_its_deposits",
+   "text": "Coastal Savings Bank (NASDAQ: CSTL) today said customers withdrew a quarter of its deposits in two days and that it sold bonds at a loss to pay them. It is seeking emergency funding and will not pay its next dividend.",
+   "expect": {
+    "issuer_effect": [
+     "adverse"
+    ],
+    "issuer_significance": [
+     "major",
+     "critical"
+    ],
+    "cx_state_body_acts_against": [
+     "false"
+    ],
+    "spillover_channel": [
+     "contagion"
+    ],
+    "spillover_effect": [
+     "adverse"
+    ]
+   }
+  },
+  {
+   "id": "chip_maker_delays_its_next_product_and_lowers_its_forecast",
+   "text": "Bigchip Corporation (NASDAQ: BGCP) today said its next generation of processors will ship six months later than planned because of a defect in its own manufacturing process, and lowered its full-year revenue forecast by eight percent.",
+   "expect": {
+    "issuer_effect": [
+     "adverse"
+    ],
+    "cause_scope": [
+     "issuer_specific"
+    ],
+    "cx_state_body_acts_against": [
+     "false"
+    ],
+    "spillover_channel": [
+     "rival_weakened"
+    ],
+    "spillover_effect": [
+     "favourable"
+    ],
+    "ev_guidance_cut_or_warning": [
+     "true"
+    ]
+   }
+  },
+  {
+   "id": "export_ban_on_one_company",
+   "text": "The trade ministry today barred domestic companies from selling components or software to Farphone Ltd. without a licence, effective immediately. Farphone buys about a fifth of its components from domestic suppliers.",
+   "expect": {
+    "source_role": [
+     "regulator_or_exchange"
+    ],
+    "cx_state_body_acts_against": [
+     "true"
+    ],
+    "issuer_effect": [
+     "adverse"
+    ],
+    "spillover_channel": [
+     "state_action"
+    ],
+    "spillover_effect": [
+     "adverse"
+    ]
+   }
+  },
+  {
+   "id": "share_repurchase_with_no_channel",
+   "text": "Midco Inc. (NYSE: MDCO) today said its board authorised the repurchase of up to $200 million of its shares over the next two years.",
+   "expect": {
+    "event_class": [
+     "buyback"
+    ],
+    "scope": [
+     "issuer_only"
+    ],
+    "category_significance": [
+     "none"
+    ],
+    "spillover_channel": [
+     "none_of_these"
+    ],
+    "spillover_effect": [
+     "neutral"
+    ]
+   }
+  },
+  {
+   "id": "contract_won_in_a_tender",
+   "text": "Defenceco Systems (NYSE: DFNC) today said the defence ministry awarded it a five-year contract worth 2 billion for armoured vehicles, after a tender against two other bidders.",
+   "expect": {
+    "event_class": [
+     "contract_or_customer_win"
+    ],
+    "issuer_effect": [
+     "favourable"
+    ],
+    "spillover_channel": [
+     "none_of_these"
+    ]
+   }
+  },
+  {
+   "id": "regulator_declines_an_approval",
+   "text": "Pharmaco Inc. (NASDAQ: PHMC) today said the medicines regulator declined to approve its treatment for migraine and asked for a further trial.",
+   "expect": {
+    "issuer_effect": [
+     "adverse"
+    ],
+    "spillover_channel": [
+     "none_of_these"
+    ]
+   }
+  },
+  {
+   "id": "platform_endorses_the_category_and_will_enter_it",
+   "text": "Largeplat Corporation (NASDAQ: LRGP) today said ion-trap quantum processors are ready for commercial workloads and added support for the processors of three specialist makers to its software. It also said it will design and sell its own ion-trap processors from next year.",
+   "expect": {
+    "scope": [
+     "whole_category"
+    ],
+    "stance_to_category": [
+     "validates",
+     "threatens_to_absorb"
+    ],
+    "spillover_channel": [
+     "none_of_these"
+    ],
+    "spillover_effect": [
+     "mixed"
+    ]
+   }
+  }
+ ]
+}

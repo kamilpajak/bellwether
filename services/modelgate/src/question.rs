@@ -8,8 +8,9 @@ use serde::Deserialize;
 
 pub const QUESTIONS_SCHEMA: &str = "modelgate.questions/1";
 /// Bytes the encoded `questions` object may reach. Fixed apart from the state budget
-/// (`request.rs`), so a longer document never shortens the text the model reads.
-pub const MAX_QUESTIONS_BYTES: usize = 16_500;
+/// (`request.rs`), so a longer document never shortens the text the model reads. Why 22,600:
+/// section 3.5, `request_format`.
+pub const MAX_QUESTIONS_BYTES: usize = 22_600;
 const NOUL_OPTIONS: [&str; 2] = ["true", "false"];
 const MIN_CHOICE_OPTIONS: usize = 2;
 
@@ -255,7 +256,7 @@ impl QuestionDoc {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{QuestionDoc, QuestionError, MAX_QUESTIONS_BYTES};
+    use super::{QuestionDoc, QuestionError, QuestionKind, MAX_QUESTIONS_BYTES};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -377,16 +378,430 @@ pub(crate) mod tests {
         }
     }
 
-    /// The committed instrument parses, fits the budget, and its version is the one section 3.5
-    /// names; an edit to the file without an edit there is red.
+    const COMMITTED: &[u8] = include_bytes!("../questions/ripple-shadow-1.json");
+    const DESIGN: &str = include_str!("../../../docs/design/architecture.md");
+    const LEVELS: [&str; 4] = ["none", "minor", "major", "critical"];
+
+    pub(crate) fn committed() -> Result<QuestionDoc, QuestionError> {
+        QuestionDoc::parse(COMMITTED)
+    }
+
+    /// The synthetic stories of `tests/fixtures`, each with the reading its author expects: per
+    /// question id, the options that would not be a surprise. Hand-written, measured by nothing.
+    pub(crate) fn examples() -> Result<Vec<serde_json::Value>, serde_json::Error> {
+        let file: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/ripple-shadow-1.examples.json"
+        ))?;
+        Ok(file["examples"].as_array().cloned().unwrap_or_default())
+    }
+
+    fn option_ids<'a>(doc: &'a QuestionDoc, id: &str) -> Vec<&'a str> {
+        let asked = doc.questions().iter().find(|question| question.id == id);
+        asked.map_or_else(Vec::new, |question| {
+            question.options.iter().map(|o| o.id.as_str()).collect()
+        })
+    }
+
+    /// The committed instrument parses, and section 3.5 names its version, its encoded size and
+    /// its counts; an edit to the file without an edit there is red.
     #[test]
     fn the_committed_ripple_shadow_document_parses_and_has_the_version_the_design_names(
     ) -> TestResult {
-        let bytes = include_bytes!("../questions/ripple-shadow-0.json");
-        let doc = QuestionDoc::parse(bytes)?;
-        let design = include_str!("../../../docs/design/architecture.md");
-        assert_eq!(doc.name(), "ripple-shadow/0");
-        assert!(design.contains(doc.version()), "{}", doc.version());
+        let doc = committed()?;
+        let bytes = doc.wire().len();
+        let size = format!("{},{:03} encoded bytes", bytes / 1_000, bytes % 1_000);
+        assert_eq!(doc.name(), "ripple-shadow/1");
+        assert!(DESIGN.contains(doc.version()), "{}", doc.version());
+        assert!(DESIGN.contains(&size), "{size}");
+        let asked = doc.questions().len();
+        let choice = doc
+            .questions()
+            .iter()
+            .filter(|q| q.kind == QuestionKind::Choice);
+        let choice = choice.count();
+        let noul = asked - choice;
+        let counts = format!("{asked} questions ({choice} choice, {noul} noul)");
+        assert!(DESIGN.contains(&counts), "{counts}");
+        let stories = format!("{} synthetic stories", examples()?.len());
+        assert!(DESIGN.contains(&stories), "{stories}");
+        Ok(())
+    }
+
+    /// Every instruction and option description of the questions `id` names, as one text.
+    fn texts(doc: &QuestionDoc, id: &str) -> String {
+        let asked = doc.questions().iter().filter(|question| question.id == id);
+        asked
+            .flat_map(|question| {
+                let options = question.options.iter().map(|o| o.description.as_str());
+                std::iter::once(question.instructions.as_str()).chain(options)
+            })
+            .collect::<Vec<&str>>()
+            .join(" ")
+    }
+
+    /// Section 8 row MG13, where the mutations of 2026-11-23 are listed: significance is asked
+    /// twice on one scale of sizes, no level is a kind of notice, and one phrase names the company.
+    #[test]
+    fn significance_is_two_questions_on_one_ordered_scale_and_none_is_called_materiality(
+    ) -> TestResult {
+        let doc = committed()?;
+        let with_off_scale = [&LEVELS[..], &["cannot_tell"]].concat();
+        assert_eq!(option_ids(&doc, "issuer_significance"), with_off_scale);
+        assert_eq!(option_ids(&doc, "category_significance"), LEVELS);
+        assert_eq!(
+            option_ids(&doc, "cx_magnitude_size"),
+            ["not_stated", "no_base", "small", "large"]
+        );
+        assert!(doc
+            .questions()
+            .iter()
+            .all(|q| !q.id.contains("material") || q.id == "cx_issuer_calls_it_material"));
+        assert!(texts(&doc, "content_kind").contains("release is a new event, however ordinary"));
+        let (issuer, category) = (
+            texts(&doc, "issuer_significance"),
+            texts(&doc, "category_significance"),
+        );
+        assert!(issuer.contains("that company alone"));
+        assert!(category.contains("whatever the event means for that company"));
+        for scale in [&issuer, &category] {
+            assert!(scale.contains("for better or worse"), "{scale}");
+            for kind_of_notice in ["routine", "promotional", "ordinary for", "leadership"] {
+                assert!(!scale.contains(kind_of_notice), "{kind_of_notice}: {scale}");
+            }
+        }
+        let size = texts(&doc, "cx_magnitude_size");
+        assert!(
+            size.contains("a tenth") && !size.contains("calls it"),
+            "{size}"
+        );
+        for question in doc.questions() {
+            let text = texts(&doc, &question.id);
+            for other_name in [
+                "main company",
+                "its subject",
+                "The subject",
+                "subject company",
+                "mainly about",
+            ] {
+                assert!(!text.contains(other_name), "{}: {other_name}", question.id);
+            }
+        }
+        Ok(())
+    }
+
+    fn expected<'a>(
+        examples: &'a [serde_json::Value],
+        example: &str,
+        question: &str,
+    ) -> &'a serde_json::Value {
+        let found = examples.iter().find(|e| e["id"] == example);
+        found.map_or(&serde_json::Value::Null, |e| &e["expect"][question])
+    }
+
+    /// Every expected reading is inside the committed answer spaces, and the contrasts the owner
+    /// named on 2026-11-23 are held as literals. Mutations: section 8 row MG13.
+    #[test]
+    fn every_expected_reading_of_a_synthetic_example_is_an_option_of_the_committed_document(
+    ) -> TestResult {
+        let (doc, examples) = (committed()?, examples()?);
+        assert_eq!(examples.len(), 20);
+        for example in &examples {
+            let expected = example["expect"].as_object().ok_or("no expect object")?;
+            assert!(!expected.is_empty(), "{example}");
+            for (id, wanted) in expected {
+                let offered = option_ids(&doc, id);
+                let wanted = wanted.as_array().ok_or("an expectation is not a list")?;
+                assert!(!wanted.is_empty(), "{id}");
+                for option in wanted {
+                    let named = option.as_str().unwrap_or_default();
+                    assert!(offered.contains(&named), "{id}: {named}");
+                }
+            }
+        }
+        let (low, high) = (&LEVELS[..2], &LEVELS[2..]);
+        let (yes, no) = (&["true"][..], &["false"][..]);
+        let models = ["validates", "lowers_cost_or_barrier"];
+        let (forced, planned) = (
+            "chief_executive_forced_out_under_charges",
+            "chief_executive_planned_retirement",
+        );
+        let held: [(&str, &str, &[&str]); 22] = [
+            ("open_models_for_a_category", "issuer_significance", low),
+            ("open_models_for_a_category", "category_significance", high),
+            ("open_models_for_a_category", "scope", &["whole_category"]),
+            ("open_models_for_a_category", "stance_to_category", &models),
+            (
+                "open_models_in_the_words_of_a_release",
+                "issuer_significance",
+                low,
+            ),
+            (
+                "open_models_in_the_words_of_a_release",
+                "category_significance",
+                high,
+            ),
+            (
+                "open_models_in_the_words_of_a_release",
+                "stance_to_category",
+                &models,
+            ),
+            (
+                "platform_enters_the_category",
+                "category_significance",
+                high,
+            ),
+            (
+                "platform_enters_the_category",
+                "stance_to_category",
+                &["threatens_to_absorb"],
+            ),
+            (
+                "investment_in_one_named_company",
+                "category_significance",
+                &["none"],
+            ),
+            (
+                "investment_in_one_named_company",
+                "as_matters_more_to_others",
+                yes,
+            ),
+            (forced, "issuer_significance", high),
+            (planned, "issuer_significance", low),
+            (forced, "cx_forced_by_another_party", yes),
+            (planned, "cx_forced_by_another_party", no),
+            (forced, "cx_previously_announced", no),
+            (planned, "cx_previously_announced", yes),
+            (
+                "outlook_lowered_by_a_fiftieth",
+                "cx_magnitude_size",
+                &["small"],
+            ),
+            (
+                "outlook_lowered_by_two_fifths",
+                "cx_magnitude_size",
+                &["large"],
+            ),
+            (
+                "offering_of_a_stated_amount",
+                "cx_magnitude_size",
+                &["no_base"],
+            ),
+            ("law_firm_alert", "cx_investigation_open", no),
+            (
+                "rule_for_a_whole_industry",
+                "issuer_significance",
+                &["cannot_tell"],
+            ),
+        ];
+        for (example, question, reading) in held {
+            assert_eq!(
+                expected(&examples, example, question),
+                &serde_json::json!(reading),
+                "{example}: {question}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Section 3.5, "The channel to other companies": per channel in the document's order, the
+    /// sign code reads for the others and the phrase of its description that sign rests on.
+    const CHANNEL_SIGNS: [(&str, Option<&str>, &str); 7] = [
+        (
+            "state_action",
+            Some("adverse"),
+            "restricts, penalises or charges that company",
+        ),
+        (
+            "rival_weakened",
+            Some("favourable"),
+            "from a cause inside that company",
+        ),
+        ("demand_falls", Some("adverse"), "less than before"),
+        ("demand_rises", Some("favourable"), "more than before"),
+        ("contagion", Some("adverse"), "loses funding or deposits"),
+        ("none_of_these", None, "none of these"),
+        ("cannot_tell", None, "not clear enough"),
+    ];
+    const NO_CHANNEL: &str = "none_of_these";
+    /// Every example and the one channel its author expects.
+    const EXAMPLE_CHANNELS: [(&str, &str); 20] = [
+        ("open_models_for_a_category", NO_CHANNEL),
+        ("chief_executive_forced_out_under_charges", NO_CHANNEL),
+        ("chief_executive_planned_retirement", NO_CHANNEL),
+        ("outlook_lowered_by_a_fiftieth", "demand_falls"),
+        ("outlook_lowered_by_two_fifths", "demand_falls"),
+        ("open_models_in_the_words_of_a_release", NO_CHANNEL),
+        ("platform_enters_the_category", NO_CHANNEL),
+        ("investment_in_one_named_company", NO_CHANNEL),
+        ("law_firm_alert", NO_CHANNEL),
+        ("offering_of_a_stated_amount", NO_CHANNEL),
+        ("rule_for_a_whole_industry", NO_CHANNEL),
+        (
+            "customer_lowers_its_forecast_and_its_orders",
+            "demand_falls",
+        ),
+        ("customer_signs_a_long_supply_contract", "demand_rises"),
+        ("bank_loses_a_quarter_of_its_deposits", "contagion"),
+        (
+            "chip_maker_delays_its_next_product_and_lowers_its_forecast",
+            "rival_weakened",
+        ),
+        ("export_ban_on_one_company", "state_action"),
+        ("share_repurchase_with_no_channel", NO_CHANNEL),
+        ("contract_won_in_a_tender", NO_CHANNEL),
+        ("regulator_declines_an_approval", NO_CHANNEL),
+        (
+            "platform_endorses_the_category_and_will_enter_it",
+            NO_CHANNEL,
+        ),
+    ];
+
+    fn description<'a>(doc: &'a QuestionDoc, id: &str, option: &str) -> &'a str {
+        let asked = doc.questions().iter().find(|question| question.id == id);
+        let found = asked.and_then(|question| question.options.iter().find(|o| o.id == option));
+        found.map_or("", |o| o.description.as_str())
+    }
+
+    /// Section 8 row MG14, where the mutations of 2026-11-23 are listed: what is asked. The
+    /// channel is a choice beside the stance, its options say what the text reports and never
+    /// what follows for others, and the design's sign table is the one of `CHANNEL_SIGNS`.
+    #[test]
+    fn each_channel_to_other_companies_fixes_their_sign_or_has_none() -> TestResult {
+        let doc = committed()?;
+        let channels: Vec<&str> = CHANNEL_SIGNS.iter().map(|row| row.0).collect();
+        assert_eq!(option_ids(&doc, "spillover_channel"), channels);
+        assert_eq!(
+            option_ids(&doc, "spillover_effect"),
+            ["favourable", "adverse", "mixed", "neutral", "cannot_tell"]
+        );
+        assert_eq!(
+            option_ids(&doc, "stance_to_category"),
+            [
+                "validates",
+                "lowers_cost_or_barrier",
+                "opens_market",
+                "threatens_to_absorb",
+                "substitutes",
+                "undermines_category",
+                "neutral",
+                "cannot_tell"
+            ]
+        );
+        let channel = texts(&doc, "spillover_channel");
+        assert!(channel.contains("Where several fit, choose the one listed first."));
+        for (id, _) in CHANNEL_SIGNS.iter().map(|row| (row.0, row.1)) {
+            assert!(!channel.contains(id), "an option id in the wording: {id}");
+        }
+        for effect_word in [
+            "hurt",
+            "harm",
+            "improve",
+            "competitor",
+            "supplier",
+            "similar",
+            "demand",
+        ] {
+            assert!(!channel.contains(effect_word), "{effect_word}: {channel}");
+        }
+        assert!(texts(&doc, "spillover_effect").contains("other than the company reported on"));
+        assert!(description(&doc, "spillover_effect", "favourable").contains("improves"));
+        assert!(description(&doc, "spillover_effect", "adverse").contains("harms"));
+        assert!(description(&doc, "spillover_effect", "mixed").contains("for some of them"));
+        assert!(description(&doc, "spillover_effect", "neutral").contains("no other company"));
+        for (channel, sign, phrase) in CHANNEL_SIGNS {
+            let wording = description(&doc, "spillover_channel", channel);
+            assert!(wording.contains(phrase), "{channel}: {wording}");
+            let (row, cell) = (
+                format!("| `{channel}` |"),
+                format!("| {} |", sign.unwrap_or("none")),
+            );
+            let in_design = |line: &str| line.starts_with(&row) && line.ends_with(&cell);
+            assert!(DESIGN.lines().any(in_design), "{row} … {cell}");
+        }
+        let excluded = "Not a charge against an officer alone, a private claim a court hears, \
+                        a refused approval, or a rule for a whole industry.";
+        assert!(description(&doc, "spillover_channel", "state_action").contains(excluded));
+        let signed: Vec<&str> = CHANNEL_SIGNS
+            .iter()
+            .filter_map(|row| row.1.map(|_| row.0))
+            .collect();
+        assert_eq!(
+            signed,
+            [
+                "state_action",
+                "rival_weakened",
+                "demand_falls",
+                "demand_rises",
+                "contagion"
+            ]
+        );
+        Ok(())
+    }
+
+    /// Section 8 row MG14: the examples. Each expects one channel, and a signed channel's
+    /// direction for the others is that sign, with `neutral` allowed beside it and nothing else.
+    #[test]
+    fn every_example_expects_one_channel_and_the_direction_its_sign_gives() -> TestResult {
+        let examples = examples()?;
+        let pinned = |e: &&serde_json::Value| !e["expect"]["spillover_channel"].is_null();
+        assert_eq!(
+            examples.iter().filter(pinned).count(),
+            EXAMPLE_CHANNELS.len()
+        );
+        for (example, channel) in EXAMPLE_CHANNELS {
+            assert_eq!(
+                expected(&examples, example, "spillover_channel"),
+                &serde_json::json!([channel]),
+                "{example}"
+            );
+            let sign = CHANNEL_SIGNS.iter().find(|row| row.0 == channel);
+            let Some(sign) = sign.and_then(|row| row.1) else {
+                continue;
+            };
+            let effect = expected(&examples, example, "spillover_effect");
+            let listed = effect
+                .as_array()
+                .ok_or("a signed channel with no direction")?;
+            assert_eq!(listed.first(), Some(&serde_json::json!(sign)), "{example}");
+            assert!(listed.iter().skip(1).all(|o| o == "neutral"), "{example}");
+        }
+        for (channel, _, _) in CHANNEL_SIGNS {
+            let shown = EXAMPLE_CHANNELS.iter().any(|row| row.1 == channel);
+            assert!(shown || channel == "cannot_tell", "{channel}");
+        }
+        let (yes, no) = (&["true"][..], &["false"][..]);
+        let chip = "chip_maker_delays_its_next_product_and_lowers_its_forecast";
+        let state = "cx_state_body_acts_against";
+        let held: [(&str, &str, &[&str]); 9] = [
+            ("export_ban_on_one_company", state, yes),
+            ("bank_loses_a_quarter_of_its_deposits", state, no),
+            (chip, state, no),
+            ("law_firm_alert", state, no),
+            (chip, "cause_scope", &["issuer_specific"]),
+            (chip, "ev_guidance_cut_or_warning", yes),
+            (
+                "share_repurchase_with_no_channel",
+                "spillover_effect",
+                &["neutral"],
+            ),
+            (
+                "platform_endorses_the_category_and_will_enter_it",
+                "spillover_effect",
+                &["mixed"],
+            ),
+            (
+                "outlook_lowered_by_a_fiftieth",
+                "spillover_effect",
+                &["adverse", "neutral"],
+            ),
+        ];
+        for (example, question, reading) in held {
+            assert_eq!(
+                expected(&examples, example, question),
+                &serde_json::json!(reading),
+                "{example}: {question}"
+            );
+        }
         Ok(())
     }
 }

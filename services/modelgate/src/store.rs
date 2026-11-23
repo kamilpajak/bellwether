@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::cap::Spent;
+use crate::coverage::{PriorCoverage, WindowCount};
 use crate::question::QuestionDoc;
 use crate::request::DecideRequest;
 use crate::response::{Outcome, Reading};
@@ -19,16 +20,17 @@ pub const DB_FILE: &str = "gate.sqlite";
 pub const BLOB_DIR: &str = "blobs";
 const LOCK_FILE: &str = "LOCK";
 const STAGING_PREFIX: &str = ".staging-";
-const USER_VERSION: i64 = 1;
+const USER_VERSION: i64 = 2;
 /// canon's instant rendering, so text order is time order and the first ten bytes are the UTC day.
 const INSTANT_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6fZ";
 const DAY_BYTES: usize = 10;
-pub const TABLES: [&str; 6] = [
+pub const TABLES: [&str; 7] = [
     "question_docs",
     "floors",
     "run_events",
     "requests",
     "labels",
+    "prior_coverage",
     "attempt_events",
 ];
 /// Answered requests of one question version and build before a measured cost per byte is
@@ -54,6 +56,13 @@ CREATE TABLE labels (
     story_id TEXT NOT NULL, item_id TEXT NOT NULL, seq INTEGER NOT NULL, observed_at TEXT NOT NULL,
     idempotency_key TEXT NOT NULL REFERENCES requests(idempotency_key), run_id TEXT NOT NULL,
     PRIMARY KEY (story_id, idempotency_key));
+CREATE TABLE prior_coverage (
+    story_id TEXT NOT NULL, coverage_version TEXT NOT NULL, snapshot_id TEXT NOT NULL,
+    run_id TEXT NOT NULL, tag_count INTEGER NOT NULL, tags TEXT, windows TEXT,
+    PRIMARY KEY (story_id, coverage_version),
+    CHECK ((tag_count = 0 AND tags IS NULL AND windows IS NULL)
+        OR (tag_count > 0 AND tags IS NOT NULL AND windows IS NOT NULL
+            AND tag_count = json_array_length(tags))));
 CREATE TABLE attempt_events (
     attempt_id TEXT NOT NULL,
     event TEXT NOT NULL CHECK (event IN ('opened','answered','finalised','abandoned')),
@@ -83,6 +92,10 @@ pub enum StoreError {
     PermitAlreadyTaken,
     #[error("an answer for attempt {answered} was handed to the slot of attempt {slot}")]
     AnswerFromAnotherAttempt { slot: String, answered: String },
+    #[error(
+        "the prior-coverage row of story {0} does not read back as the record it was written from"
+    )]
+    CoverageUnreadable(String),
 }
 
 fn io(path: &Path) -> impl Fn(std::io::Error) -> StoreError + '_ {
@@ -369,6 +382,79 @@ impl Store {
         Ok(())
     }
 
+    pub fn has_coverage(&self, story_id: &str, coverage_version: &str) -> Result<bool, StoreError> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM prior_coverage
+                             WHERE story_id = ?1 AND coverage_version = ?2)",
+            params![story_id, coverage_version],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// One record per story and coverage version; the first written stays (section 3.5).
+    pub fn insert_coverage(
+        &self,
+        story_id: &str,
+        coverage_version: &str,
+        snapshot_id: &str,
+        run_id: &str,
+        record: &PriorCoverage,
+    ) -> Result<(), StoreError> {
+        let unreadable = |_| StoreError::CoverageUnreadable(story_id.to_owned());
+        let (count, tags, windows) = match record {
+            PriorCoverage::NoTag => (0, None, None),
+            PriorCoverage::Tagged { tags, windows } => (
+                i64::try_from(tags.len()).unwrap_or(i64::MAX),
+                Some(serde_json::to_string(tags).map_err(unreadable)?),
+                Some(serde_json::to_string(windows).map_err(unreadable)?),
+            ),
+        };
+        self.db.execute(
+            "INSERT OR IGNORE INTO prior_coverage (story_id, coverage_version, snapshot_id,
+                 run_id, tag_count, tags, windows) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                story_id,
+                coverage_version,
+                snapshot_id,
+                run_id,
+                count,
+                tags,
+                windows
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The records this run wrote under one coverage version, in the order it wrote them.
+    pub fn coverage_by(
+        &self,
+        run_id: &str,
+        coverage_version: &str,
+    ) -> Result<Vec<PriorCoverage>, StoreError> {
+        let mut statement = self.db.prepare(
+            "SELECT story_id, tags, windows FROM prior_coverage
+              WHERE run_id = ?1 AND coverage_version = ?2 ORDER BY rowid",
+        )?;
+        let rows: Vec<(String, Option<String>, Option<String>)> = statement
+            .query_map(params![run_id, coverage_version], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        rows.into_iter()
+            .map(|(story_id, tags, windows)| {
+                let (Some(tags), Some(windows)) = (tags, windows) else {
+                    return Ok(PriorCoverage::NoTag);
+                };
+                let tags = serde_json::from_str::<Vec<String>>(&tags);
+                let windows = serde_json::from_str::<Vec<WindowCount>>(&windows);
+                match (tags, windows) {
+                    (Ok(tags), Ok(windows)) => Ok(PriorCoverage::Tagged { tags, windows }),
+                    _ => Err(StoreError::CoverageUnreadable(story_id)),
+                }
+            })
+            .collect()
+    }
+
     /// The answer an attempt of this request closed with, by `Outcome::answered`; `Ok` first.
     pub fn request_outcome(&self, idempotency_key: &str) -> Result<Option<Outcome>, StoreError> {
         let mut statement = self.db.prepare_cached(
@@ -645,6 +731,7 @@ fn create(db: &Connection) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::{Store, StoreError, BLOB_DIR, DB_FILE, TABLES, USER_VERSION};
+    use crate::coverage::{PriorCoverage, WindowCount};
     use chrono::{DateTime, Utc};
     use rusqlite::Connection;
     use tempfile::TempDir;
@@ -664,6 +751,7 @@ mod tests {
              INSERT INTO requests VALUES ('k', 'v', 'm', 0, 'd', 1, 1, 0, 1, 's');
              INSERT INTO labels VALUES ('story', 'item', 1, 'o', 'k', 'run');",
         )?;
+        store.insert_coverage("story", "c", "snapshot", "run", &PriorCoverage::NoTag)?;
         store.set_floor("v", "m", 0, "run")?;
         store.run_event("run", "started", noon, &serde_json::json!({}))?;
         store.write_opened("run#0", "k", "run", 7, noon)?;
@@ -718,15 +806,67 @@ mod tests {
         let dry = Store::read_only(root.path())?;
         let written = dry.set_floor("v", "m", 0, "run");
         assert!(matches!(written, Err(StoreError::Sqlite(_))), "{written:?}");
-        Connection::open(newer.path().join(DB_FILE))?.pragma_update(
-            None,
-            "user_version",
-            USER_VERSION + 1,
+        // 1 is the store of the build before `prior_coverage`; section 3.5 names 2.
+        assert_eq!(USER_VERSION, 2);
+        for other in [1, USER_VERSION + 1] {
+            Connection::open(newer.path().join(DB_FILE))?.pragma_update(
+                None,
+                "user_version",
+                other,
+            )?;
+            for opened in [Store::open(newer.path()), Store::read_only(newer.path())] {
+                assert!(
+                    matches!(opened, Err(StoreError::SchemaVersion { found, .. }) if found == other),
+                    "{other}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Section 8 row MG12, where the mutations of 2026-11-23 are listed.
+    #[test]
+    fn a_coverage_row_is_no_tag_or_counts_never_both_and_the_first_record_stays() -> TestResult {
+        let root = TempDir::new()?;
+        let store = Store::open(root.path())?;
+        let counted = PriorCoverage::Tagged {
+            tags: vec!["LRGP".to_owned(), "SMQ".to_owned()],
+            windows: vec![WindowCount {
+                days: 1,
+                stories: 1,
+                complete: true,
+                by_tag: [("LRGP".to_owned(), 1), ("SMQ".to_owned(), 0)].into(),
+            }],
+        };
+        store.insert_coverage("tagged", "c/1", "cut-1", "run", &counted)?;
+        store.insert_coverage("tagged", "c/1", "cut-2", "run", &PriorCoverage::NoTag)?;
+        store.insert_coverage("bare", "c/1", "cut-1", "run", &PriorCoverage::NoTag)?;
+        store.insert_coverage("bare", "c/2", "cut-1", "run", &counted)?;
+        store.insert_coverage("elsewhere", "c/1", "cut-1", "another-run", &counted)?;
+        assert_eq!(
+            store.coverage_by("run", "c/1")?,
+            [counted, PriorCoverage::NoTag]
+        );
+        assert!(store.has_coverage("bare", "c/2")?);
+        assert!(!store.has_coverage("tagged", "c/2")?);
+        assert!(!store.has_coverage("absent", "c/1")?);
+        let tag_count: i64 = store.db.query_row(
+            "SELECT tag_count FROM prior_coverage WHERE story_id = 'tagged'",
+            [],
+            |row| row.get(0),
         )?;
-        for opened in [Store::open(newer.path()), Store::read_only(newer.path())] {
-            assert!(
-                matches!(opened, Err(StoreError::SchemaVersion { found, .. }) if found == USER_VERSION + 1)
-            );
+        assert_eq!(tag_count, 2);
+        for row in [
+            "('s', 'c', 'cut', 'run', 0, NULL, '[]')",
+            "('s', 'c', 'cut', 'run', 0, '[]', NULL)",
+            "('s', 'c', 'cut', 'run', 0, '[]', '[]')",
+            "('s', 'c', 'cut', 'run', 1, NULL, NULL)",
+            "('s', 'c', 'cut', 'run', 1, '[\"A\",\"B\"]', '[]')",
+        ] {
+            let refused = store
+                .db
+                .execute_batch(&format!("INSERT INTO prior_coverage VALUES {row}"));
+            assert!(refused.is_err(), "{row}");
         }
         Ok(())
     }
