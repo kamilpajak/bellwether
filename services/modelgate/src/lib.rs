@@ -46,13 +46,18 @@
 //! ```
 
 pub mod cap;
+pub mod cmd_dedup;
+pub mod cmd_embed;
 pub mod cmd_shadow;
 pub mod coverage;
+pub mod embed;
+pub mod embed_store;
 pub mod ledger;
 pub mod model;
 pub mod question;
 pub mod request;
 pub mod response;
+pub mod signals;
 pub mod store;
 pub mod wire;
 

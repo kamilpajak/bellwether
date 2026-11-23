@@ -25,18 +25,18 @@ pub const SCHEMA: &str = "modelgate.shadow_run/1";
 pub const ERROR_SCHEMA: &str = "modelgate.error/1";
 /// Sends of one request within one run. A work cap, not fitted to a failure rate.
 pub const MAX_ATTEMPTS: u32 = 3;
-const RETRY_WAIT: Duration = Duration::from_secs(2);
-const RETRY_AFTER_CEILING: Duration = Duration::from_secs(30);
+pub(crate) const RETRY_WAIT: Duration = Duration::from_secs(2);
+pub(crate) const RETRY_AFTER_CEILING: Duration = Duration::from_secs(30);
 /// Statuses a later attempt may not repeat. Every other non-2xx is final for the run.
-const RETRYABLE_STATUSES: [u16; 6] = [429, 500, 502, 503, 504, 529];
+pub(crate) const RETRYABLE_STATUSES: [u16; 6] = [429, 500, 502, 503, 504, 529];
 /// Stories in a row that end `failed` before the run stops asking: an outage otherwise costs
 /// every remaining story its three attempts and their waits.
-const FAILED_STORIES_BEFORE_STOP: u32 = 3;
+pub(crate) const FAILED_STORIES_BEFORE_STOP: u32 = 3;
 /// The 10% sample: a story is in it when the first byte of sha256(story_id ‖ salt) is below 26
 /// (26/256). Chosen by code from the id alone, before any answer exists.
 const SAMPLE_SALT: &str = "ripple-shadow-sample-1";
 const SAMPLE_BELOW: u8 = 26;
-const SECONDS_PER_HOUR: i64 = 3_600;
+pub(crate) const SECONDS_PER_HOUR: i64 = 3_600;
 
 pub const EXIT_OK: u8 = 0;
 pub const EXIT_USAGE: u8 = 2;
@@ -212,7 +212,7 @@ enum Sent {
     Refused,
 }
 
-fn invalid(why: impl ToString) -> ShadowError {
+pub(crate) fn invalid(why: impl ToString) -> ShadowError {
     ShadowError::InvalidArgument(why.to_string())
 }
 
@@ -227,7 +227,7 @@ fn read_input(path: &std::path::Path) -> Result<Vec<u8>, ShadowError> {
     })
 }
 
-fn admissible(dir: &std::path::Path) -> Result<(), ShadowError> {
+pub(crate) fn admissible(dir: &std::path::Path) -> Result<(), ShadowError> {
     let findings = snapshot_contract::validate(dir).map_err(|why| match why {
         ValidateError::Absent(_) | ValidateError::NotADirectory(_) => {
             ShadowError::InputAbsent(why.to_string())
@@ -242,12 +242,12 @@ fn admissible(dir: &std::path::Path) -> Result<(), ShadowError> {
     ))
 }
 
-fn instant(text: &str) -> Result<DateTime<Utc>, ShadowError> {
+pub(crate) fn instant(text: &str) -> Result<DateTime<Utc>, ShadowError> {
     text.parse()
         .map_err(|_| ShadowError::InputUnparseable(format!("{text:?} is not an instant")))
 }
 
-fn unreadable(why: snapshot_contract::ReadError) -> ShadowError {
+pub(crate) fn unreadable(why: snapshot_contract::ReadError) -> ShadowError {
     ShadowError::InputUnparseable(why.to_string())
 }
 
@@ -750,7 +750,7 @@ impl Run<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, VecDeque};
     use std::fs::File;
@@ -776,7 +776,7 @@ mod tests {
     use crate::wire::tests::{http, sentinel, Loopback, SENTINEL_KEY};
     use crate::wire::{Exchanged, HttpAnswer, ModelExchange, ModelWire};
 
-    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+    pub(crate) type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
     /// Dated before every observation below, so it may label them.
     const MODEL: &str = "example/decide-1-20261014";
@@ -840,7 +840,7 @@ mod tests {
         }
     }
 
-    fn story(seq: i64, id: &str, observed_at: &str, body: Option<&str>) -> SnapshotRow {
+    pub(crate) fn story(seq: i64, id: &str, observed_at: &str, body: Option<&str>) -> SnapshotRow {
         SnapshotRow {
             seq,
             item_id: format!("item-{seq}"),
@@ -859,7 +859,7 @@ mod tests {
     }
 
     /// A snapshot directory written the way `newsvault cut` writes one.
-    fn cut(rows: &[SnapshotRow], cutoff: &str) -> TestResult<TempDir> {
+    pub(crate) fn cut(rows: &[SnapshotRow], cutoff: &str) -> TestResult<TempDir> {
         let dir = TempDir::new()?;
         let cutoff: DateTime<Utc> = cutoff.parse()?;
         let digests = rows
@@ -985,7 +985,7 @@ mod tests {
         }
     }
 
-    fn at(envelope: &Value, pointer: &str) -> Value {
+    pub(crate) fn at(envelope: &Value, pointer: &str) -> Value {
         envelope.pointer(pointer).cloned().unwrap_or(Value::Null)
     }
 

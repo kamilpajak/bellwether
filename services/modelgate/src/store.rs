@@ -1,6 +1,7 @@
 //! The gate's own store: `gate.sqlite` and `blobs/<sha256>`, in a directory that is never the
 //! vault. Every table is insert-only by trigger. What that does not cover is
-//! `docs/design/architecture.md` section 8 row MG9.
+//! `docs/design/architecture.md` section 8 row MG9. A second [`Layout`] in the same directory and
+//! under the same `LOCK` is the `embed` kind's file (`embed_store`, row MG23).
 
 use std::fs::{File, TryLockError};
 use std::io::Write;
@@ -21,6 +22,23 @@ pub const BLOB_DIR: &str = "blobs";
 const LOCK_FILE: &str = "LOCK";
 const STAGING_PREFIX: &str = ".staging-";
 const USER_VERSION: i64 = 2;
+/// One database file, its blob directory and its tables. The ledger's two tables are in every
+/// layout, so an attempt of one request kind is counted against that kind's caps alone.
+#[derive(Debug, Clone, Copy)]
+pub struct Layout {
+    pub db_file: &'static str,
+    pub blob_dir: &'static str,
+    pub schema: &'static str,
+    pub tables: &'static [&'static str],
+    pub user_version: i64,
+}
+const GATE: Layout = Layout {
+    db_file: DB_FILE,
+    blob_dir: BLOB_DIR,
+    schema: SCHEMA,
+    tables: &TABLES,
+    user_version: USER_VERSION,
+};
 /// canon's instant rendering, so text order is time order and the first ten bytes are the UTC day.
 const INSTANT_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6fZ";
 const DAY_BYTES: usize = 10;
@@ -43,10 +61,6 @@ CREATE TABLE question_docs (
 CREATE TABLE floors (
     question_version TEXT NOT NULL, model TEXT NOT NULL, start_seq INTEGER NOT NULL,
     run_id TEXT NOT NULL, PRIMARY KEY (question_version, model));
-CREATE TABLE run_events (
-    run_id TEXT NOT NULL,
-    event TEXT NOT NULL CHECK (event IN ('started','ended','cost_estimate_broken','cost_model_acked')),
-    at TEXT NOT NULL, detail TEXT NOT NULL, PRIMARY KEY (run_id, event));
 CREATE TABLE requests (
     idempotency_key TEXT PRIMARY KEY, question_version TEXT NOT NULL, model TEXT NOT NULL,
     repeat_index INTEGER NOT NULL, state_digest TEXT NOT NULL, state_bytes INTEGER NOT NULL,
@@ -63,6 +77,9 @@ CREATE TABLE prior_coverage (
     CHECK ((tag_count = 0 AND tags IS NULL AND windows IS NULL)
         OR (tag_count > 0 AND tags IS NOT NULL AND windows IS NOT NULL
             AND tag_count = json_array_length(tags))));
+";
+/// Appended to every layout's schema by `create`.
+const LEDGER_SCHEMA: &str = "
 CREATE TABLE attempt_events (
     attempt_id TEXT NOT NULL,
     event TEXT NOT NULL CHECK (event IN ('opened','answered','finalised','abandoned')),
@@ -72,6 +89,10 @@ CREATE TABLE attempt_events (
     outcome TEXT, cost_micro_usd INTEGER, answering_model TEXT,
     PRIMARY KEY (attempt_id, event));
 CREATE INDEX attempt_events_by_key ON attempt_events (idempotency_key) WHERE event = 'opened';
+CREATE TABLE run_events (
+    run_id TEXT NOT NULL,
+    event TEXT NOT NULL CHECK (event IN ('started','ended','cost_estimate_broken','cost_model_acked')),
+    at TEXT NOT NULL, detail TEXT NOT NULL, PRIMARY KEY (run_id, event));
 ";
 
 #[derive(Debug, thiserror::Error)]
@@ -82,8 +103,12 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("another run holds {}", .0.display())]
     LeaseHeld(PathBuf),
-    #[error("{} is at user_version {found}; this build reads {USER_VERSION}", path.display())]
-    SchemaVersion { path: PathBuf, found: i64 },
+    #[error("{} is at user_version {found}; this build reads {reads}", path.display())]
+    SchemaVersion {
+        path: PathBuf,
+        found: i64,
+        reads: i64,
+    },
     #[error("blob {hex} does not hold the bytes its name states")]
     BlobAltered { hex: String },
     #[error("this store has no blob directory (a dry run of an absent store)")]
@@ -153,7 +178,11 @@ pub struct Store {
 impl Store {
     /// The writer's door: creates the directory on first use and holds its `LOCK` until dropped.
     pub fn open(root: &Path) -> Result<Self, StoreError> {
-        let blobs = root.join(BLOB_DIR);
+        Self::open_as(root, &GATE)
+    }
+
+    pub(crate) fn open_as(root: &Path, layout: &Layout) -> Result<Self, StoreError> {
+        let blobs = root.join(layout.blob_dir);
         std::fs::create_dir_all(&blobs).map_err(io(&blobs))?;
         let lock_path = root.join(LOCK_FILE);
         let lease = File::options()
@@ -167,15 +196,16 @@ impl Store {
             Err(TryLockError::WouldBlock) => return Err(StoreError::LeaseHeld(lock_path)),
             Err(TryLockError::Error(why)) => return Err(io(&lock_path)(why)),
         }
-        let path = root.join(DB_FILE);
+        let path = root.join(layout.db_file);
         let db = Connection::open(&path)?;
         db.pragma_update(None, "synchronous", "FULL")?;
         db.pragma_update(None, "foreign_keys", "ON")?;
         let found: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let reads = layout.user_version;
         match found {
-            0 => create(&db)?,
-            USER_VERSION => {}
-            found => return Err(StoreError::SchemaVersion { path, found }),
+            0 => create(&db, layout)?,
+            found if found == reads => {}
+            found => return Err(StoreError::SchemaVersion { path, found, reads }),
         }
         Ok(Self {
             db,
@@ -187,10 +217,14 @@ impl Store {
     /// A dry run's door: read-only, no lease, nothing created. An absent store reads as an empty
     /// one held in memory.
     pub fn read_only(root: &Path) -> Result<Self, StoreError> {
-        let path = root.join(DB_FILE);
+        Self::read_only_as(root, &GATE)
+    }
+
+    pub(crate) fn read_only_as(root: &Path, layout: &Layout) -> Result<Self, StoreError> {
+        let path = root.join(layout.db_file);
         if !path.is_file() {
             let db = Connection::open_in_memory()?;
-            create(&db)?;
+            create(&db, layout)?;
             return Ok(Self {
                 db,
                 blobs: None,
@@ -199,14 +233,19 @@ impl Store {
         }
         let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let found: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if found != USER_VERSION {
-            return Err(StoreError::SchemaVersion { path, found });
+        let reads = layout.user_version;
+        if found != reads {
+            return Err(StoreError::SchemaVersion { path, found, reads });
         }
         Ok(Self {
             db,
-            blobs: Some(root.join(BLOB_DIR)),
+            blobs: Some(root.join(layout.blob_dir)),
             _lease: None,
         })
+    }
+
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.db
     }
 
     /// Stores `bytes` under their sha256: staged, fsynced, renamed, and the directory fsynced. A
@@ -714,9 +753,9 @@ impl Store {
 
 /// The schema, its triggers and the version in one transaction: a process killed inside it leaves
 /// `user_version` 0 and no table, so the next open starts again.
-fn create(db: &Connection) -> Result<(), StoreError> {
-    let mut batch = format!("BEGIN IMMEDIATE;{SCHEMA}");
-    for table in TABLES {
+fn create(db: &Connection, layout: &Layout) -> Result<(), StoreError> {
+    let mut batch = format!("BEGIN IMMEDIATE;{}{LEDGER_SCHEMA}", layout.schema);
+    for table in layout.tables {
         for verb in ["UPDATE", "DELETE"] {
             batch.push_str(&format!(
                 "CREATE TRIGGER {table}_no_{verb} BEFORE {verb} ON {table}
@@ -724,7 +763,10 @@ fn create(db: &Connection) -> Result<(), StoreError> {
             ));
         }
     }
-    batch.push_str(&format!("PRAGMA user_version = {USER_VERSION}; COMMIT;"));
+    batch.push_str(&format!(
+        "PRAGMA user_version = {}; COMMIT;",
+        layout.user_version
+    ));
     Ok(db.execute_batch(&batch)?)
 }
 

@@ -1,5 +1,6 @@
 //! The only socket in this crate, and the only place the API key's value is read. A send consumes
-//! a [`SendPermit`], the endpoint is a constant, redirects are off, and every timeout is stated.
+//! a [`SendPermit`], each request kind's endpoint is a constant, redirects are off, and every
+//! timeout is stated.
 //! `docs/design/architecture.md` section 8 rows MG1 and MG5.
 
 use std::ffi::OsString;
@@ -14,6 +15,8 @@ use crate::ledger::SendPermit;
 /// A public vendor address, not our infrastructure. No constructor outside this file's test
 /// module takes another: a configurable endpoint is a switch that sends the key elsewhere.
 pub const ENDPOINT: &str = "https://openrouter.ai/api/v1/systemone";
+/// The `embed` kind's address, the second and last one a wire can be built for.
+pub const EMBED_ENDPOINT: &str = "https://openrouter.ai/api/v1/embeddings";
 /// Names the file holding the key. There is no variable for the value itself: a process
 /// environment is readable through `/proc` and `docker inspect`.
 pub const KEY_FILE_VARIABLE: &str = "BELLWETHER_MODEL_KEY_FILE";
@@ -24,6 +27,9 @@ const GROUP_AND_WORLD: u32 = 0o077;
 const RESPONSE_LIMIT_BYTES: u64 = 1 << 20;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// No embed call has been timed (2026-11-23); `embed run` starts none later than this before
+/// its deadline.
+pub const EMBED_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 const RETRY_AFTER: &str = "retry-after";
 
 /// Why no key was read. No variant carries the file's bytes.
@@ -163,9 +169,9 @@ pub struct ModelWire {
     endpoint: String,
 }
 
-fn agent() -> ureq::Agent {
+fn agent(call_timeout: Duration) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
-        .timeout_global(Some(CALL_TIMEOUT))
+        .timeout_global(Some(call_timeout))
         .timeout_connect(Some(CONNECT_TIMEOUT))
         // A non-2xx carries the vendor's reason in its body, which is stored like any answer.
         .http_status_as_error(false)
@@ -192,9 +198,19 @@ impl ModelWire {
     #[must_use]
     pub fn new(key: ApiKey) -> Self {
         Self {
-            agent: agent(),
+            agent: agent(CALL_TIMEOUT),
             key,
             endpoint: ENDPOINT.to_owned(),
+        }
+    }
+
+    /// The wire of the `embed` kind: its own constant address and its own call timeout.
+    #[must_use]
+    pub fn embed(key: ApiKey) -> Self {
+        Self {
+            agent: agent(EMBED_CALL_TIMEOUT),
+            key,
+            endpoint: EMBED_ENDPOINT.to_owned(),
         }
     }
 
@@ -245,7 +261,7 @@ pub(crate) mod tests {
 
     use tempfile::TempDir;
 
-    use super::{agent, ApiKey, KeyError, ModelWire, KEY_FILE_VARIABLE};
+    use super::{agent, ApiKey, KeyError, ModelWire, CALL_TIMEOUT, KEY_FILE_VARIABLE};
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -257,7 +273,7 @@ pub(crate) mod tests {
         /// `#[cfg(test)]` item, so no build of the binary holds a second endpoint.
         pub(crate) fn loopback(key: ApiKey, endpoint: String) -> Self {
             Self {
-                agent: agent(),
+                agent: agent(CALL_TIMEOUT),
                 key,
                 endpoint,
             }

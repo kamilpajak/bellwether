@@ -53,7 +53,7 @@ const fn escaped_len(character: char) -> usize {
 }
 
 /// The longest prefix of `body`, cut at a character boundary, whose escaped form fits the budget.
-fn cut(body: &str) -> &str {
+pub(crate) fn cut(body: &str) -> &str {
     let mut spent = 0;
     for (start, character) in body.char_indices() {
         spent += escaped_len(character);
@@ -67,7 +67,7 @@ fn cut(body: &str) -> &str {
 /// The state's digest or the model id cannot enter a canonical form; no input here can cause it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("the request has no idempotency key: {0}")]
-pub struct RequestError(String);
+pub struct RequestError(pub(crate) String);
 
 pub fn build(
     doc: &QuestionDoc,
