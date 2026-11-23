@@ -561,18 +561,20 @@ impl Store {
     }
 }
 
+/// The schema, its triggers and the version in one transaction: a process killed inside it leaves
+/// `user_version` 0 and no table, so the next open starts again.
 fn create(db: &Connection) -> Result<(), StoreError> {
-    db.execute_batch(SCHEMA)?;
+    let mut batch = format!("BEGIN IMMEDIATE;{SCHEMA}");
     for table in TABLES {
         for verb in ["UPDATE", "DELETE"] {
-            db.execute_batch(&format!(
+            batch.push_str(&format!(
                 "CREATE TRIGGER {table}_no_{verb} BEFORE {verb} ON {table}
                  BEGIN SELECT RAISE(ABORT, '{table} is insert-only'); END;"
-            ))?;
+            ));
         }
     }
-    db.pragma_update(None, "user_version", USER_VERSION)?;
-    Ok(())
+    batch.push_str(&format!("PRAGMA user_version = {USER_VERSION}; COMMIT;"));
+    Ok(db.execute_batch(&batch)?)
 }
 
 #[cfg(test)]
