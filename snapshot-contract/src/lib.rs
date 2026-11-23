@@ -23,9 +23,11 @@ use parquet::file::properties::WriterProperties;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+pub mod read;
 pub mod validate;
 pub mod visibility;
 
+pub use read::{manifest, rows, ReadError, Rows};
 pub use validate::{validate, Finding, ValidateError, FINDING_CODES};
 pub use visibility::{visible_at, Rule, StoredTimes, TimeError};
 
