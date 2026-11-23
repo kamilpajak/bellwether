@@ -1818,7 +1818,11 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
   | 3, `vault` complete | C2, C3, C4 if `derive` asks for it, and the N2 freshness alert |
 
 - V5 runs alongside `derive` and is in no threshold; a failing day pulls work back to `vault`.
-- Disk criterion: the VPS's free space read and an alert on it, or an accepted risk recorded in N2. State: not met; free space not read; none of the 15 rules in `deploy/prometheus/newsvault.rules.yml` reads disk; the store, a staging copy and 7 backups share one disk (N1).
+- Disk criterion: the VPS's free space read and an alert on it, or an accepted risk recorded in N2. State: met (owner decision 2026-11-23).
+  - Free space read 2026-11-22: 63 GB free of 193 GB (`df -h`, root filesystem, the one the store, a staging copy and 7 backups share, N1).
+  - The alert is the VPS's shared host rule `LowDiskSpace` in `~/monitoring/prometheus/alert.rules`: `node_filesystem_avail_bytes / node_filesystem_size_bytes * 100 < 15` for 5m, routed to the same Telegram receiver; read on the VPS 2026-11-22.
+  - Not in this repository: the rule belongs to the shared monitoring stack (§11.5 step 7, "Alerting"); none of the 15 rules in `deploy/prometheus/newsvault.rules.yml` reads disk, and `newsvault-monitoring-check` does not check the shared rule.
+  - Unmeasured: the store's growth rate.
 - A missed `collect` day is mostly recovered late with a later `observed_at`, so it gives no cutoff inside that day: the PRN sitemap walk reads back to its last basis (sitemap depth about 70.5 h, measured 2026-11-17) and the GNW id walk to the highest id of the previous RSS read (§11.2). Lost as `live_ingest`: items of RSS-only hosts (the Fed, CNW) and of any outage longer than a host's list depth. Not tested on a real outage.
 
 | id | criterion | check | state on 2026-11-22, with evidence | threshold | remaining work |
