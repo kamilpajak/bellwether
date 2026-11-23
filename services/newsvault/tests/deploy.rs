@@ -2444,6 +2444,7 @@ fn the_shadow_fires_every_30_minutes_and_frees_the_store_lock_before_any_other_s
             unit_values(&timer, "AccuracySec"),
             unit_values(&timer, "RandomizedDelaySec").len(),
             unit_values(&timer, "Persistent").len(),
+            unit_values(&timer, "WantedBy"),
         ),
         (
             48,
@@ -2455,7 +2456,8 @@ fn the_shadow_fires_every_30_minutes_and_frees_the_store_lock_before_any_other_s
             true,
             vec!["1s".to_owned()],
             0,
-            0
+            0,
+            vec!["timers.target".to_owned()]
         )
     );
     Ok(())
@@ -2479,6 +2481,7 @@ fn the_shadow_unit_succeeds_on_exit_7_records_its_result_and_ends_before_its_nex
             unit_values(&unit, "ExecStopPost"),
             unit_values(&unit, "SuccessExitStatus"),
             unit_values(&unit, "Restart").len(),
+            unit_values(&unit, "TimeoutStopSec").len(),
             ends_in_time,
         ),
         (
@@ -2491,9 +2494,47 @@ fn the_shadow_unit_succeeds_on_exit_7_records_its_result_and_ends_before_its_nex
             ],
             vec!["7".to_owned()],
             0,
+            0,
             vec![true]
         )
     );
+    Ok(())
+}
+
+/// `promtool` runs the cases in CI only and counts none, so a removed case is red here: each
+/// shadow alert keeps a case that expects it quiet and one that expects it firing.
+#[test]
+fn each_shadow_alert_has_a_quiet_and_a_firing_promtool_case() -> TestResult {
+    let rules = read("deploy/prometheus/newsvault.rules.yml")?;
+    let cases = trimmed(&read("deploy/prometheus/newsvault.rules.test.yml")?);
+    let mut seen = Vec::new();
+    for alert in rules
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- alert: ModelgateShadow"))
+    {
+        let named = format!("alertname: ModelgateShadow{alert}");
+        let expectations = |quiet: bool| {
+            cases
+                .windows(2)
+                .filter(|pair| {
+                    matches!(pair, [name, expected]
+                        if *name == named
+                            && expected.starts_with("exp_alerts:")
+                            && (expected == "exp_alerts: []") == quiet)
+                })
+                .count()
+        };
+        seen.push((
+            alert.to_owned(),
+            expectations(true) > 0,
+            expectations(false) > 0,
+        ));
+    }
+    let expected: Vec<_> = ["Failed", "Stale", "CostCapReached", "SpendNearTotalCap"]
+        .iter()
+        .map(|alert| ((*alert).to_owned(), true, true))
+        .collect();
+    assert_eq!(seen, expected);
     Ok(())
 }
 

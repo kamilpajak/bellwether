@@ -3,8 +3,9 @@
 # modelgate-shadow.service: `newsvault cut` at now under the store lock into a private directory,
 # then `modelgate shadow run` over it with no lock held, then the envelope's spend as textfile
 # metrics. Arguments, for a run by hand: --dry-run, --limit N, --ack-cost-model RUN_ID, and with
-# --dry-run only --from-seq N. Exits: 0; 7 retryable (a lock held, the cut past its bound, the
-# vendor unreachable); 8 the envelope names why; 2 setup or a setting; 4 an absent input.
+# --dry-run only --from-seq N. A live run without --limit sends at most MODELGATE_LIMIT requests.
+# Exits: 0; 7 retryable (a lock held, the cut past its bound, the vendor unreachable); 8 the
+# envelope names why; 2 setup or a setting; 4 an absent input; 137 the cut killed before its bound.
 set -u
 export LC_ALL=C
 : "${NEWSVAULT_IMAGE:?set in newsvault.env}" "${NEWSVAULT_TEXTFILE_DIR:?set in newsvault.env}"
@@ -32,8 +33,9 @@ setting() {
 }
 amount() {
     setting "$1" "$2" '0-9.'
+    # gawk reads 017 in program text as octal 15 and the binary reads it as 17.
     case $2 in
-        .* | *. | *.*.*) echo "$1 is not an amount: '$2'" >&2; exit 2 ;;
+        .* | *. | *.*.* | 0[0-9]*) echo "$1 is not an amount: '$2'" >&2; exit 2 ;;
     esac
 }
 amount MODELGATE_RUN_CAP_USD "${MODELGATE_RUN_CAP_USD-}"
@@ -41,19 +43,25 @@ amount MODELGATE_DAY_CAP_USD "${MODELGATE_DAY_CAP_USD-}"
 amount MODELGATE_TOTAL_CAP_USD "${MODELGATE_TOTAL_CAP_USD-}"
 amount MODELGATE_INPUT_PRICE_PER_MTOK "${MODELGATE_INPUT_PRICE_PER_MTOK-}"
 setting MODELGATE_GIVE_UP_AFTER_HOURS "${MODELGATE_GIVE_UP_AFTER_HOURS-}" '0-9'
+setting MODELGATE_LIMIT "${MODELGATE_LIMIT-}" '0-9'
 setting MODELGATE_MODEL "${MODELGATE_MODEL-}" 'A-Za-z0-9._/-'
 setting MODELGATE_QUESTIONS "${MODELGATE_QUESTIONS-}" 'A-Za-z0-9._/-'
 case $MODELGATE_MODEL:$MODELGATE_QUESTIONS in
     -* | *:[!/]*) echo "MODELGATE_MODEL starts with '-' or MODELGATE_QUESTIONS is not absolute" >&2; exit 2 ;;
 esac
-# Digits and at most one dot by now, so the value is safe inside the program text.
-if ! awk "BEGIN { exit !($MODELGATE_TOTAL_CAP_USD <= $total_ceiling) }"; then
+case $MODELGATE_LIMIT in
+    0*) echo "MODELGATE_LIMIT is 0 or starts with 0: '$MODELGATE_LIMIT'" >&2; exit 2 ;;
+esac
+# As data, never program text: awk converts a string as decimal.
+if ! total=$MODELGATE_TOTAL_CAP_USD ceiling=$total_ceiling \
+    awk 'BEGIN { exit !(ENVIRON["total"] + 0 <= ENVIRON["ceiling"] + 0) }'; then
     echo "MODELGATE_TOTAL_CAP_USD $MODELGATE_TOTAL_CAP_USD is above the owner's $total_ceiling USD" >&2
     exit 2
 fi
 
 dry=''
 floor=''
+limited=''
 previous=''
 for arg; do
     case $previous:$arg in
@@ -61,7 +69,8 @@ for arg; do
         --ack-cost-model:*) setting "$previous" "$arg" 'A-Za-z0-9.:-'; previous='' ;;
         :--dry-run) dry=yes ;;
         :--from-seq) floor=yes; previous=$arg ;;
-        :--limit | :--ack-cost-model) previous=$arg ;;
+        :--limit) limited=yes; previous=$arg ;;
+        :--ack-cost-model) previous=$arg ;;
         *) echo "usage: modelgate-shadow [--dry-run [--from-seq N]] [--limit N] [--ack-cost-model RUN_ID]" >&2; exit 2 ;;
     esac
 done
@@ -82,10 +91,12 @@ flock --nonblock 9 || { echo "another shadow run holds its lock" >&2; exit 7; }
 rm -rf "${cache:?}"/shadow.*
 work=$(mktemp -d "$cache/shadow.XXXXXX") || exit 2
 trap 'rm -rf "$work"' EXIT
-trap 'exit 130' INT TERM
+# dash runs the EXIT trap for a trapped signal only: an untrapped HUP left the cut (2026-11-23).
+trap 'exit 130' HUP INT QUIT PIPE TERM
 mkdir "$work/cut" || exit 2
 
 at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+cut_started=$(date +%s)
 flock --nonblock --conflict-exit-code 7 "$XDG_RUNTIME_DIR/bellwether-store.lock" \
     timeout --kill-after "$cut_kill" "$cut_bound" \
     docker run --rm --name modelgate-shadow-cut --pull never \
@@ -96,24 +107,30 @@ flock --nonblock --conflict-exit-code 7 "$XDG_RUNTIME_DIR/bellwether-store.lock"
     "$NEWSVAULT_IMAGE" \
     cut --at "$at" --out /cut --non-interactive --format json >&2
 status=$?
+cut_seconds=$(($(date +%s) - cut_started))
+# timeout(1): 124 its TERM ended the client; 137 its KILL did, or the container was killed by
+# something else (the kernel's OOM killer), which only the elapsed time tells apart.
+case $status in
+    124 | 137) docker rm --force modelgate-shadow-cut >/dev/null 2>&1 ;;
+esac
+[ "$status" -ne 137 ] || [ "$cut_seconds" -lt "$cut_bound" ] || status=124
 case $status in
     0) ;;
     7) echo "the store lock or the commit log is held" >&2; exit 7 ;;
-    124 | 137)
-        # timeout(1): 124 its TERM ended the client, 137 its KILL did and the container may live.
-        docker rm --force modelgate-shadow-cut >/dev/null 2>&1
-        echo "the cut passed its $cut_bound s bound" >&2
-        exit 7
-        ;;
+    124) echo "the cut passed its $cut_bound s bound" >&2; exit 7 ;;
+    137) echo "the cut was killed after $cut_seconds s, before its $cut_bound s bound" >&2; exit 137 ;;
     *) exit "$status" ;;
 esac
 snapshot=''
+found=0
 for entry in "$work/cut"/*; do
     [ -d "$entry" ] || continue
-    [ -z "$snapshot" ] || { echo "the cut left more than one directory" >&2; exit 2; }
+    found=$((found + 1))
     snapshot=${entry##*/}
 done
-[ -n "$snapshot" ] || { echo "the cut wrote no snapshot directory" >&2; exit 2; }
+[ "$found" -eq 1 ] || { echo "the cut left $found snapshot directories, not one" >&2; exit 2; }
+
+[ -n "$dry$limited" ] || set -- "$@" --limit "$MODELGATE_LIMIT"
 
 set -- "$NEWSVAULT_IMAGE" -- /usr/local/bin/modelgate shadow run \
     --snapshot "/cut/$snapshot" --store /modelgate --questions "$MODELGATE_QUESTIONS" \
