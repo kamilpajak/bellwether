@@ -2,8 +2,11 @@
 # One shadow run (architecture.md section 3.5, "The shadow run on the VPS"), started by
 # modelgate-shadow.service: `newsvault cut` at now under the store lock into a private directory,
 # then `modelgate shadow run` over it with no lock held, then the envelope's spend as textfile
-# metrics. Arguments, for a run by hand: --dry-run, --limit N, --ack-cost-model RUN_ID, and with
-# --dry-run only --from-seq N. A live run without --limit sends at most MODELGATE_LIMIT requests.
+# metrics. By hand: --dry-run, --limit N, --ack-cost-model RUN_ID, and with --dry-run only
+# --from-seq N. A live run without --limit sends at most MODELGATE_LIMIT requests. With the nine
+# MODELGATE_EMBED_* settings `modelgate embed run` follows and never changes the exit:
+# --embed-limit N, --embed-ack-cost-model RUN_ID. In place of both steps, a read-only report:
+# --dedup distribution, or --dedup sample --seed N --per-stratum M.
 # Exits: 0; 7 retryable (a lock held, the cut past its bound, the vendor unreachable); 8 the
 # envelope names why; 2 setup or a setting; 4 an absent input; 137 the cut killed before its bound.
 set -u
@@ -19,6 +22,14 @@ cut_bound=180
 cut_kill=30
 # Owner decision 2026-11-23: the whole shadow spends at most this many USD.
 total_ceiling=15
+# The unit's TimeoutStartSec; services/newsvault/tests/deploy.rs holds the two equal. No embed call
+# starts later than embed_reserve + 20 s before it: the reserve is the comparison's and the
+# metrics' time (section 3.5, "Repeated releases", where the comparison was timed).
+run_bound=1500
+embed_reserve=120
+# The embed container is stopped this long before the unit's bound, so the script ends itself.
+embed_stop=30
+embed_kill=10
 vault="$HOME/.bellwether/vault"
 store="$HOME/.bellwether/modelgate"
 key="$HOME/.config/bellwether/model-key"
@@ -59,30 +70,85 @@ if ! total=$MODELGATE_TOTAL_CAP_USD ceiling=$total_ceiling \
     exit 2
 fi
 
+# The embed step is on only when all nine settings hold and the two total caps together stay
+# under the ceiling. A refused setting turns the step off for this run and is named on stderr; it
+# never stops the labelling, and ModelgateEmbedStale names a step that stays off.
+embed=''
+if [ -n "${MODELGATE_EMBED_MODEL-}${MODELGATE_EMBED_PROVIDER-}${MODELGATE_EMBED_QUANTIZATION-}${MODELGATE_EMBED_EPOCH-}${MODELGATE_EMBED_PRICE_PER_MTOK-}${MODELGATE_EMBED_LIMIT-}${MODELGATE_EMBED_RUN_CAP_USD-}${MODELGATE_EMBED_DAY_CAP_USD-}${MODELGATE_EMBED_TOTAL_CAP_USD-}" ]; then
+    if (
+        setting MODELGATE_EMBED_MODEL "${MODELGATE_EMBED_MODEL-}" 'A-Za-z0-9._/-'
+        setting MODELGATE_EMBED_PROVIDER "${MODELGATE_EMBED_PROVIDER-}" 'A-Za-z0-9._/-'
+        setting MODELGATE_EMBED_QUANTIZATION "${MODELGATE_EMBED_QUANTIZATION-}" 'a-z0-9'
+        setting MODELGATE_EMBED_EPOCH "${MODELGATE_EMBED_EPOCH-}" '0-9'
+        setting MODELGATE_EMBED_LIMIT "${MODELGATE_EMBED_LIMIT-}" '0-9'
+        amount MODELGATE_EMBED_PRICE_PER_MTOK "${MODELGATE_EMBED_PRICE_PER_MTOK-}"
+        amount MODELGATE_EMBED_RUN_CAP_USD "${MODELGATE_EMBED_RUN_CAP_USD-}"
+        amount MODELGATE_EMBED_DAY_CAP_USD "${MODELGATE_EMBED_DAY_CAP_USD-}"
+        amount MODELGATE_EMBED_TOTAL_CAP_USD "${MODELGATE_EMBED_TOTAL_CAP_USD-}"
+        case $MODELGATE_EMBED_MODEL:$MODELGATE_EMBED_PROVIDER:$MODELGATE_EMBED_LIMIT:$MODELGATE_EMBED_EPOCH in
+            -* | *:-*:*:* | *:*:0*:* | *:*:*:0?*)
+                echo "MODELGATE_EMBED_MODEL or MODELGATE_EMBED_PROVIDER starts with '-', or MODELGATE_EMBED_LIMIT or MODELGATE_EMBED_EPOCH with 0" >&2
+                exit 2 ;;
+        esac
+        if ! decide=$MODELGATE_TOTAL_CAP_USD embed=$MODELGATE_EMBED_TOTAL_CAP_USD ceiling=$total_ceiling \
+            awk 'BEGIN { exit !(ENVIRON["decide"] + ENVIRON["embed"] <= ENVIRON["ceiling"] + 0) }'; then
+            echo "MODELGATE_TOTAL_CAP_USD $MODELGATE_TOTAL_CAP_USD + MODELGATE_EMBED_TOTAL_CAP_USD $MODELGATE_EMBED_TOTAL_CAP_USD is above the owner's $total_ceiling USD" >&2
+            exit 2
+        fi
+    ); then
+        embed=yes
+    else
+        echo "the embed step is off for this run: the setting named above" >&2
+    fi
+fi
+
+usage() {
+    echo "usage: modelgate-shadow [--dry-run [--from-seq N]] [--limit N] [--ack-cost-model RUN_ID] [--embed-limit N] [--embed-ack-cost-model RUN_ID] | --dedup distribution | --dedup sample --seed N --per-stratum M" >&2
+    exit 2
+}
 dry=''
 floor=''
 limited=''
 previous=''
+embed_limit=''
+embed_ack=''
+dedup=''
+seed=''
+per_stratum=''
+given=$#
+# The words for `shadow run` are appended again behind the given ones, which are then dropped.
 for arg; do
     case $previous:$arg in
-        --limit:* | --from-seq:*) setting "$previous" "$arg" '0-9'; previous='' ;;
-        --ack-cost-model:*) setting "$previous" "$arg" 'A-Za-z0-9.:-'; previous='' ;;
-        :--dry-run) dry=yes ;;
-        :--from-seq) floor=yes; previous=$arg ;;
-        :--limit) limited=yes; previous=$arg ;;
-        :--ack-cost-model) previous=$arg ;;
-        *) echo "usage: modelgate-shadow [--dry-run [--from-seq N]] [--limit N] [--ack-cost-model RUN_ID]" >&2; exit 2 ;;
+        --limit:* | --from-seq:*) setting "$previous" "$arg" '0-9'; previous=''; set -- "$@" "$arg" ;;
+        --ack-cost-model:*) setting "$previous" "$arg" 'A-Za-z0-9.:-'; previous=''; set -- "$@" "$arg" ;;
+        --embed-limit:*) setting "$previous" "$arg" '0-9'; embed_limit=$arg; previous='' ;;
+        --embed-ack-cost-model:*) setting "$previous" "$arg" 'A-Za-z0-9.:-'; embed_ack=$arg; previous='' ;;
+        --seed:*) setting "$previous" "$arg" '0-9'; seed=$arg; previous='' ;;
+        --per-stratum:*) setting "$previous" "$arg" '0-9'; per_stratum=$arg; previous='' ;;
+        --dedup:distribution | --dedup:sample) dedup=$arg; previous='' ;;
+        :--dry-run) dry=yes; set -- "$@" "$arg" ;;
+        :--from-seq) floor=yes; previous=$arg; set -- "$@" "$arg" ;;
+        :--limit) limited=yes; previous=$arg; set -- "$@" "$arg" ;;
+        :--ack-cost-model) previous=$arg; set -- "$@" "$arg" ;;
+        :--embed-limit | :--embed-ack-cost-model | :--dedup | :--seed | :--per-stratum) previous=$arg ;;
+        *) usage ;;
     esac
 done
 if [ -n "$previous" ] || [ "$floor:$dry" = yes: ]; then
     echo "$previous needs a value, or --from-seq came without --dry-run: a floor is fixed for good" >&2
     exit 2
 fi
+shift "$given"
+case $dedup:$#:$embed_limit$embed_ack:$seed:$per_stratum in
+    :*::: | distribution:0::: | sample:0::?*:?*) ;;
+    :*:?*:: ) [ -n "$embed" ] || { echo "--embed-limit or --embed-ack-cost-model without the embed step" >&2; exit 2; } ;;
+    *) usage ;;
+esac
 
 : "${XDG_RUNTIME_DIR:?not set: run as the unit does, or from a login session}"
 [ -d "$vault" ] || { echo "no store at $vault" >&2; exit 4; }
 [ -d "$store" ] || { echo "no directory at $store; the install creates it" >&2; exit 4; }
-[ -n "$dry" ] || [ -f "$key" ] || { echo "no key file at $key" >&2; exit 4; }
+[ -n "$dry$dedup" ] || [ -f "$key" ] || { echo "no key file at $key" >&2; exit 4; }
 
 mkdir -p "$cache" || exit 2
 exec 9>"$XDG_RUNTIME_DIR/bellwether-shadow.lock" || exit 2
@@ -130,6 +196,28 @@ for entry in "$work/cut"/*; do
 done
 [ "$found" -eq 1 ] || { echo "the cut left $found snapshot directories, not one" >&2; exit 2; }
 
+# One container's flags; the name, the network and the mounts follow. $bounded is empty or a
+# timeout(1) prefix of several words.
+bounded=''
+contained() {
+    name=$1
+    shift
+    # shellcheck disable=SC2086 # split on purpose: a command prefix, set by this script alone
+    $bounded docker run --rm --name "$name" --pull never \
+        --user "$(id -u):$(id -g)" --read-only --tmpfs /tmp:rw,size=16m \
+        --cap-drop ALL --security-opt no-new-privileges --entrypoint /usr/bin/tini \
+        --mount "type=bind,src=$work/cut,dst=/cut,readonly" "$@"
+}
+if [ -n "$dedup" ]; then
+    set -- "$NEWSVAULT_IMAGE" -- /usr/local/bin/modelgate dedup "$dedup" --store /modelgate \
+        --format json
+    [ "$dedup" = distribution ] ||
+        set -- "$@" --seed "$seed" --per-stratum "$per_stratum" --snapshot "/cut/$snapshot"
+    contained modelgate-dedup --network none \
+        --mount "type=bind,src=$store,dst=/modelgate,readonly" "$@"
+    exit $?
+fi
+
 [ -n "$dry$limited" ] || set -- "$@" --limit "$MODELGATE_LIMIT"
 
 set -- "$NEWSVAULT_IMAGE" -- /usr/local/bin/modelgate shadow run \
@@ -145,50 +233,94 @@ else
         --mount "type=bind,src=$key,dst=/run/secrets/model-key,readonly" \
         --env BELLWETHER_MODEL_KEY_FILE=/run/secrets/model-key "$@"
 fi
-docker run --rm --name modelgate-shadow --pull never \
-    --user "$(id -u):$(id -g)" --read-only --tmpfs /tmp:rw,size=16m \
-    --cap-drop ALL --security-opt no-new-privileges --entrypoint /usr/bin/tini \
-    --mount "type=bind,src=$work/cut,dst=/cut,readonly" "$@" >"$work/envelope"
+contained modelgate-shadow "$@" >"$work/envelope"
 status=$?
 cat "$work/envelope"
-case $dry:$status in
-    :0 | :8) ;;
+case $status in
+    0 | 8) ;;
     *) exit "$status" ;;
 esac
 
-# The envelope is one compact line; its cost_micro_usd object holds integers and one null.
-cost=$(sed -n 's/.*"cost_micro_usd":{\([^{}]*\)}.*/\1/p' "$work/envelope")
 field() {
     printf '%s\n' "$cost" | sed -n "s/.*\"$1\":\([0-9][0-9]*\).*/\1/p"
 }
-reached=0
-if grep -q '"error_code":"cost_cap_reached"' "$work/envelope"; then reached=1; fi
-prom="$NEWSVAULT_TEXTFILE_DIR/modelgate-shadow.prom"
-last_ok=''
-if [ "$status" -eq 0 ]; then
-    last_ok=$(date -u +%s)
-elif [ -f "$prom" ]; then
-    last_ok=$(sed -n 's/^modelgate_shadow_last_success_timestamp_seconds \([0-9][0-9]*\)$/\1/p' "$prom")
-fi
-tmp="$NEWSVAULT_TEXTFILE_DIR/.modelgate-shadow.prom.$$"
-if ! {
-    echo '# TYPE modelgate_shadow_spent_micro_usd gauge'
-    for scope in run day total; do
-        printf 'modelgate_shadow_spent_micro_usd{scope="%s"} %s\n' "$scope" "$(field "$scope")"
-    done
-    echo '# TYPE modelgate_shadow_cap_micro_usd gauge'
-    for scope in run day total; do
-        printf 'modelgate_shadow_cap_micro_usd{scope="%s"} %s\n' "$scope" "$(field "${scope}_cap")"
-    done
-    echo '# TYPE modelgate_shadow_cost_cap_reached gauge'
-    echo "modelgate_shadow_cost_cap_reached $reached"
-    if [ -n "$last_ok" ]; then
-        echo '# TYPE modelgate_shadow_last_success_timestamp_seconds gauge'
-        echo "modelgate_shadow_last_success_timestamp_seconds $last_ok"
+# metrics ENVELOPE EXIT FILE SPENT CAP REACHED STAMP: a step's spend as the four named families.
+# The envelope is one compact line; its cost_micro_usd object holds integers and at most one null.
+# Fails when the envelope states no cost or FILE cannot be written; FILE then stays as it was.
+metrics() {
+    cost=$(sed -n 's/.*"cost_micro_usd":{\([^{}]*\)}.*/\1/p' "$1")
+    reached=0
+    if grep -q '"error_code":"cost_cap_reached"' "$1"; then reached=1; fi
+    last_ok=''
+    if [ "$2" -eq 0 ]; then
+        last_ok=$(date -u +%s)
+    elif [ -f "$3" ]; then
+        last_ok=$(sed -n "s/^$7 \([0-9][0-9]*\)\$/\1/p" "$3")
     fi
-} >"$tmp" || grep -q '} $' "$tmp" || ! mv -f "$tmp" "$prom"; then
-    echo "the envelope states no cost, or $prom could not be written" >&2
-    rm -f "$tmp"
-    [ "$status" -ne 0 ] || status=2
+    tmp="${3%/*}/.${3##*/}.$$"
+    if ! {
+        echo "# TYPE $4 gauge"
+        for scope in run day total; do
+            printf '%s{scope="%s"} %s\n' "$4" "$scope" "$(field "$scope")"
+        done
+        echo "# TYPE $5 gauge"
+        for scope in run day total; do
+            printf '%s{scope="%s"} %s\n' "$5" "$scope" "$(field "${scope}_cap")"
+        done
+        echo "# TYPE $6 gauge"
+        echo "$6 $reached"
+        if [ -n "$last_ok" ]; then
+            echo "# TYPE $7 gauge"
+            echo "$7 $last_ok"
+        fi
+    } >"$tmp" || grep -q '} $' "$tmp" || ! mv -f "$tmp" "$3"; then
+        echo "the envelope states no cost, or $3 could not be written" >&2
+        rm -f "$tmp"
+        return 1
+    fi
+}
+if [ -z "$dry" ]; then
+    metrics "$work/envelope" "$status" "$NEWSVAULT_TEXTFILE_DIR/modelgate-shadow.prom" \
+        modelgate_shadow_spent_micro_usd modelgate_shadow_cap_micro_usd \
+        modelgate_shadow_cost_cap_reached modelgate_shadow_last_success_timestamp_seconds ||
+        [ "$status" -ne 0 ] || status=2
 fi
+[ -n "$embed" ] || exit "$status"
+
+# The embed step. Nothing below changes $status: the step's envelope and its own textfile carry
+# its result, and a step that is killed or refused leaves both as they were.
+remaining=$((cut_started + run_bound - embed_stop - $(date +%s)))
+if [ "$remaining" -le "$embed_reserve" ]; then
+    echo "the embed step is off for this run: $remaining s are left of the unit's $run_bound" >&2
+    exit "$status"
+fi
+set -- "$NEWSVAULT_IMAGE" -- /usr/local/bin/modelgate embed run \
+    --snapshot "/cut/$snapshot" --store /modelgate --model "$MODELGATE_EMBED_MODEL" \
+    --provider "$MODELGATE_EMBED_PROVIDER" --quantization "$MODELGATE_EMBED_QUANTIZATION" \
+    --epoch "$MODELGATE_EMBED_EPOCH" --run-cap-usd "$MODELGATE_EMBED_RUN_CAP_USD" \
+    --day-cap-usd "$MODELGATE_EMBED_DAY_CAP_USD" --total-cap-usd "$MODELGATE_EMBED_TOTAL_CAP_USD" \
+    --input-price-per-mtok "$MODELGATE_EMBED_PRICE_PER_MTOK" \
+    --give-up-after-hours "$MODELGATE_GIVE_UP_AFTER_HOURS" \
+    --limit "${embed_limit:-$MODELGATE_EMBED_LIMIT}" \
+    --deadline "@$((cut_started + run_bound - embed_reserve))" --non-interactive --format json
+[ -z "$embed_ack" ] || set -- "$@" --ack-cost-model "$embed_ack"
+if [ -n "$dry" ]; then
+    set -- --network none --mount "type=bind,src=$store,dst=/modelgate,readonly" "$@" --dry-run
+else
+    set -- --network bridge --mount "type=bind,src=$store,dst=/modelgate" \
+        --mount "type=bind,src=$key,dst=/run/secrets/model-key,readonly" \
+        --env BELLWETHER_MODEL_KEY_FILE=/run/secrets/model-key "$@"
+fi
+bounded="timeout --kill-after $embed_kill $remaining"
+contained modelgate-embed "$@" >"$work/embed-envelope"
+embed_status=$?
+cat "$work/embed-envelope"
+case $dry:$embed_status in
+    :0 | :8)
+        metrics "$work/embed-envelope" "$embed_status" "$NEWSVAULT_TEXTFILE_DIR/modelgate-embed.prom" \
+            modelgate_embed_spent_micro_usd modelgate_embed_cap_micro_usd \
+            modelgate_embed_cost_cap_reached modelgate_embed_last_success_timestamp_seconds ;;
+    :124 | :137) docker rm --force modelgate-embed >/dev/null 2>&1 ;;
+esac
+[ -n "$dry" ] || [ "$embed_status" -eq 0 ] || echo "the embed step ended at exit $embed_status" >&2
 exit "$status"
