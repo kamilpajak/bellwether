@@ -1,0 +1,27 @@
+# The daily roster fetch (architecture.md section 10, "The roster"): SEC's company_tickers_exchange.json
+# kept as received under the ledger. services/newsvault/tests/deploy.rs reads TimeoutStartSec, the
+# container shape and the ExecStopPost lines. Exit 8 fails the unit: a partial roster day is a lost day.
+[Unit]
+Description=newsvault roster fetch, the daily company roster
+Documentation=https://github.com/kamilpajak/bellwether/blob/main/docs/design/architecture.md
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/bellwether/newsvault.env
+# The copy's observation time is the clock's, as a collect's is.
+ExecStartPre=/bin/sh -c 'test "$$(timedatectl show --property=NTPSynchronized --value)" = yes || { echo "the clock is not NTP-synchronised" >&2; exit 1; }'
+ExecStart=/usr/bin/flock --nonblock --conflict-exit-code 7 %t/bellwether-store.lock \
+    /usr/bin/docker run --rm --name newsvault-roster --pull never \
+    --user %U:%G --read-only --tmpfs /tmp:rw,size=16m \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --mount type=bind,src=%h/.bellwether/vault,dst=/vault \
+    --mount type=bind,src=%h/.config/bellwether/feed-contact,dst=/run/secrets/feed-contact,readonly \
+    --env BELLWETHER_FEED_CONTACT_FILE=/run/secrets/feed-contact \
+    ${NEWSVAULT_IMAGE} \
+    roster fetch --non-interactive --format json
+# The input of NewsvaultRosterFailed and NewsvaultRosterMissed; first and `-`, as the collect unit's.
+ExecStopPost=-%h/.local/lib/bellwether/newsvault-unit-result roster
+ExecStopPost=/bin/sh -c 'if [ "$$SERVICE_RESULT" = timeout ]; then /usr/bin/docker rm --force newsvault-roster; fi'
+# SEC's 30 s patience for each request (the robots.txt and one file) plus 120 s; the deploy test
+# derives it.
+TimeoutStartSec=180
