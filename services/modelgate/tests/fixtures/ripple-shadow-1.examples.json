@@ -30,20 +30,23 @@
     "as_matters_more_to_others": [
      "true"
     ],
-    "as_issuer_large_others_smaller": [
-     "true"
-    ],
     "as_issuer_opens_what_others_need": [
      "true"
     ],
     "as_names_category_as_purpose": [
+     "true"
+    ],
+    "as_issuer_described_as_large": [
+     "true"
+    ],
+    "as_others_small_or_specialised": [
      "true"
     ]
    }
   },
   {
    "id": "chief_executive_forced_out_under_charges",
-   "text": "Largeplat Corporation (NASDAQ: LRGP) today said its founder and chief executive resigned at the request of the board, effective immediately, after prosecutors in two countries charged him with bribery and with breaking export controls. The board has opened an independent investigation. The chief operating officer becomes interim chief executive. The company said the matter is material to its business.",
+   "text": "Largeplat Corporation (NASDAQ: LRGP) today said its founder and chief executive resigned at the request of the board, effective immediately, after prosecutors in two countries charged him with bribery and with breaking export controls. The board has opened an independent investigation. The chief operating officer becomes interim chief executive. The company said the matter is material to its results.",
    "expect": {
     "event_class": [
      "key_person_departure"
@@ -52,19 +55,19 @@
      "major",
      "critical"
     ],
-    "cx_state_body_involved": [
+    "cx_state_body_acts_against": [
      "true"
     ],
     "cx_criminal_or_security_allegation": [
      "true"
     ],
-    "cx_forced_or_under_pressure": [
+    "cx_forced_by_another_party": [
      "true"
     ],
     "cx_international_reach": [
      "true"
     ],
-    "cx_previously_announced_or_expected": [
+    "cx_previously_announced": [
      "false"
     ],
     "cx_interim_successor_named": [
@@ -95,16 +98,16 @@
      "none",
      "minor"
     ],
-    "cx_state_body_involved": [
+    "cx_state_body_acts_against": [
      "false"
     ],
     "cx_criminal_or_security_allegation": [
      "false"
     ],
-    "cx_forced_or_under_pressure": [
+    "cx_forced_by_another_party": [
      "false"
     ],
-    "cx_previously_announced_or_expected": [
+    "cx_previously_announced": [
      "true"
     ],
     "cx_interim_successor_named": [
@@ -118,6 +121,9 @@
     ],
     "kp_reason_is_benign": [
      "true"
+    ],
+    "cx_magnitude_size": [
+     "not_stated"
     ]
    }
   },
@@ -164,6 +170,162 @@
     "issuer_significance": [
      "major",
      "critical"
+    ]
+   }
+  },
+  {
+   "id": "open_models_in_the_words_of_a_release",
+   "text": "Largeplat Corporation (NASDAQ: LRGP) today released Calibra, a family of open AI models for calibrating quantum processors, available now under an open licence. Calibrating a processor before a run takes days, and in tests with three hardware makers Calibra cut it to hours, the company said. \"Quantum builders can spend that time on experiments,\" said its vice president of research.",
+   "expect": {
+    "content_kind": [
+     "new_fact"
+    ],
+    "event_class": [
+     "product_or_technology_release"
+    ],
+    "issuer_significance": [
+     "none",
+     "minor"
+    ],
+    "category_significance": [
+     "major",
+     "critical"
+    ],
+    "scope": [
+     "whole_category"
+    ],
+    "stance_to_category": [
+     "validates",
+     "lowers_cost_or_barrier"
+    ],
+    "as_matters_more_to_others": [
+     "true"
+    ],
+    "as_issuer_opens_what_others_need": [
+     "true"
+    ],
+    "as_names_category_as_purpose": [
+     "true"
+    ]
+   }
+  },
+  {
+   "id": "platform_enters_the_category",
+   "text": "Largeplat Corporation (NASDAQ: LRGP) today said it will design and build its own quantum processors and sell them to its data-centre customers from next year. Until now it has bought quantum processors from specialist makers. The company said the programme does not change its outlook for this year.",
+   "expect": {
+    "event_class": [
+     "product_or_technology_release"
+    ],
+    "issuer_significance": [
+     "minor",
+     "major"
+    ],
+    "category_significance": [
+     "major",
+     "critical"
+    ],
+    "scope": [
+     "whole_category"
+    ],
+    "names_a_category_of_companies": [
+     "true"
+    ],
+    "stance_to_category": [
+     "threatens_to_absorb"
+    ],
+    "st_issuer_enters_their_market": [
+     "true"
+    ],
+    "as_issuer_opens_what_others_need": [
+     "false"
+    ]
+   }
+  },
+  {
+   "id": "investment_in_one_named_company",
+   "text": "Largeplat Corporation (NASDAQ: LRGP) today said it will invest $40 million in Smallq Inc. (NYSE: SMQ), a maker of quantum processors with 60 employees, and will buy its processors for three years.",
+   "expect": {
+    "scope": [
+     "named_counterparties"
+    ],
+    "category_significance": [
+     "none"
+    ],
+    "issuer_significance": [
+     "none",
+     "minor"
+    ],
+    "as_matters_more_to_others": [
+     "true"
+    ],
+    "as_others_small_or_specialised": [
+     "true"
+    ],
+    "cx_magnitude_stated": [
+     "true"
+    ],
+    "cx_magnitude_size": [
+     "no_base"
+    ]
+   }
+  },
+  {
+   "id": "law_firm_alert",
+   "text": "Claimfirm LLP announces an investigation of Midco Inc. (NYSE: MDCO) on behalf of shareholders. A class action filed in federal court alleges that Midco made misleading statements about its outlook. Shareholders who lost money may contact the firm before the deadline.",
+   "expect": {
+    "source_role": [
+     "third_party_solicitation"
+    ],
+    "cx_state_body_acts_against": [
+     "false"
+    ],
+    "cx_criminal_or_security_allegation": [
+     "false"
+    ],
+    "cx_investigation_open": [
+     "false"
+    ],
+    "cx_issuer_calls_it_material": [
+     "false"
+    ]
+   }
+  },
+  {
+   "id": "offering_of_a_stated_amount",
+   "text": "Smallq Inc. (NYSE: SMQ) today priced a registered public offering of common shares for gross proceeds of $50 million. The securities regulator declared the registration statement effective on Monday.",
+   "expect": {
+    "event_class": [
+     "equity_offering_dilutive"
+    ],
+    "ev_equity_offering_dilutive": [
+     "true"
+    ],
+    "cx_state_body_acts_against": [
+     "false"
+    ],
+    "cx_magnitude_stated": [
+     "true"
+    ],
+    "cx_magnitude_size": [
+     "no_base"
+    ]
+   }
+  },
+  {
+   "id": "rule_for_a_whole_industry",
+   "text": "The central bank today published final rules that raise the capital every bank above a size threshold must hold from next year.",
+   "expect": {
+    "source_role": [
+     "regulator_or_exchange"
+    ],
+    "issuer_significance": [
+     "cannot_tell"
+    ],
+    "scope": [
+     "whole_category"
+    ],
+    "cx_state_body_acts_against": [
+     "false"
     ]
    }
   }

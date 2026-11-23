@@ -13,9 +13,9 @@ pub const REQUEST_FORMAT: &str = "modelgate.request/2";
 /// Bytes the state may take once JSON-escaped, quotes excluded. Independent of the question
 /// document, so two documents read the same cut of one story.
 pub const STATE_BUDGET_BYTES: usize = 13_000;
-/// The whole body stays under this. Why 33,200, and what it no longer bounds: section 3.5,
+/// The whole body stays under this. Why 34,200, and what it no longer bounds: section 3.5,
 /// `request_format` and "Not verified".
-pub const REQUEST_CEILING_BYTES: usize = 33_200;
+pub const REQUEST_CEILING_BYTES: usize = 34_200;
 const MODEL_KEY: &str = "{\"model\":";
 const STATE_KEY: &str = ",\"state\":";
 const QUESTIONS_KEY: &str = ",\"questions\":";
@@ -110,7 +110,10 @@ pub fn build(
 
 #[cfg(test)]
 mod tests {
-    use super::{build, escaped_len, ENVELOPE_BYTES, REQUEST_CEILING_BYTES, STATE_BUDGET_BYTES};
+    use super::{
+        build, escaped_len, ENVELOPE_BYTES, REQUEST_CEILING_BYTES, REQUEST_FORMAT,
+        STATE_BUDGET_BYTES,
+    };
     use crate::model::{ModelId, MAX_MODEL_ID_BYTES};
     use crate::question::tests::{committed, TWO_QUESTIONS};
     use crate::question::{QuestionDoc, MAX_QUESTIONS_BYTES};
@@ -180,10 +183,33 @@ mod tests {
         Ok(())
     }
 
+    /// The key names the layout and the three budgets as one token, so a budget moves only with
+    /// the token and with section 3.5. Mutations 2026-11-23: see section 8 row MG8.
+    #[test]
+    fn the_format_token_and_its_three_budgets_are_the_ones_the_design_names() {
+        assert_eq!(
+            (
+                REQUEST_FORMAT,
+                STATE_BUDGET_BYTES,
+                MAX_QUESTIONS_BYTES,
+                REQUEST_CEILING_BYTES
+            ),
+            ("modelgate.request/2", 13_000, 21_000, 34_200)
+        );
+        let design = include_str!("../../../docs/design/architecture.md");
+        for named in [
+            "`modelgate.request/2` (2026-11-23)",
+            "13,000 JSON-escaped bytes",
+            "21,000-byte bound",
+            "34,200-byte ceiling",
+        ] {
+            assert!(design.contains(named), "{named}");
+        }
+    }
+
     /// The budgets against the committed document: the longest id, a body over the state budget
     /// and all its questions stay under the ceiling, and the state is not shortened for them.
-    /// Mutation 2026-11-23, `REQUEST_CEILING_BYTES` put back to 30,000: E0080, the constant
-    /// assertion of this file does not compile.
+    /// Mutations 2026-11-23: see section 8 row MG8.
     #[test]
     fn the_committed_document_and_a_full_state_fit_the_ceiling_with_the_state_uncut() -> TestResult
     {

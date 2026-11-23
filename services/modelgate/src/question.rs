@@ -8,9 +8,9 @@ use serde::Deserialize;
 
 pub const QUESTIONS_SCHEMA: &str = "modelgate.questions/1";
 /// Bytes the encoded `questions` object may reach. Fixed apart from the state budget
-/// (`request.rs`), so a longer document never shortens the text the model reads. Why 20,000:
+/// (`request.rs`), so a longer document never shortens the text the model reads. Why 21,000:
 /// section 3.5, `request_format`.
-pub const MAX_QUESTIONS_BYTES: usize = 20_000;
+pub const MAX_QUESTIONS_BYTES: usize = 21_000;
 const NOUL_OPTIONS: [&str; 2] = ["true", "false"];
 const MIN_CHOICE_OPTIONS: usize = 2;
 
@@ -416,44 +416,84 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// Section 8 row MG13: significance is asked twice, for the issuer and for the category, on
-    /// one ordered scale, and no question is called materiality. Mutations 2026-11-23, each red:
-    /// `category_significance` renamed in the file; one of its options renamed; `content_kind`
-    /// renamed back to `materiality`; the sentence on releases cut from its instructions.
+    /// Every instruction and option description of the questions `id` names, as one text.
+    fn texts(doc: &QuestionDoc, id: &str) -> String {
+        let asked = doc.questions().iter().filter(|question| question.id == id);
+        asked
+            .flat_map(|question| {
+                let options = question.options.iter().map(|o| o.description.as_str());
+                std::iter::once(question.instructions.as_str()).chain(options)
+            })
+            .collect::<Vec<&str>>()
+            .join(" ")
+    }
+
+    /// Section 8 row MG13, where the mutations of 2026-11-23 are listed: significance is asked
+    /// twice on one scale of sizes, no level is a kind of notice, and one phrase names the company.
     #[test]
     fn significance_is_two_questions_on_one_ordered_scale_and_none_is_called_materiality(
     ) -> TestResult {
         let doc = committed()?;
-        assert_eq!(option_ids(&doc, "issuer_significance"), LEVELS);
+        let with_off_scale = [&LEVELS[..], &["cannot_tell"]].concat();
+        assert_eq!(option_ids(&doc, "issuer_significance"), with_off_scale);
         assert_eq!(option_ids(&doc, "category_significance"), LEVELS);
         assert_eq!(
             option_ids(&doc, "cx_magnitude_size"),
-            ["none_stated", "small", "large"]
+            ["not_stated", "no_base", "small", "large"]
         );
-        let texts = |id: &str| -> String {
-            let asked = doc.questions().iter().filter(|question| question.id == id);
-            asked
-                .map(|question| question.instructions.as_str())
-                .collect()
-        };
         assert!(doc
             .questions()
             .iter()
             .all(|q| !q.id.contains("material") || q.id == "cx_issuer_calls_it_material"));
-        assert!(texts("content_kind").contains("release is a new event, however ordinary"));
-        assert!(texts("category_significance").contains("ordinary for the main company"));
-        assert!(texts("issuer_significance").contains("that company alone"));
+        assert!(texts(&doc, "content_kind").contains("release is a new event, however ordinary"));
+        let (issuer, category) = (
+            texts(&doc, "issuer_significance"),
+            texts(&doc, "category_significance"),
+        );
+        assert!(issuer.contains("that company alone"));
+        assert!(category.contains("whatever the event means for that company"));
+        for scale in [&issuer, &category] {
+            assert!(scale.contains("for better or worse"), "{scale}");
+            for kind_of_notice in ["routine", "promotional", "ordinary for", "leadership"] {
+                assert!(!scale.contains(kind_of_notice), "{kind_of_notice}: {scale}");
+            }
+        }
+        let size = texts(&doc, "cx_magnitude_size");
+        assert!(
+            size.contains("a tenth") && !size.contains("calls it"),
+            "{size}"
+        );
+        for question in doc.questions() {
+            let text = texts(&doc, &question.id);
+            for other_name in [
+                "main company",
+                "its subject",
+                "The subject",
+                "subject company",
+                "mainly about",
+            ] {
+                assert!(!text.contains(other_name), "{}: {other_name}", question.id);
+            }
+        }
         Ok(())
     }
 
-    /// Every expected reading is inside the committed answer spaces, and the first example is the
-    /// owner's of 2026-11-23: minor for its publisher, major for a category. Mutation that day,
-    /// `lowers_cost_or_barrier` renamed in the file: red.
+    fn expected<'a>(
+        examples: &'a [serde_json::Value],
+        example: &str,
+        question: &str,
+    ) -> &'a serde_json::Value {
+        let found = examples.iter().find(|e| e["id"] == example);
+        found.map_or(&serde_json::Value::Null, |e| &e["expect"][question])
+    }
+
+    /// Every expected reading is inside the committed answer spaces, and the contrasts the owner
+    /// named on 2026-11-23 are held as literals. Mutations: section 8 row MG13.
     #[test]
     fn every_expected_reading_of_a_synthetic_example_is_an_option_of_the_committed_document(
     ) -> TestResult {
         let (doc, examples) = (committed()?, examples()?);
-        assert_eq!(examples.len(), 5);
+        assert_eq!(examples.len(), 11);
         for example in &examples {
             let expected = example["expect"].as_object().ok_or("no expect object")?;
             assert!(!expected.is_empty(), "{example}");
@@ -467,20 +507,88 @@ pub(crate) mod tests {
                 }
             }
         }
-        let asymmetric = &examples[0]["expect"];
-        assert_eq!(
-            asymmetric["issuer_significance"],
-            serde_json::json!(LEVELS[..2])
+        let (low, high) = (&LEVELS[..2], &LEVELS[2..]);
+        let (yes, no) = (&["true"][..], &["false"][..]);
+        let models = ["validates", "lowers_cost_or_barrier"];
+        let (forced, planned) = (
+            "chief_executive_forced_out_under_charges",
+            "chief_executive_planned_retirement",
         );
-        assert_eq!(
-            asymmetric["category_significance"],
-            serde_json::json!(LEVELS[2..])
-        );
-        assert_eq!(asymmetric["scope"], serde_json::json!(["whole_category"]));
-        assert_eq!(
-            asymmetric["stance_to_category"],
-            serde_json::json!(["validates", "lowers_cost_or_barrier"])
-        );
+        let held: [(&str, &str, &[&str]); 22] = [
+            ("open_models_for_a_category", "issuer_significance", low),
+            ("open_models_for_a_category", "category_significance", high),
+            ("open_models_for_a_category", "scope", &["whole_category"]),
+            ("open_models_for_a_category", "stance_to_category", &models),
+            (
+                "open_models_in_the_words_of_a_release",
+                "issuer_significance",
+                low,
+            ),
+            (
+                "open_models_in_the_words_of_a_release",
+                "category_significance",
+                high,
+            ),
+            (
+                "open_models_in_the_words_of_a_release",
+                "stance_to_category",
+                &models,
+            ),
+            (
+                "platform_enters_the_category",
+                "category_significance",
+                high,
+            ),
+            (
+                "platform_enters_the_category",
+                "stance_to_category",
+                &["threatens_to_absorb"],
+            ),
+            (
+                "investment_in_one_named_company",
+                "category_significance",
+                &["none"],
+            ),
+            (
+                "investment_in_one_named_company",
+                "as_matters_more_to_others",
+                yes,
+            ),
+            (forced, "issuer_significance", high),
+            (planned, "issuer_significance", low),
+            (forced, "cx_forced_by_another_party", yes),
+            (planned, "cx_forced_by_another_party", no),
+            (forced, "cx_previously_announced", no),
+            (planned, "cx_previously_announced", yes),
+            (
+                "outlook_lowered_by_a_fiftieth",
+                "cx_magnitude_size",
+                &["small"],
+            ),
+            (
+                "outlook_lowered_by_two_fifths",
+                "cx_magnitude_size",
+                &["large"],
+            ),
+            (
+                "offering_of_a_stated_amount",
+                "cx_magnitude_size",
+                &["no_base"],
+            ),
+            ("law_firm_alert", "cx_investigation_open", no),
+            (
+                "rule_for_a_whole_industry",
+                "issuer_significance",
+                &["cannot_tell"],
+            ),
+        ];
+        for (example, question, reading) in held {
+            assert_eq!(
+                expected(&examples, example, question),
+                &serde_json::json!(reading),
+                "{example}: {question}"
+            );
+        }
         Ok(())
     }
 }

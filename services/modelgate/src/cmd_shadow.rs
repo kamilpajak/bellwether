@@ -1035,18 +1035,15 @@ mod tests {
         status(200, &body.to_string())
     }
 
-    /// Section 8 rows MG12 and MG13, over the committed document and the synthetic examples: an
-    /// earlier note, an untagged story, the release that is minor for its publisher, and the
-    /// forced departure, and a story tagged past the state budget. Mutations 2026-11-23, each
-    /// red: `label` returning before the send for a body naming an open licence; `cover` not
-    /// called; `cover` reading the cut state in place of the body; `finish` summarising
-    /// `planned_coverage` in a real run; a dry run keeping no record; a fourth key in the request.
+    /// Section 8 rows MG12 and MG13, where the mutations are listed. An earlier note, an untagged
+    /// story, the release that is minor for its publisher, the forced departure, and a story
+    /// with two tags past the state budget.
     #[test]
     fn every_question_is_asked_of_every_story_and_prior_coverage_is_recorded_and_never_sent(
     ) -> TestResult {
         let (doc, examples) = (committed()?, examples()?);
         let text = |index: usize| examples[index]["text"].as_str().unwrap_or_default();
-        let tail_tagged = format!("{}(NYSE: SMQ)", "word ".repeat(3_000));
+        let tail_tagged = format!("{}(NYSE: SMQ, SMQX)", "word ".repeat(3_000));
         let rows = [
             story(
                 1,
@@ -1067,10 +1064,11 @@ mod tests {
         let snapshot = cut(&rows, CUTOFF)?;
         let expected = json!({
             "version": coverage::version(), "stories": 5, "no_tag": 1, "tagged": 4,
+            "several_tags": 1,
             "windows": [
-                {"days": 1, "none": 3, "some": 1, "max": 1, "incomplete": 1},
-                {"days": 7, "none": 2, "some": 2, "max": 2, "incomplete": 4},
-                {"days": 30, "none": 2, "some": 2, "max": 2, "incomplete": 4},
+                {"days": 1, "none": 3, "some": 1, "none_for_a_tag": 3, "max": 1, "incomplete": 1},
+                {"days": 7, "none": 2, "some": 2, "none_for_a_tag": 2, "max": 2, "incomplete": 4},
+                {"days": 30, "none": 2, "some": 2, "none_for_a_tag": 2, "max": 2, "incomplete": 4},
             ],
         });
         let dry = Bench::new()?;
@@ -1102,7 +1100,7 @@ mod tests {
         let stub = Stub::scripted(readings.iter().map(|e| full_reading(&doc, e)).collect());
         let done = bench.go(&bench.args(snapshot.path()), &stub)?;
         let asked = u64::try_from(doc.questions().len())?;
-        assert_eq!(asked, 61);
+        assert_eq!(asked, 62);
         assert_eq!(at(&done.envelope, "/stories/labelled"), 5);
         assert_eq!(at(&done.envelope, "/questions/answered"), asked * 5);
         assert_eq!(at(&done.envelope, "/questions/missing"), 0);
@@ -1133,19 +1131,20 @@ mod tests {
         };
         let departure: (i64, Option<String>, Option<String>, String) = stored("departure")?;
         assert_eq!(departure.0, 1);
-        assert_eq!(departure.1.as_deref(), Some(r#"["NASDAQ:LRGP"]"#));
+        assert_eq!(departure.1.as_deref(), Some(r#"["LRGP"]"#));
         assert_eq!(
             serde_json::from_str::<Value>(departure.2.as_deref().unwrap_or_default())?,
-            json!([{"days": 1, "stories": 1, "complete": true},
-                   {"days": 7, "stories": 2, "complete": false},
-                   {"days": 30, "stories": 2, "complete": false}])
+            json!([{"days": 1, "stories": 1, "complete": true, "by_tag": {"LRGP": 1}},
+                   {"days": 7, "stories": 2, "complete": false, "by_tag": {"LRGP": 2}},
+                   {"days": 30, "stories": 2, "complete": false, "by_tag": {"LRGP": 2}}])
         );
         assert_eq!(
             json!(departure.3),
             at(&done.envelope, "/snapshot/snapshot_id")
         );
         assert_eq!(stored("bare")?, (0, None, None, departure.3));
-        assert_eq!(stored("long")?.0, 1);
+        let long = stored("long")?;
+        assert_eq!((long.0, long.1.as_deref()), (2, Some(r#"["SMQ","SMQX"]"#)));
         Ok(())
     }
 
@@ -1401,6 +1400,7 @@ mod tests {
         );
         assert_eq!(at(&done.envelope, "/requests/already_answered"), 1);
         assert_eq!(at(&done.envelope, "/stories/labelled"), 2);
+        assert_eq!(bench.count("SELECT COUNT(*) FROM prior_coverage")?, 2);
         Ok(())
     }
 

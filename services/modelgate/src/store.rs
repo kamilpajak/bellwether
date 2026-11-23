@@ -61,7 +61,8 @@ CREATE TABLE prior_coverage (
     run_id TEXT NOT NULL, tag_count INTEGER NOT NULL, tags TEXT, windows TEXT,
     PRIMARY KEY (story_id, coverage_version),
     CHECK ((tag_count = 0 AND tags IS NULL AND windows IS NULL)
-        OR (tag_count > 0 AND tags IS NOT NULL AND windows IS NOT NULL)));
+        OR (tag_count > 0 AND tags IS NOT NULL AND windows IS NOT NULL
+            AND tag_count = json_array_length(tags))));
 CREATE TABLE attempt_events (
     attempt_id TEXT NOT NULL,
     event TEXT NOT NULL CHECK (event IN ('opened','answered','finalised','abandoned')),
@@ -805,48 +806,62 @@ mod tests {
         let dry = Store::read_only(root.path())?;
         let written = dry.set_floor("v", "m", 0, "run");
         assert!(matches!(written, Err(StoreError::Sqlite(_))), "{written:?}");
-        Connection::open(newer.path().join(DB_FILE))?.pragma_update(
-            None,
-            "user_version",
-            USER_VERSION + 1,
-        )?;
-        for opened in [Store::open(newer.path()), Store::read_only(newer.path())] {
-            assert!(
-                matches!(opened, Err(StoreError::SchemaVersion { found, .. }) if found == USER_VERSION + 1)
-            );
+        // 1 is the store of the build before `prior_coverage`; section 3.5 names 2.
+        assert_eq!(USER_VERSION, 2);
+        for other in [1, USER_VERSION + 1] {
+            Connection::open(newer.path().join(DB_FILE))?.pragma_update(
+                None,
+                "user_version",
+                other,
+            )?;
+            for opened in [Store::open(newer.path()), Store::read_only(newer.path())] {
+                assert!(
+                    matches!(opened, Err(StoreError::SchemaVersion { found, .. }) if found == other),
+                    "{other}"
+                );
+            }
         }
         Ok(())
     }
 
-    /// Section 8 row MG12. Mutations 2026-11-23, each red: the `CHECK` removed from
-    /// `prior_coverage`; `INSERT OR IGNORE` made `INSERT OR REPLACE`; `coverage_by` ignoring the
-    /// coverage version.
+    /// Section 8 row MG12, where the mutations of 2026-11-23 are listed.
     #[test]
     fn a_coverage_row_is_no_tag_or_counts_never_both_and_the_first_record_stays() -> TestResult {
         let root = TempDir::new()?;
         let store = Store::open(root.path())?;
         let counted = PriorCoverage::Tagged {
-            tags: vec!["NYSE:SMQ".to_owned()],
+            tags: vec!["LRGP".to_owned(), "SMQ".to_owned()],
             windows: vec![WindowCount {
                 days: 1,
-                stories: 0,
+                stories: 1,
                 complete: true,
+                by_tag: [("LRGP".to_owned(), 1), ("SMQ".to_owned(), 0)].into(),
             }],
         };
         store.insert_coverage("tagged", "c/1", "cut-1", "run", &counted)?;
         store.insert_coverage("tagged", "c/1", "cut-2", "run", &PriorCoverage::NoTag)?;
         store.insert_coverage("bare", "c/1", "cut-1", "run", &PriorCoverage::NoTag)?;
         store.insert_coverage("bare", "c/2", "cut-1", "run", &counted)?;
+        store.insert_coverage("elsewhere", "c/1", "cut-1", "another-run", &counted)?;
         assert_eq!(
             store.coverage_by("run", "c/1")?,
             [counted, PriorCoverage::NoTag]
         );
         assert!(store.has_coverage("bare", "c/2")?);
+        assert!(!store.has_coverage("tagged", "c/2")?);
         assert!(!store.has_coverage("absent", "c/1")?);
+        let tag_count: i64 = store.db.query_row(
+            "SELECT tag_count FROM prior_coverage WHERE story_id = 'tagged'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(tag_count, 2);
         for row in [
             "('s', 'c', 'cut', 'run', 0, NULL, '[]')",
             "('s', 'c', 'cut', 'run', 0, '[]', NULL)",
+            "('s', 'c', 'cut', 'run', 0, '[]', '[]')",
             "('s', 'c', 'cut', 'run', 1, NULL, NULL)",
+            "('s', 'c', 'cut', 'run', 1, '[\"A\",\"B\"]', '[]')",
         ] {
             let refused = store
                 .db
