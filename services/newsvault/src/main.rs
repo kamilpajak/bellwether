@@ -1648,7 +1648,7 @@ fn print_schema(format: Format) {
             },
             {
                 "path": ["roster", "show"],
-                "summary": "Per roster file, the newest usable copy visible at at: valid time (Last-Modified, else Date) and observation time (received_at) both at or before it, and the newest attempt opened by then.",
+                "summary": "Per roster file, the newest usable copy visible at at: valid time (Last-Modified, else Date) and observation time (received_at) both at or before it, and the newest attempt opened by then, its outcome and verdict only once closed by then (else in_flight true).",
                 "options": [
                     {"name": "at", "type": "rfc3339", "required": true},
                     {"name": "store", "type": "path"},

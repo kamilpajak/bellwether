@@ -10,9 +10,10 @@ use std::time::Duration;
 use canon::FileDigest;
 use chrono::{DateTime, Utc};
 use news_provider::{
-    AttemptSlot, Baseline, BudgetError, Clock, Counts, Credentials, Exchange, Exit, LedgerError,
-    Outcome, OutcomeKind, Payload, Provenance, Provider, RawResponse, Request, RequestPhase, RunId,
-    SendFailure, SourceId, Tally, TargetWindow, TransportError, TransportKind, Verdict, Wire,
+    AttemptId, AttemptSlot, Baseline, BudgetError, Clock, Counts, Credentials, Exchange, Exit,
+    LedgerError, Outcome, OutcomeKind, Payload, Provenance, Provider, RawResponse, Request,
+    RequestPhase, RunId, SendFailure, SourceId, Tally, TargetWindow, TransportError, TransportKind,
+    Verdict, Wire,
 };
 use open_web_feed::{HostPin, OpenWebFeed};
 use pit::ObservationTime;
@@ -307,6 +308,54 @@ fn url_of(host: &str) -> String {
     format!("https://{host}{ROBOTS_PATH}")
 }
 
+/// The attempt a run opened and has not closed, for [`or_abandon`].
+pub(crate) struct Opened<'a> {
+    pub(crate) attempt_id: &'a str,
+    pub(crate) run: &'a RunId,
+    pub(crate) clock: &'a dyn Clock,
+}
+
+/// A send's answer, or the error that sent nothing: a transport error is an answer to record.
+pub(crate) fn sent(
+    send: Result<RawResponse, SendFailure>,
+) -> Result<Result<RawResponse, TransportError>, RobotsError> {
+    match send {
+        Ok(response) => Ok(Ok(response)),
+        Err(SendFailure::Transport(failed)) => Ok(Err(failed)),
+        Err(SendFailure::CredentialMissing(name)) => Err(RobotsError::Credential(name)),
+        Err(SendFailure::Budget(why)) => Err(RobotsError::Budget(why)),
+    }
+}
+
+/// An error between an attempt's open and its close closes it as abandoned first: left open, the
+/// next collect's startup sweep closes it and counts it as that collect's interruption (exit 8).
+pub(crate) fn or_abandon<T, E, R>(
+    result: Result<T, E>,
+    store: &mut Committer,
+    opened: &Opened<'_>,
+) -> Result<T, R>
+where
+    R: From<E> + From<RobotsError>,
+{
+    match result {
+        Ok(value) => Ok(value),
+        Err(why) => {
+            let at = ObservationTime::new(opened.clock.now());
+            let closed = news_provider::abandon(
+                store,
+                AttemptId::recorded(opened.attempt_id),
+                at,
+                opened.run,
+            )
+            .map_err(RobotsError::from)?;
+            store
+                .record(closed, None, &[], at)
+                .map_err(RobotsError::from)?;
+            Err(R::from(why))
+        }
+    }
+}
+
 /// One host's fetch as a run asks it; `interval` is the per-host pace the parse verdict compares a
 /// Crawl-delay with.
 pub(crate) struct Asked<'a> {
@@ -333,21 +382,29 @@ pub(crate) fn fetch(
     let opened_at = ObservationTime::new(clock.now());
     let mut slot = AttemptSlot::open(store, request, None, run, ordinal, opened_at)?;
     let attempt_id = slot.attempt_id().hex().to_owned();
-    let permit = slot.take_permit()?;
-    let answer = match exchange.send(permit, request, clock) {
-        Ok(response) => Ok(response),
-        Err(SendFailure::Transport(failed)) => Err(failed),
-        Err(SendFailure::CredentialMissing(name)) => return Err(RobotsError::Credential(name)),
-        Err(SendFailure::Budget(why)) => return Err(RobotsError::Budget(why)),
+    let opened = Opened {
+        attempt_id: &attempt_id,
+        run,
+        clock,
     };
+    let permit = or_abandon::<_, _, RobotsError>(slot.take_permit(), store, &opened)?;
+    let answer = or_abandon::<_, _, RobotsError>(
+        sent(exchange.send(permit, request, clock)),
+        store,
+        &opened,
+    )?;
     let verdict = verdict_of(&answer);
     // Every body is stored and linked, a 403 page and a cut body included (P10, section 3.9).
     let payload = Payload::stored(request, &answer, |body| {
         store.put_blob(body).map(|digest| digest.hex().to_owned())
-    })?;
+    });
+    let payload = or_abandon::<_, _, RobotsError>(payload, store, &opened)?;
     let robots = match (&payload, verdict) {
         (Some(stored), Verdict::Usable) => {
-            Some(RobotsAnswer::Present(store.blob_named(&stored.raw_blob)?))
+            let read = store.blob_named(&stored.raw_blob);
+            Some(RobotsAnswer::Present(or_abandon::<_, _, RobotsError>(
+                read, store, &opened,
+            )?))
         }
         (Some(_), Verdict::Empty) => Some(RobotsAnswer::Absent),
         _ => None,

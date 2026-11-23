@@ -8,10 +8,9 @@ use std::path::{Path, PathBuf};
 use canon::FileDigest;
 use chrono::{DateTime, SecondsFormat, Utc};
 use news_provider::{
-    AttemptSlot, Baseline, BudgetError, Clock, Counts, Credentials, Exchange, Exit, Headers,
-    LedgerError, Outcome, OutcomeKind, Payload, Provenance, RawResponse, Request, RequestPhase,
-    RunId, SendFailure, SourceId, Tally, TargetWindow, TransportError, TransportKind, Verdict,
-    Wire,
+    AttemptSlot, Baseline, Clock, Counts, Credentials, Exchange, Exit, Headers, LedgerError,
+    Outcome, OutcomeKind, Payload, Provenance, RawResponse, Request, RequestPhase, RunId, SourceId,
+    Tally, TargetWindow, TransportError, TransportKind, Verdict, Wire,
 };
 use pit::{Cutoff, ObservationTime, PitError, ValidTime, Visibility};
 use rusqlite::{Connection, OpenFlags};
@@ -20,8 +19,8 @@ use serde_json::{json, Value};
 use crate::cmd_collect::{
     crawl_delay_over_interval, write_envelope, CollectRunError, RUN_ID_FORMAT,
 };
-use crate::cmd_ledger::{Envelope, RunKind, RUN_ENVELOPE_SCHEMA};
-use crate::cmd_robots::{self, Asked, Fetched, RobotsError};
+use crate::cmd_ledger::{Envelope, RunKind, LEASE_HELD, RUN_ENVELOPE_SCHEMA};
+use crate::cmd_robots::{self, or_abandon, sent, Asked, Fetched, Opened, RobotsError};
 use crate::robots::Robots;
 use crate::store::{require_current_version, Committer, RobotsAnswer, StoreError, COMMIT_LOG};
 
@@ -111,10 +110,6 @@ pub enum RosterError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Ledger(#[from] LedgerError),
-    #[error("no credential named {0} is held")]
-    Credential(String),
-    #[error(transparent)]
-    Budget(#[from] BudgetError),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
 }
@@ -239,7 +234,22 @@ pub fn run(ask: &Ask, exchange: &dyn Exchange, clock: &dyn Clock) -> Result<Answ
     };
     write_envelope(&ask.store, &envelope)?;
     let run = RunId::new(run_id.clone());
-    let mut store = Committer::open(&ask.store, &run)?;
+    let mut store = match Committer::open(&ask.store, &run) {
+        Ok(store) => store,
+        // Finished and marked as a refused collect's envelope is (S7-D9), never left unfinished.
+        Err(StoreError::LeaseHeld(lock)) => {
+            write_envelope(
+                &ask.store,
+                &Envelope {
+                    finished_at: Some(clock.now()),
+                    refused: Some(LEASE_HELD.to_owned()),
+                    ..envelope
+                },
+            )?;
+            return Err(StoreError::LeaseHeld(lock).into());
+        }
+        Err(other) => return Err(other.into()),
+    };
     let interval = edgar_press::sec_transport().budget.per_host;
     let mut ordinal: u32 = 0;
     let mut robots = Vec::with_capacity(hosts.len());
@@ -353,13 +363,17 @@ fn fetch_file(
     let opened_at = ObservationTime::new(clock.now());
     let mut slot = AttemptSlot::open(store, &request, None, run, ordinal, opened_at)?;
     let attempt_id = slot.attempt_id().hex().to_owned();
-    let permit = slot.take_permit()?;
-    let answer = match exchange.send(permit, &request, clock) {
-        Ok(response) => Ok(response),
-        Err(SendFailure::Transport(failed)) => Err(failed),
-        Err(SendFailure::CredentialMissing(name)) => return Err(RosterError::Credential(name)),
-        Err(SendFailure::Budget(why)) => return Err(RosterError::Budget(why)),
+    let opened = Opened {
+        attempt_id: &attempt_id,
+        run,
+        clock,
     };
+    let permit = or_abandon::<_, _, RosterError>(slot.take_permit(), store, &opened)?;
+    let answer = or_abandon::<_, _, RosterError>(
+        sent(exchange.send(permit, &request, clock)),
+        store,
+        &opened,
+    )?;
     let rows = match &answer {
         Ok(response) if response.status() == OK => (file.rows)(response.body()),
         _ => None,
@@ -368,7 +382,8 @@ fn fetch_file(
     // Every body is stored and linked, a 403 page and a cut body included (P10, section 3.9).
     let payload = Payload::stored(&request, &answer, |body| {
         store.put_blob(body).map(|digest| digest.hex().to_owned())
-    })?;
+    });
+    let payload = or_abandon::<_, _, RosterError>(payload, store, &opened)?;
     let outcome = Outcome::decide(
         &verdict,
         Counts {
@@ -534,6 +549,7 @@ struct Stored {
     key: String,
     opened_at: DateTime<Utc>,
     received_at: Option<DateTime<Utc>>,
+    closed_at: Option<DateTime<Utc>>,
     outcome: Option<String>,
     verdict: Option<String>,
     vendor_rows: Option<i64>,
@@ -544,7 +560,7 @@ struct Stored {
 }
 
 /// What `roster show --at` answers: per file, the newest usable copy visible at `at` by both of
-/// its times, and the newest attempt opened by then, whatever it answered.
+/// its times, and the newest attempt opened by then, with its answer only once closed by then.
 #[derive(Debug)]
 pub struct Shown {
     pub report: Value,
@@ -605,12 +621,17 @@ pub fn show(root: &Path, at: DateTime<Utc>) -> Result<Shown, RosterError> {
                 "valid_from": valid_from,
                 "observed_at": stamp(visibility.observed().inner()),
             })),
-            "last_attempt": last.map(|stored| json!({
-                "attempt_id": stored.attempt_id,
-                "opened_at": stamp(stored.opened_at),
-                "outcome": stored.outcome,
-                "verdict": stored.verdict,
-            })),
+            "last_attempt": last.map(|stored| {
+                // An attempt's outcome is known at its close; before that it is in flight.
+                let closed = stored.closed_at.is_some_and(|closed| closed <= at);
+                json!({
+                    "attempt_id": stored.attempt_id,
+                    "opened_at": stamp(stored.opened_at),
+                    "in_flight": !closed,
+                    "outcome": stored.outcome.as_ref().filter(|_| closed),
+                    "verdict": stored.verdict.as_ref().filter(|_| closed),
+                })
+            }),
             "attempts": attempts.len(),
             "refused": refused,
         }));
@@ -633,8 +654,8 @@ fn stamp(at: DateTime<Utc>) -> String {
 
 fn stored_attempts(db: &Connection) -> Result<Vec<Stored>, RosterError> {
     let mut statement = db.prepare(
-        "SELECT a.attempt_id, a.run_id, a.target_window, a.opened_at, a.received_at, a.outcome,
-                a.verdict, a.vendor_rows, p.url, p.raw_blob, b.bytes, p.headers
+        "SELECT a.attempt_id, a.run_id, a.target_window, a.opened_at, a.received_at, a.closed_at,
+                a.outcome, a.verdict, a.vendor_rows, p.url, p.raw_blob, b.bytes, p.headers
            FROM attempts a
            LEFT JOIN payloads p ON p.attempt_id = a.attempt_id
            LEFT JOIN blobs b ON b.digest = p.raw_blob
@@ -648,21 +669,24 @@ fn stored_attempts(db: &Connection) -> Result<Vec<Stored>, RosterError> {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
                 (
+                    row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                ),
+                (
                     row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<i64>>(7)?,
-                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
                     row.get::<_, Option<String>>(9)?,
-                    row.get::<_, Option<i64>>(10)?,
-                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
                 ),
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let mut stored = Vec::with_capacity(raw.len());
-    for (attempt_id, run_id, key, opened, received, rest) in raw {
+    for (attempt_id, run_id, key, opened, (received, closed), rest) in raw {
         let (outcome, verdict, vendor_rows, url, raw_blob, bytes, headers) = rest;
         let instant = |text: &str| {
             DateTime::parse_from_rfc3339(text)
@@ -674,12 +698,14 @@ fn stored_attempts(db: &Connection) -> Result<Vec<Stored>, RosterError> {
         };
         let opened_at = instant(&opened)?;
         let received_at = received.as_deref().map(instant).transpose()?;
+        let closed_at = closed.as_deref().map(instant).transpose()?;
         stored.push(Stored {
             attempt_id,
             run_id,
             key,
             opened_at,
             received_at,
+            closed_at,
             outcome,
             verdict,
             vendor_rows,

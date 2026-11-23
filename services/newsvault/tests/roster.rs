@@ -9,15 +9,17 @@ use std::process::Command;
 
 use canon::FileDigest;
 use chrono::{DateTime, Utc};
+use chrono::{SecondsFormat, TimeDelta};
 use news_provider::{
-    Clock, Exchange, Exit, Headers, RawResponse, Request, SendFailure, SendPermit, TransportError,
+    BudgetError, Clock, Exchange, Exit, Headers, RawResponse, Request, RunId, SendFailure,
+    SendPermit, TransportError, TransportKind,
 };
 use newsvault::blobs::BlobStore;
 use newsvault::cmd_collect::Registered;
 use newsvault::cmd_ledger;
 use newsvault::cmd_robots::ROBOTS_SOURCE;
 use newsvault::cmd_roster::{self, Ask, RosterError, FILES, ROSTER_SOURCE};
-use newsvault::store::{COMMIT_LOG, RUNS_DIR};
+use newsvault::store::{Committer, COMMIT_LOG, RUNS_DIR};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -46,6 +48,10 @@ const NOT_FOUND: u16 = 404;
 const FOUND: u16 = 302;
 const FORBIDDEN: u16 = 403;
 const UNAVAILABLE: u16 = 503;
+const MOVED: u16 = 301;
+const TOO_MANY: u16 = 429;
+/// Each `Tick` read moves the clock this far, so an attempt's open, answer and close differ.
+const TICK_S: i64 = 10;
 
 /// A clock a test moves between runs.
 struct Set(Cell<DateTime<Utc>>);
@@ -67,6 +73,30 @@ impl Clock for Set {
     }
 }
 
+/// A clock that moves on by [`TICK_S`] each time it is read.
+struct Tick(Cell<DateTime<Utc>>);
+
+impl Tick {
+    fn at(text: &str) -> Result<Self, Box<dyn Error>> {
+        Ok(Self(Cell::new(text.parse()?)))
+    }
+}
+
+impl Clock for Tick {
+    fn now(&self) -> DateTime<Utc> {
+        let now = self.0.get();
+        self.0.set(now + TimeDelta::seconds(TICK_S));
+        now
+    }
+}
+
+/// A send that returns no status: a body cut at the limit, or a pace that refused the call.
+#[derive(Clone, Copy)]
+enum Failing {
+    OverLimit,
+    Budget,
+}
+
 /// One answer per url: a status, a body and the headers a server sent.
 type Answer = (u16, Vec<u8>, Vec<(String, String)>);
 
@@ -74,6 +104,7 @@ type Answer = (u16, Vec<u8>, Vec<(String, String)>);
 #[derive(Default)]
 struct Stub {
     answers: BTreeMap<String, Answer>,
+    failing: BTreeMap<String, Failing>,
     asked: RefCell<Vec<String>>,
 }
 
@@ -85,6 +116,11 @@ impl Stub {
             .collect();
         self.answers
             .insert(url.to_owned(), (status, body.to_vec(), kept));
+        self
+    }
+
+    fn failing(mut self, url: &str, failing: Failing) -> Self {
+        self.failing.insert(url.to_owned(), failing);
         self
     }
 
@@ -115,6 +151,16 @@ impl Exchange for Stub {
         self.asked.borrow_mut().push(request.url.clone());
         let attempt = permit.attempt_id().clone();
         let at = pit::ObservationTime::new(clock.now());
+        let failed = || TransportError::new(attempt.clone(), at, at, "cut".to_owned());
+        match self.failing.get(&request.url) {
+            Some(Failing::OverLimit) => {
+                return Err(SendFailure::Transport(
+                    failed().of_kind(TransportKind::BodyOverLimit),
+                ))
+            }
+            Some(Failing::Budget) => return Err(SendFailure::Budget(BudgetError::NoPace)),
+            None => {}
+        }
         match self.answers.get(&request.url) {
             Some((status, body, headers)) => {
                 Ok(RawResponse::new(attempt, *status, body.clone(), at, at)
@@ -342,10 +388,12 @@ fn a_robots_txt_with_no_answer_asks_no_file_and_a_404_asks_it() -> TestResult {
     Ok(())
 }
 
-/// A 200 that is not the file's shape (a challenge page) is a failed fetch kept as received, an
-/// empty roster is no roster, and a 403 is transient as edgar-press reads SEC; none is worked
-/// around. Mutations 2026-11-23, each red: the shape check dropped (any 200 usable); an empty
-/// `data` usable; `Empty` counted as work done in the exit.
+/// A 200 that is not the file's shape (a challenge page, other or reordered field names) is a
+/// failed fetch kept as received, an empty roster is no roster, 403, 429 and 5xx are transient as
+/// edgar-press reads SEC, and any other status is permanent; none is worked around. Mutations
+/// 2026-11-23, each red: the shape check dropped (any 200 usable); the field-name check dropped; an
+/// empty `data` usable; `Empty` counted as work done; 5xx permanent; 408 and 429 permanent; any
+/// other status transient.
 #[test]
 fn a_challenge_page_an_empty_roster_and_a_403_are_failures_kept_as_received() -> TestResult {
     let mut seen = Vec::new();
@@ -353,6 +401,18 @@ fn a_challenge_page_an_empty_roster_and_a_403_are_failures_kept_as_received() ->
         (OK, CHALLENGE),
         (OK, EMPTY_ROSTER),
         (FORBIDDEN, b"Access Denied".as_slice()),
+        (
+            OK,
+            br#"{"fields":["cik","name","ticker"],"data":[[1,"A","A"]]}"#.as_slice(),
+        ),
+        (
+            OK,
+            br#"{"fields":["cik","ticker","name","exchange"],"data":[[1,"A","A","N"]]}"#.as_slice(),
+        ),
+        (TOO_MANY, b"slow down".as_slice()),
+        (UNAVAILABLE, b"down".as_slice()),
+        (NOT_FOUND, b"gone".as_slice()),
+        (MOVED, b"moved".as_slice()),
     ] {
         let root = TempDir::new()?;
         let stub = Stub::sec(ROBOTS_BODY, b"").answering(FILE_URL, status, body, &[]);
@@ -377,6 +437,36 @@ fn a_challenge_page_an_empty_roster_and_a_403_are_failures_kept_as_received() ->
                 Exit::VendorUnreachable,
                 json!("transient_failure"),
                 kept(b"Access Denied")
+            ),
+            (
+                Exit::VendorRefusedAll,
+                json!("permanent_failure"),
+                kept(br#"{"fields":["cik","name","ticker"],"data":[[1,"A","A"]]}"#)
+            ),
+            (
+                Exit::VendorRefusedAll,
+                json!("permanent_failure"),
+                kept(br#"{"fields":["cik","ticker","name","exchange"],"data":[[1,"A","A","N"]]}"#)
+            ),
+            (
+                Exit::VendorUnreachable,
+                json!("transient_failure"),
+                kept(b"slow down")
+            ),
+            (
+                Exit::VendorUnreachable,
+                json!("transient_failure"),
+                kept(b"down")
+            ),
+            (
+                Exit::VendorRefusedAll,
+                json!("permanent_failure"),
+                kept(b"gone")
+            ),
+            (
+                Exit::VendorRefusedAll,
+                json!("permanent_failure"),
+                kept(b"moved")
             ),
         ]
     );
@@ -468,9 +558,29 @@ fn current(shown: &cmd_roster::Shown) -> Value {
     shown.report["files"][0]["current"].clone()
 }
 
-/// `show` names the newest copy both of whose times are at or before `--at`; a failed later attempt
-/// is the last attempt, never the copy. Mutations 2026-11-23, each red: the observation a day early;
-/// the oldest visible copy kept; a failed attempt's payload taken as a copy.
+fn last(shown: &cmd_roster::Shown) -> Value {
+    shown.report["files"][0]["last_attempt"].clone()
+}
+
+/// The roster attempt's `opened_at`, `received_at` and `closed_at` as stored.
+fn roster_times(store: &Path) -> Result<(String, String, String), Box<dyn Error>> {
+    Ok(read_only(store)?.query_row(
+        "SELECT opened_at, received_at, closed_at FROM attempts WHERE source = ?1",
+        [ROSTER_SOURCE],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?)
+}
+
+fn micros(text: &str) -> Result<Value, Box<dyn Error>> {
+    Ok(json!(text
+        .parse::<DateTime<Utc>>()?
+        .to_rfc3339_opts(SecondsFormat::Micros, true)))
+}
+
+/// `show` names the newest copy both of whose times are at or before `--at`; a failed or empty later
+/// attempt is the last attempt, never the copy, and an attempt opened after `--at` is not counted.
+/// Mutations 2026-11-23, each red: the observation a day early; the oldest visible copy kept; a
+/// failed attempt's payload taken as a copy; an `empty` copy taken; the `opened_at` filter dropped.
 #[test]
 fn roster_show_names_the_copy_visible_at_an_instant_by_both_times() -> TestResult {
     let root = TempDir::new()?;
@@ -493,9 +603,15 @@ fn roster_show_names_the_copy_visible_at_an_instant_by_both_times() -> TestResul
         &Stub::sec(ROBOTS_BODY, b"").answering(FILE_URL, OK, CHALLENGE, &[("date", DATE)]),
         &clock,
     )?;
+    clock.to("2026-11-26T01:20:00Z")?;
+    cmd_roster::run(
+        &ask(root.path()),
+        &Stub::sec(ROBOTS_BODY, EMPTY_ROSTER),
+        &clock,
+    )?;
     let before = shown(root.path(), "2026-11-23T01:19:59Z")?;
     let between = shown(root.path(), "2026-11-24T00:00:00Z")?;
-    let after = shown(root.path(), "2026-11-26T00:00:00Z")?;
+    let after = shown(root.path(), "2026-11-27T00:00:00Z")?;
     assert_eq!(
         (
             before.every_file_visible,
@@ -506,8 +622,10 @@ fn roster_show_names_the_copy_visible_at_an_instant_by_both_times() -> TestResul
             current(&between)["valid_from"].clone(),
             current(&between)["observed_at"].clone(),
             current(&after)["universe_version"].clone(),
-            after.report["files"][0]["last_attempt"]["verdict"].clone(),
+            last(&after)["verdict"].clone(),
             after.report["files"][0]["attempts"].clone(),
+            between.report["files"][0]["attempts"].clone(),
+            last(&between)["opened_at"].clone(),
         ),
         (
             false,
@@ -518,8 +636,10 @@ fn roster_show_names_the_copy_visible_at_an_instant_by_both_times() -> TestResul
             json!("last-modified"),
             json!("2026-11-23T01:20:00.000000Z"),
             json!(FileDigest::of(second_body).hex()),
-            json!("permanent_failure"),
-            json!(3),
+            json!("empty"),
+            json!(4),
+            json!(1),
+            json!("2026-11-23T01:20:00.000000Z"),
         )
     );
     Ok(())
@@ -676,6 +796,305 @@ fn roster_show_over_no_store_exits_4() -> TestResult {
     assert_eq!(
         (output.status.code(), output.stdout.is_empty()),
         (Some(4), true)
+    );
+    Ok(())
+}
+
+/// On a clock that moves between an attempt's open, answer and close: at `opened_at` there is no
+/// copy and no verdict, at `received_at` the copy is current and the attempt still in flight, and
+/// only at `closed_at` is its verdict reported. Mutations 2026-11-23, each red: the observation
+/// taken at `opened_at`; the verdict reported before the close.
+#[test]
+fn roster_show_reports_a_copy_once_received_and_a_verdict_once_closed() -> TestResult {
+    let root = TempDir::new()?;
+    cmd_roster::run(
+        &ask(root.path()),
+        &Stub::sec(ROBOTS_BODY, ROSTER_BODY),
+        &Tick::at(FIRST_RUN)?,
+    )?;
+    let (opened, received, closed) = roster_times(root.path())?;
+    let at_open = shown(root.path(), &opened)?;
+    let at_received = shown(root.path(), &received)?;
+    let at_closed = shown(root.path(), &closed)?;
+    assert_eq!(
+        (
+            opened < received && received < closed,
+            current(&at_open),
+            last(&at_open)["in_flight"].clone(),
+            last(&at_open)["verdict"].clone(),
+            current(&at_received)["observed_at"].clone(),
+            last(&at_received)["in_flight"].clone(),
+            last(&at_received)["outcome"].clone(),
+            last(&at_closed)["in_flight"].clone(),
+            last(&at_closed)["verdict"].clone(),
+        ),
+        (
+            true,
+            Value::Null,
+            json!(true),
+            Value::Null,
+            micros(&received)?,
+            json!(true),
+            Value::Null,
+            json!(false),
+            json!("usable"),
+        )
+    );
+    Ok(())
+}
+
+/// A copy whose server clock is ahead of ours is listed as refused only once we hold it: a read
+/// between the attempt's open and its answer lists nothing. Mutation 2026-11-23, the `received`
+/// guard dropped: red.
+#[test]
+fn a_skewed_copy_is_refused_only_from_its_received_at() -> TestResult {
+    let root = TempDir::new()?;
+    let stub = Stub::sec(ROBOTS_BODY, b"").answering(
+        FILE_URL,
+        OK,
+        ROSTER_BODY,
+        &[("date", "Mon, 23 Nov 2026 03:00:00 GMT")],
+    );
+    cmd_roster::run(&ask(root.path()), &stub, &Tick::at(FIRST_RUN)?)?;
+    let (opened, received, _) = roster_times(root.path())?;
+    let refused = |at: &str| -> Result<Value, Box<dyn Error>> {
+        Ok(shown(root.path(), at)?.report["files"][0]["refused"].clone())
+    };
+    assert_eq!(
+        (
+            refused(&opened)?.as_array().map(Vec::len),
+            refused(&received)?.as_array().map(Vec::len)
+        ),
+        (Some(0), Some(1))
+    );
+    Ok(())
+}
+
+/// `(source, outcome)` of an attempt.
+type SourceOutcome = (String, Option<String>);
+
+/// `(source, outcome)` of every attempt left with no `closed_at`.
+fn open_attempts(store: &Path) -> Result<Vec<SourceOutcome>, Box<dyn Error>> {
+    let db = read_only(store)?;
+    let mut statement =
+        db.prepare("SELECT source, outcome FROM attempts WHERE closed_at IS NULL")?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// An error between an attempt's open and its close (here a pace that refuses the send) closes
+/// that attempt as `interrupted` before the run fails, for the file and for its robots.txt; left
+/// open, the next collect's startup sweep would close it and exit 8 for it. Mutation 2026-11-23,
+/// either `or_abandon` returning the error alone: red.
+#[test]
+fn an_error_between_open_and_close_leaves_no_attempt_open() -> TestResult {
+    let mut seen = Vec::new();
+    for url in [FILE_URL, ROBOTS_URL] {
+        let root = TempDir::new()?;
+        let stub = Stub::sec(ROBOTS_BODY, ROSTER_BODY).failing(url, Failing::Budget);
+        let refused = cmd_roster::run(&ask(root.path()), &stub, &Set::at(FIRST_RUN)?);
+        let interrupted: i64 = read_only(root.path())?.query_row(
+            "SELECT COUNT(*) FROM attempts WHERE outcome = 'interrupted'",
+            [],
+            |row| row.get(0),
+        )?;
+        seen.push((
+            refused.as_ref().err().map(RosterError::exit),
+            open_attempts(root.path())?,
+            interrupted,
+        ));
+    }
+    assert_eq!(
+        seen,
+        vec![(Some(2), Vec::new(), 1), (Some(2), Vec::new(), 1)]
+    );
+    Ok(())
+}
+
+/// A file with no answer at all is a closed `transient_failure` attempt with no payload, exit 7;
+/// a body over the limit is `permanent_failure`, exit 8. Mutations 2026-11-23, each red: a
+/// transport error returned before the close; a transport error permanent; an over-limit body
+/// transient.
+#[test]
+fn a_file_with_no_answer_or_a_body_over_the_limit_is_closed_and_counted() -> TestResult {
+    let mut seen = Vec::new();
+    for stub in [
+        Stub::default().answering(ROBOTS_URL, OK, ROBOTS_BODY, &[]),
+        Stub::sec(ROBOTS_BODY, ROSTER_BODY).failing(FILE_URL, Failing::OverLimit),
+    ] {
+        let root = TempDir::new()?;
+        let answer = cmd_roster::run(&ask(root.path()), &stub, &Set::at(FIRST_RUN)?)?;
+        let roster_payloads: i64 = read_only(root.path())?.query_row(
+            "SELECT COUNT(*) FROM payloads p JOIN attempts a ON a.attempt_id = p.attempt_id
+              WHERE a.source = ?1",
+            [ROSTER_SOURCE],
+            |row| row.get(0),
+        )?;
+        seen.push((
+            answer.exit,
+            file_row(&answer)["verdict"].clone(),
+            open_attempts(root.path())?.len(),
+            roster_payloads,
+        ));
+    }
+    assert_eq!(
+        seen[0],
+        (Exit::VendorUnreachable, json!("transient_failure"), 0, 0)
+    );
+    assert_eq!(
+        (seen[1].0, seen[1].1.clone(), seen[1].2),
+        (Exit::VendorRefusedAll, json!("permanent_failure"), 0)
+    );
+    Ok(())
+}
+
+/// A usable copy whose stored headers do not parse, or carry neither `Last-Modified` nor `Date`,
+/// fails the read by name (exit 2), never a hidden copy. Mutations 2026-11-23, each red: either
+/// case read as no copy.
+#[test]
+fn a_usable_copy_with_no_readable_valid_time_fails_the_read_by_name() -> TestResult {
+    let undated = TempDir::new()?;
+    let stub = Stub::sec(ROBOTS_BODY, b"").answering(FILE_URL, OK, ROSTER_BODY, &[]);
+    cmd_roster::run(&ask(undated.path()), &stub, &Set::at(FIRST_RUN)?)?;
+    let corrupt = TempDir::new()?;
+    cmd_roster::run(
+        &ask(corrupt.path()),
+        &Stub::sec(ROBOTS_BODY, ROSTER_BODY),
+        &Set::at(FIRST_RUN)?,
+    )?;
+    Connection::open(corrupt.path().join(COMMIT_LOG))?.execute(
+        "UPDATE payloads SET headers = '{' WHERE url = ?1",
+        [FILE_URL],
+    )?;
+    let at: DateTime<Utc> = "2026-11-24T00:00:00Z".parse()?;
+    let read = |root: &Path| {
+        cmd_roster::show(root, at)
+            .map(|shown| shown.every_file_visible)
+            .map_err(|why| (matches!(why, RosterError::StoredTime { .. }), why.exit()))
+    };
+    assert_eq!(
+        (read(undated.path()), read(corrupt.path())),
+        (Err((true, 2)), Err((true, 2)))
+    );
+    Ok(())
+}
+
+/// A run that finds the store lease held exits 7 and leaves its envelope finished and marked
+/// `lease_held`, as a refused collect's is. Mutations 2026-11-23, each red: `lease_held` mapped to
+/// 2; the envelope left unfinished.
+#[test]
+fn a_held_lease_exits_7_and_marks_the_envelope() -> TestResult {
+    let root = TempDir::new()?;
+    let holder = Committer::open(root.path(), &RunId::new("holder".to_owned()))?;
+    let stub = Stub::sec(ROBOTS_BODY, ROSTER_BODY);
+    let refused = cmd_roster::run(&ask(root.path()), &stub, &Set::at(FIRST_RUN)?);
+    drop(holder);
+    let envelope: Value = serde_json::from_slice(&std::fs::read(
+        root.path()
+            .join(RUNS_DIR)
+            .join("roster-20261123T012000Z.json"),
+    )?)?;
+    assert_eq!(
+        (
+            refused.as_ref().err().map(RosterError::exit),
+            stub.asked.borrow().len(),
+            envelope["refused"].clone(),
+            envelope["finished_at"].is_string(),
+        ),
+        (Some(7), 0, json!("lease_held"), true)
+    );
+    Ok(())
+}
+
+/// Exit 7 carries the report in the error object (stderr); 0 and 8 carry it on stdout. The
+/// binary's choice of stream reads this; no test drives the binary to exit 7 (it sends to SEC).
+#[test]
+fn only_an_unreachable_run_rides_the_error_object() {
+    let object = |exit: Exit| {
+        cmd_roster::Answer {
+            report: json!({}),
+            exit,
+        }
+        .error_object(Vec::new())
+        .map(|object| object["code"].clone())
+    };
+    assert_eq!(
+        (
+            object(Exit::VendorUnreachable),
+            object(Exit::PartialCollect),
+            object(Exit::VendorRefusedAll),
+            object(Exit::Ok),
+        ),
+        (Some(json!("vendor_unreachable")), None, None, None)
+    );
+}
+
+/// The four contact variables, cleared so the developer's own shell cannot answer a test.
+const CONTACT_VARIABLES: [&str; 4] = [
+    "BELLWETHER_FEED_CONTACT",
+    "BELLWETHER_FEED_CONTACT_FILE",
+    "BELLWETHER_SEC_CONTACT",
+    "BELLWETHER_SEC_CONTACT_FILE",
+];
+
+/// `roster fetch` reads the feed's contact file, the one the VPS unit mounts, and not SEC's: a
+/// dry run with only the feed file set plans, and with only SEC's set is refused (exit 2, stdout
+/// empty). Mutation 2026-11-23, `Registered::EdgarPress` for the contact: red.
+#[test]
+fn roster_fetch_reads_the_feed_contact_file_the_unit_mounts() -> TestResult {
+    let root = TempDir::new()?;
+    let file = root.path().join("contact");
+    std::fs::write(&file, CONTACT)?;
+    let dry_run = |variable: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_newsvault"));
+        for name in CONTACT_VARIABLES {
+            command.env_remove(name);
+        }
+        command
+            .args([
+                "roster",
+                "fetch",
+                "--dry-run",
+                "--format",
+                "json",
+                "--store",
+            ])
+            .arg(root.path().join("vault"))
+            .env(variable, &file)
+            .output()
+    };
+    let feed = dry_run("BELLWETHER_FEED_CONTACT_FILE")?;
+    let sec = dry_run("BELLWETHER_SEC_CONTACT_FILE")?;
+    assert_eq!(
+        (feed.status.code(), sec.status.code(), sec.stdout.is_empty()),
+        (Some(0), Some(2), true)
+    );
+    Ok(())
+}
+
+/// `roster show` exits 1 when a file has no copy at `--at` ("the answer is no") and 0 when every
+/// file has one, the report on stdout both times. Mutation 2026-11-23, exit 1 never returned: red.
+#[test]
+fn roster_show_exits_1_before_the_first_copy_and_0_after() -> TestResult {
+    let root = TempDir::new()?;
+    cmd_roster::run(
+        &ask(root.path()),
+        &Stub::sec(ROBOTS_BODY, ROSTER_BODY),
+        &Set::at(FIRST_RUN)?,
+    )?;
+    let show = |at: &str| -> Result<(Option<i32>, Value), Box<dyn Error>> {
+        let output = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+            .args(["roster", "show", "--at", at, "--format", "json", "--store"])
+            .arg(root.path())
+            .output()?;
+        let report: Value = serde_json::from_slice(&output.stdout)?;
+        Ok((output.status.code(), report["every_file_visible"].clone()))
+    };
+    assert_eq!(
+        (show("2026-11-23T01:19:59Z")?, show("2026-11-23T02:00:00Z")?),
+        ((Some(1), json!(false)), (Some(0), json!(true)))
     );
     Ok(())
 }
