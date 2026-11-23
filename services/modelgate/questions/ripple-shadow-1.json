@@ -1159,35 +1159,35 @@
   {
    "id": "spillover_channel",
    "type": "choice",
-   "instructions": "According to the text, how does the reported event most affect companies other than the company reported on? Where two fit: state_action first, then a demand option.",
+   "instructions": "Which of these does the text report about the company reported on? Where several fit, choose the one listed first.",
    "options": [
     {
      "id": "state_action",
-     "description": "A state body restricts or acts against that company, which also hurts its suppliers, its customers, or similar companies the body may act against next."
-    },
-    {
-     "id": "demand_rises",
-     "description": "That company or its customer orders, contracts or plans to spend more, or expects to sell more: more demand for suppliers and for other sellers of the same thing."
-    },
-    {
-     "id": "demand_falls",
-     "description": "That company or its customer orders or plans to spend less, or expects to sell less: less demand for suppliers and for other sellers of the same thing."
-    },
-    {
-     "id": "contagion",
-     "description": "That company's trouble may sit in similar companies too: the same kind of assets, funding, customers or exposure."
+     "description": "A government, a regulator, a prosecutor or a court restricts, penalises or charges that company. Not a charge against an officer alone, a private claim a court hears, a refused approval, or a rule for a whole industry."
     },
     {
      "id": "rival_weakened",
-     "description": "That company's trouble is its own (a delay, a failure, an outage), so its competitors can take its business."
+     "description": "A delay, a defect, a recall or an outage of what that company sells, from a cause inside that company."
+    },
+    {
+     "id": "demand_falls",
+     "description": "That company, or a buyer of what it sells, will order, buy or spend less than before, or that company expects to sell less."
+    },
+    {
+     "id": "demand_rises",
+     "description": "That company, or a buyer of what it sells, will order, buy or spend more than before, or that company expects to sell more."
+    },
+    {
+     "id": "contagion",
+     "description": "That company loses funding or deposits, takes losses on what it holds, or may be unable to pay what it owes."
     },
     {
      "id": "none_of_these",
-     "description": "It affects other companies in another way, or affects none."
+     "description": "The text reports none of these."
     },
     {
      "id": "cannot_tell",
-     "description": "The text does not say enough to tell."
+     "description": "The text is not clear enough to tell."
     }
    ]
   },
@@ -1205,12 +1205,16 @@
      "description": "It harms their business, finances or standing."
     },
     {
+     "id": "mixed",
+     "description": "It clearly improves these for some of them and harms them for others."
+    },
+    {
      "id": "neutral",
      "description": "It changes neither, or it affects no other company."
     },
     {
      "id": "cannot_tell",
-     "description": "The text does not say enough to tell."
+     "description": "It affects other companies, but the text does not say enough to tell how."
     }
    ]
   }

@@ -256,7 +256,7 @@ impl QuestionDoc {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{QuestionDoc, QuestionError, MAX_QUESTIONS_BYTES};
+    use super::{QuestionDoc, QuestionError, QuestionKind, MAX_QUESTIONS_BYTES};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -402,8 +402,8 @@ pub(crate) mod tests {
         })
     }
 
-    /// The committed instrument parses, and section 3.5 names its version and its encoded size;
-    /// an edit to the file without an edit there is red.
+    /// The committed instrument parses, and section 3.5 names its version, its encoded size and
+    /// its counts; an edit to the file without an edit there is red.
     #[test]
     fn the_committed_ripple_shadow_document_parses_and_has_the_version_the_design_names(
     ) -> TestResult {
@@ -413,6 +413,17 @@ pub(crate) mod tests {
         assert_eq!(doc.name(), "ripple-shadow/1");
         assert!(DESIGN.contains(doc.version()), "{}", doc.version());
         assert!(DESIGN.contains(&size), "{size}");
+        let asked = doc.questions().len();
+        let choice = doc
+            .questions()
+            .iter()
+            .filter(|q| q.kind == QuestionKind::Choice);
+        let choice = choice.count();
+        let noul = asked - choice;
+        let counts = format!("{asked} questions ({choice} choice, {noul} noul)");
+        assert!(DESIGN.contains(&counts), "{counts}");
+        let stories = format!("{} synthetic stories", examples()?.len());
+        assert!(DESIGN.contains(&stories), "{stories}");
         Ok(())
     }
 
@@ -493,7 +504,7 @@ pub(crate) mod tests {
     fn every_expected_reading_of_a_synthetic_example_is_an_option_of_the_committed_document(
     ) -> TestResult {
         let (doc, examples) = (committed()?, examples()?);
-        assert_eq!(examples.len(), 17);
+        assert_eq!(examples.len(), 20);
         for example in &examples {
             let expected = example["expect"].as_object().ok_or("no expect object")?;
             assert!(!expected.is_empty(), "{example}");
@@ -592,27 +603,76 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// Section 3.5, "The channel to other companies": the sign code reads from each channel.
-    const CHANNEL_SIGNS: [(&str, Option<&str>); 7] = [
-        ("state_action", Some("adverse")),
-        ("demand_rises", Some("favourable")),
-        ("demand_falls", Some("adverse")),
-        ("contagion", Some("adverse")),
-        ("rival_weakened", Some("favourable")),
-        ("none_of_these", None),
-        ("cannot_tell", None),
+    /// Section 3.5, "The channel to other companies": per channel in the document's order, the
+    /// sign code reads for the others and the phrase of its description that sign rests on.
+    const CHANNEL_SIGNS: [(&str, Option<&str>, &str); 7] = [
+        (
+            "state_action",
+            Some("adverse"),
+            "restricts, penalises or charges that company",
+        ),
+        (
+            "rival_weakened",
+            Some("favourable"),
+            "from a cause inside that company",
+        ),
+        ("demand_falls", Some("adverse"), "less than before"),
+        ("demand_rises", Some("favourable"), "more than before"),
+        ("contagion", Some("adverse"), "loses funding or deposits"),
+        ("none_of_these", None, "none of these"),
+        ("cannot_tell", None, "not clear enough"),
+    ];
+    const NO_CHANNEL: &str = "none_of_these";
+    /// Every example and the one channel its author expects.
+    const EXAMPLE_CHANNELS: [(&str, &str); 20] = [
+        ("open_models_for_a_category", NO_CHANNEL),
+        ("chief_executive_forced_out_under_charges", NO_CHANNEL),
+        ("chief_executive_planned_retirement", NO_CHANNEL),
+        ("outlook_lowered_by_a_fiftieth", "demand_falls"),
+        ("outlook_lowered_by_two_fifths", "demand_falls"),
+        ("open_models_in_the_words_of_a_release", NO_CHANNEL),
+        ("platform_enters_the_category", NO_CHANNEL),
+        ("investment_in_one_named_company", NO_CHANNEL),
+        ("law_firm_alert", NO_CHANNEL),
+        ("offering_of_a_stated_amount", NO_CHANNEL),
+        ("rule_for_a_whole_industry", NO_CHANNEL),
+        (
+            "customer_lowers_its_forecast_and_its_orders",
+            "demand_falls",
+        ),
+        ("customer_signs_a_long_supply_contract", "demand_rises"),
+        ("bank_loses_a_quarter_of_its_deposits", "contagion"),
+        (
+            "chip_maker_delays_its_next_product_and_lowers_its_forecast",
+            "rival_weakened",
+        ),
+        ("export_ban_on_one_company", "state_action"),
+        ("share_repurchase_with_no_channel", NO_CHANNEL),
+        ("contract_won_in_a_tender", NO_CHANNEL),
+        ("regulator_declines_an_approval", NO_CHANNEL),
+        (
+            "platform_endorses_the_category_and_will_enter_it",
+            NO_CHANNEL,
+        ),
     ];
 
-    /// Section 8 row MG14, where the mutations of 2026-11-23 are listed: the channel is asked
-    /// beside the stance, and an example's direction for the others is its channel's sign.
+    fn description<'a>(doc: &'a QuestionDoc, id: &str, option: &str) -> &'a str {
+        let asked = doc.questions().iter().find(|question| question.id == id);
+        let found = asked.and_then(|question| question.options.iter().find(|o| o.id == option));
+        found.map_or("", |o| o.description.as_str())
+    }
+
+    /// Section 8 row MG14, where the mutations of 2026-11-23 are listed: what is asked. The
+    /// channel is a choice beside the stance, its options say what the text reports and never
+    /// what follows for others, and the design's sign table is the one of `CHANNEL_SIGNS`.
     #[test]
     fn each_channel_to_other_companies_fixes_their_sign_or_has_none() -> TestResult {
-        let (doc, examples) = (committed()?, examples()?);
-        let channels: Vec<&str> = CHANNEL_SIGNS.iter().map(|(channel, _)| *channel).collect();
+        let doc = committed()?;
+        let channels: Vec<&str> = CHANNEL_SIGNS.iter().map(|row| row.0).collect();
         assert_eq!(option_ids(&doc, "spillover_channel"), channels);
         assert_eq!(
             option_ids(&doc, "spillover_effect"),
-            ["favourable", "adverse", "neutral", "cannot_tell"]
+            ["favourable", "adverse", "mixed", "neutral", "cannot_tell"]
         );
         assert_eq!(
             option_ids(&doc, "stance_to_category"),
@@ -628,42 +688,116 @@ pub(crate) mod tests {
             ]
         );
         let channel = texts(&doc, "spillover_channel");
-        assert!(channel.contains("state_action first, then a demand option"));
+        assert!(channel.contains("Where several fit, choose the one listed first."));
+        for (id, _) in CHANNEL_SIGNS.iter().map(|row| (row.0, row.1)) {
+            assert!(!channel.contains(id), "an option id in the wording: {id}");
+        }
+        for effect_word in [
+            "hurt",
+            "harm",
+            "improve",
+            "competitor",
+            "supplier",
+            "similar",
+            "demand",
+        ] {
+            assert!(!channel.contains(effect_word), "{effect_word}: {channel}");
+        }
         assert!(texts(&doc, "spillover_effect").contains("other than the company reported on"));
-        let held = [
-            ("export_ban_on_one_company", "state_action"),
-            ("customer_signs_a_long_supply_contract", "demand_rises"),
-            (
-                "customer_lowers_its_forecast_and_its_orders",
+        assert!(description(&doc, "spillover_effect", "favourable").contains("improves"));
+        assert!(description(&doc, "spillover_effect", "adverse").contains("harms"));
+        assert!(description(&doc, "spillover_effect", "mixed").contains("for some of them"));
+        assert!(description(&doc, "spillover_effect", "neutral").contains("no other company"));
+        for (channel, sign, phrase) in CHANNEL_SIGNS {
+            let wording = description(&doc, "spillover_channel", channel);
+            assert!(wording.contains(phrase), "{channel}: {wording}");
+            let (row, cell) = (
+                format!("| `{channel}` |"),
+                format!("| {} |", sign.unwrap_or("none")),
+            );
+            let in_design = |line: &str| line.starts_with(&row) && line.ends_with(&cell);
+            assert!(DESIGN.lines().any(in_design), "{row} … {cell}");
+        }
+        let signed: Vec<&str> = CHANNEL_SIGNS
+            .iter()
+            .filter_map(|row| row.1.map(|_| row.0))
+            .collect();
+        assert_eq!(
+            signed,
+            [
+                "state_action",
+                "rival_weakened",
                 "demand_falls",
-            ),
-            ("bank_loses_a_quarter_of_its_deposits", "contagion"),
-            ("chip_maker_delays_its_next_product", "rival_weakened"),
-            ("share_repurchase_with_no_channel", "none_of_these"),
-            ("platform_enters_the_category", "none_of_these"),
-        ];
-        for (example, reading) in held {
+                "demand_rises",
+                "contagion"
+            ]
+        );
+        Ok(())
+    }
+
+    /// Section 8 row MG14: the examples. Each expects one channel, and a signed channel's
+    /// direction for the others is that sign, with `neutral` allowed beside it and nothing else.
+    #[test]
+    fn every_example_expects_one_channel_and_the_direction_its_sign_gives() -> TestResult {
+        let examples = examples()?;
+        let pinned = |e: &&serde_json::Value| !e["expect"]["spillover_channel"].is_null();
+        assert_eq!(
+            examples.iter().filter(pinned).count(),
+            EXAMPLE_CHANNELS.len()
+        );
+        for (example, channel) in EXAMPLE_CHANNELS {
             assert_eq!(
                 expected(&examples, example, "spillover_channel"),
-                &serde_json::json!([reading]),
+                &serde_json::json!([channel]),
                 "{example}"
             );
+            let sign = CHANNEL_SIGNS.iter().find(|row| row.0 == channel);
+            let Some(sign) = sign.and_then(|row| row.1) else {
+                continue;
+            };
+            let effect = expected(&examples, example, "spillover_effect");
+            let listed = effect
+                .as_array()
+                .ok_or("a signed channel with no direction")?;
+            assert_eq!(listed.first(), Some(&serde_json::json!(sign)), "{example}");
+            assert!(listed.iter().skip(1).all(|o| o == "neutral"), "{example}");
         }
-        for (channel, sign) in CHANNEL_SIGNS {
-            let reading = serde_json::json!([channel]);
-            let mut shown = 0;
-            for example in &examples {
-                if example["expect"]["spillover_channel"] != reading {
-                    continue;
-                }
-                shown += 1;
-                let effect = &example["expect"]["spillover_effect"];
-                assert!(effect.is_array(), "{example}");
-                if let Some(sign) = sign {
-                    assert_eq!(effect, &serde_json::json!([sign]), "{example}");
-                }
-            }
-            assert!(shown > 0 || channel == "cannot_tell", "{channel}");
+        for (channel, _, _) in CHANNEL_SIGNS {
+            let shown = EXAMPLE_CHANNELS.iter().any(|row| row.1 == channel);
+            assert!(shown || channel == "cannot_tell", "{channel}");
+        }
+        let (yes, no) = (&["true"][..], &["false"][..]);
+        let chip = "chip_maker_delays_its_next_product_and_lowers_its_forecast";
+        let state = "cx_state_body_acts_against";
+        let held: [(&str, &str, &[&str]); 9] = [
+            ("export_ban_on_one_company", state, yes),
+            ("bank_loses_a_quarter_of_its_deposits", state, no),
+            (chip, state, no),
+            ("law_firm_alert", state, no),
+            (chip, "cause_scope", &["issuer_specific"]),
+            (chip, "ev_guidance_cut_or_warning", yes),
+            (
+                "share_repurchase_with_no_channel",
+                "spillover_effect",
+                &["neutral"],
+            ),
+            (
+                "platform_endorses_the_category_and_will_enter_it",
+                "spillover_effect",
+                &["mixed"],
+            ),
+            (
+                "outlook_lowered_by_a_fiftieth",
+                "spillover_effect",
+                &["adverse", "neutral"],
+            ),
+        ];
+        for (example, question, reading) in held {
+            assert_eq!(
+                expected(&examples, example, question),
+                &serde_json::json!(reading),
+                "{example}: {question}"
+            );
         }
         Ok(())
     }

@@ -667,7 +667,7 @@
 | `model` | a dated build id, `<id>-YYYYMMDD` with a real date. An alias (a leading `~`, or no date suffix) is refused before any row or socket (`modelgate::model::ModelId`) |
 | `state` | the text the model reads: a story's `body` from a snapshot (§3.0), cut at a character boundary to 13,000 JSON-escaped bytes (`STATE_BUDGET_BYTES`). `state_digest` is the sha256 of the text sent |
 | `schema` | `decide`: question id to `noul` (yes/no) or `choice` (named options, each described). `generate`: text and choice. **No schema has a numeric or date type: a model cannot be asked for a price, a return, a magnitude, a count, a date or a threshold.** A `score` type (2 to 10 described levels, never a number) is design, no code |
-| `request_format` | `modelgate.request/2` (2026-11-23): the JSON layout, the state budget, the 22,600-byte bound on the encoded questions (`MAX_QUESTIONS_BYTES`) and the 35,800-byte ceiling on the whole body (`REQUEST_CEILING_BYTES`: 36 bytes of layout + a 128-byte model id + the two budgets = 35,764). The two budgets are independent, so two documents read the same cut of one story (`two_documents_of_different_length_cut_one_body_at_the_same_point`). `modelgate.request/1` (16,500 and 30,000) named no stored row: nothing was sent under it. Rejected, keeping 30,000 by cutting the state: `ripple-shadow/1` is 22,373 bytes, which leaves a state of 7,463, and D17 already asks whether 13,000 is too little. Rejected, 20,000 for the questions: the document measured 19,627 bytes while its `cx_*` and `as_*` questions did not say whose act they ask about, and 20,790 once each does (2026-11-23). Rejected, 21,000 and a ceiling of 34,200, the bounds of earlier that day: the two `spillover_*` questions add 1,583 bytes to 20,790, and shortening the two repeated lead-ins (the `ev_*` one to "Is this reported of the company reported on?", the `kp_*` one to "On a senior change at the company reported on:") frees 297 of the 1,373 needed and takes "the text" out of 21 questions. Cost: the largest request grows from 29,664 to 35,764 bytes, so its worst case grows by 20.6%. The token and the three numbers are literals in `request::tests::the_format_token_and_its_three_budgets_are_the_ones_the_design_names`, so a budget moves only with that test and this row. What the ceiling no longer bounds: "Not verified", the size limit; decision D19 |
+| `request_format` | `modelgate.request/2` (2026-11-23): the JSON layout, the state budget, the 22,600-byte bound on the encoded questions (`MAX_QUESTIONS_BYTES`) and the 35,800-byte ceiling on the whole body (`REQUEST_CEILING_BYTES`: 36 bytes of layout + a 128-byte model id + the two budgets = 35,764). The two budgets are independent, so two documents read the same cut of one story (`two_documents_of_different_length_cut_one_body_at_the_same_point`). `modelgate.request/1` (16,500 and 30,000) named no stored row: nothing was sent under it. Rejected, keeping 30,000 by cutting the state: `ripple-shadow/1` is 22,399 bytes, which leaves a state of 7,437, and D17 already asks whether 13,000 is too little. Rejected, 20,000 for the questions: the document measured 19,627 bytes while its `cx_*` and `as_*` questions did not say whose act they ask about, and 20,790 once each does (2026-11-23). Rejected, 21,000 and a ceiling of 34,200, the bounds of earlier that day: the two `spillover_*` questions add 1,609 bytes to 20,790, and shortening the two repeated lead-ins (the `ev_*` one to "Is this reported of the company reported on?", the `kp_*` one to "On a senior change at the company reported on:") frees 297 of the 1,399 needed and takes "the text" out of 21 questions. Cost: the largest request grows from 29,664 to 35,764 bytes, so its worst case grows by 20.6%. The token and the three numbers are literals in `request::tests::the_format_token_and_its_three_budgets_are_the_ones_the_design_names`, so a budget moves only with that test and this row. What the ceiling no longer bounds: "Not verified", the size limit; decision D19 |
 | `idempotency_key` | `canon::digest::model_request` over (kind, request_format, question_version, state_digest, model, repeat_index). No story field: two stories with one body share one request, and each gets its own `labels` row. An ANSWERED request is never sent again; a process killed between the send and the commit of `answered` and `finalised` pays once more |
 | `repeat_index` | `decide`: 0 is the label; 1 and above repeat the same bytes and are instrument noise. `generate`: the draw index (design) |
 
@@ -763,15 +763,15 @@ The key:
 | relation typing for an (event, candidate) pair | decision | choice + noul | not asked: nothing produces candidates |
 | affected company profiles, supporting span | generative | text | not asked: `generate` is design |
 
-- The document: `services/modelgate/questions/ripple-shadow-1.json`, 64 questions (12 choice, 52 noul), 22,373 encoded bytes (`QuestionDoc::wire().len()`, 2026-11-23).
-- `question_version` `26dcd1abce4407ce63228895f96b2a4e6b8890e9f337878a83e0c918507b3ff6`; `the_committed_ripple_shadow_document_parses_and_has_the_version_the_design_names` reads this line and the size above, so an edit to the file without an edit here is red.
+- The document: `services/modelgate/questions/ripple-shadow-1.json`, 64 questions (12 choice, 52 noul), 22,399 encoded bytes (`QuestionDoc::wire().len()`, 2026-11-23).
+- `question_version` `c5b01e01851c0731b64a5dd553823d345aa07d57c701e24717d6824ae7f170d9`; `the_committed_ripple_shadow_document_parses_and_has_the_version_the_design_names` reads this line, the size and the counts above and the count of examples below, so an edit to the file without an edit here is red.
 - `ripple-shadow/0` (45 questions, 16,280 bytes) was never sent and its file is deleted.
 
 | from version 0 to 1 | encoded bytes |
 |---|---|
 | the 45 questions of version 0, reworded: "the company the text is mainly about", "its subject" and "the subject company" are all "the company reported on", the `kp_*` lead-in is shorter, a noul whose two descriptions said only yes and no says `Yes.` and `No.` | 16,280 to 15,331 |
 | 17 new questions: `issuer_significance`, `category_significance`, 5 `as_*`, 9 `cx_*` nouls, `cx_magnitude_size` | 5,459, with their separators |
-| 2 new questions, same name and file, never sent: `spillover_channel` (1,140), `spillover_effect` (443) | 20,790 to 22,373 |
+| 2 new questions, same name and file, never sent: `spillover_channel` (1,050), `spillover_effect` (559) | 20,790 to 22,399 |
 
 - The owner's point, 2026-11-23: an event's weight depends on its circumstances. A chief executive forced out under an international scandal is not a planned retirement; an outlook lowered by 2% is not one lowered by 40%. The class label carries neither.
 
@@ -815,7 +815,7 @@ The key:
 - `no_base` is the answer for an amount with nothing to set it against, such as an offering stated in dollars alone; `not_stated` contradicts `cx_magnitude_stated` true, and the other three contradict it false (K7).
 - The boundary, a tenth of what the event is a part of, was written 2026-11-23 before any answer and is fitted to nothing. It is one boundary for every base: a 9% cut of a full-year outlook reads `small` (D20).
 - `kp_successor_named` stays beside `cx_interim_successor_named`: both true is a contradiction (K7). `kp_linked_to_investigation_or_dispute` and `cx_investigation_open` ask different things, and no combination of the two contradicts.
-- Examples: `services/modelgate/tests/fixtures/ripple-shadow-1.examples.json`, 17 synthetic stories, each with the options its author expects. Hand-written; no model has read them; comparing a build's answers with them is not built.
+- Examples: `services/modelgate/tests/fixtures/ripple-shadow-1.examples.json`, 20 synthetic stories, each with the options its author expects, and each with one expected `spillover_channel`. Hand-written; no model has read them; comparing a build's answers with them is not built.
 
 | example | what it is there for |
 |---|---|
@@ -827,10 +827,13 @@ The key:
 | an offering of a stated amount | `no_base`; a regulator that only registers |
 | a law-firm alert | the firm's investigation is not the company's |
 | a central bank's rule for an industry | issuer `cannot_tell` |
-| a handset maker lowers its forecast and its component orders; a power producer signs a 20-year contract with a cloud company that seeks more | `demand_falls` with `adverse`; `demand_rises` with `favourable` |
-| a bank loses a quarter of its deposits, with assets and funding common among banks of its size | `contagion`, `adverse` |
-| a chip maker delays its next product for a defect of its own | `rival_weakened`, `favourable` |
+| a handset maker lowers its forecast and its component orders; a power producer signs a 20-year contract for data centres that will use more than their owner buys today | `demand_falls` with `adverse`; `demand_rises` with `favourable` |
+| a bank loses a quarter of its deposits and sells bonds at a loss; the text says nothing of other banks | `contagion`, `adverse` |
+| a chip maker delays its next product for a defect of its own and lowers its forecast | `rival_weakened`, `favourable`: the list order decides against `demand_falls` |
 | a trade ministry bars sales to one company | `state_action`, `adverse` |
+| a contract won in a tender; a regulator declines an approval; the law-firm alert, the industry rule, the offering, both departures and the investment above | `none_of_these`: a court that hears a private claim, a rule for an industry, a refused approval and a charge against an officer alone are not `state_action`; a contract that states no change in what the buyer buys is not a demand option |
+| the outlook lowered by 2%; by 40% | `demand_falls`: an outlook change of any size is a demand option; the 2% one expects `adverse` or `neutral` |
+| a platform says a category's processors are ready, supports three makers and will sell its own | `none_of_these`, `spillover_effect` `mixed`, stance `validates` or `threatens_to_absorb` |
 | a share repurchase; the open models and the platform entry above | `none_of_these`: no channel, or the stance carries it |
 
 - The repository is public, so the answer spaces and the hypothesis are public (owner decision D15, open).
@@ -843,31 +846,50 @@ The key:
 #### The channel to other companies (`spillover_channel`, `spillover_effect`, 2026-11-23)
 
 - Owner decision, 2026-11-23: ask through which channel an event reaches OTHER companies. The owner's review of 28 historical cases (27 under 10 relation labels and one expected spillover that did not occur; read that day, not committed) found four relations the stance list lacks.
-- Form: a separate choice beside `stance_to_category`, and the direction for the others in a second choice.
+- Form: a separate choice beside `stance_to_category`. Its options say what the text reports of the company reported on, never what follows for others; the group reached and its sign are the second table, read by code. The direction for the others is a second choice, a comparison arm.
 
 | rejected form | symptom |
 |---|---|
 | the channels as further options of `stance_to_category` | not exclusive: a cloud company's long power contract both `validates` what power producers sell and raises demand, and the case review labels it with both. A demand signal needs two options for its two signs, so the list grows from 8 to 13 |
 | one `demand_signal` option, its sign read from `spillover_effect` | the sign of an effect is then asked of the model, which this section forbids; rising or falling demand is a statement of the text |
-| `contagion` and `rival_weakened` derived in code from `cause_scope` × an adverse class (this document until 2026-11-23) | `cause_scope` has no option for a customer's orders or a state body's act, and an own-cause adverse event is not a rival's gain unless a rival can take the business |
+| `contagion` and `rival_weakened` derived in code from `cause_scope` × an adverse class (this document until 2026-11-23) | `cause_scope` has no option for a customer's orders or a state body's act |
+| options that end in the effect on others: "so its competitors can take its business", "may sit in similar companies too", "which also hurts its suppliers" (8ea32d3, 2026-11-23) | the clause is the hypothesis. Read as a condition, the model predicts the world; ignored, every own trouble reads `rival_weakened`. A failing bank or a late chip maker does not write the clause in its own release. "Hurts" and "more demand" inside the channel also built agreement with `spillover_effect` in |
+| demand options reaching "suppliers and other sellers of the same thing" (8ea32d3) | one sign for two groups: a contract won in a tender is favourable for the winner's suppliers and adverse for the losing bidders |
+| the tie-break "`state_action` first, then a demand option" (8ea32d3) | a delayed product with a lowered forecast read `demand_falls`, adverse, where the owner's third relation is favourable for rivals; `contagion` against `rival_weakened` had no order; it named option ids, which no other of the 64 instructions does |
+| demand options without "expects to sell less" and "expects to sell more" | the owner's own case of the first relation, a phone maker lowering its forecast with no word on its orders, reads `none_of_these` (D20) |
+| `contagion` worded as "the text ties the trouble to something similar companies share" | a bank's own release on a run names no other bank, so the option answers no real text of the owner's second relation |
 
-| `spillover_channel` | the text reports | others it reaches | sign for them |
+| `spillover_channel`, in the document's order | the text reports, of the company reported on | others it reaches | sign for them |
 |---|---|---|---|
-| `state_action` | a state body restricts or acts against the company | its suppliers, its customers, similar companies the body may act against next | adverse |
-| `demand_rises` | the company or its customer orders, contracts or plans to spend more, or expects to sell more | suppliers, other sellers of the same thing | favourable |
-| `demand_falls` | the company or its customer orders or plans to spend less, or expects to sell less | the same | adverse |
-| `contagion` | trouble that may sit in similar companies too: the same kind of assets, funding, customers or exposure | similar companies | adverse |
-| `rival_weakened` | trouble of the company's own: a delay, a failure, an outage | its competitors | favourable |
-| `none_of_these` | another way of reaching others, or none | | none |
-| `cannot_tell` | not enough | | none |
+| `state_action` | a government, a regulator, a prosecutor or a court restricts, penalises or charges it; not a charge against an officer alone, a private claim a court hears, a refused approval, or a rule for a whole industry | its suppliers, its customers, similar companies | adverse |
+| `rival_weakened` | a delay, a defect, a recall or an outage of what it sells, from a cause inside it | its competitors | favourable |
+| `demand_falls` | it, or a buyer of what it sells, will order, buy or spend less than before, or it expects to sell less | the suppliers of whichever company buys less | adverse |
+| `demand_rises` | it, or a buyer of what it sells, will order, buy or spend more than before, or it expects to sell more | the suppliers of whichever company buys more, and other providers of what a buyer needs more of | favourable |
+| `contagion` | it loses funding or deposits, takes losses on what it holds, or may be unable to pay what it owes | similar companies | adverse |
+| `none_of_these` | none of the five | | none |
+| `cannot_tell` | a text not clear enough to tell | | none |
 
-- The sign column is the table code reads; written 2026-11-23 before any answer or return, fitted to nothing. It lives in this row and in `question::tests::CHANNEL_SIGNS`; no production code reads it yet.
-- `spillover_effect` (`favourable`, `adverse`, `neutral`, `cannot_tell`) is a comparison arm, as `issuer_effect` is. It disagreeing with the channel's sign is a K7 count.
-- Where two channels fit, the instruction says: `state_action` first, then a demand option. A regulator closing a failed bank reads `state_action`; both it and `contagion` are adverse.
-- Both questions say "companies other than the company reported on", not "a category": a single rival is reached too.
+- The sign column is the table code reads; written 2026-11-23 before any answer or return, fitted to nothing. It lives in this table and in `question::tests::CHANNEL_SIGNS`, and `each_channel_to_other_companies_fixes_their_sign_or_has_none` holds each row's last cell to the constant. No production code reads it yet.
+- The order of the list is the tie-break: the instruction says "Where several fit, choose the one listed first." Written 2026-11-23, fitted to nothing. A delayed product with a lowered forecast reads `rival_weakened`; a regulator's order against a bank that lost its deposits reads `state_action`, adverse as `contagion` is.
+- `contagion` and `rival_weakened` are two kinds of trouble the text states: in what the company holds or owes, or in what it sells. Whether similar companies share the first, or a rival can take the business of the second, is the hypothesis and is not asked.
+- `rival_weakened` asks for a cause inside the company, as `cause_scope` `issuer_specific` does: `rival_weakened` with `industry_wide` is a K7 contradiction. `contagion` with `issuer_specific` is valid (a run on one bank) and is counted, because the adverse sign for similar companies is weakest there.
+- A regulator's refusal of an approval reads `none_of_these`: the body does not act against the company, and the cause is not inside it.
+- `none_of_these` is a statement about the text. Whether others are reached another way or not at all is read from `spillover_effect` and the stance.
+- `spillover_effect` (`favourable`, `adverse`, `mixed`, `neutral`, `cannot_tell`) is a comparison arm, as `issuer_effect` is. `mixed` is for a text that states a gain for some companies and a loss for others; `cannot_tell` only where others are affected and the direction is not stated, so a text with no effect reads `neutral`. Its disagreement with the channel's sign is a K7 count.
+- Only `spillover_effect` says "companies other than the company reported on", not "a category", so a single rival is reached too. The channel asks about the company reported on.
 - A stance and a channel are answered apart. The six stances read `none_of_these` unless a channel also fits.
 - Not asked, out of scope: a company moved because its name resembles another's (2 cases of the review), and index or investor decisions (3 cases). Neither is a relation the text of the event states.
-- Unguarded: an event that reaches two groups with opposite signs (a delayed product: rivals gain, the maker's suppliers lose) gets one channel. `state_action` reads adverse although a rival outside the action may gain; `spillover_effect` `favourable` beside it counts that case.
+
+| unguarded | what the table then says |
+|---|---|
+| an event that reaches two groups with opposite signs | one channel: a delayed product reads `rival_weakened`, favourable, though the maker's suppliers lose |
+| a customer that leaves one seller for another | `demand_falls`, adverse for the seller's suppliers; nothing for the seller's rivals, who gain |
+| a contract won in a tender | expected `none_of_these`; a build that reads `demand_rises` signs the losing bidders favourable |
+| an outlook change of any size | a demand option: size is `cx_magnitude_size`, and K16 is split by `event_class` |
+| a going-concern doubt at one small company | `contagion`, adverse for similar companies |
+| a state act against one company | adverse, although a rival outside the act may gain; `spillover_effect` `favourable` beside it counts that case |
+| a refused approval | `none_of_these`, although the maker of a competing product may gain |
+| a rule for a whole industry | `none_of_these`: the owner's fourth relation is an act against one company |
 
 #### Prior coverage (`modelgate::coverage`, built 2026-11-23; not run on production)
 
@@ -965,7 +987,7 @@ What the shadow measures. A number is read per `question_version` and never acro
 | K4 | determinism | share of byte-identical responses to byte-identical requests, with the gap between the sends: a repeat seconds later may be a cache hit | none; decides whether repeats continue |
 | K5 | order sensitivity | a second document with another option order, on the sample | owner: not set |
 | K6 | wording sensitivity | a reworded document on the sample | owner: not set |
-| K7 | self-consistency | `stance_to_category` against the `st_*` nouls; `event_class` against `ev_*` and `any_listed_event_fits`; `category_significance` above `none` with `names_a_category_of_companies` false; `cx_magnitude_stated` true with `cx_magnitude_size` `not_stated`, or false with any other size; `kp_successor_named` and `cx_interim_successor_named` both true; `spillover_effect` `favourable` or `adverse` against the sign of `spillover_channel` ("The channel to other companies"). Not a check: `kp_linked_to_investigation_or_dispute` with `cx_investigation_open`, where all four combinations are valid (the link may be a dispute; an investigation may concern no person) | owner: not set |
+| K7 | self-consistency | `stance_to_category` against the `st_*` nouls; `event_class` against `ev_*` and `any_listed_event_fits`; `category_significance` above `none` with `names_a_category_of_companies` false; `cx_magnitude_stated` true with `cx_magnitude_size` `not_stated`, or false with any other size; `kp_successor_named` and `cx_interim_successor_named` both true; a signed `spillover_channel` against `spillover_effect`, counted apart for the opposite sign, `neutral` and `mixed` ("The channel to other companies"); `state_action` with `cx_state_body_acts_against` false; `rival_weakened` with `cause_scope` `industry_wide`. Not a check: a signed channel with `scope` `issuer_only` (in the case review the companies reached were mostly absent from the text); `contagion` with `cause_scope` `issuer_specific`; `kp_linked_to_investigation_or_dispute` with `cx_investigation_open`, where all four combinations are valid (the link may be a dispute; an investigation may concern no person) | owner: not set |
 | K8 | class list fit | share of `issuer_own` + `new_fact` stories whose `any_listed_event_fits` is below one half | none; a high share revises the list (a new version) |
 | K9 | noise share | share of `third_party_solicitation` and `not_a_company_event` | none; sizes the gate |
 | K10 | time | label lag p50, p90 | owner: not set |
@@ -974,7 +996,7 @@ What the shadow measures. A number is read per `question_version` and never acro
 | K13 | hand check | the owner labels 50 sampled shadow stories blind for `scope`, `issuer_effect`, stance, `issuer_significance`, `category_significance`, `spillover_channel`, `spillover_effect` | owner: not set |
 | K14 | frequency of asymmetric events | stories per week: `source_role` `issuer_own`, `issuer_significance` `none` or `minor`, and `category_significance` `major` or `critical` | owner: not set |
 | K15 | reach of prior coverage | share of `no_tag` and of `several_tags`; per window `none`, `some`, `none_for_a_tag`, `incomplete`. A window count on a large company is mostly law-firm alerts until a split by `source_role` exists | none; a high `no_tag` share revises the grammar (a new `coverage_version`) |
-| K16 | frequency of each channel | stories per week per `spillover_channel` option but `none_of_these` and `cannot_tell`, `content_kind` `new_fact`, split by `source_role` | owner: not set |
+| K16 | frequency of each channel | stories per week per `spillover_channel` option but `none_of_these` and `cannot_tell`, `content_kind` `new_fact`, split by `source_role` and by `event_class`: an outlook change of any size reads a demand option | owner: not set |
 
 - K1 to K9, K13, K14 and K16 need the answers read out of the blobs; no command does that yet. The envelope carries K10 to K12 and K15 per run.
 - "How much has already moved" reads returns and is not a shadow measurement.
@@ -996,10 +1018,11 @@ Not verified, because it needs a paid call or the VPS; the write path stores raw
 - how the vendor reports an error inside a 2xx: only a top-level `error` member beside no answer is read as `failed`;
 - the refusal shape; a refused question is counted `not_answered` whatever it looks like;
 - the question wire shape (`type`, `instructions`, `criteria`), and whether the vendor keeps the order of a JSON object's keys;
+- whether a build is shown a choice's options together and in the document's order: the tie-break of `spillover_channel` is that order;
 - whether a dated request echoes its dated id;
 - billed tokens against request bytes, and whether the state is billed once or once per question;
 - whether a byte-identical request returns identical bytes; the rate limit; how long a dated build is served;
-- the size limit: the predecessor's one non-transport refusal in 23,823 calls was an HTTP 400 on a 180,725-character title against the vendor's 32,000-token limit (its `2026_10_jev_feature_layer.py`, read 2026-11-23). The 35,800-byte ceiling is above 32,000, so it is under that limit only if a token averages at least 1.12 bytes (35,800 ÷ 32,000); 34,200 needed 1.07, and 30,000 held at one byte per token. An inference, not a measurement: the predecessor's 32,000-character states and their questions passed that limit. A full-length story refused here closes `failed` with a 400, final for the run, and shows in K12;
+- the size limit: the predecessor's one non-transport refusal in 23,823 calls was an HTTP 400 on a 180,725-character title against the vendor's 32,000-token limit (its `2026_10_jev_feature_layer.py`, read 2026-11-23). The 35,800-byte ceiling is above 32,000, so it is under that limit only if a token averages at least 1.12 bytes (35,800 ÷ 32,000); the largest request the committed document can produce is 35,563 bytes (36 + 128 + 13,000 + 22,399), which needs 1.11; 34,200 needed 1.07, and 30,000 held at one byte per token. An inference, not a measurement: the predecessor's 32,000-character states and their questions passed that limit. A full-length story refused here closes `failed` with a 400, final for the run, and shows in K12;
 - body sizes in the production store, so the truncated share; the predecessor measured its harder question gaining about 6 AUC points up to a 32,000-character cap, above this budget of 13,000 bytes;
 - the size and duration of a production `newsvault cut`; distinct stories per day.
 
@@ -1041,8 +1064,8 @@ Owner decisions needed before a paid call:
 | D16 | `--give-up-after-hours` | 24 |
 | D17 | the state budget of 13,000 bytes against the predecessor's 32,000 characters | measure the truncated share first; a change is `modelgate.request/3` |
 | D18 | whether `empty` and `unparseable` stay final | yes until D12 shows the response shape; the alternative, asking again, pays for the same bytes on every run while the shape is misread |
-| D19 | the request ceiling of 35,800 bytes (34,200 until the two `spillover_*` questions, 2026-11-23), above the vendor's 32,000 tokens unless a token averages 1.12 bytes | proposed by this change, so merging it is the yes; D12 on a full-length story settles it. The alternatives, each sized on the 22,373-byte document of 2026-11-23: a state of 7,463 bytes under 30,000; or 34,200 kept with the 21,000 bound by dropping 1,373 bytes of questions: the 9 `kp_*` (2,354), the 5 `st_*` and `cause_scope` (1,432), or the 5 `as_*` and `names_a_category_of_companies` (1,481); dropping `spillover_effect` alone frees 443 |
-| D20 | the question wording: the seven options of `spillover_channel` and its sign table; the four significance levels; `cannot_tell` as a fifth, off-scale option of `issuer_significance`; the one boundary of `cx_magnitude_size` (a tenth) for every base (outlook, workforce, shares); whether a named counterparty gets its own 4-level question | confirm before the first paid call; a change is a new question version and costs nothing until then |
+| D19 | the request ceiling of 35,800 bytes (34,200 until the two `spillover_*` questions, 2026-11-23), above the vendor's 32,000 tokens unless a token averages 1.12 bytes (1.11 for the committed document's largest request, 35,563 bytes) | proposed by this change, so merging it is the yes; D12 on a full-length story settles it. The alternatives, each sized on the 22,399-byte document of 2026-11-23: a state of 7,437 bytes under 30,000; or 34,200 kept with the 21,000 bound by dropping 1,399 bytes of questions: the 9 `kp_*` (2,354), the 5 `st_*` and `cause_scope` (1,432; K7 then loses its check of the stance), or the 5 `as_*` and `names_a_category_of_companies` (1,481). Alone, `spillover_effect` frees 559 and `cause_scope` 394, the cheaper of the two if the first sample shows it repeats `rival_weakened` |
+| D20 | the question wording: the seven options of `spillover_channel`, their order as its tie-break and its sign table; whether an outlook change ("expects to sell less") stays in the demand options; `contagion` as any loss of funding or of asset value; a refused approval as `none_of_these`; `mixed` in `spillover_effect`; the four significance levels; `cannot_tell` as a fifth, off-scale option of `issuer_significance`; the one boundary of `cx_magnitude_size` (a tenth) for every base (outlook, workforce, shares); whether a named counterparty gets its own 4-level question | confirm before the first paid call; a change is a new question version and costs nothing until then |
 
 ### 3.6 `Brief` — `propose` to a person
 

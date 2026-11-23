@@ -201,7 +201,7 @@ mod tests {
             "`modelgate.request/2` (2026-11-23)",
             "13,000 JSON-escaped bytes",
             "22,600-byte bound",
-            "35,800-byte ceiling",
+            "35,800-byte ceiling on the whole body",
         ] {
             assert!(design.contains(named), "{named}");
         }

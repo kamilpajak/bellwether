@@ -90,6 +90,9 @@
     ],
     "kp_reason_is_benign": [
      "false"
+    ],
+    "spillover_channel": [
+     "none_of_these"
     ]
    }
   },
@@ -130,6 +133,9 @@
     ],
     "cx_magnitude_size": [
      "not_stated"
+    ],
+    "spillover_channel": [
+     "none_of_these"
     ]
    }
   },
@@ -151,6 +157,13 @@
     ],
     "issuer_significance": [
      "minor"
+    ],
+    "spillover_channel": [
+     "demand_falls"
+    ],
+    "spillover_effect": [
+     "adverse",
+     "neutral"
     ]
    }
   },
@@ -176,6 +189,12 @@
     "issuer_significance": [
      "major",
      "critical"
+    ],
+    "spillover_channel": [
+     "demand_falls"
+    ],
+    "spillover_effect": [
+     "adverse"
     ]
    }
   },
@@ -284,6 +303,9 @@
     ],
     "cx_magnitude_size": [
      "no_base"
+    ],
+    "spillover_channel": [
+     "none_of_these"
     ]
    }
   },
@@ -305,6 +327,9 @@
     ],
     "cx_issuer_calls_it_material": [
      "false"
+    ],
+    "spillover_channel": [
+     "none_of_these"
     ]
    }
   },
@@ -326,6 +351,9 @@
     ],
     "cx_magnitude_size": [
      "no_base"
+    ],
+    "spillover_channel": [
+     "none_of_these"
     ]
    }
   },
@@ -344,6 +372,9 @@
     ],
     "cx_state_body_acts_against": [
      "false"
+    ],
+    "spillover_channel": [
+     "none_of_these"
     ]
    }
   },
@@ -370,7 +401,7 @@
   },
   {
    "id": "customer_signs_a_long_supply_contract",
-   "text": "Gridco Energy (NYSE: GRDC) today signed a 20-year agreement to sell the whole output of one generating station to Cloudhost Corporation. Cloudhost said its new data centres need more electricity than its present suppliers can deliver, and that it is seeking further agreements of this kind.",
+   "text": "Gridco Energy (NYSE: GRDC) today signed a 20-year agreement to sell the whole output of one generating station to Cloudhost Corporation. The electricity will supply data centres Cloudhost is building, which will use more than it buys from all its suppliers today.",
    "expect": {
     "event_class": [
      "contract_or_customer_win"
@@ -388,7 +419,7 @@
   },
   {
    "id": "bank_loses_a_quarter_of_its_deposits",
-   "text": "Coastal Savings Bank (NASDAQ: CSTL) today said customers withdrew a quarter of its deposits in two days and that it sold bonds at a loss to pay them. Most of its deposits are above the insured limit, and most of its assets are long-dated bonds bought before interest rates rose, as is common among banks of its size. It is seeking emergency funding.",
+   "text": "Coastal Savings Bank (NASDAQ: CSTL) today said customers withdrew a quarter of its deposits in two days and that it sold bonds at a loss to pay them. It is seeking emergency funding and will not pay its next dividend.",
    "expect": {
     "issuer_effect": [
      "adverse"
@@ -409,8 +440,8 @@
    }
   },
   {
-   "id": "chip_maker_delays_its_next_product",
-   "text": "Bigchip Corporation (NASDAQ: BGCP) today said its next generation of processors will ship six months later than planned because of a defect in its own manufacturing process. Customers that cannot wait may buy from other makers in the meantime, it said.",
+   "id": "chip_maker_delays_its_next_product_and_lowers_its_forecast",
+   "text": "Bigchip Corporation (NASDAQ: BGCP) today said its next generation of processors will ship six months later than planned because of a defect in its own manufacturing process, and lowered its full-year revenue forecast by eight percent.",
    "expect": {
     "issuer_effect": [
      "adverse"
@@ -426,6 +457,9 @@
     ],
     "spillover_effect": [
      "favourable"
+    ],
+    "ev_guidance_cut_or_warning": [
+     "true"
     ]
    }
   },
@@ -468,6 +502,52 @@
     ],
     "spillover_effect": [
      "neutral"
+    ]
+   }
+  },
+  {
+   "id": "contract_won_in_a_tender",
+   "text": "Defenceco Systems (NYSE: DFNC) today said the defence ministry awarded it a five-year contract worth 2 billion for armoured vehicles, after a tender against two other bidders.",
+   "expect": {
+    "event_class": [
+     "contract_or_customer_win"
+    ],
+    "issuer_effect": [
+     "favourable"
+    ],
+    "spillover_channel": [
+     "none_of_these"
+    ]
+   }
+  },
+  {
+   "id": "regulator_declines_an_approval",
+   "text": "Pharmaco Inc. (NASDAQ: PHMC) today said the medicines regulator declined to approve its treatment for migraine and asked for a further trial.",
+   "expect": {
+    "issuer_effect": [
+     "adverse"
+    ],
+    "spillover_channel": [
+     "none_of_these"
+    ]
+   }
+  },
+  {
+   "id": "platform_endorses_the_category_and_will_enter_it",
+   "text": "Largeplat Corporation (NASDAQ: LRGP) today said ion-trap quantum processors are ready for commercial workloads and added support for the processors of three specialist makers to its software. It also said it will design and sell its own ion-trap processors from next year.",
+   "expect": {
+    "scope": [
+     "whole_category"
+    ],
+    "stance_to_category": [
+     "validates",
+     "threatens_to_absorb"
+    ],
+    "spillover_channel": [
+     "none_of_these"
+    ],
+    "spillover_effect": [
+     "mixed"
     ]
    }
   }
