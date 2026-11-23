@@ -410,7 +410,7 @@ tests:
         alertname: NewsvaultCollectFailed
         exp_alerts: []
 
-  # No roster run ever is missed, not silent.
+  # No roster run ever is missed, not silent; absent() keeps the selector's unit label.
   - interval: 1h
     input_series:
       - series: 'up{job="node"}'
@@ -421,6 +421,7 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: critical
+              unit: roster
             exp_annotations:
               summary: no newsvault roster fetch has ended for over a day, or none ever.
 
