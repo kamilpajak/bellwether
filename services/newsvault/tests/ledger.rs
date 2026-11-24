@@ -194,6 +194,191 @@ fn a_day_where_every_source_closed_empty_differs_from_one_where_every_source_fai
     Ok(())
 }
 
+const EMPTY_RUN: &str = "run-0702-a";
+const EMPTY_DAY_SECOND_RUN: &str = "run-0702-b";
+const GONE: u16 = 410;
+const FAILED_AT: &str = "2026-07-02T00:40:00.000000Z";
+const ONE_FAILURE_NO_GONE: &str = "1 failed, 0 interrupted, 0 gone not counted";
+
+/// One edgar attempt in `run`, on a day with no finding, closed `failed` with `status`: a
+/// Document attempt of `story`, or an index attempt when `story` is `None`.
+fn a_failed_answer(
+    db: &Connection,
+    (run, attempt): (&str, &str),
+    status: u16,
+    story: Option<&str>,
+) -> TestResult {
+    db.execute(
+        "INSERT INTO attempts (attempt_id, run_id, source, target_window, filter_params,
+                               universe_version, opened_at, closed_at, transport_status,
+                               outcome, verdict, story_id)
+         VALUES (?1, ?2, ?3, ?4, 'fp', 'uv', ?5, ?5, ?6, 'failed', 'permanent_failure', ?7)",
+        rusqlite::params![attempt, run, EDGAR, EMPTY_DAY, FAILED_AT, status, story],
+    )?;
+    Ok(())
+}
+
+/// The exit, the finding codes, edgar's row and the first finding's detail.
+type Checked = (i32, Vec<String>, Value, Value);
+
+/// `--check` over `EMPTY_DAY`.
+fn checked_empty_day(root: &TempDir) -> Result<Checked, Box<dyn Error>> {
+    let answer = run(root, &["--from", EMPTY_DAY, "--to", EMPTY_DAY, "--check"])?;
+    let report = answer.json()?;
+    let row = per_source(&report, EMPTY_DAY, EDGAR)
+        .cloned()
+        .ok_or("the source is missing")?;
+    let detail = report["check"]["findings"][0]["detail"].clone();
+    Ok((answer.code, codes(&report), row, detail))
+}
+
+/// Owner decision 2026-11-24 (§10 V5): a document answered 410 stays a `failed` row, is counted
+/// `gone`, and is no `holds_a_failure`; two runs of the day, so the count is a sum. Mutations 2026-11-24 in §8
+/// row R24.
+#[test]
+fn a_document_answered_410_is_counted_gone_and_is_no_failure() -> TestResult {
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    a_failed_answer(&db, (EMPTY_RUN, "g-1"), GONE, Some("s-gone-1"))?;
+    a_failed_answer(&db, (EMPTY_DAY_SECOND_RUN, "g-2"), GONE, Some("s-gone-2"))?;
+    drop(db);
+    let (code, findings, row, _) = checked_empty_day(&root)?;
+    let human = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .arg("ledger")
+        .args(["--store", &root.path().to_string_lossy()])
+        .args(["--at", AT, "--format", "human"])
+        .args(["--from", EMPTY_DAY, "--to", EMPTY_DAY])
+        .output()?;
+    let text = String::from_utf8(human.stdout)?;
+    let words: Vec<&str> = text
+        .lines()
+        .find(|line| line.trim_start().starts_with(EDGAR))
+        .map(|line| line.split_whitespace().collect())
+        .unwrap_or_default();
+    let shown = words
+        .iter()
+        .position(|word| *word == "gone")
+        .and_then(|at| words.get(at + 1))
+        .map(|word| (*word).to_owned());
+    assert_eq!(
+        (
+            code,
+            findings,
+            row["failed"].as_u64(),
+            row["gone"].as_u64(),
+            shown
+        ),
+        (EXIT_OK, Vec::new(), Some(2), Some(2), Some("2".to_owned()))
+    );
+    Ok(())
+}
+
+/// The owner named 410 alone: a document answered 404, 403, 429, 411, 451, 503, 301 or 200 with
+/// nothing usable, and an index answered 410, each still raise `holds_a_failure` and count no
+/// `gone`.
+#[test]
+fn every_other_failed_answer_and_an_index_answered_410_still_hold_a_failure() -> TestResult {
+    let story = Some("s-failed");
+    for (status, story) in [
+        (404, story),
+        (403, story),
+        (429, story),
+        (411, story),
+        (451, story),
+        (503, story),
+        (301, story),
+        (200, story),
+        (GONE, None),
+    ] {
+        let root = fixture()?;
+        let db = Connection::open(root.path().join(COMMIT_LOG))?;
+        a_failed_answer(&db, (EMPTY_RUN, "f-1"), status, story)?;
+        drop(db);
+        let (code, findings, row, detail) = checked_empty_day(&root)?;
+        assert_eq!(
+            (code, findings, row["gone"].as_u64(), detail.as_str()),
+            (
+                EXIT_NO,
+                vec!["holds_a_failure".to_owned()],
+                Some(0),
+                Some(ONE_FAILURE_NO_GONE)
+            ),
+            "{status} {story:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A 410 beside a 404 hides neither: the finding counts the 404 and names the 410 apart. A 410
+/// answered and never finalised is not `failed`, so it is not `gone` and takes nothing off the 404.
+#[test]
+fn a_410_beside_another_failure_leaves_that_failure_counted() -> TestResult {
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    a_failed_answer(&db, (EMPTY_RUN, "g-1"), GONE, Some("s-gone"))?;
+    a_failed_answer(&db, (EMPTY_RUN, "f-1"), 404, Some("s-failed"))?;
+    a_failed_answer(&db, (EMPTY_RUN, "g-open"), GONE, Some("s-open"))?;
+    db.execute(
+        "UPDATE attempts SET outcome = NULL, verdict = NULL, closed_at = NULL
+          WHERE attempt_id = 'g-open'",
+        [],
+    )?;
+    drop(db);
+    let (code, findings, row, detail) = checked_empty_day(&root)?;
+    assert_eq!(
+        (
+            code,
+            findings,
+            row["failed"].as_u64(),
+            row["gone"].as_u64(),
+            detail.as_str()
+        ),
+        (
+            EXIT_NO,
+            vec!["holds_a_failure".to_owned()],
+            Some(2),
+            Some(1),
+            Some("1 failed, 0 interrupted, 1 gone not counted")
+        )
+    );
+    Ok(())
+}
+
+/// A 410 takes nothing off an interrupted attempt: the day still fails on the interrupted one.
+#[test]
+fn a_410_beside_an_interrupted_attempt_leaves_the_interruption_a_failure() -> TestResult {
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    a_failed_answer(&db, (EMPTY_RUN, "g-1"), GONE, Some("s-gone"))?;
+    a_failed_answer(&db, (EMPTY_RUN, "i-1"), GONE, Some("s-swept"))?;
+    db.execute(
+        "UPDATE attempts SET outcome = 'interrupted', verdict = NULL, transport_status = NULL
+          WHERE attempt_id = 'i-1'",
+        [],
+    )?;
+    drop(db);
+    let (code, findings, row, detail) = checked_empty_day(&root)?;
+    assert_eq!(
+        (
+            code,
+            findings,
+            row["failed"].as_u64(),
+            row["interrupted"].as_u64(),
+            row["gone"].as_u64(),
+            detail.as_str()
+        ),
+        (
+            EXIT_NO,
+            vec!["holds_a_failure".to_owned()],
+            Some(1),
+            Some(1),
+            Some(1),
+            Some("0 failed, 1 interrupted, 1 gone not counted")
+        )
+    );
+    Ok(())
+}
+
 #[test]
 fn both_clocks_are_present_and_differ_and_neither_is_computed_from_a_wall_clock() -> TestResult {
     let root = fixture()?;

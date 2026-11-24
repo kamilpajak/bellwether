@@ -36,6 +36,8 @@ const OUTCOME_OK: &str = "ok";
 const OUTCOME_EMPTY: &str = "empty";
 const OUTCOME_FAILED: &str = "failed";
 const OUTCOME_INTERRUPTED: &str = "interrupted";
+/// Owner decision 2026-11-24 (architecture.md section 10, V5): a document answered 410.
+const GONE: u16 = 410;
 
 /// The `--check` answers, each the code of a finding: `coverage_incomplete` since 2026-11-13
 /// (§8 row R20), the two busy bounds since 2026-11-18 (S7-D11). No asking-clock age: it needs a
@@ -190,6 +192,10 @@ pub struct SourceRow {
     pub ok: u32,
     pub empty: u32,
     pub failed: u32,
+    /// Of `failed`: document attempts (a `story_id`) answered 410, which `holds_a_failure` leaves
+    /// out since 2026-11-24. Per attempt row on its run's day, where `walk.gone` is per walked id
+    /// on its poll's day; an index answered 410 is not counted here and stays a failure.
+    pub gone: u32,
     pub interrupted: u32,
     pub in_flight: u32,
     pub opened_without_answered: Vec<String>,
@@ -507,6 +513,7 @@ struct Grouped {
     source: String,
     state: String,
     attempts: u32,
+    gone: u32,
     vendor_rows: i64,
     held: i64,
     listing_unusable: i64,
@@ -755,7 +762,9 @@ fn grouped_attempts(
                                            AND NOT EXISTS (SELECT 1 FROM deferred_closed c
                                                             WHERE c.deferred_id = d.deferred_id
                                                               AND c.closed_at <= ?1)), ?2) <= ?2
-                     THEN 1 ELSE 0 END)
+                     THEN 1 ELSE 0 END),
+                SUM(outcome IS '{OUTCOME_FAILED}' AND story_id IS NOT NULL
+                    AND transport_status IS {GONE})
          FROM attempts WHERE opened_at <= ?1
          GROUP BY run_id, source, state
          ORDER BY run_id, source, state"
@@ -767,6 +776,7 @@ fn grouped_attempts(
                 source: row.get(1)?,
                 state: row.get(2)?,
                 attempts: row.get(3)?,
+                gone: row.get(30)?,
                 vendor_rows: row.get(4)?,
                 items_new: row.get(5)?,
                 held: row.get(6)?,
@@ -1113,6 +1123,7 @@ fn day_row(date: NaiveDate, envelopes: &[Envelope], read: &Read, ask: &Ask) -> D
             .entry(entry.source.clone())
             .or_insert_with(|| SourceRow::named(&entry.source));
         row.attempts += entry.attempts;
+        row.gone += entry.gone;
         row.vendor_rows += entry.vendor_rows;
         row.held += entry.held;
         row.listing_unusable += entry.listing_unusable;
@@ -1220,6 +1231,7 @@ impl SourceRow {
             ok: 0,
             empty: 0,
             failed: 0,
+            gone: 0,
             interrupted: 0,
             in_flight: 0,
             opened_without_answered: Vec::new(),
@@ -1279,12 +1291,16 @@ fn findings_for(day: &DayRow) -> Vec<Finding> {
         });
     }
     for row in &day.per_source {
-        if row.failed + row.interrupted > 0 {
+        let failed = row.failed.saturating_sub(row.gone);
+        if failed + row.interrupted > 0 {
             findings.push(Finding {
                 code: HOLDS_A_FAILURE,
                 run_date: day.run_date.clone(),
                 source: Some(row.source.clone()),
-                detail: format!("{} failed, {} interrupted", row.failed, row.interrupted),
+                detail: format!(
+                    "{failed} failed, {} interrupted, {} gone not counted",
+                    row.interrupted, row.gone
+                ),
             });
         }
         if row.carried.expired > 0 {
@@ -1383,7 +1399,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
         for row in &day.per_source {
             writeln!(
                 out,
-                "  {:<14} ok {} empty {} failed {} interrupted {} in-flight {} \
+                "  {:<14} ok {} empty {} failed {} gone {} interrupted {} in-flight {} \
                  vendor_rows {} held {} listing_unusable {} bodies_truncated {} \
                  cuts_held_at_limit {} cuts_released_unreachable {} \
                  relisted_disputed {} relisted_compared {} robots_disallowed {} \
@@ -1400,6 +1416,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 row.ok,
                 row.empty,
                 row.failed,
+                row.gone,
                 row.interrupted,
                 row.in_flight,
                 row.vendor_rows,
