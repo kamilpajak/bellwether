@@ -1,10 +1,12 @@
 #!/bin/sh
-# The daily copy of the store into Nextcloud (architecture.md section 10, N1), run by
+# The daily copy of one store into Nextcloud (architecture.md section 10, N1). No argument, run by
 # newsvault-backup.service under the store lock: `newsvault snapshot` of the commit log plus every
-# other store file in one .tar.gz, written into the data directory through the AIO container as
-# www-data, registered with `occ files:scan` and found by `occ info:file`, then all but the 7 newest
-# copies deleted. Exits: 2 setup or an unsafe setting, 4 an absent input, 7 the write, rename, scan
-# or lookup, 8 the copy is in and the retention failed; the snapshot's own exit when it refuses.
+# other store file. `modelgate`, run by modelgate-backup.service: `modelgate snapshot` under the
+# shadow lock, then `modelgate verify` of the copy. Either way one .tar.gz, written into the data
+# directory through the AIO container as www-data, registered with `occ files:scan` and found by
+# `occ info:file`, then all but the 7 newest copies of that store deleted. Exits: 2 setup or an
+# unsafe setting, 4 an absent input, 7 a held lock, a snapshot past its bound, the write, rename,
+# scan or lookup, 8 the copy is in and the retention failed; else the snapshot's or verify's own.
 set -u
 export LC_ALL=C
 : "${NEWSVAULT_IMAGE:?set in newsvault.env}" "${NEWSVAULT_TEXTFILE_DIR:?set in newsvault.env}"
@@ -13,8 +15,29 @@ case $NEWSVAULT_TEXTFILE_DIR in
     *) echo "NEWSVAULT_TEXTFILE_DIR is not an absolute path: '$NEWSVAULT_TEXTFILE_DIR'" >&2; exit 2 ;;
 esac
 keep=7
-vault="$HOME/.bellwether/vault"
-copy='bellwether-vault-[0-9]\{8\}T[0-9]\{6\}Z\.tar\.gz'
+# The shadow lock is held within lock_wait + snapshot_bound + snapshot_kill of the start;
+# services/newsvault/tests/deploy.rs holds that between two shadow firings.
+lock_wait=760
+snapshot_bound=150
+snapshot_kill=20
+case $#:${1-} in
+    0:)
+        what=vault
+        prom=newsvault-backup.prom
+        stamp=newsvault_backup_last_success_timestamp_seconds
+        size=newsvault_backup_last_success_bytes
+        ;;
+    1:modelgate)
+        what=modelgate
+        prom=modelgate-backup.prom
+        stamp=modelgate_backup_last_success_timestamp_seconds
+        size=modelgate_backup_last_success_bytes
+        : "${XDG_RUNTIME_DIR:?not set: run as the unit does, or from a login session}"
+        ;;
+    *) echo "usage: newsvault-backup [modelgate]" >&2; exit 2 ;;
+esac
+store="$HOME/.bellwether/$what"
+copy="bellwether-$what-"'[0-9]\{8\}T[0-9]\{6\}Z\.tar\.gz'
 
 # check NAME VALUE KIND, KIND one of word, absolute, relative: every '/'-separated part starts with a
 # letter or digit and holds only letters, digits, '.', '_' and '-'.
@@ -39,7 +62,7 @@ check NEXTCLOUD_CONTAINER "${NEXTCLOUD_CONTAINER-}" word
 check NEXTCLOUD_DATA "${NEXTCLOUD_DATA-}" absolute
 check NEXTCLOUD_USER "${NEXTCLOUD_USER-}" word
 check NEXTCLOUD_FOLDER "${NEXTCLOUD_FOLDER-}" relative
-[ -d "$vault" ] || { echo "no store at $vault" >&2; exit 4; }
+[ -d "$store" ] || { echo "no store at $store" >&2; exit 4; }
 
 container=$NEXTCLOUD_CONTAINER
 dir="$NEXTCLOUD_DATA/$NEXTCLOUD_USER/files/$NEXTCLOUD_FOLDER"
@@ -55,26 +78,55 @@ trap 'rm -rf "$work"; if [ -n "$staged" ]; then as_www rm -f -- "$staged"; fi' E
 trap 'exit 130' INT TERM
 
 at=$(date -u +%s)
-name="bellwether-vault-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
-docker run --rm --name newsvault-backup --pull never \
-    --user "$(id -u):$(id -g)" --read-only --network none \
-    --cap-drop ALL --security-opt no-new-privileges \
-    --mount "type=bind,src=$vault,dst=/vault,readonly" \
-    --mount "type=bind,src=$work,dst=/out" \
-    "$NEWSVAULT_IMAGE" \
-    snapshot --out /out/commit.sqlite3 --non-interactive --format json || exit
-
-# The live log and its lock stay out: the snapshot is the archive's commit.sqlite3.
-cd "$vault" || exit 4
-set --
-for entry in * .[!.]* ..?*; do
-    [ -e "$entry" ] || continue
-    case $entry in
-        commit.sqlite3 | commit.sqlite3-* | LOCK) ;;
-        *) set -- "$@" "$entry" ;;
+name="bellwether-$what-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+if [ "$what" = modelgate ]; then
+    # The archive is the snapshot's output and nothing else of the store: the database and the
+    # blobs its rows name. A shadow run that fired while the lock is held here would exit 7.
+    set -- --pull never --user "$(id -u):$(id -g)" --read-only --network none \
+        --cap-drop ALL --security-opt no-new-privileges --entrypoint /usr/bin/tini \
+        --mount "type=bind,src=$work,dst=/out"
+    flock --timeout "$lock_wait" --conflict-exit-code 7 "$XDG_RUNTIME_DIR/bellwether-shadow.lock" \
+        timeout --kill-after "$snapshot_kill" "$snapshot_bound" \
+        docker run --rm --name modelgate-backup "$@" \
+        --mount "type=bind,src=$store,dst=/modelgate,readonly" \
+        "$NEWSVAULT_IMAGE" -- /usr/local/bin/modelgate \
+        snapshot --store /modelgate --out /out/store --non-interactive --format json
+    status=$?
+    case $status in
+        0) ;;
+        7) echo "a shadow run held its lock for $lock_wait s, or the store's LOCK is held; no copy taken" >&2; exit 7 ;;
+        124 | 137)
+            docker rm --force modelgate-backup >/dev/null 2>&1
+            echo "the snapshot passed its $snapshot_bound s bound; no copy taken" >&2
+            exit 7
+            ;;
+        *) exit "$status" ;;
     esac
-done
-tar -czf "$work/$name" -C "$work" commit.sqlite3 -C "$vault" "$@" || exit 2
+    docker run --rm --name modelgate-backup-verify "$@" \
+        "$NEWSVAULT_IMAGE" -- /usr/local/bin/modelgate \
+        verify --store /out/store --non-interactive --format json || exit
+    tar -czf "$work/$name" -C "$work/store" gate.sqlite blobs || exit 2
+else
+    docker run --rm --name newsvault-backup --pull never \
+        --user "$(id -u):$(id -g)" --read-only --network none \
+        --cap-drop ALL --security-opt no-new-privileges \
+        --mount "type=bind,src=$store,dst=/vault,readonly" \
+        --mount "type=bind,src=$work,dst=/out" \
+        "$NEWSVAULT_IMAGE" \
+        snapshot --out /out/commit.sqlite3 --non-interactive --format json || exit
+
+    # The live log and its lock stay out: the snapshot is the archive's commit.sqlite3.
+    cd "$store" || exit 4
+    set --
+    for entry in * .[!.]* ..?*; do
+        [ -e "$entry" ] || continue
+        case $entry in
+            commit.sqlite3 | commit.sqlite3-* | LOCK) ;;
+            *) set -- "$@" "$entry" ;;
+        esac
+    done
+    tar -czf "$work/$name" -C "$work" commit.sqlite3 -C "$store" "$@" || exit 2
+fi
 bytes=$(wc -c <"$work/$name" | tr -d ' ')
 
 as_www mkdir -p -- "$dir" || { echo "creating $dir in $container failed" >&2; exit 7; }
@@ -99,13 +151,13 @@ known=$(as_www php occ info:file "/$scanned/$name") || {
     exit 7
 }
 
-tmp="$NEWSVAULT_TEXTFILE_DIR/.newsvault-backup.prom.$$"
+tmp="$NEWSVAULT_TEXTFILE_DIR/.$prom.$$"
 if ! {
-    echo '# TYPE newsvault_backup_last_success_timestamp_seconds gauge'
-    echo "newsvault_backup_last_success_timestamp_seconds $at"
-    echo '# TYPE newsvault_backup_last_success_bytes gauge'
-    echo "newsvault_backup_last_success_bytes $bytes"
-} >"$tmp" || ! mv -f "$tmp" "$NEWSVAULT_TEXTFILE_DIR/newsvault-backup.prom"; then
+    echo "# TYPE $stamp gauge"
+    echo "$stamp $at"
+    echo "# TYPE $size gauge"
+    echo "$size $bytes"
+} >"$tmp" || ! mv -f "$tmp" "$NEWSVAULT_TEXTFILE_DIR/$prom"; then
     rm -f "$tmp"
     exit 2
 fi

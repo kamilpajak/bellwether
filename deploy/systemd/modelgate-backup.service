@@ -1,0 +1,16 @@
+# The daily copy of the gate's store to Nextcloud (architecture.md section 3.5, "The store's daily
+# copy"). The script takes the shadow lock itself, waiting; no store lock. A wait that ends without
+# the lock exits 7 and ModelgateBackupFailed fires. services/newsvault/tests/deploy.rs reads
+# ExecStart, the ExecStopPost lines and TimeoutStartSec.
+[Unit]
+Description=modelgate daily backup of the gate's store to Nextcloud
+Documentation=https://github.com/kamilpajak/bellwether/blob/main/docs/design/architecture.md
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/bellwether/newsvault.env
+ExecStart=%h/.local/lib/bellwether/newsvault-backup modelgate
+ExecStopPost=-%h/.local/lib/bellwether/newsvault-unit-result gatebackup
+ExecStopPost=-/bin/sh -c 'if [ "$$SERVICE_RESULT" = timeout ]; then /usr/bin/docker rm --force modelgate-backup; fi'
+ExecStopPost=-/bin/sh -c 'if [ "$$SERVICE_RESULT" = timeout ]; then /usr/bin/docker rm --force modelgate-backup-verify; fi'
+TimeoutStartSec=1800

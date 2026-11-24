@@ -2,12 +2,14 @@
 //! vault. Every table is insert-only by trigger. What that does not cover is
 //! `docs/design/architecture.md` section 8 row MG9.
 
+use std::collections::BTreeMap;
 use std::fs::{File, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use canon::FileDigest;
 use chrono::{DateTime, Utc};
+use rusqlite::backup::{Backup, StepResult};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::cap::Spent;
@@ -21,6 +23,8 @@ pub const BLOB_DIR: &str = "blobs";
 const LOCK_FILE: &str = "LOCK";
 const STAGING_PREFIX: &str = ".staging-";
 const USER_VERSION: i64 = 2;
+const ALL_PAGES: i32 = -1;
+const QUICK_CHECK_OK: &str = "ok";
 /// canon's instant rendering, so text order is time order and the first ten bytes are the UTC day.
 const INSTANT_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6fZ";
 const DAY_BYTES: usize = 10;
@@ -92,6 +96,8 @@ pub enum StoreError {
     PermitAlreadyTaken,
     #[error("an answer for attempt {answered} was handed to the slot of attempt {slot}")]
     AnswerFromAnotherAttempt { slot: String, answered: String },
+    #[error("the copy at {} is not a whole database: {why}", path.display())]
+    CopyMalformed { path: PathBuf, why: String },
     #[error(
         "the prior-coverage row of story {0} does not read back as the record it was written from"
     )]
@@ -207,6 +213,96 @@ impl Store {
             blobs: Some(root.join(BLOB_DIR)),
             _lease: None,
         })
+    }
+
+    /// A copy's door: an existing store read-only, under its `LOCK` so no writer is inside a
+    /// transaction or between a blob and its row. `LOCK` is opened without write access: the
+    /// backup mounts the store read-only. No `LOCK` or no database is `None`.
+    pub fn leased_read(root: &Path) -> Result<Option<Self>, StoreError> {
+        let lock_path = root.join(LOCK_FILE);
+        if !lock_path.is_file() || !root.join(DB_FILE).is_file() {
+            return Ok(None);
+        }
+        let lease = File::open(&lock_path).map_err(io(&lock_path))?;
+        match lease.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(StoreError::LeaseHeld(lock_path)),
+            Err(TryLockError::Error(why)) => return Err(io(&lock_path)(why)),
+        }
+        let mut store = Self::read_only(root)?;
+        // Under `LOCK` a locked database is a writer that took no lease: refused, not waited for.
+        store.db.busy_timeout(std::time::Duration::ZERO)?;
+        store._lease = Some(lease);
+        Ok(Some(store))
+    }
+
+    /// SQLite's online backup into a new file at `target`, then the copy's `quick_check`. A
+    /// source another connection has locked is `LeaseHeld`.
+    pub fn copy_database(&self, target: &Path) -> Result<(), StoreError> {
+        let mut copy = Connection::open(target)?;
+        {
+            let backup = Backup::new(&self.db, &mut copy)?;
+            loop {
+                match backup.step(ALL_PAGES)? {
+                    StepResult::Done => break,
+                    StepResult::More => {}
+                    _ => {
+                        let held = self.db.path().unwrap_or(DB_FILE);
+                        return Err(StoreError::LeaseHeld(PathBuf::from(held)));
+                    }
+                }
+            }
+        }
+        let verdicts: Vec<String> = copy
+            .prepare("PRAGMA quick_check")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        if verdicts != [QUICK_CHECK_OK] {
+            return Err(StoreError::CopyMalformed {
+                path: target.to_path_buf(),
+                why: verdicts.join("; "),
+            });
+        }
+        copy.close().map_err(|(_, failure)| failure)?;
+        Ok(())
+    }
+
+    /// Rows per table of [`TABLES`].
+    pub fn row_counts(&self) -> Result<BTreeMap<&'static str, i64>, StoreError> {
+        TABLES
+            .iter()
+            .map(|table| {
+                let rows =
+                    self.db
+                        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+                Ok((*table, rows))
+            })
+            .collect()
+    }
+
+    /// Every blob a row names, once, in name order: question files, requests and responses.
+    pub fn blob_names(&self) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.db.prepare(
+            "SELECT file_sha256 FROM question_docs
+             UNION SELECT request_sha256 FROM requests
+             UNION SELECT response_sha256 FROM attempt_events WHERE response_sha256 IS NOT NULL
+             ORDER BY 1",
+        )?;
+        let names = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(names)
+    }
+
+    /// How many entries the blob directory holds, staging files of a killed write among them.
+    pub fn blob_files(&self) -> Result<u64, StoreError> {
+        let dir = self.blobs.as_ref().ok_or(StoreError::NoBlobs)?;
+        let mut files = 0;
+        for entry in std::fs::read_dir(dir).map_err(io(dir))? {
+            entry.map_err(io(dir))?;
+            files += 1;
+        }
+        Ok(files)
     }
 
     /// Stores `bytes` under their sha256: staged, fsynced, renamed, and the directory fsynced. A
@@ -868,6 +964,36 @@ mod tests {
                 .execute_batch(&format!("INSERT INTO prior_coverage VALUES {row}"));
             assert!(refused.is_err(), "{row}");
         }
+        Ok(())
+    }
+
+    /// Section 8 row MG19. The copy goes through SQLite's own locks, so a writer that took no
+    /// lease and holds the file is refused, not copied mid-write. Mutation 2026-11-24,
+    /// `copy_database` by `fs::copy`: red.
+    #[test]
+    fn a_copy_of_a_database_a_leaseless_writer_holds_is_refused_and_taken_once_it_lets_go(
+    ) -> TestResult {
+        let (root, out) = (TempDir::new()?, TempDir::new()?);
+        seeded(&root)?;
+        let Some(reader) = Store::leased_read(root.path())? else {
+            return Err("no store".into());
+        };
+        let writer = Connection::open(root.path().join(DB_FILE))?;
+        writer.execute_batch("BEGIN EXCLUSIVE")?;
+        let refused = reader.copy_database(&out.path().join(DB_FILE));
+        assert!(
+            matches!(refused, Err(StoreError::LeaseHeld(_))),
+            "{refused:?}"
+        );
+        writer.execute_batch("ROLLBACK")?;
+        let again = TempDir::new()?;
+        reader.copy_database(&again.path().join(DB_FILE))?;
+        let rows: i64 = Connection::open(again.path().join(DB_FILE))?.query_row(
+            "SELECT COUNT(*) FROM question_docs",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rows, 1);
         Ok(())
     }
 

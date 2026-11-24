@@ -94,8 +94,13 @@ fn schema_prints_one_json_value_and_one_command_when_asked_for_it() -> TestResul
 }
 
 #[test]
-fn help_carries_the_fixed_headings_at_both_levels() -> TestResult {
-    for args in [&["--help"][..], &["shadow", "run", "--help"][..]] {
+fn help_carries_the_fixed_headings_at_every_level() -> TestResult {
+    for args in [
+        &["--help"][..],
+        &["shadow", "run", "--help"][..],
+        &["snapshot", "--help"][..],
+        &["verify", "--help"][..],
+    ] {
         let help = String::from_utf8(modelgate(args, None)?.stdout)?;
         for heading in ["USAGE:", "OPTIONS:", "OUTPUT:", "EXIT CODES:", "EXAMPLES:"] {
             assert!(help.contains(heading), "{args:?} lacks {heading}\n{help}");

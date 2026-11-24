@@ -79,7 +79,8 @@ const IMAGE_IDENTITY: &str =
     "docker inspect --format '{{.Config.User}} {{json .Config.Entrypoint}}'";
 const IMAGE_IDENTITY_EXPECTED: &str =
     "| grep -Fx '10001 [\"/usr/bin/tini\",\"--\",\"/usr/local/bin/newsvault\"]'";
-const SERVICES: [&str; 6] = [
+const SERVICES: [&str; 7] = [
+    "modelgate-backup.service",
     "modelgate-shadow.service",
     "newsvault-collect.service",
     "newsvault-robots-refresh.service",
@@ -115,6 +116,11 @@ const BACKUP_FAMILIES: [&str; 2] = [
     "newsvault_backup_last_success_timestamp_seconds",
     "newsvault_backup_last_success_bytes",
 ];
+/// `deploy/systemd/newsvault-backup modelgate`'s.
+const GATE_BACKUP_FAMILIES: [&str; 2] = [
+    "modelgate_backup_last_success_timestamp_seconds",
+    "modelgate_backup_last_success_bytes",
+];
 /// `deploy/systemd/modelgate-shadow`'s, from the run's envelope.
 const SHADOW_FAMILIES: [&str; 4] = [
     "modelgate_shadow_spent_micro_usd",
@@ -130,7 +136,10 @@ const MODELGATE_SMOKE: (&str, &str) = (
     "--dry-run --format json | jq -e '.dry_run and .question_document == \"ripple-shadow/1\"'",
 );
 /// Written for a person reading the textfile or a dashboard; no alert reads them.
-const UNREAD_FAMILIES: [&str; 1] = ["newsvault_backup_last_success_bytes"];
+const UNREAD_FAMILIES: [&str; 2] = [
+    "newsvault_backup_last_success_bytes",
+    "modelgate_backup_last_success_bytes",
+];
 /// The roster fetch's requests: one robots.txt and one file (`cmd_roster::FILES`).
 const ROSTER_REQUESTS: i32 = 2;
 const DAY_S: i64 = 86_400;
@@ -358,6 +367,7 @@ fn every_metric_written_has_an_alert_rule_and_no_rule_reads_another() -> TestRes
         .iter()
         .chain(&UNIT_RESULT_FAMILIES)
         .chain(&BACKUP_FAMILIES)
+        .chain(&GATE_BACKUP_FAMILIES)
         .chain(&SHADOW_FAMILIES)
         .filter(|family| !UNREAD_FAMILIES.contains(family))
         .map(|family| (*family).to_owned())
@@ -372,7 +382,7 @@ fn every_metric_written_has_an_alert_rule_and_no_rule_reads_another() -> TestRes
         (
             read_by_rules,
             owned(&UNIT_RESULT_FAMILIES),
-            owned(&BACKUP_FAMILIES),
+            owned(&[BACKUP_FAMILIES, GATE_BACKUP_FAMILIES].concat()),
             owned(&SHADOW_FAMILIES)
         )
     );
@@ -721,6 +731,7 @@ fn each_timer_starts_its_own_service() -> TestResult {
         "newsvault-backup.timer",
         "newsvault-roster.timer",
         "modelgate-shadow.timer",
+        "modelgate-backup.timer",
     ] {
         let unit = read(&format!("deploy/systemd/{timer}"))?;
         started.push((timer, unit_values(&unit, "Unit")));
@@ -747,6 +758,10 @@ fn each_timer_starts_its_own_service() -> TestResult {
             (
                 "modelgate-shadow.timer",
                 vec!["modelgate-shadow.service".to_owned()]
+            ),
+            (
+                "modelgate-backup.timer",
+                vec!["modelgate-backup.service".to_owned()]
             ),
         ]
     );
@@ -2194,7 +2209,8 @@ fn the_unit_result_names_success_and_the_exit_status_through_a_renamed_hidden_fi
 }
 
 /// The scripts that write node-exporter textfiles, each with the arguments its unit passes.
-const TEXTFILE_SCRIPTS: [(&str, &[&str]); 4] = [
+const TEXTFILE_SCRIPTS: [(&str, &[&str]); 5] = [
+    ("deploy/systemd/newsvault-backup", &["modelgate"]),
     ("deploy/systemd/modelgate-shadow", &[]),
     ("deploy/systemd/newsvault-watchdog", &[]),
     ("deploy/systemd/newsvault-unit-result", &["collect"]),
@@ -2502,17 +2518,17 @@ fn the_shadow_unit_succeeds_on_exit_7_records_its_result_and_ends_before_its_nex
 }
 
 /// `promtool` runs the cases in CI only and counts none, so a removed case is red here: each
-/// shadow alert keeps a case that expects it quiet and one that expects it firing.
+/// modelgate alert keeps a case that expects it quiet and one that expects it firing.
 #[test]
-fn each_shadow_alert_has_a_quiet_and_a_firing_promtool_case() -> TestResult {
+fn each_modelgate_alert_has_a_quiet_and_a_firing_promtool_case() -> TestResult {
     let rules = read("deploy/prometheus/newsvault.rules.yml")?;
     let cases = trimmed(&read("deploy/prometheus/newsvault.rules.test.yml")?);
     let mut seen = Vec::new();
     for alert in rules
         .lines()
-        .filter_map(|line| line.trim().strip_prefix("- alert: ModelgateShadow"))
+        .filter_map(|line| line.trim().strip_prefix("- alert: Modelgate"))
     {
-        let named = format!("alertname: ModelgateShadow{alert}");
+        let named = format!("alertname: Modelgate{alert}");
         let expectations = |quiet: bool| {
             cases
                 .windows(2)
@@ -2530,10 +2546,17 @@ fn each_shadow_alert_has_a_quiet_and_a_firing_promtool_case() -> TestResult {
             expectations(false) > 0,
         ));
     }
-    let expected: Vec<_> = ["Failed", "Stale", "CostCapReached", "SpendNearTotalCap"]
-        .iter()
-        .map(|alert| ((*alert).to_owned(), true, true))
-        .collect();
+    let expected: Vec<_> = [
+        "ShadowFailed",
+        "ShadowStale",
+        "ShadowCostCapReached",
+        "ShadowSpendNearTotalCap",
+        "BackupStale",
+        "BackupFailed",
+    ]
+    .iter()
+    .map(|alert| ((*alert).to_owned(), true, true))
+    .collect();
     assert_eq!(seen, expected);
     Ok(())
 }
@@ -2552,6 +2575,72 @@ fn the_shadow_staleness_threshold_is_two_intervals_plus_one_runs_bound() -> Test
                 .first()
                 .map(|bound| 2 * SHADOW_INTERVAL_S + bound + DEFAULT_TIMEOUT_STOP_S),
             1
+        )
+    );
+    Ok(())
+}
+
+/// Section 8 row MG19. The copy holds the shadow lock only between its start and its wait plus
+/// the snapshot's bound and kill grace, and no shadow firing falls inside that; the wait outlasts
+/// the hard bound of the run fired before it, so only a run by hand makes it give up. Its
+/// staleness threshold is the vault backup's: two daily intervals plus one run's bound.
+#[test]
+fn the_gate_backup_holds_the_shadow_lock_between_two_firings_and_outwaits_a_timer_run() -> TestResult
+{
+    let timer = read("deploy/systemd/modelgate-backup.timer")?;
+    let unit = read("deploy/systemd/modelgate-backup.service")?;
+    let script = read("deploy/systemd/newsvault-backup")?;
+    let rules = read("deploy/prometheus/newsvault.rules.yml")?;
+    let shadow = read("deploy/systemd/modelgate-shadow.service")?;
+    let firings = shadow_firings(&read("deploy/systemd/modelgate-shadow.timer")?);
+    let constant = |name| script_constant(&script, name).unwrap_or(i64::MAX);
+    let wait = constant("lock_wait");
+    let held_until = wait + constant("snapshot_bound") + constant("snapshot_kill");
+    let run_bound = integers(&unit_values(&shadow, "TimeoutStartSec"))
+        .first()
+        .map_or(i64::MAX, |bound| bound + DEFAULT_TIMEOUT_STOP_S);
+    let starts = daily_times(&timer);
+    let fits: Vec<(Option<i64>, bool)> = starts
+        .iter()
+        .flatten()
+        .map(|start| {
+            let since = |fired: &i64| (start - fired).rem_euclid(DAY_S);
+            let until = |fired: &i64| (fired - start).rem_euclid(DAY_S);
+            (
+                firings.iter().map(until).min(),
+                firings.iter().all(|fired| run_bound - since(fired) <= wait)
+                    && firings.iter().all(|fired| until(fired) > held_until),
+            )
+        })
+        .collect();
+    let bound = integers(&unit_values(&unit, "TimeoutStartSec"));
+    assert_eq!(
+        (
+            fits,
+            held_until,
+            unit_values(&unit, "ExecStart"),
+            unit_values(&unit, "ExecStopPost"),
+            unit_values(&unit, "SuccessExitStatus").len() + unit_values(&unit, "Restart").len(),
+            unit_values(&timer, "AccuracySec"),
+            unit_values(&timer, "RandomizedDelaySec").len()
+                + unit_values(&timer, "Persistent").len(),
+            threshold(&rules, "ModelgateBackupStale"),
+        ),
+        (
+            vec![(Some(960), true)],
+            930,
+            vec![format!("{SCRIPTS}/newsvault-backup modelgate")],
+            vec![
+                result_line("gatebackup"),
+                format!("-{}", removal("modelgate-backup")),
+                format!("-{}", removal("modelgate-backup-verify")),
+            ],
+            0,
+            vec!["1s".to_owned()],
+            0,
+            bound
+                .first()
+                .map(|bound| 2 * DAY_S + bound + DEFAULT_TIMEOUT_STOP_S),
         )
     );
     Ok(())

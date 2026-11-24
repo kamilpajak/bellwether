@@ -47,6 +47,7 @@
 
 pub mod cap;
 pub mod cmd_shadow;
+pub mod cmd_snapshot;
 pub mod coverage;
 pub mod ledger;
 pub mod model;

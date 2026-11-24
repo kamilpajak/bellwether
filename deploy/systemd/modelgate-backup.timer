@@ -1,0 +1,14 @@
+# Daily at 23:30:00 UTC: the 23:16 shadow run's hard bound (23:42:30) falls inside the script's
+# wait for the shadow lock, and the snapshot's bound ends before the 23:46 firing.
+# services/newsvault/tests/deploy.rs derives both. No Persistent=: ModelgateBackupStale names a miss.
+[Unit]
+Description=modelgate backup, daily (UTC)
+Documentation=https://github.com/kamilpajak/bellwether/blob/main/docs/design/architecture.md
+
+[Timer]
+OnCalendar=*-*-* 23:30:00 UTC
+AccuracySec=1s
+Unit=modelgate-backup.service
+
+[Install]
+WantedBy=timers.target
