@@ -506,3 +506,73 @@ tests:
       - eval_time: 0m
         alertname: ModelgateShadowFailed
         exp_alerts: []
+
+  # A copy of the gate's store at t=0, the file re-read each hour: fresh for 2 days, stale after;
+  # its failed run alerts by its own unit label and the vault backup's alert stays quiet.
+  - interval: 1h
+    input_series:
+      - series: 'modelgate_backup_last_success_timestamp_seconds'
+        values: '0x60'
+      - series: 'newsvault_unit_result_success{unit="gatebackup"}'
+        values: '1 0'
+      - series: 'newsvault_unit_result_success{unit="backup"}'
+        values: '1 1'
+    alert_rule_test:
+      - eval_time: 48h
+        alertname: ModelgateBackupStale
+        exp_alerts: []
+      - eval_time: 49h
+        alertname: ModelgateBackupStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: no copy of the modelgate store has reached Nextcloud for over 2 days, or none ever.
+      - eval_time: 0h
+        alertname: ModelgateBackupFailed
+        exp_alerts: []
+      - eval_time: 1h
+        alertname: ModelgateBackupFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              unit: gatebackup
+            exp_annotations:
+              summary: the last modelgate backup run failed; at exit 7 a run held the shadow lock or a step to Nextcloud failed, at exit 8 the copy is up and old copies were not deleted.
+      - eval_time: 1h
+        alertname: NewsvaultBackupFailed
+        exp_alerts: []
+
+  # No copy of the gate's store ever written is stale, not silent, whatever the vault's copy says.
+  - interval: 1h
+    input_series:
+      - series: 'newsvault_backup_last_success_timestamp_seconds'
+        values: '0'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: ModelgateBackupStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: no copy of the modelgate store has reached Nextcloud for over 2 days, or none ever.
+      - eval_time: 0m
+        alertname: NewsvaultBackupStale
+        exp_alerts: []
+
+  # Two missed days: quiet at 174,600 s, stale at 174,900 s, either side of 174,690.
+  - interval: 5m
+    input_series:
+      - series: 'modelgate_backup_last_success_timestamp_seconds'
+        values: '0x720'
+    alert_rule_test:
+      - eval_time: 48h30m
+        alertname: ModelgateBackupStale
+        exp_alerts: []
+      - eval_time: 48h35m
+        alertname: ModelgateBackupStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: no copy of the modelgate store has reached Nextcloud for over 2 days, or none ever.

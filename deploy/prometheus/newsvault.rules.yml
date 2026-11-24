@@ -185,3 +185,21 @@ groups:
           severity: warning
         annotations:
           summary: the modelgate store has spent {{ $value }} USD, at least 80% of its total cap.
+
+      # The gate's store: its answers were produced once, at observation time. The threshold is
+      # NewsvaultBackupStale's (2 x 86,400 s + TimeoutStartSec 1,800 s + 90 s stop timeout).
+      - alert: ModelgateBackupStale
+        expr: |
+          (time() - max(modelgate_backup_last_success_timestamp_seconds)) > 174690
+          or absent(modelgate_backup_last_success_timestamp_seconds)
+        labels:
+          severity: critical
+        annotations:
+          summary: no copy of the modelgate store has reached Nextcloud for over 2 days, or none ever.
+
+      - alert: ModelgateBackupFailed
+        expr: max by (unit) (newsvault_unit_result_success{unit="gatebackup"} == 0)
+        labels:
+          severity: warning
+        annotations:
+          summary: the last modelgate backup run failed; at exit 7 a run held the shadow lock or a step to Nextcloud failed, at exit 8 the copy is up and old copies were not deleted.

@@ -15,6 +15,7 @@ use modelgate::cmd_shadow::{
     self, Args, Env, ShadowError, ERROR_SCHEMA, EXIT_INCOMPLETE, EXIT_NOT_FOUND, EXIT_OK,
     EXIT_TRANSIENT, EXIT_USAGE,
 };
+use modelgate::cmd_snapshot::{self, SNAPSHOT_SCHEMA, VERIFY_SCHEMA};
 use modelgate::ledger::SendPermit;
 use modelgate::wire::{
     ApiKey, Exchanged, KeyError, ModelExchange, ModelWire, ENDPOINT, KEY_FILE_VARIABLE,
@@ -44,6 +45,7 @@ EXIT CODES:
 EXAMPLES:
   modelgate schema --format json
   modelgate schema shadow run
+  modelgate verify --store /tmp/restored --format json
 ";
 
 const RUN_HELP: &str = "\
@@ -76,6 +78,53 @@ EXAMPLES:
       --dry-run --format json
 ";
 
+const SNAPSHOT_HELP: &str = "\
+{about}
+
+USAGE:
+  {usage}
+
+OPTIONS:
+{options}
+
+OUTPUT:
+  stdout: one modelgate.snapshot/1 object for exit 0, nothing otherwise.
+  stderr: one modelgate.error/1 object under --format json; otherwise `error: <text> (<code>)`.
+
+EXIT CODES:
+  0  the database and every blob a row names are in --out
+  2  invalid_argument (--out is not empty), input_schema_mismatch, io_failed (a named blob is
+     missing or does not hash to its name; the copy fails quick_check)
+  4  input_absent: no gate.sqlite or no LOCK in the store
+  7  lease_held: a run holds the store's LOCK (retryable)
+
+EXAMPLES:
+  modelgate snapshot --store ~/.bellwether/modelgate --out /tmp/gate-copy --format json
+";
+
+const VERIFY_HELP: &str = "\
+{about}
+
+USAGE:
+  {usage}
+
+OPTIONS:
+{options}
+
+OUTPUT:
+  stdout: one modelgate.store_verify/1 object for exit 0, nothing otherwise.
+  stderr: one modelgate.error/1 object under --format json; otherwise `error: <text> (<code>)`.
+
+EXIT CODES:
+  0  the database passes quick_check and every blob a row names hashes to its name
+  2  input_schema_mismatch, io_failed (the database fails quick_check; the error names a blob
+     that is missing or altered)
+  4  input_absent: no gate.sqlite in the store
+
+EXAMPLES:
+  modelgate verify --store /tmp/restored --format json
+";
+
 #[derive(Parser)]
 #[command(
     name = "modelgate",
@@ -93,6 +142,23 @@ enum Command {
     /// Record-only labelling of news stories. Nothing reads a price or builds a list.
     #[command(subcommand)]
     Shadow(Shadow),
+    /// Copy the database and every blob a row names into an empty directory, under the store's
+    /// LOCK. The daily backup's input.
+    #[command(help_template = SNAPSHOT_HELP)]
+    Snapshot {
+        /// An absent or empty directory; it receives gate.sqlite and blobs/.
+        #[arg(long)]
+        out: PathBuf,
+        #[command(flatten)]
+        read: ReadArgs,
+    },
+    /// Check a store's database, count its rows and read every blob they name. Writes nothing
+    /// and takes no lock.
+    #[command(help_template = VERIFY_HELP)]
+    Verify {
+        #[command(flatten)]
+        read: ReadArgs,
+    },
     /// This binary's commands, options, outputs and exit codes, as JSON.
     Schema {
         /// A command path, such as `shadow run`. Without one, every command.
@@ -100,6 +166,21 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Json)]
         format: Format,
     },
+}
+
+#[derive(clap::Args)]
+struct ReadArgs {
+    /// The gate's store. Defaults to $BELLWETHER_MODELGATE, then ~/.bellwether/modelgate.
+    #[arg(long)]
+    store: Option<PathBuf>,
+    /// Accepted and does nothing: no command here prompts or reads stdin.
+    #[arg(long)]
+    non_interactive: bool,
+    #[arg(long, value_enum, default_value_t = Format::Human)]
+    format: Format,
+    /// Alias of --format json.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -230,6 +311,47 @@ fn schema_doc() -> Value {
                 "spends_money": true,
                 "network": [ENDPOINT]
             },
+            {"path": ["snapshot"],
+             "summary": "Copies gate.sqlite by SQLite's online backup and every blob a row of that copy names into --out, under the store's LOCK opened without write access. rows are the copy's. A blob no row names is left behind and counted.",
+             "options": [
+                 {"name": "out", "type": "path", "required": true,
+                  "doc": "absent or empty, else invalid_argument"},
+                 {"name": "store", "type": "path"},
+                 {"name": "non_interactive", "type": "flag",
+                  "doc": "accepted and does nothing: no command here prompts or reads stdin"},
+                 {"name": "format", "type": "enum", "values": ["human", "json"],
+                  "default": "human"},
+                 {"name": "json", "type": "flag", "doc": "alias of --format json"}
+             ],
+             "env": [{"name": STORE_VARIABLE,
+                      "doc": "the store when --store is not given, then ~/.bellwether/modelgate"}],
+             "output": SNAPSHOT_SCHEMA,
+             "exits": {
+                 "0": "the database and every named blob are in --out",
+                 "2": "invalid_argument, input_schema_mismatch, io_failed: a named blob is missing or altered, or the copy fails quick_check",
+                 "4": "input_absent: no gate.sqlite or no LOCK",
+                 "7": "lease_held"
+             },
+             "mutates": true, "spends_money": false, "network": []},
+            {"path": ["verify"],
+             "summary": "Runs PRAGMA quick_check, counts the rows of every table and reads every blob a row names, each refused unless it hashes to its name. Read-only, no lock.",
+             "options": [
+                 {"name": "store", "type": "path"},
+                 {"name": "non_interactive", "type": "flag",
+                  "doc": "accepted and does nothing: no command here prompts or reads stdin"},
+                 {"name": "format", "type": "enum", "values": ["human", "json"],
+                  "default": "human"},
+                 {"name": "json", "type": "flag", "doc": "alias of --format json"}
+             ],
+             "env": [{"name": STORE_VARIABLE,
+                      "doc": "the store when --store is not given, then ~/.bellwether/modelgate"}],
+             "output": VERIFY_SCHEMA,
+             "exits": {
+                 "0": "the database passes quick_check and every named blob hashes to its name",
+                 "2": "input_schema_mismatch, io_failed: the database fails quick_check, or a named blob is missing or altered",
+                 "4": "input_absent: no gate.sqlite"
+             },
+             "mutates": false, "spends_money": false, "network": []},
             {"path": ["schema"], "summary": "This document, or one command of it.",
              "options": [
                  {"name": "command", "type": "words"},
@@ -405,6 +527,38 @@ fn shadow_run(run: RunArgs) -> u8 {
     }
 }
 
+/// `snapshot` with `out`, `verify` without.
+fn store_read(read: ReadArgs, out: Option<&PathBuf>) -> u8 {
+    let format = if read.json { Format::Json } else { read.format };
+    let Some(store) = store_root(read.store) else {
+        let message = format!("no --store, no {STORE_VARIABLE} and no HOME");
+        return fail(
+            "invalid_argument",
+            EXIT_USAGE,
+            false,
+            &message,
+            &json!({}),
+            format,
+        );
+    };
+    let done = match out {
+        Some(out) => cmd_snapshot::snapshot(&store, out),
+        None => cmd_snapshot::verify(&store),
+    };
+    match done.map(|envelope| print(&envelope, format)) {
+        Ok(Ok(())) => EXIT_OK,
+        Ok(Err(why)) => fail(
+            "io_failed",
+            EXIT_USAGE,
+            false,
+            &why.to_string(),
+            &json!({}),
+            format,
+        ),
+        Err(failure) => report(&failure, format),
+    }
+}
+
 fn report(failure: &ShadowError, format: Format) -> u8 {
     fail(
         failure.code(),
@@ -479,6 +633,8 @@ fn main() -> ExitCode {
     };
     let exit = match cli.command {
         Command::Shadow(Shadow::Run(run)) => shadow_run(*run),
+        Command::Snapshot { out, read } => store_read(read, Some(&out)),
+        Command::Verify { read } => store_read(read, None),
         Command::Schema { command, format } => schema(&command, format),
     };
     ExitCode::from(exit)
@@ -553,7 +709,7 @@ mod tests {
             assert_eq!(parsed, in_schema, "{}", entry["path"]);
             checked += 1;
         }
-        assert_eq!(checked, 2);
+        assert_eq!(checked, 4);
     }
 
     /// Exit 7 carries the run's envelope under `details`, and no binary test reaches a send.
