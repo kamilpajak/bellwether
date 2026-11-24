@@ -811,7 +811,7 @@ fn strings(value: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Section 8 row N3. The first night packs the dictionary and every blob, the second only the
+/// Section 8 row B3. The first night packs the dictionary and every blob, the second only the
 /// two blobs indexed since, the third none; no log archive holds a blob. The newest archive and
 /// every pack, unpacked, are a store `blobs verify` accepts, and a dry run over the restored log
 /// finds nothing the packs lack.
@@ -882,7 +882,7 @@ fn each_night_packs_only_what_no_pack_holds_and_the_restore_verifies() -> TestRe
     Ok(())
 }
 
-/// Section 8 row N3. A pack that is gone, one of another length, a manifest with no `end` line
+/// Section 8 row B3. A pack that is gone, one of another length, a manifest with no `end` line
 /// and a pack with no manifest: a dry run names each and counts every member as unpacked; the
 /// next night exits 8 naming it, deletes nothing and packs the members again, after which the
 /// packs that count restore to a store `blobs verify` accepts.
