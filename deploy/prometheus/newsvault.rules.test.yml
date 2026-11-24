@@ -549,3 +549,11 @@ tests:
       - eval_time: 0m
         alertname: ModelgateShadowFailed
         exp_alerts: []
+      # Nor is an embed step that never ended at exit 0.
+      - eval_time: 0m
+        alertname: ModelgateEmbedStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: no modelgate embed step has ended at exit 0 for over 86 min, or none ever; the journal of the shadow unit names why.

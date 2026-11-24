@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use modelgate::cmd_embed::COMPARE_SECONDS_PAST_DEADLINE;
 use tempfile::TempDir;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -1207,6 +1208,24 @@ fn a_dedup_report_runs_offline_over_a_read_only_store_in_place_of_both_steps() -
             "dedup sample --store /modelgate --format json --seed 7 --per-stratum 2 \
              --snapshot /cut/a-snapshot",
         ),
+        (
+            &[
+                "--dedup",
+                "sample",
+                "--seed",
+                "7",
+                "--per-stratum",
+                "2",
+                "--space",
+                "modelgate.embed/1;model=example/embed-1;epoch=1",
+                "--compare-version",
+                "dedup.compare/1(window_days=7;exchanges=NYSE,OTC)",
+            ][..],
+            "dedup sample --store /modelgate --format json --seed 7 --per-stratum 2 \
+             --snapshot /cut/a-snapshot \
+             --compare-version dedup.compare/1(window_days=7;exchanges=NYSE,OTC) \
+             --space modelgate.embed/1;model=example/embed-1;epoch=1",
+        ),
     ] {
         let ran = shadow(
             Setup {
@@ -1244,5 +1263,72 @@ fn a_dedup_report_runs_offline_over_a_read_only_store_in_place_of_both_steps() -
         ));
     }
     assert_eq!(seen, expected);
+    // A group's name belongs to the sample alone, and is a token of the two names' letters.
+    for args in [
+        &["--dedup", "distribution", "--space", "x"][..],
+        &["--space", "x"][..],
+        &[
+            "--dedup",
+            "sample",
+            "--seed",
+            "7",
+            "--per-stratum",
+            "2",
+            "--space",
+            "a b",
+        ][..],
+    ] {
+        let refused = shadow(Setup { args, ..EMBEDDING }, None)?;
+        assert_eq!(
+            (refused.exit, refused.docker.len()),
+            (Some(2), 0),
+            "{args:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Section 8 row MG25, the two cases in which the step is not reached. Mutations 2026-11-24,
+/// each alone: the test of the seconds left made never true; the step also run after a labelling
+/// that ended 7: red each.
+#[test]
+fn the_embed_step_is_off_when_too_little_time_is_left_or_the_labelling_did_not_end_0_or_8(
+) -> TestResult {
+    // The stub clock: the cut starts at 1000 and every later reading is that many seconds on.
+    let at = |cut_seconds| Setup {
+        cut_seconds,
+        ..EMBEDDING
+    };
+    let (late, in_time) = (shadow(at("1355"), None)?, shadow(at("1349"), None)?);
+    assert_eq!(
+        (
+            late.exit,
+            late.docker.len(),
+            late.stderr.contains("115 s are left"),
+            in_time.docker.len(),
+            in_time.timeouts.last().map(String::as_str),
+        ),
+        (Some(0), 2, true, 3, Some("--kill-after 10 121")),
+        "{}",
+        late.stderr
+    );
+    let unreachable = shadow(
+        Setup {
+            run: "7",
+            envelope: NO_COST,
+            ..EMBEDDING
+        },
+        None,
+    )?;
+    assert_eq!((unreachable.exit, unreachable.docker.len()), (Some(7), 2));
+    // The comparison's own bound past the deadline ends before the container is stopped.
+    let script = std::fs::read_to_string(repo("deploy/systemd/modelgate-shadow"))?;
+    let seconds = |name: &str| {
+        let line = script.lines().find_map(|line| line.strip_prefix(name));
+        line.and_then(|value| value.parse::<i64>().ok())
+    };
+    let (reserve, stop) = (seconds("embed_reserve="), seconds("embed_stop="));
+    assert_eq!((reserve, stop), (Some(120), Some(30)));
+    assert!(reserve.unwrap_or(0) - stop.unwrap_or(0) > COMPARE_SECONDS_PAST_DEADLINE);
     Ok(())
 }

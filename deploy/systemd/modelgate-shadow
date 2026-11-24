@@ -6,7 +6,8 @@
 # --from-seq N. A live run without --limit sends at most MODELGATE_LIMIT requests. With the nine
 # MODELGATE_EMBED_* settings `modelgate embed run` follows and never changes the exit:
 # --embed-limit N, --embed-ack-cost-model RUN_ID. In place of both steps, a read-only report:
-# --dedup distribution, or --dedup sample --seed N --per-stratum M.
+# --dedup distribution, or --dedup sample --seed N --per-stratum M, with --compare-version TOKEN
+# and --space NAME when the store holds comparisons of several (the refusal prints both).
 # Exits: 0; 7 retryable (a lock held, the cut past its bound, the vendor unreachable); 8 the
 # envelope names why; 2 setup or a setting; 4 an absent input; 137 the cut killed before its bound.
 set -u
@@ -23,8 +24,9 @@ cut_kill=30
 # Owner decision 2026-11-23: the whole shadow spends at most this many USD.
 total_ceiling=15
 # The unit's TimeoutStartSec; services/newsvault/tests/deploy.rs holds the two equal. No embed call
-# starts later than embed_reserve + 20 s before it: the reserve is the comparison's and the
-# metrics' time (section 3.5, "Repeated releases", where the comparison was timed).
+# starts later than embed_reserve + 20 s before it. Of the reserve, the comparison may use the
+# binary's COMPARE_SECONDS_PAST_DEADLINE; services/modelgate/tests/deploy.rs holds that below
+# embed_reserve - embed_stop, and the rest is the envelope's and the metrics' time.
 run_bound=1500
 embed_reserve=120
 # The embed container is stopped this long before the unit's bound, so the script ends itself.
@@ -103,7 +105,7 @@ if [ -n "${MODELGATE_EMBED_MODEL-}${MODELGATE_EMBED_PROVIDER-}${MODELGATE_EMBED_
 fi
 
 usage() {
-    echo "usage: modelgate-shadow [--dry-run [--from-seq N]] [--limit N] [--ack-cost-model RUN_ID] [--embed-limit N] [--embed-ack-cost-model RUN_ID] | --dedup distribution | --dedup sample --seed N --per-stratum M" >&2
+    echo "usage: modelgate-shadow [--dry-run [--from-seq N]] [--limit N] [--ack-cost-model RUN_ID] [--embed-limit N] [--embed-ack-cost-model RUN_ID] | --dedup distribution | --dedup sample --seed N --per-stratum M [--compare-version TOKEN] [--space NAME]" >&2
     exit 2
 }
 dry=''
@@ -115,6 +117,8 @@ embed_ack=''
 dedup=''
 seed=''
 per_stratum=''
+group_version=''
+group_space=''
 given=$#
 # The words for `shadow run` are appended again behind the given ones, which are then dropped.
 for arg; do
@@ -125,12 +129,15 @@ for arg; do
         --embed-ack-cost-model:*) setting "$previous" "$arg" 'A-Za-z0-9.:-'; embed_ack=$arg; previous='' ;;
         --seed:*) setting "$previous" "$arg" '0-9'; seed=$arg; previous='' ;;
         --per-stratum:*) setting "$previous" "$arg" '0-9'; per_stratum=$arg; previous='' ;;
+        --compare-version:*) setting "$previous" "$arg" 'A-Za-z0-9._/=;(),-'; group_version=$arg; previous='' ;;
+        --space:*) setting "$previous" "$arg" 'A-Za-z0-9._/=;(),-'; group_space=$arg; previous='' ;;
         --dedup:distribution | --dedup:sample) dedup=$arg; previous='' ;;
         :--dry-run) dry=yes; set -- "$@" "$arg" ;;
         :--from-seq) floor=yes; previous=$arg; set -- "$@" "$arg" ;;
         :--limit) limited=yes; previous=$arg; set -- "$@" "$arg" ;;
         :--ack-cost-model) previous=$arg; set -- "$@" "$arg" ;;
         :--embed-limit | :--embed-ack-cost-model | :--dedup | :--seed | :--per-stratum) previous=$arg ;;
+        :--compare-version | :--space) previous=$arg ;;
         *) usage ;;
     esac
 done
@@ -144,6 +151,7 @@ case $dedup:$#:$embed_limit$embed_ack:$seed:$per_stratum in
     :*:?*:: ) [ -n "$embed" ] || { echo "--embed-limit or --embed-ack-cost-model without the embed step" >&2; exit 2; } ;;
     *) usage ;;
 esac
+[ -z "$group_version$group_space" ] || [ "$dedup" = sample ] || usage
 
 : "${XDG_RUNTIME_DIR:?not set: run as the unit does, or from a login session}"
 [ -d "$vault" ] || { echo "no store at $vault" >&2; exit 4; }
@@ -213,6 +221,8 @@ if [ -n "$dedup" ]; then
         --format json
     [ "$dedup" = distribution ] ||
         set -- "$@" --seed "$seed" --per-stratum "$per_stratum" --snapshot "/cut/$snapshot"
+    [ -z "$group_version" ] || set -- "$@" --compare-version "$group_version"
+    [ -z "$group_space" ] || set -- "$@" --space "$group_space"
     contained modelgate-dedup --network none \
         --mount "type=bind,src=$store,dst=/modelgate,readonly" "$@"
     exit $?
