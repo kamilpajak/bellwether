@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use news_provider::RunId;
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
@@ -205,10 +205,7 @@ pub fn verify(root: &std::path::Path, limit: usize) -> Result<VerifyReport, Blob
     }
     let (active, recorded) = store::recorded_dictionaries(root)?;
     let log = root.join(COMMIT_LOG);
-    let db = log
-        .exists()
-        .then(|| Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY))
-        .transpose()?;
+    let db = log.exists().then(|| store::read_only(&log)).transpose()?;
     let mut indexed = db.as_ref().map(|_| Indexed::default());
     let blobs = store::blob_store(root);
     let mut failures = Failures {

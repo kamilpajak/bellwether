@@ -6,7 +6,8 @@
 //! holds. Row R4's manifest half is [`clients`], its clock half [`clocks`] and its no-sink half
 //! [`sinks`]; the size step's own precondition is [`layout`]. Row R2's doc-test switch is
 //! [`doctests`]. Row G2, no `\r` outside a `-text` path, is [`line_ends`]. Row B2, no committed
-//! zstd dictionary, is [`dictionaries`].
+//! zstd dictionary, is [`dictionaries`]. Row T1, no SQLite connection opened outside a crate's `connect`,
+//! is [`temp_store`].
 //!
 //! The member set comes from `cargo metadata`, never from `workspace.members`: measured
 //! 2026-11-12 on cargo 1.99.1, a crate reached only by a `path` dependency from inside the
@@ -25,6 +26,7 @@ pub mod doctests;
 pub mod layout;
 pub mod line_ends;
 pub mod sinks;
+pub mod temp_store;
 
 const MANIFEST: &str = "Cargo.toml";
 /// The two lines a crate needs in its own manifest to inherit the floor, indented for a message.
