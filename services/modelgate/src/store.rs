@@ -249,7 +249,7 @@ impl Store {
     /// SQLite's online backup into a new file at `target`, then the copy's `quick_check`. A
     /// source another connection has locked is `LeaseHeld`.
     pub fn copy_database(&self, target: &Path) -> Result<(), StoreError> {
-        let mut copy = Connection::open(target)?;
+        let mut copy = connect(target, OpenFlags::default())?;
         {
             let backup = Backup::new(&self.db, &mut copy)?;
             loop {
