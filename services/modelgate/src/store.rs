@@ -2,7 +2,7 @@
 //! vault. Every table is insert-only by trigger. What that does not cover is
 //! `docs/design/architecture.md` section 8 row MG9.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -96,8 +96,8 @@ pub enum StoreError {
     PermitAlreadyTaken,
     #[error("an answer for attempt {answered} was handed to the slot of attempt {slot}")]
     AnswerFromAnotherAttempt { slot: String, answered: String },
-    #[error("the copy at {} is not a whole database: {why}", path.display())]
-    CopyMalformed { path: PathBuf, why: String },
+    #[error("{} is not a whole database: {why}", path.display())]
+    Malformed { path: PathBuf, why: String },
     #[error(
         "the prior-coverage row of story {0} does not read back as the record it was written from"
     )]
@@ -253,18 +253,14 @@ impl Store {
                 }
             }
         }
-        let verdicts: Vec<String> = copy
-            .prepare("PRAGMA quick_check")?
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
-        if verdicts != [QUICK_CHECK_OK] {
-            return Err(StoreError::CopyMalformed {
-                path: target.to_path_buf(),
-                why: verdicts.join("; "),
-            });
-        }
+        quick_check(&copy, target)?;
         copy.close().map_err(|(_, failure)| failure)?;
         Ok(())
+    }
+
+    /// `PRAGMA quick_check`, which reads every table page; `COUNT(*)` reads an index alone.
+    pub fn quick_check(&self) -> Result<(), StoreError> {
+        quick_check(&self.db, Path::new(self.db.path().unwrap_or(DB_FILE)))
     }
 
     /// Rows per table of [`TABLES`].
@@ -280,17 +276,21 @@ impl Store {
             .collect()
     }
 
-    /// Every blob a row names, once, in name order: question files, requests and responses.
-    pub fn blob_names(&self) -> Result<Vec<String>, StoreError> {
-        let mut statement = self.db.prepare(
-            "SELECT file_sha256 FROM question_docs
-             UNION SELECT request_sha256 FROM requests
-             UNION SELECT response_sha256 FROM attempt_events WHERE response_sha256 IS NOT NULL
-             ORDER BY 1",
-        )?;
-        let names = statement
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
+    /// Every blob a row names, once: question files, requests and responses. Three plain scans:
+    /// as one `UNION … ORDER BY`, SQLite's sorter needed a temp file at 100,000 names and the
+    /// backup's container has none (`disk I/O error`, measured 2026-11-24, section 3.5).
+    pub fn blob_names(&self) -> Result<BTreeSet<String>, StoreError> {
+        let mut names = BTreeSet::new();
+        for select in [
+            "SELECT file_sha256 FROM question_docs",
+            "SELECT request_sha256 FROM requests",
+            "SELECT response_sha256 FROM attempt_events WHERE response_sha256 IS NOT NULL",
+        ] {
+            let mut statement = self.db.prepare(select)?;
+            for name in statement.query_map([], |row| row.get(0))? {
+                names.insert(name?);
+            }
+        }
         Ok(names)
     }
 
@@ -808,6 +808,20 @@ impl Store {
     }
 }
 
+fn quick_check(db: &Connection, path: &Path) -> Result<(), StoreError> {
+    let verdicts: Vec<String> = db
+        .prepare("PRAGMA quick_check")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    if verdicts != [QUICK_CHECK_OK] {
+        return Err(StoreError::Malformed {
+            path: path.to_path_buf(),
+            why: verdicts.join("; "),
+        });
+    }
+    Ok(())
+}
+
 /// The schema, its triggers and the version in one transaction: a process killed inside it leaves
 /// `user_version` 0 and no table, so the next open starts again.
 fn create(db: &Connection) -> Result<(), StoreError> {
@@ -833,6 +847,7 @@ mod tests {
     use tempfile::TempDir;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+    const REFUSED_WITHIN: std::time::Duration = std::time::Duration::from_secs(1);
 
     fn at(text: &str) -> Result<DateTime<Utc>, chrono::ParseError> {
         text.parse()
@@ -968,8 +983,7 @@ mod tests {
     }
 
     /// Section 8 row MG19. The copy goes through SQLite's own locks, so a writer that took no
-    /// lease and holds the file is refused, not copied mid-write. Mutation 2026-11-24,
-    /// `copy_database` by `fs::copy`: red.
+    /// lease and holds the file is refused at once, not waited for and not copied mid-write.
     #[test]
     fn a_copy_of_a_database_a_leaseless_writer_holds_is_refused_and_taken_once_it_lets_go(
     ) -> TestResult {
@@ -980,11 +994,14 @@ mod tests {
         };
         let writer = Connection::open(root.path().join(DB_FILE))?;
         writer.execute_batch("BEGIN EXCLUSIVE")?;
+        let asked = std::time::Instant::now();
         let refused = reader.copy_database(&out.path().join(DB_FILE));
         assert!(
             matches!(refused, Err(StoreError::LeaseHeld(_))),
             "{refused:?}"
         );
+        // rusqlite's default busy timeout is 5 s.
+        assert!(asked.elapsed() < REFUSED_WITHIN, "{:?}", asked.elapsed());
         writer.execute_batch("ROLLBACK")?;
         let again = TempDir::new()?;
         reader.copy_database(&again.path().join(DB_FILE))?;
@@ -994,6 +1011,26 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(rows, 1);
+        Ok(())
+    }
+
+    /// Section 8 row MG19: a run cannot write a blob and its row between the copy of the database
+    /// and the copy of the blobs.
+    #[test]
+    fn a_copys_reader_keeps_the_lease_until_it_is_dropped() -> TestResult {
+        let root = TempDir::new()?;
+        seeded(&root)?;
+        let Some(reader) = Store::leased_read(root.path())? else {
+            return Err("no store".into());
+        };
+        let writer = Store::open(root.path());
+        assert!(
+            matches!(writer, Err(StoreError::LeaseHeld(_))),
+            "{:?}",
+            writer.err()
+        );
+        drop(reader);
+        Store::open(root.path())?;
         Ok(())
     }
 

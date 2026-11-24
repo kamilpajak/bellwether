@@ -94,7 +94,7 @@ OUTPUT:
 EXIT CODES:
   0  the database and every blob a row names are in --out
   2  invalid_argument (--out is not empty), input_schema_mismatch, io_failed (a named blob is
-     missing or does not hash to its name; the copy is not a whole database)
+     missing or does not hash to its name; the copy fails quick_check)
   4  input_absent: no gate.sqlite or no LOCK in the store
   7  lease_held: a run holds the store's LOCK (retryable)
 
@@ -116,8 +116,9 @@ OUTPUT:
   stderr: one modelgate.error/1 object under --format json; otherwise `error: <text> (<code>)`.
 
 EXIT CODES:
-  0  the database opens at this build's version and every blob a row names hashes to its name
-  2  input_schema_mismatch, io_failed (the error names the blob)
+  0  the database passes quick_check and every blob a row names hashes to its name
+  2  input_schema_mismatch, io_failed (the database fails quick_check; the error names a blob
+     that is missing or altered)
   4  input_absent: no gate.sqlite in the store
 
 EXAMPLES:
@@ -151,7 +152,8 @@ enum Command {
         #[command(flatten)]
         read: ReadArgs,
     },
-    /// Count a store's rows and read every blob they name. Writes nothing and takes no lock.
+    /// Check a store's database, count its rows and read every blob they name. Writes nothing
+    /// and takes no lock.
     #[command(help_template = VERIFY_HELP)]
     Verify {
         #[command(flatten)]
@@ -310,7 +312,7 @@ fn schema_doc() -> Value {
                 "network": [ENDPOINT]
             },
             {"path": ["snapshot"],
-             "summary": "Copies gate.sqlite by SQLite's online backup and every blob a row names into --out, under the store's LOCK opened without write access. A blob no row names is left behind and counted.",
+             "summary": "Copies gate.sqlite by SQLite's online backup and every blob a row of that copy names into --out, under the store's LOCK opened without write access. rows are the copy's. A blob no row names is left behind and counted.",
              "options": [
                  {"name": "out", "type": "path", "required": true,
                   "doc": "absent or empty, else invalid_argument"},
@@ -332,7 +334,7 @@ fn schema_doc() -> Value {
              },
              "mutates": true, "spends_money": false, "network": []},
             {"path": ["verify"],
-             "summary": "Counts the rows of every table and reads every blob a row names, each refused unless it hashes to its name. Read-only, no lock.",
+             "summary": "Runs PRAGMA quick_check, counts the rows of every table and reads every blob a row names, each refused unless it hashes to its name. Read-only, no lock.",
              "options": [
                  {"name": "store", "type": "path"},
                  {"name": "non_interactive", "type": "flag",
@@ -345,8 +347,8 @@ fn schema_doc() -> Value {
                       "doc": "the store when --store is not given, then ~/.bellwether/modelgate"}],
              "output": VERIFY_SCHEMA,
              "exits": {
-                 "0": "every named blob is present and hashes to its name",
-                 "2": "input_schema_mismatch, io_failed naming the blob",
+                 "0": "the database passes quick_check and every named blob hashes to its name",
+                 "2": "input_schema_mismatch, io_failed: the database fails quick_check, or a named blob is missing or altered",
                  "4": "input_absent: no gate.sqlite"
              },
              "mutates": false, "spends_money": false, "network": []},
