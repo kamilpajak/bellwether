@@ -6,8 +6,8 @@
 //! holds. Row R4's manifest half is [`clients`], its clock half [`clocks`] and its no-sink half
 //! [`sinks`]; the size step's own precondition is [`layout`]. Row R2's doc-test switch is
 //! [`doctests`]. Row G2, no `\r` outside a `-text` path, is [`line_ends`]. Row B2, no committed
-//! zstd dictionary, is [`dictionaries`]. Row T1, no SQLite connection without `temp_store`, is
-//! [`temp_store`].
+//! zstd dictionary, is [`dictionaries`]. Row T1, no SQLite connection opened outside a crate's `connect`,
+//! is [`temp_store`].
 //!
 //! The member set comes from `cargo metadata`, never from `workspace.members`: measured
 //! 2026-11-12 on cargo 1.99.1, a crate reached only by a `path` dependency from inside the

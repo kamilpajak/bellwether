@@ -1,6 +1,6 @@
-//! The temp-store scan: `docs/design/architecture.md` section 8 row T1. A SQLite connection opened
-//! outside a test sets `temp_store` on the next line, so no command of an image run `--read-only`
-//! needs a temporary file. A text scan over every member's `src`, lines before `#[cfg(test)]`.
+//! The temp-store scan: `docs/design/architecture.md` section 8 row T1. A rusqlite constructor is
+//! named outside a test module in two files only, once each: the `connect` of each crate that
+//! opens SQLite, which sets `temp_store`. A text scan over every member's `src`.
 
 use std::path::Path;
 
@@ -8,16 +8,21 @@ use crate::clocks::rust_files;
 use crate::resolve_members;
 
 /// Every rusqlite constructor starts with it: `open`, `open_with_flags`, `open_in_memory`.
-/// Assembled so this file's own text holds no such line.
+/// Assembled so this line is no finding of its own scan.
 pub const OPEN: &str = concat!("Connection", "::open");
-/// The pragma's name as `pragma_update` is given it.
-pub const PRAGMA: &str = "\"temp_store\"";
+/// The files that may name [`OPEN`] outside a test module, once each, in the scan's order.
+pub const OPENERS: [&str; 2] = [
+    "services/modelgate/src/store.rs",
+    "services/newsvault/src/store.rs",
+];
 const TEST_MARKER: &str = "#[cfg(test)]";
+const MODULE: &str = "mod";
+const VISIBILITY: &str = "pub";
 const ROW: &str = "docs/design/architecture.md section 8 row T1";
 
-/// One connection opened with no `temp_store` line after it, as the scan found it.
-#[derive(Debug, PartialEq, Eq)]
-pub struct BareOpen {
+/// One code line outside a test module that names [`OPEN`], as the scan found it.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Open {
     /// Path relative to the workspace root, spelled with `/`.
     pub file: String,
     /// 1-indexed, as an editor counts.
@@ -29,9 +34,23 @@ fn code_of(line: &str) -> &str {
     line.split("//").next().unwrap_or("")
 }
 
-/// Every code line before a file's test marker that names [`OPEN`] and is not followed by a line
-/// naming [`PRAGMA`].
-pub fn bare_opens(root: &Path, members: &[crate::Member]) -> Result<Vec<BareOpen>, String> {
+/// The lines above the file's test module: a marker cuts only when the next line opens a `mod`.
+fn above_the_test_module(text: &str) -> Vec<&str> {
+    let lines: Vec<&str> = text.lines().collect();
+    let opens_a_module = |index: usize| {
+        lines.get(index + 1).is_some_and(|next| {
+            let mut words = next.split_whitespace();
+            words.find(|word| !word.starts_with(VISIBILITY)) == Some(MODULE)
+        })
+    };
+    let end = (0..lines.len())
+        .find(|&index| lines[index].trim() == TEST_MARKER && opens_a_module(index))
+        .unwrap_or(lines.len());
+    lines.into_iter().take(end).collect()
+}
+
+/// Every code line above a file's test module that names [`OPEN`], sorted by file then line.
+pub fn opens(root: &Path, members: &[crate::Member]) -> Result<Vec<Open>, String> {
     let mut found = Vec::new();
     for member in members {
         let src = root.join(&member.path).join("src");
@@ -41,56 +60,70 @@ pub fn bare_opens(root: &Path, members: &[crate::Member]) -> Result<Vec<BareOpen
         for file in rust_files(&src)? {
             let text = std::fs::read_to_string(&file)
                 .map_err(|why| format!("{} could not be read: {why}", file.display()))?;
-            let source: Vec<&str> = text
-                .lines()
-                .take_while(|line| line.trim_start() != TEST_MARKER)
-                .collect();
-            for (index, line) in source.iter().enumerate() {
-                let set_next = source
-                    .get(index + 1)
-                    .is_some_and(|next| code_of(next).contains(PRAGMA));
-                if code_of(line).contains(OPEN) && !set_next {
-                    found.push(BareOpen {
-                        file: file
-                            .strip_prefix(root)
-                            .unwrap_or(&file)
-                            .to_string_lossy()
-                            .replace('\\', "/"),
+            let shown = file
+                .strip_prefix(root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            for (index, line) in above_the_test_module(&text).iter().enumerate() {
+                if code_of(line).contains(OPEN) {
+                    found.push(Open {
+                        file: shown.clone(),
                         line: index + 1,
                     });
                 }
             }
         }
     }
+    found.sort();
     Ok(found)
 }
 
-/// The check: `None` when every connection opened outside a test sets `temp_store` at once.
+/// The opens no opener accounts for: any outside [`OPENERS`], and any after a file's first.
+pub fn bare(found: &[Open]) -> Vec<&Open> {
+    found
+        .iter()
+        .enumerate()
+        .filter(|(index, open)| {
+            let repeated = found[..*index]
+                .iter()
+                .any(|earlier| earlier.file == open.file);
+            repeated || !OPENERS.contains(&open.file.as_str())
+        })
+        .map(|(_, open)| open)
+        .collect()
+}
+
+/// The check: `None` when no connection is opened outside the two `connect` functions.
 pub fn bare_open_failure(root_manifest: &Path) -> Option<String> {
     let root = root_manifest.parent().unwrap_or(Path::new("."));
-    let found = resolve_members(root_manifest).and_then(|members| bare_opens(root, &members));
-    match found {
-        Err(why) => Some(format!("{why}\n\nThe invariant is {ROW}.\n")),
-        Ok(found) if found.is_empty() => None,
-        Ok(found) => Some(format!(
-            concat!(
-                "`{}` on {} code line(s) with no {} line after it:\n\n{}\n\n",
-                "Why this matters: the image runs `--read-only`, and a sort that outgrows SQLite's ",
-                "memory then\nfails with SQLITE_IOERR_GETTEMPPATH (6410). Open through the crate's ",
-                "`connect` instead.\nA TEXT scan: it sees no constructor reached under another ",
-                "name. The invariant is {}.\n",
-            ),
-            OPEN,
-            found.len(),
-            PRAGMA,
-            found
-                .iter()
-                .map(|open| format!("    * {}:{}", open.file, open.line))
-                .collect::<Vec<String>>()
-                .join("\n"),
-            ROW,
-        )),
+    let found = resolve_members(root_manifest).and_then(|members| opens(root, &members));
+    let found = match found {
+        Err(why) => return Some(format!("{why}\n\nThe invariant is {ROW}.\n")),
+        Ok(found) => found,
+    };
+    let bare = bare(&found);
+    if bare.is_empty() {
+        return None;
     }
+    Some(format!(
+        concat!(
+            "`{}` on {} code line(s) outside the one opener of {}:\n\n{}\n\n",
+            "Why this matters: the image runs `--read-only`, and a sort that outgrows SQLite's ",
+            "memory then\nfails with SQLITE_IOERR_GETTEMPPATH (6410) unless the connection keeps ",
+            "its temporary data in\nmemory. Open through the crate's `connect` instead.\n",
+            "A TEXT scan: it sees no constructor reached under another name. The invariant is ",
+            "{}.\n",
+        ),
+        OPEN,
+        bare.len(),
+        OPENERS.join(" and "),
+        bare.iter()
+            .map(|open| format!("    * {}:{}", open.file, open.line))
+            .collect::<Vec<String>>()
+            .join("\n"),
+        ROW,
+    ))
 }
 
 #[cfg(test)]
@@ -102,42 +135,103 @@ mod tests {
 
     const ONE_MEMBER: &str = "[workspace]\nmembers = [\"services/newsvault\"]\nresolver = \"2\"\n";
     const READER: &str = "services/newsvault/src/cmd_new.rs";
+    const OPENER: &str = "services/newsvault/src/store.rs";
+    /// Written out, never built from [`OPEN`]: a narrowed constant must not narrow the fixture.
+    const THREE_CONSTRUCTORS: &str = "fn read() {\n    \
+        let a = Connection::open(log)?;\n    \
+        let b = rusqlite::Connection::open_with_flags(log, flags)?;\n    \
+        let c = Connection::open_in_memory()?;\n    \
+        // Connection::open(log) in a comment\n}\n";
 
     fn one_service() -> Tree {
         Tree::new(ONE_MEMBER).crate_at("services/newsvault", &manifest("newsvault", INHERITS))
     }
 
-    /// §8 row T1 over this workspace.
+    fn seen(tree: &Tree) -> Vec<(String, usize)> {
+        let manifest = tree.root_manifest();
+        let members = resolve_members(&manifest).unwrap();
+        opens(manifest.parent().unwrap(), &members)
+            .unwrap()
+            .into_iter()
+            .map(|open| (open.file, open.line))
+            .collect()
+    }
+
+    /// §8 row T1 over this workspace. The second assertion is the positive control: a scan that
+    /// read no SQLite code would pass the first.
     #[test]
-    fn every_sqlite_connection_opened_outside_a_test_sets_temp_store_on_the_next_line() {
-        let failure = bare_open_failure(&root_manifest()).unwrap_or_default();
+    fn a_sqlite_connection_is_opened_outside_a_test_module_in_the_two_openers_only() {
+        let manifest = root_manifest();
+        let failure = bare_open_failure(&manifest).unwrap_or_default();
         assert!(failure.is_empty(), "\n\n{failure}\n");
+        let members = resolve_members(&manifest).unwrap();
+        let files: Vec<String> = opens(manifest.parent().unwrap(), &members)
+            .unwrap()
+            .into_iter()
+            .map(|open| open.file)
+            .collect();
+        assert_eq!(files, OPENERS);
     }
 
     #[test]
-    fn a_connection_opened_with_no_pragma_after_it_turns_the_scan_red() {
+    fn each_of_the_three_constructors_is_seen_and_a_comment_or_a_test_module_is_not() {
         let tree = one_service();
         tree.write(
             READER,
             &format!(
-                "fn read() {{\n    let db = {OPEN}_with_flags(log, flags)?;\n    db.query()\n}}\n"
+                "{THREE_CONSTRUCTORS}{TEST_MARKER}\nmod tests {{\n    \
+                 fn raw() {{ Connection::open_in_memory(); }}\n}}\n"
             ),
         );
+        let reader = |line: usize| (READER.to_owned(), line);
+        assert_eq!(seen(&tree), [reader(2), reader(3), reader(4)]);
+    }
+
+    #[test]
+    fn an_open_outside_the_two_openers_turns_the_scan_red() {
+        let tree = one_service();
+        tree.write(READER, THREE_CONSTRUCTORS);
         let failure = bare_open_failure(&tree.root_manifest()).expect("expected a failure");
-        assert!(failure.contains(&format!("{READER}:2")), "{failure}");
+        let named = [2, 3, 4].map(|line| failure.contains(&format!("{READER}:{line}")));
+        assert_eq!(named, [true; 3], "{failure}");
     }
 
     #[test]
-    fn an_open_followed_by_the_pragma_or_written_in_a_test_module_is_not_a_finding() {
+    fn an_opener_holds_one_open_and_a_second_turns_the_scan_red() {
+        let tree = one_service();
+        let connect = "fn connect() {\n    Connection::open_with_flags(path, flags)\n}\n";
+        tree.write(OPENER, connect);
+        let one = bare_open_failure(&tree.root_manifest());
+        tree.write(
+            OPENER,
+            &format!("{connect}fn other() {{\n    Connection::open(path)\n}}\n"),
+        );
+        let two = bare_open_failure(&tree.root_manifest()).unwrap_or_default();
+        assert_eq!(
+            (
+                one,
+                two.contains(&format!("{OPENER}:5")),
+                two.contains(&format!("{OPENER}:2"))
+            ),
+            (None, true, false),
+            "{two}"
+        );
+    }
+
+    /// Mutation 2026-11-24: a `#[cfg(test)] const` above an open hid it from a scan that stopped
+    /// at the first marker.
+    #[test]
+    fn a_test_marker_that_opens_no_module_hides_nothing_below_it() {
         let tree = one_service();
         tree.write(
             READER,
             &format!(
-                "fn connect() {{\n    let db = {OPEN}(path)?;\n    \
-                 db.pragma_update(None, {PRAGMA}, \"MEMORY\")?;\n}}\n\
-                 {TEST_MARKER}\nmod tests {{\n    fn raw() {{ {OPEN}_in_memory(); }}\n}}\n"
+                "{TEST_MARKER}\nconst ONLY_IN_TESTS: u8 = 0;\n\
+                 fn read() {{\n    Connection::open(log)\n}}\n\
+                 {TEST_MARKER}\npub(crate) mod tests {{\n    \
+                 fn raw() {{ Connection::open(log); }}\n}}\n"
             ),
         );
-        assert_eq!(bare_open_failure(&tree.root_manifest()), None);
+        assert_eq!(seen(&tree), [(READER.to_owned(), 4)]);
     }
 }
