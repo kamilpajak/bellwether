@@ -64,14 +64,14 @@ OUTPUT:
           otherwise `error: <text> (<code>)`, then the details when there are any.
 
 EXIT CODES:
-  0  no attempt of this run failed or closed unusable, or nothing was new, or a dry run,
-     or the deadline or --limit stopped it
+  0  the run's first canary closed ok and no story's request failed or closed unusable,
+     or nothing was new, or a dry run, or the deadline or --limit stopped it
   2  invalid_argument, input_unparseable, input_schema_mismatch, credential_key_missing,
      credential_key_exposed, io_failed
   4  input_absent
-  7  vendor_unreachable, lease_held (retryable)
-  8  store_failed, cost_estimate_broken, cost_cap_reached, partial_embed, unusable_answer;
-     the envelope names which
+  7  vendor_unreachable (the first canary met a retryable status or no answer), lease_held
+  8  store_failed, cost_estimate_broken, cost_cap_reached, canary_not_ok, partial_embed,
+     unusable_answer; the envelope names which
 
 EXAMPLES:
   modelgate embed run --snapshot /cuts/3f2a --model example/embed-1 --provider example-host \\
@@ -101,6 +101,8 @@ EXIT CODES:
 EXAMPLES:
   modelgate dedup distribution --store /modelgate --format json
   modelgate dedup sample --seed 20261201 --per-stratum 8 --snapshot /cuts/3f2a --format json
+  modelgate dedup sample --seed 20261201 --per-stratum 8 --snapshot /cuts/3f2a \\
+      --compare-version 'dedup.compare/1(window_days=7)' --space 'modelgate.embed/1;epoch=1'
 ";
 
 const RUN_HELP: &str = "\
@@ -175,8 +177,8 @@ enum Shadow {
 
 #[derive(Subcommand)]
 enum Embed {
-    /// One embed request per story of a `newsvault cut` snapshot that has no vector, oldest
-    /// first, then each settled story's nearest earlier stories. Spends money.
+    /// One embed request per story of a `newsvault cut` snapshot that has no vector, behind
+    /// one canary call, then each settled story's nearest earlier stories. Spends money.
     #[command(help_template = EMBED_HELP)]
     Run(Box<EmbedArgs>),
 }
@@ -221,7 +223,7 @@ struct EmbedArgs {
     /// USD per million input tokens, for the worst-case bound.
     #[arg(long)]
     input_price_per_mtok: String,
-    /// Hours after its observation at which a story whose request keeps failing is left.
+    /// Hours after its first attempt at which a story whose request keeps failing is left.
     #[arg(long)]
     give_up_after_hours: u32,
     /// Stories this run embeds at most.
@@ -272,6 +274,9 @@ struct SampleCli {
     /// A snapshot directory written by `newsvault cut`, for the two texts of each pair.
     #[arg(long)]
     snapshot: PathBuf,
+    /// One comparison version's token, when the store holds comparisons of several.
+    #[arg(long)]
+    compare_version: Option<String>,
     /// One space's name, when the store holds comparisons of several.
     #[arg(long)]
     space: Option<String>,
@@ -407,7 +412,7 @@ fn schema_doc() -> Value {
             },
             {
                 "path": ["embed", "run"],
-                "summary": "One embed request per first-sighted story of a newsvault cut snapshot that has a body and no vector in this space, oldest first; then, for each embedded story with no earlier story still waiting for a vector, its nearest earlier stories within 7 days and what code reads in both texts. Records raw bytes, vectors and comparison records; writes no verdict, and shadow run reads none of it.",
+                "summary": "One embed request per first-sighted story of a newsvault cut snapshot that has a body, no vector in this space and was observed no more than 7 days before the space's first run, stories never attempted first and each group oldest first, and none unless the run's first canary closed ok; then, for each embedded story with no earlier story still waiting for a vector, its nearest earlier stories within 7 days and what code reads in both texts. Records raw bytes, vectors and comparison records; writes no verdict, and shadow run reads none of it.",
                 "options": [
                     {"name": "snapshot", "type": "path", "required": true},
                     {"name": "model", "type": "string", "required": true,
@@ -423,10 +428,11 @@ fn schema_doc() -> Value {
                      "doc": "over the embed file's lifetime; decide spend is not counted"},
                     {"name": "input_price_per_mtok", "type": "usd", "required": true,
                      "doc": "above zero; 0 is invalid_argument"},
-                    {"name": "give_up_after_hours", "type": "integer", "required": true},
+                    {"name": "give_up_after_hours", "type": "integer", "required": true,
+                     "doc": "counted from a story's first attempt in the space, never from its observation"},
                     {"name": "limit", "type": "integer", "required": true},
                     {"name": "deadline", "type": "instant", "required": true,
-                     "doc": "RFC 3339 or @<unix seconds>; no call starts later than 20 s before it"},
+                     "doc": "RFC 3339 or @<unix seconds>; no call starts later than 20 s before it and the comparison's scan stops 60 s past it"},
                     {"name": "store", "type": "path"},
                     {"name": "ack_cost_model", "type": "string",
                      "doc": "an embed run id with a cost_estimate_broken row, else invalid_argument"},
@@ -446,11 +452,11 @@ fn schema_doc() -> Value {
                 ],
                 "output": cmd_embed::SCHEMA,
                 "exits": {
-                    "0": "no attempt of this run failed or closed unusable, or nothing was new, or a dry run, or the deadline or the limit stopped it",
+                    "0": "the run's first canary closed ok and no story's request failed or closed unusable, or nothing was new, or a dry run, or the deadline or the limit stopped it; a text the provider refuses changes no exit",
                     "2": "invalid_argument, input_unparseable, input_schema_mismatch, credential_key_missing, credential_key_exposed, io_failed",
                     "4": "input_absent: the snapshot or the key file",
-                    "7": "vendor_unreachable (nothing embedded, every failure transient), lease_held",
-                    "8": "store_failed, cost_estimate_broken, cost_cap_reached, partial_embed or unusable_answer, named in the envelope's exit.error_code"
+                    "7": "vendor_unreachable (the first canary met a retryable status or no answer; no story sent), lease_held",
+                    "8": "store_failed, cost_estimate_broken, cost_cap_reached, canary_not_ok, partial_embed or unusable_answer, named in the envelope's exit.error_code"
                 },
                 "mutates": true,
                 "spends_money": true,
@@ -477,7 +483,10 @@ fn schema_doc() -> Value {
                     {"name": "seed", "type": "integer", "required": true},
                     {"name": "per_stratum", "type": "integer", "required": true},
                     {"name": "snapshot", "type": "path", "required": true},
-                    {"name": "space", "type": "string"},
+                    {"name": "compare_version", "type": "string",
+                     "doc": "a comparison version's token as dedup distribution prints it"},
+                    {"name": "space", "type": "string",
+                     "doc": "a space's name as dedup distribution prints it"},
                     {"name": "store", "type": "path"},
                     {"name": "format", "type": "enum", "values": ["human", "json"],
                      "default": "human"},
@@ -485,7 +494,7 @@ fn schema_doc() -> Value {
                 ],
                 "output": SAMPLE_SCHEMA,
                 "exits": {"0": "printed",
-                          "2": "invalid_argument (comparisons of several spaces and no --space), input_unparseable, input_schema_mismatch, io_failed",
+                          "2": "invalid_argument (the comparisons left by --compare-version and --space are of several versions or spaces; the message names each), input_unparseable, input_schema_mismatch, io_failed",
                           "4": "input_absent: no embed.sqlite in the store, or no snapshot"},
                 "mutates": false
             },
@@ -518,6 +527,7 @@ fn schema_doc() -> Value {
             {"code": "cost_estimate_broken", "exit": EXIT_INCOMPLETE, "retryable": false},
             {"code": "partial_shadow", "exit": EXIT_INCOMPLETE, "retryable": false},
             {"code": "partial_embed", "exit": EXIT_INCOMPLETE, "retryable": false},
+            {"code": "canary_not_ok", "exit": EXIT_INCOMPLETE, "retryable": false},
             {"code": "unusable_answer", "exit": EXIT_INCOMPLETE, "retryable": false},
             {"code": "store_failed", "exit": EXIT_INCOMPLETE, "retryable": false}
         ],
@@ -716,6 +726,7 @@ fn dedup(command: Dedup) -> u8 {
                 per_stratum: args.per_stratum,
                 snapshot: args.snapshot,
                 store,
+                compare_version: args.compare_version,
                 space: args.space,
             };
             reported(cmd_dedup::sample(&sample), format)

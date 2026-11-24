@@ -211,7 +211,9 @@ pub struct SampleArgs {
     pub per_stratum: u64,
     pub snapshot: PathBuf,
     pub store: PathBuf,
-    /// Needed only when the store holds comparisons of several spaces.
+    /// The two names of one group of comparisons. Needed only when the store holds several
+    /// groups: pairs of two versions or two spaces are never drawn into one sample.
+    pub compare_version: Option<String>,
     pub space: Option<String>,
 }
 
@@ -235,46 +237,41 @@ pub fn sample(args: &SampleArgs) -> Result<Value, ShadowError> {
     let store = present(&args.store)?;
     admissible(&args.snapshot)?;
     let manifest = snapshot_contract::manifest(&args.snapshot).map_err(unreadable)?;
-    let mut pairs: BTreeMap<(String, String), (Best, Candidate)> = BTreeMap::new();
+    let chosen =
+        |wanted: &Option<String>, found: &str| wanted.as_ref().is_none_or(|wanted| wanted == found);
+    let mut groups: BTreeMap<(String, String), BTreeMap<(String, String), Candidate>> =
+        BTreeMap::new();
     for list in [LIST_NEAREST, LIST_GUARDED] {
         for (best, candidate) in store.candidates(list)? {
-            if args
-                .space
-                .as_ref()
-                .is_some_and(|space| *space != best.space)
+            if !chosen(&args.compare_version, &best.compare_version)
+                || !chosen(&args.space, &best.space)
             {
                 continue;
             }
-            pairs
-                .entry((best.story_id.clone(), candidate.story_id.clone()))
-                .or_insert((best, candidate));
+            groups
+                .entry((best.compare_version, best.space))
+                .or_default()
+                .entry((best.story_id, candidate.story_id.clone()))
+                .or_insert(candidate);
         }
     }
-    let spaces: HashSet<(&str, &str)> = pairs
-        .values()
-        .map(|(best, _)| (best.compare_version.as_str(), best.space.as_str()))
-        .collect();
-    if spaces.len() > 1 {
-        let mut named: Vec<String> = spaces
-            .iter()
-            .map(|(_, space)| (*space).to_owned())
+    if groups.len() > 1 {
+        let named: Vec<String> = groups
+            .keys()
+            .map(|(version, space)| format!("--compare-version '{version}' --space '{space}'"))
             .collect();
-        named.sort();
-        named.dedup();
         return Err(invalid(format!(
-            "the store holds comparisons of {} versions or spaces; name one with --space: {}",
-            spaces.len(),
+            "the store holds {} groups of comparisons; name one: {}",
+            groups.len(),
             named.join(" | ")
         )));
     }
-    let (compare_version, space) = spaces
-        .iter()
-        .next()
-        .map(|(version, space)| ((*version).to_owned(), (*space).to_owned()))
-        .unzip();
+    let (group, pairs) = groups.into_iter().next().unzip();
+    let (compare_version, space): (Option<String>, Option<String>) = group.unzip();
+    let pairs: BTreeMap<(String, String), Candidate> = pairs.unwrap_or_default();
     let population = pairs.len();
     let mut strata: BTreeMap<(usize, bool), Vec<Drawn>> = BTreeMap::new();
-    for ((story_id, candidate_id), (_, candidate)) in pairs {
+    for ((story_id, candidate_id), candidate) in pairs {
         let drawn = FileDigest::of(
             format!("{}{FIELD}{story_id}{FIELD}{candidate_id}", args.seed).as_bytes(),
         );
@@ -340,8 +337,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{band, band_edges, distribution, excerpt, sample, SampleArgs, BANDS, EXCERPT_GAP};
-    use crate::cmd_embed::tests::compared;
-    use crate::cmd_shadow::tests::{at, TestResult};
+    use crate::cmd_embed::compare_version;
+    use crate::cmd_embed::tests::{compared, compared_in_two_spaces, five_stories, Bench};
+    use crate::cmd_shadow::tests::{at, cut, story, TestResult};
+    use crate::embed::tests::space;
+    use crate::embed_store::{Candidate, Comparison, EmbedStore, LIST_GUARDED, LIST_NEAREST};
 
     /// Section 8 row MG22, the first reader. Mutations 2026-11-23, each alone: every candidate
     /// rank counted and not the first; the host count taken from the guarded list: red each.
@@ -385,21 +385,149 @@ mod tests {
         Ok(())
     }
 
-    /// Section 8 row MG22, the second reader. Mutations 2026-11-23, each alone: the similarity
-    /// written into a pair; the strata dropped (one draw over all pairs): red each.
+    /// A second group in the store of `compared()`: three stories under another comparison
+    /// version, written by hand so that each counter of the report has a value of its own.
+    fn second_version(bench: &Bench) -> TestResult<String> {
+        let version = "dedup.compare/0(by-hand)".to_owned();
+        let pair = |list, rank, story: &str, ppm, host: bool, source| Candidate {
+            list,
+            rank,
+            story_id: story.to_owned(),
+            similarity_ppm: ppm,
+            age_seconds: 7_200,
+            hosts_shared: if host {
+                vec!["issuer.example".to_owned()]
+            } else {
+                Vec::new()
+            },
+            numbers_candidate: 4,
+            numbers_shared: 2,
+            tickers_candidate: 0,
+            tickers_shared: 0,
+            length_ratio_ppm: 900_000,
+            same_source: source,
+        };
+        let record = |story: &str, unembedded, own_numbers, listed| Comparison {
+            story_id: story.to_owned(),
+            window_stories: 4,
+            candidates: 4 - unembedded,
+            unembedded,
+            own_hosts: 1,
+            own_numbers,
+            own_tickers: 0,
+            listed,
+        };
+        let store = EmbedStore::open(&bench.store())?;
+        let name = space()?.name();
+        for comparison in [
+            record(
+                "unrelated",
+                3,
+                2,
+                vec![
+                    pair(LIST_NEAREST, 1, "release-en", 605_000, true, true),
+                    pair(LIST_NEAREST, 2, "release-de", 604_000, true, false),
+                    pair(LIST_NEAREST, 3, "firm-one", 603_000, true, true),
+                    pair(LIST_GUARDED, 1, "release-en", 605_000, true, true),
+                    pair(LIST_GUARDED, 2, "release-de", 604_000, true, false),
+                ],
+            ),
+            record(
+                "firm-two",
+                0,
+                1,
+                vec![pair(LIST_NEAREST, 1, "release-en", 610_000, false, true)],
+            ),
+        ] {
+            store.insert_comparison(&comparison, &version, &name, "cut", "by-hand")?;
+        }
+        Ok(version)
+    }
+
+    /// Section 8 row MG22, never pooled. Mutations 2026-11-24, each alone: the groups keyed by a
+    /// constant; `candidates_without_vector` not summed; `fewer_than_three_numbers` or
+    /// `same_source` inverted; every rank of the guarded list counted: red each.
+    #[test]
+    fn the_distribution_keeps_two_versions_and_two_spaces_apart_with_each_groups_own_counts(
+    ) -> TestResult {
+        let (bench, _snapshot, _) = compared_in_two_spaces()?;
+        second_version(&bench)?;
+        let found = distribution(&bench.store())?;
+        let groups = at(&found, "/groups");
+        assert_eq!(groups.as_array().map(Vec::len), Some(3));
+        let by_hand = at(&found, "/groups/0");
+        assert_eq!(at(&by_hand, "/compare_version"), "dedup.compare/0(by-hand)");
+        assert_eq!(at(&by_hand, "/stories"), 2);
+        assert_eq!(at(&by_hand, "/candidates_without_vector"), 3);
+        assert_eq!(at(&by_hand, "/fewer_than_three_numbers"), 2);
+        assert_eq!(at(&by_hand, "/best_candidate/6/stories"), 2);
+        assert_eq!(at(&by_hand, "/best_candidate/6/same_source"), 2);
+        assert_eq!(at(&by_hand, "/best_candidate/6/shares_host"), 1);
+        assert_eq!(
+            at(&by_hand, "/best_structurally_alike_candidate/6/stories"),
+            1
+        );
+        for index in [1, 2] {
+            assert_eq!(at(&found, &format!("/groups/{index}/stories")), 5);
+        }
+        assert!(at(&found, "/groups/2/space")
+            .as_str()
+            .is_some_and(|name| name.ends_with("epoch=2")));
+        Ok(())
+    }
+
+    /// Section 8 rows MG22 and MG21, the second reader; the rows list the mutations run.
     #[test]
     fn a_sample_draws_the_same_pairs_for_a_seed_from_every_stratum_and_states_no_similarity(
     ) -> TestResult {
-        let (bench, snapshot) = compared()?;
-        let args = SampleArgs {
+        let (bench, _snapshot, second_space) = compared_in_two_spaces()?;
+        let version = second_version(&bench)?;
+        // The cut a sample is drawn over holds a later row of one story: its head is shown.
+        let mut rows = five_stories();
+        rows.push(story(
+            20,
+            "firm-two",
+            "2026-11-20T20:00:00.000000Z",
+            Some("re-sighted"),
+        ));
+        let snapshot = cut(&rows, "2026-11-21T00:00:00Z")?;
+        let mut args = SampleArgs {
             seed: 7,
             per_stratum: 1,
             snapshot: snapshot.path().to_path_buf(),
             store: bench.store(),
+            compare_version: None,
             space: None,
         };
+        let refused = sample(&args).err().map(|why| why.to_string());
+        let refused = refused.unwrap_or_default();
+        assert!(refused.contains("3 groups"), "{refused}");
+        assert!(refused.contains(&format!("--space '{second_space}'")));
+        args.space = Some(space()?.name());
+        assert!(sample(&args).is_err());
+        args.compare_version = Some(version.clone());
+        let by_hand = sample(&args)?;
+        assert_eq!(at(&by_hand, "/compare_version"), version.as_str());
+        assert_eq!(at(&by_hand, "/population"), 4);
+        assert_eq!(at(&by_hand, "/strata"), 2);
+        // The seed decides which of a stratum's three pairs is taken.
+        let mut taken = std::collections::BTreeSet::new();
+        for seed in 1..=8 {
+            let drawn = sample(&SampleArgs {
+                seed,
+                ..args.clone()
+            })?;
+            let pairs = at(&drawn, "/pairs");
+            taken.extend(pairs.as_array().into_iter().flatten().filter_map(|pair| {
+                (pair["story_id"] == "unrelated")
+                    .then(|| pair["candidate_story_id"].as_str().map(str::to_owned))?
+            }));
+        }
+        assert!(taken.len() > 1, "{taken:?}");
+        args.compare_version = Some(compare_version());
         let drawn = sample(&args)?;
         assert_eq!(drawn, sample(&args)?);
+        assert_eq!(at(&drawn, "/space"), space()?.name());
         assert_eq!(at(&drawn, "/population"), 10);
         assert_eq!(at(&drawn, "/strata"), 3);
         let pairs = at(&drawn, "/pairs");
@@ -437,6 +565,7 @@ mod tests {
         let shown = firm.map(|pair| pair["excerpt_a"].as_str().unwrap_or_default());
         assert!(shown.is_some_and(|text| text.contains("Okonjo")));
         let elsewhere = SampleArgs {
+            compare_version: None,
             space: Some("another space".to_owned()),
             ..args
         };

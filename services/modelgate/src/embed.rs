@@ -476,14 +476,20 @@ pub(crate) mod tests {
     }
 
     /// Section 8 row MG20. Mutations, each alone: the width test removed; a zero vector accepted;
-    /// the `error` arm removed (2026-11-23); the length's finite test removed (2026-11-24): red
-    /// each.
+    /// the `error` arm removed (2026-11-23); the length's finite test removed; a ragged base64
+    /// tail accepted; a member that is no number read as one (2026-11-24): red each.
     #[test]
     fn a_vector_is_ok_only_at_4096_finite_values_in_either_encoding() {
         let sound = axis(0, 3.0, 1, 4.0);
         let mut not_finite = sound.clone();
         not_finite[7] = f32::NAN;
         let short = &sound[..DIMS - 1];
+        // One byte more than 4,096 values, and an array with one member that is no number.
+        let ragged = [to_blob(&sound), vec![0]].concat();
+        let ragged = json!({"data": [{"embedding": encode(&ragged)}]}).to_string();
+        let mut mixed = json!({"data": [{"embedding": sound}]});
+        mixed["data"][0]["embedding"][5] = json!("0.5");
+        let mixed = mixed.to_string();
         let outcomes = [
             read_embedding(200, answer(&sound, true, Some(0.000_02)).as_bytes()),
             read_embedding(200, answer(&sound, false, None).as_bytes()),
@@ -496,6 +502,8 @@ pub(crate) mod tests {
             read_embedding(200, br#"{"error":{"code":503}}"#),
             read_embedding(200, b"<html>gateway</html>"),
             read_embedding(429, answer(&sound, true, None).as_bytes()),
+            read_embedding(200, ragged.as_bytes()),
+            read_embedding(200, mixed.as_bytes()),
         ];
         let read: Vec<(Outcome, bool)> = outcomes
             .iter()
@@ -515,6 +523,8 @@ pub(crate) mod tests {
                 (Outcome::Failed, false),
                 (Outcome::Unparseable, false),
                 (Outcome::Failed, false),
+                (Outcome::Unparseable, false),
+                (Outcome::Unparseable, false),
             ]
         );
         let (packed, listed) = (&outcomes[0], &outcomes[1]);

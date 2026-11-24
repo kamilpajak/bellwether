@@ -277,17 +277,67 @@ impl EmbedStore {
         Ok(found)
     }
 
-    /// Stories of this space whose request has at least one attempt.
-    pub fn attempted_stories(&self, space: &str) -> Result<HashSet<String>, StoreError> {
+    /// Per story of this space with an attempt, the instant its first attempt opened.
+    pub fn first_attempts(&self, space: &str) -> Result<HashMap<String, String>, StoreError> {
         let mut statement = self.ledger.connection().prepare(
-            "SELECT DISTINCT l.story_id FROM embed_links l
+            "SELECT l.story_id, MIN(o.at) FROM embed_links l
                JOIN embed_requests r ON r.idempotency_key = l.idempotency_key
-              WHERE r.space = ?1
-                AND EXISTS (SELECT 1 FROM attempt_events o WHERE o.event = 'opened'
-                             AND o.idempotency_key = l.idempotency_key)",
+               JOIN attempt_events o ON o.event = 'opened'
+                AND o.idempotency_key = l.idempotency_key
+              WHERE r.space = ?1 GROUP BY l.story_id",
         )?;
         let found = statement
-            .query_map([space], |row| row.get(0))?
+            .query_map([space], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        Ok(found)
+    }
+
+    /// Stories of this space whose request closed `failed` on an answered status outside
+    /// `retryable` in at least `runs` runs: the provider refuses the text, not the moment.
+    pub fn refused_stories(
+        &self,
+        space: &str,
+        retryable: &[u16],
+        runs: u32,
+    ) -> Result<HashSet<String>, StoreError> {
+        let listed: Vec<String> = retryable.iter().map(u16::to_string).collect();
+        let mut statement = self.ledger.connection().prepare(&format!(
+            "SELECT l.story_id FROM embed_links l
+               JOIN embed_requests r ON r.idempotency_key = l.idempotency_key
+               JOIN attempt_events o ON o.event = 'opened'
+                AND o.idempotency_key = l.idempotency_key
+               JOIN attempt_events a ON a.attempt_id = o.attempt_id AND a.event = 'answered'
+               JOIN attempt_events f ON f.attempt_id = o.attempt_id AND f.event = 'finalised'
+              WHERE r.space = ?1 AND f.outcome = ?2 AND a.http_status NOT IN ({})
+              GROUP BY l.story_id HAVING COUNT(DISTINCT o.run_id) >= ?3",
+            listed.join(",")
+        ))?;
+        let found = statement
+            .query_map(params![space, Outcome::Failed.name(), runs], |row| {
+                row.get(0)
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(found)
+    }
+
+    /// The start of the first run that named this space, which is where the space begins.
+    pub fn space_started(&self, space: &str) -> Result<Option<String>, StoreError> {
+        Ok(self.ledger.connection().query_row(
+            "SELECT MIN(at) FROM run_events
+              WHERE event = 'started' AND json_extract(detail, '$.space') = ?1",
+            [space],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Every story linked to this request: stories with one cut text share it.
+    pub fn stories_of(&self, idempotency_key: &str) -> Result<Vec<String>, StoreError> {
+        let mut statement = self
+            .ledger
+            .connection()
+            .prepare_cached("SELECT story_id FROM embed_links WHERE idempotency_key = ?1")?;
+        let found = statement
+            .query_map([idempotency_key], |row| row.get(0))?
             .collect::<Result<_, _>>()?;
         Ok(found)
     }
@@ -690,6 +740,7 @@ mod tests {
         Ok(())
     }
 
+    /// Mutation 2026-11-24, `compare_version` left out of the `comparisons` key: red.
     #[test]
     fn a_story_is_embedded_once_its_request_has_a_vector_and_the_first_comparison_stays(
     ) -> TestResult {
@@ -700,7 +751,14 @@ mod tests {
         let embedded = store.embedded_stories(&name)?;
         assert_eq!(embedded.get("story"), Some(&key));
         assert!(store.embedded_stories("another space")?.is_empty());
-        assert!(store.attempted_stories(&name)?.contains("story"));
+        assert_eq!(
+            store
+                .first_attempts(&name)?
+                .get("story")
+                .map(String::as_str),
+            Some("2026-11-23T12:00:00.000000Z")
+        );
+        assert_eq!(store.stories_of(&key)?, ["story"]);
         assert_eq!(store.vector(&key)?, Some(axis(0, 0.6, 1, 0.8)));
         assert_eq!(store.ok_response(&key)?, None);
         let later = Comparison {
@@ -721,6 +779,11 @@ mod tests {
         assert_eq!(store.candidates(LIST_NEAREST)?.len(), 1);
         assert!(store.compared_stories("c/1", &name)?.contains("story"));
         assert!(store.compared_stories("c/2", &name)?.is_empty());
+        // Another version's record of the same story is a second row, not a refused one.
+        store.insert_comparison(&later, "c/2", &name, "cut-2", "run-2")?;
+        assert!(store.compared_stories("c/2", &name)?.contains("story"));
+        assert_eq!(store.best()?.len(), 2);
+        assert_eq!(store.candidates(LIST_NEAREST)?.len(), 3);
         assert_eq!(store.canary_count("short", &name)?, 1);
         assert!(store.canary_on("short", &name, "2026-11-23")?);
         assert!(!store.canary_on("short", &name, "2026-11-24")?);

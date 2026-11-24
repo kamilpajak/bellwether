@@ -206,7 +206,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// The hard negatives of section 3.5: what the structural guards say about each.
+    /// The hard negatives of section 3.5: what the structural guards say about each. Mutations
+    /// 2026-11-24, each alone: an untagged text read as a contradiction; one tagged text enough
+    /// for one: red each.
     #[test]
     fn two_firms_on_one_lawsuit_share_a_ticker_and_no_host_and_a_follow_up_shares_both() {
         let release = Signals::of(FUNDING[0].1);
@@ -240,6 +242,18 @@ pub(crate) mod tests {
         let other =
             Signals::of("Quillfeather Mining (NYSE: QFM) https://harrowgate-robotics.example");
         assert!(!release.structurally_alike(&other));
+        // A text with no ticker tag contradicts nothing: 70% of the first 106 stories had none.
+        let untagged = Signals::of("Our annual meeting: https://harrowgate-robotics.example/agm");
+        assert!(untagged.tickers.is_empty());
+        assert!(untagged.structurally_alike(&untagged.clone()));
+        assert!(release.structurally_alike(&untagged) && untagged.structurally_alike(&release));
+        // Two firms that both print one third party's host are alike: a rule must exclude it.
+        let social = " Follow https://www.social-network.example/firm";
+        let (one, two) = (
+            Signals::of(&format!("{FIRM_ONE}{social}")),
+            Signals::of(&format!("{FIRM_TWO}{social}")),
+        );
+        assert!(one.structurally_alike(&two));
         assert_eq!(release.length_ratio_ppm(&release), 1_000_000);
         assert_eq!(
             Signals::of("ab").length_ratio_ppm(&Signals::of("abcd")),

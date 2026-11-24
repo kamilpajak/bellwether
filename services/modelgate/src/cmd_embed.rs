@@ -1,6 +1,7 @@
 //! `modelgate embed run`: one `embed` request per first-sighted story of a `newsvault cut` that
-//! has no vector yet, oldest first, then the comparison record of each story whose earlier window
-//! is settled. Record only: no verdict is written and `shadow run` reads none of it. Rules:
+//! has no vector yet, behind the run's first canary, then the comparison record of each story
+//! whose earlier window is settled. Record only: no verdict is written and `shadow run` reads
+//! none of it. Rules:
 //! `docs/design/architecture.md` section 3.5, "The `embed` kind" and "Repeated releases".
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -42,6 +43,12 @@ pub const WINDOW_DAYS: i64 = 7;
 pub const KEEP: usize = 5;
 /// Stories compared by one run: 256 unit vectors are 4 MiB held while the window is streamed.
 const COMPARE_BATCH: usize = 256;
+/// Seconds past the deadline the comparison's scan may still run: the wrapper stops the container
+/// 90 s after it, and the envelope and the metrics are written in what is left.
+pub const COMPARE_SECONDS_PAST_DEADLINE: i64 = 60;
+/// Runs in which the provider refused a story's text before the story is no longer sent. Two,
+/// so one refusal by an endpoint that broke after the run's canary costs no story.
+pub const REFUSALS_BEFORE_FINAL: u32 = 2;
 const DAY_BYTES: usize = 10;
 const UNIX_PREFIX: char = '@';
 
@@ -65,6 +72,8 @@ struct Canary {
 }
 
 const SHORT: &str = "short/1";
+/// The canary every run sends first.
+const GATE: &str = SHORT;
 const LONG: &str = "long/1";
 const PAIR_EN: &str = "pair-en/1";
 const PAIR_DE: &str = "pair-de/1";
@@ -172,6 +181,8 @@ struct Stories {
     repeat_of_story: u64,
     no_body: u64,
     already_embedded: u64,
+    before_space: u64,
+    refused: u64,
     gave_up: u64,
     selected: u64,
     embedded: u64,
@@ -189,6 +200,7 @@ struct Requests {
     sent: u64,
     recovered: u64,
     failed_stories: u64,
+    refused_stories: u64,
     refused_by_cap: u64,
 }
 
@@ -213,8 +225,18 @@ enum Attempted {
 enum Sent {
     Embedded,
     Unusable,
+    /// Every attempt failed on a retryable status or with no answer.
     Failed,
+    /// The provider answered with a status that a second send would meet again.
+    Refused,
     Stopped,
+}
+
+/// Why a story without a vector is not sent, if it is not.
+enum Settled {
+    BeforeSpace,
+    Refused,
+    GaveUp,
 }
 
 struct Run<'a> {
@@ -238,7 +260,6 @@ struct Run<'a> {
     compared: Compared,
     canaries: Vec<Value>,
     consecutive_failed: u32,
-    every_failure_transient: bool,
     stopped_by: Option<&'static str>,
     store_failure: Option<String>,
 }
@@ -326,7 +347,6 @@ pub fn run(args: &Args, env: &Env) -> Result<Finished, ShadowError> {
         compared: Compared::default(),
         canaries: Vec::new(),
         consecutive_failed: 0,
-        every_failure_transient: true,
         stopped_by,
         store_failure: None,
     };
@@ -370,11 +390,23 @@ struct Query {
 impl Run<'_> {
     fn work(&mut self) -> Result<(), ShadowError> {
         let mut embedded = self.store.embedded_stories(&self.space_name)?;
-        let attempted = self.store.attempted_stories(&self.space_name)?;
+        let first_attempts = self.store.first_attempts(&self.space_name)?;
+        let refused = self.store.refused_stories(
+            &self.space_name,
+            &RETRYABLE_STATUSES,
+            REFUSALS_BEFORE_FINAL,
+        )?;
         let compared = self
             .store
             .compared_stories(&self.compare_version, &self.space_name)?;
         let give_up = i64::from(self.args.give_up_after_hours) * SECONDS_PER_HOUR;
+        let started = self.started;
+        // A space begins a window before its first run: an older story is in no later window.
+        let space_started = match self.store.space_started(&self.space_name)? {
+            Some(at) => instant(&at)?,
+            None => started,
+        };
+        let floor = stamp(space_started - TimeDelta::days(WINDOW_DAYS));
         let mut first: HashMap<String, First> = HashMap::new();
         for row in rows(&self.args.snapshot)? {
             let row = row?;
@@ -390,18 +422,29 @@ impl Run<'_> {
                 }
             }
         }
-        let started = self.started;
-        let gave_up = |story_id: &str, key: &Key| -> Result<bool, ShadowError> {
-            let age = (started - instant(&key.0)?).num_seconds();
-            Ok(attempted.contains(story_id) && age > give_up)
+        // The age limit runs from a story's first attempt, never from its observation: a
+        // backlog story is older than any limit before it is first sent.
+        let settled = |story_id: &str, key: &Key| -> Result<Option<Settled>, ShadowError> {
+            if key.0 < floor {
+                return Ok(Some(Settled::BeforeSpace));
+            }
+            if refused.contains(story_id) {
+                return Ok(Some(Settled::Refused));
+            }
+            let Some(at) = first_attempts.get(story_id) else {
+                return Ok(None);
+            };
+            let age = (started - instant(at)?).num_seconds();
+            Ok((age > give_up).then_some(Settled::GaveUp))
         };
         // The earliest story a comparison of this run could concern, less the window.
         let mut horizon: Option<Key> = None;
         for (story_id, sighting) in &first {
-            let settled = !sighting.has_body
+            let done = !sighting.has_body
                 || compared.contains(story_id)
-                || (!embedded.contains_key(story_id) && gave_up(story_id, &sighting.key)?);
-            if !settled && horizon.as_ref().is_none_or(|kept| sighting.key < *kept) {
+                || (!embedded.contains_key(story_id)
+                    && settled(story_id, &sighting.key)?.is_some());
+            if !done && horizon.as_ref().is_none_or(|kept| sighting.key < *kept) {
                 horizon = Some(sighting.key.clone());
             }
         }
@@ -412,7 +455,9 @@ impl Run<'_> {
             None => None,
         };
         let limit = usize::try_from(self.args.limit).unwrap_or(usize::MAX);
-        let mut kept: BTreeMap<Key, SnapshotRow> = BTreeMap::new();
+        // Never-attempted stories first, each group oldest first: a story that failed before
+        // takes no slot from one that was never sent.
+        let mut kept: BTreeMap<(bool, Key), SnapshotRow> = BTreeMap::new();
         let mut pending: BTreeSet<Key> = BTreeSet::new();
         let mut seen: Vec<Seen> = Vec::new();
         for row in rows(&self.args.snapshot)? {
@@ -439,28 +484,41 @@ impl Run<'_> {
             }
             if embedded.contains_key(&row.story_id) {
                 self.stories.already_embedded += 1;
-            } else if gave_up(&row.story_id, &key)? {
-                self.stories.gave_up += 1;
-            } else {
-                self.stories.selected += 1;
-                pending.insert(key.clone());
-                kept.insert(key, row);
-                if kept.len() > limit {
-                    kept.pop_last();
+                continue;
+            }
+            match settled(&row.story_id, &key)? {
+                Some(Settled::BeforeSpace) => self.stories.before_space += 1,
+                Some(Settled::Refused) => self.stories.refused += 1,
+                Some(Settled::GaveUp) => self.stories.gave_up += 1,
+                None => {
+                    self.stories.selected += 1;
+                    pending.insert(key.clone());
+                    kept.insert((first_attempts.contains_key(&row.story_id), key), row);
+                    if kept.len() > limit {
+                        kept.pop_last();
+                    }
                 }
             }
         }
         self.stories.left = self.stories.selected - u64::try_from(kept.len()).unwrap_or(u64::MAX);
         self.send_canaries()?;
-        for (key, row) in kept {
+        for ((_, key), row) in kept {
             if self.stopped_by.is_some() {
                 self.stories.left += 1;
                 continue;
             }
-            if let Some(vector_key) = self.embed(&row)? {
-                pending.remove(&key);
-                embedded.insert(row.story_id, vector_key);
+            let Some(vector_key) = self.embed(&row)? else {
+                continue;
+            };
+            pending.remove(&key);
+            // Every story this text is linked to has the vector now, a given-up copy too.
+            for story_id in self.store.stories_of(&vector_key)? {
+                if let Some(sighting) = first.get(&story_id) {
+                    pending.remove(&sighting.key);
+                }
+                embedded.insert(story_id, vector_key.clone());
             }
+            embedded.insert(row.story_id, vector_key);
         }
         seen.sort_by(|left, right| left.key.cmp(&right.key));
         for story in &mut seen {
@@ -503,20 +561,18 @@ impl Run<'_> {
                 self.consecutive_failed = 0;
                 return Ok(Some(key));
             }
-            Sent::Unusable => {
-                self.stories.unusable += 1;
-                self.consecutive_failed = 0;
+            Sent::Stopped => {
+                self.stories.left += 1;
+                return Ok(None);
             }
-            Sent::Stopped => self.stories.left += 1,
-            Sent::Failed => {
-                self.requests.failed_stories += 1;
-                self.consecutive_failed += 1;
-                if self.consecutive_failed >= FAILED_STORIES_BEFORE_STOP
-                    && self.stopped_by.is_none()
-                {
-                    self.stopped_by = Some("vendor_failing");
-                }
-            }
+            Sent::Unusable => self.stories.unusable += 1,
+            Sent::Failed => self.requests.failed_stories += 1,
+            Sent::Refused => self.requests.refused_stories += 1,
+        }
+        // Each of the three is paid at its worst case, so a run of them ends the run.
+        self.consecutive_failed += 1;
+        if self.consecutive_failed >= FAILED_STORIES_BEFORE_STOP && self.stopped_by.is_none() {
+            self.stopped_by = Some("vendor_failing");
         }
         Ok(None)
     }
@@ -656,8 +712,10 @@ impl Run<'_> {
                 Outcome::Empty | Outcome::Unparseable => return Ok(Sent::Unusable),
                 Outcome::Failed | Outcome::Abandoned => {}
             }
-            self.every_failure_transient &= retryable;
-            if !retryable || attempt == MAX_ATTEMPTS || self.stopped_by.is_some() {
+            if !retryable {
+                return Ok(Sent::Refused);
+            }
+            if attempt == MAX_ATTEMPTS || self.stopped_by.is_some() {
                 break;
             }
             let wait = retry_after.map_or(RETRY_WAIT * attempt, Duration::from_secs);
@@ -666,7 +724,9 @@ impl Run<'_> {
         Ok(Sent::Failed)
     }
 
-    /// Each canary once, with no retry. A canary that fails is reported and stops nothing.
+    /// Each canary once, with no retry. The first one is the run's gate: no story is sent unless
+    /// it closed `ok`, so a dead or changed endpoint costs one short call a run. A later canary
+    /// that does not close `ok` is reported and stops nothing.
     fn send_canaries(&mut self) -> Result<(), ShadowError> {
         let day = self.run_id[..DAY_BYTES].to_owned();
         let mut english: Option<Vec<f32>> = None;
@@ -695,7 +755,20 @@ impl Run<'_> {
                 None => match self.attempt(&request, worst)? {
                     Attempted::Refused => ("refused_by_cap", None),
                     Attempted::Deadline => ("deadline", None),
-                    Attempted::Read { found, .. } => (found.reading.outcome.name(), Some(found)),
+                    Attempted::Read {
+                        found, retryable, ..
+                    } => {
+                        let outcome = found.reading.outcome;
+                        if name == GATE && outcome != Outcome::Ok && self.stopped_by.is_none() {
+                            let transient = outcome == Outcome::Failed && retryable;
+                            self.stopped_by = Some(if transient {
+                                "vendor_unreachable"
+                            } else {
+                                "canary_not_ok"
+                            });
+                        }
+                        (outcome.name(), Some(found))
+                    }
                 },
             };
             // Only a canary's first answer keeps its vector: every later one is compared with it.
@@ -781,18 +854,32 @@ impl Run<'_> {
             self.stopped_by = self.stopped_by.or(Some("deadline"));
             return Ok(());
         }
-        let (Some(earliest), Some(latest)) = (
-            queries.iter().map(|query| &query.from).min().cloned(),
-            queries
-                .iter()
-                .map(|query| &seen[query.index].key)
-                .max()
-                .cloned(),
-        ) else {
-            return Ok(());
-        };
+        // `seen` is in key order, so a query's window is scanned once the scan reaches its own
+        // story, and its record is written then: a killed run keeps every record it finished.
+        let mut waiting = queries.into_iter().peekable();
+        let mut open: Vec<Query> = Vec::new();
+        let until = self.deadline + TimeDelta::seconds(COMPARE_SECONDS_PAST_DEADLINE);
         for (index, candidate) in seen.iter().enumerate() {
-            if candidate.key < earliest || candidate.key >= latest {
+            if (self.env.now)() > until {
+                let unscanned = open.len() + waiting.count();
+                self.compared.left += u64::try_from(unscanned).unwrap_or(u64::MAX);
+                self.stopped_by = self.stopped_by.or(Some("deadline"));
+                break;
+            }
+            while let Some(query) = waiting.next_if(|query| query.from <= candidate.key) {
+                open.push(query);
+            }
+            let (scanned, rest): (Vec<Query>, Vec<Query>) = std::mem::take(&mut open)
+                .into_iter()
+                .partition(|query| query.index <= index);
+            open = rest;
+            for query in &scanned {
+                self.record(seen, query)?;
+            }
+            if open.is_empty() {
+                if waiting.peek().is_none() {
+                    break;
+                }
                 continue;
             }
             let unit = match &candidate.vector_key {
@@ -800,10 +887,9 @@ impl Run<'_> {
                 None => None,
             };
             self.compared.vectors_read += u64::from(unit.is_some());
-            for query in &mut queries {
+            for query in &mut open {
                 let story = &seen[query.index];
-                let earlier = candidate.key >= query.from && candidate.key < story.key;
-                if !earlier || candidate.story_id == story.story_id {
+                if candidate.story_id == story.story_id {
                     continue;
                 }
                 query.window_stories += 1;
@@ -816,52 +902,53 @@ impl Run<'_> {
                 }
             }
         }
-        for query in &queries {
-            let story = &seen[query.index];
-            let mut listed = Vec::new();
-            for (list, kept) in [
-                (LIST_NEAREST, &query.nearest),
-                (LIST_GUARDED, &query.guarded),
-            ] {
-                for (rank, (similarity, index)) in kept.iter().enumerate() {
-                    let other = &seen[*index];
-                    let shared =
-                        |a: &BTreeSet<String>, b: &BTreeSet<String>| a.intersection(b).count();
-                    listed.push(Candidate {
-                        list,
-                        rank: u32::try_from(rank + 1).unwrap_or(u32::MAX),
-                        story_id: other.story_id.clone(),
-                        similarity_ppm: ppm(*similarity),
-                        age_seconds: (story.at - other.at).num_seconds(),
-                        hosts_shared: story.signals.shared_hosts(&other.signals),
-                        numbers_candidate: other.signals.numbers.len(),
-                        numbers_shared: shared(&story.signals.numbers, &other.signals.numbers),
-                        tickers_candidate: other.signals.tickers.len(),
-                        tickers_shared: shared(&story.signals.tickers, &other.signals.tickers),
-                        length_ratio_ppm: story.signals.length_ratio_ppm(&other.signals),
-                        same_source: story.source == other.source,
-                    });
-                }
+        Ok(())
+    }
+
+    fn record(&mut self, seen: &[Seen], query: &Query) -> Result<(), ShadowError> {
+        let story = &seen[query.index];
+        let mut listed = Vec::new();
+        for (list, kept) in [
+            (LIST_NEAREST, &query.nearest),
+            (LIST_GUARDED, &query.guarded),
+        ] {
+            for (rank, (similarity, index)) in kept.iter().enumerate() {
+                let other = &seen[*index];
+                let shared = |a: &BTreeSet<String>, b: &BTreeSet<String>| a.intersection(b).count();
+                listed.push(Candidate {
+                    list,
+                    rank: u32::try_from(rank + 1).unwrap_or(u32::MAX),
+                    story_id: other.story_id.clone(),
+                    similarity_ppm: ppm(*similarity),
+                    age_seconds: (story.at - other.at).num_seconds(),
+                    hosts_shared: story.signals.shared_hosts(&other.signals),
+                    numbers_candidate: other.signals.numbers.len(),
+                    numbers_shared: shared(&story.signals.numbers, &other.signals.numbers),
+                    tickers_candidate: other.signals.tickers.len(),
+                    tickers_shared: shared(&story.signals.tickers, &other.signals.tickers),
+                    length_ratio_ppm: story.signals.length_ratio_ppm(&other.signals),
+                    same_source: story.source == other.source,
+                });
             }
-            let comparison = Comparison {
-                story_id: story.story_id.clone(),
-                window_stories: query.window_stories,
-                candidates: query.candidates,
-                unembedded: query.window_stories - query.candidates,
-                own_hosts: story.signals.hosts.len(),
-                own_numbers: story.signals.numbers.len(),
-                own_tickers: story.signals.tickers.len(),
-                listed,
-            };
-            self.store.insert_comparison(
-                &comparison,
-                &self.compare_version,
-                &self.space_name,
-                &self.snapshot_id,
-                &self.run_id,
-            )?;
-            self.compared.written += 1;
         }
+        let comparison = Comparison {
+            story_id: story.story_id.clone(),
+            window_stories: query.window_stories,
+            candidates: query.candidates,
+            unembedded: query.window_stories - query.candidates,
+            own_hosts: story.signals.hosts.len(),
+            own_numbers: story.signals.numbers.len(),
+            own_tickers: story.signals.tickers.len(),
+            listed,
+        };
+        self.store.insert_comparison(
+            &comparison,
+            &self.compare_version,
+            &self.space_name,
+            &self.snapshot_id,
+            &self.run_id,
+        )?;
+        self.compared.written += 1;
         Ok(())
     }
 
@@ -906,19 +993,21 @@ impl Run<'_> {
             .iter()
             .filter(|c| c.outcome == Outcome::Ok.name() && c.cost_micro_usd.is_none())
             .count();
-        let closed_unusable = count(Outcome::Empty) + count(Outcome::Unparseable);
+        // A canary's attempt reaches the exit only as the gate's stop, a refused text never.
         let error_code = match self.stopped_by {
-            Some("store_failed") => Some("store_failed"),
-            Some("cost_estimate_broken") => Some("cost_estimate_broken"),
-            Some("cost_cap_reached") => Some("cost_cap_reached"),
+            Some(
+                named @ ("store_failed"
+                | "cost_estimate_broken"
+                | "cost_cap_reached"
+                | "vendor_unreachable"
+                | "canary_not_ok"),
+            ) => Some(named),
+            Some("vendor_failing") => Some("partial_embed"),
             _ if self.requests.failed_stories > 0 => Some("partial_embed"),
-            _ if closed_unusable > 0 => Some("unusable_answer"),
+            _ if self.stories.unusable > 0 => Some("unusable_answer"),
             _ => None,
         };
-        let unreachable = error_code == Some("partial_embed")
-            && count(Outcome::Ok) == 0
-            && closed_unusable == 0
-            && self.every_failure_transient;
+        let unreachable = error_code == Some("vendor_unreachable");
         let exit = if error_code.is_some() {
             EXIT_INCOMPLETE
         } else {
@@ -942,6 +1031,7 @@ impl Run<'_> {
             "stories": {
                 "rows": stories.rows, "repeat_of_story": stories.repeat_of_story,
                 "no_body": stories.no_body, "already_embedded": stories.already_embedded,
+                "before_space": stories.before_space, "refused": stories.refused,
                 "gave_up": stories.gave_up, "selected": stories.selected,
                 "embedded": stories.embedded, "twin_of_embedded": stories.twin_of_embedded,
                 "unusable": stories.unusable, "truncated": stories.truncated,
@@ -953,6 +1043,7 @@ impl Run<'_> {
                 "ok": count(Outcome::Ok), "empty": count(Outcome::Empty),
                 "unparseable": count(Outcome::Unparseable), "failed": count(Outcome::Failed),
                 "costless": costless, "failed_stories": requests.failed_stories,
+                "refused_stories": requests.refused_stories,
                 "refused_by_cap": requests.refused_by_cap,
             },
             "vectors": {
@@ -979,7 +1070,7 @@ impl Run<'_> {
             },
             "stopped_by": self.stopped_by,
             "exit": { "code": if unreachable { EXIT_TRANSIENT } else { exit },
-                      "error_code": if unreachable { Some("vendor_unreachable") } else { error_code } },
+                      "error_code": error_code },
         });
         if !self.args.dry_run {
             let detail = json!({ "exit": envelope["exit"], "stopped_by": self.stopped_by });
@@ -1015,6 +1106,7 @@ pub(crate) mod tests {
     use crate::ledger::{AttemptSlot, Opening, SendPermit};
     use crate::request::STATE_BUDGET_BYTES;
     use crate::signals::tests::{FIRM_ONE, FIRM_TWO, FUNDING};
+    use crate::store::stamp;
     use crate::store::{Store, DB_FILE};
     use crate::wire::tests::{http, sentinel, Loopback, SENTINEL_KEY};
     use crate::wire::{Exchanged, HttpAnswer, ModelExchange, ModelWire};
@@ -1033,21 +1125,32 @@ pub(crate) mod tests {
     /// status with a body. Any other text gets a vector orthogonal to every marked one.
     pub(crate) struct Stub {
         vectors: Vec<(&'static str, Vec<f32>)>,
-        refusing: RefCell<Vec<(&'static str, u16, &'static str)>>,
+        /// The vector of a marker's n-th repeated send; its last one for every later send.
+        later: Vec<(&'static str, Vec<Vec<f32>>)>,
+        refusing: RefCell<Vec<(&'static str, u16, String)>>,
         inputs: RefCell<Vec<String>>,
         as_base64: bool,
         cost: Option<f64>,
+        /// The `model` and the `provider` member every vector answer states.
+        stated: (&'static str, Option<&'static str>),
     }
 
     impl Stub {
         pub(crate) fn of(vectors: Vec<(&'static str, Vec<f32>)>) -> Self {
             Self {
                 vectors,
+                later: Vec::new(),
                 refusing: RefCell::default(),
                 inputs: RefCell::default(),
                 as_base64: true,
                 cost: Some(COST_USD),
+                stated: (MODEL, None),
             }
+        }
+
+        fn refuse(&self, marker: &'static str, status: u16, body: &str) {
+            let mut refusing = self.refusing.borrow_mut();
+            refusing.push((marker, status, body.to_owned()));
         }
 
         fn sends(&self) -> usize {
@@ -1070,14 +1173,33 @@ pub(crate) mod tests {
                 .borrow()
                 .iter()
                 .find(|(marker, _, _)| input.contains(marker))
-                .map(|(_, status, body)| (*status, (*body).to_owned()));
+                .map(|(_, status, body)| (*status, body.clone()));
             let (status, body) = refused.unwrap_or_else(|| {
-                let vector = self
+                let repeated = self
+                    .later
+                    .iter()
+                    .find(|(marker, _)| input.contains(marker))
+                    .and_then(|(marker, vectors)| {
+                        let earlier = self.sent(marker);
+                        vectors.get(earlier.checked_sub(1)?.min(vectors.len() - 1))
+                    });
+                let first = self
                     .vectors
                     .iter()
                     .find(|(marker, _)| input.contains(marker))
-                    .map_or_else(|| axis(4000, 1.0, 4001, 0.0), |(_, vector)| vector.clone());
-                (200, answer(&vector, self.as_base64, self.cost))
+                    .map(|(_, vector)| vector);
+                let vector = repeated
+                    .or(first)
+                    .cloned()
+                    .unwrap_or_else(|| axis(4000, 1.0, 4001, 0.0));
+                let mut body: Value =
+                    serde_json::from_str(&answer(&vector, self.as_base64, self.cost))
+                        .unwrap_or(Value::Null);
+                body["model"] = Value::from(self.stated.0);
+                if let Some(provider) = self.stated.1 {
+                    body["provider"] = Value::from(provider);
+                }
+                (200, body.to_string())
             });
             self.inputs.borrow_mut().push(input);
             let now: DateTime<Utc> = NOW.parse().unwrap_or_default();
@@ -1093,6 +1215,8 @@ pub(crate) mod tests {
     pub(crate) struct Bench {
         root: TempDir,
         now: Cell<DateTime<Utc>>,
+        /// What every reading of the clock moves it on by.
+        tick: Cell<TimeDelta>,
     }
 
     impl Bench {
@@ -1100,6 +1224,7 @@ pub(crate) mod tests {
             Ok(Self {
                 root: TempDir::new()?,
                 now: Cell::new(NOW.parse()?),
+                tick: Cell::new(TimeDelta::zero()),
             })
         }
 
@@ -1108,7 +1233,7 @@ pub(crate) mod tests {
         }
 
         /// Caps of 1 USD each, a limit above every cut here, a deadline an hour after `NOW`.
-        fn args(&self, snapshot: &Path) -> Args {
+        pub(crate) fn args(&self, snapshot: &Path) -> Args {
             Args {
                 snapshot: snapshot.to_path_buf(),
                 model: MODEL.to_owned(),
@@ -1129,12 +1254,21 @@ pub(crate) mod tests {
         }
 
         /// One run at the bench's instant, which then moves on a second: a run id is its start.
-        fn go(&self, args: &Args, exchange: &dyn ModelExchange) -> Result<Finished, ShadowError> {
+        pub(crate) fn go(
+            &self,
+            args: &Args,
+            exchange: &dyn ModelExchange,
+        ) -> Result<Finished, ShadowError> {
+            let read = || {
+                let at = self.now.get();
+                self.now.set(at + self.tick.get());
+                at
+            };
             let done = run(
                 args,
                 &Env {
                     exchange,
-                    now: &|| self.now.get(),
+                    now: &read,
                     sleep: &|_| {},
                 },
             );
@@ -1166,7 +1300,7 @@ pub(crate) mod tests {
 
     /// A release, its German copy, two firms on one lawsuit and an unrelated notice, an hour
     /// apart. The copy is at cosine 0.6 of the release and the second firm at 0.8 of the first.
-    fn five_stories() -> Vec<SnapshotRow> {
+    pub(crate) fn five_stories() -> Vec<SnapshotRow> {
         vec![
             story(5, "release-en", &hour(10), Some(FUNDING[0].1)),
             story(6, "release-de", &hour(11), Some(FUNDING[1].1)),
@@ -1193,6 +1327,17 @@ pub(crate) mod tests {
         let done = bench.go(&bench.args(snapshot.path()), &stub)?;
         assert_eq!(done.exit, 0, "{:#}", done.envelope);
         Ok((bench, snapshot))
+    }
+
+    /// The same store after a run of epoch 2 over the same cut, and that second space's name.
+    pub(crate) fn compared_in_two_spaces() -> TestResult<(Bench, TempDir, String)> {
+        let (bench, snapshot) = compared()?;
+        let mut args = bench.args(snapshot.path());
+        args.epoch = 2;
+        let done = bench.go(&args, &Stub::of(five_vectors()))?;
+        assert_eq!(done.exit, 0, "{:#}", done.envelope);
+        let name = at(&done.envelope, "/space").as_str().map(str::to_owned);
+        Ok((bench, snapshot, name.unwrap_or_default()))
     }
 
     fn nearest(ppm: i64, candidate: &str) -> (String, u32, String, i64) {
@@ -1261,9 +1406,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// Section 8 row MG21. Mutations, each alone: the upper bound `candidate.key < story.key`
-    /// dropped (2026-11-24); the window's lower bound dropped; `embedded_stories` not filtered
-    /// by space (both 2026-11-23): red each.
+    /// Section 8 row MG21, which lists the mutations run against this test and their dates.
     #[test]
     fn a_candidate_is_observed_strictly_earlier_inside_the_window_and_in_the_same_space(
     ) -> TestResult {
@@ -1271,24 +1414,47 @@ pub(crate) mod tests {
         let rows = vec![
             story(
                 1,
-                "eight-days-before",
-                "2026-11-12T11:59:59.000000Z",
+                "a-microsecond-outside",
+                "2026-11-13T11:59:59.999999Z",
                 Some("old text"),
             ),
-            story(2, "an-hour-before", &hour(11), Some("earlier text")),
-            story(3, "same-instant-lower-seq", &hour(12), Some("tie text one")),
-            story(4, "the-story", &hour(12), Some("the text")),
             story(
-                5,
+                2,
+                "exactly-seven-days-before",
+                "2026-11-13T12:00:00.000000Z",
+                Some("week-old text"),
+            ),
+            story(3, "an-hour-before", &hour(11), Some("earlier text")),
+            story(4, "same-instant-lower-seq", &hour(12), Some("tie text one")),
+            story(5, "the-story", &hour(12), Some("the text")),
+            story(
+                6,
                 "same-instant-higher-seq",
                 &hour(12),
                 Some("tie text two"),
             ),
-            story(6, "an-hour-after", &hour(13), Some("later text")),
+            story(7, "an-hour-after", &hour(13), Some("later text")),
+            // A later row of an earlier story: its head stays the first one.
+            story(8, "an-hour-before", &hour(14), Some("re-sighted text")),
         ];
         let snapshot = cut(&rows, CUTOFF)?;
         let mut args = bench.args(snapshot.path());
-        assert_eq!(bench.go(&args, &stub)?.exit, 0);
+        let first = bench.go(&args, &stub)?;
+        assert_eq!(first.exit, 0);
+        assert_eq!(at(&first.envelope, "/stories/repeat_of_story"), 1);
+        // The space begins 7 days before its first run, 2026-11-14T00:10: both week-old stories
+        // are older, get no vector and are counted in the window they fall in.
+        assert_eq!(at(&first.envelope, "/stories/before_space"), 2);
+        assert_eq!((stub.sent("old text"), stub.sent("week-old text")), (0, 0));
+        assert_eq!((stub.sent("earlier text"), stub.sent("re-sighted")), (1, 0));
+        assert_eq!(
+            bench.count(&format!(
+                "SELECT COUNT(*) FROM embed_links WHERE story_id = 'an-hour-before'
+                    AND seq = 3 AND observed_at = '{}'",
+                hour(11)
+            ))?,
+            1
+        );
         let named = |found: Vec<(String, u32, String, i64)>| -> Vec<String> {
             found.into_iter().map(|(_, _, story, _)| story).collect()
         };
@@ -1296,16 +1462,17 @@ pub(crate) mod tests {
             named(bench.candidates("the-story")?),
             ["an-hour-before", "same-instant-lower-seq"]
         );
-        assert_eq!(
-            bench.count("SELECT window_stories FROM comparisons WHERE story_id = 'the-story'")?,
-            2
-        );
-        // Another epoch is another space: the earlier story fails there and is given up, and
-        // its vector of epoch 1 is no candidate.
+        let window = "SELECT window_stories * 10 + unembedded FROM comparisons WHERE story_id";
+        assert_eq!(bench.count(&format!("{window} = 'the-story'"))?, 31);
+        // Another epoch is another space: the earlier story is refused there once and then
+        // given up, and its vector of epoch 1 is no candidate.
         args.epoch = 2;
         args.give_up_after_hours = 0;
-        stub.refusing.borrow_mut().push(("earlier text", 400, "{}"));
-        assert_eq!(bench.go(&args, &stub)?.exit, 8);
+        stub.refuse("earlier text", 400, "{}");
+        let refused = bench.go(&args, &stub)?;
+        assert_eq!(refused.exit, 0, "{:#}", refused.envelope);
+        assert_eq!(at(&refused.envelope, "/requests/refused_stories"), 1);
+        assert_eq!(stub.sent("earlier text"), 2);
         let second = bench.go(&args, &stub)?;
         assert_eq!(at(&second.envelope, "/stories/gave_up"), 1);
         assert_eq!(
@@ -1317,11 +1484,8 @@ pub(crate) mod tests {
             0
         );
         assert_eq!(
-            bench.count(
-                "SELECT unembedded FROM comparisons
-                  WHERE story_id = 'the-story' AND space LIKE '%epoch=2'"
-            )?,
-            1
+            bench.count(&format!("{window} = 'the-story' AND space LIKE '%epoch=2'"))?,
+            32
         );
         Ok(())
     }
@@ -1332,9 +1496,7 @@ pub(crate) mod tests {
     fn a_story_waits_for_its_comparison_while_an_earlier_story_has_no_vector_yet() -> TestResult {
         let (bench, stub) = (Bench::new()?, Stub::of(five_vectors()));
         let snapshot = cut(&five_stories()[..2], CUTOFF)?;
-        stub.refusing
-            .borrow_mut()
-            .push(("said on November 23", 503, "{}"));
+        stub.refuse("said on November 23", 503, "{}");
         let first = bench.go(&bench.args(snapshot.path()), &stub)?;
         assert_eq!(first.exit, 8);
         assert_eq!(at(&first.envelope, "/exit/error_code"), "partial_embed");
@@ -1352,9 +1514,8 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// The oldest story first, and a limit leaves the rest for the next run, whatever their age:
-    /// an age counts failed attempts. Mutations, each alone: `pop_last` made `pop_first`
-    /// (2026-11-23); the `attempted` test dropped from `gave_up` (2026-11-24): red each.
+    /// The oldest story first, and a limit leaves the rest for the next run, whatever their age.
+    /// Mutation 2026-11-23, `pop_last` made `pop_first`: red.
     #[test]
     fn a_limit_embeds_the_oldest_stories_and_two_stories_with_one_text_share_a_vector() -> TestResult
     {
@@ -1388,9 +1549,7 @@ pub(crate) mod tests {
     fn an_unusable_answer_is_asked_again_by_a_later_run_until_the_storys_age_limit() -> TestResult {
         let (bench, stub) = (Bench::new()?, Stub::of(five_vectors()));
         let snapshot = cut(&five_stories()[..1], CUTOFF)?;
-        stub.refusing
-            .borrow_mut()
-            .push(("said on November 23", 200, r#"{"data":[]}"#));
+        stub.refuse("said on November 23", 200, r#"{"data":[]}"#);
         let mut args = bench.args(snapshot.path());
         let first = bench.go(&args, &stub)?;
         assert_eq!(first.exit, 8);
@@ -1400,9 +1559,146 @@ pub(crate) mod tests {
         bench.go(&args, &stub)?;
         assert_eq!(stub.sent("November 23"), 2);
         assert_eq!(bench.count("SELECT COUNT(*) FROM vectors")?, 4);
-        args.give_up_after_hours = 14;
+        // Two hours after the first attempt, under a limit of one.
+        bench.now.set(bench.now.get() + TimeDelta::hours(2));
+        args.give_up_after_hours = 1;
+        args.deadline = "2026-11-22T00:00:00Z".to_owned();
         let last = bench.go(&args, &stub)?;
         assert_eq!(at(&last.envelope, "/stories/gave_up"), 1);
+        assert_eq!(stub.sent("November 23"), 2);
+        Ok(())
+    }
+
+    /// Mutations 2026-11-24, each alone: the age counted from `observed_at`; `stories_of` not
+    /// read after a send: red each.
+    #[test]
+    fn the_age_limit_runs_from_the_first_attempt_and_a_given_up_copy_shares_a_later_vector(
+    ) -> TestResult {
+        let (bench, stub) = (Bench::new()?, Stub::of(five_vectors()));
+        // Observed 30 hours before the run, under a limit of 24: a backlog story.
+        let old = story(
+            1,
+            "copy-a",
+            "2026-11-19T18:00:00.000000Z",
+            Some(FUNDING[0].1),
+        );
+        let snapshot = cut(std::slice::from_ref(&old), CUTOFF)?;
+        stub.refuse("said on November 23", 503, "{}");
+        assert_eq!(bench.go(&bench.args(snapshot.path()), &stub)?.exit, 8);
+        let again = bench.go(&bench.args(snapshot.path()), &stub)?;
+        assert_eq!(at(&again.envelope, "/stories/gave_up"), 0);
+        assert_eq!(stub.sent("November 23"), 4);
+        // A day later the copy is given up, and a second story arrives with the same text.
+        stub.refusing.borrow_mut().clear();
+        bench.now.set(bench.now.get() + TimeDelta::hours(25));
+        let both = [old, story(2, "copy-b", &hour(22), Some(FUNDING[0].1))];
+        let snapshot = cut(&both, "2026-11-22T01:00:00Z")?;
+        let mut args = bench.args(snapshot.path());
+        args.deadline = "2026-11-23T00:00:00Z".to_owned();
+        let later = bench.go(&args, &stub)?;
+        assert_eq!(at(&later.envelope, "/stories/gave_up"), 1);
+        assert_eq!(at(&later.envelope, "/stories/embedded"), 1);
+        assert_eq!(at(&later.envelope, "/comparisons/written"), 2);
+        assert_eq!(bench.candidates("copy-b")?[0], nearest(1_000_000, "copy-a"));
+        Ok(())
+    }
+
+    /// Section 8 row MG26. Mutations 2026-11-24, each alone: the gate's stop removed; a failed
+    /// gate always `canary_not_ok`; a later canary's answer made a stop: red each.
+    #[test]
+    fn no_story_is_sent_unless_the_runs_first_canary_closed_ok() -> TestResult {
+        let snapshot = cut(&five_stories(), CUTOFF)?;
+        let narrow = answer(&[1.0; 4095], true, Some(COST_USD));
+        for (status, body, code, exit) in [
+            (200, narrow.as_str(), "canary_not_ok", 8),
+            (200, r#"{"data":[]}"#, "canary_not_ok", 8),
+            (400, "{}", "canary_not_ok", 8),
+            (503, "{}", "vendor_unreachable", 7),
+        ] {
+            let (bench, stub) = (Bench::new()?, Stub::of(five_vectors()));
+            stub.refuse("", status, body);
+            for sends in 1..=2 {
+                let envelope = match bench.go(&bench.args(snapshot.path()), &stub) {
+                    Ok(done) => {
+                        assert_eq!(done.exit, exit);
+                        done.envelope
+                    }
+                    Err(ShadowError::VendorUnreachable(envelope)) => *envelope,
+                    Err(other) => return Err(other.into()),
+                };
+                assert_eq!(at(&envelope, "/exit/code"), exit, "{status}");
+                assert_eq!(at(&envelope, "/exit/error_code"), code, "{status}");
+                assert_eq!(at(&envelope, "/stopped_by"), code);
+                assert_eq!(at(&envelope, "/stories/left"), 5);
+                assert_eq!(stub.sends(), sends, "{status}");
+            }
+        }
+        // A daily canary that fails or answers nothing is reported and changes no exit.
+        let (bench, stub) = (Bench::new()?, Stub::of(five_vectors()));
+        stub.refuse("reports no event", 200, r#"{"data":[]}"#);
+        stub.refuse("Brightwater", 500, "{}");
+        let done = bench.go(&bench.args(snapshot.path()), &stub)?;
+        assert_eq!(done.exit, 0, "{:#}", done.envelope);
+        assert_eq!(at(&done.envelope, "/exit/error_code"), Value::Null);
+        assert_eq!(at(&done.envelope, "/canaries/1/outcome"), "empty");
+        assert_eq!(at(&done.envelope, "/canaries/2/outcome"), "failed");
+        assert_eq!(at(&done.envelope, "/stories/embedded"), 5);
+        Ok(())
+    }
+
+    /// Mutations 2026-11-24, each alone: `vendor_failing` never set; an unusable answer not
+    /// counted toward it; a refused status sent a second time: red each.
+    #[test]
+    fn three_stories_in_a_row_without_a_vector_stop_the_run_whatever_each_one_met() -> TestResult {
+        let (bench, stub) = (Bench::new()?, Stub::of(five_vectors()));
+        let snapshot = cut(&five_stories(), CUTOFF)?;
+        stub.refuse("said on November 23", 503, "{}");
+        stub.refuse("teilte am", 200, r#"{"data":[]}"#);
+        stub.refuse("Dunmere", 400, "{}");
+        let done = bench.go(&bench.args(snapshot.path()), &stub)?;
+        let envelope = &done.envelope;
+        assert_eq!(done.exit, 8);
+        assert_eq!(at(envelope, "/exit/error_code"), "partial_embed");
+        assert_eq!(at(envelope, "/stopped_by"), "vendor_failing");
+        assert_eq!(at(envelope, "/requests/failed_stories"), 1);
+        assert_eq!(at(envelope, "/stories/unusable"), 1);
+        assert_eq!(at(envelope, "/requests/refused_stories"), 1);
+        assert_eq!(at(envelope, "/stories/left"), 2);
+        let sent = ["November 23", "teilte am", "Dunmere", "Okonjo"].map(|text| stub.sent(text));
+        assert_eq!(sent, [2, 1, 1, 0]);
+        Ok(())
+    }
+
+    /// Section 8 row MG26. Mutations 2026-11-24, each alone: `refused_stories` asked for one
+    /// run; a refused story counted in `failed_stories`; the never-attempted-first half of the
+    /// order dropped: red each.
+    #[test]
+    fn a_text_the_provider_refuses_in_two_runs_is_not_sent_again_and_fails_no_run() -> TestResult {
+        let (bench, stub) = (Bench::new()?, Stub::of(five_vectors()));
+        let snapshot = cut(&five_stories(), CUTOFF)?;
+        stub.refuse("said on November 23", 400, "{}");
+        let first = bench.go(&bench.args(snapshot.path()), &stub)?;
+        assert_eq!(first.exit, 0, "{:#}", first.envelope);
+        assert_eq!(at(&first.envelope, "/requests/refused_stories"), 1);
+        assert_eq!(at(&first.envelope, "/stories/embedded"), 4);
+        assert_eq!(at(&first.envelope, "/comparisons/waiting"), 4);
+        // Under a limit of one, a story never sent goes before the older refused one.
+        let mut rows = five_stories();
+        rows.push(story(10, "late", &hour(15), Some("late text")));
+        let snapshot = cut(&rows, CUTOFF)?;
+        let mut args = bench.args(snapshot.path());
+        args.limit = 1;
+        bench.go(&args, &stub)?;
+        assert_eq!((stub.sent("late text"), stub.sent("November 23")), (1, 1));
+        args.limit = 100;
+        let third = bench.go(&args, &stub)?;
+        assert_eq!(third.exit, 0);
+        assert_eq!(stub.sent("November 23"), 2);
+        let fourth = bench.go(&args, &stub)?;
+        assert_eq!(fourth.exit, 0);
+        assert_eq!(at(&fourth.envelope, "/stories/refused"), 1);
+        assert_eq!(at(&fourth.envelope, "/stories/selected"), 0);
+        assert_eq!(at(&fourth.envelope, "/comparisons/written"), 5);
         assert_eq!(stub.sent("November 23"), 2);
         Ok(())
     }
@@ -1437,6 +1733,53 @@ pub(crate) mod tests {
         }
         args.deadline = "@1795219821".to_owned();
         assert_eq!(at(&late.go(&args, &idle)?.envelope, "/stories/embedded"), 5);
+        Ok(())
+    }
+
+    /// Section 8 row MG19. Mutations 2026-11-24, each alone: the deadline test before the scan
+    /// removed; the cap test moved ahead of the deadline test in `attempt`; the test inside the
+    /// scan removed: red each.
+    #[test]
+    fn past_the_deadline_no_comparison_starts_and_a_scan_under_way_keeps_what_it_finished(
+    ) -> TestResult {
+        // Four stories hold a vector and wait for the first one, which then is given up.
+        let waiting = || -> TestResult<(Bench, Stub, TempDir, Args)> {
+            let (bench, stub) = (Bench::new()?, Stub::of(five_vectors()));
+            let snapshot = cut(&five_stories(), CUTOFF)?;
+            stub.refuse("said on November 23", 503, "{}");
+            let first = bench.go(&bench.args(snapshot.path()), &stub)?;
+            assert_eq!(at(&first.envelope, "/comparisons/waiting"), 4);
+            let mut args = bench.args(snapshot.path());
+            args.give_up_after_hours = 0;
+            Ok((bench, stub, snapshot, args))
+        };
+        let (bench, stub, _snapshot, mut args) = waiting()?;
+        args.deadline = "2026-11-21T00:00:00Z".to_owned();
+        args.run_cap_usd = "0.000001".to_owned();
+        let late = bench.go(&args, &stub)?;
+        assert_eq!(at(&late.envelope, "/stopped_by"), "deadline");
+        assert_eq!(at(&late.envelope, "/requests/refused_by_cap"), 0);
+        assert_eq!(at(&late.envelope, "/comparisons/left"), 4);
+        assert_eq!(at(&late.envelope, "/comparisons/written"), 0);
+        // Every reading of the clock moves it 25 s: the scan starts before the deadline and
+        // passes deadline + 60 s between two candidates.
+        let (bench, stub, _snapshot, mut args) = waiting()?;
+        args.deadline = stamp(bench.now.get() + TimeDelta::seconds(150));
+        bench.tick.set(TimeDelta::seconds(25));
+        let cut_short = bench.go(&args, &stub)?;
+        let read = |key: &str| at(&cut_short.envelope, key).as_u64().unwrap_or_default();
+        let (written, left) = (read("/comparisons/written"), read("/comparisons/left"));
+        assert!(written >= 1 && left >= 1, "{:#}", cut_short.envelope);
+        assert_eq!(written + left, 4);
+        assert_eq!(at(&cut_short.envelope, "/stopped_by"), "deadline");
+        assert_eq!(
+            bench.count("SELECT COUNT(*) FROM comparisons")?,
+            i64::try_from(written)?
+        );
+        bench.tick.set(TimeDelta::zero());
+        args.deadline = stamp(bench.now.get() + TimeDelta::hours(1));
+        let rest = bench.go(&args, &stub)?;
+        assert_eq!(at(&rest.envelope, "/comparisons/written"), left);
         Ok(())
     }
 
@@ -1486,6 +1829,21 @@ pub(crate) mod tests {
         assert_eq!(at(&done.envelope, "/canaries/1/worst_case_micro_usd"), 132);
         assert_eq!(stub.sends(), 0);
         assert!(!bench.store().exists());
+        args.run_cap_usd = "0.000001".to_owned();
+        let capped = bench.go(&args, &stub)?;
+        assert_eq!(at(&capped.envelope, "/requests/refused_by_cap"), 5);
+        // Over a store in which a story waits for its record: planned as `left`, nothing written.
+        let (bench, stub) = (Bench::new()?, Stub::of(five_vectors()));
+        stub.refuse("said on November 23", 503, "{}");
+        bench.go(&bench.args(snapshot.path()), &stub)?;
+        let before = std::fs::read(bench.store().join(EMBED_DB_FILE))?;
+        let mut args = bench.args(snapshot.path());
+        (args.dry_run, args.give_up_after_hours) = (true, 0);
+        let (sent, planned) = (stub.sends(), bench.go(&args, &stub)?);
+        assert_eq!(at(&planned.envelope, "/comparisons/left"), 4);
+        assert_eq!(at(&planned.envelope, "/changed"), false);
+        assert_eq!(stub.sends(), sent);
+        assert_eq!(std::fs::read(bench.store().join(EMBED_DB_FILE))?, before);
         Ok(())
     }
 
@@ -1507,15 +1865,19 @@ pub(crate) mod tests {
         assert!(canary_text(LONG).len() > STATE_BUDGET_BYTES);
     }
 
-    /// Section 8 row MG24. Mutations 2026-11-23, each alone: the daily test removed; every
-    /// canary's vector kept; the pair compared with its own first answer: red each.
+    /// Section 8 rows MG24 and MG21, which list the mutations run against this test.
     #[test]
     fn the_short_canary_is_sent_by_every_run_the_others_once_a_day_each_against_its_first_answer(
     ) -> TestResult {
-        let stub = Stub::of(vec![
+        let mut stub = Stub::of(vec![
             ("Brightwater Ferries, a company", axis(8, 1.0, 9, 0.0)),
             ("Kanarientext", axis(8, 0.6, 9, 0.8)),
         ]);
+        // The short canary's answers after its first: at cosine 0.8 of it, then at 0.6.
+        stub.later = vec![(
+            "says it will open",
+            vec![axis(4000, 0.8, 4001, 0.6), axis(4000, 0.6, 4001, 0.8)],
+        )];
         let bench = Bench::new()?;
         let snapshot = cut(&[story(1, "bodiless", &hour(10), None)], CUTOFF)?;
         let first = bench.go(&bench.args(snapshot.path()), &stub)?;
@@ -1530,18 +1892,115 @@ pub(crate) mod tests {
         assert_eq!(at(&second.envelope, "/canaries/1"), Value::Null);
         assert_eq!(read(&second.envelope, 0, "name"), SHORT);
         assert_eq!(read(&second.envelope, 0, "repeat_index"), 1);
-        assert_eq!(read(&second.envelope, 0, "self_similarity_ppm"), 1_000_000);
+        assert_eq!(read(&second.envelope, 0, "self_similarity_ppm"), 800_000);
         assert_eq!(stub.sends(), 5);
         bench.now.set(bench.now.get() + TimeDelta::days(1));
         let mut args = bench.args(snapshot.path());
         args.deadline = "2026-11-23T00:00:00Z".to_owned();
         let third = bench.go(&args, &stub)?;
+        assert_eq!(read(&third.envelope, 0, "self_similarity_ppm"), 600_000);
         assert_eq!(read(&third.envelope, 3, "repeat_index"), 1);
         assert_eq!(read(&third.envelope, 3, "self_similarity_ppm"), 1_000_000);
         assert_eq!(stub.sends(), 9);
         assert_eq!(bench.count("SELECT COUNT(*) FROM vectors")?, 4);
         assert_eq!(bench.count("SELECT COUNT(*) FROM canaries")?, 9);
         assert_eq!(bench.count("SELECT COUNT(*) FROM embed_requests")?, 9);
+        // Another epoch is another space: all four again, each a first answer of its own.
+        args.epoch = 2;
+        let other = bench.go(&args, &stub)?;
+        assert_eq!(stub.sends(), 13);
+        for index in 0..4 {
+            assert_eq!(read(&other.envelope, index, "repeat_index"), 0);
+            assert_eq!(
+                read(&other.envelope, index, "self_similarity_ppm"),
+                Value::Null
+            );
+        }
+        assert_eq!(bench.count("SELECT COUNT(*) FROM vectors")?, 8);
+        // Its second answer there is measured against its first there, not epoch 1's.
+        let again = bench.go(&args, &stub)?;
+        assert_eq!(read(&again.envelope, 0, "self_similarity_ppm"), 1_000_000);
+        let series = crate::cmd_dedup::distribution(&bench.store())?;
+        let short = at(&series, "/canaries/3");
+        assert_eq!(at(&short, "/space"), space()?.name());
+        assert_eq!(
+            at(&short, "/similarity_to_first_answer_ppm"),
+            serde_json::json!({"answers": 2, "min": 600_000, "max": 800_000, "last": 600_000})
+        );
+        assert_eq!(at(&series, "/canaries/7/answers"), 2);
+        Ok(())
+    }
+
+    /// Section 8 row MG19, what the answer states. Mutations 2026-11-24, each alone:
+    /// `answered_by_another_model` or `answered_by_another_provider` always 0; the answer's
+    /// `provider` not read; a vendor cost of 0 kept as a cost: red each.
+    #[test]
+    fn an_answer_naming_another_model_or_provider_is_counted_and_a_cost_of_zero_is_no_cost(
+    ) -> TestResult {
+        let snapshot = cut(&five_stories(), CUTOFF)?;
+        let (bench, mut stub) = (Bench::new()?, Stub::of(five_vectors()));
+        stub.stated = ("example/another", Some("another-host"));
+        stub.cost = Some(0.0);
+        let done = bench.go(&bench.args(snapshot.path()), &stub)?;
+        let read = |envelope: &Value, key: &str| at(envelope, &format!("/vectors/{key}"));
+        assert_eq!(read(&done.envelope, "answered_by_another_model"), 9);
+        assert_eq!(read(&done.envelope, "answered_by_another_provider"), 9);
+        assert_eq!(read(&done.envelope, "provider_not_stated"), 0);
+        assert_eq!(
+            bench
+                .count("SELECT COUNT(*) FROM vectors WHERE answering_provider = 'another-host'")?,
+            9
+        );
+        assert_eq!(at(&done.envelope, "/requests/costless"), 9);
+        let worst = bench.count("SELECT SUM(worst_case_micro_usd) FROM attempt_events")?;
+        assert_eq!(at(&done.envelope, "/cost_micro_usd/run"), worst);
+        let (bench, mut stub) = (Bench::new()?, Stub::of(five_vectors()));
+        stub.stated = (MODEL, Some("example-host"));
+        let pinned = bench.go(&bench.args(snapshot.path()), &stub)?;
+        assert_eq!(read(&pinned.envelope, "answered_by_another_model"), 0);
+        assert_eq!(read(&pinned.envelope, "answered_by_another_provider"), 0);
+        assert_eq!(
+            read(&pinned.envelope, "answering_providers"),
+            serde_json::json!(["example-host"])
+        );
+        Ok(())
+    }
+
+    /// Section 8 rows MG19, MG21 and MG22, which list the mutations run against this test.
+    #[test]
+    fn the_comparison_token_the_embed_wire_and_the_whole_body_are_the_ones_the_design_names(
+    ) -> TestResult {
+        assert_eq!(
+            compare_version(),
+            format!(
+                "dedup.compare/1(window_days=7;keep=5;dot=8-lane-f32;visible-host/1;\
+                 number-token/1;{})",
+                crate::coverage::version()
+            )
+        );
+        let main = include_str!("main.rs");
+        assert!(main.contains("wire_or_refusal(run.dry_run, ModelWire::embed, format)"));
+        assert_eq!(main.matches("ModelWire::embed").count(), 1);
+        // Two bodies over the state budget whose one URL is their last line.
+        let padded = |word: &str| {
+            let filler = format!("{word} ").repeat(STATE_BUDGET_BYTES / word.len());
+            format!("{filler}\nContact: https://tail-host.example/press")
+        };
+        let rows = [
+            story(1, "long-one", &hour(10), Some(&padded("alpha"))),
+            story(2, "long-two", &hour(11), Some(&padded("beta"))),
+        ];
+        let (bench, stub) = (Bench::new()?, Stub::of(Vec::new()));
+        let snapshot = cut(&rows, CUTOFF)?;
+        let done = bench.go(&bench.args(snapshot.path()), &stub)?;
+        assert_eq!(at(&done.envelope, "/stories/truncated"), 2);
+        assert_eq!(
+            bench.count(
+                "SELECT COUNT(*) FROM comparison_candidates
+                  WHERE list = 'guarded' AND hosts_shared = '[\"tail-host.example\"]'"
+            )?,
+            1
+        );
         Ok(())
     }
 

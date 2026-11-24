@@ -412,6 +412,16 @@ pub(crate) mod tests {
     }
 
     /// Section 8 row MG5. Mutation 2026-11-23, `#[derive(Debug)]` on `ApiKey`: red.
+    /// Mutation 2026-11-24, `EMBED_ENDPOINT` given the `decide` path: red.
+    #[test]
+    fn each_wire_holds_its_own_kinds_address() {
+        let (decide, embed) = (ModelWire::new(sentinel()), ModelWire::embed(sentinel()));
+        assert_eq!(decide.endpoint, "https://openrouter.ai/api/v1/systemone");
+        assert_eq!(embed.endpoint, "https://openrouter.ai/api/v1/embeddings");
+        let design = include_str!("../../../docs/design/architecture.md");
+        assert!(design.contains("| endpoint | `https://openrouter.ai/api/v1/embeddings`"));
+    }
+
     #[test]
     fn the_keys_debug_form_prints_no_byte_of_it() {
         assert_eq!(format!("{:?}", sentinel()), "ApiKey(<redacted>)");
