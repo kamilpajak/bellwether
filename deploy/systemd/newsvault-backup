@@ -173,7 +173,10 @@ else
             *) set -- "$@" "$entry" ;;
         esac
     done
-    tar -czf "$work/$name" -C "$work" commit.sqlite3 -C "$store" "$@" || exit 2
+    # A store of the log and the blob tree alone leaves no entry: GNU tar 1.35 exits 2 on a `-C`
+    # no member follows (CI, 2026-11-24).
+    [ "$#" -eq 0 ] || set -- -C "$store" "$@"
+    tar -czf "$work/$name" -C "$work" commit.sqlite3 "$@" || exit 2
 fi
 
 # Every file is staged before any is renamed, a pack before its manifest and both before the

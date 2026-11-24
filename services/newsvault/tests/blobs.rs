@@ -711,9 +711,10 @@ fn backup_bench(store: &Path) -> Result<TempDir, Box<dyn Error>> {
     Ok(work)
 }
 
-/// One run of `deploy/systemd/newsvault-backup` under the unit's shell.
-fn night(work: &Path, stamp: &str) -> Result<Output, Box<dyn Error>> {
-    Ok(Command::new("/bin/dash")
+/// One run of `deploy/systemd/newsvault-backup` under the unit's shell; any exit but `exit` is
+/// an error carrying the run's stderr.
+fn night(work: &Path, stamp: &str, exit: i32) -> Result<Output, Box<dyn Error>> {
+    let run = Command::new("/bin/dash")
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/systemd/newsvault-backup"))
         .current_dir(work)
         .env_clear()
@@ -732,7 +733,11 @@ fn night(work: &Path, stamp: &str) -> Result<Output, Box<dyn Error>> {
         .env("STUB_NEWSVAULT", env!("CARGO_BIN_EXE_newsvault"))
         .env("STUB_STAMP", stamp)
         .stdin(Stdio::null())
-        .output()?)
+        .output()?;
+    match run.status.code() == Some(exit) {
+        true => Ok(run),
+        false => Err(format!("{}: {}", run.status, String::from_utf8_lossy(&run.stderr)).into()),
+    }
 }
 
 fn names(dir: &Path) -> Result<Vec<String>, Box<dyn Error>> {
@@ -820,14 +825,13 @@ fn each_night_packs_only_what_no_pack_holds_and_the_restore_verifies() -> TestRe
     let (root, pages, dictionary) = compressed_store()?;
     let work = backup_bench(root.path())?;
     let folder = work.path().join(FOLDER);
-    let mut exits = Vec::new();
     for (index, stamp) in NIGHTS.iter().enumerate() {
         if index == 1 {
             let db = Connection::open(root.path().join(COMMIT_LOG))?;
             index_raw(root.path(), &db, b"a page indexed after the first night")?;
             index_raw(root.path(), &db, b"and another one")?;
         }
-        exits.push(night(work.path(), stamp)?.status.code());
+        night(work.path(), stamp, 0)?;
     }
     let members = |pack: &str| -> Result<[usize; 2], Box<dyn Error>> {
         let text = std::fs::read_to_string(folder.join(format!("{pack}.manifest")))?;
@@ -852,7 +856,6 @@ fn each_night_packs_only_what_no_pack_holds_and_the_restore_verifies() -> TestRe
     held.sort();
     assert_eq!(
         (
-            exits,
             names(&folder)?,
             members(PACK_1)?,
             members(PACK_2)?,
@@ -868,7 +871,6 @@ fn each_night_packs_only_what_no_pack_holds_and_the_restore_verifies() -> TestRe
             ),
         ),
         (
-            vec![Some(0); 3],
             held,
             [1, pages.len()],
             [0, 2],
@@ -893,7 +895,7 @@ fn a_lost_short_or_unrecorded_pack_is_named_and_its_blobs_are_packed_again() -> 
         let (root, _, _) = compressed_store()?;
         let work = backup_bench(root.path())?;
         let folder = work.path().join(FOLDER);
-        let first = night(work.path(), NIGHTS[0])?;
+        night(work.path(), NIGHTS[0], 0)?;
         let (tar, manifest) = (
             folder.join(PACK_1),
             folder.join(format!("{PACK_1}.manifest")),
@@ -914,7 +916,7 @@ fn a_lost_short_or_unrecorded_pack_is_named_and_its_blobs_are_packed_again() -> 
         let log = root.path().join(COMMIT_LOG);
         let facts = folder_facts(&folder, work.path())?;
         let plan = answered(&pack(root.path(), &log, &facts, &["--dry-run"])?)?;
-        let second = night(work.path(), NIGHTS[1])?;
+        let second = night(work.path(), NIGHTS[1], 8)?;
         let after = names(&folder)?;
         let healed = pack(
             root.path(),
@@ -926,13 +928,11 @@ fn a_lost_short_or_unrecorded_pack_is_named_and_its_blobs_are_packed_again() -> 
         let (restored, _) = restore(&folder, &lost)?;
         got.push((
             damage,
-            first.status.code(),
             (
                 strings(&plan["lost"]),
                 strings(&plan["unrecorded"]),
                 plan["packed"].as_u64(),
             ),
-            second.status.code(),
             String::from_utf8_lossy(&second.stdout).contains(&format!("\"{PACK_1}\"")),
             before.iter().all(|name| after.contains(name)) && after.len() == before.len() + 3,
             (healed.status.code(), answered(&healed)?["packed"].as_u64()),
@@ -946,9 +946,7 @@ fn a_lost_short_or_unrecorded_pack_is_named_and_its_blobs_are_packed_again() -> 
     let row = |damage, lost: &Vec<String>, unrecorded: &Vec<String>| {
         (
             damage,
-            Some(0),
             (lost.clone(), unrecorded.clone(), all),
-            Some(8),
             true,
             true,
             (Some(8), Some(0)),
