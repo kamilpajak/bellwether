@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -103,6 +104,15 @@ const TAR_STUB: &str = r#"#!/bin/sh
 if [ "$STUB_TAR" = fail ]; then echo part >"$2"; exit 1; fi
 exec /usr/bin/tar "$@"
 "#;
+
+/// A child spawned by one test holds, until its exec, a copy of every descriptor open in this
+/// process, a store's locked `LOCK` among them: with the tests in parallel `Store::open` met
+/// `LeaseHeld` in 1 of 11 runs of this binary (2026-11-24). Every test here takes this first.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+fn alone() -> TestResult<MutexGuard<'static, ()>> {
+    Ok(ONE_AT_A_TIME.lock().map_err(|_| "a test here failed")?)
+}
 
 fn repo(path: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -370,6 +380,7 @@ fn backup(meets: Meets) -> TestResult<Backed> {
 #[test]
 fn the_archive_is_the_database_and_its_named_blobs_and_a_restore_verifies_with_the_sources_counts(
 ) -> TestResult {
+    let _alone = alone()?;
     let backed = backup(Meets::Nothing)?;
     assert_eq!(backed.exit, Some(0), "{}", backed.stderr);
     let source = backed.path("home/.bellwether/modelgate");
@@ -528,6 +539,7 @@ fn the_archive_is_the_database_and_its_named_blobs_and_a_restore_verifies_with_t
 /// the last metric kept, the staging directory gone. Only a snapshot past its bound is removed.
 #[test]
 fn a_held_lock_a_snapshot_past_its_bound_or_a_copy_verify_refuses_writes_nothing() -> TestResult {
+    let _alone = alone()?;
     let bound = "the snapshot passed its 150 s bound";
     let cases = [
         (
@@ -591,6 +603,7 @@ fn code(output: &Output) -> TestResult<(Option<i32>, String, usize)> {
 #[test]
 fn a_snapshot_is_refused_under_a_writers_lease_and_verify_names_a_missing_or_altered_blob(
 ) -> TestResult {
+    let _alone = alone()?;
     let work = TempDir::new()?;
     let at = |relative: &str| work.path().join(relative);
     let text = |relative: &str| at(relative).to_string_lossy().into_owned();
@@ -692,6 +705,7 @@ fn a_snapshot_is_refused_under_a_writers_lease_and_verify_names_a_missing_or_alt
 /// `COUNT(*)` alone reads an index and the same counts.
 #[test]
 fn a_store_without_write_access_is_copied_and_a_damaged_table_page_is_refused() -> TestResult {
+    let _alone = alone()?;
     use std::os::unix::fs::PermissionsExt;
     let work = TempDir::new()?;
     let at = |relative: &str| work.path().join(relative);
