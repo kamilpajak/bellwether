@@ -16,6 +16,7 @@ use newsvault::cmd_collect::{self, CollectRunError};
 use newsvault::cmd_cut::{self, CutError};
 use newsvault::cmd_items;
 use newsvault::cmd_ledger::{self, Ask, LedgerReadError, Report};
+use newsvault::cmd_pack;
 use newsvault::cmd_robots::{self, RobotsError};
 use newsvault::cmd_roster::{self, RosterError};
 use newsvault::cmd_snapshot::{self, SnapshotError};
@@ -339,6 +340,32 @@ enum BlobsAction {
         non_interactive: bool,
         #[arg(long, default_value_t = cmd_blobs::DEFAULT_FAILURES_SHOWN)]
         limit: usize,
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
+    },
+    /// Writes the blobs and dictionaries a commit log names that no backup pack holds as one
+    /// tar and its manifest. Exit 8 when a pack is lost or unrecorded. Mutates no store.
+    Pack {
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// The commit log whose rows are packed: the backup's snapshot, or a restored copy.
+        #[arg(long)]
+        log: PathBuf,
+        /// A file of `<pack> <bytes>` lines: every pack the backup folder holds.
+        #[arg(long)]
+        have: PathBuf,
+        /// A file holding every manifest of the backup folder, one after another.
+        #[arg(long)]
+        manifests: PathBuf,
+        /// The tar to write, with its manifest beside it. Required unless a dry run.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Plans and writes nothing: `packed` counts what a run would pack.
+        #[arg(long)]
+        dry_run: bool,
+        /// Accepted and does nothing: no command here prompts or reads stdin.
+        #[arg(long)]
+        non_interactive: bool,
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
@@ -1128,6 +1155,7 @@ fn run_blobs(action: BlobsAction) -> anyhow::Result<Verdict> {
     let format_of = |action: &BlobsAction| match action {
         BlobsAction::Verify { format, .. }
         | BlobsAction::Compress { format, .. }
+        | BlobsAction::Pack { format, .. }
         | BlobsAction::Dictionary {
             action: DictionaryAction::Train { format, .. },
         } => *format,
@@ -1206,6 +1234,27 @@ fn run_blobs(action: BlobsAction) -> anyhow::Result<Verdict> {
                 },
             )
         }),
+        BlobsAction::Pack {
+            store,
+            log,
+            have,
+            manifests,
+            out,
+            dry_run,
+            ..
+        } => {
+            if out.is_none() && !dry_run {
+                usage_exit("--out is required unless --dry-run".to_owned());
+            }
+            let ask = cmd_pack::Ask {
+                store: vault_root(store),
+                log,
+                have,
+                manifests,
+                out: out.filter(|_| !dry_run),
+            };
+            return run_pack(&ask, format);
+        }
         BlobsAction::Dictionary {
             action:
                 DictionaryAction::Train {
@@ -1253,6 +1302,58 @@ fn run_blobs(action: BlobsAction) -> anyhow::Result<Verdict> {
         }
         Err(refused) => {
             emit_blobs_error(&refused, format)?;
+            Ok(Verdict::No(refused.exit()))
+        }
+    }
+}
+
+/// Exit 8 with the report on stdout when a pack is lost or unrecorded: the pack asked for is
+/// written all the same. A refusal goes to stderr with stdout empty; none is retryable.
+fn run_pack(ask: &cmd_pack::Ask, format: Format) -> anyhow::Result<Verdict> {
+    match cmd_pack::run(ask) {
+        Ok(report) => {
+            let out = std::io::stdout();
+            let mut out = out.lock();
+            match format {
+                Format::Json => {
+                    serde_json::to_writer_pretty(&mut out, &report)?;
+                    writeln!(out)?;
+                }
+                Format::Human => writeln!(
+                    out,
+                    "{} named {} held {} packed {} pack {} bytes {} lost [{}] unrecorded [{}]{}",
+                    report.log,
+                    report.named,
+                    report.held,
+                    report.packed,
+                    report.pack.as_deref().unwrap_or("-"),
+                    report.pack_bytes,
+                    report.lost.join(" "),
+                    report.unrecorded.join(" "),
+                    if report.dry_run { " (dry run)" } else { "" }
+                )?,
+            }
+            Ok(if report.is_whole() {
+                Verdict::Ok
+            } else {
+                Verdict::No(EXIT_INCOMPLETE)
+            })
+        }
+        Err(refused) => {
+            let object = serde_json::json!({
+                "schema": "newsvault.error/1",
+                "code": refused.code(),
+                "message": refused.to_string(),
+                "retryable": false,
+                "details": {"store": ask.store.display().to_string(), "log": ask.log.display().to_string()},
+                "suggestions": Vec::<Vec<String>>::new(),
+            });
+            let err = std::io::stderr();
+            let mut err = err.lock();
+            match format {
+                Format::Json => writeln!(err, "{object}")?,
+                Format::Human => writeln!(err, "error: {refused} ({})", refused.code())?,
+            }
             Ok(Verdict::No(refused.exit()))
         }
     }
@@ -1743,7 +1844,7 @@ fn print_schema(format: Format) {
             },
             {
                 "path": ["blobs", "compress"],
-                "summary": "Rewrites every raw blob as one zstd frame with the active dictionary, under the store's LOCK lease; first removes staging files a crash left; removes a raw file only after the compressed copy is renamed, fsynced and read back to the digest, and rewrites a compressed copy left beside it that does not read back. Idempotent and resumable. The backup's tar does not take LOCK: run it under the host lock the systemd units take.",
+                "summary": "Rewrites every raw blob as one zstd frame with the active dictionary, under the store's LOCK lease; first removes staging files a crash left; removes a raw file only after the compressed copy is renamed, fsynced and read back to the digest, and rewrites a compressed copy left beside it that does not read back. Idempotent and resumable. The backup's blobs pack does not take LOCK: run it under the host lock the systemd units take.",
                 "options": [
                     {"name": "store", "type": "path"},
                     {"name": "allow_no_dictionary", "type": "flag",
@@ -1762,6 +1863,36 @@ fn print_schema(format: Format) {
                     "4": "input_absent: no commit log, or the active dictionary's file",
                     "7": "lease_held",
                     "8": "a blob failed; it keeps its raw file and is listed in failures"
+                },
+                "mutates": true
+            },
+            {
+                "path": ["blobs", "pack"],
+                "summary": "Writes the dictionaries and blobs the commit log at log names that no pack of the backup folder holds as one tar of store-relative paths (blobs/dictionaries/<sha256>, blobs/sha256/..), each file as stored and only after it read back to its digest, and then out.manifest: `pack <name> <bytes>`, one `dictionary <sha256>` or `blob <sha256>` line per member, `end <members>`. A manifest counts only when have lists its pack at its length; the members of any other are packed again. Reads the store without the lease and writes only out and out.manifest.",
+                "options": [
+                    {"name": "store", "type": "path"},
+                    {"name": "log", "type": "path", "required": true,
+                     "doc": "the commit log whose blobs and dictionaries rows are packed"},
+                    {"name": "have", "type": "path", "required": true,
+                     "doc": "a file of `<pack file name> <bytes>` lines, one per pack the folder holds"},
+                    {"name": "manifests", "type": "path", "required": true,
+                     "doc": "a file holding every manifest of the folder, one after another"},
+                    {"name": "out", "type": "path",
+                     "doc": "the tar; required unless dry_run; refused when it or its manifest exists; neither is written when nothing is left to pack"},
+                    {"name": "dry_run", "type": "flag",
+                     "doc": "reads log, have and manifests only: packed is what a run would pack, so 0 with lost and unrecorded empty says the folder's packs hold every blob the log names"},
+                    {"name": "non_interactive", "type": "flag",
+                     "doc": "accepted and does nothing: no command here prompts or reads stdin"},
+                    {"name": "format", "type": "enum", "values": ["human", "json"]}
+                ],
+                "env": [{"name": "BELLWETHER_VAULT",
+                         "doc": "the store when --store is not given, then ~/.bellwether/vault"}],
+                "output": cmd_pack::SCHEMA,
+                "exits": {
+                    "0": "every manifest has its pack and every pack its manifest; pack is null when nothing was left to pack",
+                    "2": "invalid_argument (out exists; no out without dry_run), input_unparseable (a line of have or manifests; a blob or dictionary that does not read back to its digest), io_failed",
+                    "4": "input_absent: no log, have or manifests file, or a blob or dictionary the log names is not in the store",
+                    "8": "lost or unrecorded is not empty; the pack is written and holds the members of every lost one"
                 },
                 "mutates": true
             },

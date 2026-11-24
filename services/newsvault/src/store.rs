@@ -1260,7 +1260,7 @@ pub struct RobotsLedger {
 }
 
 /// Whether the commit log holds a table of this name.
-fn holds_table(db: &Connection, table: &str) -> Result<bool, StoreError> {
+pub(crate) fn holds_table(db: &Connection, table: &str) -> Result<bool, StoreError> {
     Ok(db.query_row(
         "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
         [table],

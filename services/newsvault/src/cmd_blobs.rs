@@ -350,7 +350,7 @@ impl CompressReport {
 }
 
 /// Rewrites every raw copy as `.zst` under the store's `LOCK` lease, the one `collect` and
-/// `snapshot` take. The backup's tar of `blobs/` holds only the host lock the systemd units take,
+/// `snapshot` take. The backup's `blobs pack` reads the tree under only the host lock the systemd units take,
 /// so a manual run goes under that lock too (§3.9). Running it again rewrites only what is raw.
 pub fn compress(ask: &CompressAsk) -> Result<CompressReport, BlobsError> {
     if !ask.store.join(COMMIT_LOG).is_file() {

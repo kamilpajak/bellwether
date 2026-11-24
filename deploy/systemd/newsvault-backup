@@ -1,12 +1,15 @@
 #!/bin/sh
 # The daily copy of one store into Nextcloud (architecture.md section 10, N1). No argument, run by
-# newsvault-backup.service under the store lock: `newsvault snapshot` of the commit log plus every
-# other store file. `modelgate`, run by modelgate-backup.service: `modelgate snapshot` under the
-# shadow lock, then `modelgate verify` of the copy. Either way one .tar.gz, written into the data
-# directory through the AIO container as www-data, registered with `occ files:scan` and found by
-# `occ info:file`, then all but the 7 newest copies of that store deleted. Exits: 2 setup or an
-# unsafe setting, 4 an absent input, 7 a held lock, a snapshot past its bound, the write, rename,
-# scan or lookup, 8 the copy is in and the retention failed; else the snapshot's or verify's own.
+# newsvault-backup.service under the store lock: `newsvault snapshot` of the commit log, then
+# `newsvault blobs pack` of the blobs no pack in the folder holds, then one .tar.gz of the snapshot
+# and every other store entry but `blobs`. `modelgate`, run by modelgate-backup.service:
+# `modelgate snapshot` under the shadow lock, `modelgate verify` of the copy, one .tar.gz of it.
+# Each file is written into the data directory through the AIO container as www-data and renamed,
+# the folder registered with `occ files:scan`, each file found by `occ info:file`, then all but the
+# 7 newest .tar.gz of that store deleted. No pack or manifest is ever deleted. Exits: 2 setup or an
+# unsafe setting, 4 an absent input, 7 a held lock, a snapshot past its bound, a read, write,
+# rename, scan or lookup, 8 the copy is in and the retention failed or a pack is lost or
+# unrecorded; else the snapshot's, pack's or verify's own.
 set -u
 export LC_ALL=C
 : "${NEWSVAULT_IMAGE:?set in newsvault.env}" "${NEWSVAULT_TEXTFILE_DIR:?set in newsvault.env}"
@@ -20,15 +23,19 @@ keep=7
 lock_wait=760
 snapshot_bound=150
 snapshot_kill=20
+packs=''
 case $#:${1-} in
     0:)
         what=vault
+        base=bellwether-vault-log
+        packs=bellwether-vault-blobs
         prom=newsvault-backup.prom
         stamp=newsvault_backup_last_success_timestamp_seconds
         size=newsvault_backup_last_success_bytes
         ;;
     1:modelgate)
         what=modelgate
+        base=bellwether-modelgate
         prom=modelgate-backup.prom
         stamp=modelgate_backup_last_success_timestamp_seconds
         size=modelgate_backup_last_success_bytes
@@ -37,7 +44,8 @@ case $#:${1-} in
     *) echo "usage: newsvault-backup [modelgate]" >&2; exit 2 ;;
 esac
 store="$HOME/.bellwether/$what"
-copy="bellwether-$what-"'[0-9]\{8\}T[0-9]\{6\}Z\.tar\.gz'
+stamped='-[0-9]\{8\}T[0-9]\{6\}Z\.tar'
+copy="$base$stamped\\.gz"
 
 # check NAME VALUE KIND, KIND one of word, absolute, relative: every '/'-separated part starts with a
 # letter or digit and holds only letters, digits, '.', '_' and '-'.
@@ -71,14 +79,37 @@ as_www() {
     docker exec -u www-data "$container" "$@"
 }
 
+# put FILE NAME: FILE written into the folder under the hidden .NAME.part, which Nextcloud's scanner
+# skips (Scanner::isPartialFile, 30 to 32 source, read 2026-11-18), and its byte count compared.
+put() {
+    bytes=$(wc -c <"$1" | tr -d ' ')
+    staged="$staged $dir/.$2.part"
+    written=$(docker exec -i -u www-data "$container" sh -c 'cat >"$1" && wc -c <"$1"' sh \
+        "$dir/.$2.part" <"$1") || { echo "writing $dir/.$2.part in $container failed" >&2; exit 7; }
+    written=$(printf '%s' "$written" | tr -d ' \n')
+    if [ "$written" != "$bytes" ]; then
+        echo "$dir/.$2.part holds $written of $bytes bytes; not renamed" >&2
+        exit 7
+    fi
+}
+folder() {
+    as_www mkdir -p -- "$dir" || { echo "creating $dir in $container failed" >&2; exit 7; }
+}
+
 mkdir -p "$HOME/.cache/bellwether" || exit 2
 work=$(mktemp -d "$HOME/.cache/bellwether/backup.XXXXXX") || exit 2
 staged=''
-trap 'rm -rf "$work"; if [ -n "$staged" ]; then as_www rm -f -- "$staged"; fi' EXIT
+# $staged is split into paths: `check` admits no blank or glob character in any part of them.
+# shellcheck disable=SC2086
+trap 'rm -rf "$work"; if [ -n "$staged" ]; then as_www rm -f -- $staged; fi' EXIT
 trap 'exit 130' INT TERM
 
 at=$(date -u +%s)
-name="bellwether-$what-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+now=$(date -u +%Y%m%dT%H%M%SZ)
+name="$base-$now.tar.gz"
+pack="$packs-$now.tar"
+packed=0
+held=0
 if [ "$what" = modelgate ]; then
     # The archive is the snapshot's output and nothing else of the store: the database and the
     # blobs its rows name. A shadow run that fired while the lock is held here would exit 7.
@@ -106,50 +137,71 @@ if [ "$what" = modelgate ]; then
         "$NEWSVAULT_IMAGE" -- /usr/local/bin/modelgate \
         verify --store /out/store --non-interactive --format json || exit
     tar -czf "$work/$name" -C "$work/store" gate.sqlite blobs || exit 2
+    folder
 else
-    docker run --rm --name newsvault-backup --pull never \
+    set -- --rm --name newsvault-backup --pull never \
         --user "$(id -u):$(id -g)" --read-only --network none \
         --cap-drop ALL --security-opt no-new-privileges \
         --mount "type=bind,src=$store,dst=/vault,readonly" \
-        --mount "type=bind,src=$work,dst=/out" \
-        "$NEWSVAULT_IMAGE" \
+        --mount "type=bind,src=$work,dst=/out"
+    docker run "$@" "$NEWSVAULT_IMAGE" \
         snapshot --out /out/commit.sqlite3 --non-interactive --format json || exit
+    folder
+    # What the folder holds, for `blobs pack` to judge: each pack's length, then every manifest.
+    if ! docker exec -u www-data "$container" sh -c 'cd "$1" || exit; for f in "$2"-*.tar; do [ -f "$f" ] || continue; printf "%s " "$f"; wc -c <"$f" || exit; done' \
+        sh "$dir" "$packs" >"$work/have" ||
+        ! docker exec -u www-data "$container" sh -c 'cd "$1" || exit; for f in "$2"-*.tar.manifest; do [ -f "$f" ] || continue; cat "$f" || exit; done' \
+            sh "$dir" "$packs" >"$work/manifests"; then
+        echo "reading the packs and manifests in $dir failed" >&2
+        exit 7
+    fi
+    while read -r _ length; do held=$((held + length)); done <"$work/have"
+    docker run "$@" "$NEWSVAULT_IMAGE" \
+        blobs pack --log /out/commit.sqlite3 --have /out/have --manifests /out/manifests \
+        --out "/out/$pack" --non-interactive --format json
+    packed=$?
+    case $packed in 0 | 8) ;; *) exit "$packed" ;; esac
 
-    # The live log and its lock stay out: the snapshot is the archive's commit.sqlite3.
+    # The live log and its lock stay out, the snapshot is the archive's commit.sqlite3, and the
+    # blob tree is in the packs.
     cd "$store" || exit 4
     set --
     for entry in * .[!.]* ..?*; do
         [ -e "$entry" ] || continue
         case $entry in
-            commit.sqlite3 | commit.sqlite3-* | LOCK) ;;
+            commit.sqlite3 | commit.sqlite3-* | LOCK | blobs) ;;
             *) set -- "$@" "$entry" ;;
         esac
     done
     tar -czf "$work/$name" -C "$work" commit.sqlite3 -C "$store" "$@" || exit 2
 fi
-bytes=$(wc -c <"$work/$name" | tr -d ' ')
 
-as_www mkdir -p -- "$dir" || { echo "creating $dir in $container failed" >&2; exit 7; }
-# Written under a hidden name and renamed, so the final name never holds part of a copy. Nextcloud's
-# scanner skips the `.part` extension (Scanner::isPartialFile, 30 to 32 source, read 2026-11-18).
-staged="$dir/.$name.part"
-written=$(docker exec -i -u www-data "$container" sh -c 'cat >"$1" && wc -c <"$1"' sh "$staged" \
-    <"$work/$name") || { echo "writing $staged in $container failed" >&2; exit 7; }
-written=$(printf '%s' "$written" | tr -d ' \n')
-if [ "$written" != "$bytes" ]; then
-    echo "$staged holds $written of $bytes bytes; not renamed" >&2
-    exit 7
+# Every file is staged before any is renamed, a pack before its manifest and both before the
+# archive whose log names their blobs: no final name ever holds part of a file, and an archive in
+# the folder has its packs.
+set -- "$name"
+if [ -f "$work/$pack" ]; then
+    set -- "$pack" "$pack.manifest" "$name"
+    put "$work/$pack" "$pack"
+    held=$((held + bytes))
+    put "$work/$pack.manifest" "$pack.manifest"
 fi
-as_www mv -- "$staged" "$dir/$name" || { echo "renaming $staged failed" >&2; exit 7; }
+put "$work/$name" "$name"
+for file; do
+    as_www mv -- "$dir/.$file.part" "$dir/$file" ||
+        { echo "renaming $dir/.$file.part failed" >&2; exit 7; }
+done
 staged=''
 as_www php occ files:scan "--path=$scanned" || { echo "occ files:scan $scanned failed" >&2; exit 7; }
 # files:scan exits 0 on an unknown user or a path it cannot find; info:file exits 1 on a file it
 # does not know (Nextcloud 30 to 32 source, read 2026-11-18).
-known=$(as_www php occ info:file "/$scanned/$name") || {
-    printf '%s\n' "$known" >&2
-    echo "Nextcloud does not know $scanned/$name after the scan" >&2
-    exit 7
-}
+for file; do
+    known=$(as_www php occ info:file "/$scanned/$file") || {
+        printf '%s\n' "$known" >&2
+        echo "Nextcloud does not know $scanned/$file after the scan" >&2
+        exit 7
+    }
+done
 
 tmp="$NEWSVAULT_TEXTFILE_DIR/.$prom.$$"
 if ! {
@@ -157,6 +209,10 @@ if ! {
     echo "$stamp $at"
     echo "# TYPE $size gauge"
     echo "$size $bytes"
+    if [ -n "$packs" ]; then
+        echo "# TYPE newsvault_backup_packs_bytes gauge"
+        echo "newsvault_backup_packs_bytes $held"
+    fi
 } >"$tmp" || ! mv -f "$tmp" "$NEWSVAULT_TEXTFILE_DIR/$prom"; then
     rm -f "$tmp"
     exit 2
@@ -178,7 +234,13 @@ if [ "$excess" -gt 0 ]; then
         set -- "$@" "$dir/$old"
     done
 fi
-for left in $(printf '%s\n' "$listing" | grep -x "\\.$copy\\.part"); do
+leftovers() {
+    printf '%s\n' "$listing" | grep -x "\\.$1\\.part"
+}
+for left in $(
+    leftovers "$copy"
+    [ -z "$packs" ] || { leftovers "$packs$stamped"; leftovers "$packs$stamped\\.manifest"; }
+); do
     set -- "$@" "$dir/$left"
 done
 if [ "$#" -gt 0 ]; then
@@ -186,4 +248,8 @@ if [ "$#" -gt 0 ]; then
     as_www php occ files:scan "--path=$scanned" ||
         { echo "occ files:scan $scanned after the deletion failed" >&2; exit 8; }
 fi
-echo "wrote $name, $bytes bytes, to $scanned; kept the $keep newest"
+echo "wrote $name, $bytes bytes, to $scanned; kept the $keep newest${packs:+; the packs hold $held bytes}"
+if [ "$packed" = 8 ]; then
+    echo "a pack in $dir is lost, of another length or has no manifest: blobs pack names it above; tonight's pack holds its blobs again and nothing was deleted" >&2
+    exit 8
+fi

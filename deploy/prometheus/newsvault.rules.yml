@@ -128,7 +128,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: the last newsvault backup run failed; at exit 8 the copy is up and old copies were not deleted, otherwise no copy was made.
+          summary: the last newsvault backup run failed; at exit 8 the copy is up and old copies were not deleted or a blob pack is lost or has no manifest, otherwise no copy was made.
 
       # The roster unit's last ExecStopPost: a failed fetch, exit 8 included, is a roster day lost.
       - alert: NewsvaultRosterFailed
