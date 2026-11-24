@@ -11,11 +11,11 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use pit::Cutoff;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use serde_json::{json, Map, Value};
 use snapshot_contract::{visible_at, Rule, StoredTimes, TimeError};
 
-use crate::store::{require_current_version, StoreError, COMMIT_LOG, VALID_DATE};
+use crate::store::{read_only, require_current_version, StoreError, COMMIT_LOG, VALID_DATE};
 
 pub const SCHEMA: &str = "newsvault.items/1";
 
@@ -132,7 +132,7 @@ pub fn read(root: &Path, ask: &Ask) -> Result<Report, ItemsError> {
     if !log.exists() {
         return Err(ItemsError::StoreAbsent(log));
     }
-    let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let db = read_only(&log)?;
     require_current_version(&db)?;
     let cutoff = Cutoff::new(ask.at);
     let mut visible: Vec<Row> = Vec::new();

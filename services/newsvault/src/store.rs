@@ -113,6 +113,22 @@ const CONNECTION: &str = "
 PRAGMA foreign_keys = ON;
 PRAGMA synchronous = FULL;
 ";
+/// SQLite's name for a database that is no file.
+const IN_MEMORY: &str = ":memory:";
+
+/// The one place this crate opens SQLite: §8 row T1. `temp_store = MEMORY` keeps a sort, a
+/// transient index and a materialised subquery out of a temporary file, which a `--read-only`
+/// container has no directory for (SQLITE_IOERR_GETTEMPPATH, 6410, production 2026-11-23).
+pub fn connect(path: &Path, flags: OpenFlags) -> rusqlite::Result<Connection> {
+    let db = Connection::open_with_flags(path, flags)?;
+    db.pragma_update(None, "temp_store", "MEMORY")?;
+    Ok(db)
+}
+
+/// A reader's connection to the commit log at `log`.
+pub fn read_only(log: &Path) -> rusqlite::Result<Connection> {
+    connect(log, OpenFlags::SQLITE_OPEN_READ_ONLY)
+}
 
 /// The `PRAGMA user_version` this build writes, and the only one a read-only reader accepts.
 pub const SCHEMA_VERSION: i32 = 17;
@@ -916,7 +932,7 @@ pub fn refuse_an_unreadable_version(root: &Path) -> Result<(), StoreError> {
     if !log.exists() {
         return Ok(());
     }
-    let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let db = read_only(&log)?;
     let found = user_version(&db)?;
     if !(0..=SCHEMA_VERSION).contains(&found) {
         return Err(StoreError::SchemaVersion {
@@ -1009,7 +1025,7 @@ pub fn recorded_dictionaries(
     if !log.exists() {
         return Ok((None, Vec::new()));
     }
-    let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let db = read_only(&log)?;
     let active = active_dictionary(&db)?;
     if !holds_table(&db, "dictionaries")? {
         return Ok((active, Vec::new()));
@@ -1052,7 +1068,7 @@ pub fn basis_pages(
     if !log.exists() {
         return Ok(Vec::new());
     }
-    let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let db = read_only(&log)?;
     if !(CONTINUITY_VERSION..=SCHEMA_VERSION).contains(&user_version(&db)?) {
         return Ok(Vec::new());
     }
@@ -1107,7 +1123,7 @@ pub fn walk_read(
     if !log.exists() {
         return Ok(WalkRead::default());
     }
-    let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let db = read_only(&log)?;
     if !(WALK_VERSION..=SCHEMA_VERSION).contains(&user_version(&db)?) {
         return Ok(WalkRead::default());
     }
@@ -1286,7 +1302,7 @@ impl RobotsLedger {
                 blobs,
             });
         }
-        let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let db = read_only(&log)?;
         let found = user_version(&db)?;
         if found > SCHEMA_VERSION {
             return Err(StoreError::SchemaVersion {
@@ -1422,7 +1438,7 @@ fn columns_of(db: &Connection, table: &str) -> Result<BTreeMap<String, ColumnSha
 /// `SCHEMA_V0` replayed with `MIGRATIONS[..found]`. A table a v0 store lacks is absent here,
 /// because `SCHEMA_V0` creates it whole; a table a later version lacks names each of its columns.
 fn columns_that_differ(db: &Connection, found: usize) -> Result<Vec<String>, StoreError> {
-    let frozen = Connection::open_in_memory()?;
+    let frozen = connect(Path::new(IN_MEMORY), OpenFlags::default())?;
     frozen.execute_batch(SCHEMA_V0)?;
     for step in MIGRATIONS.iter().take(found) {
         frozen.execute_batch(step)?;
@@ -1497,7 +1513,7 @@ impl Committer {
             Err(TryLockError::WouldBlock) => return Err(StoreError::LeaseHeld(lock_path)),
             Err(TryLockError::Error(failure)) => return Err(StoreError::Io(failure)),
         }
-        let mut db = Connection::open(root.join(COMMIT_LOG))?;
+        let mut db = connect(&root.join(COMMIT_LOG), OpenFlags::default())?;
         db.execute_batch(CONNECTION)?;
         migrate(&mut db)?;
         let blobs = BlobStore::new(root.join(BLOB_DIR));
@@ -7821,6 +7837,42 @@ mod tests {
                 })
             ),
             "{refused:?}"
+        );
+        Ok(())
+    }
+
+    /// `PRAGMA temp_store` reads 2 for MEMORY, 0 for the build's default and 1 for FILE.
+    const TEMP_STORE_MEMORY: i64 = 2;
+
+    fn temp_store(db: &Connection) -> rusqlite::Result<i64> {
+        db.query_row("PRAGMA temp_store", [], |row| row.get(0))
+    }
+
+    /// Section 8 row T1: a writer's connection, a reader's, the robots reader's and the one held
+    /// in memory.
+    #[test]
+    fn every_connection_the_store_opens_keeps_its_temporary_data_in_memory() -> TestResult {
+        let temp = TempDir::new()?;
+        let writer = temp_store(&open(&temp)?.db)?;
+        let log = temp.path().join(COMMIT_LOG);
+        let reader = temp_store(&super::read_only(&log)?)?;
+        let robots = RobotsLedger::open(temp.path())?
+            .db
+            .as_ref()
+            .map(temp_store)
+            .transpose()?;
+        let in_memory = temp_store(&super::connect(
+            super::Path::new(super::IN_MEMORY),
+            rusqlite::OpenFlags::default(),
+        )?)?;
+        assert_eq!(
+            (writer, reader, robots, in_memory),
+            (
+                TEMP_STORE_MEMORY,
+                TEMP_STORE_MEMORY,
+                Some(TEMP_STORE_MEMORY),
+                TEMP_STORE_MEMORY
+            )
         );
         Ok(())
     }

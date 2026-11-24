@@ -36,6 +36,16 @@ pub const TABLES: [&str; 7] = [
 /// Answered requests of one question version and build before a measured cost per byte is
 /// reported. Below it `shadow run --dry-run` prints `null`, never a guess.
 pub const ESTIMATE_MIN_REQUESTS: i64 = 100;
+/// SQLite's name for a database that is no file.
+const IN_MEMORY: &str = ":memory:";
+
+/// The one place this crate opens SQLite. `temp_store = MEMORY`:
+/// `docs/design/architecture.md` section 8 row T1.
+fn connect(path: &Path, flags: OpenFlags) -> rusqlite::Result<Connection> {
+    let db = Connection::open_with_flags(path, flags)?;
+    db.pragma_update(None, "temp_store", "MEMORY")?;
+    Ok(db)
+}
 
 const SCHEMA: &str = "
 CREATE TABLE question_docs (
@@ -168,7 +178,7 @@ impl Store {
             Err(TryLockError::Error(why)) => return Err(io(&lock_path)(why)),
         }
         let path = root.join(DB_FILE);
-        let db = Connection::open(&path)?;
+        let db = connect(&path, OpenFlags::default())?;
         db.pragma_update(None, "synchronous", "FULL")?;
         db.pragma_update(None, "foreign_keys", "ON")?;
         let found: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -189,7 +199,7 @@ impl Store {
     pub fn read_only(root: &Path) -> Result<Self, StoreError> {
         let path = root.join(DB_FILE);
         if !path.is_file() {
-            let db = Connection::open_in_memory()?;
+            let db = connect(Path::new(IN_MEMORY), OpenFlags::default())?;
             create(&db)?;
             return Ok(Self {
                 db,
@@ -197,7 +207,7 @@ impl Store {
                 _lease: None,
             });
         }
-        let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let db = connect(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let found: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if found != USER_VERSION {
             return Err(StoreError::SchemaVersion { path, found });
@@ -963,6 +973,24 @@ mod tests {
         assert_eq!(store.unacked_cost_break()?, None);
         assert_eq!(store.cost_break("run-1")?, Some(true));
         assert_eq!(store.cost_break("run-0")?, None);
+        Ok(())
+    }
+
+    /// `PRAGMA temp_store` reads 2 for MEMORY. Section 8 row T1, the gate's three doors: the
+    /// writer, a reader of a store on disk and a dry run's store held in memory.
+    #[test]
+    fn every_connection_the_gate_opens_keeps_its_temporary_data_in_memory() -> TestResult {
+        const MEMORY: i64 = 2;
+        let temp_store = |store: &Store| -> rusqlite::Result<i64> {
+            store
+                .db
+                .query_row("PRAGMA temp_store", [], |row| row.get(0))
+        };
+        let (root, absent) = (TempDir::new()?, TempDir::new()?);
+        let writer = temp_store(&Store::open(root.path())?)?;
+        let reader = temp_store(&Store::read_only(root.path())?)?;
+        let in_memory = temp_store(&Store::read_only(absent.path())?)?;
+        assert_eq!((writer, reader, in_memory), (MEMORY, MEMORY, MEMORY));
         Ok(())
     }
 }

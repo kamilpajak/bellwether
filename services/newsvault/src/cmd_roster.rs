@@ -13,7 +13,7 @@ use news_provider::{
     Tally, TargetWindow, TransportError, TransportKind, Verdict, Wire,
 };
 use pit::{Cutoff, ObservationTime, PitError, ValidTime, Visibility};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use serde_json::{json, Value};
 
 use crate::cmd_collect::{
@@ -22,7 +22,9 @@ use crate::cmd_collect::{
 use crate::cmd_ledger::{Envelope, RunKind, LEASE_HELD, RUN_ENVELOPE_SCHEMA};
 use crate::cmd_robots::{self, or_abandon, sent, Asked, Fetched, Opened, RobotsError};
 use crate::robots::Robots;
-use crate::store::{require_current_version, Committer, RobotsAnswer, StoreError, COMMIT_LOG};
+use crate::store::{
+    read_only, require_current_version, Committer, RobotsAnswer, StoreError, COMMIT_LOG,
+};
 
 pub const SCHEMA: &str = "newsvault.roster/1";
 pub const SHOW_SCHEMA: &str = "newsvault.roster_show/1";
@@ -575,7 +577,7 @@ pub fn show(root: &Path, at: DateTime<Utc>) -> Result<Shown, RosterError> {
     if !log.exists() {
         return Err(RosterError::StoreAbsent(log));
     }
-    let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let db = read_only(&log)?;
     require_current_version(&db)?;
     let cutoff = Cutoff::new(at);
     let mut by_key: BTreeMap<String, Vec<Stored>> = FILES
