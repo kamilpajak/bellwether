@@ -331,17 +331,10 @@ impl BlobStore {
     }
 
     /// The file a backup pack carries for `digest`: the bytes as stored, raw or `.zst`, only
-    /// after their payload read back to the digest. The copy [`BlobStore::read_listed`] takes.
+    /// after their payload read back to the digest. The raw copy while one exists.
     pub fn stored_file(&self, digest: &BlobDigest) -> Result<StoredFile, StoreError> {
-        let mut encoding = self.listed(digest).read_from();
-        let read = match self.read_file(digest, encoding) {
-            Err(StoreError::Io(gone)) if gone.kind() == ErrorKind::NotFound => {
-                encoding = self.listed(digest).read_from();
-                self.read_file(digest, encoding)
-            }
-            read => read,
-        };
-        let read = read?;
+        let encoding = self.listed(digest).read_from();
+        let read = self.read_file(digest, encoding)?;
         Ok(StoredFile {
             path: self.path_in(digest, encoding),
             dictionary: read.dictionary,
