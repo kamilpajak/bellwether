@@ -490,6 +490,49 @@ tests:
             exp_annotations:
               summary: no modelgate shadow run has ended at exit 0 for over 86 min, or none ever.
 
+  # The embed step's three, each on both sides of its threshold; its stamp is the same 3600.
+  - interval: 1m
+    input_series:
+      - series: 'modelgate_embed_last_success_timestamp_seconds'
+        values: '3600x240'
+      - series: 'modelgate_embed_cost_cap_reached'
+        values: '0x119 1x120'
+      - series: 'modelgate_embed_spent_micro_usd{scope="total"}'
+        values: '2399999x119 2400000x120'
+      - series: 'modelgate_embed_cap_micro_usd{scope="total"}'
+        values: '3000000x240'
+    alert_rule_test:
+      - eval_time: 1h59m
+        alertname: ModelgateEmbedCostCapReached
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: ModelgateEmbedCostCapReached
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: a cost cap refused an embed call in the last embed step; no story gets a vector until the cap's scope ends.
+      - eval_time: 1h59m
+        alertname: ModelgateEmbedSpendNearTotalCap
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: ModelgateEmbedSpendNearTotalCap
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: the modelgate embed file has spent 2.4 USD, at least 80% of its total cap.
+      - eval_time: 2h26m
+        alertname: ModelgateEmbedStale
+        exp_alerts: []
+      - eval_time: 2h27m
+        alertname: ModelgateEmbedStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: no modelgate embed step has ended at exit 0 for over 86 min, or none ever; the journal of the shadow unit names why.
+
   # No shadow run ever is stale, not silent.
   - interval: 1h
     input_series:
@@ -506,3 +549,11 @@ tests:
       - eval_time: 0m
         alertname: ModelgateShadowFailed
         exp_alerts: []
+      # Nor is an embed step that never ended at exit 0.
+      - eval_time: 0m
+        alertname: ModelgateEmbedStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: no modelgate embed step has ended at exit 0 for over 86 min, or none ever; the journal of the shadow unit names why.

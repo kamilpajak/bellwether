@@ -63,7 +63,7 @@ keep passing.
 | `news-provider/` | the provider seam: the coverage ledger's write half, the one HTTP client that talks to a news vendor — a send consumes a permit that only a written attempt row hands out — and the driver that opens and closes every slot |
 | `providers/` | one crate per vendor adapter. Each declares no HTTP dependency at all |
 | `services/newsvault/` | the archive: the commit log, the coverage reader and the segment export, in Rust |
-| `services/modelgate/` | the only exit to a language model: `decide` calls behind an attempt ledger, a cost cap and a pinned build, and the record-only `shadow run`. Nothing has been sent to a model |
+| `services/modelgate/` | the only exit to a model: `decide` and `embed` calls behind an attempt ledger, a cost cap and a pinned build, the record-only `shadow run` and `embed run`, and two read-only `dedup` reports. No test sends anything to a model |
 | `snapshot-contract/` | the Snapshot contract `vault` hands `derive`: the column list, the manifest, the visibility predicate every reader of stored times calls, the writer and the validator `newsvault cut` runs before it renames a cut into place |
 | `panel-contract/` | the panel manifest contract: the shape the statistics tier may read, and the validator that refuses a row count that is really a product |
 | `repo-invariants/` | the one invariant that is a property of the repository rather than of a crate |
@@ -149,5 +149,7 @@ row's `robots` pin; it never writes the hosts file. Exit 1 means a pin differs.
   record-only shadow command (2026-11-23) that has sent nothing to a model. The other three have no code.
 - The shadow's image, wrapper, unit, timer and alerts are written under `deploy/` and not installed
   (2026-11-23).
+- `modelgate`'s `embed` calls, the comparison record of each story and the wrapper's embed step are
+  written and not installed (2026-11-24). No rule merges a repeated release yet.
 - The design is a draft with decisions still open, including which news vendor the archive is built
   on, and the handover criterion that, with build steps 3 and 6, decides when the predecessor may stop.

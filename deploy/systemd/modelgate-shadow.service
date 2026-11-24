@@ -16,8 +16,10 @@ ExecStart=%h/.local/lib/bellwether/modelgate-shadow
 ExecStopPost=-%h/.local/lib/bellwether/newsvault-unit-result shadow
 ExecStopPost=-/bin/sh -c 'if [ "$$SERVICE_RESULT" = timeout ]; then /usr/bin/docker rm --force modelgate-shadow-cut; fi'
 ExecStopPost=-/bin/sh -c 'if [ "$$SERVICE_RESULT" = timeout ]; then /usr/bin/docker rm --force modelgate-shadow; fi'
+ExecStopPost=-/bin/sh -c 'if [ "$$SERVICE_RESULT" = timeout ]; then /usr/bin/docker rm --force modelgate-embed; fi'
 # Exit 7 is retryable and the next firing retries it; ModelgateShadowStale names a run of them.
 SuccessExitStatus=7
 # With systemd's 90 s stop timeout, 210 s before the next firing; no Restart=. The script sends at
-# most MODELGATE_LIMIT requests in a timer run; nothing else keeps a run inside this bound.
+# most MODELGATE_LIMIT requests in a timer run; nothing else keeps the labelling inside this bound.
+# The script's run_bound is this number: its embed step is given a deadline from it.
 TimeoutStartSec=1500

@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use modelgate::cmd_embed::COMPARE_SECONDS_PAST_DEADLINE;
 use tempfile::TempDir;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -25,7 +26,22 @@ const SETTINGS: [(&str, &str); 8] = [
     ("MODELGATE_LIMIT", "21"),
     ("MODELGATE_QUESTIONS", QUESTIONS),
 ];
+/// The embed step's nine: all or none. Without them the script runs as it did before the step.
+const EMBED_SETTINGS: [(&str, &str); 9] = [
+    ("MODELGATE_EMBED_MODEL", "example/embed-1"),
+    ("MODELGATE_EMBED_PROVIDER", "example-host"),
+    ("MODELGATE_EMBED_QUANTIZATION", "bf16"),
+    ("MODELGATE_EMBED_EPOCH", "1"),
+    ("MODELGATE_EMBED_PRICE_PER_MTOK", "0.01"),
+    ("MODELGATE_EMBED_LIMIT", "200"),
+    ("MODELGATE_EMBED_RUN_CAP_USD", "0.05"),
+    ("MODELGATE_EMBED_DAY_CAP_USD", "0.50"),
+    ("MODELGATE_EMBED_TOTAL_CAP_USD", "3"),
+];
+/// A decide total that leaves the embed total its 3 USD under the owner's 15.
+const DECIDE_TOTAL_BESIDE_EMBED: (&str, Option<&str>) = ("MODELGATE_TOTAL_CAP_USD", Some("12"));
 const PROM: &str = "modelgate-shadow.prom";
+const EMBED_PROM: &str = "modelgate-embed.prom";
 const OLD_METRICS: &str = "modelgate_shadow_last_success_timestamp_seconds 1700000000\n";
 /// A killed run's directory, which only a run holding the shadow lock may remove.
 const LEFTOVER: &str = "shadow.killed";
@@ -36,7 +52,7 @@ const NO_COST: &str = r#"{"exit":{"code":0,"error_code":null}}"#;
 /// run lists the cache, then answers as `STUB_RUN` says: `real` execs the real binary on the
 /// words after `/usr/local/bin/modelgate`, container paths mapped to the host's, as a dry run;
 /// `slow` outlasts the test, which signals the process group; a number prints `STUB_ENVELOPE`
-/// and exits with it.
+/// and exits with it. The embed container answers as `STUB_EMBED_RUN` says when that is set.
 const DOCKER_STUB: &str = r#"#!/bin/sh
 { printf '%s\n' "$@"; echo ----; } >>"$STUB_DIR/docker-args"
 [ "$1" = run ] || exit 0
@@ -56,6 +72,9 @@ if [ "$name" = modelgate-shadow-cut ]; then
     exit 0
 fi
 ls "$HOME/.cache/bellwether" >"$STUB_DIR/cache-during-run"
+if [ "$name" = modelgate-embed ] && [ -n "$STUB_EMBED_RUN" ]; then
+    printf '%s\n' "$STUB_EMBED_ENVELOPE"; exit "$STUB_EMBED_RUN"
+fi
 case $STUB_RUN in
     real) ;;
     slow) sleep 60; exit 0 ;;
@@ -63,7 +82,7 @@ case $STUB_RUN in
 esac
 while [ "$1" != /usr/local/bin/modelgate ]; do shift; done
 shift
-case " $* " in *" --dry-run "*) ;; *) set -- "$@" --dry-run ;; esac
+case "$name: $* " in modelgate-dedup:* | *" --dry-run "*) ;; *) set -- "$@" --dry-run ;; esac
 n=$#
 for arg; do
     case $arg in
@@ -87,6 +106,7 @@ exec "$@"
 "#;
 /// Stands in for timeout(1): exits `STUB_TIMEOUT` without running the command when it is set.
 const TIMEOUT_STUB: &str = r#"#!/bin/sh
+echo "$1 $2 $3" >>"$STUB_DIR/timeout-args"
 [ -z "$STUB_TIMEOUT" ] || exit "$STUB_TIMEOUT"
 shift 3
 exec "$@"
@@ -131,6 +151,13 @@ struct Setup {
     leftover: bool,
     /// A directory under `~/.bellwether` left out.
     missing: &'static str,
+    /// Whether `EMBED_SETTINGS` are set, and what the embed container answers: empty for the
+    /// real binary's dry run, else the exit it ends with after printing `embed_envelope`.
+    embed: bool,
+    embed_run: &'static str,
+    embed_envelope: &'static str,
+    /// A second setting, replacing or unsetting one after `setting`.
+    also: Option<(&'static str, Option<&'static str>)>,
 }
 
 const PLAIN: Setup = Setup {
@@ -146,6 +173,17 @@ const PLAIN: Setup = Setup {
     key_file: true,
     leftover: true,
     missing: "",
+    embed: false,
+    embed_run: "",
+    embed_envelope: "",
+    also: None,
+};
+/// `PLAIN` with the embed step on, the cut timed by the stub clock: it starts at 1000 and takes 5 s.
+const EMBEDDING: Setup = Setup {
+    embed: true,
+    cut_seconds: "5",
+    setting: Some(DECIDE_TOTAL_BESIDE_EMBED),
+    ..PLAIN
 };
 
 struct Ran {
@@ -155,7 +193,10 @@ struct Ran {
     /// Each docker call's words joined by one space.
     docker: Vec<String>,
     flock: Vec<String>,
+    timeouts: Vec<String>,
     metric: String,
+    /// `modelgate-embed.prom`, empty when the run wrote none.
+    embed_metric: String,
     /// `~/.cache/bellwether` while the stub's run step ran, and after the wrapper ended.
     cache_during: Vec<String>,
     cache_after: Vec<String>,
@@ -274,13 +315,20 @@ fn shadow(setup: Setup, interrupt: Option<&str>) -> TestResult<Ran> {
         .env("STUB_ENVELOPE", setup.envelope)
         .env("STUB_HELD", setup.held)
         .env("STUB_TIMEOUT", setup.timeout)
+        .env("STUB_EMBED_RUN", setup.embed_run)
+        .env("STUB_EMBED_ENVELOPE", setup.embed_envelope)
         .envs(SETTINGS)
         .stdin(Stdio::null());
-    match setup.setting {
-        Some((key, Some(value))) => command.env(key, value),
-        Some((key, None)) => command.env_remove(key),
-        None => &mut command,
-    };
+    if setup.embed {
+        command.envs(EMBED_SETTINGS);
+    }
+    for change in [setup.setting, setup.also] {
+        match change {
+            Some((key, Some(value))) => command.env(key, value),
+            Some((key, None)) => command.env_remove(key),
+            None => &mut command,
+        };
+    }
     let output: Output = if let Some(signal) = interrupt {
         let child = command
             .process_group(0)
@@ -320,7 +368,9 @@ fn shadow(setup: Setup, interrupt: Option<&str>) -> TestResult<Ran> {
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         docker,
         flock: lines(&stub.join("flock-args")),
+        timeouts: lines(&stub.join("timeout-args")),
         metric: std::fs::read_to_string(textfile.join(PROM)).unwrap_or_default(),
+        embed_metric: std::fs::read_to_string(textfile.join(EMBED_PROM)).unwrap_or_default(),
         cache_during: lines(&stub.join("cache-during-run")),
         cache_after: names(&cache),
         textfile: names(&textfile),
@@ -751,13 +801,14 @@ fn a_limit_given_by_hand_replaces_the_settings() -> TestResult {
     Ok(())
 }
 
-/// The template's `KEY=value` lines for the shadow's settings.
-fn template() -> TestResult<Vec<(String, String)>> {
+/// The template's `KEY=value` lines for the shadow's settings, or for its embed step's.
+fn template(embed: bool) -> TestResult<Vec<(String, String)>> {
     Ok(
         std::fs::read_to_string(repo("deploy/systemd/newsvault.env"))?
             .lines()
             .filter_map(|line| line.split_once('='))
             .filter(|(key, _)| key.starts_with("MODELGATE_"))
+            .filter(|(key, _)| key.starts_with("MODELGATE_EMBED_") == embed)
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect(),
     )
@@ -772,7 +823,7 @@ fn template() -> TestResult<Vec<(String, String)>> {
 /// each.
 #[test]
 fn each_setting_is_required_and_the_owners_ceiling_and_the_argument_list_are_held() -> TestResult {
-    let template = template()?;
+    let template = template(false)?;
     let mut settings: Vec<(&'static str, Option<&'static str>)> = Vec::new();
     for (key, _) in SETTINGS {
         settings.push((key, None));
@@ -825,13 +876,27 @@ fn each_setting_is_required_and_the_owners_ceiling_and_the_argument_list_are_hel
         let named = String::from_utf8_lossy(&output.stderr).contains(key.as_str());
         seen.push((output.status.code(), named, 0));
     }
-    let arguments: [&[&str]; 6] = [
+    let arguments: [&[&str]; 13] = [
         &["--total-cap-usd", "99"],
         &["--from-seq", "0"],
         &["--limit"],
         &["--limit", "x"],
         &["--dry-run", "--sample-only"],
         &["--ack-cost-model", "a b"],
+        &["--embed-limit", "5"],
+        &["--embed-ack-cost-model", "2026-11-23T10:16:01.000000Z"],
+        &["--dedup", "everything"],
+        &["--dedup", "sample", "--seed", "7"],
+        &[
+            "--dedup",
+            "distribution",
+            "--seed",
+            "7",
+            "--per-stratum",
+            "2",
+        ],
+        &["--dedup", "distribution", "--dry-run"],
+        &["--seed", "7", "--per-stratum", "2"],
     ];
     for args in arguments {
         let ran = shadow(Setup { args, ..PLAIN }, None)?;
@@ -861,7 +926,7 @@ fn each_setting_is_required_and_the_owners_ceiling_and_the_argument_list_are_hel
             absent,
         ),
         (
-            settings.len() + 7 + 6,
+            settings.len() + 7 + 13,
             0,
             7,
             SETTINGS.len(),
@@ -870,5 +935,400 @@ fn each_setting_is_required_and_the_owners_ceiling_and_the_argument_list_are_hel
         ),
         "{seen:?}"
     );
+    Ok(())
+}
+
+fn embed_metrics(reached: u8) -> String {
+    format!(
+        "# TYPE modelgate_embed_spent_micro_usd gauge\n\
+         modelgate_embed_spent_micro_usd{{scope=\"run\"}} 0\n\
+         modelgate_embed_spent_micro_usd{{scope=\"day\"}} 0\n\
+         modelgate_embed_spent_micro_usd{{scope=\"total\"}} 0\n\
+         # TYPE modelgate_embed_cap_micro_usd gauge\n\
+         modelgate_embed_cap_micro_usd{{scope=\"run\"}} 50000\n\
+         modelgate_embed_cap_micro_usd{{scope=\"day\"}} 500000\n\
+         modelgate_embed_cap_micro_usd{{scope=\"total\"}} 3000000\n\
+         # TYPE modelgate_embed_cost_cap_reached gauge\n\
+         modelgate_embed_cost_cap_reached {reached}\n"
+    )
+}
+
+/// Section 8 row MG25. The embed step runs after the labelling, over the same cut, with its own
+/// caps, a deadline 120 s before the unit's bound counted from the cut's start, and a `timeout`
+/// that ends 30 s before that bound. Mutations 2026-11-24, each alone:
+/// `--total-cap-usd "$MODELGATE_TOTAL_CAP_USD"` on the embed call; the deadline from `date` at
+/// the step's start; the embed metrics written into `modelgate-shadow.prom`: red each.
+#[test]
+fn with_its_settings_the_embed_step_follows_the_labelling_under_a_deadline_with_its_own_metrics(
+) -> TestResult {
+    let ran = shadow(EMBEDDING, None)?;
+    let home = &ran.home;
+    let (uid, gid) = (id("-u")?, id("-g")?);
+    let work = ran.cache_during.first().cloned().unwrap_or_default();
+    let embed = format!(
+        "run --rm --name modelgate-embed --pull never --user {uid}:{gid} --read-only \
+         --tmpfs /tmp:rw,size=16m --cap-drop ALL --security-opt no-new-privileges \
+         --entrypoint /usr/bin/tini \
+         --mount type=bind,src={home}/home/.cache/bellwether/{work}/cut,dst=/cut,readonly \
+         --network bridge --mount type=bind,src={home}/home/.bellwether/modelgate,dst=/modelgate \
+         --mount type=bind,src={home}/home/.config/bellwether/model-key,dst=/run/secrets/model-key,readonly \
+         --env BELLWETHER_MODEL_KEY_FILE=/run/secrets/model-key newsvault:test -- \
+         /usr/local/bin/modelgate embed run --snapshot /cut/a-snapshot --store /modelgate \
+         --model example/embed-1 --provider example-host --quantization bf16 --epoch 1 \
+         --run-cap-usd 0.05 --day-cap-usd 0.50 --total-cap-usd 3 --input-price-per-mtok 0.01 \
+         --give-up-after-hours 24 --limit 200 --deadline @2380 --non-interactive --format json"
+    );
+    let (body, stamp) = ran
+        .embed_metric
+        .rsplit_once("# TYPE modelgate_embed_last_success_timestamp_seconds gauge\n")
+        .unwrap_or_default();
+    let stamped = stamp
+        .strip_prefix("modelgate_embed_last_success_timestamp_seconds ")
+        .and_then(|at| at.trim().parse::<i64>().ok());
+    let order = (
+        ran.stdout.find("\"schema\":\"modelgate.shadow_run/1\""),
+        ran.stdout.find("\"schema\":\"modelgate.embed_run/1\""),
+    );
+    assert_eq!(
+        (
+            ran.exit,
+            ran.docker.len(),
+            ran.docker.get(2),
+            ran.docker
+                .get(1)
+                .is_some_and(|run| run.contains(" --total-cap-usd 12 ")),
+            ran.timeouts,
+            body,
+            stamped.is_some_and(|at| at > 1_700_000_000),
+            ran.textfile,
+            matches!(order, (Some(labelled), Some(embedded)) if labelled < embedded),
+            ran.metric.contains("modelgate_embed"),
+        ),
+        (
+            Some(0),
+            3,
+            Some(&embed),
+            true,
+            vec![
+                "--kill-after 30 180".to_owned(),
+                "--kill-after 10 1465".to_owned()
+            ],
+            embed_metrics(0).as_str(),
+            true,
+            vec![EMBED_PROM.to_owned(), PROM.to_owned()],
+            true,
+            false,
+        ),
+        "{}",
+        ran.stderr
+    );
+    Ok(())
+}
+
+/// Section 8 row MG25: whatever the embed step does, the run's exit and `modelgate-shadow.prom`
+/// are the labelling's, and a refused embed setting turns the step off, named, with no embed
+/// container. Mutations 2026-11-24, each alone: `exit "$embed_status"` at the end; the embed
+/// settings checked in a `{ }` group and not a subshell; the summed ceiling removed; its `<=`
+/// made `<`; the `[ -n "$embed" ] || exit` line removed (red in the test of row MG15): red each.
+#[test]
+fn the_embed_step_never_changes_the_runs_exit_and_a_refused_embed_setting_only_turns_it_off(
+) -> TestResult {
+    let answered = |embed_run, embed_envelope| Setup {
+        embed_run,
+        embed_envelope,
+        ..EMBEDDING
+    };
+    let mut seen = Vec::new();
+    for (setup, metric, said) in [
+        (answered("8", CAP_REACHED), "cost_cap_reached 1", "exit 8"),
+        (answered("2", NO_COST), "", "exit 2"),
+        (answered("0", NO_COST), "", "states no cost"),
+        (answered("7", NO_COST), "", "exit 7"),
+    ] {
+        let ran = shadow(setup, None)?;
+        seen.push((
+            ran.exit,
+            ran.docker.len(),
+            ran.embed_metric.contains(metric) && (metric.is_empty() == ran.embed_metric.is_empty()),
+            ran.stderr.contains(said),
+            ran.embed_metric.contains("last_success"),
+            ran.metric
+                .contains("modelgate_shadow_last_success_timestamp_seconds 1"),
+        ));
+    }
+    assert_eq!(seen, vec![(Some(0), 3, true, true, false, true); 4]);
+
+    let mut refused: Vec<(&str, Option<&str>)> = Vec::new();
+    for (key, _) in EMBED_SETTINGS {
+        refused.push((key, None));
+        refused.push((key, Some("<placeholder>")));
+    }
+    refused.extend([
+        ("MODELGATE_EMBED_TOTAL_CAP_USD", Some("3.5.0")),
+        ("MODELGATE_EMBED_TOTAL_CAP_USD", Some("3.000001")),
+        ("MODELGATE_EMBED_RUN_CAP_USD", Some("00.05")),
+        ("MODELGATE_EMBED_PRICE_PER_MTOK", Some("1e-2")),
+        ("MODELGATE_EMBED_MODEL", Some("-x")),
+        ("MODELGATE_EMBED_PROVIDER", Some("a b")),
+        ("MODELGATE_EMBED_PROVIDER", Some("-host")),
+        ("MODELGATE_EMBED_QUANTIZATION", Some("BF16")),
+        ("MODELGATE_EMBED_EPOCH", Some("01")),
+        ("MODELGATE_EMBED_LIMIT", Some("0")),
+        ("MODELGATE_EMBED_LIMIT", Some("2.5")),
+    ]);
+    let mut off = Vec::new();
+    for (key, value) in &refused {
+        let ran = shadow(
+            Setup {
+                also: Some((key, *value)),
+                ..EMBEDDING
+            },
+            None,
+        )?;
+        let named = ran.stderr.contains(key) && ran.stderr.contains("the embed step is off");
+        off.push((ran.exit, ran.docker.len(), named, ran.embed_metric));
+    }
+    assert_eq!(
+        (
+            off.len(),
+            off.iter()
+                .filter(|case| **case != (Some(0), 2, true, String::new()))
+                .count()
+        ),
+        (29, 0),
+        "{off:?}"
+    );
+    let placeholders = template(true)?;
+    assert_eq!(
+        placeholders
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.starts_with('<')))
+            .collect::<Vec<_>>(),
+        EMBED_SETTINGS.map(|(key, _)| (key, true))
+    );
+    // 14.99 + 0.01 is the ceiling exactly and stays on.
+    let at_ceiling = shadow(
+        Setup {
+            setting: Some(("MODELGATE_TOTAL_CAP_USD", Some("14.99"))),
+            also: Some(("MODELGATE_EMBED_TOTAL_CAP_USD", Some("0.01"))),
+            ..EMBEDDING
+        },
+        None,
+    )?;
+    assert_eq!((at_ceiling.exit, at_ceiling.docker.len()), (Some(0), 3));
+    Ok(())
+}
+
+/// A dry run plans the embed step too, with no network, no key and no metric; a limit and an
+/// acknowledgement given by hand reach the embed call alone. Mutations 2026-11-24, each alone:
+/// the embed step's dry branch given the live one's network and store mount; `--embed-limit`
+/// not passed on: red each.
+#[test]
+fn a_dry_run_plans_the_embed_step_offline_and_its_own_arguments_reach_it_alone() -> TestResult {
+    let dry = shadow(
+        Setup {
+            args: &["--dry-run", "--from-seq", "0"],
+            key_file: false,
+            ..EMBEDDING
+        },
+        None,
+    )?;
+    let last = dry.docker.last().cloned().unwrap_or_default();
+    let by_hand = shadow(
+        Setup {
+            args: &[
+                "--embed-limit",
+                "5",
+                "--embed-ack-cost-model",
+                "2026-11-23T10:16:01.000000Z",
+            ],
+            ..EMBEDDING
+        },
+        None,
+    )?;
+    let calls = by_hand.docker;
+    assert_eq!(
+        (
+            dry.exit,
+            dry.docker.len(),
+            last.contains(" --name modelgate-embed ")
+                && last.contains(" --network none --mount type=bind,src=")
+                && last
+                    .contains("/home/.bellwether/modelgate,dst=/modelgate,readonly newsvault:test"),
+            last.contains("model-key") || last.contains("bridge"),
+            last.ends_with("--non-interactive --format json --dry-run"),
+            dry.stdout.matches("\"dry_run\":true").count(),
+            dry.embed_metric.as_str(),
+            dry.metric.as_str(),
+            by_hand.exit,
+            calls
+                .get(1)
+                .is_some_and(|run| run.ends_with("--format json --limit 21")),
+            calls.get(2).is_some_and(|run| run.ends_with(
+                "--limit 5 --deadline @2380 --non-interactive --format json \
+                 --ack-cost-model 2026-11-23T10:16:01.000000Z"
+            )),
+        ),
+        (
+            Some(0),
+            3,
+            true,
+            false,
+            true,
+            2,
+            "",
+            OLD_METRICS,
+            Some(0),
+            true,
+            true
+        ),
+        "{}{}",
+        dry.stdout,
+        dry.stderr
+    );
+    Ok(())
+}
+
+/// The two read-only reports: a cut, then one container with no network, the store read-only and
+/// no key, in place of both steps; the exit is the binary's, here 4 for a store with no
+/// `embed.sqlite`. Mutations 2026-11-24, each alone: `--network bridge` in place of `none`; the
+/// store mounted read-write: red each.
+#[test]
+fn a_dedup_report_runs_offline_over_a_read_only_store_in_place_of_both_steps() -> TestResult {
+    let (uid, gid) = (id("-u")?, id("-g")?);
+    let mut seen = Vec::new();
+    let mut expected = Vec::new();
+    for (args, words) in [
+        (
+            &["--dedup", "distribution"][..],
+            "dedup distribution --store /modelgate --format json",
+        ),
+        (
+            &["--dedup", "sample", "--seed", "7", "--per-stratum", "2"][..],
+            "dedup sample --store /modelgate --format json --seed 7 --per-stratum 2 \
+             --snapshot /cut/a-snapshot",
+        ),
+        (
+            &[
+                "--dedup",
+                "sample",
+                "--seed",
+                "7",
+                "--per-stratum",
+                "2",
+                "--space",
+                "modelgate.embed/1;model=example/embed-1;epoch=1",
+                "--compare-version",
+                "dedup.compare/1(window_days=7;exchanges=NYSE,OTC)",
+            ][..],
+            "dedup sample --store /modelgate --format json --seed 7 --per-stratum 2 \
+             --snapshot /cut/a-snapshot \
+             --compare-version dedup.compare/1(window_days=7;exchanges=NYSE,OTC) \
+             --space modelgate.embed/1;model=example/embed-1;epoch=1",
+        ),
+    ] {
+        let ran = shadow(
+            Setup {
+                args,
+                key_file: false,
+                ..EMBEDDING
+            },
+            None,
+        )?;
+        let home = &ran.home;
+        let work = ran.cache_during.first().cloned().unwrap_or_default();
+        expected.push((
+            Some(4),
+            2,
+            Some(format!(
+                "run --rm --name modelgate-dedup --pull never --user {uid}:{gid} --read-only \
+                 --tmpfs /tmp:rw,size=16m --cap-drop ALL --security-opt no-new-privileges \
+                 --entrypoint /usr/bin/tini \
+                 --mount type=bind,src={home}/home/.cache/bellwether/{work}/cut,dst=/cut,readonly \
+                 --network none \
+                 --mount type=bind,src={home}/home/.bellwether/modelgate,dst=/modelgate,readonly \
+                 newsvault:test -- /usr/local/bin/modelgate {words}"
+            )),
+            String::new(),
+            true,
+            Vec::<String>::new(),
+        ));
+        seen.push((
+            ran.exit,
+            ran.docker.len(),
+            ran.docker.last().cloned(),
+            ran.stdout,
+            ran.stderr.contains("input_absent"),
+            ran.cache_after,
+        ));
+    }
+    assert_eq!(seen, expected);
+    // A group's name belongs to the sample alone, and is a token of the two names' letters.
+    for args in [
+        &["--dedup", "distribution", "--space", "x"][..],
+        &["--space", "x"][..],
+        &[
+            "--dedup",
+            "sample",
+            "--seed",
+            "7",
+            "--per-stratum",
+            "2",
+            "--space",
+            "a b",
+        ][..],
+    ] {
+        let refused = shadow(Setup { args, ..EMBEDDING }, None)?;
+        assert_eq!(
+            (refused.exit, refused.docker.len()),
+            (Some(2), 0),
+            "{args:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Section 8 row MG25, the two cases in which the step is not reached. Mutations 2026-11-24,
+/// each alone: the test of the seconds left made never true; the step also run after a labelling
+/// that ended 7: red each.
+#[test]
+fn the_embed_step_is_off_when_too_little_time_is_left_or_the_labelling_did_not_end_0_or_8(
+) -> TestResult {
+    // The stub clock: the cut starts at 1000 and every later reading is that many seconds on.
+    let at = |cut_seconds| Setup {
+        cut_seconds,
+        ..EMBEDDING
+    };
+    let (late, in_time) = (shadow(at("1355"), None)?, shadow(at("1349"), None)?);
+    assert_eq!(
+        (
+            late.exit,
+            late.docker.len(),
+            late.stderr.contains("115 s are left"),
+            in_time.docker.len(),
+            in_time.timeouts.last().map(String::as_str),
+        ),
+        (Some(0), 2, true, 3, Some("--kill-after 10 121")),
+        "{}",
+        late.stderr
+    );
+    let unreachable = shadow(
+        Setup {
+            run: "7",
+            envelope: NO_COST,
+            ..EMBEDDING
+        },
+        None,
+    )?;
+    assert_eq!((unreachable.exit, unreachable.docker.len()), (Some(7), 2));
+    // The comparison's own bound past the deadline ends before the container is stopped.
+    let script = std::fs::read_to_string(repo("deploy/systemd/modelgate-shadow"))?;
+    let seconds = |name: &str| {
+        let line = script.lines().find_map(|line| line.strip_prefix(name));
+        line.and_then(|value| value.parse::<i64>().ok())
+    };
+    let (reserve, stop) = (seconds("embed_reserve="), seconds("embed_stop="));
+    assert_eq!((reserve, stop), (Some(120), Some(30)));
+    assert!(reserve.unwrap_or(0) - stop.unwrap_or(0) > COMPARE_SECONDS_PAST_DEADLINE);
     Ok(())
 }

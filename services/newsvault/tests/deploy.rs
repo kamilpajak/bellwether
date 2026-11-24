@@ -115,12 +115,16 @@ const BACKUP_FAMILIES: [&str; 2] = [
     "newsvault_backup_last_success_timestamp_seconds",
     "newsvault_backup_last_success_bytes",
 ];
-/// `deploy/systemd/modelgate-shadow`'s, from the run's envelope.
-const SHADOW_FAMILIES: [&str; 4] = [
+/// `deploy/systemd/modelgate-shadow`'s, from the labelling's envelope and the embed step's.
+const SHADOW_FAMILIES: [&str; 8] = [
     "modelgate_shadow_spent_micro_usd",
     "modelgate_shadow_cap_micro_usd",
     "modelgate_shadow_cost_cap_reached",
     "modelgate_shadow_last_success_timestamp_seconds",
+    "modelgate_embed_spent_micro_usd",
+    "modelgate_embed_cap_micro_usd",
+    "modelgate_embed_cost_cap_reached",
+    "modelgate_embed_last_success_timestamp_seconds",
 ];
 /// The shadow timer's interval: two firings an hour.
 const SHADOW_INTERVAL_S: i64 = 1_800;
@@ -2465,7 +2469,8 @@ fn the_shadow_fires_every_30_minutes_and_frees_the_store_lock_before_any_other_s
 
 /// Exit 7 leaves the unit successful, so only `ModelgateShadowFailed`'s exits fail it; a hung
 /// run is stopped, its stop timeout included, before the next firing, which an active unit would
-/// swallow; a timed-out run's two containers are removed by name.
+/// swallow; a timed-out run's three containers are removed by name; the script's `run_bound`,
+/// which its embed step's deadline is counted from, is the unit's `TimeoutStartSec`.
 #[test]
 fn the_shadow_unit_succeeds_on_exit_7_records_its_result_and_ends_before_its_next_firing(
 ) -> TestResult {
@@ -2474,6 +2479,20 @@ fn the_shadow_unit_succeeds_on_exit_7_records_its_result_and_ends_before_its_nex
         .iter()
         .map(|start| start + DEFAULT_TIMEOUT_STOP_S < SHADOW_INTERVAL_S)
         .collect();
+    let script = read("deploy/systemd/modelgate-shadow")?;
+    let run_bound: Vec<&str> = script
+        .lines()
+        .filter_map(|line| line.strip_prefix("run_bound="))
+        .collect();
+    assert_eq!(
+        integers(&unit_values(&unit, "TimeoutStartSec")),
+        integers(
+            &run_bound
+                .iter()
+                .map(|text| (*text).to_owned())
+                .collect::<Vec<_>>()
+        )
+    );
     assert_eq!(
         (
             unit_values(&unit, "ExecStart"),
@@ -2491,6 +2510,7 @@ fn the_shadow_unit_succeeds_on_exit_7_records_its_result_and_ends_before_its_nex
                 result_line("shadow"),
                 format!("-{}", removal("modelgate-shadow-cut")),
                 format!("-{}", removal("modelgate-shadow")),
+                format!("-{}", removal("modelgate-embed")),
             ],
             vec!["7".to_owned()],
             0,
@@ -2502,7 +2522,8 @@ fn the_shadow_unit_succeeds_on_exit_7_records_its_result_and_ends_before_its_nex
 }
 
 /// `promtool` runs the cases in CI only and counts none, so a removed case is red here: each
-/// shadow alert keeps a case that expects it quiet and one that expects it firing.
+/// shadow alert and each of its embed step's keeps a case that expects it quiet and one that
+/// expects it firing.
 #[test]
 fn each_shadow_alert_has_a_quiet_and_a_firing_promtool_case() -> TestResult {
     let rules = read("deploy/prometheus/newsvault.rules.yml")?;
@@ -2510,9 +2531,9 @@ fn each_shadow_alert_has_a_quiet_and_a_firing_promtool_case() -> TestResult {
     let mut seen = Vec::new();
     for alert in rules
         .lines()
-        .filter_map(|line| line.trim().strip_prefix("- alert: ModelgateShadow"))
+        .filter_map(|line| line.trim().strip_prefix("- alert: Modelgate"))
     {
-        let named = format!("alertname: ModelgateShadow{alert}");
+        let named = format!("alertname: Modelgate{alert}");
         let expectations = |quiet: bool| {
             cases
                 .windows(2)
@@ -2530,10 +2551,18 @@ fn each_shadow_alert_has_a_quiet_and_a_firing_promtool_case() -> TestResult {
             expectations(false) > 0,
         ));
     }
-    let expected: Vec<_> = ["Failed", "Stale", "CostCapReached", "SpendNearTotalCap"]
-        .iter()
-        .map(|alert| ((*alert).to_owned(), true, true))
-        .collect();
+    let expected: Vec<_> = [
+        "ShadowFailed",
+        "ShadowStale",
+        "ShadowCostCapReached",
+        "ShadowSpendNearTotalCap",
+        "EmbedStale",
+        "EmbedCostCapReached",
+        "EmbedSpendNearTotalCap",
+    ]
+    .iter()
+    .map(|alert| ((*alert).to_owned(), true, true))
+    .collect();
     assert_eq!(seen, expected);
     Ok(())
 }
@@ -2546,11 +2575,16 @@ fn the_shadow_staleness_threshold_is_two_intervals_plus_one_runs_bound() -> Test
     let unit = read("deploy/systemd/modelgate-shadow.service")?;
     let bound = integers(&unit_values(&unit, "TimeoutStartSec"));
     assert_eq!(
-        (threshold(&rules, "ModelgateShadowStale"), bound.len()),
+        (
+            threshold(&rules, "ModelgateShadowStale"),
+            threshold(&rules, "ModelgateEmbedStale"),
+            bound.len()
+        ),
         (
             bound
                 .first()
                 .map(|bound| 2 * SHADOW_INTERVAL_S + bound + DEFAULT_TIMEOUT_STOP_S),
+            threshold(&rules, "ModelgateShadowStale"),
             1
         )
     );

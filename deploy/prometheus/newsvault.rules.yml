@@ -185,3 +185,32 @@ groups:
           severity: warning
         annotations:
           summary: the modelgate store has spent {{ $value }} USD, at least 80% of its total cap.
+
+      # The shadow unit's embed step (architecture.md section 3.5, "Repeated releases"): record
+      # only, so a warning. Its stamp is written when the step ends at exit 0, inside the same
+      # unit, so the bound is ModelgateShadowStale's.
+      - alert: ModelgateEmbedStale
+        expr: |
+          (time() - max(modelgate_embed_last_success_timestamp_seconds)) > 5190
+          or absent(modelgate_embed_last_success_timestamp_seconds)
+        labels:
+          severity: warning
+        annotations:
+          summary: no modelgate embed step has ended at exit 0 for over 86 min, or none ever; the journal of the shadow unit names why.
+
+      - alert: ModelgateEmbedCostCapReached
+        expr: max(modelgate_embed_cost_cap_reached) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: a cost cap refused an embed call in the last embed step; no story gets a vector until the cap's scope ends.
+
+      # 80% of the embed file's own total cap, the shadow's fraction.
+      - alert: ModelgateEmbedSpendNearTotalCap
+        expr: |
+          max(modelgate_embed_spent_micro_usd{scope="total"}) / 1e6
+          >= 0.8 * max(modelgate_embed_cap_micro_usd{scope="total"}) / 1e6
+        labels:
+          severity: warning
+        annotations:
+          summary: the modelgate embed file has spent {{ $value }} USD, at least 80% of its total cap.

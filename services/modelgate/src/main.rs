@@ -11,13 +11,16 @@ use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 
+use modelgate::cmd_dedup::{self, SampleArgs, DISTRIBUTION_SCHEMA, SAMPLE_SCHEMA};
+use modelgate::cmd_embed;
 use modelgate::cmd_shadow::{
     self, Args, Env, ShadowError, ERROR_SCHEMA, EXIT_INCOMPLETE, EXIT_NOT_FOUND, EXIT_OK,
     EXIT_TRANSIENT, EXIT_USAGE,
 };
 use modelgate::ledger::SendPermit;
 use modelgate::wire::{
-    ApiKey, Exchanged, KeyError, ModelExchange, ModelWire, ENDPOINT, KEY_FILE_VARIABLE,
+    ApiKey, Exchanged, KeyError, ModelExchange, ModelWire, EMBED_ENDPOINT, ENDPOINT,
+    KEY_FILE_VARIABLE,
 };
 
 const STORE_VARIABLE: &str = "BELLWETHER_MODELGATE";
@@ -44,6 +47,62 @@ EXIT CODES:
 EXAMPLES:
   modelgate schema --format json
   modelgate schema shadow run
+";
+
+const EMBED_HELP: &str = "\
+{about}
+
+USAGE:
+  {usage}
+
+OPTIONS:
+{options}
+
+OUTPUT:
+  stdout: one modelgate.embed_run/1 object for exits 0 and 8, nothing otherwise.
+  stderr: one modelgate.error/1 object for exits 2, 4 and 7 under --format json;
+          otherwise `error: <text> (<code>)`, then the details when there are any.
+
+EXIT CODES:
+  0  the run's first canary closed ok and no story's request failed or closed unusable,
+     or nothing was new, or a dry run, or the deadline or --limit stopped it
+  2  invalid_argument, input_unparseable, input_schema_mismatch, credential_key_missing,
+     credential_key_exposed, io_failed
+  4  input_absent
+  7  vendor_unreachable (the first canary met a retryable status or no answer), lease_held
+  8  store_failed, cost_estimate_broken, cost_cap_reached, canary_not_ok, partial_embed,
+     unusable_answer; the envelope names which
+
+EXAMPLES:
+  modelgate embed run --snapshot /cuts/3f2a --model example/embed-1 --provider example-host \\
+      --quantization bf16 --epoch 1 --run-cap-usd 0.05 --day-cap-usd 0.50 \\
+      --total-cap-usd 3 --input-price-per-mtok 0.01 --give-up-after-hours 24 --limit 200 \\
+      --deadline 2026-11-24T10:40:00Z --dry-run --format json
+";
+
+const DEDUP_HELP: &str = "\
+{about}
+
+USAGE:
+  {usage}
+
+OPTIONS:
+{options}
+
+OUTPUT:
+  stdout: one JSON object for exit 0, nothing otherwise; see `modelgate schema`.
+  stderr: one modelgate.error/1 object under --format json, else `error: <text> (<code>)`.
+
+EXIT CODES:
+  0  printed
+  2  invalid_argument, input_unparseable, input_schema_mismatch, io_failed
+  4  input_absent: no embed.sqlite in the store, or no snapshot
+
+EXAMPLES:
+  modelgate dedup distribution --store /modelgate --format json
+  modelgate dedup sample --seed 20261201 --per-stratum 8 --snapshot /cuts/3f2a --format json
+  modelgate dedup sample --seed 20261201 --per-stratum 8 --snapshot /cuts/3f2a \\
+      --compare-version 'dedup.compare/1(window_days=7)' --space 'modelgate.embed/1;epoch=1'
 ";
 
 const RUN_HELP: &str = "\
@@ -79,7 +138,7 @@ EXAMPLES:
 #[derive(Parser)]
 #[command(
     name = "modelgate",
-    about = "The only exit to a language model: decide calls behind a ledger and a cost cap.",
+    about = "The only exit to a model: decide and embed calls behind a ledger and a cost cap.",
     version,
     help_template = TOP_HELP
 )]
@@ -93,6 +152,12 @@ enum Command {
     /// Record-only labelling of news stories. Nothing reads a price or builds a list.
     #[command(subcommand)]
     Shadow(Shadow),
+    /// Vectors of story texts and the comparison record of each story. Record only.
+    #[command(subcommand)]
+    Embed(Embed),
+    /// Read-only reports over the comparison records.
+    #[command(subcommand)]
+    Dedup(Dedup),
     /// This binary's commands, options, outputs and exit codes, as JSON.
     Schema {
         /// A command path, such as `shadow run`. Without one, every command.
@@ -108,6 +173,121 @@ enum Shadow {
     /// spends money.
     #[command(help_template = RUN_HELP)]
     Run(Box<RunArgs>),
+}
+
+#[derive(Subcommand)]
+enum Embed {
+    /// One embed request per story of a `newsvault cut` snapshot that has no vector, behind
+    /// one canary call, then each settled story's nearest earlier stories. Spends money.
+    #[command(help_template = EMBED_HELP)]
+    Run(Box<EmbedArgs>),
+}
+
+#[derive(Subcommand)]
+enum Dedup {
+    /// Stories per similarity band of their best earlier candidate, and the canary series.
+    #[command(help_template = DEDUP_HELP)]
+    Distribution(DistributionArgs),
+    /// Candidate pairs for a person to label, drawn by a seed. The output holds story text.
+    #[command(help_template = DEDUP_HELP)]
+    Sample(SampleCli),
+}
+
+#[derive(clap::Args)]
+struct EmbedArgs {
+    /// A snapshot directory written by `newsvault cut`.
+    #[arg(long)]
+    snapshot: PathBuf,
+    /// The embedding model's id. No dated build exists, so the provider pins it.
+    #[arg(long)]
+    model: String,
+    /// The one provider endpoint that may answer, by its slug. Fallbacks are off.
+    #[arg(long)]
+    provider: String,
+    /// The precision that endpoint serves, by the vendor's name for it.
+    #[arg(long)]
+    quantization: String,
+    /// Raise it when the provider's serving is seen to change: vectors of two epochs are
+    /// never compared.
+    #[arg(long)]
+    epoch: u32,
+    /// USD this run may spend at most. No default.
+    #[arg(long)]
+    run_cap_usd: String,
+    /// USD the embed file may spend per UTC day.
+    #[arg(long)]
+    day_cap_usd: String,
+    /// USD the embed file may spend over its lifetime.
+    #[arg(long)]
+    total_cap_usd: String,
+    /// USD per million input tokens, for the worst-case bound.
+    #[arg(long)]
+    input_price_per_mtok: String,
+    /// Hours after its first attempt at which a story whose request keeps failing is left.
+    #[arg(long)]
+    give_up_after_hours: u32,
+    /// Stories this run embeds at most.
+    #[arg(long)]
+    limit: u64,
+    /// No call starts later than 20 s before this instant: RFC 3339, or @<unix seconds>.
+    #[arg(long)]
+    deadline: String,
+    /// The gate's store. Defaults to $BELLWETHER_MODELGATE, then ~/.bellwether/modelgate.
+    #[arg(long)]
+    store: Option<PathBuf>,
+    /// The embed run id whose cost_estimate_broken this run acknowledges.
+    #[arg(long)]
+    ack_cost_model: Option<String>,
+    /// Validate, select and plan; send nothing, write nothing and read no key.
+    #[arg(long)]
+    dry_run: bool,
+    /// Accepted and does nothing: no command here prompts or reads stdin.
+    #[arg(long)]
+    non_interactive: bool,
+    #[arg(long, value_enum, default_value_t = Format::Human)]
+    format: Format,
+    /// Alias of --format json.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args)]
+struct DistributionArgs {
+    /// The gate's store. Defaults to $BELLWETHER_MODELGATE, then ~/.bellwether/modelgate.
+    #[arg(long)]
+    store: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = Format::Human)]
+    format: Format,
+    /// Alias of --format json.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args)]
+struct SampleCli {
+    /// Written down before the draw; the same seed over the same store draws the same pairs.
+    #[arg(long)]
+    seed: u64,
+    /// Pairs drawn from each stratum: a similarity band x whether a visible host is shared.
+    #[arg(long)]
+    per_stratum: u64,
+    /// A snapshot directory written by `newsvault cut`, for the two texts of each pair.
+    #[arg(long)]
+    snapshot: PathBuf,
+    /// One comparison version's token, when the store holds comparisons of several.
+    #[arg(long)]
+    compare_version: Option<String>,
+    /// One space's name, when the store holds comparisons of several.
+    #[arg(long)]
+    space: Option<String>,
+    /// The gate's store. Defaults to $BELLWETHER_MODELGATE, then ~/.bellwether/modelgate.
+    #[arg(long)]
+    store: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = Format::Human)]
+    format: Format,
+    /// Alias of --format json.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(clap::Args)]
@@ -230,6 +410,94 @@ fn schema_doc() -> Value {
                 "spends_money": true,
                 "network": [ENDPOINT]
             },
+            {
+                "path": ["embed", "run"],
+                "summary": "One embed request per first-sighted story of a newsvault cut snapshot that has a body, no vector in this space and was observed no more than 7 days before the space's first run, stories never attempted first and each group oldest first, and none unless the run's first canary closed ok; then, for each embedded story with no earlier story still waiting for a vector, its nearest earlier stories within 7 days and what code reads in both texts. Records raw bytes, vectors and comparison records; writes no verdict, and shadow run reads none of it.",
+                "options": [
+                    {"name": "snapshot", "type": "path", "required": true},
+                    {"name": "model", "type": "string", "required": true,
+                     "doc": "an alias (leading ~) is invalid_argument; an undated id is accepted for this kind only"},
+                    {"name": "provider", "type": "string", "required": true,
+                     "doc": "a provider slug; sent as the only allowed provider with fallbacks off"},
+                    {"name": "quantization", "type": "string", "required": true},
+                    {"name": "epoch", "type": "integer", "required": true},
+                    {"name": "run_cap_usd", "type": "usd", "required": true},
+                    {"name": "day_cap_usd", "type": "usd", "required": true,
+                     "doc": "over the embed file per UTC day; decide spend is not counted"},
+                    {"name": "total_cap_usd", "type": "usd", "required": true,
+                     "doc": "over the embed file's lifetime; decide spend is not counted"},
+                    {"name": "input_price_per_mtok", "type": "usd", "required": true,
+                     "doc": "above zero; 0 is invalid_argument"},
+                    {"name": "give_up_after_hours", "type": "integer", "required": true,
+                     "doc": "counted from a story's first attempt in the space, never from its observation"},
+                    {"name": "limit", "type": "integer", "required": true},
+                    {"name": "deadline", "type": "instant", "required": true,
+                     "doc": "RFC 3339 or @<unix seconds>; no call starts later than 20 s before it and the comparison's scan stops 60 s past it"},
+                    {"name": "store", "type": "path"},
+                    {"name": "ack_cost_model", "type": "string",
+                     "doc": "an embed run id with a cost_estimate_broken row, else invalid_argument"},
+                    {"name": "dry_run", "type": "flag",
+                     "doc": "validates, selects and plans; opens no attempt, writes no row and no blob, sends nothing, and neither needs nor reads the key file"},
+                    {"name": "non_interactive", "type": "flag",
+                     "doc": "accepted and does nothing: no command here prompts or reads stdin"},
+                    {"name": "format", "type": "enum", "values": ["human", "json"],
+                     "default": "human"},
+                    {"name": "json", "type": "flag", "doc": "alias of --format json"}
+                ],
+                "env": [
+                    {"name": KEY_FILE_VARIABLE,
+                     "doc": "the same key file as shadow run; not read under --dry-run"},
+                    {"name": STORE_VARIABLE,
+                     "doc": "the store when --store is not given, then ~/.bellwether/modelgate"}
+                ],
+                "output": cmd_embed::SCHEMA,
+                "exits": {
+                    "0": "the run's first canary closed ok and no story's request failed or closed unusable, or nothing was new, or a dry run, or the deadline or the limit stopped it; a text the provider refuses changes no exit",
+                    "2": "invalid_argument, input_unparseable, input_schema_mismatch, credential_key_missing, credential_key_exposed, io_failed",
+                    "4": "input_absent: the snapshot or the key file",
+                    "7": "vendor_unreachable (the first canary met a retryable status or no answer; no story sent), lease_held",
+                    "8": "store_failed, cost_estimate_broken, cost_cap_reached, canary_not_ok, partial_embed or unusable_answer, named in the envelope's exit.error_code"
+                },
+                "mutates": true,
+                "spends_money": true,
+                "network": [EMBED_ENDPOINT]
+            },
+            {
+                "path": ["dedup", "distribution"],
+                "summary": "Per comparison version and space: stories per similarity band of their best earlier candidate, with how many of those candidates share a visible host, a ticker tag or the source and how old they are; the hosts shared most often; the canary series.",
+                "options": [
+                    {"name": "store", "type": "path"},
+                    {"name": "format", "type": "enum", "values": ["human", "json"],
+                     "default": "human"},
+                    {"name": "json", "type": "flag", "doc": "alias of --format json"}
+                ],
+                "output": DISTRIBUTION_SCHEMA,
+                "exits": {"0": "printed", "2": "io_failed, input_schema_mismatch",
+                          "4": "input_absent: no embed.sqlite in the store"},
+                "mutates": false
+            },
+            {
+                "path": ["dedup", "sample"],
+                "summary": "Candidate pairs for a person to label duplicate, same_matter or different: per stratum (similarity band x a shared visible host) the first pairs by sha256 of the seed and the pair. The output states no similarity and holds story text, so it never enters a repository.",
+                "options": [
+                    {"name": "seed", "type": "integer", "required": true},
+                    {"name": "per_stratum", "type": "integer", "required": true},
+                    {"name": "snapshot", "type": "path", "required": true},
+                    {"name": "compare_version", "type": "string",
+                     "doc": "a comparison version's token as dedup distribution prints it"},
+                    {"name": "space", "type": "string",
+                     "doc": "a space's name as dedup distribution prints it"},
+                    {"name": "store", "type": "path"},
+                    {"name": "format", "type": "enum", "values": ["human", "json"],
+                     "default": "human"},
+                    {"name": "json", "type": "flag", "doc": "alias of --format json"}
+                ],
+                "output": SAMPLE_SCHEMA,
+                "exits": {"0": "printed",
+                          "2": "invalid_argument (the comparisons left by --compare-version and --space are of several versions or spaces; the message names each), input_unparseable, input_schema_mismatch, io_failed",
+                          "4": "input_absent: no embed.sqlite in the store, or no snapshot"},
+                "mutates": false
+            },
             {"path": ["schema"], "summary": "This document, or one command of it.",
              "options": [
                  {"name": "command", "type": "words"},
@@ -258,6 +526,8 @@ fn schema_doc() -> Value {
             {"code": "cost_cap_reached", "exit": EXIT_INCOMPLETE, "retryable": false},
             {"code": "cost_estimate_broken", "exit": EXIT_INCOMPLETE, "retryable": false},
             {"code": "partial_shadow", "exit": EXIT_INCOMPLETE, "retryable": false},
+            {"code": "partial_embed", "exit": EXIT_INCOMPLETE, "retryable": false},
+            {"code": "canary_not_ok", "exit": EXIT_INCOMPLETE, "retryable": false},
             {"code": "unusable_answer", "exit": EXIT_INCOMPLETE, "retryable": false},
             {"code": "store_failed", "exit": EXIT_INCOMPLETE, "retryable": false}
         ],
@@ -336,36 +606,143 @@ fn store_root(given: Option<PathBuf>) -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(DEFAULT_STORE)))
 }
 
-fn shadow_run(run: RunArgs) -> u8 {
-    let format = if run.json { Format::Json } else { run.format };
-    let Some(store) = store_root(run.store) else {
+/// The store, or the refusal already written to stderr.
+fn store_or_refusal(given: Option<PathBuf>, format: Format) -> Result<PathBuf, u8> {
+    store_root(given).ok_or_else(|| {
         let message = format!("no --store, no {STORE_VARIABLE} and no HOME");
-        return fail(
+        fail(
             "invalid_argument",
             EXIT_USAGE,
             false,
             &message,
             &json!({}),
             format,
-        );
+        )
+    })
+}
+
+/// A dry run's exchange with no key and no socket, or the wire `live` builds from the key file.
+fn wire_or_refusal(
+    dry_run: bool,
+    live: fn(ApiKey) -> ModelWire,
+    format: Format,
+) -> Result<Box<dyn ModelExchange>, u8> {
+    if dry_run {
+        return Ok(Box::new(NoWire));
+    }
+    match ApiKey::read(|name| std::env::var_os(name)) {
+        Ok(key) => Ok(Box::new(live(key))),
+        Err(failure) => Err(fail(
+            failure.code(),
+            key_exit(&failure),
+            false,
+            &failure.to_string(),
+            &json!({}),
+            format,
+        )),
+    }
+}
+
+fn finished(done: Result<cmd_shadow::Finished, ShadowError>, format: Format) -> u8 {
+    match done {
+        Ok(done) => match print(&done.envelope, format) {
+            Ok(()) => done.exit,
+            Err(why) => fail(
+                "io_failed",
+                EXIT_USAGE,
+                false,
+                &why.to_string(),
+                &json!({}),
+                format,
+            ),
+        },
+        Err(failure) => report(&failure, format),
+    }
+}
+
+fn embed_run(run: EmbedArgs) -> u8 {
+    let format = if run.json { Format::Json } else { run.format };
+    let store = match store_or_refusal(run.store, format) {
+        Ok(store) => store,
+        Err(exit) => return exit,
     };
-    let wire: Box<dyn ModelExchange> = if run.dry_run {
-        Box::new(NoWire)
-    } else {
-        match ApiKey::read(|name| std::env::var_os(name)) {
-            Ok(key) => Box::new(ModelWire::new(key)),
-            Err(failure) => {
-                let exit = key_exit(&failure);
-                return fail(
-                    failure.code(),
-                    exit,
-                    false,
-                    &failure.to_string(),
-                    &json!({}),
-                    format,
-                );
+    let wire = match wire_or_refusal(run.dry_run, ModelWire::embed, format) {
+        Ok(wire) => wire,
+        Err(exit) => return exit,
+    };
+    let args = cmd_embed::Args {
+        snapshot: run.snapshot,
+        model: run.model,
+        provider: run.provider,
+        quantization: run.quantization,
+        epoch: run.epoch,
+        run_cap_usd: run.run_cap_usd,
+        day_cap_usd: run.day_cap_usd,
+        total_cap_usd: run.total_cap_usd,
+        input_price_per_mtok: run.input_price_per_mtok,
+        give_up_after_hours: run.give_up_after_hours,
+        limit: run.limit,
+        deadline: run.deadline,
+        store,
+        ack_cost_model: run.ack_cost_model,
+        dry_run: run.dry_run,
+    };
+    let env = Env {
+        exchange: wire.as_ref(),
+        now: &Utc::now,
+        sleep: &std::thread::sleep,
+    };
+    finished(cmd_embed::run(&args, &env), format)
+}
+
+/// A read-only report: the value on stdout at exit 0, or the refusal.
+fn reported(found: Result<Value, ShadowError>, format: Format) -> u8 {
+    finished(
+        found.map(|envelope| cmd_shadow::Finished {
+            envelope,
+            exit: EXIT_OK,
+        }),
+        format,
+    )
+}
+
+fn dedup(command: Dedup) -> u8 {
+    match command {
+        Dedup::Distribution(args) => {
+            let format = if args.json { Format::Json } else { args.format };
+            match store_or_refusal(args.store, format) {
+                Ok(store) => reported(cmd_dedup::distribution(&store), format),
+                Err(exit) => exit,
             }
         }
+        Dedup::Sample(args) => {
+            let format = if args.json { Format::Json } else { args.format };
+            let store = match store_or_refusal(args.store, format) {
+                Ok(store) => store,
+                Err(exit) => return exit,
+            };
+            let sample = SampleArgs {
+                seed: args.seed,
+                per_stratum: args.per_stratum,
+                snapshot: args.snapshot,
+                store,
+                compare_version: args.compare_version,
+                space: args.space,
+            };
+            reported(cmd_dedup::sample(&sample), format)
+        }
+    }
+}
+
+fn shadow_run(run: RunArgs) -> u8 {
+    let format = if run.json { Format::Json } else { run.format };
+    let store = match store_or_refusal(run.store, format) {
+        Ok(store) => store,
+        Err(exit) => return exit,
+    };
+    let wire = match wire_or_refusal(run.dry_run, ModelWire::new, format) {
+        Ok(wire) => wire,
+        Err(exit) => return exit,
     };
     let args = Args {
         snapshot: run.snapshot,
@@ -389,20 +766,7 @@ fn shadow_run(run: RunArgs) -> u8 {
         now: &Utc::now,
         sleep: &std::thread::sleep,
     };
-    match cmd_shadow::run(&args, &env) {
-        Ok(done) => match print(&done.envelope, format) {
-            Ok(()) => done.exit,
-            Err(why) => fail(
-                "io_failed",
-                EXIT_USAGE,
-                false,
-                &why.to_string(),
-                &json!({}),
-                format,
-            ),
-        },
-        Err(failure) => report(&failure, format),
-    }
+    finished(cmd_shadow::run(&args, &env), format)
 }
 
 fn report(failure: &ShadowError, format: Format) -> u8 {
@@ -479,6 +843,8 @@ fn main() -> ExitCode {
     };
     let exit = match cli.command {
         Command::Shadow(Shadow::Run(run)) => shadow_run(*run),
+        Command::Embed(Embed::Run(run)) => embed_run(*run),
+        Command::Dedup(command) => dedup(command),
         Command::Schema { command, format } => schema(&command, format),
     };
     ExitCode::from(exit)
@@ -553,7 +919,7 @@ mod tests {
             assert_eq!(parsed, in_schema, "{}", entry["path"]);
             checked += 1;
         }
-        assert_eq!(checked, 2);
+        assert_eq!(checked, 5);
     }
 
     /// Exit 7 carries the run's envelope under `details`, and no binary test reaches a send.
