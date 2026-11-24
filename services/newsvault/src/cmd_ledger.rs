@@ -10,15 +10,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Days, NaiveDate, Utc};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 use crate::cmd_collect::Registered;
 use crate::cmd_robots::ROBOTS_SOURCE;
 use crate::cmd_roster::ROSTER_SOURCE;
 use crate::store::{
-    coverage_up_to, newest_visible_publication, require_current_version, unpublished_seq_ranges,
-    SeqRange, WindowCoverage, COMMIT_LOG, REDIRECTS, RUNS_DIR,
+    coverage_up_to, newest_visible_publication, read_only, require_current_version,
+    unpublished_seq_ranges, SeqRange, WindowCoverage, COMMIT_LOG, REDIRECTS, RUNS_DIR,
 };
 use news_provider::{Closing, DeferReason, Verdict, CARRY_LIMIT};
 use open_web_feed::Continuity;
@@ -533,7 +533,7 @@ pub fn read(root: &Path, ask: &Ask) -> Result<Report, LedgerReadError> {
     if !log.exists() {
         return Err(LedgerReadError::StoreAbsent(log));
     }
-    let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let db = read_only(&log)?;
     require_current_version(&db)?;
     let at = stamp(ask.at);
     let (envelopes, unreadable_runs) = read_envelopes(&root.join(RUNS_DIR), ask.at);

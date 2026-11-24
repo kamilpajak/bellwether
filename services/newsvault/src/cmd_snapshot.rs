@@ -130,7 +130,7 @@ pub fn run(ask: &Ask) -> Result<Snapshot, SnapshotError> {
         return Err(SnapshotError::OutputExists(ask.out.clone()));
     }
     let _lease = store::hold_lease_to_copy(&ask.store)?;
-    let source = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let source = store::read_only(&log)?;
     source.busy_timeout(BUSY_WAIT)?;
     let shown = |path: &Path| path.display().to_string();
     if ask.dry_run {
@@ -197,7 +197,7 @@ fn copy(source: &Connection, partial: &Path) -> Result<i32, SnapshotError> {
 }
 
 fn checked_copy(source: &Connection, partial: &Path) -> Result<i32, SnapshotError> {
-    let mut target = Connection::open(partial)?;
+    let mut target = store::connect(partial, OpenFlags::default())?;
     {
         let backup = Backup::new(source, &mut target)?;
         loop {
@@ -208,7 +208,6 @@ fn checked_copy(source: &Connection, partial: &Path) -> Result<i32, SnapshotErro
             }
         }
     }
-    target.pragma_update(None, "temp_store", "MEMORY")?;
     let verdicts: Vec<String> = target
         .prepare("PRAGMA quick_check")?
         .query_map([], |row| row.get(0))?

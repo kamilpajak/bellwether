@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Timelike, Utc};
 use pit::Cutoff;
-use rusqlite::{params, Connection, OpenFlags, Row};
+use rusqlite::{params, Connection, Row};
 use serde::Serialize;
 use serde_json::{json, Value};
 use snapshot_contract::{
@@ -25,7 +25,9 @@ use snapshot_contract::{
 };
 
 use crate::publish::Durability;
-use crate::store::{blob_bytes, blob_store, require_current_version, StoreError, COMMIT_LOG};
+use crate::store::{
+    blob_bytes, blob_store, read_only, require_current_version, StoreError, COMMIT_LOG,
+};
 
 pub const SCHEMA: &str = "newsvault.cut/1";
 /// Rows one chunked read returns.
@@ -266,7 +268,7 @@ pub fn run(ask: &Ask, durability: &dyn Durability) -> Result<Report, CutError> {
     if let Some(out) = ask.out.as_deref().filter(|_| !ask.dry_run) {
         refuse_out_inside(out, &ask.store)?;
     }
-    let db = Connection::open_with_flags(&log, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let db = read_only(&log)?;
     db.busy_timeout(ask.busy_wait)?;
     require_current_version(&db)?;
     let cutoff = Cutoff::new(ask.at);

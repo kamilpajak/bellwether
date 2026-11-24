@@ -1948,3 +1948,56 @@ fn listing_latency_counts_a_bodyless_answer_under_no_host_and_one_received_at_th
     );
     Ok(())
 }
+
+/// Copies of one fixture attempt. Measured 2026-11-24 without the pragma, system SQLite 3.54.0 on
+/// macOS (`cache_size` 2,000 pages of 4,096 bytes): the read below is killed by SIGXFSZ at 80,014
+/// attempts and passes at 50,014. Ubuntu 24.04's 3.45 holds 2 MiB, a quarter of that.
+const COPIES_PAST_THE_SORTERS_MEMORY: u32 = 120_000;
+const COPIED_ATTEMPT: &str = "a-0701-edgar-0";
+
+/// §8 row T1, the incident of 2026-11-23: a sort that outgrows SQLite's memory went to a temporary
+/// file, and the watchdog's container has no writable directory. `ulimit -f 0` lets the process
+/// write no byte to any file, and stdout is a pipe.
+#[test]
+fn a_read_whose_sort_outgrows_the_sorters_memory_writes_no_temporary_file() -> TestResult {
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    let columns: String = db.query_row(
+        "SELECT group_concat(name) FROM pragma_table_info('attempts') WHERE name != 'attempt_id'",
+        [],
+        |row| row.get(0),
+    )?;
+    let copied = db.execute(
+        &format!(
+            "WITH RECURSIVE copy (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM copy WHERE n < ?1)
+             INSERT INTO attempts (attempt_id, {columns})
+             SELECT printf('%s-copy-%06d', attempt_id, n), {columns}
+               FROM attempts, copy WHERE attempt_id = ?2"
+        ),
+        rusqlite::params![COPIES_PAST_THE_SORTERS_MEMORY, COPIED_ATTEMPT],
+    )?;
+    drop(db);
+    let unlimited = over(&root, FIRST_DAY, FIRST_DAY)?;
+
+    let limited = Command::new("/bin/sh")
+        .args(["-c", "ulimit -f 0 && exec \"$@\"", "sh"])
+        .arg(env!("CARGO_BIN_EXE_newsvault"))
+        .arg("ledger")
+        .args(["--store", &root.path().to_string_lossy()])
+        .args(["--at", AT, "--format", "json"])
+        .args(["--from", FIRST_DAY, "--to", FIRST_DAY])
+        .output()?;
+
+    assert_eq!(
+        (copied, unlimited.code, limited.status.code()),
+        (
+            COPIES_PAST_THE_SORTERS_MEMORY as usize,
+            EXIT_OK,
+            Some(EXIT_OK)
+        ),
+        "{}",
+        String::from_utf8_lossy(&limited.stderr)
+    );
+    assert_eq!(limited.stdout, unlimited.stdout);
+    Ok(())
+}
