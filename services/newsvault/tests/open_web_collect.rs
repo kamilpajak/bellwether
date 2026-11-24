@@ -5135,6 +5135,13 @@ fn a_second_poll_walks_below_the_previous_frontier_only_and_records_each_answer(
         human.contains("walk_complete 1 walk_first_poll 1 walk_id_unread 0 walk_range_unread 0 walk_gone 2 walk_other_language 1 walk_unread 0"),
         "{human}"
     );
+    let failed_and_gone: Vec<(u32, u32)> = ledgered(root.path())?
+        .days
+        .iter()
+        .flat_map(|one| &one.per_source)
+        .map(|row| (row.failed, row.gone))
+        .collect();
+    assert_eq!(failed_and_gone, vec![(2, 2)]);
     let db = Connection::open_with_flags(
         root.path().join(COMMIT_LOG),
         OpenFlags::SQLITE_OPEN_READ_ONLY,

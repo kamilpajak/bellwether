@@ -273,13 +273,18 @@ fn a_document_answered_410_is_counted_gone_and_is_no_failure() -> TestResult {
     Ok(())
 }
 
-/// The owner named 410 alone: a document answered 404, 503, 301 or 200 with nothing usable, and an
-/// index answered 410, each still raise `holds_a_failure` and count no `gone`.
+/// The owner named 410 alone: a document answered 404, 403, 429, 411, 451, 503, 301 or 200 with
+/// nothing usable, and an index answered 410, each still raise `holds_a_failure` and count no
+/// `gone`.
 #[test]
 fn every_other_failed_answer_and_an_index_answered_410_still_hold_a_failure() -> TestResult {
     let story = Some("s-failed");
     for (status, story) in [
         (404, story),
+        (403, story),
+        (429, story),
+        (411, story),
+        (451, story),
         (503, story),
         (301, story),
         (200, story),
@@ -334,6 +339,41 @@ fn a_410_beside_another_failure_leaves_that_failure_counted() -> TestResult {
             Some(2),
             Some(1),
             Some("1 failed, 0 interrupted, 1 gone not counted")
+        )
+    );
+    Ok(())
+}
+
+/// A 410 takes nothing off an interrupted attempt: the day still fails on the interrupted one.
+#[test]
+fn a_410_beside_an_interrupted_attempt_leaves_the_interruption_a_failure() -> TestResult {
+    let root = fixture()?;
+    let db = Connection::open(root.path().join(COMMIT_LOG))?;
+    a_failed_answer(&db, (EMPTY_RUN, "g-1"), GONE, Some("s-gone"))?;
+    a_failed_answer(&db, (EMPTY_RUN, "i-1"), GONE, Some("s-swept"))?;
+    db.execute(
+        "UPDATE attempts SET outcome = 'interrupted', verdict = NULL, transport_status = NULL
+          WHERE attempt_id = 'i-1'",
+        [],
+    )?;
+    drop(db);
+    let (code, findings, row, detail) = checked_empty_day(&root)?;
+    assert_eq!(
+        (
+            code,
+            findings,
+            row["failed"].as_u64(),
+            row["interrupted"].as_u64(),
+            row["gone"].as_u64(),
+            detail.as_str()
+        ),
+        (
+            EXIT_NO,
+            vec!["holds_a_failure".to_owned()],
+            Some(1),
+            Some(1),
+            Some(1),
+            Some("0 failed, 1 interrupted, 1 gone not counted")
         )
     );
     Ok(())
