@@ -1,7 +1,7 @@
 //! The gate's store in the daily backup (architecture.md section 3.5, "The store's daily copy"):
 //! `modelgate snapshot` and `modelgate verify` on a store a stubbed run wrote, and
 //! `deploy/systemd/newsvault-backup modelgate` against a stub `docker`, `flock` and `timeout`
-//! whose `docker run` execs the real binary. No test here opens a socket.
+//! and `tar` whose `docker run` execs the real binary. No test here opens a socket.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -10,10 +10,10 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use modelgate::cmd_shadow::{self, Args, Env};
 use modelgate::ledger::SendPermit;
-use modelgate::store::{Store, BLOB_DIR, DB_FILE};
+use modelgate::store::{Store, BLOB_DIR, DB_FILE, TABLES};
 use modelgate::wire::{Exchanged, HttpAnswer, ModelExchange};
 use rusqlite::Connection;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tempfile::TempDir;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -36,7 +36,7 @@ const DAYS: [&str; 8] = ["01", "02", "03", "04", "05", "06", "07", "08"];
 /// Stands in for docker. `run`: records its words on one line, then execs the real binary on
 /// the words after `/usr/local/bin/modelgate`, `/modelgate` and `/out` mapped to their mounts.
 /// `STUB_DAMAGE` removes one blob of the copy before `verify` reads it.
-/// `exec`: the Nextcloud container, `/mnt/ncdata` mapped to `$STUB_DIR/ncdata`; `occ` exits 0.
+/// `rm`: recorded. `exec`: the Nextcloud container, `/mnt/ncdata` mapped to `$STUB_DIR/ncdata`; `occ` exits 0.
 const DOCKER_STUB: &str = r#"#!/bin/sh
 if [ "$1" = run ]; then
     echo "$*" >>"$STUB_DIR/docker-runs"
@@ -62,6 +62,7 @@ if [ "$1" = run ]; then
     fi
     exec "$STUB_MODELGATE" "$@"
 fi
+if [ "$1" = rm ]; then echo "$*" >>"$STUB_DIR/docker-rms"; exit 0; fi
 [ "$1" = exec ] || exit 0
 echo "$*" >>"$STUB_DIR/execs"
 shift
@@ -89,11 +90,18 @@ echo "$1 $2 $3 $4 $5" >>"$STUB_DIR/flock-args"
 shift 5
 exec "$@"
 "#;
-/// Stands in for timeout(1): exits `STUB_TIMEOUT` without running the command when it is set.
+/// Stands in for timeout(1): records its three option words; exits `STUB_TIMEOUT` without
+/// running the command when it is set.
 const TIMEOUT_STUB: &str = r#"#!/bin/sh
+echo "$1 $2 $3" >>"$STUB_DIR/timeout-args"
 [ -z "$STUB_TIMEOUT" ] || exit "$STUB_TIMEOUT"
 shift 3
 exec "$@"
+"#;
+/// tar(1), or under `STUB_TAR` one that leaves part of an archive and fails.
+const TAR_STUB: &str = r#"#!/bin/sh
+if [ "$STUB_TAR" = fail ]; then echo part >"$2"; exit 1; fi
+exec /usr/bin/tar "$@"
 "#;
 
 fn repo(path: &str) -> PathBuf {
@@ -189,8 +197,61 @@ fn executable(path: &Path, text: &str) -> TestResult {
     Ok(())
 }
 
+fn id(flag: &str) -> TestResult<String> {
+    let printed = Command::new("id").arg(flag).output()?.stdout;
+    Ok(String::from_utf8(printed)?.trim().to_owned())
+}
+
+/// A recorded `docker run` with the staging directory's `mktemp` suffix replaced by its template.
+fn staging_named(run: &str) -> String {
+    const MARK: &str = "/backup.";
+    const SUFFIX: usize = 6;
+    match run.split_once(MARK) {
+        Some((before, after)) if after.len() >= SUFFIX => {
+            format!("{before}{MARK}XXXXXX{}", &after[SUFFIX..])
+        }
+        _ => run.to_owned(),
+    }
+}
+
+/// Overwrites the second half of a table's root page, as a damaged disk block would.
+fn damage_table(database: &Path, table: &str) -> TestResult {
+    use std::io::{Seek, SeekFrom, Write};
+    let db = Connection::open(database)?;
+    let page: i64 = db.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let root: i64 = db.query_row(
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+        [table],
+        |row| row.get(0),
+    )?;
+    drop(db);
+    let (page, root) = (u64::try_from(page)?, u64::try_from(root)?);
+    let half = page / 2;
+    let mut file = std::fs::OpenOptions::new().write(true).open(database)?;
+    file.seek(SeekFrom::Start((root - 1) * page + half))?;
+    file.write_all(&vec![0x5a; usize::try_from(half)?])?;
+    Ok(())
+}
+
 fn copy_name(store: &str, day: &str) -> String {
     format!("bellwether-{store}-200001{day}T233000Z.tar.gz")
+}
+
+/// What one run of the script meets.
+#[derive(Clone, Copy, PartialEq)]
+enum Meets {
+    Nothing,
+    /// A shadow run keeps its lock past the wait.
+    HeldLock,
+    /// `timeout` ends the snapshot with this status.
+    Bound(&'static str),
+    /// The copy loses a blob before `verify` reads it.
+    DamagedCopy,
+    FailingTar,
+    NoStore,
+    NoRuntimeDir,
+    /// The store lacks a blob one of its rows names.
+    LostSourceBlob,
 }
 
 struct Backed {
@@ -198,6 +259,8 @@ struct Backed {
     exit: Option<i32>,
     stderr: String,
     flock: Vec<String>,
+    timeouts: Vec<String>,
+    removals: Vec<String>,
     runs: Vec<String>,
     execs: Vec<String>,
     folder: Vec<String>,
@@ -211,7 +274,7 @@ impl Backed {
 
 /// One run of `newsvault-backup modelgate` over [`written_store`], the folder already holding
 /// eight copies of each store.
-fn backup(held: bool, timeout: &str, damage: bool) -> TestResult<Backed> {
+fn backup(meets: Meets) -> TestResult<Backed> {
     let work = TempDir::new()?;
     let at = |relative: &str| work.path().join(relative);
     for dir in [
@@ -223,7 +286,16 @@ fn backup(held: bool, timeout: &str, damage: bool) -> TestResult<Backed> {
     ] {
         std::fs::create_dir_all(at(dir))?;
     }
-    written_store(&at("home/.bellwether/modelgate"))?;
+    if meets != Meets::NoStore {
+        written_store(&at("home/.bellwether/modelgate"))?;
+    }
+    if meets == Meets::LostSourceBlob {
+        let blobs = at("home/.bellwether/modelgate").join(BLOB_DIR);
+        let named = names(&blobs)
+            .into_iter()
+            .find(|name| ![UNNAMED_BLOB, STAGING].contains(&name.as_str()));
+        std::fs::remove_file(blobs.join(named.ok_or("no named blob")?))?;
+    }
     std::fs::write(at("home/.config/bellwether/model-key"), SECRET)?;
     for prom in [PROM, VAULT_PROM] {
         std::fs::write(at("textfile").join(prom), OLD_METRICS)?;
@@ -240,20 +312,29 @@ fn backup(held: bool, timeout: &str, damage: bool) -> TestResult<Backed> {
         ("docker", DOCKER_STUB),
         ("flock", FLOCK_STUB),
         ("timeout", TIMEOUT_STUB),
+        ("tar", TAR_STUB),
     ] {
         executable(&at("stub/bin").join(name), text)?;
     }
-    let output = Command::new(UNIT_SHELL)
+    let mut script = Command::new(UNIT_SHELL);
+    script.env_clear();
+    if meets != Meets::NoRuntimeDir {
+        script.env("XDG_RUNTIME_DIR", at("run"));
+    }
+    let bound = match meets {
+        Meets::Bound(status) => status,
+        _ => "",
+    };
+    let said = |yes: bool, word: &'static str| if yes { word } else { "no" };
+    let output = script
         .arg(repo("deploy/systemd/newsvault-backup"))
         .arg("modelgate")
         .current_dir(work.path())
-        .env_clear()
         .env("HOME", at("home"))
         .env(
             "PATH",
             format!("{}:/usr/bin:/bin", at("stub/bin").display()),
         )
-        .env("XDG_RUNTIME_DIR", at("run"))
         .env("NEWSVAULT_IMAGE", "newsvault:test")
         .env("NEWSVAULT_TEXTFILE_DIR", at("textfile"))
         .env("NEXTCLOUD_CONTAINER", "nextcloud-aio-nextcloud")
@@ -262,15 +343,18 @@ fn backup(held: bool, timeout: &str, damage: bool) -> TestResult<Backed> {
         .env("NEXTCLOUD_FOLDER", "Backups/bellwether")
         .env("STUB_DIR", at("stub"))
         .env("STUB_MODELGATE", env!("CARGO_BIN_EXE_modelgate"))
-        .env("STUB_HELD", if held { "yes" } else { "no" })
-        .env("STUB_TIMEOUT", timeout)
-        .env("STUB_DAMAGE", if damage { "yes" } else { "no" })
+        .env("STUB_HELD", said(meets == Meets::HeldLock, "yes"))
+        .env("STUB_TIMEOUT", bound)
+        .env("STUB_DAMAGE", said(meets == Meets::DamagedCopy, "yes"))
+        .env("STUB_TAR", said(meets == Meets::FailingTar, "fail"))
         .stdin(Stdio::null())
         .output()?;
     Ok(Backed {
         exit: output.status.code(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         flock: lines(&at("stub/flock-args")),
+        timeouts: lines(&at("stub/timeout-args")),
+        removals: lines(&at("stub/docker-rms")),
         runs: lines(&at("stub/docker-runs")),
         execs: lines(&at("stub/execs")),
         folder: names(&at(&format!("stub/{FOLDER}"))),
@@ -286,7 +370,7 @@ fn backup(held: bool, timeout: &str, damage: bool) -> TestResult<Backed> {
 #[test]
 fn the_archive_is_the_database_and_its_named_blobs_and_a_restore_verifies_with_the_sources_counts(
 ) -> TestResult {
-    let backed = backup(false, "", false)?;
+    let backed = backup(Meets::Nothing)?;
     assert_eq!(backed.exit, Some(0), "{}", backed.stderr);
     let source = backed.path("home/.bellwether/modelgate");
     let new: Vec<&String> = backed
@@ -327,21 +411,30 @@ fn the_archive_is_the_database_and_its_named_blobs_and_a_restore_verifies_with_t
         .filter(|name| ![UNNAMED_BLOB, STAGING].contains(&name.as_str()))
         .cloned()
         .collect();
+    let mut rows = serde_json::Map::new();
+    let mut named_bytes = 0;
+    for table in TABLES {
+        let counted = count(&source, &format!("SELECT COUNT(*) FROM {table}"))?;
+        rows.insert(table.to_owned(), json!(counted));
+    }
+    for name in &named {
+        named_bytes += std::fs::metadata(source.join(BLOB_DIR).join(name))?.len();
+    }
     assert_eq!(
         (
             envelope["schema"].as_str(),
-            envelope["rows"]["labels"].as_i64(),
-            envelope["rows"]["requests"].as_i64(),
+            &envelope["rows"],
             envelope["blobs"]["named"].as_u64(),
+            envelope["blobs"]["bytes"].as_u64(),
             envelope["blobs"]["unnamed_files"].as_u64(),
             names(&restored),
             names(&restored.join(BLOB_DIR)),
         ),
         (
             Some("modelgate.store_verify/1"),
-            Some(labels),
-            Some(count(&source, "SELECT COUNT(*) FROM requests")?),
+            &Value::Object(rows),
             Some(u64::try_from(named.len())?),
+            Some(named_bytes),
             Some(0),
             vec![BLOB_DIR.to_owned(), DB_FILE.to_owned()],
             named.clone(),
@@ -359,45 +452,43 @@ fn the_archive_is_the_database_and_its_named_blobs_and_a_restore_verifies_with_t
     }
 
     let lock = backed.path("run/bellwether-shadow.lock");
-    let flags = "--pull never --user";
-    let hardening = "--read-only --network none --cap-drop ALL --security-opt no-new-privileges \
-                     --entrypoint /usr/bin/tini";
-    let snapshot_run = backed.runs.first().cloned().unwrap_or_default();
+    let user = format!("{}:{}", id("-u")?, id("-g")?);
+    let container = |name: &str, mounts: &str, command: &str| {
+        format!(
+            "run --rm --name {name} --pull never --user {user} --read-only --network none \
+             --cap-drop ALL --security-opt no-new-privileges --entrypoint /usr/bin/tini \
+             --mount type=bind,src={staging},dst=/out{mounts} newsvault:test -- \
+             /usr/local/bin/modelgate {command} --non-interactive --format json",
+            staging = backed
+                .path("home/.cache/bellwether/backup.XXXXXX")
+                .display()
+        )
+    };
     assert_eq!(
         (
             backed.flock.clone(),
-            backed.runs.len(),
-            snapshot_run.starts_with(&format!("run --rm --name modelgate-backup {flags} ")),
-            snapshot_run.contains(hardening),
-            snapshot_run.contains(&format!(
-                "type=bind,src={},dst=/modelgate,readonly",
-                source.display()
-            )),
-            snapshot_run.ends_with(
-                "newsvault:test -- /usr/local/bin/modelgate snapshot --store /modelgate \
-                 --out /out/store --non-interactive --format json"
-            ),
-            backed.runs.get(1).is_some_and(|run| {
-                run.starts_with(&format!("run --rm --name modelgate-backup-verify {flags} "))
-                    && run.contains(hardening)
-                    && !run.contains("dst=/modelgate")
-                    && run.ends_with(
-                        "-- /usr/local/bin/modelgate verify --store /out/store \
-                         --non-interactive --format json",
-                    )
-            }),
+            backed.timeouts.clone(),
+            backed.removals.len(),
+            backed.runs.iter().map(|run| staging_named(run)).collect(),
         ),
         (
             vec![format!(
                 "--timeout 760 --conflict-exit-code 7 {}",
                 lock.display()
             )],
-            2,
-            true,
-            true,
-            true,
-            true,
-            true
+            vec!["--kill-after 20 150".to_owned()],
+            0,
+            vec![
+                container(
+                    "modelgate-backup",
+                    &format!(
+                        " --mount type=bind,src={},dst=/modelgate,readonly",
+                        source.display()
+                    ),
+                    "snapshot --store /modelgate --out /out/store"
+                ),
+                container("modelgate-backup-verify", "", "verify --store /out/store"),
+            ],
         )
     );
 
@@ -431,52 +522,58 @@ fn the_archive_is_the_database_and_its_named_blobs_and_a_restore_verifies_with_t
     Ok(())
 }
 
-/// A shadow run that keeps its lock past the wait, a snapshot past its bound, and a copy that
-/// lost a blob before `verify` read it: the exit and its reason, nothing written to Nextcloud,
-/// nothing deleted, the last metric kept, the staging directory gone.
+/// A shadow run that keeps its lock past the wait, a snapshot past its bound, a copy that lost a
+/// blob before `verify` read it, a `tar` that failed, no store, no runtime directory and a store
+/// lacking a named blob: the exit and its reason, nothing written to Nextcloud, nothing deleted,
+/// the last metric kept, the staging directory gone. Only a snapshot past its bound is removed.
 #[test]
 fn a_held_lock_a_snapshot_past_its_bound_or_a_copy_verify_refuses_writes_nothing() -> TestResult {
-    let mut seen = Vec::new();
+    let bound = "the snapshot passed its 150 s bound";
     let cases = [
-        (true, "", false, 7, "a shadow run held its lock for 760 s"),
         (
-            false,
-            "124",
-            false,
+            Meets::HeldLock,
             7,
-            "the snapshot passed its 150 s bound",
+            "a shadow run held its lock for 760 s",
+            0,
         ),
-        (
-            false,
-            "137",
-            false,
-            7,
-            "the snapshot passed its 150 s bound",
-        ),
-        (false, "", true, 2, "io_failed"),
+        (Meets::Bound("124"), 7, bound, 0),
+        (Meets::Bound("137"), 7, bound, 0),
+        (Meets::DamagedCopy, 2, "io_failed", 2),
+        (Meets::FailingTar, 2, "", 2),
+        (Meets::NoStore, 4, "no store at", 0),
+        (Meets::NoRuntimeDir, 2, "XDG_RUNTIME_DIR", 0),
+        (Meets::LostSourceBlob, 2, "io_failed", 1),
     ];
-    for (held, timeout, damage, exit, reason) in cases {
-        let backed = backup(held, timeout, damage)?;
+    let mut seen = Vec::new();
+    let mut expected = Vec::new();
+    for (meets, exit, reason, runs) in cases {
+        let backed = backup(meets)?;
         seen.push((
-            backed.exit == Some(exit) && backed.stderr.contains(reason),
+            backed.exit,
+            backed.stderr.contains(reason),
             backed.runs.len(),
+            backed.removals.clone(),
             backed.execs.len(),
             backed.folder.len(),
             std::fs::read_to_string(backed.path("textfile").join(PROM))?,
             names(&backed.path("home/.cache/bellwether")),
         ));
-    }
-    let refused = |runs: usize| {
-        (
+        let removals = match meets {
+            Meets::Bound(_) => vec!["rm --force modelgate-backup".to_owned()],
+            _ => Vec::new(),
+        };
+        expected.push((
+            Some(exit),
             true,
             runs,
+            removals,
             0,
             2 * DAYS.len(),
             OLD_METRICS.to_owned(),
             Vec::<String>::new(),
-        )
-    };
-    assert_eq!(seen, [0, 0, 0, 2].map(refused).to_vec());
+        ));
+    }
+    assert_eq!(seen, expected);
     Ok(())
 }
 
@@ -517,21 +614,29 @@ fn a_snapshot_is_refused_under_a_writers_lease_and_verify_names_a_missing_or_alt
     std::fs::write(at("full/a-file"), "")?;
     let full = code(&snapshot("full")?)?;
     std::fs::create_dir(at("never-run"))?;
-    let absent = [
-        code(&modelgate(&[
+    let from = |store: &str| {
+        modelgate(&[
             "snapshot",
             "--store",
-            &text("never-run"),
+            &text(store),
             "--out",
             &text("none"),
             "--json",
-        ])?)?,
+        ])
+    };
+    std::fs::create_dir(at("lock-only"))?;
+    std::fs::write(at("lock-only/LOCK"), "")?;
+    let mut absent = vec![
+        code(&from("never-run")?)?,
         code(&verify("never-run")?)?,
+        code(&from("lock-only")?)?,
     ];
 
     let taken = snapshot("copy")?;
     assert_eq!(taken.status.code(), Some(0), "{:?}", taken.stderr);
     let envelope = json(&taken.stdout)?;
+    // A restored store before its first live run: a database and no `LOCK`.
+    absent.push(code(&from("copy")?)?);
     let whole = verify("copy")?.status.code();
     let blobs = names(&at("copy").join(BLOB_DIR));
     let victim = at("copy").join(BLOB_DIR).join(&blobs[0]);
@@ -541,6 +646,9 @@ fn a_snapshot_is_refused_under_a_writers_lease_and_verify_names_a_missing_or_alt
     std::fs::remove_file(&victim)?;
     let missing = verify("copy")?;
     std::fs::write(&victim, kept)?;
+    let restored = verify("copy")?.status.code();
+    std::fs::remove_file(at("store").join(BLOB_DIR).join(&blobs[0]))?;
+    let lost = snapshot("lost")?;
     assert_eq!(
         (
             held,
@@ -553,15 +661,12 @@ fn a_snapshot_is_refused_under_a_writers_lease_and_verify_names_a_missing_or_alt
             String::from_utf8_lossy(&altered.stderr).contains(&blobs[0]),
             code(&missing)?,
             String::from_utf8_lossy(&missing.stderr).contains(&blobs[0]),
-            verify("copy")?.status.code(),
+            restored,
         ),
         (
             (Some(7), "lease_held".to_owned(), 0),
             (Some(2), "invalid_argument".to_owned(), 0),
-            [
-                (Some(4), "input_absent".to_owned(), 0),
-                (Some(4), "input_absent".to_owned(), 0)
-            ],
+            vec![(Some(4), "input_absent".to_owned(), 0); 4],
             Some("modelgate.snapshot/1"),
             Some(2),
             Some(0),
@@ -570,6 +675,78 @@ fn a_snapshot_is_refused_under_a_writers_lease_and_verify_names_a_missing_or_alt
             (Some(2), "io_failed".to_owned(), 0),
             true,
             Some(0),
+        )
+    );
+    assert_eq!(
+        (
+            code(&lost)?,
+            String::from_utf8_lossy(&lost.stderr).contains(&blobs[0])
+        ),
+        ((Some(2), "io_failed".to_owned(), 0), true)
+    );
+    Ok(())
+}
+
+/// The backup mounts the store read-only: a store nothing here may write is copied. A table page
+/// damaged after that is refused by `verify` in the copy and by `snapshot` in the source, where
+/// `COUNT(*)` alone reads an index and the same counts.
+#[test]
+fn a_store_without_write_access_is_copied_and_a_damaged_table_page_is_refused() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    let work = TempDir::new()?;
+    let at = |relative: &str| work.path().join(relative);
+    let text = |relative: &str| at(relative).to_string_lossy().into_owned();
+    written_store(&at("store"))?;
+    let snapshot = |out: &str| {
+        modelgate(&[
+            "snapshot",
+            "--store",
+            &text("store"),
+            "--out",
+            &text(out),
+            "--json",
+        ])
+    };
+    let modes = |dir: u32, file: u32| -> TestResult {
+        for (path, mode) in [
+            ("store/LOCK", file),
+            ("store/gate.sqlite", file),
+            ("store/blobs", dir),
+            ("store", dir),
+        ] {
+            std::fs::set_permissions(at(path), std::fs::Permissions::from_mode(mode))?;
+        }
+        Ok(())
+    };
+    modes(0o555, 0o444)?;
+    let read_only = snapshot("copy");
+    modes(0o755, 0o644)?;
+    let read_only = read_only?;
+    assert_eq!(read_only.status.code(), Some(0), "{:?}", read_only.stderr);
+
+    let verify = || modelgate(&["verify", "--store", &text("copy"), "--json"]);
+    let whole = verify()?.status.code();
+    damage_table(&at("copy").join(DB_FILE), "labels")?;
+    let copy = verify()?;
+    damage_table(&at("store").join(DB_FILE), "labels")?;
+    let source = snapshot("second")?;
+    let names_it = |output: &Output| {
+        String::from_utf8_lossy(&output.stderr).contains("is not a whole database")
+    };
+    assert_eq!(
+        (
+            whole,
+            code(&copy)?,
+            names_it(&copy),
+            code(&source)?,
+            names_it(&source)
+        ),
+        (
+            Some(0),
+            (Some(2), "io_failed".to_owned(), 0),
+            true,
+            (Some(2), "io_failed".to_owned(), 0),
+            true
         )
     );
     Ok(())

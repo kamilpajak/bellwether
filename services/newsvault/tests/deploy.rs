@@ -2518,7 +2518,8 @@ fn the_shadow_unit_succeeds_on_exit_7_records_its_result_and_ends_before_its_nex
 }
 
 /// `promtool` runs the cases in CI only and counts none, so a removed case is red here: each
-/// modelgate alert keeps a case that expects it quiet and one that expects it firing.
+/// modelgate alert keeps a case that expects it quiet and one that expects it firing, and the
+/// gate copy's stale alert one that fires with its stamp never written.
 #[test]
 fn each_modelgate_alert_has_a_quiet_and_a_firing_promtool_case() -> TestResult {
     let rules = read("deploy/prometheus/newsvault.rules.yml")?;
@@ -2558,6 +2559,16 @@ fn each_modelgate_alert_has_a_quiet_and_a_firing_promtool_case() -> TestResult {
     .map(|alert| ((*alert).to_owned(), true, true))
     .collect();
     assert_eq!(seen, expected);
+    let never_written = read("deploy/prometheus/newsvault.rules.test.yml")?
+        .split("\n  - interval:")
+        .filter(|group| !group.contains(GATE_BACKUP_FAMILIES[0]))
+        .any(|group| {
+            holds(
+                &trimmed(group),
+                &["alertname: ModelgateBackupStale", "exp_alerts:"],
+            )
+        });
+    assert!(never_written);
     Ok(())
 }
 
@@ -2582,8 +2593,9 @@ fn the_shadow_staleness_threshold_is_two_intervals_plus_one_runs_bound() -> Test
 
 /// Section 8 row MG19. The copy holds the shadow lock only between its start and its wait plus
 /// the snapshot's bound and kill grace, and no shadow firing falls inside that; the wait outlasts
-/// the hard bound of the run fired before it, so only a run by hand makes it give up. Its
-/// staleness threshold is the vault backup's: two daily intervals plus one run's bound.
+/// the hard bound of the run fired before it, so only a run by hand makes it give up. The unit's
+/// own bound is past that hold. Its staleness threshold is the vault backup's: two daily
+/// intervals plus one run's bound.
 #[test]
 fn the_gate_backup_holds_the_shadow_lock_between_two_firings_and_outwaits_a_timer_run() -> TestResult
 {
@@ -2625,6 +2637,8 @@ fn the_gate_backup_holds_the_shadow_lock_between_two_firings_and_outwaits_a_time
             unit_values(&timer, "RandomizedDelaySec").len()
                 + unit_values(&timer, "Persistent").len(),
             threshold(&rules, "ModelgateBackupStale"),
+            bound.first().is_some_and(|bound| *bound > held_until),
+            unit_values(&timer, "WantedBy"),
         ),
         (
             vec![(Some(960), true)],
@@ -2641,6 +2655,8 @@ fn the_gate_backup_holds_the_shadow_lock_between_two_firings_and_outwaits_a_time
             bound
                 .first()
                 .map(|bound| 2 * DAY_S + bound + DEFAULT_TIMEOUT_STOP_S),
+            true,
+            vec!["timers.target".to_owned()],
         )
     );
     Ok(())

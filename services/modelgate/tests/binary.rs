@@ -93,6 +93,29 @@ fn schema_prints_one_json_value_and_one_command_when_asked_for_it() -> TestResul
     Ok(())
 }
 
+/// Section 8 row MG19: what a caller reads before it runs either store command.
+#[test]
+fn schema_states_what_snapshot_and_verify_write_and_exit_with() -> TestResult {
+    let mut seen = Vec::new();
+    for command in ["snapshot", "verify"] {
+        let printed = modelgate(&["schema", command], None)?;
+        let one: Value = serde_json::from_slice(&printed.stdout)?;
+        let exits: Vec<String> = one["exits"]
+            .as_object()
+            .map(|exits| exits.keys().cloned().collect())
+            .unwrap_or_default();
+        seen.push((one["mutates"].as_bool(), exits.join(" ")));
+    }
+    assert_eq!(
+        seen,
+        [
+            (Some(true), "0 2 4 7".to_owned()),
+            (Some(false), "0 2 4".to_owned())
+        ]
+    );
+    Ok(())
+}
+
 #[test]
 fn help_carries_the_fixed_headings_at_every_level() -> TestResult {
     for args in [
