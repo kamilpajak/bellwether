@@ -15,7 +15,7 @@ use sha2::{Digest as _, Sha256};
 use zstd::dict::{DecoderDictionary, EncoderDictionary};
 use zstd::zstd_safe::{self, CCtx, DCtx};
 
-use crate::store::StoreError;
+use crate::BlobError;
 
 /// A sha256 over a payload's bytes, lower-case hex. The field is private and [`BlobStore::put`]
 /// is the only producer, so a value of this type names bytes this process hashed.
@@ -34,8 +34,6 @@ pub const LEVEL: i32 = 9;
 /// What marks a compressed file is its name, never its bytes: a payload a server sent as zstd
 /// starts with zstd's own magic number and is stored raw all the same.
 pub const COMPRESSED_SUFFIX: &str = ".zst";
-/// The largest dictionary `dictionary train` writes: the zstd 1.5.7 CLI's `--maxdict` default.
-pub const DICTIONARY_BYTES: usize = 112_640;
 /// A zstd skippable frame, magic nibble `E`, holding the dictionary's sha256 or nothing.
 const HEADER_MAGIC: u32 = 0x184D_2A5E;
 const HEADER_FIELDS: usize = 8;
@@ -139,7 +137,7 @@ pub struct StoredFile {
 #[derive(Debug)]
 pub struct StreamedBlob {
     pub listed: Listed,
-    pub read: Result<ReadBack, StoreError>,
+    pub read: Result<ReadBack, BlobError>,
 }
 
 /// What `blobs compress` did to one raw file.
@@ -232,7 +230,7 @@ impl BlobStore {
 
     /// Where the bytes land before the rename. Named by the run as well as the digest: a crash
     /// leaves this path behind and [`BlobStore::put`] refuses to reopen it.
-    pub(crate) fn staging_path(&self, run: &str, digest: &BlobDigest) -> PathBuf {
+    pub fn staging_path(&self, run: &str, digest: &BlobDigest) -> PathBuf {
         self.space()
             .join(format!("{STAGING_PREFIX}{run}-{}", digest.hex()))
     }
@@ -249,7 +247,7 @@ impl BlobStore {
     /// form is not written again. Raw until a dictionary is active: `blobs compress` rewrites a
     /// raw file and never a `.zst` one, so a frame written without a dictionary would keep the
     /// weaker ratio for good (architecture.md section 3.9's level table, 2.99 against 7.49).
-    pub fn put(&self, run: &str, payload: &[u8]) -> Result<BlobDigest, StoreError> {
+    pub fn put(&self, run: &str, payload: &[u8]) -> Result<BlobDigest, BlobError> {
         let digest = BlobDigest(const_hex::encode(Sha256::digest(payload)));
         let held = self.listed(&digest);
         if held.raw || held.zstd {
@@ -279,10 +277,10 @@ impl BlobStore {
     /// The payload stored under `digest`, decoded and re-hashed: bytes that hash to another
     /// digest are `BlobAltered`. Read through [`BlobStore::read_listed`], so a raw copy
     /// `blobs compress` removes after the listing is read from the `.zst` one.
-    pub fn read_verified(&self, digest: &BlobDigest) -> Result<Vec<u8>, StoreError> {
+    pub fn read_verified(&self, digest: &BlobDigest) -> Result<Vec<u8>, BlobError> {
         let held = self.listed(digest);
         if !held.raw && !held.zstd {
-            return Err(StoreError::BlobAbsent {
+            return Err(BlobError::BlobAbsent {
                 digest: digest.hex().to_owned(),
             });
         }
@@ -295,7 +293,7 @@ impl BlobStore {
         &self,
         digest: &BlobDigest,
         encoding: Encoding,
-    ) -> Result<ReadBack, StoreError> {
+    ) -> Result<ReadBack, BlobError> {
         let read = self.read_file(digest, encoding)?;
         Ok(ReadBack {
             encoding,
@@ -307,7 +305,7 @@ impl BlobStore {
 
     /// One copy's file, the dictionary a `.zst` one names and what it decodes to; the payload
     /// re-hashed against `digest`.
-    fn read_file(&self, digest: &BlobDigest, encoding: Encoding) -> Result<FileRead, StoreError> {
+    fn read_file(&self, digest: &BlobDigest, encoding: Encoding) -> Result<FileRead, BlobError> {
         let file = fs::read(self.path_in(digest, encoding))?;
         let (dictionary, decoded) = match encoding {
             Encoding::Raw => (None, None),
@@ -318,7 +316,7 @@ impl BlobStore {
         };
         let found = const_hex::encode(Sha256::digest(decoded.as_ref().unwrap_or(&file)));
         if found != digest.hex() {
-            return Err(StoreError::BlobAltered {
+            return Err(BlobError::BlobAltered {
                 digest: digest.hex().to_owned(),
                 found,
             });
@@ -332,7 +330,7 @@ impl BlobStore {
 
     /// The file a backup pack carries for `digest`: the bytes as stored, raw or `.zst`, only
     /// after their payload read back to the digest.
-    pub fn stored_file(&self, digest: &BlobDigest) -> Result<StoredFile, StoreError> {
+    pub fn stored_file(&self, digest: &BlobDigest) -> Result<StoredFile, BlobError> {
         let encoding = self.listed(digest).read_from();
         let read = self.read_file(digest, encoding)?;
         Ok(StoredFile {
@@ -345,8 +343,8 @@ impl BlobStore {
     /// The payload's length, uncompressed, which is what `blobs.bytes` records and §11.1's held
     /// read compares with the body limit; and the check that no index row is written about a
     /// missing file. A `.zst` copy answers from the content size its frame header records.
-    pub fn len_of(&self, digest: &BlobDigest) -> Result<u64, StoreError> {
-        let absent = || StoreError::BlobAbsent {
+    pub fn len_of(&self, digest: &BlobDigest) -> Result<u64, BlobError> {
+        let absent = || BlobError::BlobAbsent {
             digest: digest.hex().to_owned(),
         };
         let held = self.listed(digest);
@@ -364,7 +362,7 @@ impl BlobStore {
             .map_err(|_| absent())?
             .take(u64::try_from(HEADER_FIELDS + SHA256_BYTES + FRAME_HEADER_MAX).unwrap_or(0))
             .read_to_end(&mut prefix)?;
-        let undecodable = |why: String| StoreError::BlobUndecodable {
+        let undecodable = |why: String| BlobError::BlobUndecodable {
             digest: digest.hex().to_owned(),
             why,
         };
@@ -373,7 +371,7 @@ impl BlobStore {
     }
 
     /// The dictionary `put` compresses with from now on, held prepared for the whole process.
-    pub fn activate(&self, dictionary: &Dictionary) -> Result<(), StoreError> {
+    pub fn activate(&self, dictionary: &Dictionary) -> Result<(), BlobError> {
         let prepared = EncoderDictionary::try_copy(dictionary.bytes(), LEVEL)?;
         self.writer.borrow_mut().dictionary = Some((dictionary.hex().to_owned(), prepared));
         Ok(())
@@ -391,11 +389,11 @@ impl BlobStore {
 
     /// A stored dictionary, re-hashed. Absent is `DictionaryAbsent`: no blob is ever read or
     /// written as though a dictionary it names were not needed.
-    pub fn load_dictionary(&self, hex: &str) -> Result<Dictionary, StoreError> {
+    pub fn load_dictionary(&self, hex: &str) -> Result<Dictionary, BlobError> {
         let bytes = match fs::read(self.dictionary_path(hex)) {
             Ok(bytes) => bytes,
             Err(failure) if failure.kind() == ErrorKind::NotFound || !is_digest(hex) => {
-                return Err(StoreError::DictionaryAbsent {
+                return Err(BlobError::DictionaryAbsent {
                     dictionary: hex.to_owned(),
                 })
             }
@@ -403,7 +401,7 @@ impl BlobStore {
         };
         let found = const_hex::encode(Sha256::digest(&bytes));
         if found != hex {
-            return Err(StoreError::DictionaryAltered {
+            return Err(BlobError::DictionaryAltered {
                 dictionary: hex.to_owned(),
                 found,
             });
@@ -415,7 +413,7 @@ impl BlobStore {
     }
 
     /// Stores a dictionary under its own digest, with `put`'s crash order. Nothing deletes one.
-    pub fn store_dictionary(&self, run: &str, bytes: &[u8]) -> Result<Dictionary, StoreError> {
+    pub fn store_dictionary(&self, run: &str, bytes: &[u8]) -> Result<Dictionary, BlobError> {
         let hex = const_hex::encode(Sha256::digest(bytes));
         let path = self.dictionary_path(&hex);
         if path.exists() {
@@ -436,7 +434,7 @@ impl BlobStore {
     /// renamed, fsynced and read back to the same digest, so no step leaves zero readable copies.
     /// A `.zst` copy already there that does not decode to the digest is replaced by the rename;
     /// the raw copy, re-hashed first, is the source.
-    pub fn compress_raw(&self, run: &str, digest: &BlobDigest) -> Result<Rewritten, StoreError> {
+    pub fn compress_raw(&self, run: &str, digest: &BlobDigest) -> Result<Rewritten, BlobError> {
         let original = self.read_copy(digest, Encoding::Raw)?;
         let compressed = self.compressed_path_of(digest);
         let left = compressed
@@ -444,8 +442,7 @@ impl BlobStore {
             .then(|| self.read_copy(digest, Encoding::Zstd));
         let (back, resumed, replaced) = match left {
             Some(Ok(back)) => (back, true, false),
-            Some(Err(StoreError::BlobAltered { .. } | StoreError::BlobUndecodable { .. }))
-            | None => {
+            Some(Err(BlobError::BlobAltered { .. } | BlobError::BlobUndecodable { .. })) | None => {
                 let encoded = self.encode(&original.payload)?;
                 write_durably(&self.staging_path(run, digest), &compressed, &encoded)?;
                 (
@@ -478,7 +475,7 @@ impl BlobStore {
 
     /// Every digest on disk read back through [`BlobStore::read_listed`], one payload in memory at
     /// a time, each dictionary loaded once: the bulk read a re-extraction pass makes (§3.9, P11).
-    pub fn stream(&self) -> impl Iterator<Item = Result<StreamedBlob, StoreError>> + '_ {
+    pub fn stream(&self) -> impl Iterator<Item = Result<StreamedBlob, BlobError>> + '_ {
         self.listing().map(move |listed| {
             listed.map(|listed| StreamedBlob {
                 read: self.read_listed(&listed),
@@ -488,9 +485,9 @@ impl BlobStore {
     }
 
     /// The copy `listed` prefers, or, when that file is gone since the listing, the one left.
-    pub fn read_listed(&self, listed: &Listed) -> Result<ReadBack, StoreError> {
+    pub fn read_listed(&self, listed: &Listed) -> Result<ReadBack, BlobError> {
         match self.read_copy(&listed.digest, listed.read_from()) {
-            Err(StoreError::Io(gone)) if gone.kind() == ErrorKind::NotFound => {
+            Err(BlobError::Io(gone)) if gone.kind() == ErrorKind::NotFound => {
                 let now = self.listed(&listed.digest);
                 self.read_copy(&now.digest, now.read_from())
             }
@@ -499,13 +496,13 @@ impl BlobStore {
     }
 
     /// Staging files a crash or a failed write left beside the tree; `put` never reopens one.
-    pub fn staging_leftovers(&self) -> Result<usize, StoreError> {
+    pub fn staging_leftovers(&self) -> Result<usize, BlobError> {
         Ok(self.staging_files()?.len())
     }
 
     /// Removes every staging file. Only for a holder of the writer's lease, under which no other
-    /// write is in flight: `Committer::remove_staging_leftovers`.
-    pub(crate) fn remove_staging_files(&self) -> Result<usize, StoreError> {
+    /// write is in flight.
+    pub fn remove_staging_files(&self) -> Result<usize, BlobError> {
         let found = self.staging_files()?;
         for path in &found {
             fs::remove_file(path)?;
@@ -518,7 +515,7 @@ impl BlobStore {
         Ok(found.len())
     }
 
-    fn staging_files(&self) -> Result<Vec<PathBuf>, StoreError> {
+    fn staging_files(&self) -> Result<Vec<PathBuf>, BlobError> {
         let mut found = Vec::new();
         for directory in [self.space(), self.root.join(DICTIONARY_DIR)] {
             let entries = match fs::read_dir(&directory) {
@@ -541,7 +538,7 @@ impl BlobStore {
     }
 
     /// `[skippable frame: dictionary sha256 or nothing][one zstd frame recording its size]`.
-    fn encode(&self, payload: &[u8]) -> Result<Vec<u8>, StoreError> {
+    fn encode(&self, payload: &[u8]) -> Result<Vec<u8>, BlobError> {
         let mut writer = self.writer.borrow_mut();
         let Writer {
             context,
@@ -577,8 +574,8 @@ impl BlobStore {
         &self,
         digest: &BlobDigest,
         file: &[u8],
-    ) -> Result<(Option<String>, Vec<u8>), StoreError> {
-        let undecodable = |why: String| StoreError::BlobUndecodable {
+    ) -> Result<(Option<String>, Vec<u8>), BlobError> {
+        let undecodable = |why: String| BlobError::BlobUndecodable {
             digest: digest.hex().to_owned(),
             why,
         };
@@ -626,7 +623,7 @@ impl BlobStore {
         Ok((dictionary, payload))
     }
 
-    fn ensure_decoder(&self, hex: &str) -> Result<(), StoreError> {
+    fn ensure_decoder(&self, hex: &str) -> Result<(), BlobError> {
         if self.reader.borrow().dictionaries.contains_key(hex) {
             return Ok(());
         }
@@ -647,11 +644,11 @@ fn is_digest(hex: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn zstd_failure(code: usize) -> StoreError {
-    StoreError::Io(std::io::Error::other(zstd_safe::get_error_name(code)))
+fn zstd_failure(code: usize) -> BlobError {
+    BlobError::Io(std::io::Error::other(zstd_safe::get_error_name(code)))
 }
 
-fn header(dictionary: Option<&str>) -> Result<Vec<u8>, StoreError> {
+fn header(dictionary: Option<&str>) -> Result<Vec<u8>, BlobError> {
     let named = match dictionary {
         Some(hex) => const_hex::decode(hex).map_err(std::io::Error::other)?,
         None => Vec::new(),
@@ -700,7 +697,7 @@ fn content_size(frame: &[u8]) -> Result<u64, String> {
 
 /// `staging`, fsynced, renamed onto `target`, the directory fsynced: durable before any
 /// transaction names it. A staging file this call created and could not rename is removed.
-fn write_durably(staging: &Path, target: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+fn write_durably(staging: &Path, target: &Path, bytes: &[u8]) -> Result<(), BlobError> {
     if let Some(parent) = target.parent() {
         create_directories_durably(parent)?;
     }
@@ -734,7 +731,7 @@ fn fill_and_rename(
 
 /// `create_dir_all`, then an fsync of the parent of each directory it created: a new name in a
 /// directory is durable only once that directory is fsynced.
-fn create_directories_durably(directory: &Path) -> Result<(), StoreError> {
+fn create_directories_durably(directory: &Path) -> Result<(), BlobError> {
     let mut missing = Vec::new();
     let mut at = Some(directory);
     while let Some(path) = at {
@@ -755,7 +752,7 @@ fn create_directories_durably(directory: &Path) -> Result<(), StoreError> {
 }
 
 /// A rename is durable only once the directory holding the new name is fsynced.
-fn sync_directory(directory: Option<&Path>) -> Result<(), StoreError> {
+fn sync_directory(directory: Option<&Path>) -> Result<(), BlobError> {
     if let Some(directory) = directory {
         File::open(directory)?.sync_all()?;
     }
@@ -772,11 +769,11 @@ enum Level {
 /// `<64 hex>.zst` is a `BlobStray` item, and the walk goes on.
 pub struct Listing {
     pending: Vec<Level>,
-    leaf: std::collections::btree_map::IntoIter<String, Result<Listed, StoreError>>,
+    leaf: std::collections::btree_map::IntoIter<String, Result<Listed, BlobError>>,
 }
 
 /// The subdirectories of `directory`, in reverse name order so `pop` takes the first.
-fn subdirectories(directory: &Path) -> Result<Vec<PathBuf>, StoreError> {
+fn subdirectories(directory: &Path) -> Result<Vec<PathBuf>, BlobError> {
     let mut found = Vec::new();
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -794,8 +791,8 @@ fn subdirectories(directory: &Path) -> Result<Vec<PathBuf>, StoreError> {
     Ok(found)
 }
 
-fn leaf_of(directory: &Path) -> Result<BTreeMap<String, Result<Listed, StoreError>>, StoreError> {
-    let mut found: BTreeMap<String, Result<Listed, StoreError>> = BTreeMap::new();
+fn leaf_of(directory: &Path) -> Result<BTreeMap<String, Result<Listed, BlobError>>, BlobError> {
+    let mut found: BTreeMap<String, Result<Listed, BlobError>> = BTreeMap::new();
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -804,7 +801,7 @@ fn leaf_of(directory: &Path) -> Result<BTreeMap<String, Result<Listed, StoreErro
             None => (name.clone(), Encoding::Raw),
         };
         if !is_digest(&hex) || !entry.file_type()?.is_file() {
-            found.insert(name, Err(StoreError::BlobStray { path: entry.path() }));
+            found.insert(name, Err(BlobError::BlobStray { path: entry.path() }));
             continue;
         }
         let slot = found.entry(hex.clone()).or_insert_with(|| {
@@ -825,7 +822,7 @@ fn leaf_of(directory: &Path) -> Result<BTreeMap<String, Result<Listed, StoreErro
 }
 
 impl Iterator for Listing {
-    type Item = Result<Listed, StoreError>;
+    type Item = Result<Listed, BlobError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -871,7 +868,7 @@ mod tests {
     /// Every file of one `open-web-feed` fixture directory, in name order.
     fn fixtures(directory: &str) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../providers/open-web-feed/tests/fixtures")
+            .join("../providers/open-web-feed/tests/fixtures")
             .join(directory);
         let mut paths: Vec<PathBuf> = fs::read_dir(root)?
             .map(|entry| entry.map(|entry| entry.path()))
@@ -982,7 +979,7 @@ mod tests {
         fs::write(store.path_of(&digest), b"other bytes")?;
         let read = store.read_verified(&digest);
         assert!(
-            matches!(&read, Err(StoreError::BlobAltered { found, .. }) if *found == sha256(b"other bytes")),
+            matches!(&read, Err(BlobError::BlobAltered { found, .. }) if *found == sha256(b"other bytes")),
             "{read:?}"
         );
         Ok(())
@@ -1002,7 +999,7 @@ mod tests {
             .map(|streamed| streamed.map(|streamed| streamed.read))
             .collect::<Result<_, _>>()?;
         assert!(
-            matches!(&read[..], [Err(StoreError::BlobAltered { digest: named, .. })] if *named == digest.hex()),
+            matches!(&read[..], [Err(BlobError::BlobAltered { digest: named, .. })] if *named == digest.hex()),
             "{read:?}"
         );
         Ok(())
@@ -1029,7 +1026,7 @@ mod tests {
         overwrite_compressed(&store.compressed_path_of(&digest), b"other bytes")?;
         let read = store.read_verified(&digest);
         assert!(
-            matches!(&read, Err(StoreError::BlobAltered { found, .. }) if *found == sha256(b"other bytes")),
+            matches!(&read, Err(BlobError::BlobAltered { found, .. }) if *found == sha256(b"other bytes")),
             "{read:?}"
         );
         Ok(())
@@ -1145,7 +1142,7 @@ mod tests {
         fs::remove_file(writer.dictionary_path(dictionary.hex()))?;
         let read = BlobStore::new(temp.path()).read_verified(&digest);
         assert!(
-            matches!(&read, Err(StoreError::DictionaryAbsent { dictionary: named }) if named == dictionary.hex()),
+            matches!(&read, Err(BlobError::DictionaryAbsent { dictionary: named }) if named == dictionary.hex()),
             "{read:?}"
         );
         Ok(())
@@ -1160,7 +1157,7 @@ mod tests {
         fs::write(store.dictionary_path(dictionary.hex()), b"changed")?;
         let loaded = store.load_dictionary(dictionary.hex());
         assert!(
-            matches!(loaded, Err(StoreError::DictionaryAltered { .. })),
+            matches!(loaded, Err(BlobError::DictionaryAltered { .. })),
             "{loaded:?}"
         );
         Ok(())
@@ -1199,7 +1196,7 @@ mod tests {
             ),
         ];
         expected.sort();
-        let pass = || -> Result<Vec<_>, StoreError> {
+        let pass = || -> Result<Vec<_>, BlobError> {
             store
                 .stream()
                 .map(|streamed| {
@@ -1259,7 +1256,7 @@ mod tests {
         fs::remove_file(store.dictionary_path(&dictionary))?;
         let refused = store.compress_raw(RUN, &digest);
         assert!(
-            matches!(&refused, Err(StoreError::DictionaryAbsent { dictionary: named }) if *named == dictionary),
+            matches!(&refused, Err(BlobError::DictionaryAbsent { dictionary: named }) if *named == dictionary),
             "{refused:?}"
         );
         assert_eq!(store.read_copy(&digest, Encoding::Raw)?.payload, PAYLOAD);

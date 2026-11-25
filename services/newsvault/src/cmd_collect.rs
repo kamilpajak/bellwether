@@ -1415,7 +1415,11 @@ fn read_blob(store: &Committer, hex: &str) -> Result<Vec<u8>, Value> {
             format!("no blob is stored under {hex}"),
         ));
     };
-    match store.blobs().read_verified(&digest) {
+    match store
+        .blobs()
+        .read_verified(&digest)
+        .map_err(StoreError::from)
+    {
         Ok(bytes) => Ok(bytes),
         Err(failure @ StoreError::BlobAltered { .. }) => {
             Err(read_failure("blob_altered", failure.to_string()))
@@ -1698,7 +1702,7 @@ fn write_run_file(root: &Path, run_id: &str, bytes: &[u8]) -> Result<(), Collect
     drop(staged);
     std::fs::rename(&staging, runs.join(format!("{run_id}.json")))?;
     // A rename is durable only once the directory holding the new name is fsynced, which is the
-    // pair `blobs.rs` and `publish.rs` already keep.
+    // pair `vault_core::blobs` and `publish.rs` already keep.
     std::fs::File::open(&runs)?.sync_all()?;
     Ok(())
 }

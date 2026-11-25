@@ -90,6 +90,7 @@ use news_provider::{
 use pit::datedness::{Datedness, Published};
 use pit::{ObservationTime, Visibility};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use vault_core::BlobError;
 
 use crate::blobs::{BlobDigest, BlobStore, Dictionary};
 use crate::cmd_robots::ROBOTS_SOURCE;
@@ -676,6 +677,22 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+impl From<BlobError> for StoreError {
+    fn from(failure: BlobError) -> Self {
+        match failure {
+            BlobError::BlobAbsent { digest } => Self::BlobAbsent { digest },
+            BlobError::BlobAltered { digest, found } => Self::BlobAltered { digest, found },
+            BlobError::BlobUndecodable { digest, why } => Self::BlobUndecodable { digest, why },
+            BlobError::BlobStray { path } => Self::BlobStray { path },
+            BlobError::DictionaryAbsent { dictionary } => Self::DictionaryAbsent { dictionary },
+            BlobError::DictionaryAltered { dictionary, found } => {
+                Self::DictionaryAltered { dictionary, found }
+            }
+            BlobError::Io(failure) => Self::Io(failure),
+        }
+    }
 }
 
 /// What the shape of a store at `found` is compared against, as the refusal names it.
@@ -1611,7 +1628,7 @@ impl Committer {
 
     /// Stores a payload under its own digest, before any transaction opens.
     pub fn put_blob(&self, payload: &[u8]) -> Result<BlobDigest, StoreError> {
-        self.blobs.put(self.run.as_str(), payload)
+        Ok(self.blobs.put(self.run.as_str(), payload)?)
     }
 
     /// The blob tree this writer puts into, under its lease.
@@ -1623,7 +1640,7 @@ impl Committer {
     /// Removes every staging file in the blob tree: under this lease no other write is in
     /// flight, so each is what a crash or a failed write left (§3.9, `blobs compress`).
     pub fn remove_staging_leftovers(&self) -> Result<usize, StoreError> {
-        self.blobs.remove_staging_files()
+        Ok(self.blobs.remove_staging_files()?)
     }
 
     /// Files a dictionary already stored by [`BlobStore::store_dictionary`] and makes it the one
@@ -7230,6 +7247,40 @@ mod tests {
             "{behind_the_door:?}"
         );
         Ok(())
+    }
+
+    /// The seam of architecture.md section 12.8 step 3: `Debug` carries the variant's name and
+    /// fields, `Display` the text a caller prints. Mutations 2026-11-25, each red here:
+    /// `BlobError::BlobAltered`'s text changed; `From` mapping `BlobAltered` to `Io`.
+    #[test]
+    fn a_blob_failure_becomes_the_store_failure_of_the_same_name_fields_and_text() {
+        use vault_core::BlobError;
+        let hex = || "ab".repeat(32);
+        let failures = [
+            BlobError::BlobAbsent { digest: hex() },
+            BlobError::BlobAltered {
+                digest: hex(),
+                found: "cd".repeat(32),
+            },
+            BlobError::BlobUndecodable {
+                digest: hex(),
+                why: "the header is cut short".to_owned(),
+            },
+            BlobError::BlobStray {
+                path: "blobs/sha256/00/00/notes.txt".into(),
+            },
+            BlobError::DictionaryAbsent { dictionary: hex() },
+            BlobError::DictionaryAltered {
+                dictionary: hex(),
+                found: "cd".repeat(32),
+            },
+            BlobError::Io(std::io::Error::other("the disk is full")),
+        ];
+        for failure in failures {
+            let (shown, text) = (format!("{failure:?}"), failure.to_string());
+            let kept = StoreError::from(failure);
+            assert_eq!((format!("{kept:?}"), kept.to_string()), (shown, text));
+        }
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! The HTTP allowlist: `docs/design/architecture.md` section 8 row R4's first hole. Only the two
 //! conversation owners may DECLARE an HTTP or model client, asked of `cargo metadata` for the
 //! same reason row G1 asks it there - `workspace.members` is not the member set. Beside it, the
-//! isolation of the model's owner from the news side (row MG10).
+//! isolation of the model's owner from the news side (row MG10) and of the store core from every
+//! member (row FV1).
 //!
 //! What a manifest question cannot see, stated so the row does not claim it: a call site. A member
 //! may still reach a socket through `std::net`, through `std::process::Command` running curl, or
@@ -51,6 +52,9 @@ pub const MODEL_OWNER: &str = "modelgate";
 const NEWS_SIDE: [&str; 2] = ["news-provider", "newsvault"];
 const PROVIDER_DIR: &str = "providers/";
 const ROW_MG10: &str = "docs/design/architecture.md section 8 row MG10";
+/// The crate of store mechanics, which every context may link and which links none of them.
+pub const STORE_CORE: &str = "vault-core";
+const ROW_FV1: &str = "docs/design/architecture.md section 8 row FV1";
 
 /// One declared edge from a workspace member to a client crate.
 #[derive(Debug, PartialEq, Eq)]
@@ -194,6 +198,45 @@ pub fn model_owner_isolation_failure(root_manifest: &Path) -> Option<String> {
     }
 }
 
+/// Row FV1's first clause: `None` when [`STORE_CORE`] is a member and declares no dependency of
+/// any kind on a workspace member. A crate absent from the member set is a failure, never a pass.
+pub fn store_core_isolation_failure(root_manifest: &Path) -> Option<String> {
+    let read = || -> Result<Vec<String>, String> {
+        let json = cargo_metadata(root_manifest)?;
+        let meta: serde_json::Value = serde_json::from_slice(&json)
+            .map_err(|why| format!("`cargo metadata` printed something that is not JSON: {why}"))?;
+        let packages = array_at(&meta, "packages")?;
+        let members = packages
+            .iter()
+            .map(|package| string_at(package, "name"))
+            .collect::<Result<BTreeSet<String>, String>>()?;
+        let core = packages
+            .iter()
+            .find(|package| {
+                package.get("name").and_then(serde_json::Value::as_str) == Some(STORE_CORE)
+            })
+            .ok_or_else(|| format!("no workspace member is named `{STORE_CORE}`"))?;
+        let mut problems = Vec::new();
+        for dependency in array_at(core, "dependencies")? {
+            let name = string_at(dependency, "name")?;
+            if members.contains(&name) {
+                problems.push(format!("    * {STORE_CORE} depends on `{name}`"));
+            }
+        }
+        problems.sort();
+        Ok(problems)
+    };
+    match read() {
+        Err(why) => Some(format!("{why}\n\nThe invariant is {ROW_FV1}.\n")),
+        Ok(problems) if problems.is_empty() => None,
+        Ok(problems) => Some(format!(
+            "The store core is not a leaf ({ROW_FV1}):\n\n{}\n\n`{STORE_CORE}` holds what a store \
+             on disk needs whatever it stores, so every context and `modelgate` can link it.\n",
+            problems.join("\n")
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -232,6 +275,14 @@ mod tests {
     #[test]
     fn the_model_owner_depends_on_nothing_of_the_news_side_and_nothing_depends_on_it() {
         assert_eq!(model_owner_isolation_failure(&root_manifest()), None);
+    }
+
+    /// Row FV1 over this workspace. Mutations 2026-11-25, each red here: `news-provider` added to
+    /// `vault-core/Cargo.toml`; `canon` added to its `[dev-dependencies]`; [`STORE_CORE`] naming
+    /// a crate that does not exist.
+    #[test]
+    fn the_store_core_depends_on_no_workspace_member() {
+        assert_eq!(store_core_isolation_failure(&root_manifest()), None);
     }
 
     /// Mutations 2026-11-23 on this workspace's own manifests, each red in the test above:

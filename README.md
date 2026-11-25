@@ -62,6 +62,7 @@ keep passing.
 | `canon/` | the canonical form every identity is hashed over, with the vectors a second reader in another language must reproduce |
 | `news-provider/` | the provider seam: the coverage ledger's write half, the one HTTP client that talks to a news vendor — a send consumes a permit that only a written attempt row hands out — and the driver that opens and closes every slot |
 | `providers/` | one crate per vendor adapter. Each declares no HTTP dependency at all |
+| `vault-core/` | store mechanics every archive needs, whatever it stores: the content-addressed blob store and its error type. It depends on no other crate of this repository |
 | `services/newsvault/` | the archive: the commit log, the coverage reader and the segment export, in Rust |
 | `services/modelgate/` | the only exit to a language model: `decide` calls behind an attempt ledger, a cost cap and a pinned build, and the record-only `shadow run`. Nothing has been sent to a model |
 | `snapshot-contract/` | the Snapshot contract `vault` hands `derive`: the column list, the manifest, the visibility predicate every reader of stored times calls, the writer and the validator `newsvault cut` runs before it renames a cut into place |

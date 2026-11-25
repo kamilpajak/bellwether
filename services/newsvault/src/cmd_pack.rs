@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
+use vault_core::BlobError;
 
 use crate::blobs::BlobStore;
 use crate::store::{self, StoreError};
@@ -129,6 +130,12 @@ pub enum PackError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+impl From<BlobError> for PackError {
+    fn from(failure: BlobError) -> Self {
+        Self::Store(failure.into())
+    }
 }
 
 impl PackError {

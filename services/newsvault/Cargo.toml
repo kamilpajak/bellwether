@@ -28,6 +28,7 @@ snapshot-contract = { path = "../../snapshot-contract" }
 # Writes the backup's blob packs; no default features, so no `xattr`.
 tar = { version = "0.4.46", default-features = false }
 thiserror = "2.0.21"
+vault-core = { path = "../../vault-core" }
 # The version parquet already pulls in; defaults off so only the dictionary trainer is added.
 zstd = { version = "0.14.3", default-features = false, features = ["zdict_builder"] }
 

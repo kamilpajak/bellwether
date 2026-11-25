@@ -21,6 +21,7 @@ members = [
     "repo-invariants",
     "services/*",
     "snapshot-contract",
+    "vault-core",
 ]
 resolver = "2"
 
