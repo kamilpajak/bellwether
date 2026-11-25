@@ -35,6 +35,7 @@ const A_SESSION_THE_LISTING_OMITS: &str = "2026-11-12";
 const AN_ARCHIVED_SESSION: &str = "2026-11-09";
 const A_WINDOW_SPANNING_ALL_FOUR: &str = "2026-11-09..2026-11-12";
 const NOT_A_WINDOW: &str = "2026-QTR4";
+const NOT_A_LISTING: &[u8] = b"<html>Request Rate Threshold Exceeded</html>";
 const AN_INVERTED_WINDOW: &str = "2026-11-12..2026-11-09";
 /// 16:32:15 New York on 2026-11-10, which is 21:32:15Z: an instant, not a fabricated midnight.
 const APPLE_ACCEPTED_AT: &str = "2026-11-10T21:32:15Z";
@@ -1221,6 +1222,18 @@ fn the_quarter_listing_names_only_the_days_its_form_index_files_name() -> Outcom
     assert!(listing.names(AN_ARCHIVED_SESSION.parse()?));
     assert!(!listing.names(A_SESSION_THE_LISTING_OMITS.parse()?));
     Ok(())
+}
+
+/// The seam of section 12.8 step 6: `sec_edgar::ListingUnparseable` reaches a run as this
+/// adapter's refusal, its reason kept. Before this test the listing read as empty and the reason
+/// dropped were each 0 red of 1,307 (2026-11-25).
+#[test]
+fn a_quarter_listing_that_is_no_directory_listing_is_refused_with_its_reason() {
+    let refused = read_listing(NOT_A_LISTING).err();
+    assert!(
+        matches!(&refused, Some(Refusal::ListingUnparseable(why)) if !why.is_empty()),
+        "{refused:?}"
+    );
 }
 
 /// The urls, pinned: the 30-day incident the planning rules exist for began with a run asking the
