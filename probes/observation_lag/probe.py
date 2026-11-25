@@ -400,12 +400,30 @@ def collect_day(
     }
 
 
+def day_opens(named: dt.date, tz: ZoneInfo) -> dt.datetime:
+    return dt.datetime.combine(named, dt.time.min, tzinfo=tz).astimezone(dt.timezone.utc)
+
+
+def floors_of(days: list[dict], tz: ZoneInfo) -> dict[str, int]:
+    """Per day, the write instant minus the start of the day the file names. A backfilled on-time
+    row is dated no earlier than that start plus the scalar (pit::datedness::archive_observation),
+    so a scalar under this number dates it before the file that carried it was written."""
+    return {
+        day["day"]: int(
+            (
+                write_instant(day, tz)[0] - day_opens(dt.date.fromisoformat(day["day"]), tz)
+            ).total_seconds()
+        )
+        for day in days
+    }
+
+
 def inside_named_day(named: dt.date, written: dt.datetime, tz: ZoneInfo) -> None:
     """The one condition that can falsify the construction from a single read, and the datum the
     registration's own 'what this probe cannot settle' says would void it. A daily index whose
     last write is not the close of the day it names is a file that was rewritten, and then every
     lag taken from it is that rewrite's distance and not a publication lag."""
-    opens = dt.datetime.combine(named, dt.time.min, tzinfo=tz).astimezone(dt.timezone.utc)
+    opens = day_opens(named, tz)
     closes = opens + dt.timedelta(seconds=DAY_S + REWRITE_ALLOWANCE_S)
     if opens <= written <= closes:
         return
@@ -547,9 +565,19 @@ def decide(days: list[dict], tz: ZoneInfo, family: str) -> dict:
     # carried them existed. The registration's own asymmetry argument says this and then names
     # the p90; the p90 is reported beside it and decides nothing.
     seconds = max(lags)
+    floored: dict = {}
+    if family != DEFAULT_FAMILY:
+        floors = floors_of(days, tz)
+        floored = {
+            "max_lag_seconds": seconds,
+            "floor_seconds": floors,
+            "scalar_set_by": "index_day_floor" if max(floors.values()) > seconds else "max_lag",
+        }
+        seconds = max(seconds, *floors.values())
     p90 = quantile(lags, P90)
     band, meaning = band_of(seconds)
     return {
+        **floored,
         "registered": {
             "probe_id": f"{probe_id_prefix(family)}-{dt.datetime.now(dt.timezone.utc):%Y%m%d}",
             "probes": usable,
@@ -633,6 +661,13 @@ def report(days: list[dict], verdict: dict, spent: int, budget: int, family: str
         f"\n  the vendor-movable quantity beside the lag is the off-day row count printed per day "
         "above: those rows are what makes a max days rather than hours"
     )
+    if "scalar_set_by" in verdict:
+        print(
+            f"\n  the registered lag is the larger of the max per-filing lag, "
+            f"{verdict['max_lag_seconds']} s, and the floor per day (write instant minus the "
+            f"start of the named day in {ZONE}), {verdict['floor_seconds']}: set by "
+            f"{verdict['scalar_set_by']}"
+        )
     print(f"\npit::MeasuredLag to pass to EdgarPress::with_observation_lag:\n  {json.dumps(lag)}")
 
 
@@ -654,7 +689,10 @@ def write_result(
                     f"{LASTMOD_NOTE} cross-read against the quarter listing",
                     "form_types": list(FAMILIES[family]),
                     "sample_rule": f"row floor(i x n / {SAMPLE_PER_DAY}) in index file order",
-                    "scalar_definition": "the MAX of the per-filing lags (amendment 2026-11-13)",
+                    "scalar_definition": "the MAX of the per-filing lags (amendment 2026-11-13)"
+                    if family == DEFAULT_FAMILY
+                    else "the larger of the MAX of the per-filing lags and the per-day floor "
+                    "(sections dated 2026-11-25)",
                     "p90_definition": f"index min(floor({P90} x n), n - 1) ascending",
                     "tolerance_seconds": TOLERANCE_S,
                     "rewrite_allowance_seconds": REWRITE_ALLOWANCE_S,
