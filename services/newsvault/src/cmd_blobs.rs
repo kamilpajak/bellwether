@@ -214,7 +214,10 @@ pub fn verify(root: &std::path::Path, limit: usize) -> Result<VerifyReport, Blob
     }
     let (active, recorded) = store::recorded_dictionaries(root)?;
     let log = root.join(COMMIT_LOG);
-    let db = log.exists().then(|| store::read_only(&log)).transpose()?;
+    let db = log
+        .exists()
+        .then(|| vault_core::sqlite::read_only(&log))
+        .transpose()?;
     let mut indexed = db.as_ref().map(|_| Indexed::default());
     let blobs = store::blob_store(root);
     let mut failures = Failures {

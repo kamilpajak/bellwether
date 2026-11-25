@@ -15,6 +15,7 @@ use news_provider::{
 use pit::{Cutoff, ObservationTime, PitError, ValidTime, Visibility};
 use rusqlite::Connection;
 use serde_json::{json, Value};
+use vault_core::sqlite::read_only;
 
 use crate::cmd_collect::{
     crawl_delay_over_interval, write_envelope, CollectRunError, RUN_ID_FORMAT,
@@ -22,9 +23,7 @@ use crate::cmd_collect::{
 use crate::cmd_ledger::{Envelope, RunKind, LEASE_HELD, RUN_ENVELOPE_SCHEMA};
 use crate::cmd_robots::{self, or_abandon, sent, Asked, Fetched, Opened, RobotsError};
 use crate::robots::Robots;
-use crate::store::{
-    read_only, require_current_version, Committer, RobotsAnswer, StoreError, COMMIT_LOG,
-};
+use crate::store::{require_current_version, Committer, RobotsAnswer, StoreError, COMMIT_LOG};
 
 pub const SCHEMA: &str = "newsvault.roster/1";
 pub const SHOW_SCHEMA: &str = "newsvault.roster_show/1";

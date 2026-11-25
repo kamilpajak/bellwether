@@ -77,7 +77,7 @@
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use canon::{Digest, FileDigest};
@@ -90,12 +90,14 @@ use news_provider::{
 use pit::datedness::{Datedness, Published};
 use pit::{ObservationTime, Visibility};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
-use vault_core::BlobError;
+use vault_core::lease::Lease;
+use vault_core::sqlite::{connect, read_only};
+use vault_core::{BlobError, LeaseError};
 
 use crate::blobs::{BlobDigest, BlobStore, Dictionary};
 use crate::cmd_robots::ROBOTS_SOURCE;
 
-const LOCK_FILE: &str = "LOCK";
+pub(crate) const LOCK_FILE: &str = "LOCK";
 /// The layout, in one place because a reader and the writer may not disagree about it.
 pub const COMMIT_LOG: &str = "commit.sqlite3";
 pub const RUNS_DIR: &str = "runs";
@@ -116,20 +118,6 @@ PRAGMA synchronous = FULL;
 ";
 /// SQLite's name for a database that is no file.
 const IN_MEMORY: &str = ":memory:";
-
-/// The one place this crate opens SQLite: §8 row T1. `temp_store = MEMORY` keeps a sort, a
-/// transient index and a materialised subquery out of a temporary file, which a `--read-only`
-/// container has no directory for (SQLITE_IOERR_GETTEMPPATH, 6410, production 2026-11-23).
-pub fn connect(path: &Path, flags: OpenFlags) -> rusqlite::Result<Connection> {
-    let db = Connection::open_with_flags(path, flags)?;
-    db.pragma_update(None, "temp_store", "MEMORY")?;
-    Ok(db)
-}
-
-/// A reader's connection to the commit log at `log`.
-pub fn read_only(log: &Path) -> rusqlite::Result<Connection> {
-    connect(log, OpenFlags::SQLITE_OPEN_READ_ONLY)
-}
 
 /// The `PRAGMA user_version` this build writes, and the only one a read-only reader accepts.
 pub const SCHEMA_VERSION: i32 = 17;
@@ -695,6 +683,15 @@ impl From<BlobError> for StoreError {
     }
 }
 
+impl From<LeaseError> for StoreError {
+    fn from(failure: LeaseError) -> Self {
+        match failure {
+            LeaseError::LeaseHeld(lock) => Self::LeaseHeld(lock),
+            LeaseError::Io(failure) => Self::Io(failure),
+        }
+    }
+}
+
 /// What the shape of a store at `found` is compared against, as the refusal names it.
 fn declared_by(found: usize) -> String {
     match found {
@@ -960,23 +957,6 @@ pub fn refuse_an_unreadable_version(root: &Path) -> Result<(), StoreError> {
     match usize::try_from(found) {
         Ok(older) if older < MIGRATIONS.len() => refuse_another_shape(&db, older),
         _ => Ok(()),
-    }
-}
-
-/// The writer's lease, taken by a reader that must see no commit while it copies; `None` when no
-/// writer ever opened `root`. Opened read-only: `flock` needs no write access, so a read-only
-/// mount serves, and a `Committer` started meanwhile is `LeaseHeld`.
-pub fn hold_lease_to_copy(root: &Path) -> Result<Option<File>, StoreError> {
-    let lock_path = root.join(LOCK_FILE);
-    let lease = match File::open(&lock_path) {
-        Ok(lease) => lease,
-        Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(failure) => return Err(StoreError::Io(failure)),
-    };
-    match lease.try_lock() {
-        Ok(()) => Ok(Some(lease)),
-        Err(TryLockError::WouldBlock) => Err(StoreError::LeaseHeld(lock_path)),
-        Err(TryLockError::Error(failure)) => Err(StoreError::Io(failure)),
     }
 }
 
@@ -1511,7 +1491,7 @@ pub struct Committer {
     /// that commits them with the item and blob rows. `Opened` does not wait: it is durable
     /// before the socket, which is what records a hang.
     pending: Vec<AttemptEvent>,
-    _lease: File,
+    lease: Lease,
 }
 
 impl Committer {
@@ -1519,17 +1499,7 @@ impl Committer {
     pub fn open(root: impl Into<PathBuf>, run: &RunId) -> Result<Self, StoreError> {
         let root = root.into();
         fs::create_dir_all(&root)?;
-        let lock_path = root.join(LOCK_FILE);
-        let lease = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)?;
-        match lease.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Err(StoreError::LeaseHeld(lock_path)),
-            Err(TryLockError::Error(failure)) => return Err(StoreError::Io(failure)),
-        }
+        let lease = Lease::take(&root.join(LOCK_FILE))?;
         let mut db = connect(&root.join(COMMIT_LOG), OpenFlags::default())?;
         db.execute_batch(CONNECTION)?;
         migrate(&mut db)?;
@@ -1543,7 +1513,7 @@ impl Committer {
             run: run.clone(),
             db,
             pending: Vec::new(),
-            _lease: lease,
+            lease,
         })
     }
 
@@ -1640,7 +1610,7 @@ impl Committer {
     /// Removes every staging file in the blob tree: under this lease no other write is in
     /// flight, so each is what a crash or a failed write left (§3.9, `blobs compress`).
     pub fn remove_staging_leftovers(&self) -> Result<usize, StoreError> {
-        Ok(self.blobs.remove_staging_files()?)
+        Ok(self.blobs.remove_staging_files(&self.lease)?)
     }
 
     /// Files a dictionary already stored by [`BlobStore::store_dictionary`] and makes it the one
@@ -7275,6 +7245,21 @@ mod tests {
                 found: "cd".repeat(32),
             },
             BlobError::Io(std::io::Error::other("the disk is full")),
+        ];
+        for failure in failures {
+            let (shown, text) = (format!("{failure:?}"), failure.to_string());
+            let kept = StoreError::from(failure);
+            assert_eq!((format!("{kept:?}"), kept.to_string()), (shown, text));
+        }
+    }
+
+    /// The seam of architecture.md section 12.8 step 4, as the blob seam above.
+    #[test]
+    fn a_lease_failure_becomes_the_store_failure_of_the_same_name_fields_and_text() {
+        use vault_core::LeaseError;
+        let failures = [
+            LeaseError::LeaseHeld("a/store/LOCK".into()),
+            LeaseError::Io(std::io::Error::other("the mount is gone")),
         ];
         for failure in failures {
             let (shown, text) = (format!("{failure:?}"), failure.to_string());

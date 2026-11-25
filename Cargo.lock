@@ -2106,6 +2106,7 @@ name = "vault-core"
 version = "0.1.0"
 dependencies = [
  "const-hex",
+ "rusqlite",
  "sha2",
  "tempfile",
  "thiserror",

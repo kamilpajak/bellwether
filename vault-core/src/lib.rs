@@ -4,6 +4,9 @@
 use std::path::PathBuf;
 
 pub mod blobs;
+pub mod lease;
+pub mod log_copy;
+pub mod sqlite;
 
 /// Every failure [`blobs::BlobStore`] returns.
 #[derive(Debug, thiserror::Error)]
@@ -26,4 +29,48 @@ pub enum BlobError {
     DictionaryAltered { dictionary: String, found: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+/// Every failure of taking a [`lease::Lease`].
+#[derive(Debug, thiserror::Error)]
+pub enum LeaseError {
+    #[error("another run holds the lease on {0}")]
+    LeaseHeld(PathBuf),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+/// Every failure [`log_copy::LogCopy`] returns.
+#[derive(Debug, thiserror::Error)]
+pub enum CopyError {
+    #[error("no commit log at {0}")]
+    StoreAbsent(PathBuf),
+    #[error("the directory {0} the copy is written into does not exist")]
+    OutputDirectoryAbsent(PathBuf),
+    #[error("{0} exists, and a snapshot never replaces a file")]
+    OutputExists(PathBuf),
+    #[error("another run holds the lease on {0}")]
+    LeaseHeld(PathBuf),
+    #[error(
+        "a writer outside the lease kept the commit log locked past {:?}",
+        log_copy::BUSY_WAIT
+    )]
+    SourceBusy,
+    /// The online backup copies pages as they are, so a damaged page reaches the copy and is
+    /// named here, by SQLite's `SQLITE_CORRUPT` or by `quick_check`, instead of being uploaded.
+    #[error("the copy is not a sound database: {0}")]
+    CopyMalformed(String),
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+impl From<LeaseError> for CopyError {
+    fn from(failure: LeaseError) -> Self {
+        match failure {
+            LeaseError::LeaseHeld(lock) => Self::LeaseHeld(lock),
+            LeaseError::Io(failure) => Self::Io(failure),
+        }
+    }
 }

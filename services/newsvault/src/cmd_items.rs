@@ -14,8 +14,9 @@ use pit::Cutoff;
 use rusqlite::Connection;
 use serde_json::{json, Map, Value};
 use snapshot_contract::{visible_at, Rule, StoredTimes, TimeError};
+use vault_core::sqlite::read_only;
 
-use crate::store::{read_only, require_current_version, StoreError, COMMIT_LOG, VALID_DATE};
+use crate::store::{require_current_version, StoreError, COMMIT_LOG, VALID_DATE};
 
 pub const SCHEMA: &str = "newsvault.items/1";
 
