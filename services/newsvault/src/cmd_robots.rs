@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use canon::FileDigest;
 use chrono::{DateTime, Utc};
+use news_provider::robots::{Reading, Robots, RobotsError as ParseError};
 use news_provider::{
     AttemptId, AttemptSlot, Baseline, BudgetError, Clock, Counts, Credentials, Exchange, Exit,
     LedgerError, Outcome, OutcomeKind, Payload, Provenance, Provider, RawResponse, Request,
@@ -23,7 +24,6 @@ use crate::cmd_collect::{
     crawl_delay_over_interval, write_envelope, CollectRunError, Registered, RUN_ID_FORMAT,
 };
 use crate::cmd_ledger::{Envelope, RunKind, RUN_ENVELOPE_SCHEMA};
-use crate::robots::{Reading, Robots, RobotsError as ParseError};
 use crate::store::{Committer, RobotsAnswer, StoreError};
 
 /// Major 3 since 2026-11-17: `parse_verdict` lost `refused_not_utf8` (architecture.md §10).

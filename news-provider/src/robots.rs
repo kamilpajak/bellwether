@@ -233,12 +233,6 @@ impl Robots {
     }
 }
 
-impl open_web_feed::RobotsRules for Robots {
-    fn allows(&self, path: &str) -> bool {
-        Self::allows(self, path)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Key {
     UserAgent,
@@ -449,7 +443,7 @@ mod tests {
     fn provider_fixture(name: &str) -> Result<Vec<u8>, std::io::Error> {
         std::fs::read(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../providers/open-web-feed/tests/fixtures")
+                .join("../providers/open-web-feed/tests/fixtures")
                 .join(name),
         )
     }

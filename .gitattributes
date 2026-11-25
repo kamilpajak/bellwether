@@ -1,4 +1,5 @@
 * text=auto eol=lf
+news-provider/tests/fixtures/** -text
 providers/*/tests/fixtures/** -text
 services/*/tests/fixtures/** -text
 probes/observation_lag/quarter_index.*.json -text
