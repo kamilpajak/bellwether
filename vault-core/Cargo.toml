@@ -1,0 +1,23 @@
+[package]
+name = "vault-core"
+version = "0.1.0"
+edition = "2021"
+description = "What a store on disk needs whatever it stores: the content-addressed blob store and its error type."
+publish = false
+
+# No workspace member and no HTTP client may be named here: docs/design/architecture.md section 8
+# row FV1. Every package below was in Cargo.lock at these versions before this crate (newsvault
+# uses them), so the lock gains this crate's stanza alone.
+[dependencies]
+const-hex = "1.19.3"
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+zstd = { version = "0.14.3", default-features = false }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+# The unit tests train a dictionary; the store itself never does.
+zstd = { version = "0.14.3", default-features = false, features = ["zdict_builder"] }

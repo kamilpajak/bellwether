@@ -10,6 +10,7 @@ use news_provider::RunId;
 use rusqlite::OptionalExtension;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
+use vault_core::BlobError;
 
 use crate::blobs::{BlobStore, Encoding, Listed, ReadBack, DICTIONARY_BYTES, LEVEL};
 use crate::store::{self, Committer, DictionaryRow, StoreError, Trained, COMMIT_LOG};
@@ -47,6 +48,12 @@ pub enum BlobsError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
+}
+
+impl From<BlobError> for BlobsError {
+    fn from(failure: BlobError) -> Self {
+        Self::Store(failure.into())
+    }
 }
 
 impl BlobsError {
@@ -219,6 +226,7 @@ pub fn verify(root: &std::path::Path, limit: usize) -> Result<VerifyReport, Blob
         let streamed = match streamed {
             Ok(streamed) => streamed,
             Err(failure) => {
+                let failure = StoreError::from(failure);
                 let blob = match &failure {
                     StoreError::BlobStray { path } => path.display().to_string(),
                     _ => root.display().to_string(),
@@ -262,7 +270,7 @@ pub fn verify(root: &std::path::Path, limit: usize) -> Result<VerifyReport, Blob
                 }
                 Err(failure) => {
                     sound = false;
-                    failures.add(hex.clone(), &failure);
+                    failures.add(hex.clone(), &failure.into());
                 }
             }
         }
@@ -399,8 +407,8 @@ pub fn compress(ask: &CompressAsk) -> Result<CompressReport, BlobsError> {
                     .map(|stored| stored.len())
                     .unwrap_or_default();
             }
-            Ok(_) | Err(StoreError::BlobStray { .. }) => {}
-            Err(failure) => failures.add(ask.store.display().to_string(), &failure),
+            Ok(_) | Err(BlobError::BlobStray { .. }) => {}
+            Err(failure) => failures.add(ask.store.display().to_string(), &failure.into()),
         }
     }
     report.failed = failures.count;
@@ -417,9 +425,9 @@ fn rewrite(
     for listed in blobs.listing() {
         let listed = match listed {
             Ok(listed) => listed,
-            Err(StoreError::BlobStray { .. }) => continue,
+            Err(BlobError::BlobStray { .. }) => continue,
             Err(failure) => {
-                failures.add(report.store.clone(), &failure);
+                failures.add(report.store.clone(), &failure.into());
                 continue;
             }
         };
@@ -436,7 +444,7 @@ fn rewrite(
                 report.compressed_stored_bytes += rewritten.stored_bytes;
                 report.changed = true;
             }
-            Err(failure) => failures.add(listed.digest.hex().to_owned(), &failure),
+            Err(failure) => failures.add(listed.digest.hex().to_owned(), &failure.into()),
         }
     }
     report.failed = failures.count;
@@ -511,7 +519,7 @@ pub fn train(ask: &TrainAsk) -> Result<TrainReport, BlobsError> {
         }
         let listed = match listed {
             Ok(listed) => listed,
-            Err(StoreError::BlobStray { .. }) => continue,
+            Err(BlobError::BlobStray { .. }) => continue,
             Err(failure) => return Err(failure.into()),
         };
         if sizes.len() < ask.samples {
