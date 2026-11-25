@@ -319,6 +319,22 @@ mod tests {
         }
     }
 
+    /// Mutation 2026-11-25, an address needing a local part OR a dotted domain: red here, and
+    /// 0 red of 637 before this test.
+    #[test]
+    fn a_contact_is_addressed_by_a_token_with_a_local_part_and_a_dotted_domain() {
+        assert!(contact_is_addressed("Example Research desk@example.test"));
+        for unaddressed in [
+            "",
+            "collector/0.1",
+            "desk@example",
+            "@example.test",
+            "a @ b.c",
+        ] {
+            assert!(!contact_is_addressed(unaddressed), "{unaddressed}");
+        }
+    }
+
     /// Mutation 2026-11-25, `company.` or `master.` names counted beside `form.`: red here, and
     /// 0 red of 635 before this test, whose fixture names no day `form.` does not name too.
     #[test]
