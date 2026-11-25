@@ -1582,7 +1582,7 @@ fn a_staged_policy_copy_a_crash_left_behind_is_refused_rather_than_overwritten()
 
 /// Section 12.2: each command that builds a `Wire` reads `--pace-root`, on a dry run too. A
 /// relative one, an absent one, and one beside a store whose own `pace/` still holds a file are
-/// each refused by code on stderr, stdout empty, before any other input is read.
+/// each refused on stderr, stdout empty, by a code and exit the schema lists.
 #[test]
 fn each_command_that_sends_refuses_a_pace_root_it_cannot_use_by_its_code() -> TestResult {
     let (root, shared) = (TempDir::new()?, TempDir::new()?);
@@ -1625,7 +1625,17 @@ fn each_command_that_sends_refuses_a_pace_root_it_cannot_use_by_its_code() -> Te
             json!([A_HOLD_FILE]),
         ),
     ];
-    assert_eq!(refusals, [each.clone(), each.clone(), each].concat());
+    let schema: Value = serde_json::from_slice(&binary(&["schema", "--format", "json"])?.stdout)?;
+    let listed = |refusal: &(i32, bool, Option<String>, Value)| {
+        let code = json!({"code": refusal.2, "exit": refusal.0, "retryable": false});
+        schema["error_codes"]
+            .as_array()
+            .is_some_and(|codes| codes.contains(&code))
+    };
+    assert_eq!(
+        (each.iter().all(listed), refusals),
+        (true, [each.clone(), each.clone(), each.clone()].concat())
+    );
     Ok(())
 }
 
