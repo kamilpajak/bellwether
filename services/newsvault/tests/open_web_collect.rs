@@ -2190,11 +2190,13 @@ fn a_dry_run_refuses_an_unverified_host_too() -> TestResult {
 /// object on stderr; stdout stays empty. The unverified one suggests the refresh as an argv array;
 /// a changed pin suggests nothing, because a refresh records the same change again. Mutations
 /// 2026-11-15, the refusal written as plain `error:` text / the changed pin suggesting the
-/// refresh: each red.
+/// refresh: each red. The suggested refresh names the pace root the collect was given
+/// (section 12.2); without it the refresh would write `pace/` into the store.
 #[test]
 fn a_robots_refusal_names_the_refresh_command_as_an_argv_suggestion() -> TestResult {
     let unverified = TempDir::new()?;
     let refused = TempDir::new()?;
+    let shared = TempDir::new()?;
     seed::refresh(
         refused.path(),
         &hosts(),
@@ -2219,6 +2221,8 @@ fn a_robots_refusal_names_the_refresh_command_as_an_argv_suggestion() -> TestRes
             .arg(hosts())
             .arg("--rules")
             .arg(&rules)
+            .args((store == unverified.path()).then_some("--pace-root"))
+            .args((store == unverified.path()).then_some(shared.path()))
             .env("BELLWETHER_FEED_CONTACT", CONTACT)
             .stdin(Stdio::null())
             .output()?;
@@ -2236,6 +2240,8 @@ fn a_robots_refusal_names_the_refresh_command_as_an_argv_suggestion() -> TestRes
             &shown(&rules),
             "--store",
             &shown(store),
+            "--pace-root",
+            &shown(shared.path()),
         ]
         .map(Value::from);
         let suggested = if store == unverified.path() {

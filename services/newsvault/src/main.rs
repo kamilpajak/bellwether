@@ -449,6 +449,14 @@ impl Pace {
         };
         std::process::exit(i32::from(refused.exit()));
     }
+
+    /// The option as given, for an argv that suggests another sending command.
+    fn argv(&self) -> Vec<String> {
+        self.pace_root
+            .iter()
+            .flat_map(|root| ["--pace-root".to_owned(), root.display().to_string()])
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -710,7 +718,7 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                     let Some(facts) = robots_refusal(&refused) else {
                         return Err(refused.into());
                     };
-                    emit_robots_refusal(&refused, &facts, &ask, format)?;
+                    emit_robots_refusal(&refused, &facts, &ask, &pace, format)?;
                     return Ok(Verdict::No(facts.exit));
                 }
             };
@@ -1066,22 +1074,24 @@ fn emit_robots_refusal(
     refused: &CollectRunError,
     facts: &RobotsRefusal,
     ask: &cmd_collect::Ask,
+    pace: &Pace,
     format: Format,
 ) -> anyhow::Result<()> {
     let shown = |path: &std::path::Path| path.display().to_string();
-    let refresh = serde_json::json!([
-        "newsvault",
-        "robots",
-        "refresh",
-        "--source",
-        open_web_feed::SOURCE,
-        "--hosts",
+    let mut refresh = vec![
+        "newsvault".to_owned(),
+        "robots".to_owned(),
+        "refresh".to_owned(),
+        "--source".to_owned(),
+        open_web_feed::SOURCE.to_owned(),
+        "--hosts".to_owned(),
         ask.hosts.as_deref().map(shown).unwrap_or_default(),
-        "--rules",
+        "--rules".to_owned(),
         shown(&ask.rules),
-        "--store",
+        "--store".to_owned(),
         shown(&ask.store),
-    ]);
+    ];
+    refresh.extend(pace.argv());
     let object = serde_json::json!({
         "schema": "newsvault.error/1",
         "code": facts.code,
