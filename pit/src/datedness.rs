@@ -414,11 +414,7 @@ mod tests {
             tz: NOT_A_ZONE,
         };
         let unplaced = [
-            archived(
-                accepted(ACCEPTED_ON_THE_INDEX_DAY),
-                Some(INDEX_DAY),
-                NOT_A_ZONE,
-            ),
+            archived(accepted(ACCEPTED_ON_THE_INDEX_DAY), None, NOT_A_ZONE),
             archived(elsewhere, Some(INDEX_DAY), NEW_YORK),
             archived(Published::Unknown, Some(INDEX_DAY), NEW_YORK),
         ];
