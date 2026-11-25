@@ -282,3 +282,57 @@ numbers cannot tell a final index file from one rewritten before the probe read 
 
 - The registration text cites `edgar-press`'s `BODY_LIMIT` comment for the 5,429 filing rows of 2026-11-10 and their construction. That comment now states the measured index sizes instead; the row counts and bytes are in the run section above and in `docs/design/architecture.md` §10.
 - "About 600 KB each" above came from the fixture's 110-byte rows. The indexes read in the run were 1,057,192 B (2026-11-10) and 1,520,327 B (2026-11-12).
+
+## 2026-11-25, the second run
+
+- The run "What this probe cannot settle" schedules: the same two days, no sooner than 7 days after the first. Made 2026-11-25T20:48:52Z, 12 days 3 h 15 min after the first (2026-11-13T17:33:51Z, both `fetched_at`), with `probe.py` as committed (last change `5bc2f99`, 2026-11-15, a comment):
+
+```
+SEC_CONTACT='<name and address>' python3 -I probes/observation_lag/probe.py \
+  --days 2026-11-10 2026-11-12
+```
+
+- 27 requests of the registered 30, exit 0.
+- Which file is which:
+
+| file | run |
+|---|---|
+| `observation_lag_results.json` | the first, 2026-11-13 |
+| `observation_lag_results.20261125.json` | the second, 2026-11-25; the script wrote it under the first's name in another directory and it is committed under this one |
+| `quarter_index.2026Q4.json` | the quarter listing as the first run received it, 145 items |
+| not committed | the quarter listing as the second run received it, 185 items |
+
+- **The answer, for these two days: neither daily index was rewritten between the two reads.**
+
+| quantity, per index file | `form.20261110.idx` | `form.20261112.idx` | first run against second |
+|---|---|---|---|
+| write instant, `Last-Modified` header | 2026-11-11T03:01:42Z | 2026-11-13T03:02:22Z | equal |
+| write instant, quarter listing | `11/10/2026 10:01:42 PM` | `11/12/2026 10:02:22 PM` | equal; 0 s from the header on both reads |
+| bytes downloaded | 1,057,192 | 1,520,327 | equal |
+| rows of all forms | 5,429 | 7,805 | equal |
+| rows of form `8-K` | 384 | 549 | equal |
+| `8-K` rows whose `Date Filed` is not the index's own day | 0 | 0 | equal |
+| accessions sampled | 12 | 12 | the same 12, in the same order |
+
+- What moved is the sample, not the files: the two documents that answered `503` on 2026-11-13 answered.
+
+| quantity | first run, 2026-11-13 | second run, 2026-11-25 | construction |
+|---|---|---|---|
+| registered `seconds` | 94,922 s | **94,922 s = 26.37 h** | the MAX of the per-filing lags; accession `0001654954-26-009633` on both reads |
+| band | 24 h – 7 d | 24 h – 7 d | the band table above, read off the scalar |
+| `probe_id` | `edgar_index_write-20261113` | `edgar_index_write-20261125` | the UTC date of the run |
+| `probes` / `leaks` | 22 / 0 | 24 / 0 | sampled documents with an acceptance field; 0 because the scalar is the max |
+| the two documents `503` on the first run | unusable | 53,787 s (`0001104659-26-124772`, 2026-11-10) and 21,611 s (`0002065708-26-000008`, 2026-11-12) | write instant minus acceptance |
+| p90, which decides nothing | 57,561 s | 57,561 s | index `min(floor(0.9 × n), n − 1)` ascending: index 19 of 22 lags, index 21 of 24 |
+| median | 42,085 s | 42,085 s | index `floor(0.5 × n)` ascending |
+| per day, 2026-11-10 | n=11, median 21,432 s, max 94,922 s | n=12, median 47,870 s, p90 90,096 s, max 94,922 s | one write instant |
+| per day, 2026-11-12 | n=11, median 42,085 s, max 57,561 s | n=12, median 42,085 s, p90 54,124 s, max 57,561 s | one write instant |
+
+- Each of the 22 lags of the first run is the same number of seconds in the second.
+- What this settles: `form.20261110.idx` and `form.20261112.idx` carried on 2026-11-25 the write instant they carried on 2026-11-13, so the 94,922 s is not the distance to a rewrite made in those 12 days.
+- What it does not settle:
+  - any other index day, and any quarter but 2026 Q4;
+  - a rewrite later than 2026-11-25, 15 and 13 days after the days the files name;
+  - a rewrite before the first read on 2026-11-13 that the vendor's stated instant does not show;
+  - byte equality of the two reads: neither index body was kept, so it is inferred from equal bytes, row counts, write instants and sampled accessions.
+- `news-provider/policy/observation-lag.json` still names `edgar_index_write-20261113` with 22 probes. It is not edited here: it is hashed whole into the news run envelope, and the scalar it carries did not move.
