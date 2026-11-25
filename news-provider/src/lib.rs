@@ -41,10 +41,12 @@ pub mod budget;
 pub mod clock;
 pub mod collect;
 pub mod conformance;
+pub mod contact;
 pub mod lag_policy;
 pub mod ledger;
 pub mod provider;
 pub mod request;
+pub mod robots;
 pub mod wire;
 
 pub use budget::{host_of, BudgetError, BudgetScope, Hold, HostKey, Pace, RequestBudget, Reserved};

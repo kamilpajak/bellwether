@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use canon::FileDigest;
 use chrono::{DateTime, SecondsFormat, Utc};
+use news_provider::robots::Robots;
 use news_provider::{
     AttemptSlot, Baseline, Clock, Counts, Credentials, Exchange, Exit, Headers, LedgerError,
     Outcome, OutcomeKind, Payload, Provenance, RawResponse, Request, RequestPhase, RunId, SourceId,
@@ -22,7 +23,6 @@ use crate::cmd_collect::{
 };
 use crate::cmd_ledger::{Envelope, RunKind, LEASE_HELD, RUN_ENVELOPE_SCHEMA};
 use crate::cmd_robots::{self, or_abandon, sent, Asked, Fetched, Opened, RobotsError};
-use crate::robots::Robots;
 use crate::store::{require_current_version, Committer, RobotsAnswer, StoreError, COMMIT_LOG};
 
 pub const SCHEMA: &str = "newsvault.roster/1";

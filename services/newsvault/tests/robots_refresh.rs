@@ -1139,7 +1139,7 @@ fn every_option_the_robots_refresh_parser_takes_is_in_the_machine_readable_schem
 fn robots_fixture(name: &str) -> Result<Vec<u8>, std::io::Error> {
     std::fs::read(
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/robots")
+            .join("../../news-provider/tests/fixtures/robots")
             .join(name),
     )
 }

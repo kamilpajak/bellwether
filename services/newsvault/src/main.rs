@@ -10,6 +10,7 @@ use std::process::ExitCode;
 use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 
+use news_provider::contact::{self, ContactError};
 use news_provider::{Clock, RunId, SystemClock};
 use newsvault::cmd_blobs::{self, BlobsError};
 use newsvault::cmd_collect::{self, CollectRunError};
@@ -20,7 +21,6 @@ use newsvault::cmd_pack;
 use newsvault::cmd_robots::{self, RobotsError};
 use newsvault::cmd_roster::{self, RosterError};
 use newsvault::cmd_snapshot::{self, SnapshotError};
-use newsvault::contact::{self, ContactError};
 use newsvault::lake::{Day, LakeError, LakeReader};
 use newsvault::publish::{publish_run, Fsync, PublishError};
 use newsvault::store::{Committer, StoreError};

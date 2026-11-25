@@ -16,6 +16,7 @@ use edgar_press::EdgarPress;
 use news_provider::lag_policy::{LagPolicy, LagPolicyError};
 use news_provider::provider::{Cadence, Calendar, CalendarError, Listing, PlanRefusal, Provenance};
 use news_provider::request::RequestPhase;
+use news_provider::robots::{Robots, RobotsError};
 use news_provider::{
     stamp_of, Archive, ArchiveError, AttemptReceipt, AttemptRow, Clock, Closing, CollectError,
     Collected, CollectedItem, Committed, Credentials, DeferReason, Deferred, Exchange, Exit,
@@ -30,7 +31,6 @@ use pit::{MeasuredLag, ObservationTime};
 use serde_json::{json, Value};
 
 use crate::cmd_ledger::{Envelope, RunBusy, RunHold, RunKind, LEASE_HELD, RUN_ENVELOPE_SCHEMA};
-use crate::robots::{Robots, RobotsError};
 use crate::schedule::{self, ScheduleRefusal, SlotAt};
 use crate::store::{
     Committer, IndexPayload, ItemRow, StoreError, WalkRecord, POLICY_DIR, RUNS_DIR,
@@ -439,6 +439,23 @@ pub struct WalkedPolls {
     pub ranges: BTreeMap<String, WalkPlan>,
 }
 
+/// `Robots` is `news-provider`'s and `RobotsRules` is `open-web-feed`'s, so the impl needs a type
+/// of this crate; inside `open-web-feed/src` its bytes would move `extract_version`
+/// (architecture.md section 12.8, step 5 as built).
+struct HandedRules(Robots);
+
+impl std::fmt::Debug for HandedRules {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl open_web_feed::RobotsRules for HandedRules {
+    fn allows(&self, path: &str) -> bool {
+        self.0.allows(path)
+    }
+}
+
 /// One admitted hosts row (section 11.2): its pin, its pinned robots body as read when the
 /// provider was opened, and the paths the row asks of its host.
 #[derive(Debug, Clone)]
@@ -770,7 +787,9 @@ fn handed_robots(admitted: &[AdmittedRobots]) -> BTreeMap<String, HostRobots> {
         .filter_map(|row| {
             let handed = match &row.robots {
                 PinnedRobots::NoRobots => HostRobots::Absent,
-                PinnedRobots::Read(robots) => HostRobots::Rules(Arc::new(robots.clone())),
+                PinnedRobots::Read(robots) => {
+                    HostRobots::Rules(Arc::new(HandedRules(robots.clone())))
+                }
                 PinnedRobots::BlobMissing
                 | PinnedRobots::Altered(_)
                 | PinnedRobots::Unreadable(_) => return None,
