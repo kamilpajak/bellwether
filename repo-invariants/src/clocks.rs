@@ -180,7 +180,8 @@ mod tests {
             vec![
                 "news-provider",
                 "providers/edgar-press",
-                "providers/open-web-feed"
+                "providers/open-web-feed",
+                "providers/sec-edgar"
             ]
         );
     }

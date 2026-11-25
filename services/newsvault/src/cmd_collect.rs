@@ -344,7 +344,7 @@ impl Registered {
     #[must_use]
     pub const fn credential(self) -> &'static str {
         match self {
-            Self::EdgarPress => edgar_press::CONTACT_CREDENTIAL,
+            Self::EdgarPress => sec_edgar::CONTACT_CREDENTIAL,
             Self::OpenWebWires => open_web_feed::CONTACT_CREDENTIAL,
         }
     }

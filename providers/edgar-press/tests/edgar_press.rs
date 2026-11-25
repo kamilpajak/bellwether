@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use canon::digest::{item_id, story_id, ItemFields};
 use canon::FileDigest;
 use chrono::{DateTime, Utc};
-use edgar_press::{read_listing, EdgarPress, Refusal, CONTACT_CREDENTIAL, SOURCE};
+use edgar_press::{read_listing, EdgarPress, Refusal, SOURCE};
 use news_provider::conformance::{breaches, RecordingSink, Subject};
 use news_provider::provider::{
     precision_of, stamp_of, BodyState, Cadence, Calendar, CollectedItem, Extracted, Listing,
@@ -21,6 +21,7 @@ use news_provider::{
 };
 use pit::datedness::Published;
 use pit::{MeasuredLag, ObservationTime};
+use sec_edgar::CONTACT_CREDENTIAL;
 
 const CONTACT: &str = "Bellwether Research contact@bellwether.test";
 const NO_CONTACT: &str = "bellwether-collector/0.1";
@@ -1227,7 +1228,7 @@ fn the_quarter_listing_names_only_the_days_its_form_index_files_name() -> Outcom
 #[test]
 fn the_urls_name_the_quarter_listing_and_the_days_own_form_index() -> Outcome {
     assert_eq!(
-        EdgarPress::listing_url(A_LISTED_SESSION.parse()?),
+        sec_edgar::listing_url(A_LISTED_SESSION.parse()?),
         "https://www.sec.gov/Archives/edgar/daily-index/2026/QTR4/index.json"
     );
     assert_eq!(

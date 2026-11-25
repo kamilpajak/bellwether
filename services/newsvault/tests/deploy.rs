@@ -2474,7 +2474,7 @@ fn the_templates_textfile_placeholder_is_refused_by_every_script_before_it_runs(
 #[test]
 fn the_roster_bound_is_each_requests_patience_plus_two_minutes_and_exit_8_fails() -> TestResult {
     let unit = read("deploy/systemd/newsvault-roster.service")?;
-    let patience = TimeDelta::from_std(edgar_press::sec_transport().timeouts.global)?;
+    let patience = TimeDelta::from_std(newsvault::cmd_roster::transport().timeouts.global)?;
     let args = container_args(&unit);
     assert_eq!(
         (

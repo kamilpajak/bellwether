@@ -12,100 +12,33 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use canon::{Digest, FileDigest};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeDelta, TimeZone, Utc};
-use chrono_tz::Tz;
-use news_provider::budget::RequestBudget;
+use chrono::NaiveDate;
 use news_provider::provider::{
     listed_sessions, precision_of, probed_lag, Cadence, Calendar, CollectedItem, DecidedBy,
     Extracted, ExtractedBody, Listing, NotPlanned, Plan, PlanRefusal, Provenance, Provider,
     RawBlob, UnusableReason, UnusableRow, ValidPrecision, ValidSource,
 };
-use news_provider::request::{days_of, HeaderValue, Request, RequestPhase};
-use news_provider::wire::{RawResponse, Timeouts, TransportError, TransportKind, TransportProfile};
-use news_provider::{CredentialRef, SourceId, TargetWindow, Verdict};
-use pit::datedness::{end_of_day, Published};
-use pit::{MeasuredLag, ObservationTime, PitError, ValidTime, Visibility};
+use news_provider::request::{days_of, Request, RequestPhase};
+use news_provider::wire::{RawResponse, TransportError, TransportProfile};
+use news_provider::{SourceId, TargetWindow, Verdict};
+use pit::datedness::{archive_observation, Published};
+use pit::{MeasuredLag, ObservationTime, PitError, ValidTime};
+use sec_edgar::{
+    acceptance_instant, archive_url, body_of_200, index_rows, index_url, listed_days, Caller,
+    IndexRow, ListingUnparseable, CONTACT_CREDENTIAL, DATE_FILED, INDEX_DATE,
+};
 
 /// The adapter's own name, which is the only thing that tells ours from a purchased one besides
 /// the [`Provenance`] it returns.
 pub const SOURCE: &str = "edgar_press";
-/// The credential a run must hold. SEC answers a User-Agent with no contact address with 403 and
-/// one with a contact with 200, re-measured 2026-11-12, and the address may never reach a plan or
-/// a ledger row (architecture.md section 3.2's `filter_params` row), so it travels by NAME.
-pub const CONTACT_CREDENTIAL: &str = "sec_contact";
-
-const ARCHIVES: &str = "https://www.sec.gov/Archives/";
-const DAILY_INDEX: &str = "edgar/daily-index";
-/// The vendor's own column headings in `form.<date>.idx`. The file is FIXED WIDTH and its header
-/// line is where the columns start: a whitespace split cannot read it, because `SC 13D` and every
-/// multi-word company name hold spaces.
-const COLUMNS: [&str; 5] = [
-    "Form Type",
-    "Company Name",
-    "CIK",
-    "Date Filed",
-    "File Name",
-];
-/// The separator line the rows start after. Pure dashes, 141 of them on the real file.
-const DASH: char = '-';
-/// Where the day-precision fallback's value comes from: the one index column carrying a date and
-/// no hour. Taken from [`COLUMNS`] so the heading has one home.
-const DATE_FILED: &str = COLUMNS[3];
-/// `Date Filed` and the index file name both read `YYYYMMDD`, measured on the real file 2026-11-13.
-const INDEX_DATE: &str = "%Y%m%d";
 /// The one zone name this binary knows, because `Published::On` carries a `&'static str` and a
 /// zone read out of a file is not static. EDGAR files in Eastern time.
 const KNOWN_ZONES: [&str; 1] = ["America/New_York"];
 const RULES_SCHEMA: &str = "edgar-press.rules/1";
 const HEADER_END: &str = "</SEC-HEADER>";
-const ACCESS_DENIED: &str = "<Code>AccessDenied</Code>";
-const REQUEST_TIMEOUT: u16 = 408;
-const TOO_MANY_REQUESTS: u16 = 429;
-const SERVER_ERRORS: std::ops::RangeInclusive<u16> = 500..=599;
-const OK: u16 = 200;
-const FORBIDDEN: u16 = 403;
-
-/// Every timeout, as one value. An ASSUMPTION taken by default and not a measurement: nothing in
-/// this tree has timed an EDGAR response, so there is no quantile to quote. `transport()` below is
-/// the one place to change it.
-const VENDOR_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 /// Full daily indexes read 1,057,192 B and 1,520,327 B (2026-11-10, 2026-11-12; read as received
 /// by `probes/observation_lag/probe.py` on 2026-11-13). Construction: architecture.md §10.
 pub const BODY_LIMIT: u64 = 8 * 1_024 * 1_024;
-/// 1 s / 10 requests. SEC's fair-access ceiling is 10 requests a second per IP as the
-/// predecessor's vendor-quota table states it (read 2026-11-13 from
-/// `apps/alphalens-pipeline/CLAUDE.md`); nothing here has measured it, and this paces TO the
-/// ceiling with no margin under it, which row R19 names as the open question it is.
-const SEC_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// SEC's transport, one home for every caller of `www.sec.gov`: this provider and `newsvault
-/// roster fetch` (architecture.md section 10, the roster). The pace's per-host bucket is keyed on
-/// the host and its per-IP bucket on the `SourceId` a `Wire` is built with, so a second SEC caller
-/// shares both only when it passes [`SOURCE`].
-#[must_use]
-pub fn sec_transport() -> TransportProfile {
-    TransportProfile {
-        user_agent: HeaderValue::FromCredential(CredentialRef::new(CONTACT_CREDENTIAL)),
-        timeouts: Timeouts {
-            global: VENDOR_PATIENCE,
-            per_call: VENDOR_PATIENCE,
-            resolve: VENDOR_PATIENCE,
-            connect: VENDOR_PATIENCE,
-            send_request: VENDOR_PATIENCE,
-            await_100: VENDOR_PATIENCE,
-            send_body: VENDOR_PATIENCE,
-            recv_response: VENDOR_PATIENCE,
-            recv_body: VENDOR_PATIENCE,
-        },
-        body_limit: BODY_LIMIT,
-        // Per IP, because the contact above does not scope the quota; per host as well, keyed
-        // on `www.sec.gov` and not on this source, so a second SEC source shares the bucket.
-        budget: RequestBudget {
-            min_interval: Some(SEC_MIN_INTERVAL),
-            per_host: Some(SEC_MIN_INTERVAL),
-        },
-    }
-}
 
 /// Why no request may be made at all. Every one of these is raised BEFORE the first request, so a
 /// broken input is never a vendor event in the coverage ledger.
@@ -214,28 +147,13 @@ impl EdgarPress {
         self
     }
 
-    /// The quarter listing's url for a day, which is what `plan` is asked to consult.
-    #[must_use]
-    pub fn listing_url(day: NaiveDate) -> String {
-        format!(
-            "{ARCHIVES}{DAILY_INDEX}/{}/QTR{}/index.json",
-            day.format("%Y"),
-            quarter(day)
-        )
-    }
-
     fn index_request(&self, day: NaiveDate, provenance: Provenance) -> Request {
         Request {
             source: SourceId::new(SOURCE),
             target_window: TargetWindow::new(day.to_string()),
             phase: RequestPhase::Index,
             provenance,
-            url: format!(
-                "{ARCHIVES}{DAILY_INDEX}/{}/QTR{}/form.{}.idx",
-                day.format("%Y"),
-                quarter(day),
-                day.format(INDEX_DATE)
-            ),
+            url: index_url(day),
             headers: Vec::new(),
             params: Vec::new(),
             universe_version: self.roster.version.clone(),
@@ -254,7 +172,7 @@ impl EdgarPress {
             target_window: request.target_window.clone(),
             phase: RequestPhase::Document,
             provenance: request.provenance,
-            url: format!("{ARCHIVES}{}", row.path),
+            url: archive_url(&row.path),
             headers: Vec::new(),
             params: Vec::new(),
             universe_version: self.roster.version.clone(),
@@ -360,7 +278,9 @@ impl EdgarPress {
     /// fabricated midnight, which carried 13 h of lookahead through the predecessor's lake (§3.1).
     fn publication(&self, text: &str, request: &Request) -> (Published, String, String) {
         if let Some(raw) = tagged(text, &self.parsed.acceptance_field) {
-            if let Some(at) = self.instant(&raw) {
+            if let Some(at) =
+                acceptance_instant(&raw, &self.parsed.acceptance_format, self.parsed.zone)
+            {
                 return (
                     Published::At(ValidTime::new(at)),
                     raw,
@@ -372,18 +292,9 @@ impl EdgarPress {
         (self.listed_publication(request), raw, DATE_FILED.to_owned())
     }
 
-    /// Where a backfilled item's observation goes: its publication bounded by its index day, plus
-    /// the probed lag, via [`Visibility::from_backfill`], the only constructor taking a
-    /// [`MeasuredLag`].
-    /// `Ok(None)` for a live ingest, whose observation is the fetch instant the driver holds.
-    ///
-    /// A DATE has no instant, so the bound is the later END of two days: the row's `Date Filed` and
-    /// the index that first lists it (§3.9). Lag on top of an upper bound can only make an item
-    /// less visible. Reachable `Ok(None)` arms: §8 row R11.
-    ///
-    /// An instant floored at the START of the index's day bounds a row whose readable `Date Filed`
-    /// is that day, the only rows the lag was probed on (§8 row R11); the END of the index's day
-    /// bounds any other row.
+    /// Where a backfilled item's observation goes: [`archive_observation`] over this row's
+    /// `Date Filed` and the index day that lists it. `Ok(None)` for a live ingest, whose
+    /// observation is the fetch instant the driver holds; the other `Ok(None)` arms: §8 row R11.
     fn backfill_observation(
         &self,
         request: &Request,
@@ -395,38 +306,11 @@ impl EdgarPress {
         let Some(lag) = self.lag.as_ref() else {
             return Ok(None);
         };
-        let listed = days_of(&request.target_window).and_then(|days| days.first().copied());
-        let Some(listed_ends) = listed.and_then(|listed| end_of_day(listed, self.parsed.zone))
+        let Some(listed) = days_of(&request.target_window).and_then(|days| days.first().copied())
         else {
             return Ok(None);
         };
-        let bound = match valid {
-            Published::At(instant) if filed_day(request) == listed => {
-                match listed.and_then(|listed| start_of_day(listed, self.parsed.zone)) {
-                    Some(listed_starts) => ValidTime::new(instant.inner().max(listed_starts)),
-                    None => return Ok(None),
-                }
-            }
-            Published::At(instant) => ValidTime::new(instant.inner().max(listed_ends)),
-            Published::On { day, tz } => match end_of_day(day, tz) {
-                Some(filed) => ValidTime::new(filed.max(listed_ends)),
-                None => return Ok(None),
-            },
-            // `publication` never states a minute: EDGAR's acceptance field carries seconds.
-            Published::AtMinute(_) | Published::Unknown => return Ok(None),
-        };
-        Visibility::from_backfill(bound, lag).map(|visible| Some(visible.observed()))
-    }
-
-    fn instant(&self, raw: &str) -> Option<DateTime<Utc>> {
-        let local =
-            NaiveDateTime::parse_from_str(raw.trim(), &self.parsed.acceptance_format).ok()?;
-        let zone: Tz = self.parsed.zone.parse().ok()?;
-        Some(
-            zone.from_local_datetime(&local)
-                .earliest()?
-                .with_timezone(&Utc),
-        )
+        archive_observation(valid, filed_day(request), listed, self.parsed.zone, lag)
     }
 
     /// `doc_id`'s input. EDGAR serves one document from more than one host, so the canonical form
@@ -474,7 +358,7 @@ impl Provider for EdgarPress {
     }
 
     fn transport(&self) -> TransportProfile {
-        sec_transport()
+        sec_edgar::transport(Caller::EdgarPress, BODY_LIMIT)
     }
 
     /// Per REQUEST. A day the run is in is a live ingest; an earlier day is read after the fact
@@ -550,37 +434,26 @@ impl Provider for EdgarPress {
         })
     }
 
-    /// From the BODY as well as the status. The shared-IP traffic 403 is TRANSIENT: it cleared by
-    /// waiting (predecessor issues #379, #382, #383). Permanent: the S3 403 `AccessDenied`, as
-    /// `plan` asked for a listed day, and a body over `body_limit` whatever its status (§8 R21).
+    /// From the BODY as well as the status: [`body_of_200`] reads every answer but a 200, whose
+    /// body this adapter reads by phase. A 200 that is not what `plan` asked for is permanent.
     fn classify(&self, request: &Request, answer: &Result<RawResponse, TransportError>) -> Verdict {
-        let response = match answer {
-            Ok(response) => response,
-            Err(failed) if failed.kind() == TransportKind::BodyOverLimit => {
-                return Verdict::PermanentFailure
-            }
-            Err(_) => return Verdict::TransientFailure,
+        let body = match body_of_200(answer) {
+            Ok(body) => body,
+            Err(verdict) => return verdict,
         };
-        let body = String::from_utf8_lossy(response.body());
-        match response.status() {
-            OK => match request.phase {
-                RequestPhase::Index => match index_rows(&body) {
-                    None => Verdict::PermanentFailure,
-                    Some(rows) if rows.is_empty() => Verdict::Empty,
-                    Some(_) => Verdict::Usable,
-                },
-                RequestPhase::Document => {
-                    if body.contains(HEADER_END) {
-                        Verdict::Usable
-                    } else {
-                        Verdict::PermanentFailure
-                    }
-                }
+        match request.phase {
+            RequestPhase::Index => match index_rows(&body) {
+                None => Verdict::PermanentFailure,
+                Some(rows) if rows.is_empty() => Verdict::Empty,
+                Some(_) => Verdict::Usable,
             },
-            FORBIDDEN if body.contains(ACCESS_DENIED) => Verdict::PermanentFailure,
-            FORBIDDEN | TOO_MANY_REQUESTS | REQUEST_TIMEOUT => Verdict::TransientFailure,
-            status if SERVER_ERRORS.contains(&status) => Verdict::TransientFailure,
-            _ => Verdict::PermanentFailure,
+            RequestPhase::Document => {
+                if body.contains(HEADER_END) {
+                    Verdict::Usable
+                } else {
+                    Verdict::PermanentFailure
+                }
+            }
         }
     }
 
@@ -662,38 +535,21 @@ fn accession_of(url: &str) -> Option<String> {
     (!stem.is_empty()).then(|| stem.to_owned())
 }
 
-/// The quarter's listing, read into the seam's [`Listing`]. Only `form.<date>.idx` names count: a
-/// quarter directory also holds `company.`, `master.` and `index.json` itself.
+/// The quarter's listing, read into the seam's [`Listing`].
 pub fn read_listing(bytes: &[u8]) -> Result<Listing, Refusal> {
-    let read: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|why| Refusal::ListingUnparseable(why.to_string()))?;
-    let days: Vec<NaiveDate> = read["directory"]["item"]
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| day_of_index_name(item["name"].as_str()?))
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(Listing::of_days(&days))
+    Ok(Listing::of_days(&listed_days(bytes)?))
 }
 
-/// The first microsecond of `day` in `tz`: one past the end of the day before, so a gap or an
-/// ambiguous midnight resolves exactly as [`end_of_day`] resolves it.
-fn start_of_day(day: NaiveDate, tz: &str) -> Option<DateTime<Utc>> {
-    end_of_day(day.pred_opt()?, tz)?.checked_add_signed(TimeDelta::microseconds(1))
+impl From<ListingUnparseable> for Refusal {
+    fn from(unreadable: ListingUnparseable) -> Self {
+        Self::ListingUnparseable(unreadable.0)
+    }
 }
 
 /// The `Date Filed` of the index row behind a follow-up; `None` when absent or not `YYYYMMDD`.
 fn filed_day(request: &Request) -> Option<NaiveDate> {
     let raw = request.listed_date.as_deref()?;
     NaiveDate::parse_from_str(raw.trim(), INDEX_DATE).ok()
-}
-
-fn day_of_index_name(name: &str) -> Option<NaiveDate> {
-    let digits = name.strip_prefix("form.")?.strip_suffix(".idx")?;
-    NaiveDate::parse_from_str(digits, INDEX_DATE).ok()
 }
 
 /// SEC asks for a name and an address. Checked at startup and never stored, so a run with no
@@ -709,10 +565,6 @@ fn usable_contact(contact: &str) -> Result<(), Refusal> {
     } else {
         Err(Refusal::ContactMissing)
     }
-}
-
-fn quarter(day: NaiveDate) -> u32 {
-    (chrono::Datelike::month(&day) - 1) / 3 + 1
 }
 
 fn parse_rules(bytes: &[u8], path: &Path) -> Result<Parsed, Refusal> {
@@ -786,52 +638,6 @@ fn strings(value: &serde_json::Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// One row of a daily index.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct IndexRow {
-    form: String,
-    cik: String,
-    /// The row's own `Date Filed`, which is `YYYYMMDD` and not ISO - measured on the real file
-    /// 2026-11-13, where the hand-written fixture had `2026-11-10` until 2026-11-15.
-    filed: String,
-    path: String,
-}
-
-/// The rows of a daily index, or `None` when the payload is not one at all - which is what makes
-/// a 200 carrying the vendor's own error text a permanent failure rather than a quiet day.
-///
-/// Anchored on the dashed separator and split from BOTH ENDS, never on column offsets taken from
-/// a heading line. Measured 2026-11-13 on the real `form.20261110.idx` (1,057,192 bytes, captured
-/// through the predecessor's own client): the vendor WRAPS its heading across two lines - `CIK`
-/// ends line 9 and `Date Filed  File Name` is line 10 - so a reader requiring the five headings
-/// on one line finds none, and this one returned `None` for a day holding 5,429 filing rows. Rows
-/// are 194 bytes wide, not the 140 the hand-written fixture had. The predecessor has parsed this
-/// file in production for months by splitting from both ends, which also survives a width change.
-fn index_rows(payload: &str) -> Option<Vec<IndexRow>> {
-    let separator_at = payload
-        .lines()
-        .position(|line| !line.trim().is_empty() && line.trim().chars().all(|c| c == DASH))?;
-    let rows = payload
-        .lines()
-        .skip(separator_at + 1)
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            // Form type, then a company name of unknown word count, then CIK, date and path.
-            let [form, .., cik, date, path] = fields.as_slice() else {
-                return None;
-            };
-            Some(IndexRow {
-                form: (*form).to_owned(),
-                cik: (*cik).to_owned(),
-                filed: (*date).to_owned(),
-                path: (*path).to_owned(),
-            })
-        })
-        .collect();
-    Some(rows)
 }
 
 /// A line of the form `<TAG>value`, which is how the filing header carries its acceptance instant.

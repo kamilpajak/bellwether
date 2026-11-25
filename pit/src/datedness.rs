@@ -7,7 +7,7 @@ use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, 
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
-use crate::{Cutoff, ObservationTime, PitError, ValidTime, Visibility};
+use crate::{Cutoff, MeasuredLag, ObservationTime, PitError, ValidTime, Visibility};
 
 /// A publication value stated to the whole minute in UTC, such as an RSS `pubDate` of
 /// `Sat, 14 Nov 2026 19:00 GMT`. Not a [`ValidTime`], so no cutoff reads it as the instant at :00.
@@ -191,6 +191,40 @@ pub fn end_of_day(day: NaiveDate, tz: &str) -> Option<DateTime<Utc>> {
         None => first_local_time_after_a_gap(zone, midnight)?,
     };
     Some(starts.with_timezone(&Utc) - Duration::microseconds(1))
+}
+
+/// The first microsecond of `day` in `tz`: one past the end of the day before, so a gap or an
+/// ambiguous midnight resolves exactly as [`end_of_day`] resolves it.
+fn start_of_day(day: NaiveDate, tz: &str) -> Option<DateTime<Utc>> {
+    end_of_day(day.pred_opt()?, tz)?.checked_add_signed(Duration::microseconds(1))
+}
+
+/// The observation of a row read out of a vendor's archive: `valid` raised to the START of the
+/// `listed` index day when `filed` is that day, else to its END, plus the probed lag; `Ok(None)`
+/// when nothing resolves. Rule and measurements: architecture.md section 10 and section 8 row R11.
+pub fn archive_observation(
+    valid: Published,
+    filed: Option<NaiveDate>,
+    listed: NaiveDate,
+    tz: &str,
+    lag: &MeasuredLag,
+) -> Result<Option<ObservationTime>, PitError> {
+    let Some(listed_ends) = end_of_day(listed, tz) else {
+        return Ok(None);
+    };
+    let bound = match valid {
+        Published::At(instant) if filed == Some(listed) => match start_of_day(listed, tz) {
+            Some(listed_starts) => ValidTime::new(instant.inner().max(listed_starts)),
+            None => return Ok(None),
+        },
+        Published::At(instant) => ValidTime::new(instant.inner().max(listed_ends)),
+        Published::On { day, tz } => match end_of_day(day, tz) {
+            Some(filed) => ValidTime::new(filed.max(listed_ends)),
+            None => return Ok(None),
+        },
+        Published::AtMinute(_) | Published::Unknown => return Ok(None),
+    };
+    Visibility::from_backfill(bound, lag).map(|visible| Some(visible.observed()))
 }
 
 /// Pacific/Apia skipped the whole of 2011-12-30, so a gap can be a day long.

@@ -14,11 +14,9 @@ publish = false
 [dependencies]
 canon = { path = "../../canon" }
 chrono = "0.4.45"
-# The acceptance instant is Eastern time and `Published::On` carries a zone name, so the adapter
-# resolves one zone. Already a workspace dependency through `pit`: no new package.
-chrono-tz = "0.10.4"
 news-provider = { path = "../../news-provider" }
 pit = { path = "../../pit" }
+sec-edgar = { path = "../sec-edgar" }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
 

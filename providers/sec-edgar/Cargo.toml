@@ -1,0 +1,19 @@
+[package]
+name = "sec-edgar"
+version = "0.1.0"
+edition = "2021"
+description = "What is true of SEC's EDGAR host for every caller: where it serves, how fast it may be asked, how its index and its statuses read."
+publish = false
+
+# No HTTP dependency, as every `providers/*` member (architecture.md section 8 row R4), and no
+# workspace member but the seam: section 12.1's row for this crate.
+[dependencies]
+chrono = "0.4.45"
+# The acceptance instant is local time in a named zone. Already in the graph through `pit`.
+chrono-tz = "0.10.4"
+news-provider = { path = "../../news-provider" }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+
+[lints]
+workspace = true
