@@ -9,8 +9,9 @@
 # 7 newest .tar.gz of that store deleted. No pack or manifest is ever deleted. A work directory an
 # earlier run of the same store left is removed first: the units start one run of a store at a
 # time. Exits: 2 setup or an unsafe setting, 4 an absent input, 7 a held lock, a snapshot past its
-# bound, a read, write, rename, scan or lookup, 8 the copy is in and the retention failed or a pack
-# is lost or unrecorded; else the snapshot's, pack's or verify's own.
+# bound, a read, write, rename, scan or lookup, 8 the copy is in and the retention failed or
+# `blobs pack` exited 8 (a pack lost or unrecorded, a blob or dictionary the store could not give);
+# else the snapshot's, pack's or verify's own.
 set -u
 export LC_ALL=C
 : "${NEWSVAULT_IMAGE:?set in newsvault.env}" "${NEWSVAULT_TEXTFILE_DIR:?set in newsvault.env}"
@@ -259,6 +260,6 @@ if [ "$#" -gt 0 ]; then
 fi
 echo "wrote $name, $bytes bytes, to $scanned; kept the $keep newest${packs:+; the packs hold $held bytes}"
 if [ "$packed" = 8 ]; then
-    echo "a pack in $dir is lost, of another length or sha256, or has no whole manifest: blobs pack names it above; tonight's pack holds its blobs again and no pack or manifest was deleted" >&2
+    echo "blobs pack exited 8 and names the cause above: under lost or unrecorded, a pack in $dir that is gone, of another length or sha256, or without a whole manifest, whose blobs tonight's pack holds again; under not_packed, a blob or dictionary the log names that the store could not give, which is in no pack and is tried again every night. The log archive and every blob the store gave are written, and no pack or manifest was deleted" >&2
     exit 8
 fi

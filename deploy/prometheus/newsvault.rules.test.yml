@@ -284,7 +284,7 @@ tests:
               severity: warning
               unit: backup
             exp_annotations:
-              summary: the last newsvault backup run failed; at exit 8 the copy is up and old copies were not deleted or a blob pack is lost, altered or has no whole manifest, otherwise no copy was made.
+              summary: the last newsvault backup run failed; at exit 8 the copy is up and old copies were not deleted or a blob pack is lost, altered or has no whole manifest or the store could not give a blob, otherwise no copy was made.
       - eval_time: 0h
         alertname: NewsvaultCollectFailed
         exp_alerts: []

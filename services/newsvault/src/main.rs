@@ -344,8 +344,9 @@ enum BlobsAction {
         format: Format,
     },
     /// Writes the blobs and dictionaries a commit log names that no backup pack holds as one
-    /// tar and its manifest. Exit 8 when a pack is lost or unrecorded; a dry run exits 1 when
-    /// the folder's packs do not hold everything the log names. Mutates no store.
+    /// tar and its manifest. Exit 8 when a pack is lost or unrecorded, or the store could not
+    /// give a member; a dry run exits 1 when the folder's packs do not hold everything the log
+    /// names. Mutates no store.
     Pack {
         #[arg(long)]
         store: Option<PathBuf>,
@@ -1308,9 +1309,10 @@ fn run_blobs(action: BlobsAction) -> anyhow::Result<Verdict> {
     }
 }
 
-/// Exit 8 with the report on stdout when a pack is lost or unrecorded: the pack asked for is
-/// written all the same. A dry run that would pack anything answers no, exit 1, so a restore
-/// reads the folder's verdict from the status. A refusal goes to stderr with stdout empty.
+/// Exit 8 with the report on stdout when a pack is lost or unrecorded, or the store could not
+/// give a member, each such member also one line on stderr: the pack asked for is written all
+/// the same. A dry run that would pack anything answers no, exit 1, so a restore reads the
+/// folder's verdict from the status. A refusal goes to stderr with stdout empty.
 fn run_pack(ask: &cmd_pack::Ask, format: Format) -> anyhow::Result<Verdict> {
     match cmd_pack::run(ask) {
         Ok(report) => {
@@ -1323,7 +1325,8 @@ fn run_pack(ask: &cmd_pack::Ask, format: Format) -> anyhow::Result<Verdict> {
                 }
                 Format::Human => writeln!(
                     out,
-                    "{} named {} held {} packed {} pack {} bytes {} lost [{}] unrecorded [{}]{}",
+                    "{} named {} held {} packed {} pack {} bytes {} lost [{}] unrecorded [{}] \
+                     not packed [{}]{}",
                     report.log,
                     report.named,
                     report.held,
@@ -1332,8 +1335,21 @@ fn run_pack(ask: &cmd_pack::Ask, format: Format) -> anyhow::Result<Verdict> {
                     report.pack_bytes,
                     report.lost.join(" "),
                     report.unrecorded.join(" "),
+                    report
+                        .not_packed
+                        .iter()
+                        .map(|left| format!("{} {} {}", left.kind, left.digest, left.reason))
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     if report.dry_run { " (dry run)" } else { "" }
                 )?,
+            }
+            for left in report.not_packed.iter().filter(|_| !report.dry_run) {
+                let details = serde_json::json!({
+                    "store": report.store, "log": report.log, "kind": left.kind,
+                    "digest": left.digest, "reason": left.reason,
+                });
+                emit_pack_error(left.code(), &left.message, &details, format)?;
             }
             Ok(if report.dry_run && report.packed > 0 {
                 Verdict::No(EXIT_NO)
@@ -1344,23 +1360,39 @@ fn run_pack(ask: &cmd_pack::Ask, format: Format) -> anyhow::Result<Verdict> {
             })
         }
         Err(refused) => {
-            let object = serde_json::json!({
-                "schema": "newsvault.error/1",
-                "code": refused.code(),
-                "message": refused.to_string(),
-                "retryable": false,
-                "details": {"store": ask.store.display().to_string(), "log": ask.log.display().to_string()},
-                "suggestions": Vec::<Vec<String>>::new(),
+            let details = serde_json::json!({
+                "store": ask.store.display().to_string(), "log": ask.log.display().to_string(),
             });
-            let err = std::io::stderr();
-            let mut err = err.lock();
-            match format {
-                Format::Json => writeln!(err, "{object}")?,
-                Format::Human => writeln!(err, "error: {refused} ({})", refused.code())?,
-            }
+            emit_pack_error(refused.code(), &refused.to_string(), &details, format)?;
             Ok(Verdict::No(refused.exit()))
         }
     }
+}
+
+fn emit_pack_error(
+    code: &str,
+    message: &str,
+    details: &serde_json::Value,
+    format: Format,
+) -> anyhow::Result<()> {
+    let err = std::io::stderr();
+    let mut err = err.lock();
+    match format {
+        Format::Json => writeln!(
+            err,
+            "{}",
+            serde_json::json!({
+                "schema": "newsvault.error/1",
+                "code": code,
+                "message": message,
+                "retryable": false,
+                "details": details,
+                "suggestions": Vec::<Vec<String>>::new(),
+            })
+        )?,
+        Format::Human => writeln!(err, "error: {message} ({code})")?,
+    }
+    Ok(())
 }
 
 /// A refusal on stderr with stdout empty; a retryable one suggests the same argv again.
@@ -1872,7 +1904,7 @@ fn print_schema(format: Format) {
             },
             {
                 "path": ["blobs", "pack"],
-                "summary": "Writes the dictionaries and blobs the commit log at log names that no pack of the backup folder holds as one tar of store-relative paths (blobs/dictionaries/<sha256>, blobs/sha256/..), each file as stored and only after it read back to its digest, and then out.manifest: `pack <name> <bytes> <sha256 of the tar>`, one `dictionary <sha256>` or `blob <sha256>` line per member, `end <members>`. A manifest counts only when it is whole, is named <pack>.manifest and have lists its pack at its length and sha256; any other names its pack in lost and its members are packed again. Reads the store without the lease and writes only out and out.manifest.",
+                "summary": "Writes the dictionaries and blobs the commit log at log names that no pack of the backup folder holds as one tar of store-relative paths (blobs/dictionaries/<sha256>, blobs/sha256/..), each file as stored and only after it read back to its digest, and then out.manifest: `pack <name> <bytes> <sha256 of the tar>`, one `dictionary <sha256>` or `blob <sha256>` line per member, `end <members>`. A manifest counts only when it is whole, is named <pack>.manifest and have lists its pack at its length and sha256; any other names its pack in lost and its members are packed again. A member that is not in the store, or does not read back to its digest, is left out, named in not_packed and by one error line on stderr, and every other member is packed; it is in no manifest, so every later run tries it again. Reads the store without the lease and writes only out and out.manifest.",
                 "options": [
                     {"name": "store", "type": "path"},
                     {"name": "log", "type": "path", "required": true,
@@ -1882,9 +1914,9 @@ fn print_schema(format: Format) {
                     {"name": "manifests", "type": "path", "required": true,
                      "doc": "a directory holding every manifest of the folder under its own file name, <pack file name>.manifest"},
                     {"name": "out", "type": "path",
-                     "doc": "the tar; required unless dry_run; refused when it or its manifest exists; neither is written when nothing is left to pack"},
+                     "doc": "the tar; required unless dry_run; refused when it or its manifest exists; neither is written when nothing is left to pack or the store gives no member"},
                     {"name": "dry_run", "type": "flag",
-                     "doc": "reads log, have and manifests only and writes nothing, out given or not: packed is what a run would pack, and above 0 the exit is 1"},
+                     "doc": "reads log, have and manifests only and writes nothing, out given or not: packed is what a run would pack, not_packed names each such member with the reason dry_run, and above 0 the exit is 1"},
                     {"name": "non_interactive", "type": "flag",
                      "doc": "accepted and does nothing: no command here prompts or reads stdin"},
                     {"name": "format", "type": "enum", "values": ["human", "json"]}
@@ -1893,11 +1925,11 @@ fn print_schema(format: Format) {
                          "doc": "the store when --store is not given, then ~/.bellwether/vault"}],
                 "output": cmd_pack::SCHEMA,
                 "exits": {
-                    "0": "every manifest has its pack and every pack its manifest; pack is null when nothing was left to pack",
+                    "0": "every manifest has its pack, every pack its manifest and not_packed is empty; pack is null when nothing was left to pack",
                     "1": "dry_run only: packed is above 0, so the folder's packs do not hold every blob and dictionary the log names",
-                    "2": "invalid_argument (out or its manifest exists; no out without dry_run), input_unparseable (a line of have; a blob or dictionary that does not read back to its digest), io_failed",
-                    "4": "input_absent: no log, no have file, no manifests directory, or a blob or dictionary the log names is not in the store",
-                    "8": "lost or unrecorded is not empty; the pack is written and holds the members of every lost one"
+                    "2": "invalid_argument (out or its manifest exists; no out without dry_run), input_unparseable (a line of have), io_failed",
+                    "4": "input_absent: no log, no have file or no manifests directory",
+                    "8": "lost, unrecorded or not_packed is not empty; the pack is written and holds the members of every lost one and every member the store gave; not_packed[].reason is absent or digest_mismatch"
                 },
                 "mutates": true
             },

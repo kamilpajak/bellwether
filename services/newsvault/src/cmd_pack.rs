@@ -20,6 +20,9 @@ const PACK: &str = "pack";
 const DICTIONARY: &str = "dictionary";
 const BLOB: &str = "blob";
 const END: &str = "end";
+const ABSENT: &str = "absent";
+const DIGEST_MISMATCH: &str = "digest_mismatch";
+const DRY_RUN: &str = "dry_run";
 const MEMBER_MODE: u32 = 0o644;
 const HASH_CHUNK: usize = 1 << 16;
 
@@ -56,15 +59,54 @@ pub struct Report {
     pub lost: Vec<String>,
     /// Packs no manifest names.
     pub unrecorded: Vec<String>,
+    /// The members the log names that no pack that counts holds when the run ends: in a dry
+    /// run every one still to pack, else those the store could not give.
+    pub not_packed: Vec<NotPacked>,
     pub dry_run: bool,
     pub changed: bool,
 }
 
 impl Report {
-    /// Every manifest has its pack and every pack its manifest.
+    /// Every manifest has its pack, every pack its manifest, and the store gave every member.
     #[must_use]
     pub fn is_whole(&self) -> bool {
-        self.lost.is_empty() && self.unrecorded.is_empty()
+        self.lost.is_empty() && self.unrecorded.is_empty() && self.not_packed.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NotPacked {
+    /// `dictionary` or `blob`.
+    pub kind: &'static str,
+    pub digest: String,
+    /// `dry_run`: nothing was read. `absent`: the member's file, or the dictionary its `.zst`
+    /// file names, is not in the store. `digest_mismatch`: one of the two is there and does
+    /// not read back to its digest.
+    pub reason: &'static str,
+    /// The failed read in the store's words, for stderr; empty in a dry run.
+    #[serde(skip)]
+    pub message: String,
+}
+
+impl NotPacked {
+    fn of(line: &str, reason: &'static str, message: String) -> Self {
+        let (kind, digest) = line.split_once(' ').unwrap_or_default();
+        Self {
+            kind: if kind == DICTIONARY { DICTIONARY } else { BLOB },
+            digest: digest.to_owned(),
+            reason,
+            message,
+        }
+    }
+
+    /// The section 5.1 registry code of the stderr line that names this member.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        if self.reason == ABSENT {
+            "input_absent"
+        } else {
+            "input_unparseable"
+        }
     }
 }
 
@@ -94,17 +136,9 @@ impl PackError {
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
-            Self::InputAbsent { .. }
-            | Self::Store(StoreError::BlobAbsent { .. } | StoreError::DictionaryAbsent { .. }) => {
-                "input_absent"
-            }
+            Self::InputAbsent { .. } => "input_absent",
             Self::OutputExists(_) => "invalid_argument",
-            Self::Unreadable { .. }
-            | Self::Store(
-                StoreError::BlobAltered { .. }
-                | StoreError::BlobUndecodable { .. }
-                | StoreError::DictionaryAltered { .. },
-            ) => "input_unparseable",
+            Self::Unreadable { .. } => "input_unparseable",
             Self::Store(_) | Self::Sqlite(_) | Self::Io(_) => "io_failed",
         }
     }
@@ -220,8 +254,9 @@ fn named_by(log: &Path) -> Result<Vec<String>, PackError> {
 }
 
 /// Plans from the log, the listing and the manifests; with `out`, writes the tar and then its
-/// manifest beside it. A manifest that is not whole loses its pack and refuses nothing. A blob the log names that is not in the store, or does not read back to
-/// its digest, ends the run by name with neither file left.
+/// manifest beside it. A manifest that is not whole loses its pack and refuses nothing. A member
+/// that is not in the store, or does not read back to its digest, is left out and named in
+/// `not_packed`; with no member left neither file is written.
 pub fn run(ask: &Ask) -> Result<Report, PackError> {
     let have = packs_held(&ask.have)?;
     let manifests = manifests_in(&ask.manifests)?;
@@ -256,10 +291,15 @@ pub fn run(ask: &Ask) -> Result<Report, PackError> {
         pack_bytes: 0,
         lost,
         unrecorded,
+        not_packed: Vec::new(),
         dry_run: ask.out.is_none(),
         changed: false,
     };
     let Some(out) = ask.out.as_ref().filter(|_| !pending.is_empty()) else {
+        if report.dry_run {
+            let unread = |line: &&str| NotPacked::of(line, DRY_RUN, String::new());
+            report.not_packed = pending.iter().map(unread).collect();
+        }
         return Ok(report);
     };
     let manifest = manifest_of(out);
@@ -269,11 +309,14 @@ pub fn run(ask: &Ask) -> Result<Report, PackError> {
         }
     }
     match write(ask, out, &manifest, &pending, &held) {
-        Ok((bytes, members)) => {
-            report.pack = out.file_name().map(|name| name.to_string_lossy().into());
+        Ok((bytes, members, not_packed)) => {
+            if members > 0 {
+                report.pack = out.file_name().map(|name| name.to_string_lossy().into());
+            }
             report.pack_bytes = bytes;
             report.packed = count(members);
-            report.changed = true;
+            report.not_packed = not_packed;
+            report.changed = members > 0;
             Ok(report)
         }
         Err(failure) => {
@@ -296,41 +339,57 @@ fn manifest_of(pack: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// The tar, fsynced, then the manifest that states its length and sha256: `(bytes, members)`.
+/// The store's refusal of one member as `not_packed` carries it; any other failure ends the run.
+fn left_out(line: &str, failure: PackError) -> Result<NotPacked, PackError> {
+    let reason = match &failure {
+        PackError::Store(StoreError::BlobAbsent { .. } | StoreError::DictionaryAbsent { .. }) => {
+            ABSENT
+        }
+        PackError::Store(
+            StoreError::BlobAltered { .. }
+            | StoreError::BlobUndecodable { .. }
+            | StoreError::DictionaryAltered { .. },
+        ) => DIGEST_MISMATCH,
+        _ => return Err(failure),
+    };
+    Ok(NotPacked::of(line, reason, failure.to_string()))
+}
+
+/// The tar of every member the store gives, fsynced, then the manifest that states its length
+/// and sha256: `(bytes, members, the members left out)`. No member: neither file.
 fn write(
     ask: &Ask,
     out: &Path,
     manifest: &Path,
     pending: &[&str],
     held: &HashSet<&str>,
-) -> Result<(u64, usize), PackError> {
+) -> Result<(u64, usize, Vec<NotPacked>), PackError> {
     let blobs = store::blob_store(&ask.store);
     let mut tar = tar::Builder::new(File::create_new(out)?);
     let mut entries: Vec<String> = Vec::new();
     let mut dictionaries: BTreeSet<String> = BTreeSet::new();
+    let mut not_packed = Vec::new();
     for line in pending {
         let (kind, hex) = line.split_once(' ').unwrap_or_default();
-        if kind == DICTIONARY {
-            dictionaries.insert((*line).to_owned());
-            append_dictionary(&mut tar, ask, &blobs, hex)?;
+        let appended = if kind == DICTIONARY {
+            append_dictionary(&mut tar, ask, &blobs, hex).map(|()| {
+                dictionaries.insert((*line).to_owned());
+            })
         } else {
-            let absent = || StoreError::BlobAbsent {
-                digest: hex.to_owned(),
-            };
-            let stored = blobs.stored_file(&blobs.named(hex).ok_or_else(absent)?)?;
-            if let Some(needed) = &stored.dictionary {
-                let needed_line = format!("{DICTIONARY} {needed}");
-                if !held.contains(needed_line.as_str()) && dictionaries.insert(needed_line.clone())
-                {
-                    append_dictionary(&mut tar, ask, &blobs, needed)?;
-                    entries.push(needed_line);
-                }
-            }
-            append(&mut tar, ask, &stored.path, &stored.bytes)?;
+            append_blob(&mut tar, ask, &blobs, hex, held, &mut dictionaries).map(|dictionary| {
+                entries.extend(dictionary);
+            })
+        };
+        match appended {
+            Ok(()) => entries.push((*line).to_owned()),
+            Err(failure) => not_packed.push(left_out(line, failure)?),
         }
-        entries.push((*line).to_owned());
     }
     let file = tar.into_inner()?;
+    if entries.is_empty() {
+        fs::remove_file(out)?;
+        return Ok((0, 0, not_packed));
+    }
     file.sync_all()?;
     let bytes = file.metadata()?.len();
     let (mut digest, mut read, mut chunk) = (Sha256::new(), File::open(out)?, [0; HASH_CHUNK]);
@@ -351,7 +410,36 @@ fn write(
     let mut written = File::create_new(manifest)?;
     written.write_all(text.as_bytes())?;
     written.sync_all()?;
-    Ok((bytes, entries.len()))
+    Ok((bytes, entries.len(), not_packed))
+}
+
+/// One blob's file, after the dictionary it names when no pack holds that: the dictionary's
+/// entry line when it was appended here.
+fn append_blob(
+    tar: &mut tar::Builder<File>,
+    ask: &Ask,
+    blobs: &BlobStore,
+    hex: &str,
+    held: &HashSet<&str>,
+    dictionaries: &mut BTreeSet<String>,
+) -> Result<Option<String>, PackError> {
+    let absent = || StoreError::BlobAbsent {
+        digest: hex.to_owned(),
+    };
+    let stored = blobs.stored_file(&blobs.named(hex).ok_or_else(absent)?)?;
+    let needed = stored
+        .dictionary
+        .as_ref()
+        .map(|needed| (needed, format!("{DICTIONARY} {needed}")))
+        .filter(|(_, line)| !held.contains(line.as_str()) && !dictionaries.contains(line));
+    let mut appended = None;
+    if let Some((needed, line)) = needed {
+        append_dictionary(tar, ask, blobs, needed)?;
+        dictionaries.insert(line.clone());
+        appended = Some(line);
+    }
+    append(tar, ask, &stored.path, &stored.bytes)?;
+    Ok(appended)
 }
 
 fn append_dictionary(
