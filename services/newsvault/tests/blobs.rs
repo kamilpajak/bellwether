@@ -9,12 +9,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use news_provider::RunId;
-use newsvault::blobs::Encoding;
 use newsvault::store::{self, Committer, StoreError, COMMIT_LOG};
 use rusqlite::Connection;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
+use vault_core::blobs::Encoding;
 
 type TestResult = Result<(), Box<dyn Error>>;
 /// A store and the payloads it holds.
