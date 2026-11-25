@@ -164,6 +164,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::LeaseError;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -189,9 +190,11 @@ mod tests {
         let refused = LogCopy::open(&lock, &log, &out);
         drop(held);
         let opened = LogCopy::open(&lock, &log, &out)?;
+        let held_while_open = matches!(Lease::take(&lock), Err(LeaseError::LeaseHeld(_)));
         let planned = opened.source_state()?;
         let written_by_the_dry_read = out.exists();
         let copied = opened.write()?;
+        let free_once_written = Lease::take(&lock).is_ok();
         let kept: i64 =
             sqlite::read_only(&out)?.query_row("SELECT n FROM kept", [], |row| row.get(0))?;
         let again = LogCopy::open(&lock, &log, &out);
@@ -211,6 +214,11 @@ mod tests {
                 },
                 3
             )
+        );
+        assert!(
+            held_while_open && free_once_written,
+            "the copy holds the lease from `open` to the end of `write`: \
+             {held_while_open} {free_once_written}"
         );
         Ok(())
     }
