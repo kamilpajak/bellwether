@@ -5275,10 +5275,14 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
   | index days | 2026-11-10 and 2026-11-12, the two whose write instants were read twice and had not moved (below) |
   | rows a day | 12 evenly spaced in file order; all of them under 12; a day with none registers nothing |
   | requests | at most 27 (1 listing, 2 indexes, 24 documents), ceiling 30 |
-  | scalar and bands | the MAX of the per-filing lags; the 8-K registration's bands and refusals |
+  | scalar | the larger of the MAX of the per-filing lags and the floor: per sampled day, the index's write instant less that day's start in `America/New_York` |
+  | the floor, if the write instants read are those of 2026-11-13 and 2026-11-25 | 79,302 s (2026-11-10) and 79,342 s (2026-11-12) |
+  | bands and refusals | the 8-K registration's, read off the scalar |
 
   - Its entry takes that run's own scalar, probe id and probe count, above or below `94,922 s`; the 8-K lags and the annual-form lags are never pooled.
-  - Named there and not closed by the run: a scalar under 79,302 s (2026-11-10's write instant less its index day's start) stamps a row accepted before that start earlier than the file that carried it was written.
+  - Why a floor (registered 2026-11-25, the section "a floor under the registered scalar"): `archive_observation` dates an on-time row at the later of its acceptance and its index day's start, plus the scalar, which is at or after the file's write only when the scalar is at least the write instant less that start; a sparse sample may hold no row accepted before the start.
+  - The floor does not cover a day whose index is written later after its start than the two sampled, or an index rewritten after the run.
+  - The same test on the 8-K entry: `94,922 s` is above both bounds, by 15,620 s and 15,580 s.
   - Its entry goes in `services/filingvault/policy/observation-lag.json`, read by `news_provider::lag_policy::LagPolicy` and added to the list in `repo-invariants/src/line_ends.rs`.
   - Rejected: a second entry in `news-provider/policy/observation-lag.json`. That file is hashed whole into the news run envelope's `observation_lag_policy_version`, so a filings measurement would change the version a news run records.
 - Whether `form.<D>.idx` gains rows after day D: not in 12 days, for the two files read. That probe's second run (2026-11-25T20:48Z, 27 requests, `probes/observation_lag/PREREGISTRATION.md`) re-read the two index days of its first (2026-11-13T17:33Z):

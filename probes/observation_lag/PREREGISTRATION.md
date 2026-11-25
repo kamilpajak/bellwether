@@ -414,3 +414,49 @@ SEC_CONTACT='<name and address>' python3 -I probes/observation_lag/probe.py \
 - Without `--forms` the script is the `8-K` construction: checked offline on 2026-11-25 by replaying both committed results files through the script before and after the change (the PR that adds the option carries the check).
 - It writes `observation_lag_results.annual.<UTC date>.json` and `quarter_index.2026Q4.annual.<UTC date>.json` beside itself and refuses with `result_exists`, before any request, when the first already exists.
 - The results file's `sample_rule` string states the 12-or-more rule on every run; `rows_of_form` beside the length of `filings` shows which rule applied.
+
+## 2026-11-25, before any request: a floor under the registered scalar
+
+- Written after the section above was committed and before the annual-forms run's first request. Nothing above is edited; where this section and the one above disagree, this one holds.
+- This section's commit precedes the commit that makes `probe.py` compute the floor.
+
+### Why
+
+- The rule that dates a backfilled row, read 2026-11-25 in `pit::datedness::archive_observation`: a row whose `Date Filed` is its index's day is observed at `max(acceptance, start of the index day) + seconds`. The start is midnight of the index day in the zone the caller hands in, which for EDGAR is `America/New_York` (`edgar-press`'s `KNOWN_ZONES`, the zone its `backfill_observation` passes).
+- That instant is at or after the file's write instant only if `seconds ≥ write instant − start of the index day`.
+- A sparse sample of annual-form rows may hold no row accepted before its index day began, so its max can fall under that number. The scalar would then date such a row before the file that carried it was written: a leak.
+
+### The two bounds, from the write instants read on 2026-11-13 and 2026-11-25
+
+| index day | start of the day, `America/New_York` | write instant | bound |
+|---|---|---|---|
+| 2026-11-10 | 2026-11-10T05:00:00Z | 2026-11-11T03:01:42Z | 79,302 s = 22 h 1 min 42 s |
+| 2026-11-12 | 2026-11-12T05:00:00Z | 2026-11-13T03:02:22Z | 79,342 s = 22 h 2 min 22 s |
+
+- These are the bounds if the run reads the same write instants. The run computes them from the instants it reads, not from this table.
+
+### Registered now
+
+- The scalar the filings policy takes is the larger of:
+  - (a) the MAX of the per-filing lags, as registered in the section above;
+  - (b) for each sampled day, the write instant used for that day minus the start of that day in `America/New_York`, in whole seconds; the larger of the two days.
+- The band is read off that scalar.
+- The results file records both: `max_lag_seconds` for (a), `floor_seconds` per day for (b), and `scalar_set_by`, `max_lag` or `index_day_floor`. Equal values are recorded as `max_lag`.
+- `leaks` keeps its meaning: sampled filings whose own lag exceeds the scalar. The scalar is at least (a), so it stays 0 by construction.
+- `probes` keeps its meaning. The floor adds no probe.
+- This replaces two lines of the section above: "which number the filings policy file takes" is this scalar and not (a) alone, and the bullet on a scalar below 79,302 s or 79,342 s no longer describes a possible outcome.
+- Every refusal still refuses. The floor is applied only where the section above would have registered (a).
+
+### What the floor covers and what it does not
+
+- Covered, on the two sampled days, sampled or not: every row whose `Date Filed` is its index's day. One accepted at or after the day's start has a lag under (b); one accepted before it is raised to the start by the dating rule.
+- Not covered:
+  - a day whose index is written later after its start than these two were. Its own bound is larger and nothing here measures it;
+  - an index rewritten after the run reads it;
+  - a caller that hands the dating rule another zone, or a change to that rule;
+  - everything the section above lists, the shortfall bullet aside.
+
+### The 8-K registration
+
+- Not changed by this section: the script computes no floor without `--forms`, and no file or number of the two `8-K` runs moves.
+- The same test on it: 94,922 s is above 79,302 s and above 79,342 s, by 15,620 s and 15,580 s. By this test the `8-K` scalar dated no on-time row of those two days before its index was written.
