@@ -2220,7 +2220,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
   | whole-store archives | 10: the store, 7 kept, the work copy and the hidden copy during a run | 10 | 66 MB (397 / 6) × 10 = 660 MB | 50 |
   | packs | 2: the store and one pack; that night's new blobs twice more during a run | 10 | 61.5 MB (369 / 6) × 2 + 4.7 MB (28 / 6) × 10 = 170 MB | 194 |
 
-- The planned archive of annual reports, about 2 GB compressed for its initial fill (ratio 19.7× on 43 documents, the owner's measurement, 2026-11-24): one pack of that size once, where the whole-store shape kept 8 copies of it in the folder.
+- The planned archive of annual reports is a store of its own, `filingvault` (§12), about 4.26 GB for its initial fill (an estimate, §12.9; its primary documents alone 1.96 GB at 19.7× on 43 documents): the whole-store shape would keep 8 copies of it in the folder, and its fill waits for packs (§12.9). How that store's blobs are copied is not designed (§12).
 - The unit of copy is one pack a night. Rejected:
 
   | alternative | the symptom that killed it |
@@ -2299,7 +2299,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - The lock: the unit's `flock --nonblock` on the store lock for the whole run and `TimeoutStartSec=1800`, both unchanged, so the run's bound stays 23:26:30, before the 23:30 slot (§11.5 step 7 PR 7). `blobs pack` takes no `LOCK` lease: it reads files that never change, named by a snapshot already taken.
   - The first run after the install packs the whole store: one pack of at most 369 MB (2026-11-24). It reads every blob and writes that many bytes through `docker exec`, which every nightly run did before, without gzip and with one read-back of each blob (`blobs verify`: 9,093 blobs in 3 s on the VPS, 2026-11-22). From the second night on a run reads every pack once more for its sha256. Not measured: either's seconds.
   - Killed at the bound: systemd's SIGTERM runs the trap, nothing is recorded, `NewsvaultBackupFailed` fires and the next run packs the whole store again. A store whose first pack cannot be written in 1,800 s fails every night; no flag splits a pack.
-  - The annual-report fill is about 2 GB in one pack; not measured against the bound.
+  - The annual-report fill is not this store's (§12): about 4.26 GB over about 6 nights (§12.9), and no pack of it is designed or measured against the bound.
 - Metrics, `newsvault-backup.prom`:
 
   | series | before 2026-11-24 | now |
