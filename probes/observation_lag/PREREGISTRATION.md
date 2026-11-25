@@ -282,3 +282,181 @@ numbers cannot tell a final index file from one rewritten before the probe read 
 
 - The registration text cites `edgar-press`'s `BODY_LIMIT` comment for the 5,429 filing rows of 2026-11-10 and their construction. That comment now states the measured index sizes instead; the row counts and bytes are in the run section above and in `docs/design/architecture.md` §10.
 - "About 600 KB each" above came from the fixture's 110-byte rows. The indexes read in the run were 1,057,192 B (2026-11-10) and 1,520,327 B (2026-11-12).
+
+## 2026-11-25, the second run
+
+- The run "What this probe cannot settle" schedules: the same two days, no sooner than 7 days after the first. Made 2026-11-25T20:48:52Z, 12 days 3 h 15 min after the first (2026-11-13T17:33:51Z, both `fetched_at`), with `probe.py` as committed (last change `5bc2f99`, 2026-11-15, a comment):
+
+```
+SEC_CONTACT='<name and address>' python3 -I probes/observation_lag/probe.py \
+  --days 2026-11-10 2026-11-12
+```
+
+- 27 requests of the registered 30, exit 0.
+- Which file is which:
+
+| file | run |
+|---|---|
+| `observation_lag_results.json` | the first, 2026-11-13 |
+| `observation_lag_results.20261125.json` | the second, 2026-11-25; the script wrote it under the first's name in another directory and it is committed under this one |
+| `quarter_index.2026Q4.json` | the quarter listing as the first run received it, 145 items |
+| not committed | the quarter listing as the second run received it, 185 items |
+
+- **The answer, for these two days: neither daily index was rewritten between the two reads.**
+
+| quantity, per index file | `form.20261110.idx` | `form.20261112.idx` | first run against second |
+|---|---|---|---|
+| write instant, `Last-Modified` header | 2026-11-11T03:01:42Z | 2026-11-13T03:02:22Z | equal |
+| write instant, quarter listing | `11/10/2026 10:01:42 PM` | `11/12/2026 10:02:22 PM` | equal; 0 s from the header on both reads |
+| bytes downloaded | 1,057,192 | 1,520,327 | equal |
+| rows of all forms | 5,429 | 7,805 | equal |
+| rows of form `8-K` | 384 | 549 | equal |
+| `8-K` rows whose `Date Filed` is not the index's own day | 0 | 0 | equal |
+| accessions sampled | 12 | 12 | the same 12, in the same order |
+
+- What moved is the sample, not the files: the two documents that answered `503` on 2026-11-13 answered.
+
+| quantity | first run, 2026-11-13 | second run, 2026-11-25 | construction |
+|---|---|---|---|
+| registered `seconds` | 94,922 s | **94,922 s = 26.37 h** | the MAX of the per-filing lags; accession `0001654954-26-009633` on both reads |
+| band | 24 h – 7 d | 24 h – 7 d | the band table above, read off the scalar |
+| `probe_id` | `edgar_index_write-20261113` | `edgar_index_write-20261125` | the UTC date of the run |
+| `probes` / `leaks` | 22 / 0 | 24 / 0 | sampled documents with an acceptance field; 0 because the scalar is the max |
+| the two documents `503` on the first run | unusable | 53,787 s (`0001104659-26-124772`, 2026-11-10) and 21,611 s (`0002065708-26-000008`, 2026-11-12) | write instant minus acceptance |
+| p90, which decides nothing | 57,561 s | 57,561 s | index `min(floor(0.9 × n), n − 1)` ascending: index 19 of 22 lags, index 21 of 24 |
+| median | 42,085 s | 42,085 s | index `floor(0.5 × n)` ascending |
+| per day, 2026-11-10 | n=11, median 21,432 s, max 94,922 s | n=12, median 47,870 s, p90 90,096 s, max 94,922 s | one write instant |
+| per day, 2026-11-12 | n=11, median 42,085 s, max 57,561 s | n=12, median 42,085 s, p90 54,124 s, max 57,561 s | one write instant |
+
+- Each of the 22 lags of the first run is the same number of seconds in the second.
+- What this settles: `form.20261110.idx` and `form.20261112.idx` carried on 2026-11-25 the write instant they carried on 2026-11-13, so the 94,922 s is not the distance to a rewrite made in those 12 days.
+- What it does not settle:
+  - any other index day, and any quarter but 2026 Q4;
+  - a rewrite later than 2026-11-25, 15 and 13 days after the days the files name;
+  - a rewrite before the first read on 2026-11-13 that the vendor's stated instant does not show;
+  - byte equality of the two reads: neither index body was kept, so it is inferred from equal bytes, row counts, write instants and sampled accessions.
+- `news-provider/policy/observation-lag.json` still names `edgar_index_write-20261113` with 22 probes. It is not edited here: it is hashed whole into the news run envelope, and the scalar it carries did not move.
+
+## 2026-11-25, registered before any request: the annual-forms run
+
+- Why: the filings context refuses to collect without a `MeasuredLag` for (`edgar_filings`, `vendor_archive`) (`docs/design/architecture.md` §12.3), and the 94,922 s above was measured on `8-K` rows.
+- This section's commit precedes the commit that gives `probe.py` its `--forms` option, and both precede the run's first request. For this section the freeze is a fact git can check.
+- Nothing below is edited after the first request; the run and any disagreement go in later dated sections.
+
+### What is measured
+
+- One sentence, in the units `pit::MeasuredLag` stores: the number of whole seconds between an annual-form filing's acceptance instant and the instant the vendor states it last wrote the daily index file that names that filing.
+- The two instants subtracted, the sign and the unit: as registered above, unchanged. Publication is `<ACCEPTANCE-DATETIME>` in `America/New_York`; observation is the `Last-Modified` header of `form.<day>.idx` cross-read against the quarter listing.
+- The scalar: the MAX of the per-filing lags (amendment 2026-11-13, change 1).
+
+### The construction
+
+| choice | value | reason, and the rejected alternative |
+|---|---|---|
+| forms | `10-K`, `10-KT`, `20-F`, `40-F`, `10-K/A`, `10-KT/A`, `20-F/A`, `40-F/A`, matched on the row's first token exactly | the eight forms §12.3's table marks fetched, read 2026-11-25, and no other: nothing else would be dated by this lag. An exact match leaves out `10-K405`, `10-KSB` and `NT 10-K`, which that table does not fetch |
+| pooling of forms | the eight forms are one population with one scalar | the policy file holds one `MeasuredLag` per (source, provenance). Rejected: one scalar per form, which needs a sample per form and a key the policy file does not have |
+| days | 2026-11-10 and 2026-11-12 | below |
+| rows, a day with 12 or more rows of these forms | 12: the day's rows of these forms in the index file's own order, row `floor(i × n / 12)` for `i = 0 … 11` | the registered even-spacing rule, unchanged. The file is ordered by form type and then company name, so the spacing gives each form about its share of the day's rows, and a form holding fewer than `n / 12` of them can get none |
+| rows, a day with 1 to 11 | all of them, each once | below 12 the spacing rule repeats rows (`n = 6` gives rows 0, 0, 1, 1, 2, 2); the script did this until the `--forms` change and no `8-K` day reached it (384 and 549 rows) |
+| a day with 0 | nothing is registered from the run, code `no_rows_of_form` | amendment 2026-11-13, change 4, unchanged. The other day's documents are still requested before the refusal, so the run costs up to 15 requests |
+| roster | not applied | as registered above |
+
+- Why the same two days and not two others:
+  - their write instants are the only two in this tree read twice, 12 days apart, and found equal (the section above); any other day would owe its own second read before its number means a publication lag;
+  - both families then subtract from the same two write instants, so a difference between the two scalars is a difference between the acceptance instants of the sampled rows and nothing else;
+  - the choice reads no lag: no annual-form row of either day has been counted or read in this tree. The first run kept the total row count and the `8-K` row count of each file and not the files.
+- Its cost: both days are in November, outside the February to March weeks when most annual reports are filed, so `n` may be under 12 on either day and is unknown until the index is read.
+- If the run refuses with `no_rows_of_form`, the replacement days are fixed now so the count just seen cannot choose them: 2026-11-09 and 2026-11-13, the listed index days on either side (the listing read 2026-11-25 names both and names no `form.20261111.idx`). That run needs its own dated section before its first request, and its days owe a second read.
+
+### The request budget
+
+- 1 quarter `index.json` + 2 daily `form.<day>.idx` + at most 12 documents on each of 2 days = **at most 27 requests**; `3 + n₁ + n₂` when a day holds fewer than 12 rows.
+- The ceiling stays 30 (`--budget` above it is refused), the pace stays one request every 0.5 s, and a document is asked with `Range: bytes=0-16383` and its read capped at 16 KiB, as the script has asked since its first commit (`1ed9593`); the registered text above says `bytes=0-8191`.
+
+### What each outcome will mean, decided now
+
+- Every table of "What each outcome will mean, decided now" and every change of the amendment dated 2026-11-13 applies unchanged, read off the MAX:
+
+| outcome | meaning for (`edgar_filings`, `vendor_archive`) |
+|---|---|
+| registered, ≤ 24 h | the entry is written; a filing's observation falls on its publication day or the next |
+| registered, 24 h – 7 d | the entry is written, with the session shift written into any panel built on it |
+| registered, > 7 d | no entry; this construction is closed for these forms |
+| `no_rows_of_form`, `sample_too_thin`, `negative_or_zero_lag`, `write_instants_disagree`, `write_instant_absent`, `write_instant_outside_named_day` | no entry; `filings collect` stays refused at exit 2 before any vendor call; a new dated section precedes any further request |
+
+- If the annual-forms scalar differs from 94,922 s:
+
+| question | decided now |
+|---|---|
+| which number the filings policy file takes | the annual-forms run's own `seconds`, `probe_id`, `probes` and `leaks`, whether its scalar is above, equal to or below 94,922 s |
+| where | `services/filingvault/policy/observation-lag.json` (§12.3) |
+| the news policy file | not edited by any outcome of this run |
+| pooling | none: the 24 `8-K` lags and the annual-form lags never enter one max, median or p90, and neither entry borrows the other's number or probe id |
+
+- `probe_id`: `edgar_index_write_annual-<UTC date of the run, %Y%m%d>`.
+- `rows_by_form` is written per day and `form` per sampled filing, so the run section can name the forms that had no probe.
+
+### What this run cannot settle
+
+- Everything under "What this probe cannot settle" above, and the limits of the second run's section.
+- A form with 0 sampled rows is dated by the scalar with no probe of its own.
+- A scalar below 79,302 s (2026-11-10) or 79,342 s (2026-11-12). Each is the file's write instant minus the start of its index day in `America/New_York` (03:01:42Z − 05:00:00Z the day before; 03:02:22Z − 05:00:00Z). `pit::datedness::archive_observation` stamps an on-time row no earlier than its index day's start plus the scalar, so under a smaller scalar a row accepted before that start is stamped before the file that carried it was written, by the shortfall. It happens when no sampled row was accepted the evening before, and a max over a sample cannot see it. The run section states the shortfall if there is one; the rule above is not changed by it after the run.
+- The annual season: a February or March index holds more rows of these forms, and whether it is written at the same hour is not measured by two November days.
+- With `n` under 12 the max is taken over fewer acceptance instants, which makes it a weaker upper bound and not a tighter one.
+
+### Running it
+
+```
+SEC_CONTACT='<name and address>' python3 -I probes/observation_lag/probe.py \
+  --days 2026-11-10 2026-11-12 --forms annual
+```
+
+- Without `--forms` the script is the `8-K` construction: checked offline on 2026-11-25 by replaying both committed results files through the script before and after the change (the PR that adds the option carries the check).
+- It writes `observation_lag_results.annual.<UTC date>.json` and `quarter_index.2026Q4.annual.<UTC date>.json` beside itself and refuses with `result_exists`, before any request, when the first already exists.
+- The results file's `sample_rule` string states the 12-or-more rule on every run; `rows_of_form` beside the length of `filings` shows which rule applied.
+
+## 2026-11-25, before any request: a floor under the registered scalar
+
+- Written after the section above was committed and before the annual-forms run's first request. Nothing above is edited; where this section and the one above disagree, this one holds.
+- This section's commit precedes the commit that makes `probe.py` compute the floor.
+
+### Why
+
+- The rule that dates a backfilled row, read 2026-11-25 in `pit::datedness::archive_observation`: a row whose `Date Filed` is its index's day is observed at `max(acceptance, start of the index day) + seconds`. The start is midnight of the index day in the zone the caller hands in, which for EDGAR is `America/New_York` (`edgar-press`'s `KNOWN_ZONES`, the zone its `backfill_observation` passes).
+- That instant is at or after the file's write instant only if `seconds ≥ write instant − start of the index day`.
+- A sparse sample of annual-form rows may hold no row accepted before its index day began, so its max can fall under that number. The scalar would then date such a row before the file that carried it was written: a leak.
+
+### The two bounds, from the write instants read on 2026-11-13 and 2026-11-25
+
+| index day | start of the day, `America/New_York` | write instant | bound |
+|---|---|---|---|
+| 2026-11-10 | 2026-11-10T05:00:00Z | 2026-11-11T03:01:42Z | 79,302 s = 22 h 1 min 42 s |
+| 2026-11-12 | 2026-11-12T05:00:00Z | 2026-11-13T03:02:22Z | 79,342 s = 22 h 2 min 22 s |
+
+- These are the bounds if the run reads the same write instants. The run computes them from the instants it reads, not from this table.
+
+### Registered now
+
+- The scalar the filings policy takes is the larger of:
+  - (a) the MAX of the per-filing lags, as registered in the section above;
+  - (b) for each sampled day, the write instant used for that day minus the start of that day in `America/New_York`, in whole seconds; the larger of the two days.
+- The band is read off that scalar.
+- The results file records both: `max_lag_seconds` for (a), `floor_seconds` per day for (b), and `scalar_set_by`, `max_lag` or `index_day_floor`. Equal values are recorded as `max_lag`.
+- `leaks` keeps its meaning: sampled filings whose own lag exceeds the scalar. The scalar is at least (a), so it stays 0 by construction.
+- `probes` keeps its meaning. The floor adds no probe.
+- This replaces two lines of the section above: "which number the filings policy file takes" is this scalar and not (a) alone, and the bullet on a scalar below 79,302 s or 79,342 s no longer describes a possible outcome.
+- Every refusal still refuses. The floor is applied only where the section above would have registered (a).
+
+### What the floor covers and what it does not
+
+- Covered, on the two sampled days, sampled or not: every row whose `Date Filed` is its index's day. One accepted at or after the day's start has a lag under (b); one accepted before it is raised to the start by the dating rule.
+- Not covered:
+  - a day whose index is written later after its start than these two were. Its own bound is larger and nothing here measures it;
+  - an index rewritten after the run reads it;
+  - a caller that hands the dating rule another zone, or a change to that rule;
+  - everything the section above lists, the shortfall bullet aside.
+
+### The 8-K registration
+
+- Not changed by this section: the script computes no floor without `--forms`, and no file or number of the two `8-K` runs moves.
+- The same test on it: 94,922 s is above 79,302 s and above 79,342 s, by 15,620 s and 15,580 s. By this test the `8-K` scalar dated no on-time row of those two days before its index was written.

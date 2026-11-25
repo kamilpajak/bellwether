@@ -32,7 +32,13 @@ PROBE_ID_PREFIX = "edgar_index_write"
 
 ARCHIVES = "https://www.sec.gov/Archives"
 DAILY_INDEX = f"{ARCHIVES}/edgar/daily-index"
-FORM_TYPE = "8-K"
+# One registered form list per family, each in a dated section of PREREGISTRATION.md. A family
+# other than the first names itself in its probe_id and writes dated files beside the first's.
+DEFAULT_FAMILY = "8-K"
+FAMILIES = {
+    DEFAULT_FAMILY: ("8-K",),
+    "annual": ("10-K", "10-KT", "20-F", "40-F", "10-K/A", "10-KT/A", "20-F/A", "40-F/A"),
+}
 ZONE = "America/New_York"
 ACCEPTANCE_FIELD = "<ACCEPTANCE-DATETIME>"
 ACCEPTANCE_FORMAT = "%Y%m%d%H%M%S"
@@ -162,6 +168,24 @@ def budget_from(given: int) -> int:
     return given
 
 
+def probe_id_prefix(family: str) -> str:
+    return PROBE_ID_PREFIX if family == DEFAULT_FAMILY else f"{PROBE_ID_PREFIX}_{family}"
+
+
+def run_file(name: str, family: str, stamp: str) -> pathlib.Path:
+    """The first family's files keep the names its two runs were registered and read under."""
+    if family == DEFAULT_FAMILY:
+        return OUT.parent / name
+    stem, extension = name.rsplit(".", 1)
+    return OUT.parent / f"{stem}.{family}.{stamp}.{extension}"
+
+
+def unwritten(path: pathlib.Path) -> pathlib.Path:
+    if path.exists():
+        raise Aborted("result_exists", f"{path} holds an earlier run; this one would overwrite it")
+    return path
+
+
 def quarter_of(day: dt.date) -> int:
     return (day.month - 1) // 3 + 1
 
@@ -264,9 +288,11 @@ def sampled(rows: list[dict], k: int) -> list[dict]:
     """Evenly spaced over the day's rows in file order, decided before any instant is read: the
     file is ordered by form type and then company name, so the first k would be one end of it."""
     n = len(rows)
-    if n == 0:
-        return []
-    return [rows[min(i * n // k, n - 1)] for i in range(min(k, n))]
+    if n <= k:
+        # Below k the spacing rule repeats rows (n = 6: rows 0, 0, 1, 1, 2, 2); no 8-K day came
+        # near it (384 and 549 rows, 2026-11-13).
+        return list(rows)
+    return [rows[i * n // k] for i in range(k)]
 
 
 def acceptance_of(prefix: str, tz: ZoneInfo) -> dt.datetime | None:
@@ -298,7 +324,9 @@ def collect_day(
     listed: dict[str, dt.datetime],
     entries: dict[str, dict],
     tz: ZoneInfo,
+    family: str,
 ) -> dict:
+    forms = FAMILIES[family]
     url = index_url(day)
     status, headers, payload = vendor.get(url, INDEX_READ_CAP)
     require_ok(url, status, payload)
@@ -306,7 +334,7 @@ def collect_day(
         raise Aborted("index_truncated", f"{url} is larger than the {INDEX_READ_CAP} B read cap")
     text = payload.decode("utf-8", "replace")
     rows = index_rows(text)
-    of_form = [row for row in rows if row["form"] == FORM_TYPE]
+    of_form = [row for row in rows if row["form"] in forms]
     named = f"{day:%Y%m%d}"
     filings = []
     for row in sampled(of_form, SAMPLE_PER_DAY):
@@ -349,9 +377,12 @@ def collect_day(
                 "accepted_at": accepted.isoformat(),
             }
         )
+        if len(forms) > 1:
+            filings[-1]["form"] = row["form"]
     listed_instant = listed.get(index_name(day))
     header_instant = header_write_instant(headers)
     entry = entries.get(index_name(day), {})
+    by_form = {form: sum(1 for row in of_form if row["form"] == form) for form in forms}
     return {
         "day": day.isoformat(),
         "rows_in_index": len(rows),
@@ -363,6 +394,27 @@ def collect_day(
         "write_instant_listing": listed_instant.isoformat() if listed_instant else None,
         "last_data_received": last_data_received(text),
         "filings": filings,
+        # Which of a family's forms the day held at all: a form with 0 rows is dated by the
+        # registered scalar without one probe of its own.
+        **({"rows_by_form": by_form} if len(forms) > 1 else {}),
+    }
+
+
+def day_opens(named: dt.date, tz: ZoneInfo) -> dt.datetime:
+    return dt.datetime.combine(named, dt.time.min, tzinfo=tz).astimezone(dt.timezone.utc)
+
+
+def floors_of(days: list[dict], tz: ZoneInfo) -> dict[str, int]:
+    """Per day, the write instant minus the start of the day the file names. A backfilled on-time
+    row is dated no earlier than that start plus the scalar (pit::datedness::archive_observation),
+    so a scalar under this number dates it before the file that carried it was written."""
+    return {
+        day["day"]: int(
+            (
+                write_instant(day, tz)[0] - day_opens(dt.date.fromisoformat(day["day"]), tz)
+            ).total_seconds()
+        )
+        for day in days
     }
 
 
@@ -371,7 +423,7 @@ def inside_named_day(named: dt.date, written: dt.datetime, tz: ZoneInfo) -> None
     registration's own 'what this probe cannot settle' says would void it. A daily index whose
     last write is not the close of the day it names is a file that was rewritten, and then every
     lag taken from it is that rewrite's distance and not a publication lag."""
-    opens = dt.datetime.combine(named, dt.time.min, tzinfo=tz).astimezone(dt.timezone.utc)
+    opens = day_opens(named, tz)
     closes = opens + dt.timedelta(seconds=DAY_S + REWRITE_ALLOWANCE_S)
     if opens <= written <= closes:
         return
@@ -467,7 +519,7 @@ def per_day(days: list[dict]) -> list[dict]:
     ]
 
 
-def decide(days: list[dict], tz: ZoneInfo) -> dict:
+def decide(days: list[dict], tz: ZoneInfo, family: str) -> dict:
     """Every branch here is a row of PREREGISTRATION.md's outcome tables, plus the two the
     amendment dated 2026-11-13 in that same file adds: the registered scalar is the MAX of the
     per-filing lags and not their p90, and a day whose index carries no row of our form is its own
@@ -478,7 +530,7 @@ def decide(days: list[dict], tz: ZoneInfo) -> dict:
         return {
             "registered": None,
             "refused_because": "no_rows_of_form",
-            "detail": f"the index carried no {FORM_TYPE} row at all on {', '.join(empty)}; "
+            "detail": f"the index carried no {family} row at all on {', '.join(empty)}; "
             "the vendor's index holding nothing of our form and the documents not answering are "
             "two different facts and do not share a code",
             "probes": 0,
@@ -513,11 +565,21 @@ def decide(days: list[dict], tz: ZoneInfo) -> dict:
     # carried them existed. The registration's own asymmetry argument says this and then names
     # the p90; the p90 is reported beside it and decides nothing.
     seconds = max(lags)
+    floored: dict = {}
+    if family != DEFAULT_FAMILY:
+        floors = floors_of(days, tz)
+        floored = {
+            "max_lag_seconds": seconds,
+            "floor_seconds": floors,
+            "scalar_set_by": "index_day_floor" if max(floors.values()) > seconds else "max_lag",
+        }
+        seconds = max(seconds, *floors.values())
     p90 = quantile(lags, P90)
     band, meaning = band_of(seconds)
     return {
+        **floored,
         "registered": {
-            "probe_id": f"{PROBE_ID_PREFIX}-{dt.datetime.now(dt.timezone.utc):%Y%m%d}",
+            "probe_id": f"{probe_id_prefix(family)}-{dt.datetime.now(dt.timezone.utc):%Y%m%d}",
             "probes": usable,
             "leaks": sum(1 for lag in lags if lag > seconds),
             "seconds": seconds,
@@ -535,7 +597,7 @@ def decide(days: list[dict], tz: ZoneInfo) -> dict:
     }
 
 
-def report(days: list[dict], verdict: dict, spent: int, budget: int) -> None:
+def report(days: list[dict], verdict: dict, spent: int, budget: int, family: str) -> None:
     print(
         "construction: lag = (the instant the vendor states it last wrote form.<day>.idx) minus"
         f"\n  ({ACCEPTANCE_FIELD} of the filing, {ZONE} -> UTC), in whole seconds"
@@ -543,7 +605,7 @@ def report(days: list[dict], verdict: dict, spent: int, budget: int) -> None:
     for day in days:
         usable = [filing for filing in day["filings"] if "lag_seconds" in filing]
         print(
-            f"\n{day['day']}: {day['rows_of_form']} {FORM_TYPE} rows of {day['rows_in_index']} "
+            f"\n{day['day']}: {day['rows_of_form']} {family} rows of {day['rows_in_index']} "
             f"in the index, {day['rows_of_form_off_day']} of them carrying a Date Filed that is "
             "NOT this index's own day"
             f"\n  {day['bytes_downloaded']} B downloaded against {day['bytes_vendor_stated']!r} "
@@ -599,13 +661,22 @@ def report(days: list[dict], verdict: dict, spent: int, budget: int) -> None:
         f"\n  the vendor-movable quantity beside the lag is the off-day row count printed per day "
         "above: those rows are what makes a max days rather than hours"
     )
+    if "scalar_set_by" in verdict:
+        print(
+            f"\n  the registered lag is the larger of the max per-filing lag, "
+            f"{verdict['max_lag_seconds']} s, and the floor per day (write instant minus the "
+            f"start of the named day in {ZONE}), {verdict['floor_seconds']}: set by "
+            f"{verdict['scalar_set_by']}"
+        )
     print(f"\npit::MeasuredLag to pass to EdgarPress::with_observation_lag:\n  {json.dumps(lag)}")
 
 
-def write_result(collected: list[dict], verdict: dict, vendor: Vendor) -> None:
+def write_result(
+    collected: list[dict], verdict: dict, vendor: Vendor, family: str, out: pathlib.Path
+) -> None:
     """Written whether the run finished or aborted, so a refused run is still a record of what it
     cost: the project's own rule that an attempt row exists whether or not anything came back."""
-    OUT.write_text(
+    out.write_text(
         json.dumps(
             {
                 "fetched_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -616,9 +687,12 @@ def write_result(collected: list[dict], verdict: dict, vendor: Vendor) -> None:
                     "publication": f"{ACCEPTANCE_FIELD} parsed {ACCEPTANCE_FORMAT} in {ZONE}",
                     "observation": f"the vendor's stated last write of form.<day>.idx, the "
                     f"{LASTMOD_NOTE} cross-read against the quarter listing",
-                    "form_types": [FORM_TYPE],
+                    "form_types": list(FAMILIES[family]),
                     "sample_rule": f"row floor(i x n / {SAMPLE_PER_DAY}) in index file order",
-                    "scalar_definition": "the MAX of the per-filing lags (amendment 2026-11-13)",
+                    "scalar_definition": "the MAX of the per-filing lags (amendment 2026-11-13)"
+                    if family == DEFAULT_FAMILY
+                    else "the larger of the MAX of the per-filing lags and the per-day floor "
+                    "(sections dated 2026-11-25)",
                     "p90_definition": f"index min(floor({P90} x n), n - 1) ascending",
                     "tolerance_seconds": TOLERANCE_S,
                     "rewrite_allowance_seconds": REWRITE_ALLOWANCE_S,
@@ -632,12 +706,17 @@ def write_result(collected: list[dict], verdict: dict, vendor: Vendor) -> None:
             indent=1,
         )
     )
-    print(f"\nwritten {OUT} after {vendor.spent} requests")
+    print(f"\nwritten {out} after {vendor.spent} requests")
 
 
 def run(args: argparse.Namespace) -> int:
     days = days_from(args.days)
     tz = zone()
+    family = args.forms
+    stamp = f"{dt.datetime.now(dt.timezone.utc):%Y%m%d}"
+    out = run_file(OUT.name, family, stamp)
+    if family != DEFAULT_FAMILY:
+        unwritten(out)
     vendor = Vendor(contact_from_env(), budget_from(args.budget))
     collected: list[dict] = []
     verdict: dict = {
@@ -655,13 +734,15 @@ def run(args: argparse.Namespace) -> int:
             # The vendor payload as received. `collect` wants the quarter listing as a hashed
             # FILE it is handed (architecture.md section 10), and this is the one request in the
             # tree that fetches it, so the bytes are kept rather than re-fetched.
-            listing_copy = OUT.parent / f"quarter_index.{quarter[0]}Q{quarter[1]}.json"
+            listing_copy = run_file(
+                f"quarter_index.{quarter[0]}Q{quarter[1]}.json", family, stamp
+            )
             listing_copy.write_bytes(payload)
             entries.update(listed_entries(payload))
         listed = listed_write_instants(entries, tz)
-        collected = [collect_day(vendor, day, listed, entries, tz) for day in days]
-        verdict = decide(collected, tz)
-        report(collected, verdict, vendor.spent, vendor.budget)
+        collected = [collect_day(vendor, day, listed, entries, tz, family) for day in days]
+        verdict = decide(collected, tz, family)
+        report(collected, verdict, vendor.spent, vendor.budget, family)
         # 1 is "the answer is no": the probe ran and registered nothing. Every abort exits 2.
         return 0 if verdict["registered"] is not None else 1
     except Aborted as why:
@@ -672,7 +753,7 @@ def run(args: argparse.Namespace) -> int:
         }
         raise
     finally:
-        write_result(collected, verdict, vendor)
+        write_result(collected, verdict, vendor, family, out)
 
 
 def main() -> int:
@@ -683,6 +764,12 @@ def main() -> int:
         type=int,
         default=DEFAULT_BUDGET,
         help=f"request ceiling, lowering only: a value over {DEFAULT_BUDGET} is refused",
+    )
+    ap.add_argument(
+        "--forms",
+        choices=sorted(FAMILIES),
+        default=DEFAULT_FAMILY,
+        help="a registered form family; an unregistered form list cannot be passed",
     )
     try:
         return run(ap.parse_args())
