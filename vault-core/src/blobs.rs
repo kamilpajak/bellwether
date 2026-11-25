@@ -1428,7 +1428,7 @@ mod tests {
     fn a_plain_store_refuses_a_dictionary_and_writes_a_frame_naming_none() -> TestResult {
         let temp = TempDir::new()?;
         let store = BlobStore::new(temp.path(), WritePolicy::PlainZstd);
-        let refused = store.activate(&store.store_dictionary(RUN, &trained(&["prn", "gnw"])?)?);
+        let refused = store.activate(&store.store_dictionary(RUN, b"a dictionary")?);
         let digest = store.put(RUN, PAYLOAD)?;
         let back = store.read_copy(&digest, Encoding::Zstd)?;
         assert!(
