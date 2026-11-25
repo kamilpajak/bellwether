@@ -34,8 +34,6 @@ pub const LEVEL: i32 = 9;
 /// What marks a compressed file is its name, never its bytes: a payload a server sent as zstd
 /// starts with zstd's own magic number and is stored raw all the same.
 pub const COMPRESSED_SUFFIX: &str = ".zst";
-/// The largest dictionary `dictionary train` writes: the zstd 1.5.7 CLI's `--maxdict` default.
-pub const DICTIONARY_BYTES: usize = 112_640;
 /// A zstd skippable frame, magic nibble `E`, holding the dictionary's sha256 or nothing.
 const HEADER_MAGIC: u32 = 0x184D_2A5E;
 const HEADER_FIELDS: usize = 8;

@@ -12,7 +12,7 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use vault_core::BlobError;
 
-use crate::blobs::{BlobStore, Encoding, Listed, ReadBack, DICTIONARY_BYTES, LEVEL};
+use crate::blobs::{BlobStore, Encoding, Listed, ReadBack, LEVEL};
 use crate::store::{self, Committer, DictionaryRow, StoreError, Trained, COMMIT_LOG};
 
 pub const VERIFY_SCHEMA: &str = "newsvault.blobs.verify/1";
@@ -25,6 +25,8 @@ pub const DEFAULT_HOLDOUT: usize = 500;
 /// Each sample's first bytes only: the samples are held once, in one buffer, at most
 /// `--samples` × 128 KiB (256 MiB at the default); held-out payloads are read one at a time.
 pub const SAMPLE_PREFIX: usize = 131_072;
+/// The largest dictionary `dictionary train` writes: the zstd 1.5.7 CLI's `--maxdict` default.
+const DICTIONARY_BYTES: usize = 112_640;
 pub const DEFAULT_FAILURES_SHOWN: usize = 20;
 
 #[derive(Debug, thiserror::Error)]
