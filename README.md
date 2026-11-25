@@ -110,6 +110,9 @@ Three commands fetch from a vendor and write what came back to the store:
   hosts file.
 - `roster fetch`: SEC's daily company file as received, after SEC's robots.txt, under attempt rows
   of its own; no item rows. `roster show --at` names the copy current at an instant.
+- Each takes `--pace-root`, an existing absolute directory whose `pace/` holds the pace files of
+  every command that sends; without it, the store. Where it is mounted and why:
+  `docs/design/architecture.md` §12.2.
 - An open-web `collect`, dry run included, is refused `robots_unverified` (exit 4) until a
   `robots refresh` without `--dry-run` has ledgered a fetch of each admitted host matching its pin.
 
