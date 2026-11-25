@@ -153,9 +153,8 @@ pub struct Pace {
 }
 
 impl Pace {
-    /// `<store>/pace/<source>.per-ip` or `<store>/pace/<host>.per-host` — beside the archive the
-    /// run writes, never a system directory. The hole that leaves is named in row R19: one host
-    /// running two stores holds two pace files and therefore two buckets.
+    /// `<pace root>/pace/<source>.per-ip` or `<pace root>/pace/<host>.per-host`; `store` is the
+    /// pace root, which is the store only when no other was named (architecture.md section 12.2).
     #[must_use]
     pub fn beside_the_store(store: &Path, scope: &BudgetScope, min_interval: Duration) -> Self {
         Self {
@@ -302,8 +301,8 @@ enum Slot {
     },
 }
 
-/// `<store>/pace/<host>.hold`: the instant a server's `Retry-After` holds one host until, read by
-/// every later run and process on the store (S7-D7). Raised by an answer, never lowered; the
+/// `<pace root>/pace/<host>.hold`: the instant a server's `Retry-After` holds one host until, read
+/// by every later run and process on the pace root (S7-D7). Raised by an answer, never lowered; the
 /// caller caps what it writes, so the file holds no instant past that cap.
 #[derive(Debug)]
 pub struct Hold {
@@ -366,7 +365,7 @@ impl Hold {
     }
 }
 
-/// `<store>/pace/<bucket file>.sent`: the `requested_at` of the last call through one bucket. A
+/// `<pace root>/pace/<bucket file>.sent`: the `requested_at` of the last call through one bucket. A
 /// slot counts from its reservation, and a call leaves after its attempt row is written: two
 /// consecutive `requested_at` of one 7 s host were 5.93 s apart on production, 2026-11-20/21.
 #[derive(Debug)]

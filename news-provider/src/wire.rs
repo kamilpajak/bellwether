@@ -1030,7 +1030,7 @@ mod tests {
     const ELAPSED: Duration = Duration::from_millis(60);
     const EXPECTED_WAIT: Duration = Duration::from_millis(40);
     const NO_WAIT: Duration = Duration::ZERO;
-    /// `<store>/pace/<source>.per-ip`, the per-IP layout `BudgetScope::file_name` states.
+    /// `<pace root>/pace/<source>.per-ip`, the per-IP layout `BudgetScope::file_name` states.
     const PACE_FILE: &str = "pace/edgar_press.per-ip";
     /// `RESERVED_AT` plus `TEST_INTERVAL`, in the form the pace file is written in.
     const RESERVED_UNTIL: &str = "2026-11-10T13:00:00.100000Z";
@@ -2626,7 +2626,7 @@ mod tests {
     /// Where host A's 120 s `Retry-After` is held, beside its pace file (S7-D7).
     const LOOPBACK_HOLD_FILE: &str = "127.0.0.1.hold";
 
-    /// Every file under `<store>/pace/`, sorted.
+    /// Every file under `<pace root>/pace/`, sorted.
     fn pace_files(store: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let mut files: Vec<String> = std::fs::read_dir(store.join(PACE_DIR))?
             .map(|entry| entry.map(|found| found.file_name().to_string_lossy().into_owned()))
@@ -3029,7 +3029,7 @@ mod tests {
         Ok(())
     }
 
-    /// Every file under `<store>/pace/` with its bytes.
+    /// Every file under `<pace root>/pace/` with its bytes.
     fn pace_bytes(
         store: &Path,
     ) -> Result<std::collections::BTreeMap<String, Vec<u8>>, Box<dyn std::error::Error>> {
