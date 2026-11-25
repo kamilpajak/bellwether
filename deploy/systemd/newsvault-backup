@@ -6,10 +6,11 @@
 # `modelgate snapshot` under the shadow lock, `modelgate verify` of the copy, one .tar.gz of it.
 # Each file is written into the data directory through the AIO container as www-data and renamed,
 # the folder registered with `occ files:scan`, each file found by `occ info:file`, then all but the
-# 7 newest .tar.gz of that store deleted. No pack or manifest is ever deleted. Exits: 2 setup or an
-# unsafe setting, 4 an absent input, 7 a held lock, a snapshot past its bound, a read, write,
-# rename, scan or lookup, 8 the copy is in and the retention failed or a pack is lost or
-# unrecorded; else the snapshot's, pack's or verify's own.
+# 7 newest .tar.gz of that store deleted. No pack or manifest is ever deleted. A work directory an
+# earlier run of the same store left is removed first: the units start one run of a store at a
+# time. Exits: 2 setup or an unsafe setting, 4 an absent input, 7 a held lock, a snapshot past its
+# bound, a read, write, rename, scan or lookup, 8 the copy is in and the retention failed or a pack
+# is lost or unrecorded; else the snapshot's, pack's or verify's own.
 set -u
 export LC_ALL=C
 : "${NEWSVAULT_IMAGE:?set in newsvault.env}" "${NEWSVAULT_TEXTFILE_DIR:?set in newsvault.env}"
@@ -97,7 +98,8 @@ folder() {
 }
 
 mkdir -p "$HOME/.cache/bellwether" || exit 2
-work=$(mktemp -d "$HOME/.cache/bellwether/backup.XXXXXX") || exit 2
+rm -rf "$HOME/.cache/bellwether/backup-$what".* || exit 2
+work=$(mktemp -d "$HOME/.cache/bellwether/backup-$what.XXXXXX") || exit 2
 staged=''
 # $staged is split into paths: `check` admits no blank or glob character in any part of them.
 # shellcheck disable=SC2086
@@ -147,15 +149,19 @@ else
     docker run "$@" "$NEWSVAULT_IMAGE" \
         snapshot --out /out/commit.sqlite3 --non-interactive --format json || exit
     folder
-    # What the folder holds, for `blobs pack` to judge: each pack's length, then every manifest.
-    if ! docker exec -u www-data "$container" sh -c 'cd "$1" || exit; for f in "$2"-*.tar; do [ -f "$f" ] || continue; printf "%s " "$f"; wc -c <"$f" || exit; done' \
+    # What the folder holds, for `blobs pack` to judge: each pack's length and sha256, then every
+    # manifest under its own name. Only www-data reads the data directory, so the container's
+    # sha256sum reads the packs and its tar carries the manifests out.
+    mkdir "$work/manifests" || exit 2
+    if ! docker exec -u www-data "$container" sh -c 'cd "$1" || exit; for f in "$2"-*.tar; do [ -f "$f" ] || continue; n=$(wc -c <"$f") && s=$(sha256sum <"$f") || exit; echo "$f" $n "${s%% *}"; done' \
         sh "$dir" "$packs" >"$work/have" ||
-        ! docker exec -u www-data "$container" sh -c 'cd "$1" || exit; for f in "$2"-*.tar.manifest; do [ -f "$f" ] || continue; cat "$f" || exit; done' \
-            sh "$dir" "$packs" >"$work/manifests"; then
+        ! docker exec -u www-data "$container" sh -c 'cd "$1" || exit; set -- "$2"-*.tar.manifest; [ -f "$1" ] || exit 0; tar -cf - "$@"' \
+            sh "$dir" "$packs" >"$work/manifests.tar" ||
+        { [ -s "$work/manifests.tar" ] && ! tar -xf "$work/manifests.tar" -C "$work/manifests"; }; then
         echo "reading the packs and manifests in $dir failed" >&2
         exit 7
     fi
-    while read -r _ length; do held=$((held + length)); done <"$work/have"
+    while read -r _ length _; do held=$((held + length)); done <"$work/have"
     docker run "$@" "$NEWSVAULT_IMAGE" \
         blobs pack --log /out/commit.sqlite3 --have /out/have --manifests /out/manifests \
         --out "/out/$pack" --non-interactive --format json
@@ -253,6 +259,6 @@ if [ "$#" -gt 0 ]; then
 fi
 echo "wrote $name, $bytes bytes, to $scanned; kept the $keep newest${packs:+; the packs hold $held bytes}"
 if [ "$packed" = 8 ]; then
-    echo "a pack in $dir is lost, of another length or has no manifest: blobs pack names it above; tonight's pack holds its blobs again and nothing was deleted" >&2
+    echo "a pack in $dir is lost, of another length or sha256, or has no whole manifest: blobs pack names it above; tonight's pack holds its blobs again and no pack or manifest was deleted" >&2
     exit 8
 fi

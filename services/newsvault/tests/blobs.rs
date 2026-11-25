@@ -719,9 +719,10 @@ fn night(work: &Path, stamp: &str, exit: i32) -> Result<Output, Box<dyn Error>> 
         .current_dir(work)
         .env_clear()
         .env("HOME", work.join("home"))
+        // macOS keeps `sha256sum` in /sbin.
         .env(
             "PATH",
-            format!("{}:/usr/bin:/bin", work.join("stub/bin").display()),
+            format!("{}:/usr/bin:/bin:/sbin", work.join("stub/bin").display()),
         )
         .env("NEWSVAULT_IMAGE", "newsvault:test")
         .env("NEWSVAULT_TEXTFILE_DIR", work.join("textfile"))
@@ -751,17 +752,21 @@ fn names(dir: &Path) -> Result<Vec<String>, Box<dyn Error>> {
 
 /// What the script reads from the folder for `blobs pack`, as `[have, manifests]` in `into`.
 fn folder_facts(folder: &Path, into: &Path) -> Result<[PathBuf; 2], Box<dyn Error>> {
-    let (mut have, mut manifests) = (String::new(), String::new());
+    let facts = [into.join("have"), into.join("manifests")];
+    if facts[1].exists() {
+        std::fs::remove_dir_all(&facts[1])?;
+    }
+    std::fs::create_dir(&facts[1])?;
+    let mut have = String::new();
     for name in names(folder)? {
         if name.ends_with(".tar") {
-            have += &format!("{name} {}\n", std::fs::metadata(folder.join(&name))?.len());
+            let bytes = std::fs::read(folder.join(&name))?;
+            have += &format!("{name} {} {}\n", bytes.len(), sha256(&bytes));
         } else if name.ends_with(".tar.manifest") {
-            manifests += &std::fs::read_to_string(folder.join(&name))?;
+            std::fs::copy(folder.join(&name), facts[1].join(&name))?;
         }
     }
-    let facts = [into.join("have"), into.join("manifests")];
     std::fs::write(&facts[0], have)?;
-    std::fs::write(&facts[1], manifests)?;
     Ok(facts)
 }
 
@@ -817,7 +822,8 @@ fn strings(value: &Value) -> Vec<String> {
 }
 
 /// Section 8 row B3. The first night packs the dictionary and every blob, the second only the
-/// two blobs indexed since, the third none; no log archive holds a blob. The newest archive and
+/// two blobs indexed and compressed since, without their dictionary again, the third none; no
+/// log archive holds a blob. The newest archive and
 /// every pack, unpacked, are a store `blobs verify` accepts, and a dry run over the restored log
 /// finds nothing the packs lack.
 #[test]
@@ -830,6 +836,7 @@ fn each_night_packs_only_what_no_pack_holds_and_the_restore_verifies() -> TestRe
             let db = Connection::open(root.path().join(COMMIT_LOG))?;
             index_raw(root.path(), &db, b"a page indexed after the first night")?;
             index_raw(root.path(), &db, b"and another one")?;
+            newsvault(root.path(), &["blobs", "compress"])?;
         }
         night(work.path(), stamp, 0)?;
     }
@@ -866,8 +873,10 @@ fn each_night_packs_only_what_no_pack_holds_and_the_restore_verifies() -> TestRe
             report["indexed"].clone(),
             (
                 planned.status.code(),
+                plan["named"].as_u64(),
                 plan["held"].as_u64(),
-                plan["packed"].as_u64()
+                plan["packed"].as_u64(),
+                plan["dry_run"].as_bool(),
             ),
         ),
         (
@@ -878,20 +887,40 @@ fn each_night_packs_only_what_no_pack_holds_and_the_restore_verifies() -> TestRe
             false,
             (Some(0), Some(count + 2)),
             serde_json::json!({"rows": count + 2, "absent": 0, "length_differs": 0}),
-            (Some(0), Some(count + 3), Some(0)),
+            (
+                Some(0),
+                Some(count + 3),
+                Some(count + 3),
+                Some(0),
+                Some(true)
+            ),
         )
     );
     Ok(())
 }
 
-/// Section 8 row B3. A pack that is gone, one of another length, a manifest with no `end` line
-/// and a pack with no manifest: a dry run names each and counts every member as unpacked; the
-/// next night exits 8 naming it, deletes nothing and packs the members again, after which the
-/// packs that count restore to a store `blobs verify` accepts.
+/// Section 8 row B3. A pack that is gone, of another length or of other bytes at the same
+/// length, a manifest that is not whole (no `end` line, cut mid-line, a second blank in a line,
+/// another count, a line after `end`, another pack's name) and a pack with no manifest: a dry run names each, in
+/// both renderings, and answers no with every member unpacked; the next night exits 8 naming it,
+/// deletes no pack or manifest and packs the members again, after which the packs that count
+/// restore to a store `blobs verify` accepts.
 #[test]
 fn a_lost_short_or_unrecorded_pack_is_named_and_its_blobs_are_packed_again() -> TestResult {
+    const DAMAGES: [&str; 10] = [
+        "gone",
+        "short",
+        "altered",
+        "cut",
+        "torn",
+        "spaced",
+        "miscounted",
+        "trailing",
+        "misnamed",
+        "unrecorded",
+    ];
     let mut got = Vec::new();
-    for damage in ["gone", "short", "cut", "unrecorded"] {
+    for damage in DAMAGES {
         let (root, _, _) = compressed_store()?;
         let work = backup_bench(root.path())?;
         let folder = work.path().join(FOLDER);
@@ -900,22 +929,41 @@ fn a_lost_short_or_unrecorded_pack_is_named_and_its_blobs_are_packed_again() -> 
             folder.join(PACK_1),
             folder.join(format!("{PACK_1}.manifest")),
         );
+        let text = std::fs::read_to_string(&manifest)?;
+        let ended = text.rsplit_once("end ").map_or("", |(kept, _)| kept);
         match damage {
             "gone" => std::fs::remove_file(&tar)?,
             "short" => std::fs::write(&tar, "cut")?,
-            "cut" => {
-                let text = std::fs::read_to_string(&manifest)?;
-                std::fs::write(
-                    &manifest,
-                    text.rsplit_once("end ").map_or("", |(kept, _)| kept),
-                )?;
+            "altered" => {
+                let mut bytes = std::fs::read(&tar)?;
+                if let Some(byte) = bytes.last_mut() {
+                    *byte ^= 1;
+                }
+                std::fs::write(&tar, bytes)?;
             }
+            "cut" => std::fs::write(&manifest, ended)?,
+            "torn" => std::fs::write(&manifest, &text[..text.len() / 2])?,
+            "spaced" => std::fs::write(&manifest, text.replacen("blob ", "blob  ", 1))?,
+            "miscounted" => std::fs::write(&manifest, format!("{ended}end 0\n"))?,
+            "trailing" => std::fs::write(&manifest, format!("{text}blob abcd\n"))?,
+            "misnamed" => std::fs::write(&manifest, text.replacen(PACK_1, PACK_2, 1))?,
             _ => std::fs::remove_file(&manifest)?,
         }
         let before = names(&folder)?;
         let log = root.path().join(COMMIT_LOG);
         let facts = folder_facts(&folder, work.path())?;
-        let plan = answered(&pack(root.path(), &log, &facts, &["--dry-run"])?)?;
+        let planned = pack(root.path(), &log, &facts, &["--dry-run"])?;
+        let plan = answered(&planned)?;
+        let human = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+            .args(["blobs", "pack", "--dry-run", "--store"])
+            .arg(root.path())
+            .arg("--log")
+            .arg(&log)
+            .arg("--have")
+            .arg(&facts[0])
+            .arg("--manifests")
+            .arg(&facts[1])
+            .output()?;
         let second = night(work.path(), NIGHTS[1], 8)?;
         let after = names(&folder)?;
         let healed = pack(
@@ -928,11 +976,13 @@ fn a_lost_short_or_unrecorded_pack_is_named_and_its_blobs_are_packed_again() -> 
         let (restored, _) = restore(&folder, &lost)?;
         got.push((
             damage,
+            planned.status.code(),
             (
                 strings(&plan["lost"]),
                 strings(&plan["unrecorded"]),
                 plan["packed"].as_u64(),
             ),
+            String::from_utf8_lossy(&human.stdout).contains(PACK_1),
             String::from_utf8_lossy(&second.stdout).contains(&format!("\"{PACK_1}\"")),
             before.iter().all(|name| after.contains(name)) && after.len() == before.len() + 3,
             (healed.status.code(), answered(&healed)?["packed"].as_u64()),
@@ -943,35 +993,41 @@ fn a_lost_short_or_unrecorded_pack_is_named_and_its_blobs_are_packed_again() -> 
     }
     let all = Some(u64::try_from(pages()?.len())? + 1);
     let (named, none) = (vec![PACK_1.to_owned()], Vec::<String>::new());
-    let row = |damage, lost: &Vec<String>, unrecorded: &Vec<String>| {
-        (
-            damage,
-            (lost.clone(), unrecorded.clone(), all),
-            true,
-            true,
-            (Some(8), Some(0)),
-            Some(0),
-        )
-    };
-    assert_eq!(
-        got,
-        vec![
-            row("gone", &named, &none),
-            row("short", &named, &none),
-            row("cut", &named, &none),
-            row("unrecorded", &none, &named),
-        ]
-    );
+    let expected: Vec<_> = DAMAGES
+        .iter()
+        .map(|damage| {
+            let (lost, unrecorded) = match *damage {
+                "unrecorded" => (none.clone(), named.clone()),
+                _ => (named.clone(), none.clone()),
+            };
+            (
+                *damage,
+                Some(1),
+                (lost, unrecorded, all),
+                true,
+                true,
+                true,
+                (Some(8), Some(0)),
+                Some(0),
+            )
+        })
+        .collect();
+    assert_eq!(got, expected);
     Ok(())
 }
 
-/// A blob the log names that is gone, or that no longer reads back to its digest, ends the pack
-/// by name with stdout empty and neither file written; one a pack already holds is not read.
+/// A blob the log names that is gone, that no longer reads back to its digest or that is no
+/// zstd frame ends the pack by name with stdout empty and neither file written; one a pack
+/// already holds is not read.
 #[test]
 fn a_named_blob_that_is_gone_or_altered_ends_the_pack_by_name_unless_a_pack_holds_it() -> TestResult
 {
     let mut got = Vec::new();
-    for (altered, exit, code) in [(false, 4, "input_absent"), (true, 2, "input_unparseable")] {
+    for (damage, exit, code) in [
+        (None, 4, "input_absent"),
+        (Some(frame_of(b"other bytes")?), 2, "input_unparseable"),
+        (Some(b"no frame".to_vec()), 2, "input_unparseable"),
+    ] {
         let (root, pages, _) = compressed_store()?;
         let (out, nothing) = (TempDir::new()?, TempDir::new()?);
         let log = root.path().join(COMMIT_LOG);
@@ -979,10 +1035,9 @@ fn a_named_blob_that_is_gone_or_altered_ends_the_pack_by_name_unless_a_pack_hold
         let tar = out.path().join(PACK_1).display().to_string();
         let first = pack(root.path(), &log, &empty, &["--out", &tar])?;
         let hex = sha256(&pages[0]);
-        if altered {
-            std::fs::write(zst_path(root.path(), &hex), frame_of(b"other bytes")?)?;
-        } else {
-            std::fs::remove_file(zst_path(root.path(), &hex))?;
+        match damage {
+            Some(bytes) => std::fs::write(zst_path(root.path(), &hex), bytes)?,
+            None => std::fs::remove_file(zst_path(root.path(), &hex))?,
         }
         let held = folder_facts(out.path(), out.path())?;
         let again = out.path().join(PACK_2).display().to_string();
@@ -1014,7 +1069,7 @@ fn a_named_blob_that_is_gone_or_altered_ends_the_pack_by_name_unless_a_pack_hold
             exit,
         )
     };
-    assert_eq!(got, vec![row(4), row(2)]);
+    assert_eq!(got, vec![row(4), row(2), row(2)]);
     Ok(())
 }
 
@@ -1042,6 +1097,7 @@ fn a_dictionary_a_packed_blob_names_is_packed_with_it_when_the_log_has_no_row() 
     assert_eq!(
         (
             packed.status.code(),
+            (report["pack"].as_str(), report["changed"].as_bool()),
             report["named"].as_u64(),
             report["packed"].as_u64(),
             report["pack_bytes"].as_u64(),
@@ -1052,6 +1108,7 @@ fn a_dictionary_a_packed_blob_names_is_packed_with_it_when_the_log_has_no_row() 
         ),
         (
             Some(0),
+            (Some(PACK_1), Some(true)),
             Some(count),
             Some(count + 1),
             Some(std::fs::metadata(&tar)?.len()),
@@ -1063,7 +1120,9 @@ fn a_dictionary_a_packed_blob_names_is_packed_with_it_when_the_log_has_no_row() 
 }
 
 /// A writer needs its active dictionary's file before any blob names it, so a dictionary the
-/// log records is packed from its row: here every blob is still raw.
+/// log records is packed from its row: here every blob is still raw. A dry run given `--out`
+/// writes nothing and answers no; a dictionary of other bytes, or one that is gone, ends the
+/// pack by name with neither file written.
 #[test]
 fn a_dictionary_no_blob_names_yet_is_packed_from_the_logs_row() -> TestResult {
     let (root, pages) = legacy_store()?;
@@ -1072,6 +1131,9 @@ fn a_dictionary_no_blob_names_yet_is_packed_from_the_logs_row() -> TestResult {
     let facts = folder_facts(out.path(), out.path())?;
     let tar = out.path().join(PACK_1).display().to_string();
     let log = root.path().join(COMMIT_LOG);
+    let planned = pack(root.path(), &log, &facts, &["--dry-run", "--out", &tar])?;
+    let plan = answered(&planned)?;
+    let planned_only = !Path::new(&tar).exists() && plan["pack"].is_null();
     let packed = pack(root.path(), &log, &facts, &["--out", &tar])?;
     let restored = TempDir::new()?;
     let unpacked = Command::new("tar")
@@ -1079,64 +1141,95 @@ fn a_dictionary_no_blob_names_yet_is_packed_from_the_logs_row() -> TestResult {
         .arg(restored.path())
         .status()?;
     let dictionary = trained["dictionary"].as_str().unwrap_or_default();
+    let stored = root.path().join("blobs/dictionaries").join(dictionary);
+    let kept = std::fs::read(&stored).ok();
+    let again = out.path().join(PACK_2).display().to_string();
+    let mut refusals = Vec::new();
+    for altered in [true, false] {
+        if altered {
+            std::fs::write(&stored, "other bytes")?;
+        } else {
+            std::fs::remove_file(&stored)?;
+        }
+        let refused = pack(root.path(), &log, &facts, &["--out", &again])?;
+        let error: Value = serde_json::from_slice(&refused.stderr)?;
+        refusals.push((
+            refused.status.code(),
+            error["code"].as_str().map(str::to_owned),
+            error["message"]
+                .as_str()
+                .is_some_and(|said| said.contains(dictionary)),
+            names(out.path())?
+                .iter()
+                .any(|name| name.starts_with(PACK_2)),
+        ));
+    }
+    let refusal = |exit, code: &str| (Some(exit), Some(code.to_owned()), true, false);
     assert_eq!(
         (
+            (
+                planned.status.code(),
+                planned_only,
+                plan["dry_run"].as_bool()
+            ),
             packed.status.code(),
             answered(&packed)?["packed"].as_u64(),
             unpacked.success(),
             std::fs::read(restored.path().join("blobs/dictionaries").join(dictionary)).ok(),
+            refusals,
         ),
         (
+            (Some(1), true, Some(true)),
             Some(0),
             Some(u64::try_from(pages.len())? + 1),
             true,
-            std::fs::read(root.path().join("blobs/dictionaries").join(dictionary)).ok(),
+            kept,
+            vec![refusal(2, "input_unparseable"), refusal(4, "input_absent")],
         )
     );
     Ok(())
 }
 
-/// Each refusal exits by its code with stdout empty: no `--out` outside a dry run, an input file
-/// that is absent, a line of either that is not of its shape, and an `--out` that exists.
+/// Each refusal exits by its code with stdout empty: no `--out` outside a dry run, an input that
+/// is absent, a listing line that is not three words, and an `--out` or its manifest that
+/// exists, which is left as it was.
 #[test]
 fn each_pack_refusal_exits_by_its_code_with_stdout_empty() -> TestResult {
+    const KEPT: &str = "a manifest that was there";
     let (root, _) = legacy_store()?;
     let out = TempDir::new()?;
     let at = |name: &str| out.path().join(name);
     let log = root.path().join(COMMIT_LOG);
     let good = folder_facts(out.path(), out.path())?;
     for (name, text) in [
-        ("bad-have", "one-word\n"),
-        ("bad-manifests", "blob abcd\n"),
+        ("one-word", "one-word\n"),
+        ("two-words", "p.tar 1\n"),
+        ("four-words", "p.tar 1 ab cd\n"),
         ("taken", ""),
+        ("fresh.tar.manifest", KEPT),
     ] {
         std::fs::write(at(name), text)?;
     }
-    let (tar, taken) = (
-        at(PACK_1).display().to_string(),
-        at("taken").display().to_string(),
-    );
-    let mut got = Vec::new();
-    for (log, facts, extra) in [
+    let shown = |name: &str| at(name).display().to_string();
+    let (tar, taken, fresh) = (shown(PACK_1), shown("taken"), shown("fresh.tar"));
+    let listed = |name: &str| ([at(name), good[1].clone()], vec!["--dry-run"]);
+    let mut asks = vec![
         (log.clone(), good.clone(), vec![]),
         (at("no-log"), good.clone(), vec!["--out", tar.as_str()]),
         (
             log.clone(),
-            [at("no-have"), good[1].clone()],
+            [good[0].clone(), at("none")],
             vec!["--dry-run"],
         ),
-        (
-            log.clone(),
-            [at("bad-have"), good[1].clone()],
-            vec!["--dry-run"],
-        ),
-        (
-            log.clone(),
-            [good[0].clone(), at("bad-manifests")],
-            vec!["--dry-run"],
-        ),
-        (log, good.clone(), vec!["--out", taken.as_str()]),
-    ] {
+        (log.clone(), good.clone(), vec!["--out", taken.as_str()]),
+        (log.clone(), good.clone(), vec!["--out", fresh.as_str()]),
+    ];
+    for name in ["no-have", "one-word", "two-words", "four-words"] {
+        let (facts, extra) = listed(name);
+        asks.push((log.clone(), facts, extra));
+    }
+    let mut got = Vec::new();
+    for (log, facts, extra) in asks {
         let refused = pack(root.path(), &log, &facts, &extra)?;
         let code = serde_json::from_slice::<Value>(&refused.stderr)
             .ok()
@@ -1145,15 +1238,26 @@ fn each_pack_refusal_exits_by_its_code_with_stdout_empty() -> TestResult {
     }
     let coded = |exit, code: &str| (Some(exit), true, Some(code.to_owned()));
     assert_eq!(
-        got,
-        vec![
-            (Some(2), true, None),
-            coded(4, "input_absent"),
-            coded(4, "input_absent"),
-            coded(2, "input_unparseable"),
-            coded(2, "input_unparseable"),
-            coded(2, "invalid_argument"),
-        ]
+        (
+            got,
+            std::fs::read_to_string(at("fresh.tar.manifest"))?,
+            at("fresh.tar").exists(),
+        ),
+        (
+            vec![
+                (Some(2), true, None),
+                coded(4, "input_absent"),
+                coded(4, "input_absent"),
+                coded(2, "invalid_argument"),
+                coded(2, "invalid_argument"),
+                coded(4, "input_absent"),
+                coded(2, "input_unparseable"),
+                coded(2, "input_unparseable"),
+                coded(2, "input_unparseable"),
+            ],
+            KEPT.to_owned(),
+            false,
+        )
     );
     Ok(())
 }

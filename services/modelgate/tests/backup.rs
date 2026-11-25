@@ -214,7 +214,7 @@ fn id(flag: &str) -> TestResult<String> {
 
 /// A recorded `docker run` with the staging directory's `mktemp` suffix replaced by its template.
 fn staging_named(run: &str) -> String {
-    const MARK: &str = "/backup.";
+    const MARK: &str = "/backup-modelgate.";
     const SUFFIX: usize = 6;
     match run.split_once(MARK) {
         Some((before, after)) if after.len() >= SUFFIX => {
@@ -471,7 +471,7 @@ fn the_archive_is_the_database_and_its_named_blobs_and_a_restore_verifies_with_t
              --mount type=bind,src={staging},dst=/out{mounts} newsvault:test -- \
              /usr/local/bin/modelgate {command} --non-interactive --format json",
             staging = backed
-                .path("home/.cache/bellwether/backup.XXXXXX")
+                .path("home/.cache/bellwether/backup-modelgate.XXXXXX")
                 .display()
         )
     };
@@ -519,6 +519,11 @@ fn the_archive_is_the_database_and_its_named_blobs_and_a_restore_verifies_with_t
             families,
             std::fs::read_to_string(backed.path("textfile").join(VAULT_PROM))?,
             names(&backed.path("home/.cache/bellwether")),
+            backed
+                .execs
+                .iter()
+                .filter(|call| call.contains(" occ info:file ") && call.ends_with(archive.as_str()))
+                .count(),
         ),
         (
             kept,
@@ -528,6 +533,7 @@ fn the_archive_is_the_database_and_its_named_blobs_and_a_restore_verifies_with_t
             ],
             OLD_METRICS.to_owned(),
             Vec::<String>::new(),
+            1,
         )
     );
     Ok(())

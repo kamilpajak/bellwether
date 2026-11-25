@@ -4,10 +4,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 
 use crate::blobs::BlobStore;
 use crate::store::{self, StoreError};
@@ -20,15 +21,16 @@ const DICTIONARY: &str = "dictionary";
 const BLOB: &str = "blob";
 const END: &str = "end";
 const MEMBER_MODE: u32 = 0o644;
+const HASH_CHUNK: usize = 1 << 16;
 
 #[derive(Debug, Clone)]
 pub struct Ask {
     pub store: PathBuf,
     /// The commit log whose rows are packed: the backup's snapshot, or a restored copy.
     pub log: PathBuf,
-    /// `<pack file name> <bytes>` per line: every pack the folder holds.
+    /// `<pack file name> <bytes> <sha256>` per line: every pack the folder holds.
     pub have: PathBuf,
-    /// Every manifest of the folder, one after another.
+    /// A directory of the folder's manifests, each under its own file name.
     pub manifests: PathBuf,
     /// The tar to write; `None` plans and writes nothing.
     pub out: Option<PathBuf>,
@@ -41,7 +43,7 @@ pub struct Report {
     pub log: String,
     /// The blobs and dictionaries the log names.
     pub named: u64,
-    /// Of `named`, those in a pack the folder holds at its manifest's length.
+    /// Of `named`, those in a pack the folder holds at its manifest's length and sha256.
     pub held: u64,
     /// Members written, or the ones a dry run would write: `named - held`, plus a dictionary a
     /// packed blob names that the log does not.
@@ -49,7 +51,8 @@ pub struct Report {
     /// The file written; `null` when nothing was left to pack, and in a dry run.
     pub pack: Option<String>,
     pub pack_bytes: u64,
-    /// Manifests whose pack is absent, of another length, or whose `end` line is missing.
+    /// The packs of manifests that do not count: the pack absent, of another length or sha256,
+    /// or the manifest's text not a whole manifest of that pack.
     pub lost: Vec<String>,
     /// Packs no manifest names.
     pub unrecorded: Vec<String>,
@@ -115,13 +118,8 @@ impl PackError {
     }
 }
 
-/// One manifest of the stream: `pack <name> <bytes>`, its entry lines, `end <entries>`.
-struct Manifest {
-    pack: String,
-    bytes: u64,
-    entries: Vec<String>,
-    ended: bool,
-}
+/// A pack as the folder or a manifest states it: its length and its sha256.
+type Stated = (u64, String);
 
 fn text_of(path: &Path, what: &'static str) -> Result<String, PackError> {
     match fs::read_to_string(path) {
@@ -135,18 +133,20 @@ fn text_of(path: &Path, what: &'static str) -> Result<String, PackError> {
     }
 }
 
-fn packs_held(path: &Path) -> Result<BTreeMap<String, u64>, PackError> {
+fn packs_held(path: &Path) -> Result<BTreeMap<String, Stated>, PackError> {
     let mut held = BTreeMap::new();
     for (index, line) in text_of(path, "pack listing")?.lines().enumerate() {
-        let mut words = line.split_whitespace();
-        let bytes = words.clone().nth(1).and_then(|bytes| bytes.parse().ok());
-        match (words.next(), bytes, words.nth(1)) {
-            (Some(name), Some(bytes), None) => held.insert(name.to_owned(), bytes),
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words.as_slice() {
+            [name, bytes, digest] if bytes.parse::<u64>().is_ok() => held.insert(
+                (*name).to_owned(),
+                (bytes.parse().unwrap_or_default(), (*digest).to_owned()),
+            ),
             _ => {
                 return Err(PackError::Unreadable {
                     file: path.to_path_buf(),
                     line: index + 1,
-                    expected: "`<pack> <bytes>`",
+                    expected: "`<pack> <bytes> <sha256>`",
                     text: line.to_owned(),
                 })
             }
@@ -155,37 +155,51 @@ fn packs_held(path: &Path) -> Result<BTreeMap<String, u64>, PackError> {
     Ok(held)
 }
 
-fn manifests_in(path: &Path) -> Result<Vec<Manifest>, PackError> {
-    let mut found: Vec<Manifest> = Vec::new();
-    for (index, line) in text_of(path, "manifest stream")?.lines().enumerate() {
-        let words: Vec<&str> = line.split(' ').collect();
-        let open = found.last_mut().filter(|manifest| !manifest.ended);
-        match (words.as_slice(), open) {
-            ([PACK, name, bytes], _) if bytes.parse::<u64>().is_ok() => found.push(Manifest {
-                pack: (*name).to_owned(),
-                bytes: bytes.parse().unwrap_or_default(),
-                entries: Vec::new(),
-                ended: false,
-            }),
-            ([DICTIONARY | BLOB, _], Some(open)) => open.entries.push(line.to_owned()),
-            ([END, count], Some(open)) if count.parse() == Ok(open.entries.len()) => {
-                open.ended = true;
-            }
-            _ => {
-                return Err(PackError::Unreadable {
-                    file: path.to_path_buf(),
-                    line: index + 1,
-                    expected: "manifest",
-                    text: line.to_owned(),
-                })
-            }
+/// `pack <name> <bytes> <sha256>`, the entry lines, `end <entries>`: what the manifest states of
+/// its pack, and its entries. `None` for any other text.
+fn manifest_in<'text>(pack: &str, text: &'text str) -> Option<(Stated, Vec<&'text str>)> {
+    let mut lines = text.lines();
+    let first: Vec<&str> = lines.next()?.split(' ').collect();
+    let last: Vec<&str> = lines.next_back()?.split(' ').collect();
+    let entries: Vec<&str> = lines.collect();
+    let whole = entries.iter().all(
+        |line| matches!(line.split_once(' '), Some((DICTIONARY | BLOB, hex)) if !hex.contains(' ')),
+    );
+    match (first.as_slice(), last.as_slice()) {
+        ([PACK, name, bytes, digest], [END, count])
+            if *name == pack && whole && count.parse() == Ok(entries.len()) =>
+        {
+            Some(((bytes.parse().ok()?, (*digest).to_owned()), entries))
         }
+        _ => None,
+    }
+}
+
+/// Each file of the directory by the pack its name states, with its text when that is UTF-8.
+fn manifests_in(dir: &Path) -> Result<BTreeMap<String, Option<String>>, PackError> {
+    let listed = match fs::read_dir(dir) {
+        Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => {
+            return Err(PackError::InputAbsent {
+                what: "manifest directory",
+                path: dir.to_path_buf(),
+            })
+        }
+        listed => listed?,
+    };
+    let mut found = BTreeMap::new();
+    for entry in listed {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let pack = name.strip_suffix(MANIFEST_SUFFIX).unwrap_or(&name);
+        found.insert(
+            pack.to_owned(),
+            String::from_utf8(fs::read(entry.path())?).ok(),
+        );
     }
     Ok(found)
 }
 
-/// `dictionary <digest>` then `blob <digest>` lines, each kind in digest order. A log from
-/// before user_version 16 has no `dictionaries` table; one with no `blobs` table is refused.
+/// `dictionary <digest>` then `blob <digest>` lines, each kind in digest order.
 fn named_by(log: &Path) -> Result<Vec<String>, PackError> {
     if !log.is_file() {
         return Err(PackError::InputAbsent {
@@ -196,9 +210,6 @@ fn named_by(log: &Path) -> Result<Vec<String>, PackError> {
     let db = store::read_only(log)?;
     let mut lines = Vec::new();
     for (kind, table) in [(DICTIONARY, "dictionaries"), (BLOB, "blobs")] {
-        if kind == DICTIONARY && !store::holds_table(&db, table)? {
-            continue;
-        }
         let mut rows = db.prepare(&format!("SELECT digest FROM {table} ORDER BY digest"))?;
         let mut rows = rows.query([])?;
         while let Some(row) = rows.next()? {
@@ -209,7 +220,7 @@ fn named_by(log: &Path) -> Result<Vec<String>, PackError> {
 }
 
 /// Plans from the log, the listing and the manifests; with `out`, writes the tar and then its
-/// manifest beside it. A blob the log names that is not in the store, or does not read back to
+/// manifest beside it. A manifest that is not whole loses its pack and refuses nothing. A blob the log names that is not in the store, or does not read back to
 /// its digest, ends the run by name with neither file left.
 pub fn run(ask: &Ask) -> Result<Report, PackError> {
     let have = packs_held(&ask.have)?;
@@ -217,17 +228,15 @@ pub fn run(ask: &Ask) -> Result<Report, PackError> {
     let named = named_by(&ask.log)?;
     let mut held: HashSet<&str> = HashSet::new();
     let mut lost = Vec::new();
-    for manifest in &manifests {
-        if manifest.ended && have.get(&manifest.pack) == Some(&manifest.bytes) {
-            held.extend(manifest.entries.iter().map(String::as_str));
-        } else {
-            lost.push(manifest.pack.clone());
+    for (pack, text) in &manifests {
+        match text.as_deref().and_then(|text| manifest_in(pack, text)) {
+            Some((stated, entries)) if have.get(pack) == Some(&stated) => held.extend(entries),
+            _ => lost.push(pack.clone()),
         }
     }
-    let recorded: BTreeSet<&str> = manifests.iter().map(|m| m.pack.as_str()).collect();
     let unrecorded = have
         .keys()
-        .filter(|pack| !recorded.contains(pack.as_str()))
+        .filter(|pack| !manifests.contains_key(*pack))
         .cloned()
         .collect();
     let pending: Vec<&str> = named
@@ -287,7 +296,7 @@ fn manifest_of(pack: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// The tar, fsynced, then the manifest that states its length: `(bytes, members)`.
+/// The tar, fsynced, then the manifest that states its length and sha256: `(bytes, members)`.
 fn write(
     ask: &Ask,
     out: &Path,
@@ -324,8 +333,16 @@ fn write(
     let file = tar.into_inner()?;
     file.sync_all()?;
     let bytes = file.metadata()?.len();
+    let (mut digest, mut read, mut chunk) = (Sha256::new(), File::open(out)?, [0; HASH_CHUNK]);
+    loop {
+        match read.read(&mut chunk)? {
+            0 => break,
+            filled => digest.update(chunk.get(..filled).unwrap_or_default()),
+        }
+    }
     let name = out.file_name().unwrap_or_default().to_string_lossy();
-    let mut text = format!("{PACK} {name} {bytes}\n");
+    let digest = const_hex::encode(digest.finalize());
+    let mut text = format!("{PACK} {name} {bytes} {digest}\n");
     for entry in &entries {
         text.push_str(entry);
         text.push('\n');

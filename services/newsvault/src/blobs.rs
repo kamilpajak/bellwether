@@ -331,7 +331,7 @@ impl BlobStore {
     }
 
     /// The file a backup pack carries for `digest`: the bytes as stored, raw or `.zst`, only
-    /// after their payload read back to the digest. The raw copy while one exists.
+    /// after their payload read back to the digest.
     pub fn stored_file(&self, digest: &BlobDigest) -> Result<StoredFile, StoreError> {
         let encoding = self.listed(digest).read_from();
         let read = self.read_file(digest, encoding)?;

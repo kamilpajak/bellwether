@@ -344,17 +344,18 @@ enum BlobsAction {
         format: Format,
     },
     /// Writes the blobs and dictionaries a commit log names that no backup pack holds as one
-    /// tar and its manifest. Exit 8 when a pack is lost or unrecorded. Mutates no store.
+    /// tar and its manifest. Exit 8 when a pack is lost or unrecorded; a dry run exits 1 when
+    /// the folder's packs do not hold everything the log names. Mutates no store.
     Pack {
         #[arg(long)]
         store: Option<PathBuf>,
         /// The commit log whose rows are packed: the backup's snapshot, or a restored copy.
         #[arg(long)]
         log: PathBuf,
-        /// A file of `<pack> <bytes>` lines: every pack the backup folder holds.
+        /// A file of `<pack> <bytes> <sha256>` lines: every pack the backup folder holds.
         #[arg(long)]
         have: PathBuf,
-        /// A file holding every manifest of the backup folder, one after another.
+        /// A directory holding every manifest of the backup folder under its own file name.
         #[arg(long)]
         manifests: PathBuf,
         /// The tar to write, with its manifest beside it. Required unless a dry run.
@@ -1308,7 +1309,8 @@ fn run_blobs(action: BlobsAction) -> anyhow::Result<Verdict> {
 }
 
 /// Exit 8 with the report on stdout when a pack is lost or unrecorded: the pack asked for is
-/// written all the same. A refusal goes to stderr with stdout empty; none is retryable.
+/// written all the same. A dry run that would pack anything answers no, exit 1, so a restore
+/// reads the folder's verdict from the status. A refusal goes to stderr with stdout empty.
 fn run_pack(ask: &cmd_pack::Ask, format: Format) -> anyhow::Result<Verdict> {
     match cmd_pack::run(ask) {
         Ok(report) => {
@@ -1333,7 +1335,9 @@ fn run_pack(ask: &cmd_pack::Ask, format: Format) -> anyhow::Result<Verdict> {
                     if report.dry_run { " (dry run)" } else { "" }
                 )?,
             }
-            Ok(if report.is_whole() {
+            Ok(if report.dry_run && report.packed > 0 {
+                Verdict::No(EXIT_NO)
+            } else if report.is_whole() {
                 Verdict::Ok
             } else {
                 Verdict::No(EXIT_INCOMPLETE)
@@ -1868,19 +1872,19 @@ fn print_schema(format: Format) {
             },
             {
                 "path": ["blobs", "pack"],
-                "summary": "Writes the dictionaries and blobs the commit log at log names that no pack of the backup folder holds as one tar of store-relative paths (blobs/dictionaries/<sha256>, blobs/sha256/..), each file as stored and only after it read back to its digest, and then out.manifest: `pack <name> <bytes>`, one `dictionary <sha256>` or `blob <sha256>` line per member, `end <members>`. A manifest counts only when have lists its pack at its length; the members of any other are packed again. Reads the store without the lease and writes only out and out.manifest.",
+                "summary": "Writes the dictionaries and blobs the commit log at log names that no pack of the backup folder holds as one tar of store-relative paths (blobs/dictionaries/<sha256>, blobs/sha256/..), each file as stored and only after it read back to its digest, and then out.manifest: `pack <name> <bytes> <sha256 of the tar>`, one `dictionary <sha256>` or `blob <sha256>` line per member, `end <members>`. A manifest counts only when it is whole, is named <pack>.manifest and have lists its pack at its length and sha256; any other names its pack in lost and its members are packed again. Reads the store without the lease and writes only out and out.manifest.",
                 "options": [
                     {"name": "store", "type": "path"},
                     {"name": "log", "type": "path", "required": true,
                      "doc": "the commit log whose blobs and dictionaries rows are packed"},
                     {"name": "have", "type": "path", "required": true,
-                     "doc": "a file of `<pack file name> <bytes>` lines, one per pack the folder holds"},
+                     "doc": "a file of `<pack file name> <bytes> <sha256>` lines, one per pack the folder holds"},
                     {"name": "manifests", "type": "path", "required": true,
-                     "doc": "a file holding every manifest of the folder, one after another"},
+                     "doc": "a directory holding every manifest of the folder under its own file name, <pack file name>.manifest"},
                     {"name": "out", "type": "path",
                      "doc": "the tar; required unless dry_run; refused when it or its manifest exists; neither is written when nothing is left to pack"},
                     {"name": "dry_run", "type": "flag",
-                     "doc": "reads log, have and manifests only: packed is what a run would pack, so 0 with lost and unrecorded empty says the folder's packs hold every blob the log names"},
+                     "doc": "reads log, have and manifests only and writes nothing, out given or not: packed is what a run would pack, and above 0 the exit is 1"},
                     {"name": "non_interactive", "type": "flag",
                      "doc": "accepted and does nothing: no command here prompts or reads stdin"},
                     {"name": "format", "type": "enum", "values": ["human", "json"]}
@@ -1890,8 +1894,9 @@ fn print_schema(format: Format) {
                 "output": cmd_pack::SCHEMA,
                 "exits": {
                     "0": "every manifest has its pack and every pack its manifest; pack is null when nothing was left to pack",
-                    "2": "invalid_argument (out exists; no out without dry_run), input_unparseable (a line of have or manifests; a blob or dictionary that does not read back to its digest), io_failed",
-                    "4": "input_absent: no log, have or manifests file, or a blob or dictionary the log names is not in the store",
+                    "1": "dry_run only: packed is above 0, so the folder's packs do not hold every blob and dictionary the log names",
+                    "2": "invalid_argument (out or its manifest exists; no out without dry_run), input_unparseable (a line of have; a blob or dictionary that does not read back to its digest), io_failed",
+                    "4": "input_absent: no log, no have file, no manifests directory, or a blob or dictionary the log names is not in the store",
                     "8": "lost or unrecorded is not empty; the pack is written and holds the members of every lost one"
                 },
                 "mutates": true
