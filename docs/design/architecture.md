@@ -34,13 +34,14 @@
 
 | service | charter | code |
 |---|---|---|
-| `vault` | Owns every fact we did not derive, and the only conversation with a vendor. | `services/newsvault`, `news-provider`, `providers/*` |
+| `vault` | Owns every fact we did not derive, and the only conversation with a vendor. | `services/newsvault`, `news-provider`, `providers/*`; designed, no code (§12): `services/filingvault`, `vault-core`, `filing-contract`, `providers/sec-edgar` |
 | `derive` | Pure function of (snapshot, rule set). Nothing here reads a clock or a network. | none |
 | `modelgate` | The only exit to a language model. Spends money, answers non-deterministically. | `services/modelgate`: `decide` calls and `shadow run` only (§3.5) |
 | `propose` | Turns a panel into a ranked shortlist and the document a person reads. | none |
 | `ledger` | Reads outcomes, which nothing upstream may see. One-way edge. | none |
 
 - Each service is one deployable.
+- `vault` is one deployable over three contexts (memo §3): `newsvault` is built; `filingvault` is designed (§12, owner decision 2026-11-24); `marketvault` has no crate, and its one artefact, the roster, lives in `newsvault` (§10). A context is a crate with a store of its own, not a service, and depends on no sibling context (§12.1; unguarded until §12.7's gate FV1 exists).
 - Statistics stay in Python, inside this repository, on the far side of a file boundary from
   `derive` (§3.4, §4). Memo D-4 is why they are not a sixth service and not a second repository.
 
@@ -71,7 +72,7 @@
 | `rule_version` | sha256 of the rules file's bytes (§3.3) | Rules as constants in code cannot be diffed or tested: when a hand-written gazetteer wrongly removed a real company, there was no version, no test and no record (§3.3). |
 | `calendar_version` | sha256 of the session calendar file, half-days and DST included | A half-day close is a fact that changes results and is easy to get silently wrong. Its own file, not a group inside the rules file (§3.3): a calendar edit and a rule edit are then two diffs, which R18 needs. |
 | `hosts_version` | sha256 of one SourceId's hosts file (§11.1), `OpenWebFeed::hosts_version`. Carried by `news_provider::Request.hosts_version` through `AttemptEvent::Opened` into `attempts.hosts_version`, outside `filter_params`; every `open-web-feed` request carries it (`every_planned_request_is_a_live_index_carrying_the_hosts_version`); `newsvault collect --source open_web_wires` writes it to every attempt row and to its envelope's `hosts_version` (null for `edgar_press`): `the_run_envelope_names_the_hosts_file_it_was_allowed_to_use`, and over the real GNW index with 4 attempt rows `an_open_web_run_collects_a_globenewswire_day_end_to_end` (mutation 2026-11-15, envelope field null: both red) | Names which hosts and paces a run was allowed to use. Kept apart from `universe_version`, the ticker roster. Rejected: inside `filter_params`; it decides admission and pace, not what the vendor is asked, and edgar's `filter_params` and `attempt_id` digests stay byte-identical (`two_runs_whose_rosters_differ_have_two_filter_params_digests` and the `canon` vectors unchanged, 2026-11-15). Outside `filter_params`: `requests_that_differ_only_in_hosts_version_have_one_filter_params_digest` (`None`, `Some(a)`, `Some(b)`; mutation 2026-11-15, folded in when `Some`: red, green before the test). `attempt_id` takes run, source, window and ordinal only (`canon::digest::attempt_id`), so no request field reaches it |
-| `extract_version` | since 2026-11-16, sha256 in the canonical form below over the rules file's sha256 (`extract_rules_version`), then each file of `providers/open-web-feed/src/` by name and sha256, ordered by name over raw UTF-8 bytes (`canon::digest::extract_version`, `OpenWebFeed::extract_version`); the files are compiled in by `include_str!` (`version::SOURCES`). Carried by `Request.extract_version` through `AttemptEvent::Opened` into `attempts.extract_version` and the collect envelope's `extract_version`; NULL for `edgar-press` and for robots attempts. Tests and mutations: §8 row R17 | P5 (owner decision 2026-11-16, §11.1): `extract_rules_version` alone did not move when `parse.rs` changed a body, and the body is an `item_id` input. Rejected: inside `filter_params`, which names what the vendor is asked: `requests_that_differ_only_in_extract_version_have_one_filter_params_digest` |
+| `extract_version` | since 2026-11-16, sha256 in the canonical form below over the rules file's sha256 (`extract_rules_version`), then each file of `providers/open-web-feed/src/` by name and sha256, ordered by name over raw UTF-8 bytes (`canon::digest::extract_version`, `OpenWebFeed::extract_version`); the files are compiled in by `include_str!` (`version::SOURCES`). Carried by `Request.extract_version` through `AttemptEvent::Opened` into `attempts.extract_version` and the collect envelope's `extract_version`; NULL for `edgar-press` and for robots attempts. Tests and mutations: §8 row R17 | P5 (owner decision 2026-11-16, §11.1): `extract_rules_version` alone did not move when `parse.rs` changed a body, and the body is an `item_id` input. Rejected: inside `filter_params`, which names what the vendor is asked: `requests_that_differ_only_in_extract_version_have_one_filter_params_digest`. Design, no code: `filing-contract` takes two digests from the same function, one per source directory (§12.4) |
 | `universe_version` | sha256 of the roster the panel's tickers are drawn from, as of the snapshot's cutoff, with delisted names either included or named as absent. Since 2026-11-23 the roster's bytes have a producer, `newsvault roster fetch` (one SEC copy a day), and a reader, `newsvault roster show --at`, which names the copy current at a cutoff and prints its sha256 as this digest (§10, "The roster"). Still missing: a panel reading it; `edgar-press`'s `--roster` takes a caller-named file of another format (a CIK map); delisted names come only from a diff of two copies, which nothing computes | **Survivorship, measured by the predecessor in both directions:** 18 tickers added retrospectively on 2026-04-19 contributed about 0.3 of an OOS α t, and a PIT-95 sub-universe moved that t from 1.70 to 1.36; including delisted M&A targets flipped a train α t from +0.80 to −0.86 (`docs/inherited/paradigm_failures_postmortem.md:64` and `:67`). Without the roster as a named input a panel is reproducible and survivorship-biased at once, and `panel_id` hashes it happily. Enforcement: §8 row U1. |
 | `relation_map_version` | sha256 of the relation map `derive` reads (§4) | `has_relation` is the statistics tier's control arm and a model build sets it. Without this input a flipped control arm cannot be attributed to the build that flipped it; `brief_id` already does that for prompts. |
 | `panel_id` | sha256 over (`snapshot_id`, `rule_version`, `calendar_version`, `universe_version`, `relation_map_version`, row set); the gate requires three of these (§8 row U1) | A panel that cannot name its inputs cannot be re-derived, and a number whose panel cannot be re-derived is an anecdote. The row set means §3.10.1's rows in canonical form, not the Arrow file's bytes. Measured 2026-11-12 over one four-row panel conforming to §3.10.1, two counterparties in its first row: arrow-rs 60.1.0 writes 2,578 bytes, pyarrow 24.0.0 writes 2,050, and two record batches make 2,634, so the container cannot be the digest input. Those sizes hold for that panel's own strings and metadata and no fixture is committed: a reader's own four-row panel reproduces the **disagreement**, not the sizes (pyarrow 24.0.0 over one built to this table on 2026-11-12: 2,202 in one batch, 2,786 in two). The disagreement is the claim. |
@@ -1337,7 +1338,7 @@ Runbook, restore. No step has been executed. `<copy>` is one `bellwether-modelga
 | P9, headers | response headers kept beside the blob, outside its digest; allowlist `Content-Type`, `Last-Modified`, `ETag`, `Date`, `Cache-Control`, `Vary`, plus the original `Content-Encoding`, plus `Retry-After` since 2026-11-16 (§8 row R19, server slow-down), plus `x-sitemap-generated-at` since 2026-11-17 (owner decision 2026-11-17, §11.2's generation bullets), plus `Location` since 2026-11-17 (PG-D4) | built: `news_provider::Headers` on `RawResponse` and on a `TransportError` that read a head (`wire::KEPT_HEADERS`); stored as `payloads.headers` (table below); `only_the_allowlisted_headers_are_kept_lowercase_with_every_repeat` (mutation 2026-11-16, every header kept: red); `Location` since 2026-11-17 (owner decision PG-D4, §11.2's GNW row): read by `OpenWebFeed::classify` and, from `payloads.headers`, by `cmd_collect::moved_language`, mutation 2026-11-17, `LOCATION` removed from `KEPT_HEADERS`: §11.5 step 6's GNW walk table; `Retry-After` reaches the payload when a payload row exists, that is when a body, whole or cut at the limit, was read; a slow-down answer whose body read failed changes the pace and stores no `Retry-After`: `a_429_s_retry_after_is_kept_in_the_payload_headers` (mutation 2026-11-16, `retry-after` replaced in `KEPT_HEADERS`: red, with 4 other `wire` tests); `x-sitemap-generated-at` is read back by `cmd_collect::recorded` through `Headers::from_json` and `Headers::first` (`the_stored_headers_read_back_and_name_a_first_value`), mutation 2026-11-17, `x-sitemap-generated-at` replaced in `KEPT_HEADERS`: red, that `wire` test and `open-web-feed`'s `the_generation_header_is_kept_beside_the_blob` |
 | P9, the original `Content-Encoding` | as above | built: ureq 3.5.2 deletes `Content-Encoding` and `Content-Length` when its `gzip` feature decodes (`run.rs`, `is_decompressing`), so that feature is off and `Wire::exchange` decodes `gzip` itself (§10, P9 defaults); `a_gzip_body_is_decoded_to_the_digest_ureq_gave_it_and_keeps_its_content_encoding` (below); mutation 2026-11-16, `content-encoding` off the allowlist: red |
 | P10, link | a per-attempt link table: attempt → url, phase, `listed_date`, raw digest, headers, truncated flag; every blob `put_blob` writes gets a `blobs` row | built: `payloads` (table below), written by `Committer::record` and `Committer::record_robots` in the transaction that closes the attempt; every provider through `news_provider::collect`'s `Archive::commit`, edgar included, and `newsvault robots refresh` |
-| P11, re-extraction | a separate derived layer that copies `observed_at`, `story_id` and `seq` from the stored item and never recomputes them | no such layer and no re-extraction command; the read it will make is built: `BlobStore::stream` (compression, below) |
+| P11, re-extraction | a separate derived layer that copies `observed_at`, `story_id` and `seq` from the stored item and never recomputes them | no such layer and no re-extraction command; the read it will make is built: `BlobStore::stream` (compression, below). Filings get such a layer by design, no code: `sections` rows keyed by `extract_version` over a stored blob (§12.4) |
 | over-limit body | stored truncated at the limit, with the truncated flag set | built: a body over `body_limit` is still `TransportKind::BodyOverLimit`, so the verdict stays `permanent_failure` and nothing is extracted; the `TransportError` carries the first `body_limit` bytes (`cut_body`), which `Payload::stored` hands to `put_blob` with `truncated` 1; the cut is exactly `body_limit` bytes long, so a cut payload's `blobs.bytes` is the limit it was cut at, which §11.1's held read compares with the limit in force (`news_provider::wire::tests::a_body_over_the_limit_keeps_its_first_limit_bytes_and_its_headers`, §8 row R23) |
 | compression | zstd, one frame per blob, with a dictionary trained on the store; the store stays SQLite plus content-addressed files (owner decision 2026-11-21; WARC rejected) | built 2026-11-21: `BlobStore::put` writes every new payload as `<digest>.zst` at `blobs::LEVEL` 9 under the active dictionary, and as the raw `<digest>` while no dictionary is active, which `blobs compress` later rewrites; layout, level and reader below |
 
@@ -1586,16 +1587,17 @@ Runbook, restore. No step has been executed. `<copy>` is one `bellwether-modelga
 
 | boundary | form | why |
 |---|---|---|
-| vendor → `vault` | HTTP, behind **one owner for every vendor conversation**, not one client per vendor | a vendor conversation happens in exactly one place, so quota, retry and cost have one owner. Since 2026-11-13, when the first adapter shipped, the single `ureq` agent sits behind `news-provider`'s `Wire` and `providers/edgar-press` declares no HTTP dependency: only that shape makes "a fetch outside a ledger row does not compile" hold in every crate, not only in crates that own no agent (row R4). Per-vendor differences: the provider's `TransportProfile` (`news-provider/src/wire.rs`), call budget, bucket and redirect policy included (row R19) |
+| vendor → `vault` | HTTP, behind **one owner for every vendor conversation**, not one client per vendor | a vendor conversation happens in exactly one place, so quota, retry and cost have one owner. Since 2026-11-13, when the first adapter shipped, the single `ureq` agent sits behind `news-provider`'s `Wire` and `providers/edgar-press` declares no HTTP dependency: only that shape makes "a fetch outside a ledger row does not compile" hold in every crate, not only in crates that own no agent (row R4). Per-vendor differences: the provider's `TransportProfile` (`news-provider/src/wire.rs`), call budget, bucket and redirect policy included (row R19). Design, no code: `services/filingvault` sends through the same `Wire` and declares no HTTP dependency (§12.1) |
+| `newsvault` ↔ `filingvault` (design, no code; §12.2) | no call, no shared table, no shared lock; one shared directory of pace files, each locked per bucket (owner decision 2026-11-25, `FV-Q4`) | two contexts of one deployable, so a fault in one must not hold the other's store; SEC counts requests per address, so its budget is the one thing they share |
 | `vault` → `derive` | **file**: snapshot manifest + Parquet with ZSTD (§3.0), not Arrow IPC: zstd is compiled into parquet 60.1.0 and not into this tree's `arrow-ipc` (default features only, `cargo tree -e features -i zstd`, 2026-11-22), and a reader can skip the `body` column | `derive` must re-run years later against the same bytes; a call cannot promise that |
 | `derive` → statistics | **file**: panel manifest + Arrow | same, and it keeps the Python tier at arm's length |
 | `vault` → `modelgate` | **file**: a `newsvault cut` snapshot (§3.0), read through `snapshot-contract` | `modelgate` depends on no crate of the news side (§8 row MG10), and a label must name the exact rows and cutoff it was taken over |
 | `modelgate` → model vendor | HTTP, behind `modelgate::wire`, the second and last conversation owner (§8 row R4) | a model call is a POST with a body, a key and a cost; `news_provider::Request` requires a source, a target window, a provenance and a roster digest, none of which a model call has |
 | `propose` → `modelgate` | call, idempotent (design: `propose` has no code) | it spends money per invocation and must meter |
-| `modelgate` → `derive` | **file**: the relation map, hashed and versioned (§2) | `has_relation` comes from a model and `derive` reads no network (§1). Each edge carries its filing accession and span (§3.6), the model build that produced it, and a valid-from instant: a map that is not point-in-time dates a relation before its disclosure. Field list not written: `modelgate` has no relation-map code (§3.5 builds `decide` calls only) and §3.10's trigger has not fired |
+| `modelgate` → `derive` | **file**: the relation map, hashed and versioned (§2) | `has_relation` comes from a model and `derive` reads no network (§1). Each edge carries its filing accession and span (§3.6; by design a span is (accession, file name, `raw_blob`, start byte, end byte), §12.4), the model build that produced it, and a valid-from instant: a map that is not point-in-time dates a relation before its disclosure. Field list not written: `modelgate` has no relation-map code (§3.5 builds `decide` calls only) and §3.10's trigger has not fired |
 | `propose` → person | **file**: immutable brief, hashed | the thing someone acted on must be recoverable byte-for-byte |
 | `vault` → private stream | WebSocket, best-effort | a notification, never the transport of record |
-| `vault` → `vault` consumers | HTTP read for point-in-time queries. **No code yet.** Instead five CLI commands (`newsvault schema`): `items`, `ledger` and `publish` REQUIRE `--at` since 2026-11-13, and `cut` since 2026-11-22, so a read with no cutoff does not parse; `day`'s `--at` is optional, and without it `day` returns the whole partition with no visibility test. The only HTTP client in `Cargo.lock` since 2026-11-13 is outbound: `ureq 3.5.2` under `news-provider`, behind `Wire` (row R4) | a point-in-time query is the only read a consumer should need, so the predicate has one place to be right |
+| `vault` → `vault` consumers | HTTP read for point-in-time queries. **No code yet.** Instead five CLI commands (`newsvault schema`): `items`, `ledger` and `publish` REQUIRE `--at` since 2026-11-13, and `cut` since 2026-11-22, so a read with no cutoff does not parse; `day`'s `--at` is optional, and without it `day` returns the whole partition with no visibility test. The only HTTP client in `Cargo.lock` since 2026-11-13 is outbound: `ureq 3.5.2` under `news-provider`, behind `Wire` (row R4) | a point-in-time query is the only read a consumer should need, so the predicate has one place to be right. Design, no code: `filingvault filings show --at` (§12.5) |
 
 - **The pattern:** anything a future reader must reproduce is a file; anything that only has to
   happen now is a call.
@@ -1874,7 +1876,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | R23 | **a story whose body was stored cut is held while the limit in force is not above the cut's length, and asked once after a raise** (owner decision 2026-11-20, §11.1) | cut length: `news_provider::wire::tests::a_body_over_the_limit_keeps_its_first_limit_bytes_and_its_headers` asserts the cut is exactly the limit (mutation 2026-11-20, `read_up_to` keeping `limit − 1`: red, `left: Some(1023)`, with two other wire tests)<br>held read: `newsvault::store::tests::a_cut_body_is_held_until_a_limit_above_its_length_is_in_force` (cuts at 1,024 B and 512 B and a whole 404, read at limits 1,024 and 512; mutations 2026-11-20, `<` made `<=`: red; the `truncated = 1` check dropped: red; the exclusion dropped: red)<br>re-ask, through the real open-web `Wire` and a loopback server, the cut under a lower limit stood in by relinking the cut payload to a 2 MiB blob row: `services/newsvault/tests/open_web_collect.rs::a_cut_story_is_not_fetched_again_until_the_limit_is_raised_and_then_once` (fetches per poll 1, 0, 1, 0, 1, 1), `…::a_released_cut_older_than_the_carry_limit_is_not_asked`, `…::a_reask_answered_with_a_redirect_is_not_asked_again`, `…::a_released_cut_is_asked_on_a_run_with_no_open_deferred_rows` (no `deferred` row before or after), `…::a_deferred_reask_is_fetched_once_by_the_next_run` (an open `deferred` row for the released cut: 1 fetch, 2 attempts of the story, the row closed `answered`), `…::a_reask_answered_whole_commits_one_item_under_the_cut_s_window_and_listing` (answered 200: the re-ask's `target_window`, `payloads.listed_date` and `listed_by` equal the cut's, verdict `usable`, one item timed by the listing), `…::a_released_cut_after_an_earlier_attempt_of_its_story_is_asked_once` (three transient attempts, then the cut: 1 fetch), `…::a_reask_counts_against_the_follow_up_cap` (a released CNW cut beside 300 listed follow-ups: 300 asked, one row `follow_up_cap`), `…::a_reask_that_fails_transiently_is_retried_within_the_run` (one 503: 2 sends); mutations 2026-11-20, each run `cargo test --locked --no-fail-fast -p newsvault --test open_web_collect`, the file restored after each: the re-ask loop dropped: red (3 tests); a stale 2 MiB limit read by `carry`: red (3); a stale 2 MiB limit at the live index's held read: red (the first test); the issued insertion dropped: red (the first test, 2 fetches); `carry`'s `CARRY_LIMIT` check on the cut's `closed_at` dropped: red (the second; re-run 2026-11-21 after the bound moved out of `released_cuts`); the latest-attempt filter dropped: red (the first and third); the read moved behind the early return on no open `deferred` row: red (3); `<` made `<=` in `released_cuts`: red (the first); its `truncated = 1` dropped: red (4 tests); `carry`'s skip of a released cut a queued carried item holds dropped: red (the fifth, `left: (2, 3, ["answered"])`); a stale 2 MiB limit at `carry_deferred`'s held read: red (the fifth, `left: (1, 2, ["held"])`); mutations 2026-11-21, `cargo test --locked --no-fail-fast -p newsvault -p news-provider`, the file restored after each: `released_cuts` selecting NULL for `listed_date`, NULL for `listed_by` or a constant `target_window`, and `carry` setting `listed_by` to None: each red (the sixth only); `later.rowid > a.rowid` made `<>`: red (the seventh only); the re-ask queued uncounted: red (the eighth only); queued with its retries spent: red (the ninth only)<br>store signatures: `newsvault::store::tests::no_public_store_fn_takes_a_row_cap_or_a_slice_parameter` reads each `pub fn` parameter's name and type, lowercased, and fails on `limit` or `window` outside two exact allowed parameters: `body_limit: u64` (a byte length compared with a stored cut, not a row cap or a slice) and `target: &TargetWindow` (`covered_story_ids`' partition key, matched by equality; the case-sensitive check before 2026-11-20 passed it without naming it); mutations 2026-11-20, `cargo test --locked -p newsvault --lib`: an added `pub fn probe(&self, limit: usize)`: red; `target_window: &TargetWindow`: red; `Limit: u32`: red, and green once the lowercasing is dropped; either allowed entry removed: red<br>ledger: `services/newsvault/tests/ledger.rs::cuts_held_at_the_limit_and_released_out_of_reach_are_counted_apart` (JSON and human line; mutations 2026-11-20, either `SUM` made 0, the age bound, the later-attempt check, `>=` made `>`, the 3xx exclusion, the `truncated` check, the human fields: each red); since 2026-11-21 it seeds 2 held against 7 released, an earlier attempt before a cut, a later attempt opened after `--at`, cuts closed exactly `CARRY_LIMIT` and two days before `--at`, a young cut opened before the age bound, and `deferred` rows open and young, open and old, closed by `--at`, closed after it and deferred after it; mutations 2026-11-21, each red: the two counters' columns swapped; `later.rowid >` made `<>`; the later attempt's `opened_at <= --at` dropped; the age bound made 2.5 × `CARRY_LIMIT`; `closed_at <=` made `<`; `closed_at` read as `opened_at`; the `deferred` clause dropped; its `deferred_closed` check, `deferred_at <= --at` or `closed_at <= --at` dropped; `services/newsvault/tests/collect.rs::every_registered_credential_is_the_one_its_providers_user_agent_names` checks `Registered::body_limit` against `transport().body_limit` (mutation 2026-11-20, open-web's entry 2 MiB: red); golden `expected.json` carries both fields (0) | **enforced** since 2026-11-20 for open-web; edgar-press's `carried` returns `None`, so it is never re-asked<br>unguarded: the `verdict = permanent_failure` clause of the held exclusion and of `released_cuts`; dropping either stayed green (2026-11-20): only a `BodyOverLimit` answer stores a cut, and both providers' `classify` close it `PermanentFailure`<br>unguarded: a re-ask that fails transiently is not asked by `carry` again<br>unguarded: `carry`'s age check `>=` made `>` stayed green (2026-11-21): no test closes a cut exactly `CARRY_LIMIT` before a run<br>unguarded: the re-ask's `counted` made `true` stayed green (2026-11-20): equivalent for open-web, which has no walk ids<br>unguarded: the store-signature check reads parameters only, not fn names or return types, and does not see a row cap or a slice under another parameter name (e.g. `since`): `released_cuts` takes no time bound and `carry` applies `CARRY_LIMIT`<br>not point in time: both ledger counters compare cuts with the build's current limit (`Registered::body_limit`), not the limit in force at `--at` |
 | B1 | **a blob reads back as exactly the payload it was received as, whichever file holds it and whichever dictionary compressed it** (owner decision 2026-11-21, §3.9's compression block) | name: `newsvault::blobs::tests::the_digest_is_the_payload_s_sha256_and_the_file_is_one_zstd_frame_under_the_suffix`<br>raw before the first dictionary: `…::before_a_dictionary_is_active_a_payload_is_stored_raw`<br>read-back: `…::a_compressed_file_decoding_to_other_bytes_is_altered`, `…::a_raw_file_holding_other_bytes_is_altered`, `…::the_bulk_read_refuses_a_frame_that_decodes_to_other_bytes`, `…::with_both_files_a_reader_takes_the_raw_one`; `services/newsvault/tests/open_web_collect.rs::a_pinned_robots_blob_changed_on_disk_is_refused_and_suggests_no_refresh`, `…::a_damaged_direct_blob_is_a_cross_check_error_and_the_run_finishes` (each writes a raw file of other bytes: `collect` writes raw before the first dictionary)<br>uncompressed length: `…::the_length_is_the_payload_s_for_a_compressed_and_for_a_raw_copy`; `services/newsvault/tests/blobs.rs::verify_reads_every_compressed_blob_back_and_matches_every_row`<br>no second copy: `…::a_payload_held_raw_is_not_written_again_and_either_form_is_named`<br>form by name: `…::a_raw_payload_that_is_itself_a_zstd_file_is_read_as_the_bytes_it_holds` (a raw file opening with the header magic, and a raw file that is one zstd frame)<br>dictionaries: `…::a_blob_names_its_dictionary_and_another_handle_reads_it_back`, `…::a_blob_whose_dictionary_file_is_gone_is_dictionary_absent`, `…::a_dictionary_whose_bytes_changed_is_refused_by_its_digest`, `tests/blobs.rs::a_writer_opened_after_training_compresses_under_the_active_dictionary`, `…::a_writer_whose_active_dictionary_file_is_gone_is_refused_by_name`, `…::a_second_dictionary_trained_is_the_one_every_later_write_names`, `…::a_dictionary_is_recorded_only_once_its_file_is_in_the_store`<br>one pass over every form: `…::one_pass_reads_every_form_and_dictionary_version_exactly` (raw, no dictionary, two dictionary versions; the second pass runs with both dictionary files deleted, so each was loaded once)<br>rewrite: `…::a_compressed_copy_that_does_not_read_back_keeps_the_raw_one` (its dictionary file gone), `…::a_leftover_compressed_copy_that_does_not_read_back_is_rewritten_from_the_raw_one`, `…::a_rewrite_stopped_before_the_removal_is_resumed`, `…::a_raw_copy_removed_after_the_listing_is_read_from_the_compressed_one`, `…::a_write_that_cannot_rename_removes_its_staging_file`, `…::removing_staging_files_takes_them_from_both_directories`, `tests/blobs.rs::compress_rewrites_every_raw_blob_once_under_the_active_dictionary`, `…::compress_exits_eight_when_a_blob_fails_and_keeps_its_raw_file`, `…::compress_removes_staging_leftovers_and_replaces_a_bad_leftover_copy`<br>verify's answer: `tests/blobs.rs::verify_answers_no_for_an_undecodable_blob_and_for_a_row_of_another_length`, `…::verify_answers_no_for_a_file_in_the_tree_that_names_no_digest`, `…::verify_answers_no_for_a_row_whose_file_is_gone` (JSON and human), `…::verify_answers_no_for_a_frame_of_other_bytes_in_either_place`<br>read-only commands: `tests/blobs.rs::verify_and_both_dry_runs_read_a_v15_store_under_a_held_lease_without_migrating_it`, `…::training_on_zero_samples_or_zero_held_out_is_a_usage_error` | **enforced** (mutations 2026-11-21, one at a time, each red on the named test):<br>digest over the encoded bytes: red, 129 tests, five `blobs` unit tests among them (before `put` wrote raw without a dictionary; not re-run)<br>re-run after the review of PR #62, the same day, `cargo test --locked --no-fail-fast` of `newsvault --lib --test blobs`, or of all `newsvault` where named: `read_copy`'s hash comparison removed: red, 8 tests (all `newsvault`), the two `open_web_collect` tests above among them; the comparison for `.zst` copies only: red, the raw `blobs` test and the two `open_web_collect` tests (all `newsvault`); `len_of` answering the `.zst` file's size: red, the `blobs` length test only (all `newsvault`: `collect` now writes the cut bodies raw); `put` checking the `.zst` path only: red, 2 tests; `Committer::open` activating nothing: red, 4 `tests/blobs.rs` tests; a raw file decoded when it opens with the header magic, and when it opens with the frame magic: red, each<br>`put` encoding with no dictionary active: red, 5 tests; `stream` accepting a frame of other bytes: red, 2 tests; a reader preferring `.zst` when both exist; verify skipping the second copy; `VerifyReport::is_sound` ignoring `listing_failed`, `indexed.absent`, and (2026-11-21 earlier) `length_differs`; `active_dictionary` ordering `ASC`; either `holds_table` guard removed; the compress or the train dry run opening a `Committer`; `is_complete` always true; compress not removing staging files; the removal loop skipped; a bad leftover `.zst` returned as an error (red, 2 tests); `compress_raw`'s read-back removed; `write_durably` leaving its staging file; `record_dictionary` without its load of the file; `--samples`/`--holdout` 0 accepted; the human line without the `indexed` counts: each red on its test<br>unguarded: `write_durably`'s fsync order, as row R1's blob clause, and the fsync of each directory `create_directories_durably` creates; POSIX needs it, ext4's journal ordering makes it hold in practice<br>unguarded: nothing tests that no code deletes a dictionary file or row; a reading of the code on 2026-11-21 (§3.9's deletion bullet)<br>unguarded: `blobs compress` removes a raw file; nothing but this row's tests stops a later change from removing it before the read-back<br>unguarded: no test hits the window between a lease-free reader's listing and its read while compress removes the raw file, for `read_verified` and `len_of`; `read_listed`'s own fallback is tested<br>unguarded: `collect`'s cross-check reading through the `Committer`'s `BlobStore` (one dictionary load per run) changes cost, not bytes; no test sees it<br>deploy and rollback: §3.9's compression bullets (runbook, deploy, rollback to v0.3.1) |
 | B2 | **no zstd dictionary is committed**: the repository is public and a production dictionary is trained from vendor pages (owner requirement 2026-11-21) | `repo_invariants::dictionaries::tests::no_file_in_this_tree_is_a_zstd_dictionary`: every file outside `target/` and outside hidden directories, hidden files included (`line_ends::walk_files` with `HiddenFiles::Listed`), opening with `ZSTD_MAGIC_DICTIONARY` (`37 A4 30 EC`), or under a `blobs/dictionaries/` directory; `…::a_file_opening_with_the_dictionary_magic_or_under_a_store_s_dictionaries_fails` (one fixture is `docs/.hidden.dict`) | **enforced for trained dictionaries** (mutation 2026-11-21, a 6-byte file opening with the magic added under `providers/open-web-feed/tests/fixtures/`: red; review of PR #62 the same day, the same bytes at `docs/.hidden.dict` passed every test, since closed: mutation 2026-11-21, the walk skipping hidden files again: red, the fixture test)<br>unguarded: a raw-content dictionary, which carries no magic number, outside a `blobs/dictionaries/` path<br>unguarded: a file under a hidden directory, `.github/` included; the walk never enters one, because `.git` and local worktrees in hidden directories are whole trees of their own |
-| G1 | **a workspace member inherits the lint floor** | `repo_invariants::every_workspace_member_inherits_the_lint_floor` over the `cargo metadata` member set (not `workspace.members`: a `path`-dependency crate is a member, measured 2026-11-12); rejects `lints` inside `[package]`<br>floor contents: `repo_invariants::the_lint_floor_holds_what_the_committed_snapshot_holds` against `repo-invariants/lint-floor.snapshot`; a `warn`/`allow` entry is refused<br>`members` globs `providers/*`, `services/*` | **enforced** over 9 members (2026-11-22, `snapshot-contract` added; mutation that day, its `[lints]` stanza deleted: `every_workspace_member_inherits_the_lint_floor` red)<br>unguarded: a new top-level crate reached by no `members` entry and no `path` dependency is compiled by nothing and invisible to CI (reproduced 2026-11-12)<br>glob cost: a directory without `Cargo.toml` under either parent fails every cargo command (cargo 1.99.1, 2026-11-13) |
+| G1 | **a workspace member inherits the lint floor** | `repo_invariants::every_workspace_member_inherits_the_lint_floor` over the `cargo metadata` member set (not `workspace.members`: a `path`-dependency crate is a member, measured 2026-11-12); rejects `lints` inside `[package]`<br>floor contents: `repo_invariants::the_lint_floor_holds_what_the_committed_snapshot_holds` against `repo-invariants/lint-floor.snapshot`; a `warn`/`allow` entry is refused<br>`members` globs `providers/*`, `services/*` | **enforced** over 10 members (`cargo metadata --no-deps`, 2026-11-25; `snapshot-contract` added 2026-11-22 and `modelgate` 2026-11-23; mutations: 2026-11-22 `snapshot-contract`'s `[lints]` stanza deleted, 2026-11-25 `services/modelgate`'s: `every_workspace_member_inherits_the_lint_floor` red both times)<br>unguarded: a new top-level crate reached by no `members` entry and no `path` dependency is compiled by nothing and invisible to CI (reproduced 2026-11-12)<br>glob cost: a directory without `Cargo.toml` under either parent fails every cargo command (cargo 1.99.1, 2026-11-13) |
 | G2 | **no file outside a `-text` or `binary` path of `.gitattributes` holds `\r`, so no file whose bytes feed a version digest does** | `repo_invariants::line_ends::tests::no_hashed_input_in_this_tree_holds_a_carriage_return`: every non-hidden file outside `target/`; the exemptions are read from `.gitattributes`, the last matching `text` line deciding, as in git; a pattern with syntax the check does not read fails by name: `…::a_pattern_this_check_cannot_read_fails_by_name`<br>`HASHED_INPUTS` names the digest each path feeds, for the message only: `providers/open-web-feed/src/`, every file (`extract_version`, through `include_str!`); `providers/open-web-feed/rules/open-web-feed.rules.json` (`extract_rules_version`, `extract_version`); `providers/open-web-feed/hosts/` (`hosts_version`); `providers/edgar-press/rules/edgar-press.rules.json` (edgar's `extract_rules_version`); `news-provider/policy/observation-lag.json` (the `LagPolicy` version)<br>a listed path absent or an empty directory fails: `…::a_listed_path_that_is_absent_or_an_empty_directory_fails_rather_than_passes`<br>`.gitattributes`: `* text=auto eol=lf`; `-text` on `providers/*/tests/fixtures/**`, `services/*/tests/fixtures/**` and `probes/observation_lag/quarter_index.*.json`; `binary` on `*.parquet` | **enforced on the working-tree bytes of the whole tree** (mutations 2026-11-16, one at a time, each file converted to CRLF: the hosts file, `src/depth.rs`, both rules files, the lag policy; each red; the golden extraction test is red too for `src/` and the open-web rules file, so G2 is the only red test for the hosts file, the edgar rules file and the lag policy)<br>a digested file left out of `HASHED_INPUTS` is still checked (mutation 2026-11-16, the hosts entry removed and the hosts file converted to CRLF: all green on the fixed-list gate of `e3fab92`, red now with `feeds no listed digest`): `…::a_crlf_file_outside_every_listed_input_fails`<br>an exemption line is guarded where it covers a file holding `\r` (mutations 2026-11-16, each line deleted alone, red over): `providers/*/tests/fixtures/**`, `gnw/robots_rss_globenewswire_com.txt` (125 `\r`); `services/*/tests/fixtures/**`, `robots/synthetic_cr_line_ends.txt` (7); `*.parquet`, 1 parity parquet (2): `…::a_crlf_fixture_fails_once_its_raw_line_is_gone`<br>measured 2026-11-16 (research run, scratch clone of main `e2ed6d4` with `core.autocrlf=true` and no attributes): 201 files checked out CRLF and 6 tests red, among them the golden extraction test and both robots pins; rustc 1.99.1 compiles a CRLF `.rs` file as it compiles LF, while `include_str!` keeps the `\r`<br>`git add --renormalize .` under the committed `.gitattributes`, `*.parquet binary` included, changes 0 tracked files (2026-11-16); with `* text=auto eol=lf` alone it changes 1, `gnw/robots_rss_globenewswire_com.txt`, whose CRLF bytes are the GNW pin `eb8bb698…`<br>unguarded: the `quarter_index.*.json` `-text` line; the capture holds no `\r`, so deleting the line turns nothing red (2026-11-16)<br>unguarded on CI: a CRLF edit is committed as LF, so the gate is red only in the working tree holding the edit; a lone `\r` is committed as is, git then treats the file as `-text`, and the gate is red on CI too (2026-11-16, `git add` then `git ls-files --eol`: `i/lf w/crlf` for the CRLF lag policy, `i/-text w/-text` for the hosts file with one lone `\r`)<br>a CRLF copy of a tracked file is not listed by `git status`, and `git checkout -- <file>` leaves its bytes; deleting the file first restores LF (2026-11-16, the lag policy)<br>cost: untracked files are scanned too, so an untracked CRLF file outside `target/` and hidden directories turns the test red locally; the main checkout held 0 such files (2026-11-16, `find` plus `grep -c $'\r'`: 3 files hold `\r`, all 3 exempt)<br>unguarded: the deploy host; a file copied there by scp or rsync passes neither git nor this test, and how the VPS receives files is unknown (§10)<br>no edgar roster is committed: the roster is a run-time argument, and its test fixtures are `-text` |
 | U1 | **the panel names the roster it was built from** | collection side: `news_provider::Request.universe_version` inside `filter_params`; `attempts.universe_version` is `NOT NULL`; `news_provider::request::tests::two_runs_whose_rosters_differ_have_two_filter_params_digests`, `newsvault::store::tests::the_opened_row_carries_the_roster_digest_the_request_was_built_from`<br>absent, unparseable or empty roster: `edgar-press::Refusal` (§9)<br>panel side: nothing | **no enforcement point yet**: the panel side has none; the collection side has only a producer, a column and the two tests in the enforced-by cell<br>the roster's bytes, since 2026-11-23: a daily producer and a point-in-time reader (§10, "The roster"); nothing hands a copy to a panel, so this row's status is unchanged<br>unguarded: `panel-contract schema` lists 13 manifest fields, none a roster or `relation_map_version` (measured 2026-11-12), so §2 names five `panel_id` inputs where the gate requires three<br>making them required rewrites seven fixtures and R8: a decision, not an omission |
 | E1 | an error code is never renamed, and no code reaches stderr from outside the table | §5.1 stderr codes: nothing; design: workspace member `error-codes/` with `const CODES`, `codes.snapshot`, a snapshot test, and a constructor taking `&'static Code`<br>`panel-contract`'s 15 stdout `Finding` codes: renaming any one turns a named test red (`cargo test -p panel-contract --lib`, measured 2026-11-12) | **no enforcement point yet** for §5.1's codes<br>renaming the 15 `Finding` codes: **enforced**<br>unguarded: a new code needs no table entry and no review<br>unguarded: repurposing a code is not checkable |
@@ -1919,6 +1921,10 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | incremental salience, updated per event | makes the result depend on arrival order, which destroys the determinism the panel contract is built on |
 | the statistics tier as a separate repository | the panel handover is where the worst measured error happened, and a test can only span it from inside one tree |
 | vendor dedup and vendor entity tags as ours | unauditable editorial decisions; recorded as data, never adopted (§3.1) |
+| annual reports inside `newsvault`'s collect and store (reviewed and rejected 2026-11-24; §12) | a filings run counts toward the 31 expected news runs and hides a missed slot; the 8 MiB body limit, the news-trained zstd dictionary and the snapshot for `derive` are news-shaped (3 of 43 probed primary documents exceed 8 MiB, §12.10); its schema steps tie the news collector's rollback; a filings fault holds the news store's lock, and every collect slot it overlaps exits 7 |
+| `filingvault` linking `services/newsvault` as a library | the item door keys on `story_id` and `Published` and the schema is the news schema; linking it gives `filingvault` the news schema or nothing, and every news schema step rebuilds and re-tests the filings binary (§12.1) |
+| `filingvault` as a sixth service | the first row's cost; filings run on a clock and talk to a vendor, which is `vault`'s one reason to be separate (memo §3) |
+| a subcommand `newsvault filings` instead of a second binary | `services/newsvault` would link the filings code, the sibling dependency §12.1 forbids, and every filings command would enter `newsvault schema`, one hand-written literal |
 
 **Collecting ourselves: the body-length evidence.**
 
@@ -1956,6 +1962,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - Memo D-1 (which vendor for history): closed 2026-11-22 as "no purchases" (owner: no paid sources); memo §10 step 5's backfill to 246 sessions has no vendor.
 - The 12-month history can come only from free paths, such as the wires' own sitemaps; unmeasured: how far back the PRN, GNW and Business Wire sitemaps go.
 - A free archive read now has an observation time equal to the fetch, weeks after publication, so it gives no historical cutoff before its own fetch.
+- Two coverage reads of the news store join without an index: `store::covered_story_ids` and `store::coverage_up_to`. Measured 2026-11-24 on a laptop with Python `sqlite3` 3.53.4 over a synthetic store holding the join columns only (876,009 attempts and 797,694 items: 365 days at 2,347 attempts and 2,134 items a day, plus 19,354 attempts and 18,784 items of the filings layout §9 rejects): `covered_story_ids` for one window took 2.9 s, and 0.00013 s with indexes on `attempts(source, target_window)` and `items(attempt_id)`. `coverage_up_to` over 570 windows of the same store was not run to its end without them (one run stopped at 120 s, the same day) and took 0.07 s with them. Not re-measured on news rows alone (97.8% of those attempts) or on the VPS. Open: a `newsvault` fix on its own branch, two indexes in one schema step with a test asserting both query plans.
 - How PRN and GNW are read so that no stretch between polls goes uncovered: decided 2026-11-17 by the owner; the plan is §11.2's completeness table, whose PRN sitemap row and GNW row are built and PRN archive row is not. Their 20-item RSS indexes left uncovered stretches at both periods (§11.2's period table, measured 2026-11-16). Still open: when a PRN monthly archive is published and whether it is complete.
   - Decided 2026-11-17 ~21:30Z (owner, "tak"), option A: the GNW walk has no cap of its own; it is bounded by its id range and, once step 7 builds it, by S7-D3's deadline, and its ids are outside S7-D6's cap (§11.5 step 7): `walk_ids_are_never_counted_against_the_cap_or_deferred` (the queue) and `a_walked_poll_past_the_cap_sends_every_walk_id_and_defers_listed_releases_only` (through `collect`), 2026-11-18.
   - Decided the same day: a walked id answered 410 is never asked again, under its slug or another; asking 410 ids again is decided on live data (`ledger`'s `walk.gone`); S7-D5's carry does not ask one again, since a 410 is held and its row is closed `held` (§3.2's `deferred_closed`).
@@ -1988,7 +1995,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
     - Measured 2026-11-13 against live EDGAR with the policy: window `2026-11-12`, run date `2026-11-13`, 1 index request planned, `vendor_archive` arm on all 5 attempts, 4 items committed from a 3-CIK roster out of 7,805 vendor rows, 5 requests spent; without `--lag-policy` it refuses at exit 2 with `no lag entry` before any request.
   - **Which instant a backfilled row carries: `valid + seconds`, with `valid` raised to the listing index day's start (an on-time instant row) or end (any other row), not the fetch clock (§3.1, §8 row R11).** Not the fetch clock: it RECORDS when we read, years late on a real backfill. `valid + seconds` is the COUNTERFACTUAL a point-in-time study wants, one number per source, loose by the spread of acceptance times inside a filing day; a date is bounded at the END of its own calendar day plus the lag.
     - That looseness, measured on the run above while rows were still dated by the fetch clock: the four items' `observed_at` `2026-11-13T17:44:5x Z` against `valid_at + 94,922 s` differ by **not one sign** - `-5.81 h`, `-5.82 h`, `+2.17 h`, `+2.16 h`; the two negatives are the max scalar loose for a row whose own lag was `5.85 h`.
-  - **Two places decide it.** WHICH instant: `edgar-press`'s `EdgarPress::backfill_observation`, `Visibility::from_backfill`'s one production caller; it moves into `pit::datedness` beside `end_of_day` when a second `vendor_archive` provider exists, so two providers cannot date one `Published` value differently. WHETHER a row may carry a placed instant: `cmd_collect`'s `Committer::rows_of` stores one for `vendor_archive`, refuses an archive row with none and a `live_ingest` row with one.
+  - **Two places decide it.** WHICH instant: `edgar-press`'s `EdgarPress::backfill_observation`, `Visibility::from_backfill`'s one production caller; it moves into `pit::datedness` beside `end_of_day` when a second `vendor_archive` provider exists, so two providers cannot date one `Published` value differently. By design, no code: `filingvault` is that second caller (§12.3; the move is §12.8 step 6). WHETHER a row may carry a placed instant: `cmd_collect`'s `Committer::rows_of` stores one for `vendor_archive`, refuses an archive row with none and a `live_ingest` row with one.
   - **The other fork is three places:** `news_provider::provider::probed_lag` holds the six conditions; `edgar-press`'s `plan` is the one caller that asks; `LagPolicy::read` decides what a policy file may say.
 - **The provenance boundary, which D5 needs and no measurement places.** A window whose last day is on or before the run's own UTC date is a live ingest and an earlier one a vendor archive; an assumption, not a figure: how long an EDGAR daily index keeps growing is unmeasured, so there is no quantile to put here.
   - **The one place to change it** is `edgar-press`'s `Provider::provenance`, also home of the fail-closed arm: a window nothing can read takes the archive arm, the one that refuses.
@@ -2076,7 +2083,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
 - Why now: free sources show only today's company list, so a point-in-time roster (names later delisted or renamed included) cannot be rebuilt later; without it every panel is survivorship-biased (§2 row `universe_version`, the postmortem's +0.80 to −0.86). Snapshots fix this only from the first capture day on.
 - Owner rules: raw first (the exact bytes of each daily file with our observation time; tables later); no paid source; robots.txt honoured; no bot protection worked around; the public repository holds no vendor file.
-- The memo's `marketvault` context (memo §3) begins here: the roster is market reference data, not news. It lives in the `newsvault` crate and store. Rejected: a crate or store of its own for one file a day; a second store needs a second backup, lease and ledger.
+- The memo's `marketvault` context (memo §3) begins here: the roster is market reference data, not news. It lives in the `newsvault` crate and store. Rejected: a crate or store of its own for one file a day (521,795 B); a second store needs a second backup, lease and ledger. That rejection is the roster's alone: filings get their own store (§12, §9). The roster moves to `marketvault` when that context is built (owner decision 2026-11-24).
 - Command: `newsvault roster fetch` (`services/newsvault/src/cmd_roster.rs`). Rejected: `collect --source roster`. `collect` drives a `Provider` (`plan`, `classify`, `extract`, the held set, deferral and carry, the schedule's 31 runs); a roster file has no items, and a `Registered` variant reaches every `match` of the ledger and the schedule. `robots refresh` already holds the shape needed: an attempt row and an L2 payload per call, no item rows.
 - Files asked, `cmd_roster::FILES` (`the_roster_asks_exactly_sec_s_exchange_file`):
 
@@ -2104,7 +2111,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
   - The reason is on stdout only (the journal on the VPS). The store keeps the robots attempt row and body under the run's `run_id`, from which it can be derived again. `roster show` does not report it: a day robots kept us from the file reads as a day with no roster attempt (open).
   - Nasdaq Trader's `/robots.txt` answered 302 on 2026-11-23, and `Wire` follows no redirect (§3.9), so its files would be `robots_unverified` and never asked. This answers the open question of how our parser treats a 302 to a 200 HTML page: it never sees one.
   - Rejected: a pin in a hosts file as open-web keeps; for one host it adds a file and a refresh step, and nothing extracted here depends on the robots body.
-- Pace and contact: `edgar_press::sec_transport()`, now the one home of SEC's transport for both callers; the `Wire` is built with `SourceId` `edgar_press`, so the roster pays into `pace/edgar_press.per-ip` and `pace/www.sec.gov.per-host` with EDGAR (§8 row R19): `a_roster_fetch_through_the_wire_pays_into_edgar_press_s_per_ip_pace`. The User-Agent is the feed contact (`BELLWETHER_FEED_CONTACT_FILE`, the file the VPS mounts); SEC answered it 200 on 2026-11-23; `roster_fetch_reads_the_feed_contact_file_the_unit_mounts` (a dry run with only SEC's variable set is refused). Open: `edgar-press` sends `BELLWETHER_SEC_CONTACT[_FILE]` under the same pace, so the two SEC callers send different User-Agents; unify them before `edgar-press` runs on the VPS. Unguarded: AlphaLens's SEC calls on the same VPS share the IP and not the pace files (§10, ties to AlphaLens).
+- Pace and contact: `edgar_press::sec_transport()`, now the one home of SEC's transport for both callers; the `Wire` is built with `SourceId` `edgar_press`, so the roster pays into `pace/edgar_press.per-ip` and `pace/www.sec.gov.per-host` with EDGAR (§8 row R19): `a_roster_fetch_through_the_wire_pays_into_edgar_press_s_per_ip_pace`. The User-Agent is the feed contact (`BELLWETHER_FEED_CONTACT_FILE`, the file the VPS mounts); SEC answered it 200 on 2026-11-23; `roster_fetch_reads_the_feed_contact_file_the_unit_mounts` (a dry run with only SEC's variable set is refused). Open: `edgar-press` sends `BELLWETHER_SEC_CONTACT[_FILE]` under the same pace, so the two SEC callers send different User-Agents; unify them before `edgar-press` runs on the VPS. Owner decision 2026-11-24: one contact for every SEC request; `filingvault`, the third SEC caller by design, reads the feed contact and shares one pace directory with both (owner decision 2026-11-25, `FV-Q4`; §12.2). Unguarded: AlphaLens's SEC calls on the same VPS share the IP and not the pace files (§10, ties to AlphaLens).
 - Verdict of a file: 200 of the file's shape (`{"fields": [cik, name, ticker, exchange], "data": [...]}`) is `usable`, or `empty` with no rows; 200 of another shape (a challenge page, a changed format) and a body over 8 MiB are `permanent_failure`; 403, 408, 429, 5xx and a transport error are `transient_failure`, as `edgar-press` reads SEC; any other status (404, 3xx) is `permanent_failure`. Every body is kept, failures included.
 - Exit, `news_provider::Tally::exit`: 0 every file usable; 7 `vendor_unreachable`; 8 otherwise (`partial_collect`, `vendor_refused_all`). An empty roster counts as a failure: an empty file is the silent zero R6 forbids. A failed robots fetch counts once and its files add nothing; a file robots keeps us from counts as not asked. 2 `credential_contact_missing` before the store is touched; 7 `lease_held`, its envelope finished and marked `lease_held` as a refused collect's is (`a_held_lease_exits_7_and_marks_the_envelope`).
 - Reader on a real path: `newsvault roster show --at <instant>`, read-only, no lease. Per file, the newest usable copy whose valid time and observation time are both at or before `--at` (`Visibility::visible_at`):
@@ -2533,6 +2540,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
   - The alert is the VPS's shared host rule `LowDiskSpace` in `~/monitoring/prometheus/alert.rules`: `node_filesystem_avail_bytes / node_filesystem_size_bytes * 100 < 15` for 5m, routed to the same Telegram receiver; read on the VPS 2026-11-22.
   - Not in this repository: the rule belongs to the shared monitoring stack (§11.5 step 7, "Alerting"); none of the 23 rules in `deploy/prometheus/newsvault.rules.yml` (17 before the shadow's four of 2026-11-23 and the gate copy's two of 2026-11-24) reads disk, and `newsvault-monitoring-check` does not check the shared rule.
   - Unmeasured: the store's growth rate.
+  - Design, no code: the filings store's initial fill is about 4.26 GB in one copy (an estimate, §12.9), and waits for the backup change because 9 copies of it do not fit (§12.9).
 - A missed `collect` day is mostly recovered late with a later `observed_at`, so it gives no cutoff inside that day: the PRN sitemap walk reads back to its last basis (sitemap depth about 70.5 h, measured 2026-11-17) and the GNW id walk to the highest id of the previous RSS read (§11.2). Lost as `live_ingest`: items of RSS-only hosts (the Fed, CNW) and of any outage longer than a host's list depth. Not tested on a real outage.
 
 | id | criterion | check | state on 2026-11-22, with evidence | threshold | remaining work |
@@ -4729,3 +4737,656 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - So the challenge is neither the VPS address nor our User-Agent; it began between 2026-11-16 08:06Z and 2026-11-19 09:37Z. A browser loads CNW pages (owner, 2026-11-19), consistent with a JavaScript challenge a browser passes.
 - Research 2026-11-19 (web search): no Cision or `newswire.ca` announcement and no public report found. Cloudflare's only default change in the period (2026-09-15) applies to new domains and AI-crawler categories.
 - Reading: a rule of the site owner (a WAF managed challenge or Bot Fight Mode). robots.txt allows `/news-releases/` and the sitemap lists those urls, so the rule and the robots.txt disagree. What CNW does next: §11.2's hosts bullet.
+
+---
+
+## 12. `filingvault` — the annual-report archive as the filings context (owner decisions 2026-11-24 and 2026-11-25; design, no code)
+
+- Status of every line of §12: design, no code. No §8 row is claimed from it; §12.7 lists the gates planned.
+- Owner decision 2026-11-24 (layout B): the archive of annual reports is the memo's `filingvault` context (memo §3). It gets its own crate and its own store (lock, schema version, backup, coverage ledger, timers) inside the `vault` deployable and image. The mechanics every archive needs sit in a shared crate and reach it by PRs that move code with no behaviour change. `newsvault` keeps the news context (sources, lanes, the 31-run schedule, the cut for `derive`). The roster stays in `newsvault` until `marketvault` is built.
+- Owner rule 2026-11-24: code goes in the component that owns the responsibility; every piece has exactly one home, with the reason (§12.1).
+- Accepted by the owner 2026-11-24: the whole report is the header page, the whole primary document and the listed text exhibits, with no graphics and no XBRL; free public sources only; one nightly run; pace 500 ms; a stop after 3 consecutive traffic 403 answers; a 64 MiB document limit; one contact for every SEC request; collection by form, never by a roster filter; "newest" ordered by period first.
+- Owner decisions 2026-11-25: `FV-Q1` to `FV-Q11` (§12.11). A line below that rests on one names it.
+- Not yet assigned: the person who labels the 200 documents (`FV-Q5`, §12.4).
+- Units: MB = 10^6 B, GB = 10^9 B, MiB = 2^20 B. "Probe 1" and "probe 2" are §12.10's.
+
+### 12.1 What lives where and why
+
+| crate or unit | state | single responsibility | must never contain | workspace dependencies |
+|---|---|---|---|---|
+| `vault-core` (name kept, `FV-Q2`) | designed; top level | what a store on disk needs whatever it stores: the blob store (compression, verified read, staging) and its error type, the store lease, the one SQLite opener, the log copy | a socket or an HTTP dependency; SQL naming any table (each context reads and writes its own `blobs` rows, and the two `blobs` tables differ: §12.2); a schema; a type of any context; a dependency on a workspace member | none |
+| `news-provider` | exists; gains `robots` and `contact` | two things in one crate today. The conversation core, which `filingvault` uses: `wire`, `budget`, `clock`, `ledger` (the attempt slot, the send permit, `Sink`), `request`, `lag_policy`, and after step 5 the robots parser and the contact reader. The news collection skeleton, which `filingvault` links and does not use: `provider`, `collect`, `conformance`. The core's types carry news-only fields (below, `FV-Q10`). The only vendor-side crate that declares an HTTP client (row R4) | a store, a SQLite connection, a vendor's format | `canon`, `pit` |
+| `providers/sec-edgar` (owner decision 2026-11-25, `FV-Q3`) | designed | what is true of SEC's EDGAR host for every caller: host and path constants, the per-IP bucket's name, the contact credential's name, SEC's transport profile and the one table of its intervals per caller (100 ms for the roster and `edgar_press`, 500 ms for filings; today `edgar_press::sec_transport()` and `SEC_MIN_INTERVAL`), the daily-index and quarter-listing parsers, the acceptance-digits parser and its format constant, SEC's status reading | a `Provider` implementation; a form list; a store; an HTTP dependency | `news-provider`, `pit`, `canon` |
+| `providers/edgar-press` | exists; loses the items of the row above | the news adapter for 8-K press releases | anything a second SEC caller needs | `sec-edgar`, `news-provider`, `canon`, `pit` |
+| `providers/open-web-feed` | exists; gains the 5-line `impl RobotsRules for Robots` | the news adapter for the open web | — | unchanged |
+| `filing-contract` | designed; top level | pure functions over stored bytes and a hashed rules file: `manifest(bytes)` and `section(bytes, form, rules)`; the committed trust file (§12.4) | a clock, a socket, a store, a parsing dependency | `canon` |
+| `services/newsvault` | exists; loses `blobs.rs`, `robots.rs`, `contact.rs`, the opener, the lease and the log copy; gains one option (§12.2, the pace root) | the news context: sources, lanes, the 31-run schedule, the news schema and ledger, the cut for `derive`; the roster, for now | a filing type, table, form name or schedule | `vault-core`, `news-provider`, `providers/*`, `canon`, `pit`, `snapshot-contract` |
+| `pit` | exists; gains the archive observation bound in `datedness`, beside `end_of_day` (§10, "which instant a backfilled row carries"; §12.8 step 6) | the two time types and what dates a value | — | none |
+| `services/filingvault` | designed | the filings context: its schema, attempt sink, fetch loop, coverage ledger, reader and CLI; its lag policy file (§12.3) | a news table or source, `story_id`, the 31-run schedule; an HTTP dependency; a `Connection::open` | `vault-core`, `news-provider`, `providers/sec-edgar`, `filing-contract`, `canon`, `pit` |
+| `services/modelgate` | exists; unchanged | the only exit to a language model | — | `canon`, `snapshot-contract` |
+| `repo-invariants` | exists; gains gate FV1 and the two unit-file gates that read both contexts' units (§12.7) | invariants that span crates | — | none |
+| `probes/observation_lag/` | exists; two runs owed (§12.3, time) | the measured lag per (source, provenance) | — | — |
+| `probes/section_cut/` | designed; kept because it runs at every `extract_version` | scores the section cut (§12.4) | filing text | — |
+| `deploy/systemd/filingvault-*` | designed | three units and their timers: collect, extract, backup | the news store's lock file | — |
+| the deployable-level files: `deploy/systemd/newsvault-backup`, `deploy/systemd/newsvault-unit-result`, `deploy/monitoring/*`, `deploy/prometheus/newsvault.rules.yml` | exist; each gains a `filingvault` case, label value or rule in step 17 (`FV-Q11`) | what the host does for every store of this repository: the backup, the unit-result metrics, the one rules file and its install check (row A1) | a filings rule reading a `newsvault_` family other than the three the unit-result script writes (§12.2) | — |
+
+- `canon`, `snapshot-contract` and `panel-contract` are unchanged.
+- The deployable-level files carry `newsvault-` in their names and already serve `modelgate`: its backup case, its rules in the one group, its units read by `services/newsvault/tests/deploy.rs`. Their tests are `services/newsvault/tests/deploy.rs` and `monitoring.rs`, 2,715 and 1,175 lines (`wc -l`, 2026-11-25).
+  - Rejected (`FV-Q11`): a second rules file `deploy/prometheus/filingvault.rules.yml`. `deploy/monitoring/newsvault-monitoring-check` reads one rules file, one `rule_files` entry and one group, and exits 2 when the entry or the group is named twice; row A1, the script, `prometheus.rule_files.yml` and `monitoring.rs` would change for a split that alerts nobody differently.
+  - Known debt (§12.6): the tests of deployable-level files sit in one context's crate.
+- Why the shared mechanics are two crates and not one:
+  - conversation mechanics are already outside any service, in `news-provider`, and `services/filingvault` can depend on it as it stands: the HTTP allowlist is about declaring a client (`repo-invariants/src/clients.rs`, `CLIENT_ALLOWLIST`), and the clock scan reads `news-provider` and `providers/*` only (`clocks.rs`);
+  - store mechanics are inside the service crate `services/newsvault`, which a sibling context may not link; only they need a new crate.
+- Owner decision 2026-11-25 (`FV-Q1`): transport, pace and the send gate stay in `news-provider`, where they are shared today; `vault-core` holds store mechanics only.
+  - It narrows the decision of 2026-11-24, which named the three among what moves into the shared crate.
+  - Rejected: moving them into `vault-core`. Symptom, counted 2026-11-24 at `ea59293`: `wire`, `budget`, `clock`, `ledger` and `request` are 2,186 source and 3,265 test lines (lines before and after each file's first `#[cfg(test)]`) and cannot move in parts (`wire` needs `ledger::SendPermit`, `ledger` needs `wire::RawResponse`, and row R4 needs the permit and `Wire::send` in one crate); 87 lines of this document name `news-provider` or `news_provider::` (`grep -c`); `CLIENT_ALLOWLIST` and the clock scan's `SEAM_CRATE` name the crate.
+  - A `vault-core` that declares `ureq` could not later serve `modelgate` without `modelgate` linking a second HTTP owner (row R4).
+- Size of the store-mechanics move, counted the same way: `services/newsvault/src` is 14,401 source lines; `blobs.rs` 811, `robots.rs` 432, `contact.rs` 127; the opener, the lease and the log copy about 164 (counted from item ranges, not from a diff); 1,534 lines, 10.7%.
+- `filingvault` writes its own schema, sink, document door, coverage reader, run record and CLI. The news versions key on `story_id` and `Published` and carry news-only columns (`hosts_version`, `held`, `listing_unusable`, `relisted_compared`, `robots_disallowed`, `continuity`, `boundary_*`, `listed_by`).
+
+**What `filingvault` meets in the conversation core's types (read at `7b6e6f7`, 2026-11-25).**
+
+| field (`news-provider/src/request.rs`, `ledger.rs`) | what it is for news | what `filingvault` writes into it | the filings sink |
+|---|---|---|---|
+| `Request.source`, `Opened.source` | the ledger's source and the lag key | `edgar_filings`; the `Wire` is built under `sec-edgar`'s bucket name, as `cmd_roster` builds its `Wire` under `edgar_press::SOURCE` and its requests under its own source | not stored: one source |
+| `Request.target_window` | the window asked | `<kind>/<target>`: the only field that can carry five kinds | stored as `kind` and `target` |
+| `Request.phase` | `Index` or `Document`, two values | `Document` for a selected file, `Index` for the other four kinds | dropped |
+| `Request.provenance` | per request | `vendor_archive` for an index day, a manifest and a file (§12.3); `live_ingest` for robots.txt and a quarter listing | stored on `filings` |
+| `Request.universe_version` | the roster's digest: required, and inside `filter_params` | `FileDigest::of(&[])`, as `cmd_roster.rs` and `cmd_robots.rs` write today | dropped, with `Opened.filter_params` |
+| `Request.hosts_version`, `extract_version`, `listed_date`, `names_ticker` | admission, extraction and lane order of news | `None`, `None`, `None`, `false` | dropped |
+| `Opened.story_id`, `Opened.listed_by` | the news item an attempt fetches | `None` | dropped |
+| `Opened.attempt_id` | the only key `Answered`, `Finalised` and `Abandoned` carry | `news-provider`'s own | stored: `attempts.attempt_id` (§12.2) |
+| `Counts.vendor_rows` | rows a payload held | rows of a listed form for an index; 0 otherwise | dropped: `listings` holds the rows |
+| `Counts.listing_unusable`, `Counts.robots_disallowed` | news listing accounting | 0 | dropped |
+| `Baseline`, required by `Outcome::decide` | the collapse question | `Baseline::from_trailing_ok(&[])`, as both commands above | dropped |
+
+- `filingvault` is buildable on the core with constants in the news-only fields, as two `newsvault` commands already are. The core is shared; it is not neutral.
+- Owner decision 2026-11-25 (`FV-Q10`): for this step the news-only fields stay as they are and `filingvault` fills them with the constants above.
+  - Named debt: `news-provider` is not split into a context-neutral part and a news part. Trigger: when a third client of the conversation code exists (the `marketvault` context).
+  - Rejected for this step: a change PR before step 10 that makes the news-only fields optional or splits a core `Request`. Symptom: a PR of unknown size that is a change, never a move: `universe_version` enters `filter_params`, so the digests existing callers write and `canon`'s vectors must stay as they are.
+- Unguarded (§12.6): the `filingvault` binary links `news_provider::collect` (2,600 lines with its tests, `wc -l`), `provider` and `conformance`; gate FV1 walks `cargo metadata` and sees crates, not modules. It stays so until the split above.
+
+**Dependency rules.**
+
+- A context depends on no sibling: `services/filingvault` reaches neither `services/newsvault` nor `providers/edgar-press` nor `providers/open-web-feed`, directly or through a member; `services/newsvault` reaches neither `services/filingvault` nor `filing-contract`.
+- `vault-core` depends on no workspace member, so it stays usable by `modelgate`: row MG10 forbids `modelgate` the news side and forbids any member depending on `modelgate`; a shared leaf is allowed, as `canon` and `snapshot-contract` are.
+- `modelgate` is not switched to `vault-core` in this step. Rejected: its blobs are flat and uncompressed under `blobs/<sha256>` with staging prefix `.staging-` (`services/modelgate/src/store.rs`), so adopting `BlobStore` changes a production store's layout.
+  - Its opener, lease and log copy (`connect`, `LOCK_FILE` and the lease in the writer's door, same file) stay a second copy of what step 4 puts in `vault-core`: two homes until it is switched (§12.6).
+- Unguarded until gate FV1's tests exist (§12.7): the `vault-core` rule until step 3, the context rule until step 10.
+
+**Binary and image.**
+
+- One image, three binaries: `filingvault` is built and copied as `modelgate` is (`Dockerfile`, the `cargo build -p` line and the `COPY --from=build` line) and run with `--entrypoint`.
+- The Dockerfile line arrives with the deploy step (§12.8 step 17). Until then no `filingvault` binary exists outside a test, so schema version 1 takes its final shape before any store exists (§12.2).
+- Unmeasured: the compile time a third binary adds.
+
+**Rejected, beyond §9's four layout rows.**
+
+| alternative | symptom that killed it |
+|---|---|
+| `filingvault` depending on `providers/edgar-press` for SEC's parsers | a filings build links the 8-K adapter and its rules file, and the per-IP bucket's name stays a constant of a news adapter (`edgar_press::SOURCE`) |
+| a second migration engine written for `filingvault` | two engines to keep equal; version 1 needs only "create, or refuse another version" (§12.2) |
+| the roster moved to `marketvault` now | owner decision: it moves when that context is built |
+
+### 12.2 The store, its schedule and what it shares at runtime
+
+**Directory and lock.**
+
+| path | what | written by |
+|---|---|---|
+| `%h/.bellwether/filingvault/` | the store root; `--store` | — |
+| `…/LOCK` | the lease, `vault-core`'s type; taken without waiting by every writer, exit 7 when held | `filings collect`, `sections extract`, `snapshot` |
+| `…/filings.sqlite3` | the one log, opened only through `vault-core`'s opener (row T1) | the writers |
+| `…/blobs/sha256/<2 hex>/<2 hex>/<sha256>.zst` | every payload as received, a plain zstd frame | `vault_core::BlobStore` |
+| `%h/.bellwether/shared/pace/` | not in the store: the deployable's pace files, under the pace root `%h/.bellwether/shared` (below, `FV-Q4`) | every `Wire` of either context |
+
+- No `pace/`, `runs/` or `blobs/dictionaries/` under the store.
+- The filings units take their own host-level `flock`, `%t/bellwether-filingvault.lock`, never the news units' `%t/bellwether-store.lock`.
+- Readers (`filings show`, `ledger check`, `schema`) take no lease, as `roster show` takes none.
+
+**Schema, version 1.**
+
+- It inherits no news table.
+
+| table | one row per | key | columns beyond the key | producer | reader |
+|---|---|---|---|---|---|
+| `runs` | run of a writer | `run_id` | `kind` (`collect`, `extract`), `started_at`, `finished_at`, `exit`, `budget`, `planned`, `closed`, `left_open`, `stopped_by` (null, `deadline`, `robots` from step 10; `budget`, `traffic_403` from step 11) | each writer, opened at start and closed at end | `ledger check` |
+| `attempts` | vendor call, written before the socket | `seq` | `attempt_id` (`news-provider`'s, unique: the key every later event of the attempt carries), `run_id`, `kind` (`robots`, `listing`, `index` from step 10; `manifest` from step 11; `document` from step 12), `target`, `url`, `forms` (the form list an index attempt was asked under), `rules_version`, `body_limit`, `requested_at`, `received_at`, `status`, `verdict`, `truncated`, `raw_blob`, `response_headers` | `impl Sink` over `news-provider`'s attempt events | `ledger check`, the planner, `filings show` |
+| `blobs` | stored payload | `digest` | `bytes`, `stored_bytes` | the blob write, from the stored size `vault-core`'s write returns (§12.8 step 9; `put` returns the digest alone today) | `blobs verify`, the size metrics |
+| `listings` | row of a listed form in an index payload | (`index_day`, `cik`, `accession`) | `form`, `filed_day`, `first_seq` (the first attempt that listed it) | the index attempt's commit | the planner, `ledger check`, `filings show` |
+| `filings` | accession with a usable manifest | `accession` | `form`, `period`, `filed_day`, `acceptance_raw`, exactly one of `valid_at` or `valid_day` + `valid_tz`, `observed_at`, `provenance`, `lowest_cik`, `manifest_seq`, `manifest_version`, `closed_seq` | the manifest attempt's commit | `filings show`, the planner |
+| `filers` | `FILER` block of a manifest | (`accession`, `cik`) | `name`, `sic`, `state`, `former_names` | the same commit | `filings show` |
+| `documents` | file the rules select from a manifest | (`accession`, `file`) | `type`, `sequence`, `raw_blob`, `bytes`, `truncated`, `last_modified`, `seq`, `verdict` | the manifest commit (the row), the document attempt's commit (the blob) | the planner, `sections extract`, `filings show` |
+| `sections` | (`raw_blob`, `form`, `extract_version`, section name) | that tuple | §12.4 | `sections extract` | `filings show` |
+
+- Each table arrives in the PR that gives it a producer and a reader (§12.8).
+- Rows for selected files only: the manifest is stored whole as a blob, so an unselected file is on record by name and type. A row per listed file would be about 1.42 million rows for the initial fill (10,433 filings × 136 entries, §12.9, §12.10).
+- Indexes are declared with the tables they serve, and one test asserts the query plan of each ledger read (§12.8 step 10).
+- Version 1 is the shape at the deploy step's tag. Before it no store exists outside a test, so tables are added under `user_version` 1 with no migration; the code is "create, or refuse another version", as `modelgate`'s store does.
+- The first change after that tag is version 2. Its PR first moves `newsvault`'s migration engine into `vault-core` behind a parameter carrying the schema, the steps and the version, as a move with no behaviour change.
+
+**What "complete" means.**
+
+| unit | state | definition |
+|---|---|---|
+| a filing | closed | its manifest has a usable attempt and every `documents` row of it holds a blob or is closed by a `permanent_failure`; or the manifest itself is closed by a `permanent_failure` |
+| a filing | open | anything else |
+| an index day | complete | a quarter listing names the day, the day has a usable or `empty` index attempt whose `forms` holds every form of the current list, and every filing its `listings` rows name is closed |
+| an index day | open | it has such an index attempt and at least one open filing |
+| an index day | unasked | a listing names it and it has no such index attempt, or only attempts under a narrower form list |
+| the window | `complete_from` | the first day of the unbroken run of complete index days ending at the newest index day observable at the instant asked; null when that newest day is not complete |
+
+- "Complete" means "nothing left to ask", not "everything held": a filing closed by a permanent failure completes its day and reads `listed_not_held` (§12.5).
+- A combined filing listed under two CIKs is two `listings` rows and one `filings` row, so it is planned once.
+- A wider exhibit list does not reopen a closed filing (§12.6).
+- Reader: `filingvault ledger check --at <instant>`: the three day counts, the open filings by age, `complete_from`, the last run. Exit 0 nothing open in the forward window; 1 the answer is no; 4 no store; 2 usage.
+- It grows with its tables: after step 10 it prints asked and unasked days and the listed rows, and exits 1 while a forward day is unasked; open filings arrive with step 11; `complete` and `complete_from` arrive with step 12, the first step that can close a filing.
+
+**Schedule and run accounting.**
+
+- One run a night: `filingvault-collect.timer` at 06:10 UTC, `TimeoutStartSec=7200`, `SuccessExitStatus=8`, no `Persistent=` (owner decision 2026-11-25, `FV-Q8`: the 2 h bound and the slot).
+  - 06:10 UTC is 01:10 or 02:10 in New York. Unverified: when SEC writes a day's index; the trailing three days cover a late one.
+  - It overlaps news collect slots and shares no lock, table or store with them.
+- One run, in order: robots.txt of `www.sec.gov` under a `robots` attempt; the quarter listing of each quarter holding an open or unasked day in the plan; the trailing 3 index days; unasked days from newest to oldest until the filing budget is reached; each open filing, manifest first, then its documents.
+  - Rejected: oldest first. After one night the register would answer for mid-2025 and not for the most recent weeks.
+- The initial 15-month fill is the same unit over about 6 nights (§12.9). It does not start before the backup change of branch `fix/backup-blob-packs` is deployed (§12.9, disk).
+- Filing budget: 1,800 filings a run, in the rules file. Construction: 7,200 s less 120 s to stop issuing is 7,080 s; at 3.48 s a filing (§12.9) that is 2,034 filings; 1,800 × 3.48 s = 6,264 s leaves 816 s for index requests and slow transfers. 3.48 s rests on a laptop's transfer time; a dry run from the VPS sets the number before the first production run.
+- A filing past the budget is not issued and leaves no attempt row; it stays open for the next run.
+- No in-run retry of a transient failure; the next night asks it. Rejected: an in-run retry as row R21 has for news. Reference data loses nothing by a day, and it is one mechanism fewer.
+- Three consecutive traffic 403 answers (a 403 without `AccessDenied`) stop the run: no fourth attempt is opened, `stopped_by` is `traffic_403`, exit 7.
+- Exit of `filings collect`: 0 nothing open in its plan; 8 partial (the budget reached, or a filing left transient); 7 the lease held, the 403 stop, or robots not allowing the path; 2 usage or a missing input (the pace root, the contact, the lag entry, the rules file), before any vendor call.
+- `sections extract`: its own unit at 08:20 UTC, after the collect bound plus a 90 s stop timeout, bounded at 900 s, with `--limit`. Unmeasured: its time per document.
+- Run accounting is the `runs` table. A start that cannot take the lease writes no row; the unit's result metric and the "missed" alert carry it.
+- A run killed mid-way leaves its `runs` row and at most one attempt open; the next writer's startup closes both as `interrupted`.
+- Nothing of this is counted by `newsvault ledger`: no envelope in the news store's `runs/`, no row in its `attempts`, no asking clock moved.
+
+**Alerts and metrics.**
+
+| alert | fires when | producer of the metric |
+|---|---|---|
+| `FilingvaultCollectFailed` | the collect unit's result is failed | `newsvault-unit-result filings` |
+| `FilingvaultCollectMissed` | `newsvault_unit_result_timestamp_seconds{unit="filings"}` is older than 93,690 s (86,400 + the 7,200 s bound + 90 s) or absent | the same script |
+| `FilingvaultCoverageOpen` | `filingvault_forward_open_days` is above 0 | the collect wrapper, from `ledger check`'s JSON |
+| `FilingvaultExtractFailed` | the extract unit's result is failed | `newsvault-unit-result filingsextract` |
+| `FilingvaultBackupFailed`, `FilingvaultBackupStale` | as `modelgate`'s two backup rules read their unit and stamp | the backup script: `filingvault_backup_last_success_timestamp_seconds`, `filingvault_backup_last_success_bytes` |
+
+- `filingvault_forward_open_days`: index days on or after the day of the store's first run, older than 3 days, not complete. `filingvault_backfill_open_days`: the same for earlier days; a gauge with no alert, so the initial fill pages nobody.
+- Size gauges from the collect wrapper: `filingvault_blob_raw_bytes`, `filingvault_blob_stored_bytes` (sums over `blobs`); their quotient is the production compression ratio.
+- The unit-result script keeps its metric names and gains a `unit` label value. Rejected: renaming the families; it is a change to the shared monitoring stack.
+- The filings rules are further rules of the one group in `deploy/prometheus/newsvault.rules.yml` (§12.1, `FV-Q11`), so row A1's check reads them with no change to its script.
+- A filings rule may read three `newsvault_` families, all written by the unit-result script: `newsvault_unit_result_success`, `newsvault_unit_result_timestamp_seconds`, `newsvault_unit_exit_status`.
+- Step 17 changes `services/newsvault/tests/deploy.rs` in three places, each with its mutation: `read_families` admits the `filingvault_` prefix (it reads `newsvault_` and `modelgate_` only, so a `filingvault_` metric the backup script writes would be seen by no test); the pinned `shellcheck` line and the `--volume` file list gain the filings units.
+
+**Backup.**
+
+- The same script with its own argument: `newsvault-backup filingvault`, one more case beside `modelgate`'s, reading `$HOME/.bellwether/filingvault`.
+- `filingvault-backup.timer` at 09:10 UTC, under the store's lease through `filingvault snapshot` (`vault-core`'s log copy).
+- How blobs are copied is not designed here: branch `fix/backup-blob-packs`.
+
+**SEC's request budget across the two contexts (`FV-Q4`).**
+
+- SEC counts requests per address. Three callers leave this deployable for `www.sec.gov`: `filings collect`, `roster fetch` (01:20 UTC) and `edgar_press` (0 attempts in production, §3.0).
+- Today the pace files sit under the store, `<store>/pace/` (`news_provider::budget`, the three `beside_the_store` constructors), so a second store is a second bucket: row R19's hole 2, "pace file per store, so two stores = two buckets".
+- Owner decision 2026-11-25: one pace root for the deployable, `%h/.bellwether/shared`, mounted into every container that builds a `Wire`. The files sit in `<pace root>/pace/`, because `news_provider::budget` joins `pace/` (`PACE_DIR`) to the directory it is given.
+
+| question | answer |
+|---|---|
+| who owns the files' format and locking | `news_provider::budget`, unchanged |
+| who owns the directory | the deployable's unit files; neither context's store holds it |
+| who owns the interval | `providers/sec-edgar`: one profile constructor and one table of intervals per caller (§12.1) |
+| how `filingvault` names it | `--pace-root`, required; a missing one is exit 2 before any call |
+| how `newsvault` names it | `--pace-root` on the commands that build a `Wire` (`collect`, `roster fetch`, `robots refresh`), default the store; step 7 changes the news unit files to mount and pass it in the same PR, so the option has a producer on a real path |
+| the per-IP bucket | every SEC caller builds its `Wire` under one bucket name, a constant `providers/sec-edgar` exports; its value stays `edgar_press`, the file on disk today |
+| the per-host bucket | `www.sec.gov.per-host`, keyed by host, shared once the directory is |
+| a hold SEC sends one caller | raised in `www.sec.gov.hold`, so it holds the other callers too |
+
+- `Wire::new` uses its `store` argument for the pace, hold and gate paths only, so the pace root goes in as that argument and no `news-provider` signature changes.
+- Rejected: an option naming the files' own directory. Passed as `store` it yields `<directory>/pace/`, a second bucket with no error; placing the files directly in it changes the three `beside_the_store` constructors.
+- Rejected: `%h/.bellwether` as the pace root. It is the parent of both stores, so each container would mount the other's store.
+- Deploy step, once, with the timers stopped (owner decision 2026-11-25): move `%h/.bellwether/vault/pace` to `%h/.bellwether/shared/pace` and install step 7's unit files. At step 7's release, or with step 17 at the latest.
+- The pace directory then leaves the news store's daily archive. A lost pace file costs one unpaced first call and any hold in force.
+- Two callers at two intervals (the roster at 100 ms, filings at 500 ms), read from `news-provider/src/budget.rs` at `7b6e6f7` and tested by nothing: the per-IP file holds the next allowed instant, written with the last caller's own interval; the per-host file holds the last granted instant, and each caller adds its own interval. So a filings call is at least 500 ms after any call to the host, and a roster call at least 100 ms after any call and up to 500 ms after a filings call. §12.8 step 7 carries the test, in `news-provider`: two `Wire`s over one pace root.
+- The stop after three traffic 403 answers is `filingvault`'s alone (`runs.stopped_by`): the roster run does not read it. Shared is only a hold SEC states, through `www.sec.gov.hold` (§12.6).
+- Rejected: `filingvault` passing the news store as its pace root. The filings container would need the news store mounted writable, and a filings fault could then touch it.
+- Rejected: two buckets with the callers scheduled apart. Row R19's claim becomes a timer convention no test reads, and a 2 h filings run spans a news collect slot that calls SEC the day `edgar_press` is enabled.
+- Unguarded: AlphaLens's calls to `www.sec.gov` from the same address (§10, ties to AlphaLens); accepted at 500 ms with the 403 stop.
+- Contact: one for every SEC request. `filingvault` reads the feed-contact file the roster reads (`BELLWETHER_FEED_CONTACT_FILE`), which SEC answered 200 on 2026-11-23 (§10, the roster).
+- Transport profile: `sec-edgar`'s constructor with the filings row of its interval table, 500 ms per IP and per host (2 requests a second, 20% of SEC's stated 10); `filingvault` states its body limit, 64 MiB; timeout 30 s, no redirect followed.
+
+### 12.3 What is stored, and how a filing is identified and dated
+
+**Scope of "the whole report".**
+
+| # | stored per filing | bytes (probe 2, 43 filings) |
+|---|---|---|
+| 1 | the header-and-manifest page `<accession>-index-headers.html` | mean 31,075 B |
+| 2 | the primary document, whole: the manifest entry whose type equals the form | mean 3,717,048 B, median 2,620,952 B, max 24,864,731 B |
+| 3 | exhibits whose type is on the rules file's list, text formats only | 150,124 B a filing, pooled |
+
+| not stored | share of listed bytes (probe 2) | why |
+|---|---|---|
+| XBRL sidecars and pages SEC's renderer generates | 59.2% | inline facts stay inside the primary document |
+| graphics | 21.1% | already compressed, no text |
+| exhibits not on the list | 2.0% | named in the stored manifest; fetched later by accession if a reader arrives |
+
+- The exhibit list is a rules-file list per form family, not an enum (owner decision 2026-11-25, `FV-Q6`: this list, not every text exhibit):
+
+  | type | forms | why | measured (probe 2) |
+  |---|---|---|---|
+  | EX-21 | 10-K, 10-KT | subsidiaries, a relation the map will read | 25 files in 25 of 34 10-K, 803,771 B |
+  | EX-99.* | 40-F | a 40-F's primary document is a wrapper (71,174 B and 137,384 B); the description is in the Annual Information Form | 17 files in the 2 filings, 5,651,556 B |
+  | EX-13 | 10-K, 10-KT | the annual report to shareholders, where some filers put the business description | 0 of 34 10-K hold one; in a 20-F, EX-13 is a certification (13 files in 7 filings, 66,233 B), so the entry is per form |
+
+- Admission rule, written before probe 2: primary documents compressed at the measured ratio plus exhibits, for the 15-month fill, counted twice, at most 20 GB.
+
+  | scope | exhibit files a filing | by the rule | requests for the fill | verdict |
+  |---|---|---|---|---|
+  | the list above | 0.98 | 7.1 GB | 31,376 | admitted |
+  | every text exhibit | 8.58 | 16.1 GB | 110,716 | passes the rule; not chosen |
+
+  - Exhibits are counted raw (their compression is unmeasured), so both figures err high on exhibits. Amendments and failure bodies are in neither.
+  - Every text exhibit is rejected for requests, not bytes: 128 of its 369 files are certifications (EX-31, EX-32). It would keep material contracts (EX-10: 35 files, 5,785,578 B in 17 of 34 10-K).
+- Rejected: the complete submission `.txt`. It carries every listed file as text, of which the primary document is 17.0%; its length is unmeasured (§12.10).
+- The manifest is stored whole, so "we chose not to fetch it" and "it did not exist" stay different.
+
+**Storage of a payload.**
+
+- As received, under its sha256, through `vault_core::BlobStore`, zstd level 9, no dictionary.
+  - Rule written before probe 2: a dictionary is used only if it improves the ratio by more than 5%. The news dictionary makes the 43 documents 1.5% larger (§12.10).
+- `BlobStore::put` stores raw until a dictionary is active (row B1). `filingvault` needs a second write policy, plain zstd: a behaviour change in a PR of its own (§12.8 step 9), never in a move PR.
+- Body limit 64 MiB for every `filingvault` request: the largest primary document seen is 23.71 MiB, and 3 of 43 exceed the news limit of 8 MiB.
+- A body over the limit is stored cut, `truncated` 1, `permanent_failure`, with the limit in force on its attempt row; it is asked again only by a run whose limit is higher.
+- Memory: one payload of at most 64 MiB held three to four times (read buffer, compress buffer, frame copy), under about 300 MiB a run.
+
+**Forms and filers.**
+
+| form | fetched | cut in this step |
+|---|---|---|
+| 10-K, 10-KT | yes | Item 1 |
+| 20-F | yes | Item 4 |
+| 40-F | yes, with EX-99.* | no: refusal `no_rule_for_form` |
+| 10-K/A, 10-KT/A, 20-F/A, 40-F/A | yes, as new filings | cut attempted and recorded; never a `description_from` until an amendments stratum is measured |
+| 10-K405, 10-KSB, S-1, F-1, 424B, 10-12B, 10-12G | no | — |
+
+- Collection is by form. Rejected: a roster filter. The first roster copy is dated 2026-11-23 (§10), so a 15-month fill filtered by it drops every company delisted in those months.
+- The form list lives in `filingvault`'s rules file; each index attempt records the list it was asked under (`attempts.forms`).
+- Rejected: a filter by SIC. Missing for 7 of probe 1's 50 names and for 1 of probe 2's 43 manifests.
+- The population no probe row represents: 8,351 annual filers less 6,118 with a listed security, 2,233 (26.7%) (§12.9).
+
+**Identity.**
+
+| what | value | rule |
+|---|---|---|
+| the filing | the accession number | SEC's row identity and the primary key of `filings`. The index row and the manifest's header must agree on it, or the manifest is refused `manifest_accession_mismatch` |
+| a stored file | (accession, file name) | the primary key of `documents`; two filings whose primary documents share a name are two rows |
+| the bytes | `raw_blob`, sha256 of the payload as received | identity of bytes, never the dedup key |
+
+- No `story_id`, no `doc_id` and no new `canon` `Domain`: those name news items, and nothing here enters the news store or its snapshot.
+- First sighting wins: a `documents` row keeps the first blob it held, and a file is asked once.
+- The manifest is fetched until one copy is usable and never again; its `documents` rows drive what is still missing.
+- Unobserved: a rewrite or deletion by SEC after our fetch. Recorded at no request: the document's `Last-Modified` (sent in 43 of 43), printed by the reader as `modified_after_acceptance_seconds`.
+- Amendments: a `/A` filing has its own accession and overwrites nothing. `amends` is derived at read time: the visible original of the same CIK, form family and period; zero or more than one gives null and `amends_ambiguous`.
+- Header fields (owner decision 2026-11-25, `FV-Q7`): `name` is labelled `as_of: filing`; `sic` and `former_names` are labelled `as_of: fetch` and take the manifest's `received_at` as their observation. The rule written before probe 2 asked for 5 testable name cases and got 2, both as filed (§12.10); SIC and former names were not tested.
+
+**Time.**
+
+- `ValidTime` = the manifest's `ACCEPTANCE-DATETIME`, 14 digits, read in `America/New_York` (43 of 43 equal the submissions JSON instant, §12.10). `acceptance_raw` keeps the digits; the parser and its format constant are `sec-edgar`'s.
+  - `edgar-press`'s rules file keeps its `acceptance.format` field (`%Y%m%d%H%M%S`): removing it changes `extract_rules_version`, which a PR with no behaviour change cannot do. Step 6 adds a test in `edgar-press` that the field equals the constant; the field goes at that file's next version.
+- A manifest with no parseable acceptance gives the filing `valid_day` = the filed day and `valid_tz`: a date that cannot reach a cutoff, never a midnight. 26 of 43 acceptances are at or after 16:00 New York, so a midnight would place 60% of these reports more than 16 hours before they existed.
+- `valid_at` is EDGAR's acceptance: a lower bound on public availability by an unmeasured interval.
+- `ObservationTime`: every run reads index days that ended before its UTC date, so every filing is `vendor_archive`, under the existing archive bound of `edgar-press` (`EdgarPress::backfill_observation`), whose rule moves to `pit::datedness` as §10 planned for a second `vendor_archive` caller ("which instant a backfilled row carries"; §12.8 step 6):
+  - filed day equals the index day: the later of the acceptance instant and the index day's start, plus the measured lag;
+  - a late row: the later of the acceptance instant and the index day's end, plus the measured lag;
+  - no lag entry: `filings collect` exits 2 before any vendor call.
+- The stamp means "the daily index carried this row by then". It is not our fetch instant, which stays on the attempt row as `received_at`.
+- One observation per filing; its documents inherit it.
+- Owed before the first production run: the lag for (`edgar_filings`, `vendor_archive`). §10's `94,922 s` was taken on 8-K rows for `edgar_press`. Measurement: `probes/observation_lag/` with the annual forms, on two index days, pre-registered.
+  - Its entry goes in `services/filingvault/policy/observation-lag.json`, read by `news_provider::lag_policy::LagPolicy` and added to the list in `repo-invariants/src/line_ends.rs`.
+  - Rejected: a second entry in `news-provider/policy/observation-lag.json`. That file is hashed whole into the news run envelope's `observation_lag_policy_version`, so a filings measurement would change the version a news run records.
+- Owed before the initial fill: that probe's second run, which its `PREREGISTRATION.md` names as still owed: whether `form.<D>.idx` gains rows after day D. A row added k days later would be stamped observable at about D + 26 h, a lookahead of up to k days.
+  - Steady state asks each index day on at least 3 runs, and on 5 when a weekend follows it (a Friday is among the trailing 3 index days on the Saturday to Wednesday runs); equal bytes are one blob, and `listings.first_seq` names the attempt that first listed each row.
+  - Rule, built only if such a row is found: it is dated as a late row from that attempt's `received_at`.
+- A read made before the fill and one made after differ at the same instant; `--through-seq` makes a read reproducible (§12.5).
+
+**Discovery and the ledger.**
+
+- Discovery is the daily form index on `www.sec.gov`: 4 requests a run (a quarter listing and three index days), beside the robots.txt read. Rejected: per-filer JSON on `data.sec.gov`, one request per filer on every day, on a host with no caller, no robots read and no index day for the observation rule.
+- Each level has its own attempt row, opened before the socket through `news-provider`'s attempt slot (row R4's permit):
+
+  | level | request | on a usable answer |
+  |---|---|---|
+  | 1 | `form.<day>.idx` | one `listings` row per row of a listed form |
+  | 2 | `<accession>-index-headers.html`, under the lowest CIK that listed it | the `filings` row, its `filers` rows, one `documents` row per selected file |
+  | 3 | each selected file | the blob on its `documents` row |
+
+- `filingvault` drives its own fetches. Rejected: `news_provider::collect`. Its `Archive` trait asks for the held set, relisting, deferral and released cuts, which a filing has not.
+- The manifest parser is `filing-contract::manifest`: header fields and the typed document list, or a named refusal. A page with no document list is refused, never read as an empty filing.
+- robots.txt is read once per run under a `robots` attempt:
+
+  | answer | the run |
+  |---|---|
+  | 200 that parses, the paths allowed, Crawl-delay at most 500 ms; or 404 | goes on |
+  | 200 whose rules disallow `/Archives/edgar/` | asks no filing, exit 7, `stopped_by` `robots` |
+  | 200 that does not parse, a larger Crawl-delay, any other answer | asks no filing, exit 7 |
+
+- The ledger for a filing that is not there:
+
+  | situation | verdict | the register reads |
+  |---|---|---|
+  | the index lists no row of a listed form | `empty` | a day we asked and found nothing |
+  | the manifest answers 404, names another accession, or names no primary document | `permanent_failure` | `listed_not_held` |
+  | a selected file answers 404 | `permanent_failure` | `listed_not_held` when it is the primary document |
+  | 403 with `AccessDenied` | `permanent_failure` | the same |
+  | another 403, 408, 429, 5xx, a transport error | `transient_failure`; open until a later night | `listed_not_held` meanwhile |
+  | a body over 64 MiB | `permanent_failure`, stored cut | the cut refuses `document_truncated` |
+  | a 200 that is not the file | `permanent_failure`, the body kept | `listed_not_held` |
+  | a day nobody asked | no row | not inside `complete_from` |
+  | SEC deletes a filing after we stored it | nothing changes | the stored filing stays visible: a named gap |
+
+### 12.4 The business section and its trust
+
+- The rule lives in `filing-contract`, pure functions over bytes. A crate of its own because:
+  - its `extract_version` must cover the cut's code and nothing else, or every `filingvault` change would reset the cut's measured trust;
+  - the span crosses a boundary: `filingvault` writes it and the relation map will read it (§4).
+- Two versions from the one crate, both by `canon::digest::extract_version`, no new `Domain`: `extract_version` over the rules file's sha256 and the files under `src/section/`; `manifest_version` over the files under `src/manifest/`. A manifest-parser fix does not move the version the trust file certifies.
+- The tokenizer is written inside the crate. Rejected: a parsing dependency. A bump in `Cargo.lock` would move spans with no version change.
+- Method, version 1, over the raw bytes:
+  1. tokenize into text runs, block boundaries and anchors with byte offsets; a malformed document is a refusal;
+  2. find the contents list's links whose text names the item (10-K "Item 1" with "Business"; 20-F "Item 4" with "Information on the Company"; combined headings admitted by the rules file); the start is the link's target and the end is the target of the next entry of the same list;
+  3. with no linked contents list, the heading rule: a block whose whole text is the item heading; a candidate followed by a page-number block, or inside a run of five or more item headings, is a contents line; a heading inside quotation marks is never a candidate; exactly one candidate must remain;
+  4. the refusals below.
+- Rejected: a regex over extracted text. Of probe 1's 40 cuts, 33 start at a contents line, 4 at a cross-reference and 3 at the real heading (§12.10).
+- Recorded per (`raw_blob`, `form`, `extract_version`, section): `verdict` (`cut`, `refused`), `refusal`, `method` (`contents_anchor`, `heading`), `start_byte`, `end_byte`, `text_sha256`, `text_bytes`, `words`. `form` is in the key because the cut takes it as input.
+- The text is not stored: it is rendered from the blob and the span on each read and checked against `text_sha256`.
+- A span is (accession, file name, `raw_blob`, start byte, end byte).
+
+| refusal | when |
+|---|---|
+| `no_rule_for_form` | 40-F and its amendment |
+| `not_html` | the bytes are not an HTML document |
+| `document_truncated` | the document row says `truncated` |
+| `malformed_document` | the tokenizer cannot place a tag |
+| `heading_not_found` | no contents link and no heading candidate |
+| `ambiguous_start` | more than one heading candidate |
+| `end_not_found` | no next contents entry and no following item heading |
+| `incorporated_by_reference` | under 150 words and holding "incorporated by reference" or "incorporated herein" |
+| `too_short` | under 150 words otherwise |
+| `overrun` | over 60% of the document's words |
+
+- 150 words and 60% were set before any run of this method; 60% is a backstop, not the test of an end.
+- A refusal is never an empty section. A document with no row under the version read is `not_extracted`, which is neither.
+
+**How the cut is trusted.**
+
+- `probes/section_cut/` is kept: it runs again at every `extract_version`.
+- The 43 probe filings are the development set and cannot test the method.
+- Test set, a seeded draw from stored filings with the 50 probe CIKs excluded: 120 10-K and 40 20-F with thresholds; 40 documents from filers the roster never listed, scored with no threshold. Amendments are in neither.
+- Labels: per filing the byte offsets of the section's first character and of the first character after it, set by a person, plus "the section only points to another document". Stored as (accession, `raw_blob`, start, end, pointer); no filing text enters the repository.
+- Labeller (owner decision 2026-11-25, `FV-Q5`): the owner or a person he names labels the 200 documents, after the step that builds the cut (§12.8 step 15).
+  - Not yet assigned: no person is named. Until one labels them, `cut_trust` reads `unmeasured`.
+- Scored within 200 bytes. Thresholds written 2026-11-24, before any run, and accepted as written by the owner 2026-11-25 (`FV-Q5`):
+
+  | form | wrong cuts | refused |
+  |---|---|---|
+  | 10-K, n = 120 | at most 2 | at most 18 |
+  | 20-F, n = 40 | at most 1 | at most 12 |
+
+- The result lives in `filing-contract/cut-trust.json`, outside `src/` and outside the rules file, so writing it does not change the version it certifies. One row per (`extract_version`, form, method): run date, n, wrong cuts, refused, the pre-registration's digest.
+- `filings show` prints `cut_trust: measured` only for a row matching the record's own `extract_version` and form; a new version reads `unmeasured` with no step by anyone.
+- `--section-text` on an unmeasured (version, form) is refused by name unless `--accept-unmeasured-cut` is passed (owner decision 2026-11-25, `FV-Q9`).
+- A failed run changes the method and the version, and the next run draws a new sample.
+
+### 12.5 The reader
+
+- Proposed spelling; once built, `filingvault schema` is the only source for it.
+- `filingvault filings show --at <instant> [--through-seq <n>] [--extract-version <digest>] [--cik <n>]... [--form <f>]... [--limit <n>] [--fields <list>] [--section-text [--accept-unmeasured-cut]] [--format human|json|ndjson]`
+  - read-only, no lease;
+  - `--through-seq` bounds every row read by its attempt `seq`; without it the envelope prints `seq_high_water`;
+  - exactly one `extract_version` is read: the binary's own, or the one named;
+  - default `--limit` 50; `--section-text` off by default.
+- Visible = valid time and observation time both at or before `--at`, through `Datedness::visible_at`, which admits a day only from its end in its own zone. A listing is visible by the same rule applied to its index day and filed day.
+- `latest` = the greatest (period of report, publication, accession) among the visible filings of a filer.
+- Envelope, schema `filingvault.filings/1`: `extract_version`, `seq_high_water`, the lag policy's digest, `complete_from`.
+- One record per filer:
+
+  | field | meaning |
+  |---|---|
+  | `cik` | the filer |
+  | `name`, `sic`, `former_names[]`, each with `as_of` | from the `filers` row of `latest` (§12.3) |
+  | `state` | `annual_report`: the newest visible listing has a usable primary document; `listed_not_held`: a visible listing whose primary document is not held; `none_in_window`: no visible listing and `complete_from` is set; `window_incomplete`: no visible listing and `complete_from` is null |
+  | `listed` | under `listed_not_held`: `accession`, `form`, the newest attempt's `verdict` |
+  | `latest` | `accession`, `form`, `period`, exactly one of `valid_at` or `valid_day` + `valid_tz`, `observed_at`, `provenance`, `amends`, `amends_ambiguous`, `modified_after_acceptance_seconds` |
+  | `latest.documents[]` | `file`, `type`, `raw_blob`, `bytes`, `truncated`, `verdict`; the selected files only |
+  | `latest.business` | `verdict` (`cut`, `refused`, `not_extracted`), `refusal`, `method`, `start_byte`, `end_byte`, `words`, `text_sha256`, `text` when asked |
+  | `description_from` | the greatest visible non-amendment filing whose `business.verdict` is `cut`; null when none |
+  | `cut_trust` | `unmeasured`, or `measured` with a date and two rates |
+
+- Not in the record: `in_roster`, `ticker`, `exchange`. The roster is in the news store and a context reads no sibling's store; the join by CIK belongs to the reader that holds both outputs.
+- `description_from: null` means "we hold no cut section", never "no business". Nothing downstream may read `none_in_window`, `listed_not_held` or `window_incomplete` as "this company has no business".
+- The age of a description is `--at` minus `description_from`'s publication, computed by the reader; no threshold in the tool.
+- Exit: 0 at least one filer is `annual_report`; 1 every filer asked is `none_in_window`; 8 otherwise; 4 no store; 2 usage or an unreadable stored time. Exit 1 means "the answer is no" for `filings show` and `ledger check` (owner decision 2026-11-25, `FV-Q9`).
+- `filingvault sections extract [--limit <n>] [--dry-run]`: a writer under the lease; writes a `sections` row for each stored primary document with none under the binary's `extract_version`; a second run reports `"changed": false`.
+- How `derive` will read a section is not designed beyond its form, a file (§4): `derive` has no code, and an artefact with no reader is a gate that passes unconditionally.
+
+### 12.6 Known gaps, and what is not in this step
+
+| gap | state |
+|---|---|
+| a filing that exists and is not yet observable at T | absent at T by design |
+| the interval between acceptance and public availability | unmeasured; `valid_at` is a lower bound |
+| SEC changing or deleting a document after acceptance | not observed; `Last-Modified` is printed; 1 of 43 was modified 2.39 years after acceptance (§12.10) |
+| rows added to a daily index after its day | unmeasured; two probe runs owed (§12.3) |
+| a description for a 40-F filer | stored; the cut refuses |
+| a description from an amendment | never, until an amendments stratum is measured |
+| the 2,233 annual filers with no listed security | stored and cut like any other; scored with no threshold |
+| a clock read in `services/filingvault` outside the seam | unguarded: the clock scan reads `news-provider` and `providers/*` only |
+| `filingvault` opening a file under the news store through `std::fs` | unguarded |
+| `filing-contract` holding a clock, a socket or a store | unguarded: the clock scan reads `news-provider` and `providers/*` only. Its dependency list is guarded by design (FV1's third test, §12.7) |
+| `providers/sec-edgar` holding a `Provider` implementation or a form list; `providers/edgar-press` keeping an item a second SEC caller needs; `services/newsvault` naming a filing type, table or form | unguarded, each |
+| the `filingvault` binary linking `news_provider::collect`, `provider` and `conformance` | unguarded: FV1 sees crates, not modules; it stays so until `news-provider` is split (the row below) |
+| `news-provider` holding the conversation core and the news collection skeleton in one crate, its core types carrying news-only fields (§12.1) | named debt, deferred by owner decision 2026-11-25 (`FV-Q10`). Trigger: when a third client of the conversation code exists (the `marketvault` context) |
+| moved tests reading `providers/open-web-feed/tests/fixtures` by file path, from `vault-core` (step 3) and from `news-provider` (step 5) | unguarded: no manifest names the path, so FV1 does not see it (§12.8) |
+| the stop after three traffic 403 answers, for the other SEC callers | not shared: only a hold SEC states reaches them (§12.2) |
+| `modelgate`'s opener, lease and log copy | a second copy of `vault-core`'s until `modelgate` is switched (§12.1) |
+| the tests of deployable-level scripts and rules | in `services/newsvault/tests/` (3,890 lines, `wc -l`, 2026-11-25), policing `modelgate`'s units today and `filingvault`'s from step 17; moving them out of a context's crate is not in this step |
+
+| not in this step | state |
+|---|---|
+| the roster moved to `marketvault`; ticker and exchange in the register | owner decision; the reader holding both outputs joins by CIK |
+| `modelgate` switched to `vault-core` | its blob layout differs on disk (§12.1) |
+| `news-provider` or `vault-core` renamed | owner decision 2026-11-25 (`FV-Q2`): neither now; `news-provider` alone, after `filingvault` runs |
+| `news-provider` split into a context-neutral part and a news part | the named debt above (`FV-Q10`) |
+| the backup's blob handling | branch `fix/backup-blob-packs` |
+| prospectuses and registration statements | a newly listed company has no description until its first annual report |
+| the 8-K staleness flag | its producer `edgar_press` has 0 attempts in production |
+| embeddings, the relation map, tags made by a model | §12.3 and §12.4 state what the map will find stored |
+| companies not listed in the US | — |
+| a multi-year fill | 5 years is 7.9 GB of primary documents in one copy (41,755 × 188,336 B, the 2026 size assumed for every year) |
+| exhibits newly listed for filings already closed | one request each, no manifest request |
+| observing that SEC deleted or replaced a filing | a kept probe that re-fetches a seeded 100 stored documents a quarter (owner decision 2026-11-25, `FV-Q9`); no step of §12.8 carries it |
+| the `edgar-press` contact variable (§10, the roster's pace bullet) | a `newsvault` change; it sends nothing in production |
+
+### 12.7 Gates planned (each becomes a §8 row only after its named test has gone red under its mutation; none exists, 2026-11-24)
+
+| gate | named tests | turns red when | §8 row |
+|---|---|---|---|
+| a context reaches no sibling, `vault-core` reaches no member, and `filing-contract` reaches `canon` and no parsing crate | `the_store_core_depends_on_no_workspace_member` (step 3), `the_filings_context_and_the_news_context_reach_each_other_through_no_member` (step 10), `the_filing_contract_depends_on_canon_and_on_a_committed_list_of_crates` (step 11), over `cargo metadata` as row MG10's walk | `news-provider` added to `vault-core/Cargo.toml`; `newsvault` added to `services/filingvault/Cargo.toml`; `filing-contract` added to `services/newsvault/Cargo.toml`; `scraper` added to `filing-contract/Cargo.toml` | new row FV1 |
+| one SEC bucket for the deployable | in `news-provider`, step 7: `two_callers_at_two_intervals_share_one_pace_root_and_neither_shortens_the_other`; in `repo-invariants`, step 7 for the news units and step 17 for the filings units: `every_unit_that_builds_a_wire_mounts_the_one_pace_root`; in `services/filingvault`, step 10: `a_filings_request_and_a_roster_request_reserve_in_one_per_host_file`, `a_filings_request_pays_into_the_shared_per_ip_bucket` | the per-host file written with the next allowed instant; the mount removed from the collect unit; the `Wire` built with the store as its pace root, or under `edgar_filings` | R19, its two-stores clause |
+| no vendor call outside an open attempt row, in the second context | `no_vendor_call_leaves_without_an_open_attempt_row` | the sink writing `Opened` after the send | R4, a clause for `filingvault` |
+| a filing's valid time is its manifest's acceptance, and a day is never a midnight | `a_filing_is_dated_by_its_manifests_acceptance_read_in_new_york`, `a_manifest_with_no_acceptance_dates_the_filing_by_the_filed_day_and_never_a_midnight` | the zone read as UTC; the fallback returning the day's first instant | new row FV2 |
+| an index day is complete when every filing it lists is closed | `a_two_file_filing_with_one_file_missing_is_open`, `a_manifest_404_closes_its_filing_and_its_day`, `ledger_check_exits_1_while_a_forward_day_is_open_and_0_when_none_is` | a filing closed by its first file; a permanent failure left open; the day counted complete on its index attempt alone | new row FV3 |
+| the register tells "none in a window we fully asked" from "not fully asked" and from "listed and not held" | `a_listed_filing_whose_manifest_was_404_is_listed_not_held_and_not_none_in_window`, `a_filer_with_no_listing_reads_none_in_window_only_inside_complete_from`, `complete_from_stops_at_the_first_day_that_is_not_complete` | the state computed from `filings` only; every absent filer reported `none_in_window`; open days skipped | new row FV4 |
+| the register is reproducible under `--through-seq` and reads one `extract_version` | `the_same_at_and_through_seq_give_the_same_register_after_a_later_commit`, `a_row_of_another_extract_version_is_never_shown` | the bound not applied to `listings`; the version filter dropped | new row FV5 |
+| a section is a span whose rendered text matches its digest; a failed cut is a named refusal | `the_rendered_text_matches_the_recorded_digest`, `a_refused_cut_is_never_an_empty_section`, `a_document_with_no_item_heading_is_refused_by_name` | the span shifted by one byte; `refused` rendered as zero-length text; an empty span returned | new row FV6 |
+| a cut reads `measured` only under a trust row of its own version and form | `a_cut_under_a_version_the_trust_file_does_not_name_reads_unmeasured`, `writing_the_trust_file_leaves_the_extract_version_unchanged`, `a_change_under_src_manifest_leaves_the_extract_version_unchanged` | the lookup by form only; the trust file moved into `src/section/`; the version taken over all of `src/` | new row FV7 |
+| a filings unit never holds the news store's lock | in `repo-invariants`, step 17: `no_filingvault_unit_takes_the_news_stores_lock` | a unit given `%t/bellwether-store.lock` | new row FV8 |
+
+- Existing rows that cover a new crate by its existing on disk, each re-run under its mutation in the PR that adds the crate: G1 (the `[lints]` stanza deleted), R4 (`ureq` added to `services/filingvault/Cargo.toml`), T1 (a `Connection::open` written in `services/filingvault/src`).
+
+### 12.8 Build order (each PR passes the gate alone)
+
+- Source lines of a move or an extraction are counted as in §12.1; those of a new PR are estimates made 2026-11-24 before any code, re-split 2026-11-25 with no new count.
+- Kinds: `move` renames whole files and adds nothing but the seam its row names; `extract` takes item ranges out of a file behind a new type or signature, with no behaviour change; `change` alters behaviour; `test` adds tests to unchanged code.
+
+| step | kind | what | source lines | afterwards |
+|---|---|---|---|---|
+| 1 | document | this section | 0 | — |
+| 2 | test | committed byte vectors on the unchanged code (below) | 0; test lines only | a move can be shown to leave bytes on disk alone |
+| 3 | move | `services/newsvault/src/blobs.rs` → `vault-core`. The one non-move edit: `vault_core::BlobError` holds the 7 variants `blobs.rs` builds (`BlobAbsent`, `BlobAltered`, `BlobStray`, `BlobUndecodable`, `DictionaryAbsent`, `DictionaryAltered`, `Io`), and `StoreError` keeps its variants behind a `From`, with the same `Display` text and `error.code`. Gate FV1's `vault-core` test | 811 | a second store can hold blobs |
+| 4 | extract | the SQLite opener, the lease and the log copy → `vault-core`. New: a lease type (the lease is inline today at two sites, `store::hold_lease_to_copy` and `Committer::open`), the log copy taking the log's file name as a parameter, the core's error for a held lease mapped into `StoreError::LeaseHeld`. Tests that go through `Committer` stay in `newsvault` | about 164 | a second store can open, lock and copy its log |
+| 5 | move | `robots.rs`, `contact.rs` → `news-provider`; the `RobotsRules` impl → `open-web-feed`; the 12 files of `services/newsvault/tests/fixtures/robots/` go with the parser, and `tests/robots_refresh.rs` reads them at the new path | 559 | a second SEC caller reads robots.txt and a contact |
+| 6 | extract (`FV-Q3`) | SEC's shared facts: `providers/edgar-press` → `providers/sec-edgar`, as free functions. They are private `&self` methods today that read the adapter's rules file (`instant`, `index_rows`, the status reading inside `classify`), beside `read_listing`, `sec_transport`, `SEC_MIN_INTERVAL`, `SOURCE` and `CONTACT_CREDENTIAL`. The archive bound → `pit::datedness`; `EdgarPress::backfill_observation` stays as its caller | about 180 | a second SEC caller parses an index and dates a row |
+| 7 | change, `newsvault` (`FV-Q4`) | the `--pace-root` option, default the store; the news unit files mount and pass it; the two-interval test in `news-provider`; the unit-file gate in `repo-invariants` | about 40, plus unit files | the deployable can hold one SEC bucket |
+| 8 | no code | the two owed lag-probe runs (§12.3) | 0 | the lag entry for annual forms; the rewrite question |
+| 9 | change, `vault-core` | the plain zstd write policy; the write returns the stored size. Reader in the same PR: its own test, and step 2's vectors unchanged for the existing policy | about 40 | a store can compress without a dictionary and count what it stored |
+| 10 | new | `services/filingvault`: the store (`runs`, `attempts`, `blobs`, `listings`), the ledgered conversation, discovery, `ledger check` over days; gate FV1's context test | about 650 | which filings exist per index day, as of an instant |
+| 11 | new | `filing-contract`: the manifest parser, read in the same PR by the manifest level (`filings`, `filers`, `documents` rows); the budget, the 403 stop, the observation; gate FV1's `filing-contract` test | about 550 | who filed what and which files a filing holds; a dry run from the VPS |
+| 12 | new | the document level and closing: the blob on each `documents` row, `complete` and `complete_from` | about 300 | one filing stored whole; a day can be complete |
+| 13 | new | `filings show` without `business` | about 450 | who filed what, as of an instant |
+| 14 | new | the exhibit list | about 110 | a 40-F's description and EX-21 are stored |
+| 15 | new | the section cut, `sections extract`, the trust file, `probes/section_cut/` | about 550 | a business description, `unmeasured` until the labelled run passes |
+| 16 | extract | `blobs verify` → `vault-core`. New: the row reader as a parameter, since `cmd_blobs::verify` reads `store::recorded_dictionaries` and `SELECT … FROM blobs` itself | about 226 | a second store can verify its blobs |
+| 17 | new | `snapshot`, `blobs verify`, the Dockerfile line, units, timers, the filings rules, the backup argument, the unit-file gates for the filings units, the runbook | about 250, plus shell | the archive fills nightly |
+
+- Order constraints: 2 before 3; 3 to 6 and 9 before 10; 8 before the first production run; 7 and 16 before 17; the backup change deployed before the initial fill; step 15's labelled run after the fill.
+- After step 17, in order: the lag entry from step 8; the pace files moved, if not done at step 7's release; a dry run from the VPS, which sets the budget; the first night, read before the second (bytes raw and stored, the share of filings from CIKs in no roster copy, verdict counts); the rest of the fill; step 15's labelled run.
+- Step 2's vectors, each a literal in a test file no later step edits:
+
+  | vector | pins | red under |
+  |---|---|---|
+  | a fixed synthetic payload through `BlobStore::put` with no dictionary: the file's path and sha256 | the tree layout and the raw policy | `FAN_OUT` 2 → 3 |
+  | the same store after `store_dictionary` and `activate` of fixed synthetic bytes, then `put`: the `.zst` file's sha256 | the frame bytes: level, header, dictionary use | `LEVEL` 9 → 8 |
+  | `snapshot_id` of the fixed synthetic rows `services/newsvault/tests/cut.rs` builds | the cut's row digests (`canon::digest::snapshot_id` over the cutoff and the rows) | one row's `seq` changed |
+
+  - Today no such vector exists: the tree holds no store with blobs (`git ls-files` names `tests/fixtures/ledger/store.sql` and two `expected.json`), `tests/cut.rs` compares `snapshot_id` only with a second run of the same build, and no command writes a store without the network.
+  - Not pinned: `data_sha256`, which is over Parquet bytes and moves with the `parquet` version; a frame under a trained dictionary, which moves with the training.
+  - Unverified: that the compressor takes arbitrary bytes as a dictionary. If it refuses, the second vector is dropped and frame bytes are covered by read-back only, which the PR states.
+  - Named cost: the second vector goes red on a `zstd` bump that changes frame bytes, and is then re-recorded in the PR that bumps it.
+- A move or an extraction is shown to change no behaviour by the checks below; each names the steps it applies to.
+
+  | check | how | expected | steps |
+  |---|---|---|---|
+  | the same tests exist and pass | `cargo test --locked --no-fail-fast -- --list` before and after, sorted, the moved module's prefix rewritten | identical lists | 3, 5; in 4, 6 and 16 the old names all remain and the PR lists the tests added for the new type |
+  | the CLI contract | sha256 of `newsvault schema --format json` | equal | 3, 4, 5, 6, 16 |
+  | bytes on disk | step 2's test file, unedited | green | 3, 4, 16 |
+  | the ledger's output | the committed golden file, `services/newsvault/tests/fixtures/ledger/expected.json` | equal | 3, 4, 5, 6, 16 |
+  | error codes and exits | the integration tests asserting `error.code` and the exit status, unedited | green | 3, 4, 5, 6, 16 |
+  | dependencies | `git diff Cargo.lock` | new package stanzas and moved edges; no version change | 3, 4, 5, 6, 16 |
+  | it is a move | `git diff -M --stat` | each moved file shown as a rename | 3, 5 |
+  | it is an extraction | `git diff --color-moved=zebra` | the ranges shown as moved blocks; every other added line belongs to the new type or signature the step's row names | 4, 6, 16 |
+  | the size rule | CI's size step | the same two totals in 3 and 5; in 4, 6 and 16 the PR states the difference | 3, 4, 5, 6, 16 |
+
+  - Measured 2026-11-25 at `7b6e6f7`: the schema hash is deterministic over two runs; `cargo test -p newsvault --lib -- --list` names 247 tests, `blobs::` 21, `robots::` 32, `contact::` 8.
+  - Step 3's seam leaves the match sites outside `blobs.rs` as written: 24 uses of the six blob variants (`grep -c`, 2026-11-25: `cmd_blobs.rs` 11, `cmd_collect.rs` 6, `store.rs` 4, `cmd_cut.rs` 1, `tests/blobs.rs` 2).
+- Each of steps 3 to 7, 16 and 17 restates, in the same PR, every row and line of this document that names a moved path, module or test, and repeats the mutation of each test whose path changed, and of no other:
+
+  | step | §8 rows naming it | lines outside §8 and §12 | `grep` pattern |
+  |---|---|---|---|
+  | 3 | R1, B1, M1 | 12 | `blobs\.rs`, `BlobStore`, `newsvault::blobs`, `tests/blobs` |
+  | 4 | T1 (its `OPENERS` list and its two `cmd_snapshot` mutations) | 2 | `OPENERS`, `hold_lease_to_copy`, `LeaseHeld`, `cmd_snapshot`, `store::connect` |
+  | 5 | R19, R21 | 39, among them §11's `newsvault::robots::Robots`, "Tests in `services/newsvault/src/robots.rs`" and three mutation tables' `robots::tests::` | `robots\.rs`, `robots::`, `contact\.rs`, `contact::` (over-inclusive: it also matches `cmd_robots::`) |
+  | 6 | R11, R17, R19, R20, R21 | 12 | `edgar_press::`, `edgar-press/src`, `EdgarPress::`, `sec_transport`, `read_listing` |
+  | 7 | R19, its hole 2 | 17 | `beside_the_store`, `pace file`, `pace/` |
+  | 16 | none | 14 | `cmd_blobs`, `blobs verify` |
+  | 17 | A1 (its alert names), G1 | — | — |
+
+  - Counted 2026-11-25 at `7b6e6f7` over §8's table and the lines before §12.
+  - Mechanical rule for each PR: after it, `grep -n` for the old path and the old module prefix over this document returns nothing.
+  - Row G1's member count is restated by every step that adds a crate (3, 6, 10, 11); it reads 10 since 2026-11-25.
+- Named cost of steps 3 and 5: moved tests read `providers/open-web-feed/tests/fixtures` by file path (`blobs.rs` trains its dictionary on those pages; `robots.rs` reads that provider's robots files), so `vault-core` and the seam reach a news adapter's directory with no manifest edge (§12.6).
+  - Rejected for the move PRs: synthetic samples in place of the fixtures. It edits the tests, so the file is no longer a rename; if done, it is a commit of its own before the move.
+- Tests are not sized by a target ratio; above 1.0× is CONTRIBUTING rule 1's question in each PR.
+
+### 12.9 Sizing
+
+| input | value | source |
+|---|---|---|
+| annual filers, 2023 | 8,351: 7,243 on 10-K, 953 on 20-F, 155 on 40-F; 6,118 with a listed security | SEC's registrant counts for 2023 (`dera-registrant-count-2504.pdf`) |
+| 15-month fill | 10,433 filings = 8,351 × 456 / 365; a constant filer count, amendments ignored | arithmetic |
+| busiest day | 652 annual reports, 2022-03-31 | a vendor blog nobody reproduced |
+| index days in 456 days | about 314 (326 weekdays less about 12 holidays), over 6 quarters | arithmetic |
+| per filing | §12.10 | probe 2 |
+| disk | 63 GB free of 193 GB; the host alert fires below 15% (28.95 GB), so 34.05 GB usable, shared with news | §10, the disk criterion (read 2026-11-22) |
+
+**Disk, the 15-month fill, one copy.**
+
+| what | per filing | 10,433 filings | measured? |
+|---|---|---|---|
+| primary documents, zstd -9 | 188,336 B | 1.96 GB | yes, 43 documents |
+| manifests, raw | 31,075 B | 0.32 GB | size yes, compression no |
+| listed exhibits, raw | 150,124 B | 1.57 GB | size yes, compression no |
+| index payloads, raw | — | 0.41 GB (314 × 1.29 MB, the mean of 1,057,192 B and 1,520,327 B, the daily indexes of 2026-11-10 and 2026-11-12: §10, the roster's body limit; `probes/observation_lag/PREREGISTRATION.md`) | compression no |
+| estimate, raw where compression is unmeasured | | 4.26 GB | |
+
+- Errs high, measured: the 8 hand-picked companies are 6.61 MB a primary document against 3.06 MB for the 35 seeded names (165,469 B compressed each, 1.73 GB for the fill); two of the 8, at 24,864,731 B and 10,355,932 B, carry that mean, and four are below the seeded mean. Manifests, exhibits and indexes are counted raw.
+- Errs low, by an unmeasured amount: failure bodies, amendments (fetched as new filings, §12.3, and left out of the 10,433), the SQLite log, index days asked more than once whose bytes differ.
+- Unmeasured in either direction: the documents of the 2,233 filers with no listed security.
+- So 4.26 GB is an estimate, not a bound. The index row sizes the fill; steady state adds a day's index only when its bytes change.
+- At the 9 copies that share the disk today (the store, a staging copy and 7 backups, §10's disk criterion) the estimate is 38.4 GB against 34.05 GB usable. So the fill waits for the backup change; at 2 copies it is 8.5 GB.
+
+**Requests and time.**
+
+| quantity | value | construction |
+|---|---|---|
+| requests a filing | 2.98 | manifest + primary + 42 listed exhibit files over 43 filings; pooled, so it errs high (40-F is 2 of 43 in the sample and 155 of 8,351 filers) |
+| time a filing | 3.48 s | 0.5 s manifest + 2.0 s primary (0.5 s pace + probe 1's 1.29 s median transfer from a laptop, rounded up) + 0.98 exhibits × 1.0 s |
+| busiest day | 652 filings: 38 min, inside one run | 652 × 3.48 s |
+| the fill | 10.1 h; 31,376 requests; 6 nights | 10,433 × 3.48 s; 10,433 × (2 + 42/43) + 314 + 6; 10,433 / 1,800 = 5.8 |
+| attempts a year in steady state | about 26,700 | 8,351 × 2.98 + 365 runs × 5 (robots.txt, a quarter listing, 3 index days); amendments ignored |
+
+- Unmeasured: the VPS's transfer time; the dry run sets the budget.
+
+### 12.10 Evidence, 2026-11-24
+
+- Probe 1: 50 companies drawn from the roster, 8 of them hand-picked (the first 8 of the sample) and the rest seeded; 43 have an annual report (34 10-K, 7 20-F, 2 40-F); 136 requests (50 submissions JSON, 43 filing indexes, 43 primary documents). Its regex cut returned a section for 40 of the 43, refused the two 40-F by form and found no heading in 1.
+- Probe 2: the same 43 filings, 180 requests (4 a filing, 5 submissions JSON and 3 older manifests for the name test). Every number below was recomputed 2026-11-24 from its results file.
+- Neither probe is kept (CONTRIBUTING rule 3): each answered its question once. Not a random sample of annual filers.
+
+| measure | value | construction |
+|---|---|---|
+| `<accession>-index-headers.html` answered 200 | 43 of 43 | status |
+| header fields present | acceptance, form, period, filed date, company name: 43 each; SIC 42; a former name 23 | filings whose page holds the field |
+| document list typed for every entry; the primary document named | 43 of 43; 43 of 43 | entries carrying type, sequence and file name; the primary's file name among them |
+| bytes the filing index lists and the manifest does not | 0 B in 43 | per filing |
+| manifest size | mean 31,075 B, median 26,736 B, max 132,505 B | 43 pages |
+| manifest entries | 5,851, mean 136 a filing | sum |
+| acceptance digits read in `America/New_York` against the submissions JSON instant | equal in 43 of 43 | per filing, tolerance 1 s |
+| acceptances at or after 16:00 New York | 26 of 43 | same digits |
+| bytes by kind, of 941,586,288 B listed | XBRL and renderer output 59.2%; graphics 21.1%; primary document 17.0%; text exhibits 2.7% | manifest types grouped: `XML`, `JSON`, `ZIP`, `EXCEL`, `EX-101.*`; `GRAPHIC`; the type equal to the form; other `EX-*` |
+| text exhibits | 369 files, 25,172,845 B: 8.6 files and 585,415 B a filing | same |
+| EX-99 | 10,366,660 B in 5 filings; 5,651,556 B (17 files) in the two 40-F; 4,590,720 B in one 10-K | by form |
+| EX-10 / EX-4 / EX-31 + EX-32 | 5,785,578 B (35 files) / 3,923,490 B (42) / 1,265,918 B (128) | by family |
+| the largest single exhibit | 2,437,701 B (an EX-99 of a 40-F) | per type entry |
+| zstd -9, 43 primary documents, no dictionary | 159,833,043 B to 8,098,444 B: 19.7× | sum over sum |
+| the same with the news dictionary | 8,220,917 B: 19.4×, 1.5% larger | sum over sum |
+| ratio per document | min 6.8× (a 71,174 B 40-F wrapper), median 16.6×, max 30.2× | per document |
+| ratio, the 8 hand-picked / the 35 seeded | 22.9× / 18.5× | sum over sum per group |
+| `Last-Modified` on the primary document | sent in 43 of 43; no `ETag` in 43 | response headers |
+| `Last-Modified` minus acceptance | median 38 s; 42 of 43 between 25 s and 555 s; one 75,533,536 s (2.39 years) | acceptance read in New York |
+| complete submission `.txt` length | not measured: `HEAD` answered 200 with no `Content-Length` in 42 and 502 in 1 | per filing |
+| a header's company name: as filed or current | as filed in 2 of 2 testable cases; 3 of 5 not testable (no earlier filing in the recent list, or the change left the name unchanged) | a manifest filed before the filer's last name change, 5 filers |
+| primary documents over 8 MiB | 3 of 43; the largest 23.71 MiB | size |
+| probe 1: where the regex cut starts | a contents line in 33 of 40, a cross-reference in 4, the real heading in 3; no cut was checked against its filing by a person | the first 330 characters of each section file: three or more item numbers is a contents line (33); the other 7 read one by one |
+| probe 1: SIC absent from the submissions JSON | 7 of 50 | field empty |
+| probe 1: primary-document transfer | median 1.29 s, 43 documents, from a laptop | per request |
+
+- Not measured by either probe: an amendment; a combined filing (each of the 43 manifests names one company); a filer with no listed security; compression of manifests, exhibits and index files; any transfer time from the VPS.
+
+### 12.11 Owner decisions, 2026-11-25 (`FV-Q1` to `FV-Q11`)
+
+- Not yet assigned: the labeller's name (`FV-Q5`).
+- No row is built: §12 is design, no code.
+
+| id | decision | rejected | symptom of the rejected answer, or what the decision leaves |
+|---|---|---|---|
+| `FV-Q1` | transport, pace and the send gate stay in `news-provider`; `vault-core` holds store mechanics only | moving them into `vault-core`, as the decision of 2026-11-24 words it | one more move PR after step 17 at §12.1's counted cost, and `vault-core` then declares `ureq` |
+| `FV-Q2` | neither `news-provider` nor `vault-core` is renamed now; `news-provider` alone, after `filingvault` runs | a rename now | 87 lines of this document at `ea59293`, before this section (107 with it), and about 180 `.rs` lines in 36 files (`grep`, 2026-11-24) for no behaviour |
+| `FV-Q3` | a new crate `providers/sec-edgar` holds SEC's shared facts | `filingvault` depending on `providers/edgar-press` | a filings build links the 8-K adapter (§12.1) |
+| `FV-Q4` | one pace root outside both stores, with a one-time move of the news store's pace files (§12.2) | a pace directory per store | SEC has two buckets on one address, against row R19 |
+| `FV-Q5` | the owner or a person he names labels the 200 documents for the cut's trust, after the step that builds the cut (§12.8 step 15); §12.4's thresholds as written | — | no person is named yet; until one labels them `cut_trust` cannot read `measured` |
+| `FV-Q6` | the exhibit type list of §12.3 | every text exhibit | 16.1 GB against 7.1 GB by the admission rule, 110,716 requests against 31,376, 32.1 h against 10.1 h (10,433 × 11.08 s). The decision leaves: EX-10 contracts a later fetch may no longer find are not kept |
+| `FV-Q7` | header fields: `name` as of the filing, on 2 of 2 testable cases; `sic` and `former_names` as of our fetch | all three as filed | a 2026 SIC at a 2025 `--at` |
+| `FV-Q8` | the nightly bound of 2 h and the 06:10 UTC slot; the dry run sets the budget | a 1 h bound | a budget of about 900 and a 12-night fill |
+| `FV-Q10` | for this step `news-provider`'s core keeps the news-only fields that `filingvault` fills with constants (§12.1). The split of `news-provider` into a context-neutral part and a news part is a named debt (§12.6). Trigger: when a third client of the conversation code exists (the `marketvault` context) | a change PR before step 10 that makes the fields optional or splits a core `Request` | one change PR of unknown size that touches `filter_params`, so it must keep every digest existing callers write. The decision leaves: gate FV1 cannot see the news skeleton as separate until the split |
+| `FV-Q11` | the filings alerts are further rules in the one rules file, tested where the deployable-level files are tested today | a rules file and test file of the context's own | a second file changes `newsvault-monitoring-check`, `prometheus.rule_files.yml`, row A1 and `monitoring.rs` (§12.1) |
+| `FV-Q9` | three items carried from the reviewed design: `--section-text` refused on an unmeasured cut; a kept probe that re-fetches a seeded 100 stored documents a quarter; exit 1 = "the answer is no" for `filings show` and `ledger check` | — | the re-fetch probe is the only measurement of how often SEC changes an accepted document |
