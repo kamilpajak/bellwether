@@ -10,7 +10,7 @@ pub mod blobs;
 pub enum BlobError {
     #[error("no blob is stored under {digest}")]
     BlobAbsent { digest: String },
-    /// `BlobStore::put` keeps a file that exists, so a refresh cannot repair this one.
+    /// `BlobStore::put` keeps a file that exists, so a second `put` cannot repair this one.
     #[error("the blob stored under {digest} now hashes to {found}")]
     BlobAltered { digest: String, found: String },
     /// A `.zst` copy whose header or frame zstd cannot read back to one payload.
@@ -19,7 +19,7 @@ pub enum BlobError {
     /// A file in the blob tree named neither `<digest>` nor `<digest>.zst`.
     #[error("{} is in the blob tree and names no digest", .path.display())]
     BlobStray { path: PathBuf },
-    /// A dictionary a blob or the activation log names is not on disk; never read as "none".
+    /// A dictionary a `.zst` header or a caller names is not on disk; never read as "none".
     #[error("the zstd dictionary {dictionary} is not in the store")]
     DictionaryAbsent { dictionary: String },
     #[error("the zstd dictionary stored under {dictionary} now hashes to {found}")]
