@@ -71,7 +71,7 @@ impl RosterFile {
 /// its terms (section 10, "The roster"); SEC's content is free to reuse.
 pub const FILES: [RosterFile; 1] = [RosterFile {
     key: "sec_company_tickers_exchange",
-    host: "www.sec.gov",
+    host: sec_edgar::HOST,
     path: "/files/company_tickers_exchange.json",
     rows: sec_exchange_rows,
 }];
@@ -99,7 +99,7 @@ pub struct Ask {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RosterError {
-    /// `credential_contact_missing`: SEC refuses a User-Agent with no contact (edgar-press header).
+    /// `credential_contact_missing`: SEC refuses a User-Agent with no contact (`sec_edgar::CONTACT_CREDENTIAL`).
     #[error("no contact address for the User-Agent: set BELLWETHER_FEED_CONTACT_FILE")]
     ContactMissing,
     #[error("no commit log under {0}")]

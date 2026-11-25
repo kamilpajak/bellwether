@@ -24,8 +24,9 @@ use news_provider::{SourceId, TargetWindow, Verdict};
 use pit::datedness::{archive_observation, Published};
 use pit::{MeasuredLag, ObservationTime, PitError, ValidTime};
 use sec_edgar::{
-    acceptance_instant, archive_url, body_of_200, index_rows, index_url, listed_days, Caller,
-    IndexRow, ListingUnparseable, CONTACT_CREDENTIAL, DATE_FILED, INDEX_DATE,
+    acceptance_instant, accession_of, archive_url, body_of_200, contact_is_addressed, index_rows,
+    index_url, labelled, listed_days, tagged, Caller, IndexRow, ListingUnparseable,
+    CONTACT_CREDENTIAL, DATE_FILED, HEADER_END, INDEX_DATE,
 };
 
 /// The adapter's own name, which is the only thing that tells ours from a purchased one besides
@@ -35,7 +36,6 @@ pub const SOURCE: &str = "edgar_press";
 /// zone read out of a file is not static. EDGAR files in Eastern time.
 const KNOWN_ZONES: [&str; 1] = ["America/New_York"];
 const RULES_SCHEMA: &str = "edgar-press.rules/1";
-const HEADER_END: &str = "</SEC-HEADER>";
 /// Full daily indexes read 1,057,192 B and 1,520,327 B (2026-11-10, 2026-11-12; read as received
 /// by `probes/observation_lag/probe.py` on 2026-11-13). Construction: architecture.md §10.
 pub const BODY_LIMIT: u64 = 8 * 1_024 * 1_024;
@@ -525,16 +525,6 @@ impl Provider for EdgarPress {
     }
 }
 
-/// The accession an EDGAR document url ends in:
-/// `.../edgar/data/320193/0000320193-26-000071.txt` -> `0000320193-26-000071`. The same string
-/// the filing header's `ACCESSION NUMBER` carries, so a follow-up's story matches the committed
-/// item's.
-fn accession_of(url: &str) -> Option<String> {
-    let last = url.rsplit('/').next()?;
-    let stem = last.strip_suffix(".txt").unwrap_or(last);
-    (!stem.is_empty()).then(|| stem.to_owned())
-}
-
 /// The quarter's listing, read into the seam's [`Listing`].
 pub fn read_listing(bytes: &[u8]) -> Result<Listing, Refusal> {
     Ok(Listing::of_days(&listed_days(bytes)?))
@@ -555,12 +545,7 @@ fn filed_day(request: &Request) -> Option<NaiveDate> {
 /// SEC asks for a name and an address. Checked at startup and never stored, so a run with no
 /// contact opens no attempt row at all.
 fn usable_contact(contact: &str) -> Result<(), Refusal> {
-    let addressed = contact.split_whitespace().any(|token| {
-        token
-            .split_once('@')
-            .is_some_and(|(local, domain)| !local.is_empty() && domain.contains('.'))
-    });
-    if addressed {
+    if contact_is_addressed(contact) {
         Ok(())
     } else {
         Err(Refusal::ContactMissing)
@@ -638,22 +623,6 @@ fn strings(value: &serde_json::Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// A line of the form `<TAG>value`, which is how the filing header carries its acceptance instant.
-fn tagged(text: &str, tag: &str) -> Option<String> {
-    let opening = format!("<{tag}>");
-    text.lines()
-        .find_map(|line| line.trim().strip_prefix(&opening))
-        .map(|value| value.trim().to_owned())
-}
-
-/// A line of the form `LABEL:<whitespace>value`, which is how it carries the rest.
-fn labelled(text: &str, label: &str) -> Option<String> {
-    let opening = format!("{label}:");
-    text.lines()
-        .find_map(|line| line.trim().strip_prefix(&opening))
-        .map(|value| value.trim().to_owned())
 }
 
 /// One element and its content gone, which is the difference between article text and page HTML:

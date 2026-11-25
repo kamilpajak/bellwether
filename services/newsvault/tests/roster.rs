@@ -392,7 +392,7 @@ fn a_robots_txt_with_no_answer_asks_no_file_and_a_404_asks_it() -> TestResult {
 
 /// A 200 that is not the file's shape (a challenge page, other or reordered field names) is a
 /// failed fetch kept as received, an empty roster is no roster, 403, 429 and 5xx are transient as
-/// edgar-press reads SEC, and any other status is permanent; none is worked around. Mutations
+/// `sec_edgar::body_of_200` reads SEC, and any other status is permanent; none is worked around. Mutations
 /// 2026-11-23, each red: the shape check dropped (any 200 usable); the field-name check dropped; an
 /// empty `data` usable; `Empty` counted as work done; 5xx permanent; 408 and 429 permanent; any
 /// other status transient.

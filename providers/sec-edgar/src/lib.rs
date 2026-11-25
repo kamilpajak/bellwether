@@ -1,6 +1,6 @@
 //! What is true of SEC's EDGAR host for every caller of `www.sec.gov`: its paths, the bucket and
 //! the contact name every caller shares, its transport profile with one interval per caller, and
-//! how its daily index, quarter listing, acceptance field and statuses read. It holds no
+//! how its daily index, quarter listing, filing header and statuses read. It holds no
 //! `Provider`, no form list and no store, and declares no HTTP dependency (architecture.md
 //! section 12.1).
 
@@ -21,7 +21,12 @@ pub const PER_IP_BUCKET: &str = "edgar_press";
 /// a ledger row (architecture.md section 3.2's `filter_params` row), so it travels by NAME.
 pub const CONTACT_CREDENTIAL: &str = "sec_contact";
 
-const ARCHIVES: &str = "https://www.sec.gov/Archives/";
+/// The host every item here is a fact of. A caller's robots.txt fetch and the pace's per-host
+/// bucket are keyed on it.
+pub const HOST: &str = "www.sec.gov";
+const ARCHIVES: &str = "/Archives/";
+/// Where a full-submission text file's header ends and its documents start.
+pub const HEADER_END: &str = "</SEC-HEADER>";
 const DAILY_INDEX: &str = "edgar/daily-index";
 /// The vendor's own column headings in `form.<date>.idx`. The file is FIXED WIDTH and its header
 /// line is where the columns start: a whitespace split cannot read it, because `SC 13D` and every
@@ -106,11 +111,21 @@ pub fn transport(caller: Caller, body_limit: u64) -> TransportProfile {
     }
 }
 
+/// SEC asks for a name and an address: whether `contact` holds a token shaped like an address.
+#[must_use]
+pub fn contact_is_addressed(contact: &str) -> bool {
+    contact.split_whitespace().any(|token| {
+        token
+            .split_once('@')
+            .is_some_and(|(local, domain)| !local.is_empty() && domain.contains('.'))
+    })
+}
+
 /// The quarter listing's url for a day: the directory that names each daily index it holds.
 #[must_use]
 pub fn listing_url(day: NaiveDate) -> String {
     format!(
-        "{ARCHIVES}{DAILY_INDEX}/{}/QTR{}/index.json",
+        "https://{HOST}{ARCHIVES}{DAILY_INDEX}/{}/QTR{}/index.json",
         day.format("%Y"),
         quarter(day)
     )
@@ -120,7 +135,7 @@ pub fn listing_url(day: NaiveDate) -> String {
 #[must_use]
 pub fn index_url(day: NaiveDate) -> String {
     format!(
-        "{ARCHIVES}{DAILY_INDEX}/{}/QTR{}/form.{}.idx",
+        "https://{HOST}{ARCHIVES}{DAILY_INDEX}/{}/QTR{}/form.{}.idx",
         day.format("%Y"),
         quarter(day),
         day.format(INDEX_DATE)
@@ -130,11 +145,22 @@ pub fn index_url(day: NaiveDate) -> String {
 /// The url of a file an index row names in its `File Name` column.
 #[must_use]
 pub fn archive_url(path: &str) -> String {
-    format!("{ARCHIVES}{path}")
+    format!("https://{HOST}{ARCHIVES}{path}")
 }
 
 fn quarter(day: NaiveDate) -> u32 {
     (chrono::Datelike::month(&day) - 1) / 3 + 1
+}
+
+/// The accession an EDGAR document url ends in:
+/// `.../edgar/data/320193/0000320193-26-000071.txt` -> `0000320193-26-000071`. The same string
+/// the filing header's `ACCESSION NUMBER` carries, so a follow-up's story matches the committed
+/// item's.
+#[must_use]
+pub fn accession_of(url: &str) -> Option<String> {
+    let last = url.rsplit('/').next()?;
+    let stem = last.strip_suffix(".txt").unwrap_or(last);
+    (!stem.is_empty()).then(|| stem.to_owned())
 }
 
 /// A quarter listing nothing can read would plan zero requests, which reads as a closed market.
@@ -211,6 +237,24 @@ pub fn index_rows(payload: &str) -> Option<Vec<IndexRow>> {
     Some(rows)
 }
 
+/// A line of the form `<TAG>value`, which is how the filing header carries its acceptance instant.
+#[must_use]
+pub fn tagged(text: &str, tag: &str) -> Option<String> {
+    let opening = format!("<{tag}>");
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix(&opening))
+        .map(|value| value.trim().to_owned())
+}
+
+/// A line of the form `LABEL:<whitespace>value`, which is how it carries the rest.
+#[must_use]
+pub fn labelled(text: &str, label: &str) -> Option<String> {
+    let opening = format!("{label}:");
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix(&opening))
+        .map(|value| value.trim().to_owned())
+}
+
 /// A filing's acceptance digits as an instant: `raw` read by `format` as local time in `zone`,
 /// the earlier instant when the local time is ambiguous. `None` when either does not parse.
 #[must_use]
@@ -242,5 +286,49 @@ pub fn body_of_200(answer: &Result<RawResponse, TransportError>) -> Result<Cow<'
         FORBIDDEN | TOO_MANY_REQUESTS | REQUEST_TIMEOUT => Err(Verdict::TransientFailure),
         status if SERVER_ERRORS.contains(&status) => Err(Verdict::TransientFailure),
         _ => Err(Verdict::PermanentFailure),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn day(text: &str) -> Option<NaiveDate> {
+        NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()
+    }
+
+    /// Each quarter's first and last day. Mutation 2026-11-25, `month / 3 + 1`: red here, and
+    /// 0 red of 635 before this test, whose callers' url tests all use a November day.
+    #[test]
+    fn a_day_is_filed_under_its_calendar_quarter() {
+        let quarters = [
+            ("2026-01-01", 1),
+            ("2026-03-31", 1),
+            ("2026-04-01", 2),
+            ("2026-06-30", 2),
+            ("2026-07-01", 3),
+            ("2026-09-30", 3),
+            ("2026-10-01", 4),
+            ("2026-12-31", 4),
+        ];
+        for (text, quarter) in quarters {
+            let listing = day(text).map(listing_url);
+            let expected =
+                format!("https://{HOST}/Archives/edgar/daily-index/2026/QTR{quarter}/index.json");
+            assert_eq!(listing, Some(expected), "{text}");
+        }
+    }
+
+    /// Mutation 2026-11-25, `company.` or `master.` names counted beside `form.`: red here, and
+    /// 0 red of 635 before this test, whose fixture names no day `form.` does not name too.
+    #[test]
+    fn a_day_only_the_company_or_the_master_index_names_is_not_listed() {
+        let listing = br#"{"directory": {"item": [
+            {"name": "company.20261109.idx"}, {"name": "master.20261110.idx"},
+            {"name": "form.20261112.idx"}, {"name": "index.json"}]}}"#;
+        assert_eq!(
+            listed_days(listing),
+            Ok(vec![day("2026-11-12")].into_iter().flatten().collect())
+        );
     }
 }

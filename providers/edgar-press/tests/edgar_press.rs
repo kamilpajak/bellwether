@@ -1234,6 +1234,8 @@ fn a_quarter_listing_that_is_no_directory_listing_is_refused_with_its_reason() {
         matches!(&refused, Some(Refusal::ListingUnparseable(why)) if !why.is_empty()),
         "{refused:?}"
     );
+    let shared = sec_edgar::ListingUnparseable("why".to_owned());
+    assert_eq!(shared.to_string(), Refusal::from(shared).to_string());
 }
 
 /// The urls, pinned: the 30-day incident the planning rules exist for began with a run asking the
