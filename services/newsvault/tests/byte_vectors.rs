@@ -1,5 +1,5 @@
 //! Architecture.md section 12.8 step 2: every file the blob tree holds after one put of a fixed
-//! payload, against `vectors/blob_tree.json`. What may change that file: section 8 row V1.
+//! payload, against `vectors/blob_tree.json`. What may change that file: section 8 row B4.
 //! The tree is reached through `store::blob_store` alone, so nothing here names an item that
 //! section 12.8 moves.
 

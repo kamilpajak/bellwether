@@ -357,7 +357,7 @@ fn a_cut_holds_exactly_the_rows_items_returns_at_the_same_at_through_its_high_wa
     Ok(())
 }
 
-/// Section 8 row V1: the id `five`'s cut had on 2026-11-25, which is also canon's `snapshot_id`
+/// Section 8 row B4: the id `five`'s cut had on 2026-11-25, which is also canon's `snapshot_id`
 /// over the row digests `vectors/cut_snapshot_id.json` lists.
 #[test]
 fn a_cut_of_the_five_rows_has_the_recorded_snapshot_id() -> TestResult {

@@ -1,7 +1,7 @@
 {
   "schema": "newsvault.vector/1",
   "vector": "cut_snapshot_id",
-  "note": "The snapshot_id of a cut at the cutoff over the store that `five` in services/newsvault/tests/cut.rs commits. rows are the snapshot_row digests of its three visible rows in seq order (an instant, a minute with no body, a New York day), so sha256 is also canon's snapshot_id over this input. What may change this file: architecture.md section 8 row V1.",
+  "note": "The snapshot_id of a cut at the cutoff over the store that `five` in services/newsvault/tests/cut.rs commits. rows are the snapshot_row digests of its three visible rows in seq order (an instant, a minute with no body, a New York day), so sha256 is also canon's snapshot_id over this input. What may change this file: architecture.md section 8 row B4.",
   "input": {
     "cutoff": "2026-07-05T00:00:00.000000Z",
     "rows": [
