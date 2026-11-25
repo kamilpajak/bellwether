@@ -12,13 +12,14 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Days, NaiveDate, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use vault_core::sqlite::read_only;
 
 use crate::cmd_collect::Registered;
 use crate::cmd_robots::ROBOTS_SOURCE;
 use crate::cmd_roster::ROSTER_SOURCE;
 use crate::store::{
-    coverage_up_to, newest_visible_publication, read_only, require_current_version,
-    unpublished_seq_ranges, SeqRange, WindowCoverage, COMMIT_LOG, REDIRECTS, RUNS_DIR,
+    coverage_up_to, newest_visible_publication, require_current_version, unpublished_seq_ranges,
+    SeqRange, WindowCoverage, COMMIT_LOG, REDIRECTS, RUNS_DIR,
 };
 use news_provider::{Closing, DeferReason, Verdict, CARRY_LIMIT};
 use open_web_feed::Continuity;

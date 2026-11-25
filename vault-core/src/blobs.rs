@@ -15,6 +15,7 @@ use sha2::{Digest as _, Sha256};
 use zstd::dict::{DecoderDictionary, EncoderDictionary};
 use zstd::zstd_safe::{self, CCtx, DCtx};
 
+use crate::lease::Lease;
 use crate::BlobError;
 
 /// A sha256 over a payload's bytes, lower-case hex. The field is private and [`BlobStore::put`]
@@ -501,8 +502,9 @@ impl BlobStore {
     }
 
     /// Removes every staging file. Only for a holder of the writer's lease, under which no other
-    /// write is in flight.
-    pub fn remove_staging_files(&self) -> Result<usize, BlobError> {
+    /// write is in flight: `_held` is that lease, and which store it is on is the caller's to get
+    /// right (section 12.6).
+    pub fn remove_staging_files(&self, _held: &Lease) -> Result<usize, BlobError> {
         let found = self.staging_files()?;
         for path in &found {
             fs::remove_file(path)?;
@@ -1384,7 +1386,8 @@ mod tests {
             b"part",
         )?;
         let before = store.staging_leftovers()?;
-        let removed = store.remove_staging_files()?;
+        let held = Lease::take(&temp.path().join("LOCK"))?;
+        let removed = store.remove_staging_files(&held)?;
         assert_eq!((before, removed, store.staging_leftovers()?), (2, 2, 0));
         Ok(())
     }

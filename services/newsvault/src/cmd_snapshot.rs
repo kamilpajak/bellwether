@@ -1,23 +1,16 @@
 //! `newsvault snapshot --out <file>`: one consistent copy of the commit log for the daily backup
-//! (architecture.md section 10, N1). SQLite's online backup in ONE step, so the copy is a single
-//! read transaction, taken under the store's lease and checked before it is renamed into place.
+//! (architecture.md section 10, N1). The copy is `vault_core::log_copy`'s; this file holds the
+//! news store's paths, the envelope and the section 5.1 codes.
 
-use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use rusqlite::backup::{Backup, StepResult};
-use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
+use vault_core::log_copy::{LogCopy, BUSY_WAIT};
+use vault_core::CopyError;
 
-use crate::store::{self, StoreError, COMMIT_LOG};
+use crate::store::{COMMIT_LOG, LOCK_FILE};
 
 pub const SCHEMA: &str = "newsvault.snapshot/1";
-/// Every page in one `sqlite3_backup_step`: a step count above 1 restarts on each foreign commit.
-const ALL_PAGES: i32 = -1;
-/// The wait for a commit by a connection outside the lease, which holds no `LOCK` (a raw writer).
-const BUSY_WAIT: Duration = Duration::from_secs(30);
-const QUICK_CHECK_OK: &str = "ok";
 
 #[derive(Debug, Clone)]
 pub struct Ask {
@@ -88,134 +81,68 @@ impl SnapshotError {
     }
 }
 
-impl From<StoreError> for SnapshotError {
-    fn from(failure: StoreError) -> Self {
+impl From<CopyError> for SnapshotError {
+    fn from(failure: CopyError) -> Self {
         match failure {
-            StoreError::LeaseHeld(path) => Self::LeaseHeld(path),
-            StoreError::Io(failure) => Self::Io(failure),
-            StoreError::Sqlite(failure) => Self::Sqlite(failure),
-            other => Self::Io(std::io::Error::other(other.to_string())),
+            CopyError::StoreAbsent(log) => Self::StoreAbsent(log),
+            CopyError::OutputDirectoryAbsent(directory) => Self::OutputDirectoryAbsent(directory),
+            CopyError::OutputExists(out) => Self::OutputExists(out),
+            CopyError::LeaseHeld(lock) => Self::LeaseHeld(lock),
+            CopyError::SourceBusy => Self::SourceBusy,
+            CopyError::CopyMalformed(why) => Self::CopyMalformed(why),
+            CopyError::Sqlite(failure) => Self::Sqlite(failure),
+            CopyError::Io(failure) => Self::Io(failure),
         }
     }
 }
 
-/// The partial copy beside `out`, renamed onto it only once checked.
-fn partial_of(out: &Path) -> PathBuf {
-    let name = out
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    out.with_file_name(format!(".{name}.partial"))
-}
-
-fn user_version(db: &Connection) -> Result<i32, rusqlite::Error> {
-    db.query_row("PRAGMA user_version", [], |row| row.get(0))
-}
-
-/// Refuses before anything is opened for writing; a dry run stops after it with the source's
-/// version and size.
+/// A dry run stops after the refusals with the source's version and size.
 pub fn run(ask: &Ask) -> Result<Snapshot, SnapshotError> {
-    let log = ask.store.join(COMMIT_LOG);
-    if !log.is_file() {
-        return Err(SnapshotError::StoreAbsent(log));
-    }
-    let directory = match ask.out.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-        _ => PathBuf::from("."),
+    let copy = LogCopy::open(
+        &ask.store.join(LOCK_FILE),
+        &ask.store.join(COMMIT_LOG),
+        &ask.out,
+    )?;
+    let state = if ask.dry_run {
+        copy.source_state()?
+    } else {
+        copy.write()?
     };
-    if !directory.is_dir() {
-        return Err(SnapshotError::OutputDirectoryAbsent(directory));
-    }
-    if fs::symlink_metadata(&ask.out).is_ok() {
-        return Err(SnapshotError::OutputExists(ask.out.clone()));
-    }
-    let _lease = store::hold_lease_to_copy(&ask.store)?;
-    let source = store::read_only(&log)?;
-    source.busy_timeout(BUSY_WAIT)?;
     let shown = |path: &Path| path.display().to_string();
-    if ask.dry_run {
-        let size: i64 = source.query_row(
-            "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
-            [],
-            |row| row.get(0),
-        )?;
-        return Ok(Snapshot {
-            schema: SCHEMA,
-            store: shown(&ask.store),
-            out: shown(&ask.out),
-            user_version: user_version(&source)?,
-            bytes: u64::try_from(size).unwrap_or_default(),
-            dry_run: true,
-            changed: false,
-        });
-    }
-    let partial = partial_of(&ask.out);
-    match fs::remove_file(&partial) {
-        Err(failure) if failure.kind() != std::io::ErrorKind::NotFound => {
-            return Err(failure.into())
-        }
-        _ => {}
-    }
-    let copied = copy(&source, &partial);
-    let version = match copied {
-        Ok(version) => version,
-        Err(failure) => {
-            #[allow(
-                clippy::let_underscore_must_use,
-                reason = "the copy's own failure is the one reported; a partial left behind is \
-                          removed by the next run"
-            )]
-            let _ = fs::remove_file(&partial);
-            return Err(failure);
-        }
-    };
-    File::open(&partial)?.sync_all()?;
-    fs::rename(&partial, &ask.out)?;
-    File::open(&directory)?.sync_all()?;
     Ok(Snapshot {
         schema: SCHEMA,
         store: shown(&ask.store),
         out: shown(&ask.out),
-        user_version: version,
-        bytes: fs::metadata(&ask.out)?.len(),
-        dry_run: false,
-        changed: true,
+        user_version: state.user_version,
+        bytes: state.bytes,
+        dry_run: ask.dry_run,
+        changed: !ask.dry_run,
     })
 }
 
-/// The online backup into `partial`, then the copy's `quick_check` and `user_version`; a page
-/// SQLite reads as corrupt on either side is `CopyMalformed`.
-fn copy(source: &Connection, partial: &Path) -> Result<i32, SnapshotError> {
-    checked_copy(source, partial).map_err(|failure| match failure {
-        SnapshotError::Sqlite(rusqlite::Error::SqliteFailure(code, message))
-            if code.code == rusqlite::ErrorCode::DatabaseCorrupt =>
-        {
-            SnapshotError::CopyMalformed(message.unwrap_or_else(|| code.to_string()))
-        }
-        other => other,
-    })
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn checked_copy(source: &Connection, partial: &Path) -> Result<i32, SnapshotError> {
-    let mut target = store::connect(partial, OpenFlags::default())?;
-    {
-        let backup = Backup::new(source, &mut target)?;
-        loop {
-            match backup.step(ALL_PAGES)? {
-                StepResult::Done => break,
-                StepResult::More => {}
-                _ => return Err(SnapshotError::SourceBusy),
-            }
+    /// The seam of architecture.md section 12.8 step 4: each `vault_core::CopyError` becomes the
+    /// `SnapshotError` of the same name, fields and text, which is the one this command prints.
+    #[test]
+    fn a_copy_failure_becomes_the_snapshot_failure_of_the_same_name_fields_and_text() {
+        let path = || PathBuf::from("a/store/file");
+        let failures = [
+            CopyError::StoreAbsent(path()),
+            CopyError::OutputDirectoryAbsent(path()),
+            CopyError::OutputExists(path()),
+            CopyError::LeaseHeld(path()),
+            CopyError::SourceBusy,
+            CopyError::CopyMalformed("row 3 missing from index".to_owned()),
+            CopyError::Sqlite(rusqlite::Error::QueryReturnedNoRows),
+            CopyError::Io(std::io::Error::other("the disk is full")),
+        ];
+        for failure in failures {
+            let (shown, text) = (format!("{failure:?}"), failure.to_string());
+            let kept = SnapshotError::from(failure);
+            assert_eq!((format!("{kept:?}"), kept.to_string()), (shown, text));
         }
     }
-    let verdicts: Vec<String> = target
-        .prepare("PRAGMA quick_check")?
-        .query_map([], |row| row.get(0))?
-        .collect::<Result<_, _>>()?;
-    if verdicts != [QUICK_CHECK_OK] {
-        return Err(SnapshotError::CopyMalformed(verdicts.join("; ")));
-    }
-    let version = user_version(&target)?;
-    target.close().map_err(|(_, failure)| failure)?;
-    Ok(version)
 }

@@ -1,6 +1,7 @@
 //! The temp-store scan: `docs/design/architecture.md` section 8 row T1. A rusqlite constructor is
-//! named outside a test module in two files only, once each: the `connect` of each crate that
-//! opens SQLite, which sets `temp_store`. A text scan over every member's `src`.
+//! named outside a test module in two files only, once each: the store core's `connect`, which
+//! every store that links it opens through, and `modelgate`'s own. Each sets `temp_store`. A text
+//! scan over every member's `src`.
 
 use std::path::Path;
 
@@ -13,7 +14,7 @@ pub const OPEN: &str = concat!("Connection", "::open");
 /// The files that may name [`OPEN`] outside a test module, once each, in the scan's order.
 pub const OPENERS: [&str; 2] = [
     "services/modelgate/src/store.rs",
-    "services/newsvault/src/store.rs",
+    "vault-core/src/sqlite.rs",
 ];
 const TEST_MARKER: &str = "#[cfg(test)]";
 const MODULE: &str = "mod";
@@ -111,7 +112,7 @@ pub fn bare_open_failure(root_manifest: &Path) -> Option<String> {
             "`{}` on {} code line(s) outside the one opener of {}:\n\n{}\n\n",
             "Why this matters: the image runs `--read-only`, and a sort that outgrows SQLite's ",
             "memory then\nfails with SQLITE_IOERR_GETTEMPPATH (6410) unless the connection keeps ",
-            "its temporary data in\nmemory. Open through the crate's `connect` instead.\n",
+            "its temporary data in\nmemory. Open through an opener's `connect` or `read_only` instead.\n",
             "A TEXT scan: it sees no constructor reached under another name. The invariant is ",
             "{}.\n",
         ),
@@ -133,9 +134,12 @@ mod tests {
     use super::*;
     use crate::tests::{manifest, root_manifest, Tree, INHERITS};
 
-    const ONE_MEMBER: &str = "[workspace]\nmembers = [\"services/newsvault\"]\nresolver = \"2\"\n";
+    const TWO_MEMBERS: &str =
+        "[workspace]\nmembers = [\"services/newsvault\", \"vault-core\"]\nresolver = \"2\"\n";
     const READER: &str = "services/newsvault/src/cmd_new.rs";
-    const OPENER: &str = "services/newsvault/src/store.rs";
+    const OPENER: &str = "vault-core/src/sqlite.rs";
+    /// A file of a store that is no opener: an open there is bare.
+    const FORMER_OPENER: &str = "services/newsvault/src/store.rs";
     /// Written out, never built from [`OPEN`]: a narrowed constant must not narrow the fixture.
     const THREE_CONSTRUCTORS: &str = "fn read() {\n    \
         let a = Connection::open(log)?;\n    \
@@ -143,8 +147,10 @@ mod tests {
         let c = Connection::open_in_memory()?;\n    \
         // Connection::open(log) in a comment\n}\n";
 
-    fn one_service() -> Tree {
-        Tree::new(ONE_MEMBER).crate_at("services/newsvault", &manifest("newsvault", INHERITS))
+    fn a_service_and_the_core() -> Tree {
+        Tree::new(TWO_MEMBERS)
+            .crate_at("services/newsvault", &manifest("newsvault", INHERITS))
+            .crate_at("vault-core", &manifest("vault-core", INHERITS))
     }
 
     fn seen(tree: &Tree) -> Vec<(String, usize)> {
@@ -175,7 +181,7 @@ mod tests {
 
     #[test]
     fn each_of_the_three_constructors_is_seen_and_a_comment_or_a_test_module_is_not() {
-        let tree = one_service();
+        let tree = a_service_and_the_core();
         tree.write(
             READER,
             &format!(
@@ -189,7 +195,7 @@ mod tests {
 
     #[test]
     fn an_open_outside_the_two_openers_turns_the_scan_red() {
-        let tree = one_service();
+        let tree = a_service_and_the_core();
         tree.write(READER, THREE_CONSTRUCTORS);
         let failure = bare_open_failure(&tree.root_manifest()).expect("expected a failure");
         let named = [2, 3, 4].map(|line| failure.contains(&format!("{READER}:{line}")));
@@ -198,7 +204,7 @@ mod tests {
 
     #[test]
     fn an_opener_holds_one_open_and_a_second_turns_the_scan_red() {
-        let tree = one_service();
+        let tree = a_service_and_the_core();
         let connect = "fn connect() {\n    Connection::open_with_flags(path, flags)\n}\n";
         tree.write(OPENER, connect);
         let one = bare_open_failure(&tree.root_manifest());
@@ -206,14 +212,16 @@ mod tests {
             OPENER,
             &format!("{connect}fn other() {{\n    Connection::open(path)\n}}\n"),
         );
+        tree.write(FORMER_OPENER, connect);
         let two = bare_open_failure(&tree.root_manifest()).unwrap_or_default();
         assert_eq!(
             (
                 one,
                 two.contains(&format!("{OPENER}:5")),
-                two.contains(&format!("{OPENER}:2"))
+                two.contains(&format!("{OPENER}:2")),
+                two.contains(&format!("{FORMER_OPENER}:2"))
             ),
-            (None, true, false),
+            (None, true, false, true),
             "{two}"
         );
     }
@@ -222,7 +230,7 @@ mod tests {
     /// at the first marker.
     #[test]
     fn a_test_marker_that_opens_no_module_hides_nothing_below_it() {
-        let tree = one_service();
+        let tree = a_service_and_the_core();
         tree.write(
             READER,
             &format!(

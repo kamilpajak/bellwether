@@ -23,11 +23,10 @@ use snapshot_contract::{
     Rule, SnapshotRow, TimeError, ValidateError, DATA_FILE, MANIFEST_FILE, MANIFEST_SCHEMA,
     PROVENANCES,
 };
+use vault_core::sqlite::read_only;
 
 use crate::publish::Durability;
-use crate::store::{
-    blob_bytes, blob_store, read_only, require_current_version, StoreError, COMMIT_LOG,
-};
+use crate::store::{blob_bytes, blob_store, require_current_version, StoreError, COMMIT_LOG};
 
 pub const SCHEMA: &str = "newsvault.cut/1";
 /// Rows one chunked read returns.

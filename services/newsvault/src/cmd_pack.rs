@@ -248,7 +248,7 @@ fn named_by(log: &Path) -> Result<Vec<String>, PackError> {
             path: log.to_path_buf(),
         });
     }
-    let db = store::read_only(log)?;
+    let db = vault_core::sqlite::read_only(log)?;
     let mut lines = Vec::new();
     for (kind, table) in [(DICTIONARY, "dictionaries"), (BLOB, "blobs")] {
         let mut rows = db.prepare(&format!("SELECT digest FROM {table} ORDER BY digest"))?;
