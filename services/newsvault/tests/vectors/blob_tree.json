@@ -1,0 +1,16 @@
+{
+  "schema": "newsvault.vector/1",
+  "vector": "blob_tree",
+  "note": "Every file under an empty store after one put of the payload, by its path below the store and the sha256 of its bytes. before_a_dictionary: no dictionary is active, so the file is the payload. under_the_dictionary: a second empty store, the dictionary stored and activated first. Payload and dictionary are the UTF-8 bytes of the two strings; the dictionary is synthetic text, not a trained one. What may change this file: architecture.md section 8 row V1.",
+  "input": {
+    "payload": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Synthetic Wire</title></head><body><article class=\"release\">\n<p>Specimen Group, a company that does not exist, announced its full-year outlook of 75.5 million example dollars, up from the quarter a year earlier.</p>\n<p>Sample Holdings, a company that does not exist, completed a credit facility of 625.4 million example dollars, subject to closing conditions.</p>\n<p>Template Energy, a company that does not exist, raised a credit facility of 653.2 million example dollars, according to the synthetic filing.</p>\n<p>Dummy Logistics, a company that does not exist, announced its full-year outlook of 791.5 million example dollars, the seventh such notice this year.</p>\n<p>Placeholder Industries, a company that does not exist, raised the sale of a unit of 642.2 million example dollars, subject to closing conditions.</p>\n<p>Placeholder Industries, a company that does not exist, completed its full-year outlook of 410.6 million example dollars, up from the quarter a year earlier.</p>\n<p>Example Corp, a company that does not exist, lowered its annual meeting date of 232.2 million example dollars, below the range it gave in May.</p>\n<p>Sample Holdings, a company that does not exist, reported a quarterly dividend of 345.0 million example dollars, subject to closing conditions.</p>\n</article><footer>Synthetic Wire, an example publisher. No company named here exists.</footer></body></html>\n",
+    "dictionary": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Synthetic Wire</title></head><body><article class=\"release\">\n<p>, a company that does not exist, of million example dollars, .</p>\n</article><footer>Synthetic Wire, an example publisher. No company named here exists.</footer></body></html>\n"
+  },
+  "before_a_dictionary": {
+    "blobs/sha256/05/39/05390fa2e03eb1c4eae78344d56dffb5508a7f9a7d35d7d33631e853e3ff4e09": "05390fa2e03eb1c4eae78344d56dffb5508a7f9a7d35d7d33631e853e3ff4e09"
+  },
+  "under_the_dictionary": {
+    "blobs/dictionaries/272b178fde499b5109c1b982db6e86558385ca8177292cb5e3b51ed75fe00078": "272b178fde499b5109c1b982db6e86558385ca8177292cb5e3b51ed75fe00078",
+    "blobs/sha256/05/39/05390fa2e03eb1c4eae78344d56dffb5508a7f9a7d35d7d33631e853e3ff4e09.zst": "10148889157c6e481186d002a97b3472f015e75fa484d6e284bd6e7b06041986"
+  }
+}

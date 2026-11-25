@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use canon::digest::{item_id, story_id, ItemFields};
+use canon::digest::{item_id, snapshot_id, story_id, ItemFields};
 use canon::{FileDigest, Stamp};
 use chrono::{DateTime, NaiveDate, Utc};
 use news_provider::{
@@ -354,6 +354,26 @@ fn a_cut_holds_exactly_the_rows_items_returns_at_the_same_at_through_its_high_wa
         );
     }
     assert_eq!((at_each, items_each), (vec![2, 3], vec![2, 3]));
+    Ok(())
+}
+
+/// Section 8 row V1: the id `five`'s cut had on 2026-11-25, which is also canon's `snapshot_id`
+/// over the row digests `vectors/cut_snapshot_id.json` lists.
+#[test]
+fn a_cut_of_the_five_rows_has_the_recorded_snapshot_id() -> TestResult {
+    let vector: Value = serde_json::from_str(include_str!("vectors/cut_snapshot_id.json"))?;
+    let (input, recorded) = (&vector["input"], vector["sha256"].as_str());
+    let rows = input["rows"].as_array().into_iter().flatten();
+    let rows: Vec<&str> = rows.filter_map(Value::as_str).collect();
+    let cutoff = at(input["cutoff"].as_str().ok_or("no cutoff")?)?;
+    let over_the_rows = snapshot_id(cutoff, &rows).map_err(|why| why.to_string())?;
+    let (root, out) = (TempDir::new()?, TempDir::new()?);
+    let _store = five(root.path())?;
+    let report = cut(&ask(root.path(), out.path())?)?;
+    assert_eq!(
+        (Some(report.snapshot_id.as_str()), Some(over_the_rows.hex())),
+        (recorded, recorded)
+    );
     Ok(())
 }
 
