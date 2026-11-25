@@ -119,6 +119,22 @@ pub struct ReadBack {
     pub payload: Vec<u8>,
 }
 
+/// One copy's file, the dictionary a `.zst` one names and the payload it decodes to.
+struct FileRead {
+    file: Vec<u8>,
+    dictionary: Option<String>,
+    decoded: Option<Vec<u8>>,
+}
+
+/// One blob's file as it is on disk, checked against its digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredFile {
+    pub path: PathBuf,
+    /// The dictionary a `.zst` file names.
+    pub dictionary: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
 /// One digest of [`BlobStore::stream`]: what is on disk, and its preferred copy read back.
 #[derive(Debug)]
 pub struct StreamedBlob {
@@ -280,24 +296,49 @@ impl BlobStore {
         digest: &BlobDigest,
         encoding: Encoding,
     ) -> Result<ReadBack, StoreError> {
+        let read = self.read_file(digest, encoding)?;
+        Ok(ReadBack {
+            encoding,
+            dictionary: read.dictionary,
+            stored_bytes: u64::try_from(read.file.len()).unwrap_or(u64::MAX),
+            payload: read.decoded.unwrap_or(read.file),
+        })
+    }
+
+    /// One copy's file, the dictionary a `.zst` one names and what it decodes to; the payload
+    /// re-hashed against `digest`.
+    fn read_file(&self, digest: &BlobDigest, encoding: Encoding) -> Result<FileRead, StoreError> {
         let file = fs::read(self.path_in(digest, encoding))?;
-        let stored_bytes = u64::try_from(file.len()).unwrap_or(u64::MAX);
-        let (dictionary, payload) = match encoding {
-            Encoding::Raw => (None, file),
-            Encoding::Zstd => self.decode(digest, &file)?,
+        let (dictionary, decoded) = match encoding {
+            Encoding::Raw => (None, None),
+            Encoding::Zstd => {
+                let (dictionary, payload) = self.decode(digest, &file)?;
+                (dictionary, Some(payload))
+            }
         };
-        let found = const_hex::encode(Sha256::digest(&payload));
+        let found = const_hex::encode(Sha256::digest(decoded.as_ref().unwrap_or(&file)));
         if found != digest.hex() {
             return Err(StoreError::BlobAltered {
                 digest: digest.hex().to_owned(),
                 found,
             });
         }
-        Ok(ReadBack {
-            encoding,
+        Ok(FileRead {
+            file,
             dictionary,
-            stored_bytes,
-            payload,
+            decoded,
+        })
+    }
+
+    /// The file a backup pack carries for `digest`: the bytes as stored, raw or `.zst`, only
+    /// after their payload read back to the digest.
+    pub fn stored_file(&self, digest: &BlobDigest) -> Result<StoredFile, StoreError> {
+        let encoding = self.listed(digest).read_from();
+        let read = self.read_file(digest, encoding)?;
+        Ok(StoredFile {
+            path: self.path_in(digest, encoding),
+            dictionary: read.dictionary,
+            bytes: read.file,
         })
     }
 

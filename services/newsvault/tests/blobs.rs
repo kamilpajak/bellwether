@@ -1,6 +1,8 @@
-//! `newsvault blobs verify | compress | dictionary train` through the binary, over a store laid out
-//! as every store was before compression: raw files named by their sha256 (architecture.md
-//! section 3.9, row "compression"). Training reads repo fixtures only; nothing trained is kept.
+//! `newsvault blobs verify | compress | pack | dictionary train` through the binary, over a store
+//! laid out as every store was before compression: raw files named by their sha256
+//! (architecture.md section 3.9, row "compression"). Training reads repo fixtures only; nothing
+//! trained is kept. The pack tests run `deploy/systemd/newsvault-backup` under dash against a
+//! stub `docker` whose `run` is this build's binary (section 10, N1, "Packs").
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -90,23 +92,29 @@ fn legacy_store() -> Result<Store, Box<dyn Error>> {
     let db = Connection::open(root.path().join(COMMIT_LOG))?;
     let pages = pages()?;
     for page in &pages {
-        let hex = sha256(page);
-        let path = raw_path(root.path(), &hex);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, page)?;
-        db.execute(
-            "INSERT INTO blobs (digest, bytes, first_indexed_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(digest) DO NOTHING",
-            (
-                hex,
-                i64::try_from(page.len())?,
-                "2026-11-21T00:00:00.000000Z",
-            ),
-        )?;
+        index_raw(root.path(), &db, page)?;
     }
     Ok((root, pages))
+}
+
+/// One payload as a raw file with its `blobs` row.
+fn index_raw(store: &Path, db: &Connection, page: &[u8]) -> TestResult {
+    let hex = sha256(page);
+    let path = raw_path(store, &hex);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, page)?;
+    db.execute(
+        "INSERT INTO blobs (digest, bytes, first_indexed_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(digest) DO NOTHING",
+        (
+            hex,
+            i64::try_from(page.len())?,
+            "2026-11-21T00:00:00.000000Z",
+        ),
+    )?;
+    Ok(())
 }
 
 /// The legacy store after `train` and `compress`, with the dictionary's digest.
@@ -183,7 +191,7 @@ fn a_dry_run_trains_and_measures_and_stores_and_activates_nothing() -> TestResul
     Ok(())
 }
 
-/// The dictionary lives in the store under its own sha256, which the backup's tar carries, and
+/// The dictionary lives in the store under its own sha256, which the backup's first pack carries, and
 /// the log records it and its activation; the same samples train the same dictionary, so a
 /// second run changes nothing.
 #[test]
@@ -564,8 +572,8 @@ fn compress_exits_eight_when_a_blob_fails_and_keeps_its_raw_file() -> TestResult
     Ok(())
 }
 
-/// Under its lease compress removes the staging files a crash left, which the backup's tar
-/// would otherwise carry, and replaces a leftover `.zst` that does not decode. Mutation
+/// Under its lease compress removes the staging files a crash left and replaces a leftover
+/// `.zst` that does not decode. Mutation
 /// 2026-11-21, compress not calling `remove_staging_leftovers`: red.
 #[test]
 fn compress_removes_staging_leftovers_and_replaces_a_bad_leftover_copy() -> TestResult {
@@ -637,6 +645,705 @@ fn training_on_zero_samples_or_zero_held_out_is_a_usage_error() -> TestResult {
     Ok(())
 }
 
+const FOLDER: &str = "stub/ncdata/ncuser/files/Backups/bellwether";
+const NIGHTS: [&str; 3] = ["20261124T225500Z", "20261125T225500Z", "20261126T225500Z"];
+const PACK_1: &str = "bellwether-vault-blobs-20261124T225500Z.tar";
+const PACK_2: &str = "bellwether-vault-blobs-20261125T225500Z.tar";
+/// Stands in for docker under the backup script. `run`: this build's binary on the words after
+/// the image, with `/vault` and `/out` mapped to their mounts. `exec`: the Nextcloud container
+/// as a shell over `$STUB_DIR/ncdata`; `occ` exits 0.
+const BACKUP_DOCKER: &str = r#"#!/bin/sh
+if [ "$1" = run ]; then
+    for arg; do
+        case $arg in
+            type=bind,src=*,dst=/vault,readonly) store=${arg#type=bind,src=}; store=${store%%,dst=*} ;;
+            type=bind,src=*,dst=/out) out=${arg#type=bind,src=}; out=${out%%,dst=*} ;;
+        esac
+    done
+    while [ "$1" != newsvault:test ]; do shift; done
+    shift
+    n=$#
+    for arg; do
+        case $arg in /out/*) arg="$out/${arg#/out/}" ;; esac
+        set -- "$@" "$arg"
+    done
+    shift "$n"
+    BELLWETHER_VAULT=$store exec "$STUB_NEWSVAULT" "$@"
+fi
+shift
+while :; do
+    case $1 in -i) shift ;; -u) shift 2 ;; *) break ;; esac
+done
+shift
+n=$#
+for arg; do
+    case $arg in /mnt/ncdata/*) arg="$STUB_DIR/ncdata/${arg#/mnt/ncdata/}" ;; esac
+    set -- "$@" "$arg"
+done
+shift "$n"
+case $1 in
+    php) exit 0 ;;
+    sh | mkdir | rm | mv | ls) cmd=$1; shift; exec "/bin/$cmd" "$@" ;;
+esac
+exit 127
+"#;
+/// `date -u +%s` and the name's stamp: each night is the one the test names.
+const DATE_STUB: &str = "#!/bin/sh\ncase $2 in +%s) echo 0 ;; *) echo \"$STUB_STAMP\" ;; esac\n";
+
+/// A home whose vault is `store`, an empty Nextcloud data directory and the two stubs.
+fn backup_bench(store: &Path) -> Result<TempDir, Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    let work = TempDir::new()?;
+    for dir in [
+        "home/.bellwether",
+        "stub/bin",
+        "stub/ncdata/ncuser/files",
+        "textfile",
+    ] {
+        std::fs::create_dir_all(work.path().join(dir))?;
+    }
+    std::os::unix::fs::symlink(store, work.path().join("home/.bellwether/vault"))?;
+    for (name, text) in [("docker", BACKUP_DOCKER), ("date", DATE_STUB)] {
+        let path = work.path().join("stub/bin").join(name);
+        std::fs::write(&path, text)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(work)
+}
+
+/// One run of `deploy/systemd/newsvault-backup` under the unit's shell; any exit but `exit` is
+/// an error carrying the run's stderr.
+fn night(work: &Path, stamp: &str, exit: i32) -> Result<Output, Box<dyn Error>> {
+    let run = Command::new("/bin/dash")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/systemd/newsvault-backup"))
+        .current_dir(work)
+        .env_clear()
+        .env("HOME", work.join("home"))
+        // macOS keeps `sha256sum` in /sbin.
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin:/sbin", work.join("stub/bin").display()),
+        )
+        .env("NEWSVAULT_IMAGE", "newsvault:test")
+        .env("NEWSVAULT_TEXTFILE_DIR", work.join("textfile"))
+        .env("NEXTCLOUD_CONTAINER", "nextcloud-aio-nextcloud")
+        .env("NEXTCLOUD_DATA", "/mnt/ncdata")
+        .env("NEXTCLOUD_USER", "ncuser")
+        .env("NEXTCLOUD_FOLDER", "Backups/bellwether")
+        .env("STUB_DIR", work.join("stub"))
+        .env("STUB_NEWSVAULT", env!("CARGO_BIN_EXE_newsvault"))
+        .env("STUB_STAMP", stamp)
+        .stdin(Stdio::null())
+        .output()?;
+    match run.status.code() == Some(exit) {
+        true => Ok(run),
+        false => Err(format!("{}: {}", run.status, String::from_utf8_lossy(&run.stderr)).into()),
+    }
+}
+
+fn names(dir: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        names.push(entry?.file_name().to_string_lossy().into_owned());
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// What the script reads from the folder for `blobs pack`, as `[have, manifests]` in `into`.
+fn folder_facts(folder: &Path, into: &Path) -> Result<[PathBuf; 2], Box<dyn Error>> {
+    let facts = [into.join("have"), into.join("manifests")];
+    if facts[1].exists() {
+        std::fs::remove_dir_all(&facts[1])?;
+    }
+    std::fs::create_dir(&facts[1])?;
+    let mut have = String::new();
+    for name in names(folder)? {
+        if name.ends_with(".tar") {
+            let bytes = std::fs::read(folder.join(&name))?;
+            have += &format!("{name} {} {}\n", bytes.len(), sha256(&bytes));
+        } else if name.ends_with(".tar.manifest") {
+            std::fs::copy(folder.join(&name), facts[1].join(&name))?;
+        }
+    }
+    std::fs::write(&facts[0], have)?;
+    Ok(facts)
+}
+
+fn pack(
+    store: &Path,
+    log: &Path,
+    facts: &[PathBuf; 2],
+    extra: &[&str],
+) -> Result<Output, Box<dyn Error>> {
+    let shown = |path: &Path| path.display().to_string();
+    let (log, have, manifests) = (shown(log), shown(&facts[0]), shown(&facts[1]));
+    let asked = ["blobs", "pack", "--log", &log, "--have", &have];
+    newsvault(
+        store,
+        &[&asked, &["--manifests", &manifests][..], extra].concat(),
+    )
+}
+
+/// The restore runbook's unpacking: the newest log archive, then every pack but those in
+/// `skip`, into one directory. `.1` is whether the archive alone left a `blobs` entry.
+fn restore(folder: &Path, skip: &[String]) -> Result<(TempDir, bool), Box<dyn Error>> {
+    let into = TempDir::new()?;
+    let unpack = |flag: &str, name: &String| -> TestResult {
+        let done = Command::new("tar")
+            .arg(flag)
+            .arg(folder.join(name))
+            .arg("-C")
+            .arg(into.path())
+            .status()?;
+        if done.success() {
+            Ok(())
+        } else {
+            Err(format!("tar {flag} {name}: {done}").into())
+        }
+    };
+    let all = names(folder)?;
+    let newest = all.iter().rfind(|name| name.ends_with(".tar.gz"));
+    unpack("-xzf", newest.ok_or("no log archive")?)?;
+    let archive_holds_blobs = into.path().join("blobs").exists();
+    for name in all.iter().filter(|name| name.ends_with(".tar")) {
+        if !skip.contains(name) {
+            unpack("-xf", name)?;
+        }
+    }
+    Ok((into, archive_holds_blobs))
+}
+
+fn strings(value: &Value) -> Vec<String> {
+    let listed = value.as_array().into_iter().flatten();
+    listed
+        .filter_map(|name| name.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Section 8 row B3. The first night packs the dictionary and every blob, the second only the
+/// two blobs indexed and compressed since, without their dictionary again, the third none; no
+/// log archive holds a blob. The newest archive and
+/// every pack, unpacked, are a store `blobs verify` accepts, and a dry run over the restored log
+/// finds nothing the packs lack.
+#[test]
+fn each_night_packs_only_what_no_pack_holds_and_the_restore_verifies() -> TestResult {
+    let (root, pages, dictionary) = compressed_store()?;
+    let work = backup_bench(root.path())?;
+    let folder = work.path().join(FOLDER);
+    for (index, stamp) in NIGHTS.iter().enumerate() {
+        if index == 1 {
+            let db = Connection::open(root.path().join(COMMIT_LOG))?;
+            index_raw(root.path(), &db, b"a page indexed after the first night")?;
+            index_raw(root.path(), &db, b"and another one")?;
+            newsvault(root.path(), &["blobs", "compress"])?;
+        }
+        night(work.path(), stamp, 0)?;
+    }
+    let members = |pack: &str| -> Result<[usize; 2], Box<dyn Error>> {
+        let text = std::fs::read_to_string(folder.join(format!("{pack}.manifest")))?;
+        Ok(["dictionary ", "blob "]
+            .map(|kind| text.lines().filter(|l| l.starts_with(kind)).count()))
+    };
+    let (restored, archive_holds_blobs) = restore(&folder, &[])?;
+    let verified = newsvault(restored.path(), &["blobs", "verify"])?;
+    let report = answered(&verified)?;
+    let facts = folder_facts(&folder, work.path())?;
+    let log = restored.path().join(COMMIT_LOG);
+    let planned = pack(restored.path(), &log, &facts, &["--dry-run"])?;
+    let plan = answered(&planned)?;
+    let count = u64::try_from(pages.len())?;
+    let mut held: Vec<String> = NIGHTS
+        .iter()
+        .map(|stamp| format!("bellwether-vault-log-{stamp}.tar.gz"))
+        .collect();
+    for pack in [PACK_1, PACK_2] {
+        held.extend([pack.to_owned(), format!("{pack}.manifest")]);
+    }
+    held.sort();
+    assert_eq!(
+        (
+            names(&folder)?,
+            members(PACK_1)?,
+            members(PACK_2)?,
+            std::fs::read_to_string(folder.join(format!("{PACK_1}.manifest")))?
+                .contains(&format!("dictionary {dictionary}\n")),
+            archive_holds_blobs,
+            (verified.status.code(), report["verified"].as_u64()),
+            report["indexed"].clone(),
+            (
+                planned.status.code(),
+                plan["named"].as_u64(),
+                plan["held"].as_u64(),
+                plan["packed"].as_u64(),
+                plan["dry_run"].as_bool(),
+            ),
+        ),
+        (
+            held,
+            [1, pages.len()],
+            [0, 2],
+            true,
+            false,
+            (Some(0), Some(count + 2)),
+            serde_json::json!({"rows": count + 2, "absent": 0, "length_differs": 0}),
+            (
+                Some(0),
+                Some(count + 3),
+                Some(count + 3),
+                Some(0),
+                Some(true)
+            ),
+        )
+    );
+    Ok(())
+}
+
+/// Section 8 row B3. A pack that is gone, of another length or of other bytes at the same
+/// length, a manifest that is not whole (no `end` line, cut mid-line, a second blank in a line,
+/// another count, a line after `end`, another pack's name) and a pack with no manifest: a dry run names each, in
+/// both renderings, and answers no with every member unpacked; the next night exits 8 naming it,
+/// deletes no pack or manifest and packs the members again, after which the packs that count
+/// restore to a store `blobs verify` accepts.
+#[test]
+fn a_lost_short_or_unrecorded_pack_is_named_and_its_blobs_are_packed_again() -> TestResult {
+    const DAMAGES: [&str; 10] = [
+        "gone",
+        "short",
+        "altered",
+        "cut",
+        "torn",
+        "spaced",
+        "miscounted",
+        "trailing",
+        "misnamed",
+        "unrecorded",
+    ];
+    let mut got = Vec::new();
+    for damage in DAMAGES {
+        let (root, _, _) = compressed_store()?;
+        let work = backup_bench(root.path())?;
+        let folder = work.path().join(FOLDER);
+        night(work.path(), NIGHTS[0], 0)?;
+        let (tar, manifest) = (
+            folder.join(PACK_1),
+            folder.join(format!("{PACK_1}.manifest")),
+        );
+        let text = std::fs::read_to_string(&manifest)?;
+        let ended = text.rsplit_once("end ").map_or("", |(kept, _)| kept);
+        match damage {
+            "gone" => std::fs::remove_file(&tar)?,
+            "short" => std::fs::write(&tar, "cut")?,
+            "altered" => {
+                let mut bytes = std::fs::read(&tar)?;
+                if let Some(byte) = bytes.last_mut() {
+                    *byte ^= 1;
+                }
+                std::fs::write(&tar, bytes)?;
+            }
+            "cut" => std::fs::write(&manifest, ended)?,
+            "torn" => std::fs::write(&manifest, &text[..text.len() / 2])?,
+            "spaced" => std::fs::write(&manifest, text.replacen("blob ", "blob  ", 1))?,
+            "miscounted" => std::fs::write(&manifest, format!("{ended}end 0\n"))?,
+            "trailing" => std::fs::write(&manifest, format!("{text}blob abcd\n"))?,
+            "misnamed" => std::fs::write(&manifest, text.replacen(PACK_1, PACK_2, 1))?,
+            _ => std::fs::remove_file(&manifest)?,
+        }
+        let before = names(&folder)?;
+        let log = root.path().join(COMMIT_LOG);
+        let facts = folder_facts(&folder, work.path())?;
+        let planned = pack(root.path(), &log, &facts, &["--dry-run"])?;
+        let plan = answered(&planned)?;
+        let human = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+            .args(["blobs", "pack", "--dry-run", "--store"])
+            .arg(root.path())
+            .arg("--log")
+            .arg(&log)
+            .arg("--have")
+            .arg(&facts[0])
+            .arg("--manifests")
+            .arg(&facts[1])
+            .output()?;
+        let second = night(work.path(), NIGHTS[1], 8)?;
+        let after = names(&folder)?;
+        let healed = pack(
+            root.path(),
+            &log,
+            &folder_facts(&folder, work.path())?,
+            &["--dry-run"],
+        )?;
+        let lost = strings(&answered(&healed)?["lost"]);
+        let (restored, _) = restore(&folder, &lost)?;
+        got.push((
+            damage,
+            planned.status.code(),
+            (
+                strings(&plan["lost"]),
+                strings(&plan["unrecorded"]),
+                plan["packed"].as_u64(),
+            ),
+            String::from_utf8_lossy(&human.stdout).contains(PACK_1),
+            String::from_utf8_lossy(&second.stdout).contains(&format!("\"{PACK_1}\"")),
+            before.iter().all(|name| after.contains(name)) && after.len() == before.len() + 3,
+            (healed.status.code(), answered(&healed)?["packed"].as_u64()),
+            newsvault(restored.path(), &["blobs", "verify"])?
+                .status
+                .code(),
+        ));
+    }
+    let all = Some(u64::try_from(pages()?.len())? + 1);
+    let (named, none) = (vec![PACK_1.to_owned()], Vec::<String>::new());
+    let expected: Vec<_> = DAMAGES
+        .iter()
+        .map(|damage| {
+            let (lost, unrecorded) = match *damage {
+                "unrecorded" => (none.clone(), named.clone()),
+                _ => (named.clone(), none.clone()),
+            };
+            (
+                *damage,
+                Some(1),
+                (lost, unrecorded, all),
+                true,
+                true,
+                true,
+                (Some(8), Some(0)),
+                Some(0),
+            )
+        })
+        .collect();
+    assert_eq!(got, expected);
+    Ok(())
+}
+
+/// Section 8 row B3. A blob the log names that is gone, that no longer reads back to its digest
+/// or that is no zstd frame, before any pack held it: the night packs every other member, writes
+/// the log archive and the metric and exits 8, the blob named in the report and by one stderr
+/// line. A dry run over the restored log names it and answers no. The next night names it
+/// again and writes no pack; once the file is back a night packs it alone and exits 0, and a
+/// pack that holds it is the copy a later loss restores from.
+#[test]
+fn a_named_blob_that_is_gone_or_altered_is_named_and_left_out_until_the_store_gives_it(
+) -> TestResult {
+    let reported = |output: &Output| {
+        serde_json::Deserializer::from_slice(&output.stdout)
+            .into_iter::<Value>()
+            .map_while(Result::ok)
+            .find(|value| value["schema"] == "newsvault.blobs.pack/1")
+            .unwrap_or_default()
+    };
+    let mut got = Vec::new();
+    let mut expected = Vec::new();
+    for (damage, reason, code) in [
+        (None, "absent", "input_absent"),
+        (
+            Some(frame_of(b"other bytes")?),
+            "digest_mismatch",
+            "input_unparseable",
+        ),
+        (
+            Some(b"no frame".to_vec()),
+            "digest_mismatch",
+            "input_unparseable",
+        ),
+    ] {
+        let (root, pages, _) = compressed_store()?;
+        let work = backup_bench(root.path())?;
+        let folder = work.path().join(FOLDER);
+        let hex = sha256(&pages[0]);
+        let file = zst_path(root.path(), &hex);
+        let good = std::fs::read(&file)?;
+        match damage {
+            Some(bytes) => std::fs::write(&file, bytes)?,
+            None => std::fs::remove_file(&file)?,
+        }
+        let left = |why: &str| serde_json::json!([{"kind": "blob", "digest": hex, "reason": why}]);
+        let first = night(work.path(), NIGHTS[0], 8)?;
+        let report = reported(&first);
+        let said = String::from_utf8_lossy(&first.stderr).to_string();
+        let lines: Vec<_> = said
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .map(|error| {
+                (
+                    error["code"].as_str().map(str::to_owned),
+                    error["details"]["digest"].as_str() == Some(&hex),
+                    error["message"].as_str().is_some_and(|m| m.contains(&hex)),
+                )
+            })
+            .collect();
+        let after_first = names(&folder)?;
+        let manifest = std::fs::read_to_string(folder.join(format!("{PACK_1}.manifest")))?;
+        let metric = std::fs::read_to_string(work.path().join("textfile/newsvault-backup.prom"))?;
+        let (restored, _) = restore(&folder, &[])?;
+        let facts = folder_facts(&folder, work.path())?;
+        let log = restored.path().join(COMMIT_LOG);
+        let planned = pack(restored.path(), &log, &facts, &["--dry-run"])?;
+        let verified = newsvault(restored.path(), &["blobs", "verify"])?;
+        let second = night(work.path(), NIGHTS[1], 8)?;
+        let after_second = names(&folder)?;
+        std::fs::write(&file, &good)?;
+        night(work.path(), NIGHTS[2], 0)?;
+        let third = format!("bellwether-vault-blobs-{}.tar.manifest", NIGHTS[2]);
+        let repaired = std::fs::read_to_string(folder.join(third))?;
+        std::fs::remove_file(&file)?;
+        let out = TempDir::new()?;
+        let skipped = pack(
+            root.path(),
+            &root.path().join(COMMIT_LOG),
+            &folder_facts(&folder, work.path())?,
+            &["--out", &out.path().join(PACK_2).display().to_string()],
+        )?;
+        let (whole, _) = restore(&folder, &[])?;
+        got.push((
+            (
+                report["pack"].as_str().map(str::to_owned),
+                report["packed"].as_u64(),
+                report["not_packed"].clone(),
+            ),
+            lines,
+            said.contains("is tried again every night"),
+            (after_first.len(), manifest.contains(&hex)),
+            metric.contains("newsvault_backup_last_success_timestamp_seconds 0\n"),
+            (
+                planned.status.code(),
+                planned.stderr.is_empty(),
+                answered(&planned)?["not_packed"].clone(),
+            ),
+            (
+                verified.status.code(),
+                answered(&verified)?["indexed"]["absent"].as_u64(),
+            ),
+            (
+                reported(&second)["pack"].is_null(),
+                reported(&second)["changed"].as_bool(),
+                reported(&second)["not_packed"].clone(),
+                after_second.len(),
+            ),
+            repaired.lines().skip(1).map(str::to_owned).collect(),
+            (skipped.status.code(), answered(&skipped)?["pack"].is_null()),
+            newsvault(whole.path(), &["blobs", "verify"])?.status.code(),
+        ));
+        expected.push((
+            (
+                Some(PACK_1.to_owned()),
+                Some(u64::try_from(pages.len())?),
+                left(reason),
+            ),
+            vec![(Some(code.to_owned()), true, true)],
+            true,
+            (3, false),
+            true,
+            (Some(1), true, left("dry_run")),
+            (Some(1), Some(1)),
+            (true, Some(false), left(reason), 4),
+            vec![format!("blob {hex}"), "end 1".to_owned()],
+            (Some(0), true),
+            Some(0),
+        ));
+    }
+    assert_eq!(got, expected);
+    Ok(())
+}
+
+/// A `.zst` file names its dictionary in its header, so the dictionary goes into the pack that
+/// first holds such a blob even when the log given has no row for it.
+#[test]
+fn a_dictionary_a_packed_blob_names_is_packed_with_it_when_the_log_has_no_row() -> TestResult {
+    let (root, pages, dictionary) = compressed_store()?;
+    let out = TempDir::new()?;
+    let log = out.path().join(COMMIT_LOG);
+    std::fs::copy(root.path().join(COMMIT_LOG), &log)?;
+    Connection::open(&log)?
+        .execute_batch("DELETE FROM dictionary_activations; DELETE FROM dictionaries;")?;
+    let tar = out.path().join(PACK_1);
+    let facts = folder_facts(out.path(), out.path())?;
+    let packed = pack(
+        root.path(),
+        &log,
+        &facts,
+        &["--out", &tar.display().to_string()],
+    )?;
+    let report = answered(&packed)?;
+    let manifest = std::fs::read_to_string(out.path().join(format!("{PACK_1}.manifest")))?;
+    let count = u64::try_from(pages.len())?;
+    assert_eq!(
+        (
+            packed.status.code(),
+            (report["pack"].as_str(), report["changed"].as_bool()),
+            report["named"].as_u64(),
+            report["packed"].as_u64(),
+            report["pack_bytes"].as_u64(),
+            manifest
+                .matches(&format!("dictionary {dictionary}\n"))
+                .count(),
+            manifest.lines().next_back(),
+        ),
+        (
+            Some(0),
+            (Some(PACK_1), Some(true)),
+            Some(count),
+            Some(count + 1),
+            Some(std::fs::metadata(&tar)?.len()),
+            1,
+            Some(format!("end {}", count + 1).as_str()),
+        )
+    );
+    Ok(())
+}
+
+/// A writer needs its active dictionary's file before any blob names it, so a dictionary the
+/// log records is packed from its row: here every blob is still raw. A dry run given `--out`
+/// writes nothing and answers no; a dictionary of other bytes, or one that is gone, is named
+/// and left out of a pack of every raw blob, exit 8.
+#[test]
+fn a_dictionary_no_blob_names_yet_is_packed_from_the_logs_row() -> TestResult {
+    let (root, pages) = legacy_store()?;
+    let trained = answered(&train(root.path(), &[])?)?;
+    let out = TempDir::new()?;
+    let facts = folder_facts(out.path(), out.path())?;
+    let tar = out.path().join(PACK_1).display().to_string();
+    let log = root.path().join(COMMIT_LOG);
+    let planned = pack(root.path(), &log, &facts, &["--dry-run", "--out", &tar])?;
+    let plan = answered(&planned)?;
+    let planned_only = !Path::new(&tar).exists() && plan["pack"].is_null();
+    let packed = pack(root.path(), &log, &facts, &["--out", &tar])?;
+    let restored = TempDir::new()?;
+    let unpacked = Command::new("tar")
+        .args(["-xf", &tar, "-C"])
+        .arg(restored.path())
+        .status()?;
+    let dictionary = trained["dictionary"].as_str().unwrap_or_default();
+    let stored = root.path().join("blobs/dictionaries").join(dictionary);
+    let kept = std::fs::read(&stored).ok();
+    let mut refusals = Vec::new();
+    for (again, altered) in [(PACK_2, true), ("gone.tar", false)] {
+        if altered {
+            std::fs::write(&stored, "other bytes")?;
+        } else {
+            std::fs::remove_file(&stored)?;
+        }
+        let tar = out.path().join(again).display().to_string();
+        let partial = pack(root.path(), &log, &facts, &["--out", &tar])?;
+        let error: Value = serde_json::from_slice(&partial.stderr)?;
+        let report = answered(&partial)?;
+        refusals.push((
+            partial.status.code(),
+            error["code"].as_str().map(str::to_owned),
+            report["not_packed"].clone(),
+            report["packed"].as_u64(),
+            std::fs::read_to_string(format!("{tar}.manifest"))?.contains(dictionary),
+        ));
+    }
+    let refusal = |code: &str, reason: &str| {
+        (
+            Some(8),
+            Some(code.to_owned()),
+            serde_json::json!([{"kind": "dictionary", "digest": dictionary, "reason": reason}]),
+            u64::try_from(pages.len()).ok(),
+            false,
+        )
+    };
+    assert_eq!(
+        (
+            (
+                planned.status.code(),
+                planned_only,
+                plan["dry_run"].as_bool()
+            ),
+            packed.status.code(),
+            answered(&packed)?["packed"].as_u64(),
+            unpacked.success(),
+            std::fs::read(restored.path().join("blobs/dictionaries").join(dictionary)).ok(),
+            refusals,
+        ),
+        (
+            (Some(1), true, Some(true)),
+            Some(0),
+            Some(u64::try_from(pages.len())? + 1),
+            true,
+            kept,
+            vec![
+                refusal("input_unparseable", "digest_mismatch"),
+                refusal("input_absent", "absent"),
+            ],
+        )
+    );
+    Ok(())
+}
+
+/// Each refusal exits by its code with stdout empty: no `--out` outside a dry run, an input that
+/// is absent, a listing line that is not three words, and an `--out` or its manifest that
+/// exists, which is left as it was.
+#[test]
+fn each_pack_refusal_exits_by_its_code_with_stdout_empty() -> TestResult {
+    const KEPT: &str = "a manifest that was there";
+    let (root, _) = legacy_store()?;
+    let out = TempDir::new()?;
+    let at = |name: &str| out.path().join(name);
+    let log = root.path().join(COMMIT_LOG);
+    let good = folder_facts(out.path(), out.path())?;
+    for (name, text) in [
+        ("one-word", "one-word\n"),
+        ("two-words", "p.tar 1\n"),
+        ("four-words", "p.tar 1 ab cd\n"),
+        ("taken", ""),
+        ("fresh.tar.manifest", KEPT),
+    ] {
+        std::fs::write(at(name), text)?;
+    }
+    let shown = |name: &str| at(name).display().to_string();
+    let (tar, taken, fresh) = (shown(PACK_1), shown("taken"), shown("fresh.tar"));
+    let listed = |name: &str| ([at(name), good[1].clone()], vec!["--dry-run"]);
+    let mut asks = vec![
+        (log.clone(), good.clone(), vec![]),
+        (at("no-log"), good.clone(), vec!["--out", tar.as_str()]),
+        (
+            log.clone(),
+            [good[0].clone(), at("none")],
+            vec!["--dry-run"],
+        ),
+        (log.clone(), good.clone(), vec!["--out", taken.as_str()]),
+        (log.clone(), good.clone(), vec!["--out", fresh.as_str()]),
+    ];
+    for name in ["no-have", "one-word", "two-words", "four-words"] {
+        let (facts, extra) = listed(name);
+        asks.push((log.clone(), facts, extra));
+    }
+    let mut got = Vec::new();
+    for (log, facts, extra) in asks {
+        let refused = pack(root.path(), &log, &facts, &extra)?;
+        let code = serde_json::from_slice::<Value>(&refused.stderr)
+            .ok()
+            .and_then(|error| error["code"].as_str().map(str::to_owned));
+        got.push((refused.status.code(), refused.stdout.is_empty(), code));
+    }
+    let coded = |exit, code: &str| (Some(exit), true, Some(code.to_owned()));
+    assert_eq!(
+        (
+            got,
+            std::fs::read_to_string(at("fresh.tar.manifest"))?,
+            at("fresh.tar").exists(),
+        ),
+        (
+            vec![
+                (Some(2), true, None),
+                coded(4, "input_absent"),
+                coded(4, "input_absent"),
+                coded(2, "invalid_argument"),
+                coded(2, "invalid_argument"),
+                coded(4, "input_absent"),
+                coded(2, "input_unparseable"),
+                coded(2, "input_unparseable"),
+                coded(2, "input_unparseable"),
+            ],
+            KEPT.to_owned(),
+            false,
+        )
+    );
+    Ok(())
+}
+
 /// The manifest is hand-written and the parser derived, so each flag `--help` lists is named.
 #[test]
 fn every_option_the_blob_parsers_take_is_in_the_machine_readable_schema() -> TestResult {
@@ -651,6 +1358,7 @@ fn every_option_the_blob_parsers_take_is_in_the_machine_readable_schema() -> Tes
     for path in [
         vec!["blobs", "verify"],
         vec!["blobs", "compress"],
+        vec!["blobs", "pack"],
         vec!["blobs", "dictionary", "train"],
     ] {
         let help = Command::new(binary).args(&path).arg("--help").output()?;

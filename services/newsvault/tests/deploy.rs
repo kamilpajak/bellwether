@@ -12,6 +12,7 @@ use news_provider::Provider;
 use newsvault::cmd_ledger::PROMETHEUS_FAMILIES;
 use newsvault::schedule::{self, SLOTS};
 use open_web_feed::OpenWebFeed;
+use sha2::{Digest as _, Sha256};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -112,9 +113,10 @@ const UNIT_RESULT_FAMILIES: [&str; 3] = [
     "newsvault_unit_result_success",
     "newsvault_unit_exit_status",
 ];
-const BACKUP_FAMILIES: [&str; 2] = [
+const BACKUP_FAMILIES: [&str; 3] = [
     "newsvault_backup_last_success_timestamp_seconds",
     "newsvault_backup_last_success_bytes",
+    "newsvault_backup_packs_bytes",
 ];
 /// `deploy/systemd/newsvault-backup modelgate`'s.
 const GATE_BACKUP_FAMILIES: [&str; 2] = [
@@ -136,8 +138,9 @@ const MODELGATE_SMOKE: (&str, &str) = (
     "--dry-run --format json | jq -e '.dry_run and .question_document == \"ripple-shadow/1\"'",
 );
 /// Written for a person reading the textfile or a dashboard; no alert reads them.
-const UNREAD_FAMILIES: [&str; 2] = [
+const UNREAD_FAMILIES: [&str; 3] = [
     "newsvault_backup_last_success_bytes",
+    "newsvault_backup_packs_bytes",
     "modelgate_backup_last_success_bytes",
 ];
 /// The roster fetch's requests: one robots.txt and one file (`cmd_roster::FILES`).
@@ -382,7 +385,7 @@ fn every_metric_written_has_an_alert_rule_and_no_rule_reads_another() -> TestRes
         (
             read_by_rules,
             owned(&UNIT_RESULT_FAMILIES),
-            owned(&[BACKUP_FAMILIES, GATE_BACKUP_FAMILIES].concat()),
+            owned(&[&BACKUP_FAMILIES[..], &GATE_BACKUP_FAMILIES[..]].concat()),
             owned(&SHADOW_FAMILIES)
         )
     );
@@ -1254,56 +1257,90 @@ const NC_KNOWN: &str = "php occ info:file /ncuser/files/Backups/bellwether";
 const EXEC: &str = "exec -u www-data nextcloud-aio-nextcloud";
 const EXEC_STDIN: &str = "exec -i -u www-data nextcloud-aio-nextcloud";
 const WRITE: &str = "sh -c cat >\"$1\" && wc -c <\"$1\" sh";
-/// Copies already in the folder, oldest first.
+/// What stands for the script's two reads of the folder in `Backed::execs`.
+const READ: &str = "sh <read>";
+/// Log archives already in the folder, oldest first.
 const COPIES: [&str; 8] = [
-    "bellwether-vault-20000101T225500Z.tar.gz",
-    "bellwether-vault-20000102T225500Z.tar.gz",
-    "bellwether-vault-20000103T225500Z.tar.gz",
-    "bellwether-vault-20000104T225500Z.tar.gz",
-    "bellwether-vault-20000105T225500Z.tar.gz",
-    "bellwether-vault-20000106T225500Z.tar.gz",
-    "bellwether-vault-20000107T225500Z.tar.gz",
-    "bellwether-vault-20000108T225500Z.tar.gz",
+    "bellwether-vault-log-20000101T225500Z.tar.gz",
+    "bellwether-vault-log-20000102T225500Z.tar.gz",
+    "bellwether-vault-log-20000103T225500Z.tar.gz",
+    "bellwether-vault-log-20000104T225500Z.tar.gz",
+    "bellwether-vault-log-20000105T225500Z.tar.gz",
+    "bellwether-vault-log-20000106T225500Z.tar.gz",
+    "bellwether-vault-log-20000107T225500Z.tar.gz",
+    "bellwether-vault-log-20000108T225500Z.tar.gz",
 ];
-/// Files of another shape, which no run deletes; the last three are near misses of a staging name.
-const OTHERS: [&str; 5] = [
-    "bellwether-vault-20000101T225500Z.tar.gz.bak",
+/// An earlier night's pack, which no run deletes; its manifest is this plus `.manifest`.
+const OLD_PACK: &str = "bellwether-vault-blobs-20000101T225500Z.tar";
+/// Files no run deletes: three near misses of a staging name, a whole-store archive of the shape
+/// before packs, and a pack with its manifest.
+const OTHERS: [&str; 8] = [
+    "bellwether-vault-log-20000101T225500Z.tar.gz.bak",
     "notes.txt",
     ".notes.part",
-    "x.bellwether-vault-20000101T225500Z.tar.gz.part",
-    ".bellwether-vault-20000101T225500Z.tar.gz.part.keep",
+    "x.bellwether-vault-log-20000101T225500Z.tar.gz.part",
+    ".bellwether-vault-log-20000101T225500Z.tar.gz.part.keep",
+    "bellwether-vault-20000101T225500Z.tar.gz",
+    OLD_PACK,
+    "bellwether-vault-blobs-20000101T225500Z.tar.manifest",
 ];
-/// A staging file a killed run left, which the next run's retention removes.
-const STALE_PARTIAL: &str = ".bellwether-vault-20000101T225500Z.tar.gz.part";
+/// Staging files a killed run left, which the next run's retention removes.
+const STALE_PARTS: [&str; 3] = [
+    ".bellwether-vault-log-20000101T225500Z.tar.gz.part",
+    ".bellwether-vault-blobs-20000101T225500Z.tar.part",
+    ".bellwether-vault-blobs-20000101T225500Z.tar.manifest.part",
+];
+/// What every seeded file holds.
+const SEEDED_TEXT: &str = "an old copy";
 /// How long `terminate_during_write` waits for the write to start: 200 × 50 ms.
 const TERM_POLLS: u32 = 200;
 const TERM_POLL_MS: u64 = 50;
 /// The shell the unit runs the script with: Ubuntu's `/bin/sh`.
 const UNIT_SHELL: &str = "/bin/dash";
 /// A copy whose name sorts after any copy a run writes today.
-const FUTURE_COPY: &str = "bellwether-vault-20990101T225500Z.tar.gz";
-/// Stands in for docker. `run`: records its argv, then writes a snapshot into the directory
-/// mounted on `/out`. `exec`: records its argv on one line, fails the step `STUB_FAIL` names,
-/// and runs the command on the host with `/mnt/ncdata` mapped to `$STUB_DIR/ncdata`.
+const FUTURE_COPY: &str = "bellwether-vault-log-20990101T225500Z.tar.gz";
+/// Stands in for docker. `run`: records its words on one line; a `snapshot` writes one into the
+/// directory mounted on `/out`; a `blobs pack` keeps the `have` and `manifests` it was handed and,
+/// by `STUB_PACK`, writes a pack and its manifest and exits 0 or 8, writes none and exits 0
+/// (`none`), or exits that status. `exec`: records its argv on one line, fails the step
+/// `STUB_FAIL` names (the two reads are `have` and `manifests`; `untar` answers the second with
+/// bytes that are no tar), and runs the command on the host with `/mnt/ncdata` mapped to
+/// `$STUB_DIR/ncdata`.
 const BACKUP_DOCKER_STUB: &str = r#"#!/bin/sh
 if [ "$1" = run ]; then
-    printf '%s\n' "$@" >>"$STUB_DIR/docker-args"
+    echo "$*" >>"$STUB_DIR/docker-runs"
     for arg; do
-        case $arg in type=bind,src=*,dst=/out) out=${arg#type=bind,src=}; out=${out%,dst=/out} ;; esac
+        case $arg in
+            type=bind,src=*,dst=/out) out=${arg#type=bind,src=}; out=${out%,dst=/out} ;;
+            /out/bellwether-*) pack=${arg#/out/} ;;
+        esac
     done
-    [ "${STUB_DOCKER_EXIT:-0}" = 0 ] || exit "$STUB_DOCKER_EXIT"
-    printf 'the snapshot' >"$out/commit.sqlite3"
-    echo '{"schema": "newsvault.snapshot/1"}'
+    case " $* " in
+        *" snapshot "*)
+            [ "${STUB_DOCKER_EXIT:-0}" = 0 ] || exit "$STUB_DOCKER_EXIT"
+            printf 'the snapshot' >"$out/commit.sqlite3"
+            echo '{"schema": "newsvault.snapshot/1"}' ;;
+        *)
+            cp -R "$out/have" "$out/manifests" "$STUB_DIR/"
+            case $STUB_PACK in
+                none) ;;
+                0 | 8) printf 'a pack' >"$out/$pack"; printf 'a manifest' >"$out/$pack.manifest"
+                    exit "$STUB_PACK" ;;
+                *) exit "$STUB_PACK" ;;
+            esac ;;
+    esac
     exit 0
 fi
 echo "$*" >>"$STUB_DIR/execs"
 shift
+piped=no
 while :; do
-    case $1 in -i) shift ;; -u) shift 2 ;; *) break ;; esac
+    case $1 in -i) piped=yes; shift ;; -u) shift 2 ;; *) break ;; esac
 done
 shift
 case $1 in
-    sh) step=write ;;
+    sh) if [ "$piped" = yes ]; then step=write
+        else case $3 in *manifest*) step=manifests ;; *) step=have ;; esac; fi ;;
     mv) step=rename ;;
     ls) step=list ;;
     php) if [ "$3" = info:file ]; then step=known
@@ -1311,6 +1348,7 @@ case $1 in
     *) step=$1 ;;
 esac
 [ "$step" = "${STUB_FAIL:-}" ] && exit 1
+if [ "$step:${STUB_FAIL:-}" = manifests:untar ]; then echo 'no tar'; exit 0; fi
 n=$#
 for arg; do
     case $arg in /mnt/ncdata/*) arg="$STUB_DIR/ncdata/${arg#/mnt/ncdata/}" ;; esac
@@ -1322,6 +1360,7 @@ case $step in
         if [ "${STUB_SHORT_WRITE:-}" = yes ]; then head -c 5 >"$5"; wc -c <"$5"; exit; fi
         if [ "${STUB_SLOW_WRITE:-}" = yes ]; then exec sleep 30; fi
         shift; exec /bin/sh "$@" ;;
+    have | manifests) shift; exec /bin/sh "$@" ;;
     list) [ "${STUB_LISTING_LACKS_NEW:-}" = yes ] && exec cat "$STUB_DIR/listed"; shift; exec /bin/ls "$@" ;;
     mkdir | rm | rename) cmd=$1; shift; exec "/bin/$cmd" "$@" ;;
     scan | rescan) exit 0 ;;
@@ -1329,6 +1368,14 @@ case $step in
 esac
 exit 127
 "#;
+/// `tar`, but a log archive (`-czf`) left half written with exit 2 when `STUB_FAIL` is `archive`.
+const TAR_STUB: &str = r#"#!/bin/sh
+if [ "$1:${STUB_FAIL:-}" = -czf:archive ]; then printf 'half' >"$2"; exit 2; fi
+exec /usr/bin/tar "$@"
+"#;
+/// A work directory a killed run of this store left, and one of the other store's.
+const STALE_WORK: &str = "backup-vault.killed";
+const OTHER_WORK: &str = "backup-modelgate.running";
 /// Records its argv, then moves.
 const MV_STUB: &str =
     "#!/bin/sh\nprintf '%s\\n' \"$@\" >>\"$STUB_DIR/mv-args\"\nexec /bin/mv \"$@\"\n";
@@ -1343,8 +1390,9 @@ fn executable(path: &Path, text: &str) -> TestResult {
 /// How one backup run is set up to go wrong, if at all.
 #[derive(Default, Clone, Copy)]
 struct Trouble {
-    /// The container step that exits 1: mkdir, write, rename, scan, known (`occ info:file`), list,
-    /// rm or rescan.
+    /// The container step that exits 1: mkdir, have, manifests, write, rename, scan, known
+    /// (`occ info:file`), list, rm or rescan; or `untar`, `archive` (the stubs' own), or `sealed`:
+    /// `OLD_PACK` readable by nobody.
     fail: Option<&'static str>,
     short_write: bool,
     /// The write sleeps and the run's process group gets SIGTERM once the write has started.
@@ -1353,10 +1401,12 @@ struct Trouble {
     /// The folder also holds `FUTURE_COPY`.
     future_copy: bool,
     docker_exit: Option<i32>,
+    /// What `blobs pack` does: `STUB_PACK`, `None` writing a pack and exiting 0.
+    pack: Option<&'static str>,
     /// A Nextcloud setting replacing the template's, `None` unsetting it.
     setting: Option<(&'static str, Option<&'static str>)>,
     /// `Some(n)`: the folder holds the n oldest `COPIES` only; `None`: all, `OTHERS` and
-    /// `STALE_PARTIAL`.
+    /// `STALE_PARTS`.
     copies: Option<usize>,
     folder_absent: bool,
 }
@@ -1365,10 +1415,15 @@ struct Trouble {
 struct Backed {
     exit: Option<i32>,
     output: String,
-    /// The new copy's name, read from the write's staging path.
+    /// The new log archive's name and the new pack's, each read from its write's staging path.
     name: String,
+    pack: String,
+    /// Each container call, the two reads of the folder as `READ`.
     execs: Vec<String>,
-    docker_args: Vec<String>,
+    docker_runs: Vec<String>,
+    /// The `have` file and the `manifests` directory `blobs pack` was handed, the second as each
+    /// file's name and text.
+    handed: [String; 2],
     mv_args: Vec<String>,
     /// The folder's names after the run.
     folder: Vec<String>,
@@ -1413,7 +1468,7 @@ fn seeded(trouble: Trouble) -> Vec<&'static str> {
         None => COPIES
             .iter()
             .chain(&OTHERS)
-            .chain(&[STALE_PARTIAL])
+            .chain(&STALE_PARTS)
             .copied()
             .collect(),
     };
@@ -1491,14 +1546,25 @@ fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
     if !trouble.folder_absent {
         std::fs::create_dir_all(&folder)?;
         for name in seeded(trouble) {
-            std::fs::write(folder.join(name), "an old copy")?;
+            std::fs::write(folder.join(name), SEEDED_TEXT)?;
         }
+    }
+    if trouble.fail == Some("sealed") {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            folder.join(OLD_PACK),
+            std::fs::Permissions::from_mode(0o000),
+        )?;
+    }
+    for left in [STALE_WORK, OTHER_WORK] {
+        std::fs::create_dir_all(home.join(".cache/bellwether").join(left).join("store"))?;
     }
     std::fs::write(stub.join("listed"), seeded(trouble).join("\n") + "\n")?;
     std::fs::write(textfile.join(BACKUP_PROM), OLD_BACKUP_METRICS)?;
     std::fs::hard_link(textfile.join(BACKUP_PROM), work.path().join("old-link"))?;
     executable(&stub.join("bin/docker"), BACKUP_DOCKER_STUB)?;
     executable(&stub.join("bin/mv"), MV_STUB)?;
+    executable(&stub.join("bin/tar"), TAR_STUB)?;
     // `bx` matches the glob in an unsafe test value, so a check that expands globs admits it.
     let cwd = work.path().join("cwd");
     std::fs::create_dir_all(cwd.join("bx"))?;
@@ -1509,9 +1575,10 @@ fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
         .current_dir(&cwd)
         .env_clear()
         .env("HOME", &home)
+        // macOS keeps `sha256sum` in /sbin.
         .env(
             "PATH",
-            format!("{}:/usr/bin:/bin", stub.join("bin").display()),
+            format!("{}:/usr/bin:/bin:/sbin", stub.join("bin").display()),
         )
         .env("NEWSVAULT_IMAGE", "newsvault:test")
         .env("NEWSVAULT_TEXTFILE_DIR", &textfile)
@@ -1524,6 +1591,7 @@ fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
             "STUB_DOCKER_EXIT",
             trouble.docker_exit.unwrap_or(0).to_string(),
         )
+        .env("STUB_PACK", trouble.pack.unwrap_or("0"))
         .stdin(Stdio::null());
     for (key, value) in env_template()? {
         if NC_SETTINGS.contains(&key.as_str()) {
@@ -1541,15 +1609,34 @@ fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
     } else {
         command.output()?
     };
-    let execs = lines_of(&stub.join("execs"));
-    let name = execs
-        .iter()
-        .find(|call| call.starts_with(EXEC_STDIN))
-        .and_then(|call| call.rsplit('/').next())
-        .and_then(|staged| staged.strip_prefix('.'))
-        .and_then(|staged| staged.strip_suffix(".part"))
-        .unwrap_or_default()
-        .to_owned();
+    let execs: Vec<String> = lines_of(&stub.join("execs"))
+        .into_iter()
+        .map(|call| match call.starts_with(&format!("{EXEC} sh -c ")) {
+            true => format!("{EXEC} {READ}"),
+            false => call,
+        })
+        .collect();
+    let written = |suffix: &str| {
+        execs
+            .iter()
+            .filter(|call| call.starts_with(EXEC_STDIN))
+            .filter_map(|call| call.rsplit('/').next())
+            .filter_map(|staged| staged.strip_prefix('.'))
+            .filter_map(|staged| staged.strip_suffix(".part"))
+            .find(|staged| staged.ends_with(suffix))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let (name, pack) = (written(".tar.gz"), written(".tar"));
+    let manifests = stub.join("manifests");
+    let handed = [
+        read_or_empty(&stub.join("have")),
+        sorted_names(&manifests)
+            .unwrap_or_default()
+            .iter()
+            .map(|name| format!("{name}: {}", read_or_empty(&manifests.join(name))))
+            .collect(),
+    ];
     Ok(Backed {
         exit: output.status.code(),
         output: format!(
@@ -1559,8 +1646,10 @@ fn backup(trouble: Trouble) -> Result<Backed, Box<dyn Error>> {
         ),
         archive: std::fs::read(folder.join(&name)).unwrap_or_default(),
         name,
+        pack,
         execs,
-        docker_args: lines_of(&stub.join("docker-args")),
+        docker_runs: lines_of(&stub.join("docker-runs")),
+        handed,
         mv_args: lines_of(&stub.join("mv-args")),
         folder: sorted_names(&folder).unwrap_or_default(),
         metric: read_or_empty(&textfile.join(BACKUP_PROM)),
@@ -1603,38 +1692,64 @@ fn sorted(names: &[&str]) -> Vec<String> {
     names
 }
 
-/// One archive holding the snapshot as `commit.sqlite3` and every other store file but the live
-/// log, its journal and `LOCK`, written to a hidden name in the folder, renamed, scanned; then the
-/// oldest copies beyond 7 and a killed run's staging file deleted and the folder scanned again.
+/// The folder's packs, each with its length and sha256, and its manifests, each under its own
+/// name, are read and handed to `blobs pack`; the pack, its manifest
+/// and one archive of the snapshot as `commit.sqlite3` with every other store file but the live
+/// log, its journal, `LOCK` and the blob tree are each written to a hidden name, then renamed in
+/// that order, scanned and looked up; then the oldest archives beyond 7 and a killed run's staging
+/// files are deleted and the folder scanned again. No pack, manifest or whole-store archive goes.
 #[test]
 fn the_backup_writes_through_the_container_renames_scans_then_keeps_the_seven_newest() -> TestResult
 {
     let backed = backup(Trouble::default())?;
     let (names, log) = members(&backed.archive)?;
-    let (dir, name) = (NC_DIR, &backed.name);
-    let mut kept = vec![name.as_str()];
+    let (dir, name, pack) = (NC_DIR, &backed.name, &backed.pack);
+    let manifest = format!("{pack}.manifest");
+    let new = [pack.as_str(), manifest.as_str(), name.as_str()];
+    let mut kept = new.to_vec();
     kept.extend(&COPIES[2..]);
     kept.extend(&OTHERS);
+    let mut calls = vec![
+        format!("{EXEC} mkdir -p -- {dir}"),
+        format!("{EXEC} {READ}"),
+        format!("{EXEC} {READ}"),
+    ];
+    calls.extend(new.map(|file| format!("{EXEC_STDIN} {WRITE} {dir}/.{file}.part")));
+    calls.extend(new.map(|file| format!("{EXEC} mv -- {dir}/.{file}.part {dir}/{file}")));
+    calls.push(format!("{EXEC} {NC_SCAN}"));
+    calls.extend(new.map(|file| format!("{EXEC} {NC_KNOWN}/{file}")));
+    calls.extend([
+        format!("{EXEC} ls -1A -- {dir}"),
+        format!(
+            "{EXEC} rm -f -- {dir}/{} {dir}/{} {}",
+            COPIES[0],
+            COPIES[1],
+            STALE_PARTS.map(|part| format!("{dir}/{part}")).join(" ")
+        ),
+        format!("{EXEC} {NC_SCAN}"),
+    ]);
     assert_eq!(
-        (backed.exit, backed.execs, names, log, backed.folder),
+        (
+            backed.exit,
+            backed.execs,
+            backed.handed,
+            names,
+            log,
+            backed.folder
+        ),
         (
             Some(0),
-            vec![
-                format!("{EXEC} mkdir -p -- {dir}"),
-                format!("{EXEC_STDIN} {WRITE} {dir}/.{name}.part"),
-                format!("{EXEC} mv -- {dir}/.{name}.part {dir}/{name}"),
-                format!("{EXEC} {NC_SCAN}"),
-                format!("{EXEC} {NC_KNOWN}/{name}"),
-                format!("{EXEC} ls -1A -- {dir}"),
+            calls,
+            [
                 format!(
-                    "{EXEC} rm -f -- {dir}/{} {dir}/{} {dir}/{STALE_PARTIAL}",
-                    COPIES[0], COPIES[1]
+                    "{OLD_PACK} {} {}\n",
+                    SEEDED_TEXT.len(),
+                    const_hex::encode(Sha256::digest(SEEDED_TEXT))
                 ),
-                format!("{EXEC} {NC_SCAN}"),
+                format!("{OLD_PACK}.manifest: {SEEDED_TEXT}")
             ],
             vec![
                 ".kept".to_owned(),
-                "blobs/sha256/ab/abcd".to_owned(),
                 "commit.sqlite3".to_owned(),
                 "runs/20261118T225500Z.json".to_owned(),
             ],
@@ -1643,6 +1758,49 @@ fn the_backup_writes_through_the_container_renames_scans_then_keeps_the_seven_ne
         ),
         "{}",
         backed.output
+    );
+    Ok(())
+}
+
+/// A night with no new blob writes the archive alone. A `blobs pack` exit 8 (a pack lost or
+/// unrecorded) still writes everything and the metric, and the run exits 8 after a retention
+/// that deleted the two oldest log archives and the staging leftovers as on any night; any other
+/// exit of it ends the run with that status, nothing written and nothing deleted.
+#[test]
+fn the_pack_decides_what_is_written_and_its_exit_8_is_the_runs_after_the_copy_is_in() -> TestResult
+{
+    let mut got = Vec::new();
+    for pack in ["none", "8", "4"] {
+        let backed = backup(Trouble {
+            pack: Some(pack),
+            ..Trouble::default()
+        })?;
+        let writes = backed
+            .execs
+            .iter()
+            .filter(|call| call.starts_with(EXEC_STDIN))
+            .count();
+        let left = |seeded: &[&str]| {
+            let held = |name: &&&str| backed.folder.iter().any(|kept| kept == **name);
+            seeded.iter().filter(held).count()
+        };
+        got.push((
+            pack,
+            backed.exit,
+            writes,
+            backed.folder.contains(&backed.name) && !backed.name.is_empty(),
+            backed.metric != OLD_BACKUP_METRICS,
+            backed.output.contains("no pack or manifest was deleted"),
+            (left(&COPIES), left(&STALE_PARTS), left(&OTHERS)),
+        ));
+    }
+    assert_eq!(
+        got,
+        vec![
+            ("none", Some(0), 1, true, true, false, (6, 0, 8)),
+            ("8", Some(8), 3, true, true, true, (6, 0, 8)),
+            ("4", Some(4), 0, false, false, false, (8, 3, 8)),
+        ]
     );
     Ok(())
 }
@@ -1663,13 +1821,19 @@ fn the_folder_keeps_exactly_the_seven_newest_copies_whatever_it_held() -> TestRe
             .iter()
             .filter(|call| call.ends_with(NC_SCAN))
             .count();
-        got.push((copies, backed.exit, backed.folder.len(), scans));
+        let archives = backed
+            .folder
+            .iter()
+            .filter(|name| name.starts_with("bellwether-vault-log-"))
+            .count();
+        got.push((copies, backed.exit, archives, scans));
     }
     let newest = backup(Trouble {
         copies: Some(8),
         ..Trouble::default()
     })?;
-    let mut kept = vec![newest.name.as_str()];
+    let manifest = format!("{}.manifest", newest.pack);
+    let mut kept = vec![newest.name.as_str(), newest.pack.as_str(), &manifest];
     kept.extend(&COPIES[2..]);
     assert_eq!(
         (got, newest.folder),
@@ -1693,16 +1857,14 @@ fn the_folder_keeps_exactly_the_seven_newest_copies_whatever_it_held() -> TestRe
 fn every_container_call_runs_as_www_data_and_only_the_write_reads_stdin() -> TestResult {
     let backed = backup(Trouble::default())?;
     let script = read("deploy/systemd/newsvault-backup")?;
-    let as_www: Vec<bool> = backed
-        .execs
-        .iter()
-        .map(|call| call.starts_with(&format!("{EXEC} ")))
-        .collect();
-    let with_stdin = backed
-        .execs
-        .iter()
-        .filter(|call| call.starts_with(&format!("{EXEC_STDIN} {WRITE} ")))
-        .count();
+    let prefixed = |prefix: &str| {
+        let prefix = format!("{prefix} ");
+        backed
+            .execs
+            .iter()
+            .filter(|call| call.starts_with(&prefix))
+            .count()
+    };
     let forbidden = ["--privileged", "-u root", "--user root", "sudo", "-u 0"]
         .iter()
         .filter(|word| {
@@ -1710,13 +1872,14 @@ fn every_container_call_runs_as_www_data_and_only_the_write_reads_stdin() -> Tes
         })
         .count();
     assert_eq!(
-        (backed.exit, as_www, with_stdin, forbidden),
         (
-            Some(0),
-            vec![true, false, true, true, true, true, true, true],
-            1,
-            0
-        )
+            backed.exit,
+            prefixed(EXEC) + prefixed(EXEC_STDIN) == backed.execs.len(),
+            prefixed(EXEC_STDIN),
+            prefixed(&format!("{EXEC_STDIN} {WRITE}")),
+            forbidden
+        ),
+        (Some(0), true, 3, 3, 0)
     );
     Ok(())
 }
@@ -1729,7 +1892,6 @@ fn a_short_write_is_never_renamed_and_its_staging_file_is_removed() -> TestResul
         short_write: true,
         ..Trouble::default()
     })?;
-    let partial = format!(".{}.part", backed.name);
     let renames = backed
         .execs
         .iter()
@@ -1739,18 +1901,14 @@ fn a_short_write_is_never_renamed_and_its_staging_file_is_removed() -> TestResul
         (
             backed.exit,
             renames,
-            backed.folder.contains(&partial),
-            backed.folder.contains(&backed.name),
-            backed.folder.len(),
+            backed.folder,
             backed.metric,
             backed.output.contains("not renamed"),
         ),
         (
             Some(7),
             0,
-            false,
-            false,
-            seeded(Trouble::default()).len(),
+            sorted(&seeded(Trouble::default())),
             OLD_BACKUP_METRICS.to_owned(),
             true
         ),
@@ -1760,46 +1918,50 @@ fn a_short_write_is_never_renamed_and_its_staging_file_is_removed() -> TestResul
     Ok(())
 }
 
-/// A failed mkdir, write, rename or scan, or a scan after which `occ info:file` does not find the
-/// copy, exits 7 naming its step, deletes no copy, leaves no staging file and keeps the last metric.
+/// A failed mkdir, either read of the folder (the call, one pack nobody can read, manifests that
+/// do not unpack), write, rename or scan, or a scan after which `occ info:file` does not find a
+/// file, exits 7 naming its step; a `tar` that fails on the log archive exits 2. Each deletes no
+/// copy, leaves no staging file of its own and keeps the last metric.
 #[test]
 fn a_failed_mkdir_write_rename_or_scan_exits_7_by_name_and_deletes_nothing() -> TestResult {
     let mut got = Vec::new();
-    for (step, said) in [
-        ("mkdir", "creating"),
-        ("write", "writing"),
-        ("rename", "renaming"),
-        ("scan", "files:scan"),
-        ("known", "does not know"),
-    ] {
+    const READING: &str = "reading the packs";
+    let steps = [
+        ("mkdir", 7, "creating"),
+        ("have", 7, READING),
+        ("sealed", 7, READING),
+        ("manifests", 7, READING),
+        ("untar", 7, READING),
+        ("archive", 2, ""),
+        ("write", 7, "writing"),
+        ("rename", 7, "renaming"),
+        ("scan", 7, "files:scan"),
+        ("known", 7, "does not know"),
+    ];
+    for (step, _, said) in steps {
         let backed = backup(Trouble {
             fail: Some(step),
             ..Trouble::default()
         })?;
-        let partial = format!(".{}.part", backed.name);
         let copies_left = COPIES
             .iter()
             .filter(|copy| backed.folder.contains(&(**copy).to_owned()))
             .count();
+        let staged = |name: &&String| name.starts_with('.') && name.ends_with(".part");
         got.push((
             step,
             backed.exit,
             copies_left,
-            backed.folder.contains(&partial),
+            backed.folder.iter().filter(staged).count() > STALE_PARTS.len() + 1,
             backed.metric == OLD_BACKUP_METRICS,
             backed.output.contains(said),
         ));
     }
-    assert_eq!(
-        got,
-        vec![
-            ("mkdir", Some(7), 8, false, true, true),
-            ("write", Some(7), 8, false, true, true),
-            ("rename", Some(7), 8, false, true, true),
-            ("scan", Some(7), 8, false, true, true),
-            ("known", Some(7), 8, false, true, true),
-        ]
-    );
+    let expected: Vec<_> = steps
+        .iter()
+        .map(|(step, exit, _)| (*step, Some(*exit), 8, false, true, true))
+        .collect();
+    assert_eq!(got, expected);
     Ok(())
 }
 
@@ -1876,7 +2038,8 @@ fn a_copy_sorting_after_the_new_one_stops_the_retention_and_deletes_nothing() ->
         future_copy: true,
         ..Trouble::default()
     });
-    held.push(&backed.name);
+    let manifest = format!("{}.manifest", backed.pack);
+    held.extend([backed.name.as_str(), backed.pack.as_str(), &manifest]);
     assert_eq!(
         (
             backed.exit,
@@ -1901,15 +2064,15 @@ fn a_terminated_run_exits_130_and_removes_its_work_directory_and_staging_file() 
         terminated: true,
         ..Trouble::default()
     })?;
-    let removed = format!("{EXEC} rm -f -- {NC_DIR}/.{}.part", backed.name);
+    let removed = format!("{EXEC} rm -f -- {NC_DIR}/.{}.part", backed.pack);
     assert_eq!(
         (
             backed.exit,
             backed.staging,
-            backed.name.is_empty(),
+            backed.pack.is_empty(),
             backed.execs.last() == Some(&removed),
         ),
-        (Some(130), Vec::<String>::new(), false, true),
+        (Some(130), vec![OTHER_WORK.to_owned()], false, true),
         "{:?}",
         backed.execs
     );
@@ -1952,7 +2115,7 @@ fn an_unsafe_nextcloud_setting_is_refused_by_name_before_any_docker_call() -> Te
             key,
             value,
             backed.exit,
-            backed.docker_args.len() + backed.execs.len(),
+            backed.docker_runs.len() + backed.execs.len(),
             backed.output.contains(key),
         ));
     }
@@ -1979,7 +2142,8 @@ fn an_unsafe_nextcloud_setting_is_refused_by_name_before_any_docker_call() -> Te
     Ok(())
 }
 
-/// The metric is the archive's size and the snapshot's time, written after the scan to a hidden
+/// The metric is the archive's size, the bytes of every pack in the folder and the snapshot's
+/// time, written after the scan to a hidden
 /// non-`.prom` file beside `newsvault-backup.prom` and renamed onto it: the old inode keeps the
 /// old text.
 #[test]
@@ -1997,6 +2161,10 @@ fn the_backup_writes_its_metric_through_a_hidden_file_renamed_after_the_scan() -
                 "newsvault_backup_last_success_bytes {}\n",
                 backed.archive.len()
             )),
+            backed.metric.contains(&format!(
+                "newsvault_backup_packs_bytes {}\n",
+                SEEDED_TEXT.len() + "a pack".len()
+            )),
             backed.archive.is_empty(),
             at.is_some_and(|at| (Utc::now().timestamp() - at).abs() < AT_TOLERANCE_S),
             backed.old_link,
@@ -2004,6 +2172,7 @@ fn the_backup_writes_its_metric_through_a_hidden_file_renamed_after_the_scan() -
             backed.textfile,
         ),
         (
+            true,
             true,
             false,
             true,
@@ -2053,8 +2222,9 @@ fn a_refused_snapshot_stops_before_any_container_call() -> TestResult {
     Ok(())
 }
 
-/// The work directory under `~/.cache/bellwether` holds a whole snapshot and archive; every run,
-/// a failed one included, removes it.
+/// The work directory under `~/.cache/bellwether` holds a whole snapshot, pack and archive; every
+/// run, a failed one included, removes its own and the one a killed run of this store left, and
+/// leaves the other store's.
 #[test]
 fn every_run_removes_its_staging_copy_whether_it_succeeds_or_fails() -> TestResult {
     let mut left = Vec::new();
@@ -2084,46 +2254,62 @@ fn every_run_removes_its_staging_copy_whether_it_succeeds_or_fails() -> TestResu
         let backed = backup(trouble)?;
         left.push((backed.exit, backed.staging));
     }
+    let exits: Vec<Option<i32>> = left.iter().map(|(exit, _)| *exit).collect();
     assert_eq!(
-        left,
-        vec![
-            (Some(0), Vec::new()),
-            (Some(7), Vec::new()),
-            (Some(7), Vec::new()),
-            (Some(7), Vec::new()),
-            (Some(8), Vec::new()),
-            (Some(7), Vec::new()),
-        ]
+        (
+            exits,
+            left.iter().all(|(_, staging)| *staging == [OTHER_WORK])
+        ),
+        (
+            vec![Some(0), Some(7), Some(7), Some(7), Some(8), Some(7)],
+            true
+        )
     );
     Ok(())
 }
 
-/// The snapshot container: removed, never pulled, read-only, no network, no capability, the store
-/// mounted read-only and only the work directory writable.
+/// The snapshot's container and the pack's, one name: removed, never pulled, read-only, no
+/// network, no capability, the store mounted read-only and only the work directory writable.
 #[test]
 fn the_backup_container_reads_the_store_read_only_with_no_network() -> TestResult {
     let backed = backup(Trouble::default())?;
-    let args = backed.docker_args.join(" ");
-    let (flags, command) = args.split_at(args.find(" newsvault:test ").unwrap_or_default());
-    let mounts: Vec<&str> = flags
-        .split(' ')
-        .filter_map(|word| word.strip_prefix("type=bind,src="))
-        .map(|mount| mount.split_once(",dst=").map_or(mount, |(_, dst)| dst))
-        .collect();
-    let flags = flags
-        .split(' ')
-        .filter(|word| !word.starts_with("type=bind,src=") && !word.contains(':'))
-        .collect::<Vec<&str>>()
-        .join(" ");
-    assert_eq!(
-        (flags, mounts, command.trim()),
+    let mut got = Vec::new();
+    for run in &backed.docker_runs {
+        let (flags, command) = run.split_at(run.find(" newsvault:test ").unwrap_or_default());
+        let mounts: Vec<&str> = flags
+            .split(' ')
+            .filter_map(|word| word.strip_prefix("type=bind,src="))
+            .map(|mount| mount.split_once(",dst=").map_or(mount, |(_, dst)| dst))
+            .collect();
+        let flags = flags
+            .split(' ')
+            .filter(|word| !word.starts_with("type=bind,src=") && !word.contains(':'))
+            .collect::<Vec<&str>>()
+            .join(" ");
+        got.push((flags, mounts, command.trim().to_owned()));
+    }
+    let shape = |command: String| {
         (
             "run --rm --name newsvault-backup --pull never --user --read-only --network none \
              --cap-drop ALL --security-opt no-new-privileges --mount --mount"
                 .to_owned(),
             vec!["/vault,readonly", "/out"],
-            "newsvault:test snapshot --out /out/commit.sqlite3 --non-interactive --format json"
+            command,
         )
+    };
+    assert_eq!(
+        got,
+        vec![
+            shape(
+                "newsvault:test snapshot --out /out/commit.sqlite3 --non-interactive --format json"
+                    .to_owned()
+            ),
+            shape(format!(
+                "newsvault:test blobs pack --log /out/commit.sqlite3 --have /out/have --manifests \
+                 /out/manifests --out /out/{} --non-interactive --format json",
+                backed.pack
+            )),
+        ]
     );
     Ok(())
 }
