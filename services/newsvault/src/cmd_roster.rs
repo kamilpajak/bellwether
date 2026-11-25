@@ -11,10 +11,11 @@ use news_provider::robots::Robots;
 use news_provider::{
     AttemptSlot, Baseline, Clock, Counts, Credentials, Exchange, Exit, Headers, LedgerError,
     Outcome, OutcomeKind, Payload, Provenance, RawResponse, Request, RequestPhase, RunId, SourceId,
-    Tally, TargetWindow, TransportError, TransportKind, Verdict, Wire,
+    Tally, TargetWindow, TransportError, TransportKind, TransportProfile, Verdict, Wire,
 };
 use pit::{Cutoff, ObservationTime, PitError, ValidTime, Visibility};
 use rusqlite::Connection;
+use sec_edgar::Caller;
 use serde_json::{json, Value};
 use vault_core::sqlite::read_only;
 
@@ -36,6 +37,9 @@ const FORBIDDEN: u16 = 403;
 const REQUEST_TIMEOUT: u16 = 408;
 const TOO_MANY_REQUESTS: u16 = 429;
 const SERVER_ERRORS: std::ops::RangeInclusive<u16> = 500..=599;
+/// The most a roster answer may hold: the 8 MiB the roster had while it took the news adapter's
+/// profile whole, 2026-11-23 to 2026-11-25. Not fitted: the one file read 521,795 B on 2026-11-23.
+const BODY_LIMIT: u64 = 8 * 1_024 * 1_024;
 /// Why a file was not asked; each leaves no attempt row, because no call was made.
 const ROBOTS_UNVERIFIED: &str = "robots_unverified";
 const ROBOTS_REFUSED: &str = "robots_refused";
@@ -67,7 +71,7 @@ impl RosterFile {
 /// its terms (section 10, "The roster"); SEC's content is free to reuse.
 pub const FILES: [RosterFile; 1] = [RosterFile {
     key: "sec_company_tickers_exchange",
-    host: "www.sec.gov",
+    host: sec_edgar::HOST,
     path: "/files/company_tickers_exchange.json",
     rows: sec_exchange_rows,
 }];
@@ -95,7 +99,7 @@ pub struct Ask {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RosterError {
-    /// `credential_contact_missing`: SEC refuses a User-Agent with no contact (edgar-press header).
+    /// `credential_contact_missing`: SEC refuses a User-Agent with no contact (`sec_edgar::CONTACT_CREDENTIAL`).
     #[error("no contact address for the User-Agent: set BELLWETHER_FEED_CONTACT_FILE")]
     ContactMissing,
     #[error("no commit log under {0}")]
@@ -152,15 +156,21 @@ impl Answer {
     }
 }
 
+/// SEC's profile at the roster's row of SEC's interval table.
+#[must_use]
+pub fn transport() -> TransportProfile {
+    sec_edgar::transport(Caller::Roster, BODY_LIMIT)
+}
+
 /// SEC's transport, its contact under SEC's credential name, and SEC's per-IP pace file: the
 /// roster and `edgar_press` are one conversation with one vendor (section 8 row R19).
 #[must_use]
 pub fn wire_for(ask: &Ask) -> Wire {
     Wire::new(
-        edgar_press::sec_transport(),
-        Credentials::default().with(edgar_press::CONTACT_CREDENTIAL, ask.contact.clone()),
+        transport(),
+        Credentials::default().with(sec_edgar::CONTACT_CREDENTIAL, ask.contact.clone()),
         &ask.store,
-        &SourceId::new(edgar_press::SOURCE),
+        &SourceId::new(sec_edgar::PER_IP_BUCKET),
     )
 }
 
@@ -251,7 +261,7 @@ pub fn run(ask: &Ask, exchange: &dyn Exchange, clock: &dyn Clock) -> Result<Answ
         }
         Err(other) => return Err(other.into()),
     };
-    let interval = edgar_press::sec_transport().budget.per_host;
+    let interval = transport().budget.per_host;
     let mut ordinal: u32 = 0;
     let mut robots = Vec::with_capacity(hosts.len());
     let mut files = Vec::with_capacity(FILES.len());
@@ -418,7 +428,8 @@ fn fetch_file(
 
 /// 200 of the file's shape is usable, or empty with no rows; 200 of another shape (a challenge
 /// page) and a body over the limit are permanent; 403, 408, 429, 5xx and a transport error are
-/// transient, as `edgar-press` reads SEC; any other status is permanent.
+/// transient, as `sec_edgar::body_of_200` reads SEC outside its `AccessDenied` arm; any other
+/// status is permanent.
 fn verdict_of(answer: &Result<RawResponse, TransportError>, rows: Option<usize>) -> Verdict {
     match answer {
         Ok(response) => match (response.status(), rows) {

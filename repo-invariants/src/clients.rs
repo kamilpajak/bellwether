@@ -55,6 +55,9 @@ const ROW_MG10: &str = "docs/design/architecture.md section 8 row MG10";
 /// The crate of store mechanics, which every context may link and which links none of them.
 pub const STORE_CORE: &str = "vault-core";
 const ROW_FV1: &str = "docs/design/architecture.md section 8 row FV1";
+/// The members section 12.1 says hold no store, and the two crates a store is reached through.
+pub const STORE_FREE: [&str; 2] = ["news-provider", "sec-edgar"];
+const STORE_CRATES: [&str; 2] = ["rusqlite", STORE_CORE];
 
 /// One declared edge from a workspace member to a client crate.
 #[derive(Debug, PartialEq, Eq)]
@@ -237,6 +240,43 @@ pub fn store_core_isolation_failure(root_manifest: &Path) -> Option<String> {
     }
 }
 
+/// Row FV1's store clause: `None` when every member of [`STORE_FREE`] exists and declares no
+/// dependency of any kind on a crate of [`STORE_CRATES`]. A manifest question, as the allowlist is.
+pub fn store_free_failure(root_manifest: &Path) -> Option<String> {
+    let read = || -> Result<Vec<String>, String> {
+        let json = cargo_metadata(root_manifest)?;
+        let meta: serde_json::Value = serde_json::from_slice(&json)
+            .map_err(|why| format!("`cargo metadata` printed something that is not JSON: {why}"))?;
+        let packages = array_at(&meta, "packages")?;
+        let mut problems = Vec::new();
+        for member in STORE_FREE {
+            let package = packages
+                .iter()
+                .find(|package| {
+                    package.get("name").and_then(serde_json::Value::as_str) == Some(member)
+                })
+                .ok_or_else(|| format!("no workspace member is named `{member}`"))?;
+            for dependency in array_at(package, "dependencies")? {
+                let name = string_at(dependency, "name")?;
+                if STORE_CRATES.contains(&name.as_str()) {
+                    problems.push(format!("    * {member} depends on `{name}`"));
+                }
+            }
+        }
+        problems.sort();
+        Ok(problems)
+    };
+    match read() {
+        Err(why) => Some(format!("{why}\n\nThe invariant is {ROW_FV1}.\n")),
+        Ok(problems) if problems.is_empty() => None,
+        Ok(problems) => Some(format!(
+            "A crate that holds no store declares one ({ROW_FV1}):\n\n{}\n\nThese crates decide \
+             what may be sent and what is true of a host. What is stored is a context's.\n",
+            problems.join("\n")
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -283,6 +323,14 @@ mod tests {
     #[test]
     fn the_store_core_depends_on_no_workspace_member() {
         assert_eq!(store_core_isolation_failure(&root_manifest()), None);
+    }
+
+    /// Row FV1's store clause over this workspace. Mutations 2026-11-25, each red here and 0 red
+    /// of 74 before this test: `rusqlite`, then `vault-core`, added to `news-provider/Cargo.toml`
+    /// and to `providers/sec-edgar/Cargo.toml`.
+    #[test]
+    fn the_seam_and_the_sec_facts_crate_declare_no_store() {
+        assert_eq!(store_free_failure(&root_manifest()), None);
     }
 
     /// Mutations 2026-11-23 on this workspace's own manifests, each red in the test above:

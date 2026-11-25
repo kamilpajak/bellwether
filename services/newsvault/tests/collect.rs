@@ -60,7 +60,7 @@ const MICROSOFT_URL: &str =
 const OK: u16 = 200;
 const MOVED_PERMANENTLY: u16 = 301;
 const FORBIDDEN: u16 = 403;
-/// A server error, which `edgar-press::classify` reads as transient from the status alone (the body
+/// A server error, which `sec_edgar::body_of_200` reads as transient from the status alone (the body
 /// is not consulted for a 5xx), so any body fixture states it.
 const SERVICE_UNAVAILABLE: u16 = 503;
 

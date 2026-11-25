@@ -7,7 +7,7 @@ use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, 
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
-use crate::{Cutoff, ObservationTime, PitError, ValidTime, Visibility};
+use crate::{Cutoff, MeasuredLag, ObservationTime, PitError, ValidTime, Visibility};
 
 /// A publication value stated to the whole minute in UTC, such as an RSS `pubDate` of
 /// `Sat, 14 Nov 2026 19:00 GMT`. Not a [`ValidTime`], so no cutoff reads it as the instant at :00.
@@ -193,6 +193,40 @@ pub fn end_of_day(day: NaiveDate, tz: &str) -> Option<DateTime<Utc>> {
     Some(starts.with_timezone(&Utc) - Duration::microseconds(1))
 }
 
+/// The first microsecond of `day` in `tz`: one past the end of the day before, so a gap or an
+/// ambiguous midnight resolves exactly as [`end_of_day`] resolves it.
+fn start_of_day(day: NaiveDate, tz: &str) -> Option<DateTime<Utc>> {
+    end_of_day(day.pred_opt()?, tz)?.checked_add_signed(Duration::microseconds(1))
+}
+
+/// The observation of a row read out of a vendor's archive: `valid` raised to the START of the
+/// `listed` index day when `filed` is that day, else to its END, plus the probed lag; `Ok(None)`
+/// when nothing resolves. Rule and measurements: architecture.md section 10 and section 8 row R11.
+pub fn archive_observation(
+    valid: Published,
+    filed: Option<NaiveDate>,
+    listed: NaiveDate,
+    tz: &str,
+    lag: &MeasuredLag,
+) -> Result<Option<ObservationTime>, PitError> {
+    let Some(listed_ends) = end_of_day(listed, tz) else {
+        return Ok(None);
+    };
+    let bound = match valid {
+        Published::At(instant) if filed == Some(listed) => match start_of_day(listed, tz) {
+            Some(listed_starts) => ValidTime::new(instant.inner().max(listed_starts)),
+            None => return Ok(None),
+        },
+        Published::At(instant) => ValidTime::new(instant.inner().max(listed_ends)),
+        Published::On { day, tz } => match end_of_day(day, tz) {
+            Some(filed) => ValidTime::new(filed.max(listed_ends)),
+            None => return Ok(None),
+        },
+        Published::AtMinute(_) | Published::Unknown => return Ok(None),
+    };
+    Visibility::from_backfill(bound, lag).map(|visible| Some(visible.observed()))
+}
+
 /// Pacific/Apia skipped the whole of 2011-12-30, so a gap can be a day long.
 const LONGEST_GAP_MINUTES: i64 = 2 * 24 * 60;
 const SECONDS_PER_MINUTE: i64 = 60;
@@ -214,8 +248,8 @@ fn first_local_time_after_a_gap(zone: Tz, inside: NaiveDateTime) -> Option<DateT
 
 #[cfg(test)]
 mod tests {
-    use super::{end_of_day, Datedness, Minute};
-    use crate::{Cutoff, ObservationTime, PitError, ValidTime, Visibility};
+    use super::{archive_observation, end_of_day, Datedness, Minute, Published};
+    use crate::{Cutoff, MeasuredLag, ObservationTime, PitError, ValidTime, Visibility};
     use chrono::{DateTime, NaiveDate, Utc};
 
     const NEW_YORK: &str = "America/New_York";
@@ -253,6 +287,18 @@ mod tests {
     const FETCHED_AFTER_THAT_MINUTE: &str = "2026-11-14T19:05:00Z";
     const A_SECOND_INTO_THE_MINUTE: &str = "2026-11-14T19:00:01Z";
     const A_MICROSECOND_INTO_THE_MINUTE: &str = "2026-11-14T19:00:00.000001Z";
+    /// A Monday. In New York it runs from 05:00Z to one microsecond short of 05:00Z the day after.
+    const INDEX_DAY: &str = "2026-11-09";
+    const LAG_SECONDS: i64 = 7_200;
+    const INDEX_DAY_STARTS_PLUS_THE_LAG: &str = "2026-11-09T07:00:00Z";
+    const INDEX_DAY_ENDS_PLUS_THE_LAG: &str = "2026-11-10T06:59:59.999999Z";
+    const ACCEPTED_ON_THE_INDEX_DAY: &str = "2026-11-09T15:00:00Z";
+    const THAT_ACCEPTANCE_PLUS_THE_LAG: &str = "2026-11-09T17:00:00Z";
+    /// The Friday before at 18:00 New York, after EDGAR's close: filed under the Monday's date.
+    const ACCEPTED_BEFORE_THE_INDEX_DAY: &str = "2026-11-06T23:00:00Z";
+    const A_DAY_BEFORE_THE_INDEX_DAY: &str = "2026-11-02";
+    const THE_DAY_AFTER_THE_INDEX_DAY: &str = "2026-11-10";
+    const THE_DAY_AFTER_ENDS_PLUS_THE_LAG: &str = "2026-11-11T06:59:59.999999Z";
     const EVERY_CUTOFF: [&str; 3] = [
         "1970-01-01T00:00:00Z",
         "2026-07-09T00:00:00Z",
@@ -300,6 +346,79 @@ mod tests {
             tz,
             observed: ObservationTime::new(at(OBSERVED_AT)),
         }
+    }
+
+    fn accepted(text: &str) -> Published {
+        Published::At(ValidTime::new(at(text)))
+    }
+
+    /// The observation of a row the `INDEX_DAY` index lists, under a lag of `LAG_SECONDS`.
+    fn archived(valid: Published, filed: Option<&str>, tz: &str) -> Option<DateTime<Utc>> {
+        let lag = MeasuredLag {
+            probe_id: "a probe".to_owned(),
+            probes: 22,
+            leaks: 0,
+            seconds: LAG_SECONDS,
+        };
+        archive_observation(valid, filed.map(day), day(INDEX_DAY), tz, &lag)
+            .ok()
+            .flatten()
+            .map(ObservationTime::inner)
+    }
+
+    /// Section 8 row R11, the on-time arm and its floor.
+    #[test]
+    fn an_archived_row_filed_on_its_index_day_observes_from_its_acceptance_or_that_days_start() {
+        let observed = [ACCEPTED_ON_THE_INDEX_DAY, ACCEPTED_BEFORE_THE_INDEX_DAY]
+            .map(|accepted_at| archived(accepted(accepted_at), Some(INDEX_DAY), NEW_YORK));
+        assert_eq!(
+            observed,
+            [
+                Some(at(THAT_ACCEPTANCE_PLUS_THE_LAG)),
+                Some(at(INDEX_DAY_STARTS_PLUS_THE_LAG))
+            ]
+        );
+    }
+
+    /// Section 8 row R11, the late arm: the lag was probed on no such row.
+    #[test]
+    fn an_archived_row_filed_on_another_day_or_on_no_readable_day_observes_from_its_index_days_end()
+    {
+        let observed = [Some(A_DAY_BEFORE_THE_INDEX_DAY), None]
+            .map(|filed| archived(accepted(ACCEPTED_ON_THE_INDEX_DAY), filed, NEW_YORK));
+        assert_eq!(observed, [Some(at(INDEX_DAY_ENDS_PLUS_THE_LAG)); 2]);
+    }
+
+    #[test]
+    fn an_archived_date_observes_from_the_later_end_of_its_own_day_and_its_index_day() {
+        let observed = [A_DAY_BEFORE_THE_INDEX_DAY, THE_DAY_AFTER_THE_INDEX_DAY].map(|filed| {
+            let on = Published::On {
+                day: day(filed),
+                tz: NEW_YORK,
+            };
+            archived(on, Some(filed), NEW_YORK)
+        });
+        assert_eq!(
+            observed,
+            [
+                Some(at(INDEX_DAY_ENDS_PLUS_THE_LAG)),
+                Some(at(THE_DAY_AFTER_ENDS_PLUS_THE_LAG))
+            ]
+        );
+    }
+
+    #[test]
+    fn an_archived_row_no_calendar_or_no_publication_can_place_is_given_no_observation() {
+        let elsewhere = Published::On {
+            day: day(INDEX_DAY),
+            tz: NOT_A_ZONE,
+        };
+        let unplaced = [
+            archived(accepted(ACCEPTED_ON_THE_INDEX_DAY), None, NOT_A_ZONE),
+            archived(elsewhere, Some(INDEX_DAY), NEW_YORK),
+            archived(Published::Unknown, Some(INDEX_DAY), NEW_YORK),
+        ];
+        assert_eq!(unplaced, [None; 3]);
     }
 
     #[test]

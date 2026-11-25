@@ -708,9 +708,9 @@ version = "0.1.0"
 dependencies = [
  "canon",
  "chrono",
- "chrono-tz",
  "news-provider",
  "pit",
+ "sec-edgar",
  "serde_json",
  "thiserror",
 ]
@@ -1184,6 +1184,7 @@ dependencies = [
  "parquet",
  "pit",
  "rusqlite",
+ "sec-edgar",
  "serde",
  "serde_json",
  "sha2",
@@ -1686,6 +1687,17 @@ dependencies = [
  "html5ever",
  "precomputed-hash",
  "selectors",
+]
+
+[[package]]
+name = "sec-edgar"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "news-provider",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

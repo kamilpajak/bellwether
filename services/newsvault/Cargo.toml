@@ -21,6 +21,8 @@ pit = { path = "../../pit" }
 # No `bundled` feature: `libsqlite3-sys` links the system library, so CI gains no C compile.
 # The SQLite versions it then links on the Mac and the VPS: docs/design/architecture.md section 6.
 rusqlite = { version = "0.42.0", features = ["backup"] }
+# SEC's transport for the roster, which is no news adapter's to give.
+sec-edgar = { path = "../../providers/sec-edgar" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"

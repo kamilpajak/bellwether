@@ -33,6 +33,8 @@ const ROBOTS_URL: &str = "https://www.sec.gov/robots.txt";
 const FILE_URL: &str = "https://www.sec.gov/files/company_tickers_exchange.json";
 const FILE_KEY: &str = "sec_company_tickers_exchange";
 const SEC_HOST: &str = "www.sec.gov";
+const SEC_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const ROSTER_BODY_LIMIT: u64 = 8 * 1_024 * 1_024;
 /// SEC's robots.txt shape on 2026-11-23: `*` disallows paths, none under `/files/`.
 const ROBOTS_BODY: &[u8] = b"User-agent: *\nDisallow: /cgi-bin\nDisallow: /Archives/bin\n";
 /// Three rows of `company_tickers_exchange.json`'s shape, written for this test.
@@ -390,7 +392,7 @@ fn a_robots_txt_with_no_answer_asks_no_file_and_a_404_asks_it() -> TestResult {
 
 /// A 200 that is not the file's shape (a challenge page, other or reordered field names) is a
 /// failed fetch kept as received, an empty roster is no roster, 403, 429 and 5xx are transient as
-/// edgar-press reads SEC, and any other status is permanent; none is worked around. Mutations
+/// `sec_edgar::body_of_200` reads SEC, and any other status is permanent; none is worked around. Mutations
 /// 2026-11-23, each red: the shape check dropped (any 200 usable); the field-name check dropped; an
 /// empty `data` usable; `Empty` counted as work done; 5xx permanent; 408 and 429 permanent; any
 /// other status transient.
@@ -548,6 +550,21 @@ fn a_roster_fetch_through_the_wire_pays_into_edgar_press_s_per_ip_pace() -> Test
         )
     );
     Ok(())
+}
+
+/// The roster's row of SEC's interval table and the roster's own body limit (section 8 row R19).
+/// Before this test the row at 200 ms was 0 red of 1,307 (2026-11-25).
+#[test]
+fn the_roster_asks_sec_at_most_ten_times_a_second_and_keeps_at_most_eight_mebibytes() {
+    let profile = cmd_roster::transport();
+    assert_eq!(
+        (
+            profile.budget.min_interval,
+            profile.budget.per_host,
+            profile.body_limit
+        ),
+        (Some(SEC_INTERVAL), Some(SEC_INTERVAL), ROSTER_BODY_LIMIT)
+    );
 }
 
 fn shown(store: &Path, at: &str) -> Result<cmd_roster::Shown, Box<dyn Error>> {
