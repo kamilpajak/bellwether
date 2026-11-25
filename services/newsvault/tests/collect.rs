@@ -44,7 +44,7 @@ const AFTER_THE_NEW_YORK_DAY_CLOSED: &str = "2026-11-11T05:00:00Z";
 const AN_INVERTED_RANGE: &str = "2026-11-12..2026-11-09";
 const SOURCE: &str = "edgar_press";
 /// A pace file as `news_provider::budget` names one.
-const A_HOLD_FILE: &str = "www.sec.gov.hold";
+const A_HOLD_FILE: &str = "host.example.test.hold";
 const CONTACT: &str = "bellwether collector contact@example.test";
 /// The address half of `CONTACT`, which is the part that is a person.
 const CONTACT_ADDRESS: &str = "contact@example.test";
@@ -1072,7 +1072,7 @@ fn every_body_an_edgar_run_stores_is_indexed_and_linked_to_its_attempt() -> Test
 #[test]
 fn an_edgar_document_answered_with_a_redirect_is_a_permanent_failure_and_its_hop_never_sent(
 ) -> TestResult {
-    let root = TempDir::new()?;
+    let (root, shared) = (TempDir::new()?, TempDir::new()?);
     let ask = ask(root.path(), A_LISTED_SESSION);
     let opened = cmd_collect::open_provider(&ask)?;
     let moved = APPLE_URL
@@ -1086,7 +1086,7 @@ fn an_edgar_document_answered_with_a_redirect_is_a_permanent_failure_and_its_hop
         wire: cmd_collect::wire_for(
             &ask,
             &opened,
-            &news_provider::PaceRoot::resolve(None, &ask.store)?,
+            &news_provider::PaceRoot::resolve(Some(shared.path()), &ask.store)?,
         ),
         relayed: BTreeMap::from([(APPLE_URL.to_owned(), server.url(moved))]),
         asked: RefCell::default(),
@@ -1110,13 +1110,16 @@ fn an_edgar_document_answered_with_a_redirect_is_a_permanent_failure_and_its_hop
         )?
         .query_map([MOVED_PERMANENTLY], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<_, _>>()?;
+    // The pace files are under the root named and none is in the store (section 12.2).
+    let paced = [shared.path(), root.path()].map(|under| under.join("pace").exists());
     assert_eq!(
-        (asked_apple, hops, redirected, answer.exit),
+        (asked_apple, hops, redirected, answer.exit, paced),
         (
             1,
             vec![moved.to_owned()],
             vec![("permanent_failure".to_owned(), APPLE_URL.to_owned())],
-            Exit::PartialCollect
+            Exit::PartialCollect,
+            [true, false]
         )
     );
     Ok(())
@@ -1589,8 +1592,10 @@ fn each_command_that_sends_refuses_a_pace_root_it_cannot_use_by_its_code() -> Te
     let left = root.path().join("pace");
     std::fs::create_dir_all(&left)?;
     std::fs::write(left.join(A_HOLD_FILE), "")?;
+    let nested = TempDir::new()?;
+    std::fs::create_dir_all(nested.path().join("pace").join("pace"))?;
     let (store, elsewhere) = (path(root.path()), path(shared.path()));
-    let absent = path(&shared.path().join("absent"));
+    let (absent, nested) = (path(&shared.path().join("absent")), path(nested.path()));
     let commands: [&[&str]; 3] = [
         &["collect", "--source", SOURCE, "--window", A_LISTED_SESSION],
         &["robots", "refresh", "--source", "open_web_wires"],
@@ -1598,7 +1603,7 @@ fn each_command_that_sends_refuses_a_pace_root_it_cannot_use_by_its_code() -> Te
     ];
     let mut refusals = Vec::new();
     for command in commands {
-        for pace_root in ["shared", &absent, &elsewhere] {
+        for pace_root in ["shared", &absent, &elsewhere, &nested] {
             let mut args = command.to_vec();
             if command.len() > 2 {
                 args.extend(["--hosts", "no-hosts", "--rules", "no-rules"]);
@@ -1624,6 +1629,7 @@ fn each_command_that_sends_refuses_a_pace_root_it_cannot_use_by_its_code() -> Te
             Some("pace_root_split".to_owned()),
             json!([A_HOLD_FILE]),
         ),
+        (2, true, Some("pace_root_split".to_owned()), json!(["pace"])),
     ];
     let schema: Value = serde_json::from_slice(&binary(&["schema", "--format", "json"])?.stdout)?;
     let listed = |refusal: &(i32, bool, Option<String>, Value)| {
@@ -1632,9 +1638,26 @@ fn each_command_that_sends_refuses_a_pace_root_it_cannot_use_by_its_code() -> Te
             .as_array()
             .is_some_and(|codes| codes.contains(&code))
     };
+    // A command's own `exits` table, where the schema gives it one, names each exit measured.
+    let tabled = |command: &[&str]| {
+        let entry = schema["commands"]
+            .as_array()
+            .and_then(|all| all.iter().find(|entry| entry["path"] == json!(command)));
+        entry.map(|entry| &entry["exits"]).is_some_and(|exits| {
+            exits.is_null()
+                || each
+                    .iter()
+                    .all(|refusal| exits[refusal.0.to_string()].is_string())
+        })
+    };
+    let paths: [&[&str]; 3] = [&["collect"], &["robots", "refresh"], &["roster", "fetch"]];
     assert_eq!(
-        (each.iter().all(listed), refusals),
-        (true, [each.clone(), each.clone(), each.clone()].concat())
+        (each.iter().all(listed), paths.map(tabled), refusals),
+        (
+            true,
+            [true; 3],
+            [each.clone(), each.clone(), each.clone()].concat()
+        )
     );
     Ok(())
 }
