@@ -1588,7 +1588,7 @@ Runbook, restore. No step has been executed. `<copy>` is one `bellwether-modelga
 | boundary | form | why |
 |---|---|---|
 | vendor → `vault` | HTTP, behind **one owner for every vendor conversation**, not one client per vendor | a vendor conversation happens in exactly one place, so quota, retry and cost have one owner. Since 2026-11-13, when the first adapter shipped, the single `ureq` agent sits behind `news-provider`'s `Wire` and `providers/edgar-press` declares no HTTP dependency: only that shape makes "a fetch outside a ledger row does not compile" hold in every crate, not only in crates that own no agent (row R4). Per-vendor differences: the provider's `TransportProfile` (`news-provider/src/wire.rs`), call budget, bucket and redirect policy included (row R19). Design, no code: `services/filingvault` sends through the same `Wire` and declares no HTTP dependency (§12.1) |
-| `newsvault` ↔ `filingvault` (design, no code; §12.2) | no call, no shared table, no shared lock; one shared directory of pace files, each locked per bucket (proposed, `FV-Q4`) | two contexts of one deployable, so a fault in one must not hold the other's store; SEC counts requests per address, so its budget is the one thing they share |
+| `newsvault` ↔ `filingvault` (design, no code; §12.2) | no call, no shared table, no shared lock; one shared directory of pace files, each locked per bucket (owner decision 2026-11-25, `FV-Q4`) | two contexts of one deployable, so a fault in one must not hold the other's store; SEC counts requests per address, so its budget is the one thing they share |
 | `vault` → `derive` | **file**: snapshot manifest + Parquet with ZSTD (§3.0), not Arrow IPC: zstd is compiled into parquet 60.1.0 and not into this tree's `arrow-ipc` (default features only, `cargo tree -e features -i zstd`, 2026-11-22), and a reader can skip the `body` column | `derive` must re-run years later against the same bytes; a call cannot promise that |
 | `derive` → statistics | **file**: panel manifest + Arrow | same, and it keeps the Python tier at arm's length |
 | `vault` → `modelgate` | **file**: a `newsvault cut` snapshot (§3.0), read through `snapshot-contract` | `modelgate` depends on no crate of the news side (§8 row MG10), and a label must name the exact rows and cutoff it was taken over |
@@ -2111,7 +2111,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
   - The reason is on stdout only (the journal on the VPS). The store keeps the robots attempt row and body under the run's `run_id`, from which it can be derived again. `roster show` does not report it: a day robots kept us from the file reads as a day with no roster attempt (open).
   - Nasdaq Trader's `/robots.txt` answered 302 on 2026-11-23, and `Wire` follows no redirect (§3.9), so its files would be `robots_unverified` and never asked. This answers the open question of how our parser treats a 302 to a 200 HTML page: it never sees one.
   - Rejected: a pin in a hosts file as open-web keeps; for one host it adds a file and a refresh step, and nothing extracted here depends on the robots body.
-- Pace and contact: `edgar_press::sec_transport()`, now the one home of SEC's transport for both callers; the `Wire` is built with `SourceId` `edgar_press`, so the roster pays into `pace/edgar_press.per-ip` and `pace/www.sec.gov.per-host` with EDGAR (§8 row R19): `a_roster_fetch_through_the_wire_pays_into_edgar_press_s_per_ip_pace`. The User-Agent is the feed contact (`BELLWETHER_FEED_CONTACT_FILE`, the file the VPS mounts); SEC answered it 200 on 2026-11-23; `roster_fetch_reads_the_feed_contact_file_the_unit_mounts` (a dry run with only SEC's variable set is refused). Open: `edgar-press` sends `BELLWETHER_SEC_CONTACT[_FILE]` under the same pace, so the two SEC callers send different User-Agents; unify them before `edgar-press` runs on the VPS. Owner decision 2026-11-24: one contact for every SEC request; `filingvault`, the third SEC caller by design, reads the feed contact and, if `FV-Q4` is answered yes, shares one pace directory with both (§12.2). Unguarded: AlphaLens's SEC calls on the same VPS share the IP and not the pace files (§10, ties to AlphaLens).
+- Pace and contact: `edgar_press::sec_transport()`, now the one home of SEC's transport for both callers; the `Wire` is built with `SourceId` `edgar_press`, so the roster pays into `pace/edgar_press.per-ip` and `pace/www.sec.gov.per-host` with EDGAR (§8 row R19): `a_roster_fetch_through_the_wire_pays_into_edgar_press_s_per_ip_pace`. The User-Agent is the feed contact (`BELLWETHER_FEED_CONTACT_FILE`, the file the VPS mounts); SEC answered it 200 on 2026-11-23; `roster_fetch_reads_the_feed_contact_file_the_unit_mounts` (a dry run with only SEC's variable set is refused). Open: `edgar-press` sends `BELLWETHER_SEC_CONTACT[_FILE]` under the same pace, so the two SEC callers send different User-Agents; unify them before `edgar-press` runs on the VPS. Owner decision 2026-11-24: one contact for every SEC request; `filingvault`, the third SEC caller by design, reads the feed contact and shares one pace directory with both (owner decision 2026-11-25, `FV-Q4`; §12.2). Unguarded: AlphaLens's SEC calls on the same VPS share the IP and not the pace files (§10, ties to AlphaLens).
 - Verdict of a file: 200 of the file's shape (`{"fields": [cik, name, ticker, exchange], "data": [...]}`) is `usable`, or `empty` with no rows; 200 of another shape (a challenge page, a changed format) and a body over 8 MiB are `permanent_failure`; 403, 408, 429, 5xx and a transport error are `transient_failure`, as `edgar-press` reads SEC; any other status (404, 3xx) is `permanent_failure`. Every body is kept, failures included.
 - Exit, `news_provider::Tally::exit`: 0 every file usable; 7 `vendor_unreachable`; 8 otherwise (`partial_collect`, `vendor_refused_all`). An empty roster counts as a failure: an empty file is the silent zero R6 forbids. A failed robots fetch counts once and its files add nothing; a file robots keeps us from counts as not asked. 2 `credential_contact_missing` before the store is touched; 7 `lease_held`, its envelope finished and marked `lease_held` as a refused collect's is (`a_held_lease_exits_7_and_marks_the_envelope`).
 - Reader on a real path: `newsvault roster show --at <instant>`, read-only, no lease. Per file, the newest usable copy whose valid time and observation time are both at or before `--at` (`Visibility::visible_at`):
@@ -4740,22 +4740,23 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
 ---
 
-## 12. `filingvault` — the annual-report archive as the filings context (owner decision 2026-11-24; design, no code)
+## 12. `filingvault` — the annual-report archive as the filings context (owner decisions 2026-11-24 and 2026-11-25; design, no code)
 
 - Status of every line of §12: design, no code. No §8 row is claimed from it; §12.7 lists the gates planned.
 - Owner decision 2026-11-24 (layout B): the archive of annual reports is the memo's `filingvault` context (memo §3). It gets its own crate and its own store (lock, schema version, backup, coverage ledger, timers) inside the `vault` deployable and image. The mechanics every archive needs sit in a shared crate and reach it by PRs that move code with no behaviour change. `newsvault` keeps the news context (sources, lanes, the 31-run schedule, the cut for `derive`). The roster stays in `newsvault` until `marketvault` is built.
 - Owner rule 2026-11-24: code goes in the component that owns the responsibility; every piece has exactly one home, with the reason (§12.1).
 - Accepted by the owner 2026-11-24: the whole report is the header page, the whole primary document and the listed text exhibits, with no graphics and no XBRL; free public sources only; one nightly run; pace 500 ms; a stop after 3 consecutive traffic 403 answers; a 64 MiB document limit; one contact for every SEC request; collection by form, never by a roster filter; "newest" ordered by period first.
-- Open owner questions: `FV-Q1` to `FV-Q11` (§12.11). Where a line below depends on one, it names it.
+- Owner decisions 2026-11-25: `FV-Q1` to `FV-Q11` (§12.11). A line below that rests on one names it.
+- Not yet assigned: the person who labels the 200 documents (`FV-Q5`, §12.4).
 - Units: MB = 10^6 B, GB = 10^9 B, MiB = 2^20 B. "Probe 1" and "probe 2" are §12.10's.
 
 ### 12.1 What lives where and why
 
 | crate or unit | state | single responsibility | must never contain | workspace dependencies |
 |---|---|---|---|---|
-| `vault-core` (working name) | designed; top level | what a store on disk needs whatever it stores: the blob store (compression, verified read, staging) and its error type, the store lease, the one SQLite opener, the log copy | a socket or an HTTP dependency; SQL naming any table (each context reads and writes its own `blobs` rows, and the two `blobs` tables differ: §12.2); a schema; a type of any context; a dependency on a workspace member | none |
+| `vault-core` (name kept, `FV-Q2`) | designed; top level | what a store on disk needs whatever it stores: the blob store (compression, verified read, staging) and its error type, the store lease, the one SQLite opener, the log copy | a socket or an HTTP dependency; SQL naming any table (each context reads and writes its own `blobs` rows, and the two `blobs` tables differ: §12.2); a schema; a type of any context; a dependency on a workspace member | none |
 | `news-provider` | exists; gains `robots` and `contact` | two things in one crate today. The conversation core, which `filingvault` uses: `wire`, `budget`, `clock`, `ledger` (the attempt slot, the send permit, `Sink`), `request`, `lag_policy`, and after step 5 the robots parser and the contact reader. The news collection skeleton, which `filingvault` links and does not use: `provider`, `collect`, `conformance`. The core's types carry news-only fields (below, `FV-Q10`). The only vendor-side crate that declares an HTTP client (row R4) | a store, a SQLite connection, a vendor's format | `canon`, `pit` |
-| `providers/sec-edgar` (working name, `FV-Q3`) | designed | what is true of SEC's EDGAR host for every caller: host and path constants, the per-IP bucket's name, the contact credential's name, SEC's transport profile and the one table of its intervals per caller (100 ms for the roster and `edgar_press`, 500 ms for filings; today `edgar_press::sec_transport()` and `SEC_MIN_INTERVAL`), the daily-index and quarter-listing parsers, the acceptance-digits parser and its format constant, SEC's status reading | a `Provider` implementation; a form list; a store; an HTTP dependency | `news-provider`, `pit`, `canon` |
+| `providers/sec-edgar` (owner decision 2026-11-25, `FV-Q3`) | designed | what is true of SEC's EDGAR host for every caller: host and path constants, the per-IP bucket's name, the contact credential's name, SEC's transport profile and the one table of its intervals per caller (100 ms for the roster and `edgar_press`, 500 ms for filings; today `edgar_press::sec_transport()` and `SEC_MIN_INTERVAL`), the daily-index and quarter-listing parsers, the acceptance-digits parser and its format constant, SEC's status reading | a `Provider` implementation; a form list; a store; an HTTP dependency | `news-provider`, `pit`, `canon` |
 | `providers/edgar-press` | exists; loses the items of the row above | the news adapter for 8-K press releases | anything a second SEC caller needs | `sec-edgar`, `news-provider`, `canon`, `pit` |
 | `providers/open-web-feed` | exists; gains the 5-line `impl RobotsRules for Robots` | the news adapter for the open web | — | unchanged |
 | `filing-contract` | designed; top level | pure functions over stored bytes and a hashed rules file: `manifest(bytes)` and `section(bytes, form, rules)`; the committed trust file (§12.4) | a clock, a socket, a store, a parsing dependency | `canon` |
@@ -4776,8 +4777,9 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - Why the shared mechanics are two crates and not one:
   - conversation mechanics are already outside any service, in `news-provider`, and `services/filingvault` can depend on it as it stands: the HTTP allowlist is about declaring a client (`repo-invariants/src/clients.rs`, `CLIENT_ALLOWLIST`), and the clock scan reads `news-provider` and `providers/*` only (`clocks.rs`);
   - store mechanics are inside the service crate `services/newsvault`, which a sibling context may not link; only they need a new crate.
-- `FV-Q1`: the owner's decision names transport, pace and the send gate among what moves into the shared crate. They are shared today in `news-provider`; whether they also move into `vault-core` is open, and the build order (§12.8) holds for both answers.
-  - What moving them costs, counted 2026-11-24 at `ea59293`: `wire`, `budget`, `clock`, `ledger` and `request` are 2,186 source and 3,265 test lines (lines before and after each file's first `#[cfg(test)]`) and cannot move in parts (`wire` needs `ledger::SendPermit`, `ledger` needs `wire::RawResponse`, and row R4 needs the permit and `Wire::send` in one crate); 87 lines of this document name `news-provider` or `news_provider::` (`grep -c`); `CLIENT_ALLOWLIST` and the clock scan's `SEAM_CRATE` name the crate.
+- Owner decision 2026-11-25 (`FV-Q1`): transport, pace and the send gate stay in `news-provider`, where they are shared today; `vault-core` holds store mechanics only.
+  - It narrows the decision of 2026-11-24, which named the three among what moves into the shared crate.
+  - Rejected: moving them into `vault-core`. Symptom, counted 2026-11-24 at `ea59293`: `wire`, `budget`, `clock`, `ledger` and `request` are 2,186 source and 3,265 test lines (lines before and after each file's first `#[cfg(test)]`) and cannot move in parts (`wire` needs `ledger::SendPermit`, `ledger` needs `wire::RawResponse`, and row R4 needs the permit and `Wire::send` in one crate); 87 lines of this document name `news-provider` or `news_provider::` (`grep -c`); `CLIENT_ALLOWLIST` and the clock scan's `SEAM_CRATE` name the crate.
   - A `vault-core` that declares `ureq` could not later serve `modelgate` without `modelgate` linking a second HTTP owner (row R4).
 - Size of the store-mechanics move, counted the same way: `services/newsvault/src` is 14,401 source lines; `blobs.rs` 811, `robots.rs` 432, `contact.rs` 127; the opener, the lease and the log copy about 164 (counted from item ranges, not from a diff); 1,534 lines, 10.7%.
 - `filingvault` writes its own schema, sink, document door, coverage reader, run record and CLI. The news versions key on `story_id` and `Published` and carry news-only columns (`hosts_version`, `held`, `listing_unusable`, `relisted_compared`, `robots_disallowed`, `continuity`, `boundary_*`, `listed_by`).
@@ -4799,8 +4801,10 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | `Baseline`, required by `Outcome::decide` | the collapse question | `Baseline::from_trailing_ok(&[])`, as both commands above | dropped |
 
 - `filingvault` is buildable on the core with constants in the news-only fields, as two `newsvault` commands already are. The core is shared; it is not neutral.
-- `FV-Q10`: whether a change PR before step 10 makes the news-only fields optional or splits a core `Request`. It is a change, never a move: `universe_version` enters `filter_params`, so the digests existing callers write and `canon`'s vectors must stay as they are.
-- Unguarded (§12.6): the `filingvault` binary links `news_provider::collect` (2,600 lines with its tests, `wc -l`), `provider` and `conformance`; gate FV1 walks `cargo metadata` and sees crates, not modules.
+- Owner decision 2026-11-25 (`FV-Q10`): for this step the news-only fields stay as they are and `filingvault` fills them with the constants above.
+  - Named debt: `news-provider` is not split into a context-neutral part and a news part. Trigger: when a third client of the conversation code exists (the `marketvault` context).
+  - Rejected for this step: a change PR before step 10 that makes the news-only fields optional or splits a core `Request`. Symptom: a PR of unknown size that is a change, never a move: `universe_version` enters `filter_params`, so the digests existing callers write and `canon`'s vectors must stay as they are.
+- Unguarded (§12.6): the `filingvault` binary links `news_provider::collect` (2,600 lines with its tests, `wc -l`), `provider` and `conformance`; gate FV1 walks `cargo metadata` and sees crates, not modules. It stays so until the split above.
 
 **Dependency rules.**
 
@@ -4880,7 +4884,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
 **Schedule and run accounting.**
 
-- One run a night: `filingvault-collect.timer` at 06:10 UTC, `TimeoutStartSec=7200`, `SuccessExitStatus=8`, no `Persistent=` (`FV-Q8`).
+- One run a night: `filingvault-collect.timer` at 06:10 UTC, `TimeoutStartSec=7200`, `SuccessExitStatus=8`, no `Persistent=` (owner decision 2026-11-25, `FV-Q8`: the 2 h bound and the slot).
   - 06:10 UTC is 01:10 or 02:10 in New York. Unverified: when SEC writes a day's index; the trailing three days cover a late one.
   - It overlaps news collect slots and shares no lock, table or store with them.
 - One run, in order: robots.txt of `www.sec.gov` under a `robots` attempt; the quarter listing of each quarter holding an open or unasked day in the plan; the trailing 3 index days; unasked days from newest to oldest until the filing budget is reached; each open filing, manifest first, then its documents.
@@ -4923,7 +4927,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
 - SEC counts requests per address. Three callers leave this deployable for `www.sec.gov`: `filings collect`, `roster fetch` (01:20 UTC) and `edgar_press` (0 attempts in production, §3.0).
 - Today the pace files sit under the store, `<store>/pace/` (`news_provider::budget`, the three `beside_the_store` constructors), so a second store is a second bucket: row R19's hole 2, "pace file per store, so two stores = two buckets".
-- Proposed: one pace root for the deployable, `%h/.bellwether/shared`, mounted into every container that builds a `Wire`. The files sit in `<pace root>/pace/`, because `news_provider::budget` joins `pace/` (`PACE_DIR`) to the directory it is given.
+- Owner decision 2026-11-25: one pace root for the deployable, `%h/.bellwether/shared`, mounted into every container that builds a `Wire`. The files sit in `<pace root>/pace/`, because `news_provider::budget` joins `pace/` (`PACE_DIR`) to the directory it is given.
 
 | question | answer |
 |---|---|
@@ -4939,7 +4943,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - `Wire::new` uses its `store` argument for the pace, hold and gate paths only, so the pace root goes in as that argument and no `news-provider` signature changes.
 - Rejected: an option naming the files' own directory. Passed as `store` it yields `<directory>/pace/`, a second bucket with no error; placing the files directly in it changes the three `beside_the_store` constructors.
 - Rejected: `%h/.bellwether` as the pace root. It is the parent of both stores, so each container would mount the other's store.
-- Deploy step, once, with the timers stopped: move `%h/.bellwether/vault/pace` to `%h/.bellwether/shared/pace` and install step 7's unit files. At step 7's release, or with step 17 at the latest.
+- Deploy step, once, with the timers stopped (owner decision 2026-11-25): move `%h/.bellwether/vault/pace` to `%h/.bellwether/shared/pace` and install step 7's unit files. At step 7's release, or with step 17 at the latest.
 - The pace directory then leaves the news store's daily archive. A lost pace file costs one unpaced first call and any hold in force.
 - Two callers at two intervals (the roster at 100 ms, filings at 500 ms), read from `news-provider/src/budget.rs` at `7b6e6f7` and tested by nothing: the per-IP file holds the next allowed instant, written with the last caller's own interval; the per-host file holds the last granted instant, and each caller adds its own interval. So a filings call is at least 500 ms after any call to the host, and a roster call at least 100 ms after any call and up to 500 ms after a filings call. §12.8 step 7 carries the test, in `news-provider`: two `Wire`s over one pace root.
 - The stop after three traffic 403 answers is `filingvault`'s alone (`runs.stopped_by`): the roster run does not read it. Shared is only a hold SEC states, through `www.sec.gov.hold` (§12.6).
@@ -4965,7 +4969,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | graphics | 21.1% | already compressed, no text |
 | exhibits not on the list | 2.0% | named in the stored manifest; fetched later by accession if a reader arrives |
 
-- The exhibit list is a rules-file list per form family, not an enum (`FV-Q6`):
+- The exhibit list is a rules-file list per form family, not an enum (owner decision 2026-11-25, `FV-Q6`: this list, not every text exhibit):
 
   | type | forms | why | measured (probe 2) |
   |---|---|---|---|
@@ -5022,7 +5026,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - The manifest is fetched until one copy is usable and never again; its `documents` rows drive what is still missing.
 - Unobserved: a rewrite or deletion by SEC after our fetch. Recorded at no request: the document's `Last-Modified` (sent in 43 of 43), printed by the reader as `modified_after_acceptance_seconds`.
 - Amendments: a `/A` filing has its own accession and overwrites nothing. `amends` is derived at read time: the visible original of the same CIK, form family and period; zero or more than one gives null and `amends_ambiguous`.
-- Header fields (`FV-Q7`): `name` is labelled `as_of: filing`; `sic` and `former_names` are labelled `as_of: fetch` and take the manifest's `received_at` as their observation. The rule written before probe 2 asked for 5 testable name cases and got 2, both as filed (§12.10); SIC and former names were not tested.
+- Header fields (owner decision 2026-11-25, `FV-Q7`): `name` is labelled `as_of: filing`; `sic` and `former_names` are labelled `as_of: fetch` and take the manifest's `received_at` as their observation. The rule written before probe 2 asked for 5 testable name cases and got 2, both as filed (§12.10); SIC and former names were not tested.
 
 **Time.**
 
@@ -5117,8 +5121,10 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - `probes/section_cut/` is kept: it runs again at every `extract_version`.
 - The 43 probe filings are the development set and cannot test the method.
 - Test set, a seeded draw from stored filings with the 50 probe CIKs excluded: 120 10-K and 40 20-F with thresholds; 40 documents from filers the roster never listed, scored with no threshold. Amendments are in neither.
-- Labels: per filing the byte offsets of the section's first character and of the first character after it, set by a person, plus "the section only points to another document". Stored as (accession, `raw_blob`, start, end, pointer); no filing text enters the repository. Who labels the 200 documents is open (`FV-Q5`).
-- Scored within 200 bytes. Thresholds written 2026-11-24, before any run:
+- Labels: per filing the byte offsets of the section's first character and of the first character after it, set by a person, plus "the section only points to another document". Stored as (accession, `raw_blob`, start, end, pointer); no filing text enters the repository.
+- Labeller (owner decision 2026-11-25, `FV-Q5`): the owner or a person he names labels the 200 documents, after the step that builds the cut (§12.8 step 15).
+  - Not yet assigned: no person is named. Until one labels them, `cut_trust` reads `unmeasured`.
+- Scored within 200 bytes. Thresholds written 2026-11-24, before any run, and accepted as written by the owner 2026-11-25 (`FV-Q5`):
 
   | form | wrong cuts | refused |
   |---|---|---|
@@ -5127,7 +5133,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
 - The result lives in `filing-contract/cut-trust.json`, outside `src/` and outside the rules file, so writing it does not change the version it certifies. One row per (`extract_version`, form, method): run date, n, wrong cuts, refused, the pre-registration's digest.
 - `filings show` prints `cut_trust: measured` only for a row matching the record's own `extract_version` and form; a new version reads `unmeasured` with no step by anyone.
-- `--section-text` on an unmeasured (version, form) is refused by name unless `--accept-unmeasured-cut` is passed (`FV-Q9`).
+- `--section-text` on an unmeasured (version, form) is refused by name unless `--accept-unmeasured-cut` is passed (owner decision 2026-11-25, `FV-Q9`).
 - A failed run changes the method and the version, and the next run draws a new sample.
 
 ### 12.5 The reader
@@ -5158,7 +5164,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - Not in the record: `in_roster`, `ticker`, `exchange`. The roster is in the news store and a context reads no sibling's store; the join by CIK belongs to the reader that holds both outputs.
 - `description_from: null` means "we hold no cut section", never "no business". Nothing downstream may read `none_in_window`, `listed_not_held` or `window_incomplete` as "this company has no business".
 - The age of a description is `--at` minus `description_from`'s publication, computed by the reader; no threshold in the tool.
-- Exit: 0 at least one filer is `annual_report`; 1 every filer asked is `none_in_window`; 8 otherwise; 4 no store; 2 usage or an unreadable stored time. This relies on "exit 1 means the answer is no", decided by default and not settled (`FV-Q9`).
+- Exit: 0 at least one filer is `annual_report`; 1 every filer asked is `none_in_window`; 8 otherwise; 4 no store; 2 usage or an unreadable stored time. Exit 1 means "the answer is no" for `filings show` and `ledger check` (owner decision 2026-11-25, `FV-Q9`).
 - `filingvault sections extract [--limit <n>] [--dry-run]`: a writer under the lease; writes a `sections` row for each stored primary document with none under the binary's `extract_version`; a second run reports `"changed": false`.
 - How `derive` will read a section is not designed beyond its form, a file (§4): `derive` has no code, and an artefact with no reader is a gate that passes unconditionally.
 
@@ -5177,7 +5183,8 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | `filingvault` opening a file under the news store through `std::fs` | unguarded |
 | `filing-contract` holding a clock, a socket or a store | unguarded: the clock scan reads `news-provider` and `providers/*` only. Its dependency list is guarded by design (FV1's third test, §12.7) |
 | `providers/sec-edgar` holding a `Provider` implementation or a form list; `providers/edgar-press` keeping an item a second SEC caller needs; `services/newsvault` naming a filing type, table or form | unguarded, each |
-| the `filingvault` binary linking `news_provider::collect`, `provider` and `conformance` | unguarded: FV1 sees crates, not modules (`FV-Q10`) |
+| the `filingvault` binary linking `news_provider::collect`, `provider` and `conformance` | unguarded: FV1 sees crates, not modules; it stays so until `news-provider` is split (the row below) |
+| `news-provider` holding the conversation core and the news collection skeleton in one crate, its core types carrying news-only fields (§12.1) | named debt, deferred by owner decision 2026-11-25 (`FV-Q10`). Trigger: when a third client of the conversation code exists (the `marketvault` context) |
 | moved tests reading `providers/open-web-feed/tests/fixtures` by file path, from `vault-core` (step 3) and from `news-provider` (step 5) | unguarded: no manifest names the path, so FV1 does not see it (§12.8) |
 | the stop after three traffic 403 answers, for the other SEC callers | not shared: only a hold SEC states reaches them (§12.2) |
 | `modelgate`'s opener, lease and log copy | a second copy of `vault-core`'s until `modelgate` is switched (§12.1) |
@@ -5187,7 +5194,8 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 |---|---|
 | the roster moved to `marketvault`; ticker and exchange in the register | owner decision; the reader holding both outputs joins by CIK |
 | `modelgate` switched to `vault-core` | its blob layout differs on disk (§12.1) |
-| `news-provider` renamed or split | `FV-Q2` |
+| `news-provider` or `vault-core` renamed | owner decision 2026-11-25 (`FV-Q2`): neither now; `news-provider` alone, after `filingvault` runs |
+| `news-provider` split into a context-neutral part and a news part | the named debt above (`FV-Q10`) |
 | the backup's blob handling | branch `fix/backup-blob-packs` |
 | prospectuses and registration statements | a newly listed company has no description until its first annual report |
 | the 8-K staleness flag | its producer `edgar_press` has 0 attempts in production |
@@ -5195,7 +5203,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | companies not listed in the US | — |
 | a multi-year fill | 5 years is 7.9 GB of primary documents in one copy (41,755 × 188,336 B, the 2026 size assumed for every year) |
 | exhibits newly listed for filings already closed | one request each, no manifest request |
-| observing that SEC deleted or replaced a filing | `FV-Q9`'s re-fetch probe |
+| observing that SEC deleted or replaced a filing | a kept probe that re-fetches a seeded 100 stored documents a quarter (owner decision 2026-11-25, `FV-Q9`); no step of §12.8 carries it |
 | the `edgar-press` contact variable (§10, the roster's pace bullet) | a `newsvault` change; it sends nothing in production |
 
 ### 12.7 Gates planned (each becomes a §8 row only after its named test has gone red under its mutation; none exists, 2026-11-24)
@@ -5242,7 +5250,6 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
 - Order constraints: 2 before 3; 3 to 6 and 9 before 10; 8 before the first production run; 7 and 16 before 17; the backup change deployed before the initial fill; step 15's labelled run after the fill.
 - After step 17, in order: the lag entry from step 8; the pace files moved, if not done at step 7's release; a dry run from the VPS, which sets the budget; the first night, read before the second (bytes raw and stored, the share of filings from CIKs in no roster copy, verdict counts); the rest of the fill; step 15's labelled run.
-- If `FV-Q1` is answered "move": one more move PR after step 17, and no other row changes.
 - Step 2's vectors, each a literal in a test file no later step edits:
 
   | vector | pins | red under |
@@ -5365,18 +5372,21 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
 - Not measured by either probe: an amendment; a combined filing (each of the 43 manifests names one company); a filer with no listed security; compression of manifests, exhibits and index files; any transfer time from the VPS.
 
-### 12.11 Owner questions open (each leaves this table when taken)
+### 12.11 Owner decisions, 2026-11-25 (`FV-Q1` to `FV-Q11`)
 
-| id | question | recommendation | what the other answer changes |
+- Not yet assigned: the labeller's name (`FV-Q5`).
+- No row is built: §12 is design, no code.
+
+| id | decision | rejected | symptom of the rejected answer, or what the decision leaves |
 |---|---|---|---|
-| `FV-Q1` | transport, pace and the send gate: left in `news-provider`, or moved into `vault-core` as the decision of 2026-11-24 words it | leave them; `vault-core` holds store mechanics only | one more move PR after step 17 at §12.1's counted cost, and `vault-core` then declares `ureq` |
-| `FV-Q2` | the names `news-provider` and `vault-core` | rename neither now; `news-provider` alone, after `filingvault` runs | 87 lines of this document at `ea59293`, before this section (107 with it), and about 180 `.rs` lines in 36 files (`grep`, 2026-11-24) for no behaviour |
-| `FV-Q3` | a new crate `providers/sec-edgar` for SEC's shared facts, or `filingvault` depending on `providers/edgar-press` | the new crate | without it a filings build links the 8-K adapter (§12.1) |
-| `FV-Q4` | one pace root outside both stores, with a one-time move of the news store's pace files | yes | without it SEC has two buckets on one address, against row R19 |
-| `FV-Q5` | who labels the 200 documents for the cut's trust, and §12.4's thresholds | the owner or a person he names; the thresholds as written | whether `cut_trust` can ever read `measured` |
-| `FV-Q6` | the exhibit type list of §12.3, or every text exhibit | the list | 16.1 GB against 7.1 GB by the admission rule, 110,716 requests against 31,376, 32.1 h against 10.1 h (10,433 × 11.08 s); it keeps EX-10 contracts a later fetch may no longer find |
-| `FV-Q7` | header fields: `name` as of the filing on 2 of 2 testable cases; `sic` and `former_names` as of our fetch | yes | treating all three as filed risks a 2026 SIC at a 2025 `--at` |
-| `FV-Q8` | the nightly bound of 2 h and the 06:10 UTC slot | accept; the dry run sets the budget | a 1 h bound gives a budget of about 900 and a 12-night fill |
-| `FV-Q10` | `news-provider`'s core carries news-only fields that `filingvault` fills with constants (§12.1): leave it, or a change PR before step 10 that makes them optional or splits a core `Request` | leave it for this step; decide when a third caller needs the core | one change PR of unknown size that touches `filter_params`, so it must keep every digest existing callers write; it is the only way gate FV1 could ever see the news skeleton as separate |
-| `FV-Q11` | the filings alerts: further rules in the one rules file, tested where the deployable-level files are tested today, or a rules file and test file of the context's own | the one file | a second file changes `newsvault-monitoring-check`, `prometheus.rule_files.yml`, row A1 and `monitoring.rs` (§12.1) |
-| `FV-Q9` | three items carried from the reviewed design: `--section-text` refused on an unmeasured cut; a kept probe that re-fetches a seeded 100 stored documents a quarter; exit 1 = "the answer is no" for `filings show` and `ledger check` | accept all three | the re-fetch probe is the only measurement of how often SEC changes an accepted document |
+| `FV-Q1` | transport, pace and the send gate stay in `news-provider`; `vault-core` holds store mechanics only | moving them into `vault-core`, as the decision of 2026-11-24 words it | one more move PR after step 17 at §12.1's counted cost, and `vault-core` then declares `ureq` |
+| `FV-Q2` | neither `news-provider` nor `vault-core` is renamed now; `news-provider` alone, after `filingvault` runs | a rename now | 87 lines of this document at `ea59293`, before this section (107 with it), and about 180 `.rs` lines in 36 files (`grep`, 2026-11-24) for no behaviour |
+| `FV-Q3` | a new crate `providers/sec-edgar` holds SEC's shared facts | `filingvault` depending on `providers/edgar-press` | a filings build links the 8-K adapter (§12.1) |
+| `FV-Q4` | one pace root outside both stores, with a one-time move of the news store's pace files (§12.2) | a pace directory per store | SEC has two buckets on one address, against row R19 |
+| `FV-Q5` | the owner or a person he names labels the 200 documents for the cut's trust, after the step that builds the cut (§12.8 step 15); §12.4's thresholds as written | — | no person is named yet; until one labels them `cut_trust` cannot read `measured` |
+| `FV-Q6` | the exhibit type list of §12.3 | every text exhibit | 16.1 GB against 7.1 GB by the admission rule, 110,716 requests against 31,376, 32.1 h against 10.1 h (10,433 × 11.08 s). The decision leaves: EX-10 contracts a later fetch may no longer find are not kept |
+| `FV-Q7` | header fields: `name` as of the filing, on 2 of 2 testable cases; `sic` and `former_names` as of our fetch | all three as filed | a 2026 SIC at a 2025 `--at` |
+| `FV-Q8` | the nightly bound of 2 h and the 06:10 UTC slot; the dry run sets the budget | a 1 h bound | a budget of about 900 and a 12-night fill |
+| `FV-Q10` | for this step `news-provider`'s core keeps the news-only fields that `filingvault` fills with constants (§12.1). The split of `news-provider` into a context-neutral part and a news part is a named debt (§12.6). Trigger: when a third client of the conversation code exists (the `marketvault` context) | a change PR before step 10 that makes the fields optional or splits a core `Request` | one change PR of unknown size that touches `filter_params`, so it must keep every digest existing callers write. The decision leaves: gate FV1 cannot see the news skeleton as separate until the split |
+| `FV-Q11` | the filings alerts are further rules in the one rules file, tested where the deployable-level files are tested today | a rules file and test file of the context's own | a second file changes `newsvault-monitoring-check`, `prometheus.rule_files.yml`, row A1 and `monitoring.rs` (§12.1) |
+| `FV-Q9` | three items carried from the reviewed design: `--section-text` refused on an unmeasured cut; a kept probe that re-fetches a seeded 100 stored documents a quarter; exit 1 = "the answer is no" for `filings show` and `ledger check` | — | the re-fetch probe is the only measurement of how often SEC changes an accepted document |
