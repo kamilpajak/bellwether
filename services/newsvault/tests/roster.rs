@@ -22,7 +22,7 @@ use newsvault::store::{Committer, COMMIT_LOG, RUNS_DIR};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 use tempfile::TempDir;
-use vault_core::blobs::BlobStore;
+use vault_core::blobs::{BlobStore, WritePolicy};
 
 mod loopback;
 
@@ -241,7 +241,7 @@ fn a_roster_fetch_keeps_the_file_as_received_under_one_attempt_after_its_robots(
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     let digest = FileDigest::of(ROSTER_BODY);
-    let blobs = BlobStore::new(root.path().join("blobs"));
+    let blobs = BlobStore::new(root.path().join("blobs"), WritePolicy::RawUntilDictionary);
     let kept = blobs
         .named(&raw_blob)
         .map(|named| blobs.read_verified(&named));

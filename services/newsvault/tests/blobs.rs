@@ -299,6 +299,41 @@ fn verify_reads_every_compressed_blob_back_and_matches_every_row() -> TestResult
     Ok(())
 }
 
+/// A frame behind a header naming no dictionary is a sound blob, counted under `zstd` and
+/// under the `null` dictionary. Mutation 2026-11-26, `split_header` refusing a header that names
+/// none: red.
+#[test]
+fn verify_reads_every_frame_written_without_a_dictionary() -> TestResult {
+    let (root, pages) = legacy_store()?;
+    let compressed = newsvault(root.path(), &["blobs", "compress", "--allow-no-dictionary"])?;
+    let output = newsvault(root.path(), &["blobs", "verify"])?;
+    let report = answered(&output)?;
+    let count = u64::try_from(pages.len())?;
+    assert_eq!(
+        (
+            compressed.status.code(),
+            output.status.code(),
+            report["verified"].as_u64(),
+            report["by_encoding"]["zstd"]["blobs"].as_u64(),
+            report["by_encoding"]["raw"].is_null(),
+            report["by_dictionary"]
+                .as_array()
+                .map(|rows| (rows.len(), rows[0]["dictionary"].is_null())),
+            report["by_dictionary"][0]["blobs"].as_u64(),
+        ),
+        (
+            Some(0),
+            Some(0),
+            Some(count),
+            Some(count),
+            true,
+            Some((1, true)),
+            Some(count),
+        )
+    );
+    Ok(())
+}
+
 /// Exit 1 is the answer no: a blob that no longer decodes, or a row whose length is not its
 /// payload's. Mutation 2026-11-21, `is_sound` ignoring `length_differs`: red.
 #[test]

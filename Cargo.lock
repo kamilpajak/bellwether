@@ -2119,6 +2119,7 @@ version = "0.1.0"
 dependencies = [
  "const-hex",
  "rusqlite",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror",

@@ -1,9 +1,10 @@
 //! The content-addressed payload store: architecture.md section 2's "Content-addressed blobs"
 //! and section 3.9's L2 layer. A blob is written, fsynced and renamed BEFORE any transaction
 //! opens, so a crash leaves an unreferenced file and never an index row about a missing one.
-//! The digest is over the payload as received; the file holds it raw (written before the first
-//! dictionary is active) or as one zstd frame under `<digest>.zst`. The `.zst` layout, the level
-//! and how a dictionary is named: architecture.md section 3.9, row "compression".
+//! The digest is over the payload as received; the file holds it raw or as one zstd frame under
+//! `<digest>.zst`, and which of the two a write leaves is the store's [`WritePolicy`]. The `.zst`
+//! layout, the level and how a dictionary is named: architecture.md section 3.9, row
+//! "compression".
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -48,6 +49,7 @@ const DIGEST_HEX: usize = 64;
 const SPACE_DIR: &str = "sha256";
 const DICTIONARY_DIR: &str = "dictionaries";
 const STAGING_PREFIX: &str = ".tmp-";
+const PLAIN_TAKES_NO_DICTIONARY: &str = "a store written as plain zstd frames takes no dictionary";
 
 /// Which file a blob is read from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -66,6 +68,18 @@ impl Encoding {
             Self::Zstd => "zstd",
         }
     }
+}
+
+/// What [`BlobStore::put`] writes, fixed when the store is opened: one store, one policy. A read
+/// opens every form under either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WritePolicy {
+    /// The payload's own bytes until a dictionary is active, then one frame under it:
+    /// architecture.md section 3.9.
+    RawUntilDictionary,
+    /// One frame with no dictionary, always; [`BlobStore::activate`] is refused: architecture.md
+    /// section 12.3, "Storage of a payload".
+    PlainZstd,
 }
 
 /// A dictionary as stored: its bytes, re-hashed to the name it was asked by.
@@ -166,6 +180,7 @@ struct Reader {
 pub struct BlobStore {
     /// `<store>/blobs`.
     root: PathBuf,
+    policy: WritePolicy,
     writer: RefCell<Writer>,
     reader: RefCell<Reader>,
 }
@@ -174,17 +189,19 @@ impl std::fmt::Debug for BlobStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BlobStore")
             .field("root", &self.root)
+            .field("policy", &self.policy)
             .field("dictionary", &self.active_dictionary())
             .finish_non_exhaustive()
     }
 }
 
 impl BlobStore {
-    /// The blob tree under `blobs`, `<store>/blobs`. Writes no dictionary until one is activated.
+    /// The blob tree under `blobs`, `<store>/blobs`, written under `policy`.
     #[must_use]
-    pub fn new(blobs: impl Into<PathBuf>) -> Self {
+    pub fn new(blobs: impl Into<PathBuf>, policy: WritePolicy) -> Self {
         Self {
             root: blobs.into(),
+            policy,
             writer: RefCell::new(Writer {
                 context: None,
                 dictionary: None,
@@ -231,7 +248,7 @@ impl BlobStore {
 
     /// Where the bytes land before the rename. Named by the run as well as the digest: a crash
     /// leaves this path behind and [`BlobStore::put`] refuses to reopen it.
-    pub fn staging_path(&self, run: &str, digest: &BlobDigest) -> PathBuf {
+    fn staging_path(&self, run: &str, digest: &BlobDigest) -> PathBuf {
         self.space()
             .join(format!("{STAGING_PREFIX}{run}-{}", digest.hex()))
     }
@@ -245,9 +262,10 @@ impl BlobStore {
     }
 
     /// Stores a payload under its own digest and returns it. A digest already held in either
-    /// form is not written again. Raw until a dictionary is active: `blobs compress` rewrites a
-    /// raw file and never a `.zst` one, so a frame written without a dictionary would keep the
-    /// weaker ratio for good (architecture.md section 3.9's level table, 2.99 against 7.49).
+    /// form is not written again. Under [`WritePolicy::RawUntilDictionary`], raw until a
+    /// dictionary is active: `blobs compress` rewrites a raw file and never a `.zst` one, so a
+    /// frame written without a dictionary would keep the weaker ratio for good (architecture.md
+    /// section 3.9's level table, 2.99 against 7.49).
     pub fn put(&self, run: &str, payload: &[u8]) -> Result<BlobDigest, BlobError> {
         let digest = BlobDigest(const_hex::encode(Sha256::digest(payload)));
         let held = self.listed(&digest);
@@ -255,7 +273,7 @@ impl BlobStore {
             return Ok(digest);
         }
         let staging = self.staging_path(run, &digest);
-        if self.active_dictionary().is_none() {
+        if self.policy == WritePolicy::RawUntilDictionary && self.active_dictionary().is_none() {
             return write_durably(&staging, &self.path_of(&digest), payload).map(|()| digest);
         }
         let encoded = self.encode(payload)?;
@@ -372,7 +390,13 @@ impl BlobStore {
     }
 
     /// The dictionary `put` compresses with from now on, held prepared for the whole process.
+    /// Refused under [`WritePolicy::PlainZstd`], whose frames name no dictionary.
     pub fn activate(&self, dictionary: &Dictionary) -> Result<(), BlobError> {
+        if self.policy == WritePolicy::PlainZstd {
+            return Err(
+                std::io::Error::new(ErrorKind::Unsupported, PLAIN_TAKES_NO_DICTIONARY).into(),
+            );
+        }
         let prepared = EncoderDictionary::try_copy(dictionary.bytes(), LEVEL)?;
         self.writer.borrow_mut().dictionary = Some((dictionary.hex().to_owned(), prepared));
         Ok(())
@@ -860,6 +884,8 @@ mod tests {
     type TestResult = Result<(), Box<dyn Error>>;
 
     const RUN: &str = "a-run";
+    const NEWS: WritePolicy = WritePolicy::RawUntilDictionary;
+    const SENTINEL: &[u8] = b"a staged file a crash left behind";
     const PAYLOAD: &[u8] =
         b"<html><body><p>One press release, as the server sent it.</p></body></html>";
     /// `ZSTD_MAGICNUMBER`, as it opens every zstd frame on disk.
@@ -905,7 +931,7 @@ mod tests {
     /// A valid `.zst` file holding `payload` with no dictionary, written at `path`.
     fn overwrite_compressed(path: &Path, payload: &[u8]) -> TestResult {
         let scratch = TempDir::new()?;
-        fs::write(path, BlobStore::new(scratch.path()).encode(payload)?)?;
+        fs::write(path, BlobStore::new(scratch.path(), NEWS).encode(payload)?)?;
         Ok(())
     }
 
@@ -922,7 +948,7 @@ mod tests {
 
     /// A store whose `put` compresses: a dictionary trained on fixtures, stored and active.
     fn compressing(temp: &TempDir) -> Result<BlobStore, Box<dyn Error>> {
-        let store = BlobStore::new(temp.path());
+        let store = BlobStore::new(temp.path(), NEWS);
         store.activate(&store.store_dictionary(RUN, &trained(&["prn", "gnw"])?)?)?;
         Ok(store)
     }
@@ -959,7 +985,7 @@ mod tests {
     #[test]
     fn before_a_dictionary_is_active_a_payload_is_stored_raw() -> TestResult {
         let temp = TempDir::new()?;
-        let store = BlobStore::new(temp.path());
+        let store = BlobStore::new(temp.path(), NEWS);
         let digest = store.put(RUN, PAYLOAD)?;
         assert_eq!(
             (
@@ -976,7 +1002,7 @@ mod tests {
     #[test]
     fn a_raw_file_holding_other_bytes_is_altered() -> TestResult {
         let temp = TempDir::new()?;
-        let store = BlobStore::new(temp.path());
+        let store = BlobStore::new(temp.path(), NEWS);
         let digest = write_raw(&store, PAYLOAD)?;
         fs::write(store.path_of(&digest), b"other bytes")?;
         let read = store.read_verified(&digest);
@@ -1012,7 +1038,7 @@ mod tests {
     #[test]
     fn with_both_files_a_reader_takes_the_raw_one() -> TestResult {
         let temp = TempDir::new()?;
-        let store = BlobStore::new(temp.path());
+        let store = BlobStore::new(temp.path(), NEWS);
         let digest = write_raw(&store, PAYLOAD)?;
         overwrite_compressed(&store.compressed_path_of(&digest), b"other bytes")?;
         assert_eq!(store.read_verified(&digest)?, PAYLOAD);
@@ -1118,12 +1144,12 @@ mod tests {
     #[test]
     fn a_blob_names_its_dictionary_and_another_handle_reads_it_back() -> TestResult {
         let temp = TempDir::new()?;
-        let writer = BlobStore::new(temp.path());
+        let writer = BlobStore::new(temp.path(), NEWS);
         let dictionary = writer.store_dictionary(RUN, &trained(&["prn", "gnw"])?)?;
         writer.activate(&dictionary)?;
         let page = fixtures("fed")?.concat();
         let digest = writer.put(RUN, &page)?;
-        let reader = BlobStore::new(temp.path());
+        let reader = BlobStore::new(temp.path(), NEWS);
         let back = reader.read_copy(&digest, Encoding::Zstd)?;
         assert_eq!(
             (back.dictionary.as_deref(), back.payload == page),
@@ -1137,12 +1163,12 @@ mod tests {
     #[test]
     fn a_blob_whose_dictionary_file_is_gone_is_dictionary_absent() -> TestResult {
         let temp = TempDir::new()?;
-        let writer = BlobStore::new(temp.path());
+        let writer = BlobStore::new(temp.path(), NEWS);
         let dictionary = writer.store_dictionary(RUN, &trained(&["prn", "gnw"])?)?;
         writer.activate(&dictionary)?;
         let digest = writer.put(RUN, PAYLOAD)?;
         fs::remove_file(writer.dictionary_path(dictionary.hex()))?;
-        let read = BlobStore::new(temp.path()).read_verified(&digest);
+        let read = BlobStore::new(temp.path(), NEWS).read_verified(&digest);
         assert!(
             matches!(&read, Err(BlobError::DictionaryAbsent { dictionary: named }) if named == dictionary.hex()),
             "{read:?}"
@@ -1154,7 +1180,7 @@ mod tests {
     #[test]
     fn a_dictionary_whose_bytes_changed_is_refused_by_its_digest() -> TestResult {
         let temp = TempDir::new()?;
-        let store = BlobStore::new(temp.path());
+        let store = BlobStore::new(temp.path(), NEWS);
         let dictionary = store.store_dictionary(RUN, &trained(&["prn", "gnw"])?)?;
         fs::write(store.dictionary_path(dictionary.hex()), b"changed")?;
         let loaded = store.load_dictionary(dictionary.hex());
@@ -1171,7 +1197,7 @@ mod tests {
     #[test]
     fn one_pass_reads_every_form_and_dictionary_version_exactly() -> TestResult {
         let temp = TempDir::new()?;
-        let store = BlobStore::new(temp.path());
+        let store = BlobStore::new(temp.path(), NEWS);
         let pages = fixtures("cnw")?;
         let raw = write_raw(&store, &pages[0])?;
         let plain = write_plain_frame(&store, &pages[1])?;
@@ -1226,7 +1252,7 @@ mod tests {
     #[test]
     fn compress_raw_replaces_the_raw_copy_with_one_that_reads_back() -> TestResult {
         let temp = TempDir::new()?;
-        let store = BlobStore::new(temp.path());
+        let store = BlobStore::new(temp.path(), NEWS);
         let digest = write_raw(&store, PAYLOAD)?;
         let rewritten = store.compress_raw(RUN, &digest)?;
         assert_eq!(
@@ -1272,7 +1298,7 @@ mod tests {
     fn a_leftover_compressed_copy_that_does_not_read_back_is_rewritten_from_the_raw_one(
     ) -> TestResult {
         let temp = TempDir::new()?;
-        let store = BlobStore::new(temp.path());
+        let store = BlobStore::new(temp.path(), NEWS);
         let altered = write_raw(&store, PAYLOAD)?;
         overwrite_compressed(&store.compressed_path_of(&altered), b"other bytes")?;
         let undecodable = write_raw(&store, b"a second page")?;
@@ -1305,7 +1331,7 @@ mod tests {
     fn a_write_that_cannot_rename_removes_its_staging_file() -> TestResult {
         use std::os::unix::fs::PermissionsExt as _;
         let temp = TempDir::new()?;
-        let store = BlobStore::new(temp.path());
+        let store = BlobStore::new(temp.path(), NEWS);
         let leaf = store
             .path_of(&BlobDigest(sha256(PAYLOAD)))
             .parent()
@@ -1328,7 +1354,7 @@ mod tests {
     #[test]
     fn a_raw_copy_removed_after_the_listing_is_read_from_the_compressed_one() -> TestResult {
         let temp = TempDir::new()?;
-        let store = BlobStore::new(temp.path());
+        let store = BlobStore::new(temp.path(), NEWS);
         let digest = write_raw(&store, PAYLOAD)?;
         let listed = store.listed(&digest);
         store.compress_raw(RUN, &digest)?;
@@ -1345,7 +1371,7 @@ mod tests {
     #[test]
     fn a_rewrite_stopped_before_the_removal_is_resumed() -> TestResult {
         let temp = TempDir::new()?;
-        let store = BlobStore::new(temp.path());
+        let store = BlobStore::new(temp.path(), NEWS);
         let digest = write_raw(&store, PAYLOAD)?;
         fs::write(store.compressed_path_of(&digest), store.encode(PAYLOAD)?)?;
         let listed = store.listing().collect::<Result<Vec<_>, _>>()?;
@@ -1371,12 +1397,62 @@ mod tests {
         Ok(())
     }
 
+    /// Architecture.md section 8 row R1's blob clause, for both policies. Mutation 2026-11-26,
+    /// `write_durably` staging through `File::create`: red.
+    #[test]
+    fn a_staging_path_that_already_exists_is_refused_rather_than_truncated() -> TestResult {
+        for policy in [NEWS, WritePolicy::PlainZstd] {
+            let temp = TempDir::new()?;
+            let store = BlobStore::new(temp.path(), policy);
+            let digest = BlobDigest(sha256(PAYLOAD));
+            let staging = store.staging_path(RUN, &digest);
+            fs::create_dir_all(store.space())?;
+            fs::write(&staging, SENTINEL)?;
+            let refused = store.put(RUN, PAYLOAD);
+            assert!(
+                matches!(&refused, Err(BlobError::Io(failure)) if failure.kind() == ErrorKind::AlreadyExists),
+                "{policy:?}: {refused:?}"
+            );
+            assert_eq!(
+                (fs::read(&staging)?, store.named(digest.hex())),
+                (SENTINEL.to_vec(), None),
+                "{policy:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A plain store's frames name no dictionary, so it takes none. Mutations 2026-11-26,
+    /// `activate` without its refusal, and `put` reading no policy: red, each.
+    #[test]
+    fn a_plain_store_refuses_a_dictionary_and_writes_a_frame_naming_none() -> TestResult {
+        let temp = TempDir::new()?;
+        let store = BlobStore::new(temp.path(), WritePolicy::PlainZstd);
+        let refused = store.activate(&store.store_dictionary(RUN, &trained(&["prn", "gnw"])?)?);
+        let digest = store.put(RUN, PAYLOAD)?;
+        let back = store.read_copy(&digest, Encoding::Zstd)?;
+        assert!(
+            matches!(&refused, Err(BlobError::Io(failure)) if failure.kind() == ErrorKind::Unsupported),
+            "{refused:?}"
+        );
+        assert_eq!(
+            (
+                store.active_dictionary(),
+                store.path_of(&digest).exists(),
+                back.dictionary,
+                back.payload,
+            ),
+            (None, false, None, PAYLOAD.to_vec())
+        );
+        Ok(())
+    }
+
     /// Under the lease every staging file is a leftover. Mutation 2026-11-21, the removal loop
     /// skipped: red.
     #[test]
     fn removing_staging_files_takes_them_from_both_directories() -> TestResult {
         let temp = TempDir::new()?;
-        let store = BlobStore::new(temp.path());
+        let store = BlobStore::new(temp.path(), NEWS);
         store.store_dictionary(RUN, b"a dictionary")?;
         let digest = BlobDigest(sha256(PAYLOAD));
         fs::create_dir_all(store.space())?;
@@ -1395,7 +1471,7 @@ mod tests {
     #[test]
     fn a_file_that_names_no_digest_is_listed_as_a_stray_and_the_walk_goes_on() -> TestResult {
         let temp = TempDir::new()?;
-        let store = BlobStore::new(temp.path());
+        let store = BlobStore::new(temp.path(), NEWS);
         let digest = store.put(RUN, PAYLOAD)?;
         let stray = store.space().join("00").join("00").join("notes.txt");
         if let Some(parent) = stray.parent() {

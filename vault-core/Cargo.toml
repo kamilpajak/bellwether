@@ -20,6 +20,7 @@ zstd = { version = "0.14.3", default-features = false }
 workspace = true
 
 [dev-dependencies]
+serde_json = "1.0.154"
 tempfile = "3.27.0"
 # The unit tests train a dictionary; the store itself never does.
 zstd = { version = "0.14.3", default-features = false, features = ["zdict_builder"] }
