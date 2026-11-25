@@ -112,7 +112,7 @@ pub fn bare_open_failure(root_manifest: &Path) -> Option<String> {
             "`{}` on {} code line(s) outside the one opener of {}:\n\n{}\n\n",
             "Why this matters: the image runs `--read-only`, and a sort that outgrows SQLite's ",
             "memory then\nfails with SQLITE_IOERR_GETTEMPPATH (6410) unless the connection keeps ",
-            "its temporary data in\nmemory. Open through the crate's `connect` instead.\n",
+            "its temporary data in\nmemory. Open through an opener's `connect` or `read_only` instead.\n",
             "A TEXT scan: it sees no constructor reached under another name. The invariant is ",
             "{}.\n",
         ),
@@ -138,7 +138,7 @@ mod tests {
         "[workspace]\nmembers = [\"services/newsvault\", \"vault-core\"]\nresolver = \"2\"\n";
     const READER: &str = "services/newsvault/src/cmd_new.rs";
     const OPENER: &str = "vault-core/src/sqlite.rs";
-    /// The opener's file until 2026-11-25; an open there is bare since.
+    /// A file of a store that is no opener: an open there is bare.
     const FORMER_OPENER: &str = "services/newsvault/src/store.rs";
     /// Written out, never built from [`OPEN`]: a narrowed constant must not narrow the fixture.
     const THREE_CONSTRUCTORS: &str = "fn read() {\n    \
