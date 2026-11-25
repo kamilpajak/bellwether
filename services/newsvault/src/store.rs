@@ -90,11 +90,11 @@ use news_provider::{
 use pit::datedness::{Datedness, Published};
 use pit::{ObservationTime, Visibility};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use vault_core::blobs::{BlobDigest, BlobStore, Dictionary};
 use vault_core::lease::Lease;
 use vault_core::sqlite::{connect, read_only};
 use vault_core::{BlobError, LeaseError};
 
-use crate::blobs::{BlobDigest, BlobStore, Dictionary};
 use crate::cmd_robots::ROBOTS_SOURCE;
 
 pub(crate) const LOCK_FILE: &str = "LOCK";

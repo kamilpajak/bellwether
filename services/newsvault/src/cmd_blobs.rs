@@ -10,9 +10,9 @@ use news_provider::RunId;
 use rusqlite::OptionalExtension;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
+use vault_core::blobs::{BlobStore, Encoding, Listed, ReadBack, LEVEL};
 use vault_core::BlobError;
 
-use crate::blobs::{BlobStore, Encoding, Listed, ReadBack, LEVEL};
 use crate::store::{self, Committer, DictionaryRow, StoreError, Trained, COMMIT_LOG};
 
 pub const VERIFY_SCHEMA: &str = "newsvault.blobs.verify/1";

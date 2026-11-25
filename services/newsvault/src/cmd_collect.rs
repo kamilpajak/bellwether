@@ -2270,7 +2270,7 @@ impl Committer {
                         url: &item.url,
                         valid,
                         title: &item.title,
-                        body_ref: body.as_ref().map(crate::blobs::BlobDigest::hex),
+                        body_ref: body.as_ref().map(vault_core::blobs::BlobDigest::hex),
                     }),
                 )?,
                 story_id: named(item, story_id(item.source.as_str(), &item.source_item_id))?,
