@@ -196,6 +196,8 @@ mod tests {
     use crate::tests::{manifest, root_manifest, Tree, INHERITS};
 
     const MAIN: &str = "services/newsvault/src/main.rs";
+    /// The module whose private field only `clap` fills.
+    const OPTION_MODULE: &str = "services/newsvault/src/pace_option.rs";
     const ONE_SERVICE: &str = "[workspace]\nmembers = [\"services/newsvault\"]\nresolver = \"2\"\n";
 
     fn here() -> (std::path::PathBuf, Vec<Member>) {
@@ -240,7 +242,7 @@ mod tests {
         let (root, members) = here();
         assert_eq!(
             resolved_roots(&root, &members).unwrap(),
-            (vec![MAIN.to_owned()], Vec::<String>::new())
+            (vec![OPTION_MODULE.to_owned()], Vec::<String>::new())
         );
     }
 

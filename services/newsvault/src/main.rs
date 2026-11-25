@@ -3,15 +3,17 @@
 //! Follows the repo's CLI contract: the result on stdout and nothing else, logs and errors on
 //! stderr, exactly one JSON value in JSON mode, and `schema` for a caller that is not human.
 
+mod pace_option;
+
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use news_provider::contact::{self, ContactError};
-use news_provider::{Clock, PaceRoot, PaceRootError, RunId, SystemClock};
+use news_provider::{Clock, RunId, SystemClock};
 use newsvault::cmd_blobs::{self, BlobsError};
 use newsvault::cmd_collect::{self, CollectRunError};
 use newsvault::cmd_cut::{self, CutError};
@@ -24,6 +26,7 @@ use newsvault::cmd_snapshot::{self, SnapshotError};
 use newsvault::lake::{Day, LakeError, LakeReader};
 use newsvault::publish::{publish_run, Fsync, PublishError};
 use newsvault::store::{Committer, StoreError};
+use pace_option::Pace;
 use pit::{Cutoff, ObservationTime};
 
 /// Exit codes, kept small and documented. Domain detail belongs in the error body.
@@ -405,58 +408,6 @@ enum DictionaryAction {
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
-}
-
-/// The option of every command that builds a `Wire` (architecture.md section 12.2).
-#[derive(clap::Args)]
-struct Pace {
-    /// The existing absolute directory whose pace/ holds this deployable's pace files, shared by
-    /// every command that sends. Defaults to the store. Refused while it is not the store and the
-    /// store's own pace/ still holds a file.
-    #[arg(long)]
-    pace_root: Option<PathBuf>,
-}
-
-impl Pace {
-    /// A refusal is written to stderr here, stdout left empty, and is the exit.
-    fn resolve(&self, store: &Path, format: Format) -> PaceRoot {
-        let refused = match PaceRoot::resolve(self.pace_root.as_deref(), store) {
-            Ok(root) => return root,
-            Err(refused) => refused,
-        };
-        let object = serde_json::json!({
-            "schema": "newsvault.error/1",
-            "code": refused.code(),
-            "message": refused.to_string(),
-            "retryable": false,
-            "details": {
-                "store": store.display().to_string(),
-                "pace_root": self.pace_root.as_ref().map(|root| root.display().to_string()),
-                "files": match &refused {
-                    PaceRootError::Split { files, .. } => files.clone(),
-                    _ => Vec::new(),
-                },
-            },
-            "suggestions": [],
-        });
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "reporting a refusal must not fail on a closed stderr; the exit code is the verdict"
-        )]
-        let _ = match format {
-            Format::Json => writeln!(std::io::stderr(), "{object}"),
-            Format::Human => writeln!(std::io::stderr(), "error: {refused} ({})", refused.code()),
-        };
-        std::process::exit(i32::from(refused.exit()));
-    }
-
-    /// The option as given, for an argv that suggests another sending command.
-    fn argv(&self) -> Vec<String> {
-        self.pace_root
-            .iter()
-            .flat_map(|root| ["--pace-root".to_owned(), root.display().to_string()])
-            .collect()
-    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -1634,8 +1585,10 @@ fn emit(day: &Day, before_cutoff: usize, format: Format) -> anyhow::Result<()> {
 /// One text for both `_FILE` variables, so the two cannot describe one rule two ways.
 const PACE_ROOT_DOC: &str = "an existing absolute directory whose pace/ holds the pace files of \
     every command of the deployable that sends; defaults to the store; relative or not a \
-    directory: invalid_argument (2); absent: input_absent (4); not the store while the store's \
-    own pace/ holds a file: pace_root_split (2)";
+    directory, or itself named pace: invalid_argument (2); absent: input_absent (4); not the \
+    store while the store's own pace/ holds a file, or its pace/ holding a directory: \
+    pace_root_split (2); unreadable: io_failed (2); never written by the check, so a root the run \
+    cannot write fails at the first reservation";
 const CONTACT_FILE_DOC: &str = "a file holding the contact instead, one trailing newline removed; \
     set with its variable: invalid_argument (2); absent: input_absent (4); unreadable or not UTF-8: \
     io_failed (2); empty: credential_contact_missing (2); a control character left: \
@@ -1813,10 +1766,12 @@ fn print_schema(format: Format) {
                 "exits": {
                     "0": "every row answered and every admitted pin matches",
                     "1": "every row answered and an admitted pin differs",
-                    "2": "invalid_argument (a source with no hosts file), an unparseable hosts or \
-                          rules file, credential_contact_missing, a store of another version or \
+                    "2": "invalid_argument (a source with no hosts file; a pace root that is relative, \
+                          no directory or itself named pace), pace_root_split, an unparseable hosts \
+                          or rules file, credential_contact_missing, a store of another version or \
                           shape, io",
-                    "4": "an absent hosts or rules file, or a hosts file admitting no host",
+                    "4": "an absent hosts or rules file or pace root (input_absent), or a hosts \
+                          file admitting no host",
                     "7": "every row failed transiently (vendor_unreachable), or another run holds \
                           the lease (lease_held)",
                     "8": "a row failed"
@@ -1850,7 +1805,8 @@ fn print_schema(format: Format) {
                 ],
                 "exits": {
                     "0": "every file answered usable",
-                    "2": "credential_contact_missing, a store of another version, io",
+                    "2": "credential_contact_missing, a store of another version, io, a pace root that is relative, no directory or itself named pace (invalid_argument), pace_root_split",
+                    "4": "input_absent: the pace root named does not exist",
                     "7": "every fetch failed transiently (vendor_unreachable), or another run holds the lease (lease_held)",
                     "8": "a file failed, was empty, was another shape, or was not asked"
                 },
