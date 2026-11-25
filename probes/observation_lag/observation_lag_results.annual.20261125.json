@@ -1,0 +1,355 @@
+{
+ "fetched_at": "2026-11-25T21:15:41.165626+00:00",
+ "construction": {
+  "registration": "probes/observation_lag/PREREGISTRATION.md",
+  "publication": "<ACCEPTANCE-DATETIME> parsed %Y%m%d%H%M%S in America/New_York",
+  "observation": "the vendor's stated last write of form.<day>.idx, the Last-Modified response header cross-read against the quarter listing",
+  "form_types": [
+   "10-K",
+   "10-KT",
+   "20-F",
+   "40-F",
+   "10-K/A",
+   "10-KT/A",
+   "20-F/A",
+   "40-F/A"
+  ],
+  "sample_rule": "row floor(i x n / 12) in index file order",
+  "scalar_definition": "the larger of the MAX of the per-filing lags and the per-day floor (sections dated 2026-11-25)",
+  "p90_definition": "index min(floor(0.9 x n), n - 1) ascending",
+  "tolerance_seconds": 60,
+  "rewrite_allowance_seconds": 86400,
+  "pace_seconds": 0.5,
+  "requests_spent": 26,
+  "budget": 30
+ },
+ "days": [
+  {
+   "day": "2026-11-10",
+   "rows_in_index": 5429,
+   "rows_of_form": 11,
+   "rows_of_form_off_day": 0,
+   "bytes_downloaded": 1057192,
+   "bytes_vendor_stated": "1033 KB",
+   "write_instant_header": "2026-11-11T03:01:42+00:00",
+   "write_instant_listing": "2026-11-11T03:01:42+00:00",
+   "last_data_received": "Nov 10, 2026",
+   "filings": [
+    {
+     "accession": "0001493152-26-050839",
+     "cik": "1889106",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T02:56:01+00:00",
+     "form": "10-K",
+     "lag_seconds": 86741
+    },
+    {
+     "accession": "0001628280-26-072846",
+     "cik": "1829311",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T22:23:39+00:00",
+     "form": "10-K",
+     "lag_seconds": 16683
+    },
+    {
+     "accession": "0001193125-26-455474",
+     "cik": "1734713",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T21:12:59+00:00",
+     "form": "10-K",
+     "lag_seconds": 20923
+    },
+    {
+     "accession": "0001995920-26-000017",
+     "cik": "1995920",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T21:25:34+00:00",
+     "form": "10-K",
+     "lag_seconds": 20168
+    },
+    {
+     "accession": "0000004127-26-000055",
+     "cik": "4127",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T21:17:18+00:00",
+     "form": "10-K",
+     "lag_seconds": 20664
+    },
+    {
+     "accession": "0001368458-26-000020",
+     "cik": "1368458",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T21:02:38+00:00",
+     "form": "10-K",
+     "lag_seconds": 21544
+    },
+    {
+     "accession": "0001260221-26-000077",
+     "cik": "1260221",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T21:05:52+00:00",
+     "form": "10-K",
+     "lag_seconds": 21350
+    },
+    {
+     "accession": "0001517413-26-000357",
+     "cik": "1517413",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T22:28:01+00:00",
+     "form": "10-K/A",
+     "lag_seconds": 16421
+    },
+    {
+     "accession": "0001999371-26-025091",
+     "cik": "883107",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T21:35:43+00:00",
+     "form": "10-K/A",
+     "lag_seconds": 19559
+    },
+    {
+     "accession": "0001999371-26-025093",
+     "cik": "883107",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T21:38:01+00:00",
+     "form": "10-K/A",
+     "lag_seconds": 19421
+    },
+    {
+     "accession": "0001185185-26-005280",
+     "cik": "1993097",
+     "filed": "20261110",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-10T21:11:23+00:00",
+     "form": "20-F",
+     "lag_seconds": 21019
+    }
+   ],
+   "rows_by_form": {
+    "10-K": 7,
+    "10-KT": 0,
+    "20-F": 1,
+    "40-F": 0,
+    "10-K/A": 3,
+    "10-KT/A": 0,
+    "20-F/A": 0,
+    "40-F/A": 0
+   },
+   "write_instant_used": "both, 0 s apart",
+   "lags": [
+    86741,
+    16683,
+    20923,
+    20168,
+    20664,
+    21544,
+    21350,
+    16421,
+    19559,
+    19421,
+    21019
+   ]
+  },
+  {
+   "day": "2026-11-12",
+   "rows_in_index": 7805,
+   "rows_of_form": 12,
+   "rows_of_form_off_day": 0,
+   "bytes_downloaded": 1520327,
+   "bytes_vendor_stated": "1485 KB",
+   "write_instant_header": "2026-11-13T03:02:22+00:00",
+   "write_instant_listing": "2026-11-13T03:02:22+00:00",
+   "last_data_received": "Nov 12, 2026",
+   "filings": [
+    {
+     "accession": "0000879407-26-000078",
+     "cik": "879407",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T21:02:24+00:00",
+     "form": "10-K",
+     "lag_seconds": 21598
+    },
+    {
+     "accession": "0000876523-26-000076",
+     "cik": "876523",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T11:06:35+00:00",
+     "form": "10-K",
+     "lag_seconds": 57347
+    },
+    {
+     "accession": "0001193125-26-458439",
+     "cik": "886206",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T21:15:52+00:00",
+     "form": "10-K",
+     "lag_seconds": 20790
+    },
+    {
+     "accession": "0001493152-26-051370",
+     "cik": "1482554",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T21:00:50+00:00",
+     "form": "10-K",
+     "lag_seconds": 21692
+    },
+    {
+     "accession": "0000833444-26-000108",
+     "cik": "833444",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T15:24:06+00:00",
+     "form": "10-K",
+     "lag_seconds": 41896
+    },
+    {
+     "accession": "0001493594-26-000044",
+     "cik": "1493594",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T21:02:06+00:00",
+     "form": "10-K",
+     "lag_seconds": 21616
+    },
+    {
+     "accession": "0001644378-26-000026",
+     "cik": "1644378",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T21:22:09+00:00",
+     "form": "10-K",
+     "lag_seconds": 20413
+    },
+    {
+     "accession": "0001024478-26-000048",
+     "cik": "1024478",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T16:35:11+00:00",
+     "form": "10-K",
+     "lag_seconds": 37631
+    },
+    {
+     "accession": "0000829224-26-000162",
+     "cik": "829224",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T21:06:55+00:00",
+     "form": "10-K",
+     "lag_seconds": 21327
+    },
+    {
+     "accession": "0001493152-26-051297",
+     "cik": "1703073",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T16:26:56+00:00",
+     "form": "10-K",
+     "lag_seconds": 38126
+    },
+    {
+     "accession": "0001493152-26-051471",
+     "cik": "2076975",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T22:01:19+00:00",
+     "form": "20-F",
+     "lag_seconds": 18063
+    },
+    {
+     "accession": "0001292814-26-005235",
+     "cik": "2081206",
+     "filed": "20261112",
+     "filed_off_day": false,
+     "accepted_at": "2026-11-12T11:08:23+00:00",
+     "form": "20-F/A",
+     "lag_seconds": 57239
+    }
+   ],
+   "rows_by_form": {
+    "10-K": 10,
+    "10-KT": 0,
+    "20-F": 1,
+    "40-F": 0,
+    "10-K/A": 0,
+    "10-KT/A": 0,
+    "20-F/A": 1,
+    "40-F/A": 0
+   },
+   "write_instant_used": "both, 0 s apart",
+   "lags": [
+    21598,
+    57347,
+    20790,
+    21692,
+    41896,
+    21616,
+    20413,
+    37631,
+    21327,
+    38126,
+    18063,
+    57239
+   ]
+  }
+ ],
+ "verdict": {
+  "max_lag_seconds": 86741,
+  "floor_seconds": {
+   "2026-11-10": 79302,
+   "2026-11-12": 79342
+  },
+  "scalar_set_by": "max_lag",
+  "registered": {
+   "probe_id": "edgar_index_write_annual-20261125",
+   "probes": 23,
+   "leaks": 0,
+   "seconds": 86741
+  },
+  "band": "24 h - 7 d",
+  "meaning": "backfill permitted only with the session shift written into the panel; no day column may mix backfilled and live items",
+  "median_seconds": 21327,
+  "p90_seconds": 57239,
+  "p90_band": "<= 24 h",
+  "p90_would_have_left_above_it": 2,
+  "max_seconds": 86741,
+  "probes": 23,
+  "requested": 23,
+  "per_day": [
+   {
+    "day": "2026-11-10",
+    "probes": 11,
+    "write_instant": "both, 0 s apart",
+    "median_seconds": 20664,
+    "p90_seconds": 21544,
+    "max_seconds": 86741,
+    "rows_of_form": 11,
+    "rows_of_form_off_day": 0
+   },
+   {
+    "day": "2026-11-12",
+    "probes": 12,
+    "write_instant": "both, 0 s apart",
+    "median_seconds": 21692,
+    "p90_seconds": 57239,
+    "max_seconds": 57347,
+    "rows_of_form": 12,
+    "rows_of_form_off_day": 0
+   }
+  ]
+ }
+}

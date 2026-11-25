@@ -460,3 +460,88 @@ SEC_CONTACT='<name and address>' python3 -I probes/observation_lag/probe.py \
 
 - Not changed by this section: the script computes no floor without `--forms`, and no file or number of the two `8-K` runs moves.
 - The same test on it: 94,922 s is above 79,302 s and above 79,342 s, by 15,620 s and 15,580 s. By this test the `8-K` scalar dated no on-time row of those two days before its index was written.
+
+## 2026-11-25, the annual-forms run
+
+- The run the two sections above register. Made 2026-11-25T21:15:41Z (`fetched_at`), with `probe.py` as committed (last change `36be857`, the floor), after both sections were on the main branch (`390532a` the registration, `1b1369f` the floor):
+
+```
+SEC_CONTACT='<name and address>' python3 -I probes/observation_lag/probe.py \
+  --days 2026-11-10 2026-11-12 --forms annual
+```
+
+- 26 requests of the registered 30: 1 quarter listing, 2 daily indexes, 11 and 12 documents.
+- No refusal code was reached; the run registered.
+- Which file is which:
+
+| file | run |
+|---|---|
+| `observation_lag_results.annual.20261125.json` | this run, under the name the script gave it |
+| not committed | `quarter_index.2026Q4.annual.20261125.json`, the quarter listing as this run received it, 185 items; nothing reads it, and the two write instants taken from it are `write_instant_listing` in the results file |
+
+### The two index files, a third read
+
+| quantity, per index file | `form.20261110.idx` | `form.20261112.idx` | against the reads of 2026-11-13 and 2026-11-25T20:48Z |
+|---|---|---|---|
+| write instant, `Last-Modified` header | 2026-11-11T03:01:42Z | 2026-11-13T03:02:22Z | equal |
+| write instant, quarter listing | 2026-11-11T03:01:42Z | 2026-11-13T03:02:22Z | equal; 0 s from the header |
+| bytes downloaded | 1,057,192 | 1,520,327 | equal |
+| rows of all forms | 5,429 | 7,805 | equal |
+| floor: write instant minus the day's start in `America/New_York` | 79,302 s | 79,342 s | the bounds the floor section computed from the earlier reads |
+
+### The rows
+
+| quantity | 2026-11-10 | 2026-11-12 | construction |
+|---|---|---|---|
+| rows of the eight forms | 11 of 5,429 | 12 of 7,805 | first token of the row matched exactly, `rows_of_form` |
+| `10-K` | 7 | 10 | `rows_by_form` |
+| `10-K/A` | 3 | 0 | `rows_by_form` |
+| `20-F` | 1 | 1 | `rows_by_form` |
+| `20-F/A` | 0 | 1 | `rows_by_form` |
+| `10-KT`, `40-F`, `10-KT/A`, `40-F/A` | 0 each | 0 each | `rows_by_form` |
+| rows whose `Date Filed` is not the index's own day | 0 of 11 | 0 of 12 | `rows_of_form_off_day` |
+| sampled | all 11, each once | 12, rows 0 to 11 | the under-12 rule; at `n = 12` the spacing rule names every row |
+| usable | 11 | 12 | sampled documents that answered with an acceptance field |
+| median | 20,664 s | 21,692 s | index `floor(0.5 × n)` ascending |
+| p90 | 21,544 s | 57,239 s | index `min(floor(0.9 × n), n − 1)` ascending |
+| max | 86,741 s | 57,347 s | one write instant per day |
+
+- Probes by form, both days: `10-K` 17, `10-K/A` 3, `20-F` 2, `20-F/A` 1; 23 in all.
+- No probe: `10-KT`, `40-F`, `10-KT/A`, `40-F/A`, absent from both indexes. The registered lag dates them by the registration's pooling and not by a row.
+
+### The verdict
+
+| quantity | value | construction |
+|---|---|---|
+| registered `seconds` | **86,741 s = 24.09 h** | the larger of (a) the MAX of 23 per-filing lags over 2 days, 86,741 s, and (b) the floor, 79,342 s; `scalar_set_by` is `max_lag` |
+| the filing that set it | accession `0001493152-26-050839`, a `10-K` in the 2026-11-10 index | accepted 2026-11-10T02:56:01Z, which is 21:56:01 on 2026-11-09 in `America/New_York`; `Date Filed` 20261110 |
+| (a) above (b) | by 7,439 s (2026-11-10's floor) and 7,399 s (2026-11-12's) | no shortfall |
+| band | **24 h – 7 d** | the band table, read off the registered scalar; 341 s above 24 h |
+| `probe_id` | `edgar_index_write_annual-20261125` | the UTC date of the run |
+| `probes` / `leaks` | 23 / 0 | 23 of 23 sampled documents answered with an acceptance field; 0 because the scalar is at least the max |
+| median | 21,327 s = 5.92 h | the 23 lags, index 11 ascending |
+| p90, which decides nothing | 57,239 s = 15.90 h | the 23 lags, index `min(floor(0.9 × 23), 22)` = 20 ascending; band ≤ 24 h |
+| above the p90 | 2 of 23: 57,347 s and 86,741 s | what a p90 rule would have dated early |
+
+- The outcome, by the registration's table: "registered, 24 h – 7 d": the entry for (`edgar_filings`, `vendor_archive`) is written, with the session shift written into any panel built on it.
+- The entry: `probe_id` `edgar_index_write_annual-20261125`, `probes` 23, `leaks` 0, `seconds` 86,741.
+- `services/filingvault/policy/observation-lag.json` is not created here: nothing in the tree reads it yet (`docs/design/architecture.md` §12.3, §12.8).
+- `news-provider/policy/observation-lag.json` is not edited.
+
+### Beside the 8-K scalar
+
+| family | scalar | lags | set by a filing accepted |
+|---|---|---|---|
+| `8-K`, second run 2026-11-25 | 94,922 s | 24 | 2026-11-10T00:39:40Z (first run's results file) |
+| annual forms | 86,741 s | 23 | 2026-11-10T02:56:01Z |
+
+- The annual scalar is 8,181 s below the `8-K` one.
+- Both maxima subtract from the same write instant, 2026-11-11T03:01:42Z, so the 8,181 s is the distance between the two acceptance instants.
+- The two are not pooled: neither entry borrows the other's number or probe id.
+
+### What the run did not reach
+
+- Every refusal code stayed closed: both statements of the write instant were served on both days and agreed, both days carried rows of these forms, every sampled document answered, every lag was positive, both write instants sat inside the allowance.
+- The 12-or-more spacing rule beyond `n = 12`: one day had 11 rows and the other exactly 12.
+- A late row: 0 of 23 rows carried a `Date Filed` other than its index's day.
+- Everything "What this run cannot settle" and "What the floor covers and what it does not" list, the shortfall bullet aside.
