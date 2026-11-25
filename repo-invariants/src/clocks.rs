@@ -1,5 +1,5 @@
 //! The no-clock grep: `docs/design/architecture.md` section 8 row R4's clock clause, over the
-//! provider crates and the seam crate outside its `wire` and `clock` modules. A text scan, which
+//! provider crates, `pit` and the seam crate outside its `wire` and `clock` modules. A text scan, which
 //! is the gate shape this project otherwise refuses - it ships because it has a named mutation
 //! that turns it red (`adding_a_clock_read_to_a_provider_crate_turns_the_grep_red`), and because
 //! the thing it protects is a signature: no `Provider` method is handed an instant it did not
@@ -15,6 +15,9 @@ pub const CLOCK_READS: [&str; 4] = ["Utc::now", "Local::now", "SystemTime::now",
 
 /// The crate that owns the socket, and therefore the two instants either side of it.
 const SEAM_CRATE: &str = "news-provider";
+/// The crate of the two time types, which holds the archive observation rule since section 12.8
+/// step 6 and is handed every instant it works from.
+const TIME_CRATE: &str = "pit";
 /// Where an adapter crate lives. A member under this prefix is scanned without being named here,
 /// so a second provider is covered by existing on disk.
 const PROVIDER_DIR: &str = "providers/";
@@ -39,7 +42,7 @@ fn scanned(members: &[Member]) -> Vec<&str> {
     members
         .iter()
         .map(|member| member.path.as_str())
-        .filter(|path| *path == SEAM_CRATE || path.starts_with(PROVIDER_DIR))
+        .filter(|path| *path == SEAM_CRATE || *path == TIME_CRATE || path.starts_with(PROVIDER_DIR))
         .collect()
 }
 
@@ -170,8 +173,8 @@ mod tests {
         assert!(failure.is_empty(), "\n\n{failure}\n");
     }
 
-    /// The gate's reach, asserted rather than assumed: the seam crate and every member under
-    /// `providers/`, and nothing else. A second provider is covered by existing.
+    /// The gate's reach, asserted rather than assumed: the seam crate, `pit` and every member
+    /// under `providers/`, and nothing else. A second provider is covered by existing.
     #[test]
     fn the_scan_covers_the_seam_crate_and_every_provider_member() {
         let members = resolve_members(&root_manifest()).unwrap();
@@ -179,6 +182,7 @@ mod tests {
             scanned(&members),
             vec![
                 "news-provider",
+                "pit",
                 "providers/edgar-press",
                 "providers/open-web-feed",
                 "providers/sec-edgar"
