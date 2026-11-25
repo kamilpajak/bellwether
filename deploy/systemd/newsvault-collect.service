@@ -14,15 +14,19 @@ ExecStartPre=/bin/sh -c 'test "$$(timedatectl show --property=NTPSynchronized --
 # --pull never: the image is pulled at install, so no run spends its window on a registry.
 # --mount, not --volume: --volume creates a missing host path as a root-owned directory, and the
 # run then fails on it until root removes it; --mount refuses the run instead (docker's docs).
+# /shared is the deployable's pace root (architecture.md section 12.2): every unit that sends
+# mounts it and names it, which repo-invariants holds.
 ExecStart=/usr/bin/flock --nonblock --conflict-exit-code 7 %t/bellwether-store.lock \
     /usr/bin/docker run --rm --name newsvault-collect --pull never \
     --user %U:%G --read-only --tmpfs /tmp:rw,size=16m \
     --cap-drop ALL --security-opt no-new-privileges \
     --mount type=bind,src=%h/.bellwether/vault,dst=/vault \
+    --mount type=bind,src=%h/.bellwether/shared,dst=/shared \
     --mount type=bind,src=%h/.config/bellwether/feed-contact,dst=/run/secrets/feed-contact,readonly \
     --env BELLWETHER_FEED_CONTACT_FILE=/run/secrets/feed-contact \
     ${NEWSVAULT_IMAGE} \
     collect --source open_web_wires --window today --schedule open_web --expected-runs 31 \
+    --pace-root /shared \
     --hosts /usr/share/bellwether/open_web_wires.hosts.json \
     --rules /usr/share/bellwether/open-web-feed.rules.json \
     --non-interactive --format json

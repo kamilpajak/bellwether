@@ -12,6 +12,18 @@ spec:
     requests:
       storage: 20Gi
 ---
+# The deployable's pace root (architecture.md section 12.2): outside the store, mounted by every
+# job that sends.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bellwether-shared
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 16Mi
+---
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -57,6 +69,7 @@ spec:
                 - |
                   /usr/local/bin/newsvault collect --source open_web_wires --window today \
                     --schedule open_web --expected-runs 31 \
+                    --pace-root /shared \
                     --hosts /usr/share/bellwether/open_web_wires.hosts.json \
                     --rules /usr/share/bellwether/open-web-feed.rules.json \
                     --non-interactive --format json
@@ -74,6 +87,8 @@ spec:
               volumeMounts:
                 - name: vault
                   mountPath: /vault
+                - name: shared
+                  mountPath: /shared
                 - name: feed-contact
                   mountPath: /run/secrets/bellwether
                   readOnly: true
@@ -83,6 +98,9 @@ spec:
             - name: vault
               persistentVolumeClaim:
                 claimName: bellwether-vault
+            - name: shared
+              persistentVolumeClaim:
+                claimName: bellwether-shared
             - name: feed-contact
               secret:
                 secretName: bellwether-feed-contact
@@ -139,6 +157,7 @@ spec:
                 - |
                   /usr/local/bin/newsvault collect --source open_web_wires --window today \
                     --schedule open_web --expected-runs 31 \
+                    --pace-root /shared \
                     --hosts /usr/share/bellwether/open_web_wires.hosts.json \
                     --rules /usr/share/bellwether/open-web-feed.rules.json \
                     --non-interactive --format json
@@ -156,6 +175,8 @@ spec:
               volumeMounts:
                 - name: vault
                   mountPath: /vault
+                - name: shared
+                  mountPath: /shared
                 - name: feed-contact
                   mountPath: /run/secrets/bellwether
                   readOnly: true
@@ -165,6 +186,9 @@ spec:
             - name: vault
               persistentVolumeClaim:
                 claimName: bellwether-vault
+            - name: shared
+              persistentVolumeClaim:
+                claimName: bellwether-shared
             - name: feed-contact
               secret:
                 secretName: bellwether-feed-contact

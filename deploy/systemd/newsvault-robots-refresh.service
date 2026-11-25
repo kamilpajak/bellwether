@@ -13,10 +13,11 @@ ExecStart=/usr/bin/flock --nonblock --conflict-exit-code 7 %t/bellwether-store.l
     --user %U:%G --read-only --tmpfs /tmp:rw,size=16m \
     --cap-drop ALL --security-opt no-new-privileges \
     --mount type=bind,src=%h/.bellwether/vault,dst=/vault \
+    --mount type=bind,src=%h/.bellwether/shared,dst=/shared \
     --mount type=bind,src=%h/.config/bellwether/feed-contact,dst=/run/secrets/feed-contact,readonly \
     --env BELLWETHER_FEED_CONTACT_FILE=/run/secrets/feed-contact \
     ${NEWSVAULT_IMAGE} \
-    robots refresh --source open_web_wires \
+    robots refresh --source open_web_wires --pace-root /shared \
     --hosts /usr/share/bellwether/open_web_wires.hosts.json \
     --rules /usr/share/bellwether/open-web-feed.rules.json \
     --non-interactive --format json

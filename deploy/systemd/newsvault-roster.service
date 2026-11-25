@@ -15,10 +15,11 @@ ExecStart=/usr/bin/flock --nonblock --conflict-exit-code 7 %t/bellwether-store.l
     --user %U:%G --read-only --tmpfs /tmp:rw,size=16m \
     --cap-drop ALL --security-opt no-new-privileges \
     --mount type=bind,src=%h/.bellwether/vault,dst=/vault \
+    --mount type=bind,src=%h/.bellwether/shared,dst=/shared \
     --mount type=bind,src=%h/.config/bellwether/feed-contact,dst=/run/secrets/feed-contact,readonly \
     --env BELLWETHER_FEED_CONTACT_FILE=/run/secrets/feed-contact \
     ${NEWSVAULT_IMAGE} \
-    roster fetch --non-interactive --format json
+    roster fetch --pace-root /shared --non-interactive --format json
 # The input of NewsvaultRosterFailed and NewsvaultRosterMissed; first and `-`, as the collect unit's.
 ExecStopPost=-%h/.local/lib/bellwether/newsvault-unit-result roster
 ExecStopPost=/bin/sh -c 'if [ "$$SERVICE_RESULT" = timeout ]; then /usr/bin/docker rm --force newsvault-roster; fi'

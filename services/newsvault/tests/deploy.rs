@@ -779,7 +779,8 @@ fn the_collect_container_is_removed_read_only_unprivileged_and_never_pulled() ->
     let expected = format!(
         "{STORE_LOCK} /usr/bin/docker run --rm --name <name> --pull never --user %U:%G \
          --read-only --tmpfs /tmp:rw,size=16m --cap-drop ALL --security-opt no-new-privileges \
-         --mount type=bind,src=%h/.bellwether/vault,dst=/vault {CONTACT_MOUNT} \
+         --mount type=bind,src=%h/.bellwether/vault,dst=/vault \
+         --mount type=bind,src=%h/.bellwether/shared,dst=/shared {CONTACT_MOUNT} \
          --env BELLWETHER_FEED_CONTACT_FILE=/run/secrets/feed-contact"
     );
     assert_eq!(shape.join(" "), expected);
@@ -908,7 +909,7 @@ fn each_kubernetes_job_maps_exit_8_to_0_and_holds_its_limits() -> TestResult {
             .and_then(|line| line.strip_prefix("- name: "))
             .unwrap_or_default();
         let named = format!("containerName: {container}");
-        let runs: [&[&str]; 10] = [
+        let runs: [&[&str]; 11] = [
             &["concurrencyPolicy: Forbid"],
             &["startingDeadlineSeconds: 60"],
             &["backoffLimit: 0"],
@@ -935,6 +936,7 @@ fn each_kubernetes_job_maps_exit_8_to_0_and_holds_its_limits() -> TestResult {
                 "mountPath: /run/secrets/bellwether",
                 "readOnly: true",
             ],
+            &["- name: shared", "mountPath: /shared"],
         ];
         missing.push(
             runs.iter()
@@ -2489,9 +2491,17 @@ fn the_roster_bound_is_each_requests_patience_plus_two_minutes_and_exit_8_fails(
             0,
             0,
             true,
-            ["roster", "fetch", "--non-interactive", "--format", "json"]
-                .map(str::to_owned)
-                .to_vec(),
+            [
+                "roster",
+                "fetch",
+                "--pace-root",
+                "/shared",
+                "--non-interactive",
+                "--format",
+                "json",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
         )
     );
     Ok(())

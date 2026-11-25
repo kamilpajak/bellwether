@@ -25,6 +25,7 @@ pub mod dictionaries;
 pub mod doctests;
 pub mod layout;
 pub mod line_ends;
+pub mod pace_roots;
 pub mod sinks;
 pub mod sockets;
 pub mod temp_store;
