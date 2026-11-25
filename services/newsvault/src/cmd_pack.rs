@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
+use vault_core::blobs::BlobStore;
 use vault_core::BlobError;
 
-use crate::blobs::BlobStore;
 use crate::store::{self, StoreError};
 
 pub const SCHEMA: &str = "newsvault.blobs.pack/1";

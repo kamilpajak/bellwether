@@ -17,5 +17,3 @@ pub mod publish;
 pub mod robots;
 pub mod schedule;
 pub mod store;
-
-pub use vault_core::blobs;

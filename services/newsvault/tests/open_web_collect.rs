@@ -16,7 +16,6 @@ use news_provider::{
     Exit, Headers, LedgerError, PlanRefusal, RawResponse, Request, RunId, SendFailure, SendPermit,
     Sink, SourceId, TargetWindow, TransportError,
 };
-use newsvault::blobs;
 use newsvault::cmd_collect::{self, Ask, CollectRunError};
 use newsvault::cmd_items::{self, PerStory};
 use newsvault::store::{Committer, StoreError, COMMIT_LOG, RUNS_DIR, SCHEMA_VERSION};
@@ -25,6 +24,7 @@ use pit::ObservationTime;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 use tempfile::TempDir;
+use vault_core::blobs;
 
 mod loopback;
 mod seed;

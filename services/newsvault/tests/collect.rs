@@ -1032,7 +1032,7 @@ fn every_body_an_edgar_run_stores_is_indexed_and_linked_to_its_attempt() -> Test
             for file in std::fs::read_dir(second?.path())? {
                 let name = file?.file_name().to_string_lossy().into_owned();
                 on_disk.insert(
-                    name.strip_suffix(newsvault::blobs::COMPRESSED_SUFFIX)
+                    name.strip_suffix(vault_core::blobs::COMPRESSED_SUFFIX)
                         .unwrap_or(&name)
                         .to_owned(),
                 );

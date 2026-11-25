@@ -14,7 +14,6 @@ use news_provider::{
     BudgetError, Clock, Exchange, Exit, Headers, RawResponse, Request, RunId, SendFailure,
     SendPermit, TransportError, TransportKind,
 };
-use newsvault::blobs::BlobStore;
 use newsvault::cmd_collect::Registered;
 use newsvault::cmd_ledger;
 use newsvault::cmd_robots::ROBOTS_SOURCE;
@@ -23,6 +22,7 @@ use newsvault::store::{Committer, COMMIT_LOG, RUNS_DIR};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 use tempfile::TempDir;
+use vault_core::blobs::BlobStore;
 
 mod loopback;
 
