@@ -2963,7 +2963,11 @@ fn polled_twice_through_a_redirect(moved_body: MovedBody) -> Result<TwoPolls, Bo
     };
     let exchange = loopback::Relay {
         stub: &gnw,
-        wire: cmd_collect::wire_for(&ask, &opened),
+        wire: cmd_collect::wire_for(
+            &ask,
+            &opened,
+            &news_provider::PaceRoot::resolve(None, &ask.store)?,
+        ),
         relayed: BTreeMap::from([(redirected.clone(), server.url(&moved))]),
         asked: RefCell::default(),
     };
@@ -3157,7 +3161,11 @@ fn relayed<'stub>(
     let opened = cmd_collect::open_provider(&ask)?;
     Ok(loopback::Relay {
         stub,
-        wire: cmd_collect::wire_for(&ask, &opened),
+        wire: cmd_collect::wire_for(
+            &ask,
+            &opened,
+            &news_provider::PaceRoot::resolve(None, &ask.store)?,
+        ),
         relayed: BTreeMap::from([(release_url(0)?, to)]),
         asked: RefCell::default(),
     })

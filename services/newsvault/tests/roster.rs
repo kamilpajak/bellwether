@@ -11,8 +11,8 @@ use canon::FileDigest;
 use chrono::{DateTime, Utc};
 use chrono::{SecondsFormat, TimeDelta};
 use news_provider::{
-    BudgetError, Clock, Exchange, Exit, Headers, RawResponse, Request, RunId, SendFailure,
-    SendPermit, TransportError, TransportKind,
+    BudgetError, Clock, Exchange, Exit, Headers, PaceRoot, RawResponse, Request, RunId,
+    SendFailure, SendPermit, TransportError, TransportKind,
 };
 use newsvault::cmd_collect::Registered;
 use newsvault::cmd_ledger;
@@ -515,23 +515,25 @@ fn an_empty_contact_and_a_dry_run_ask_nothing_and_write_nothing() -> TestResult 
 
 /// Through the real `Wire`: SEC's transport, and SEC's per-IP pace file shared with edgar-press,
 /// never one of the roster's own (section 8 row R19). Mutation 2026-11-23, `wire_for` built with
-/// `ROSTER_SOURCE`: red.
+/// `ROSTER_SOURCE`: red. The files are under the pace root named and none is in the store
+/// (section 12.2).
 #[test]
 fn a_roster_fetch_through_the_wire_pays_into_edgar_press_s_per_ip_pace() -> TestResult {
-    let root = TempDir::new()?;
+    let (root, shared) = (TempDir::new()?, TempDir::new()?);
     let server = loopback::Loopback::redirecting("/never", ROSTER_BODY.to_vec())?;
     let stub = Stub::sec(ROBOTS_BODY, b"");
     let ask = ask(root.path());
+    let pace_root = PaceRoot::resolve(Some(shared.path()), root.path())?;
     let exchange = loopback::Relay {
         stub: &stub,
-        wire: cmd_roster::wire_for(&ask),
+        wire: cmd_roster::wire_for(&ask, &pace_root),
         relayed: BTreeMap::from([(FILE_URL.to_owned(), server.url("/files/roster.json"))]),
         asked: RefCell::new(Vec::new()),
     };
     let answer = cmd_roster::run(&ask, &exchange, &Set::at(FIRST_RUN)?)?;
     let (sent, seen) = (exchange.sent(), server.seen()?);
     server.finish()?;
-    let pace = root.path().join("pace");
+    let pace = shared.path().join("pace");
     assert_eq!(
         (
             answer.exit,
@@ -540,12 +542,14 @@ fn a_roster_fetch_through_the_wire_pays_into_edgar_press_s_per_ip_pace() -> Test
             pace.join(format!("{}.per-ip", edgar_press::SOURCE))
                 .exists(),
             pace.join(format!("{ROSTER_SOURCE}.per-ip")).exists(),
+            root.path().join("pace").exists(),
         ),
         (
             Exit::Ok,
             vec![ROBOTS_URL.to_owned(), FILE_URL.to_owned()],
             vec!["/files/roster.json".to_owned()],
             true,
+            false,
             false
         )
     );

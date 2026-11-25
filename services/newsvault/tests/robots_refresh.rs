@@ -460,7 +460,11 @@ fn refreshed_through_a_redirect(body_over_the_limit: bool) -> Result<Refreshed, 
     let unanswered = Robots::of(&[]);
     let exchange = loopback::Relay {
         stub: &unanswered,
-        wire: cmd_robots::wire_for(&ask, &feed),
+        wire: cmd_robots::wire_for(
+            &ask,
+            &feed,
+            &news_provider::PaceRoot::resolve(None, &ask.store)?,
+        ),
         relayed: BTreeMap::from([(GNW_ROBOTS.to_owned(), server.url(ROBOTS_PATH))]),
         asked: RefCell::default(),
     };
@@ -595,7 +599,11 @@ fn a_robots_refresh_and_a_collect_on_one_store_reserve_one_pace_file_per_host() 
     let unanswered = Robots::of(&[]);
     let by_robots = loopback::Relay {
         stub: &unanswered,
-        wire: cmd_robots::wire_for(&ask, &feed),
+        wire: cmd_robots::wire_for(
+            &ask,
+            &feed,
+            &news_provider::PaceRoot::resolve(None, &ask.store)?,
+        ),
         relayed: relayed.clone(),
         asked: RefCell::default(),
     };
@@ -621,7 +629,11 @@ fn a_robots_refresh_and_a_collect_on_one_store_reserve_one_pace_file_per_host() 
     let opened = newsvault::cmd_collect::open_provider(&collect_ask)?;
     let by_collect = loopback::Relay {
         stub: &unanswered,
-        wire: newsvault::cmd_collect::wire_for(&collect_ask, &opened),
+        wire: newsvault::cmd_collect::wire_for(
+            &collect_ask,
+            &opened,
+            &news_provider::PaceRoot::resolve(None, &collect_ask.store)?,
+        ),
         relayed,
         asked: RefCell::default(),
     };

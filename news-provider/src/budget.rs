@@ -141,8 +141,8 @@ pub enum BudgetError {
     NeverCleared { tries: u32, owed: Duration },
 }
 
-/// The directory the pace file sits in, under the store root the run writes to.
-const PACE_DIR: &str = "pace";
+/// The directory the pace files sit in, under the pace root the `Wire` is given.
+pub(crate) const PACE_DIR: &str = "pace";
 
 /// One bucket's next-allowed-call instant, on disk.
 #[derive(Debug)]

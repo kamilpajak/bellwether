@@ -4,14 +4,14 @@
 //! stderr, exactly one JSON value in JSON mode, and `schema` for a caller that is not human.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use news_provider::contact::{self, ContactError};
-use news_provider::{Clock, RunId, SystemClock};
+use news_provider::{Clock, PaceRoot, PaceRootError, RunId, SystemClock};
 use newsvault::cmd_blobs::{self, BlobsError};
 use newsvault::cmd_collect::{self, CollectRunError};
 use newsvault::cmd_cut::{self, CutError};
@@ -122,6 +122,8 @@ enum Command {
         expected_runs: u32,
         #[arg(long)]
         store: Option<PathBuf>,
+        #[command(flatten)]
+        pace: Pace,
         /// The session calendar, hashed: a non-session day is zero requests. Required for
         /// edgar_press, refused for open_web_wires.
         #[arg(long)]
@@ -270,6 +272,8 @@ enum RobotsAction {
         rules: PathBuf,
         #[arg(long)]
         store: Option<PathBuf>,
+        #[command(flatten)]
+        pace: Pace,
         /// Plans one url per row and mutates nothing.
         #[arg(long)]
         dry_run: bool,
@@ -288,6 +292,8 @@ enum RosterAction {
     Fetch {
         #[arg(long)]
         store: Option<PathBuf>,
+        #[command(flatten)]
+        pace: Pace,
         /// Plans one url per file and mutates nothing.
         #[arg(long)]
         dry_run: bool,
@@ -399,6 +405,50 @@ enum DictionaryAction {
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
+}
+
+/// The option of every command that builds a `Wire` (architecture.md section 12.2).
+#[derive(clap::Args)]
+struct Pace {
+    /// The existing absolute directory whose pace/ holds this deployable's pace files, shared by
+    /// every command that sends. Defaults to the store. Refused while it is not the store and the
+    /// store's own pace/ still holds a file.
+    #[arg(long)]
+    pace_root: Option<PathBuf>,
+}
+
+impl Pace {
+    /// A refusal is written to stderr here, stdout left empty, and is the exit.
+    fn resolve(&self, store: &Path, format: Format) -> PaceRoot {
+        let refused = match PaceRoot::resolve(self.pace_root.as_deref(), store) {
+            Ok(root) => return root,
+            Err(refused) => refused,
+        };
+        let object = serde_json::json!({
+            "schema": "newsvault.error/1",
+            "code": refused.code(),
+            "message": refused.to_string(),
+            "retryable": false,
+            "details": {
+                "store": store.display().to_string(),
+                "pace_root": self.pace_root.as_ref().map(|root| root.display().to_string()),
+                "files": match &refused {
+                    PaceRootError::Split { files, .. } => files.clone(),
+                    _ => Vec::new(),
+                },
+            },
+            "suggestions": [],
+        });
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "reporting a refusal must not fail on a closed stderr; the exit code is the verdict"
+        )]
+        let _ = match format {
+            Format::Json => writeln!(std::io::stderr(), "{object}"),
+            Format::Human => writeln!(std::io::stderr(), "error: {refused} ({})", refused.code()),
+        };
+        std::process::exit(i32::from(refused.exit()));
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -616,6 +666,7 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
             schedule,
             expected_runs,
             store,
+            pace,
             calendar,
             listing,
             roster,
@@ -650,8 +701,9 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 deadline: deadline.map(|raw| instant(&raw, "--deadline")),
                 dry_run,
             };
+            let pace_root = pace.resolve(&ask.store, format);
             let opened = cmd_collect::open_provider(&ask)?;
-            let wire = cmd_collect::wire_for(&ask, &opened);
+            let wire = cmd_collect::wire_for(&ask, &opened, &pace_root);
             let answer = match cmd_collect::run(&ask, &opened, &wire, &clock) {
                 Ok(answer) => answer,
                 Err(refused) => {
@@ -679,6 +731,7 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                     hosts,
                     rules,
                     store,
+                    pace,
                     dry_run,
                     non_interactive: _,
                     format,
@@ -693,8 +746,9 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
                 contact: contact(registered)?,
                 dry_run,
             };
+            let pace_root = pace.resolve(&ask.store, format);
             let feed = cmd_robots::open(&ask)?;
-            let wire = cmd_robots::wire_for(&ask, &feed);
+            let wire = cmd_robots::wire_for(&ask, &feed, &pace_root);
             let answer = cmd_robots::run(&ask, &feed, &wire, &SystemClock)?;
             match answer.emitted(std::env::args().collect()) {
                 cmd_robots::Emitted::Stdout(report) => emit_robots(&report, format)?,
@@ -838,6 +892,7 @@ fn run_roster(action: RosterAction) -> anyhow::Result<Verdict> {
     match action {
         RosterAction::Fetch {
             store,
+            pace,
             dry_run,
             non_interactive: _,
             format,
@@ -847,7 +902,8 @@ fn run_roster(action: RosterAction) -> anyhow::Result<Verdict> {
                 contact: contact(cmd_collect::Registered::OpenWebWires)?,
                 dry_run,
             };
-            let wire = cmd_roster::wire_for(&ask);
+            let pace_root = pace.resolve(&ask.store, format);
+            let wire = cmd_roster::wire_for(&ask, &pace_root);
             let answer = cmd_roster::run(&ask, &wire, &SystemClock)?;
             match answer.error_object(std::env::args().collect()) {
                 None => emit_value(&answer.report, format, cmd_roster::render_human)?,
@@ -1566,6 +1622,10 @@ fn emit(day: &Day, before_cutoff: usize, format: Format) -> anyhow::Result<()> {
 }
 
 /// One text for both `_FILE` variables, so the two cannot describe one rule two ways.
+const PACE_ROOT_DOC: &str = "an existing absolute directory whose pace/ holds the pace files of \
+    every command of the deployable that sends; defaults to the store; relative or not a \
+    directory: invalid_argument (2); absent: input_absent (4); not the store while the store's \
+    own pace/ holds a file: pace_root_split (2)";
 const CONTACT_FILE_DOC: &str = "a file holding the contact instead, one trailing newline removed; \
     set with its variable: invalid_argument (2); absent: input_absent (4); unreadable or not UTF-8: \
     io_failed (2); empty: credential_contact_missing (2); a control character left: \
@@ -1633,6 +1693,7 @@ fn print_schema(format: Format) {
                     {"name": "schedule", "type": "string"},
                     {"name": "expected_runs", "type": "integer", "default": 1},
                     {"name": "store", "type": "path"},
+                    {"name": "pace_root", "type": "path", "doc": PACE_ROOT_DOC},
                     {"name": "calendar", "type": "path", "required_for": ["edgar_press"],
                      "refused_for": ["open_web_wires"]},
                     {"name": "listing", "type": "path", "required_for": ["edgar_press"],
@@ -1718,6 +1779,7 @@ fn print_schema(format: Format) {
                      "doc": "every row, admitted and candidate, is asked once; the file is never written"},
                     {"name": "rules", "type": "path", "required": true},
                     {"name": "store", "type": "path"},
+                    {"name": "pace_root", "type": "path", "doc": PACE_ROOT_DOC},
                     {"name": "dry_run", "type": "flag",
                      "doc": "plans one url per row and mutates nothing"},
                     {"name": "non_interactive", "type": "flag",
@@ -1756,6 +1818,7 @@ fn print_schema(format: Format) {
                 "summary": "Fetches each roster file (SEC's company_tickers_exchange.json) once under an attempt row of source roster, after its host's robots.txt under one of source robots, and keeps the bytes and headers as an L2 payload. No item rows.",
                 "options": [
                     {"name": "store", "type": "path"},
+                    {"name": "pace_root", "type": "path", "doc": PACE_ROOT_DOC},
                     {"name": "dry_run", "type": "flag",
                      "doc": "plans one url per file and mutates nothing"},
                     {"name": "non_interactive", "type": "flag",
@@ -1986,7 +2049,8 @@ fn print_schema(format: Format) {
             {"code": "robots_refused", "exit": 2, "retryable": false},
             {"code": "provenance_unrecorded", "exit": 4, "retryable": false},
             {"code": "nothing_visible", "exit": 4, "retryable": false},
-            {"code": "staging_left", "exit": 2, "retryable": false}
+            {"code": "staging_left", "exit": 2, "retryable": false},
+            {"code": "pace_root_split", "exit": 2, "retryable": false}
         ],
         // Decision D1's companion rule, which `news_provider::Exit` holds as one function.
         "stdout_carries_the_result_for_exits": [0, 1, 8]

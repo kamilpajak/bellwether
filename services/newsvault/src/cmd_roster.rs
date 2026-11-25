@@ -10,8 +10,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use news_provider::robots::Robots;
 use news_provider::{
     AttemptSlot, Baseline, Clock, Counts, Credentials, Exchange, Exit, Headers, LedgerError,
-    Outcome, OutcomeKind, Payload, Provenance, RawResponse, Request, RequestPhase, RunId, SourceId,
-    Tally, TargetWindow, TransportError, TransportKind, TransportProfile, Verdict, Wire,
+    Outcome, OutcomeKind, PaceRoot, Payload, Provenance, RawResponse, Request, RequestPhase, RunId,
+    SourceId, Tally, TargetWindow, TransportError, TransportKind, TransportProfile, Verdict, Wire,
 };
 use pit::{Cutoff, ObservationTime, PitError, ValidTime, Visibility};
 use rusqlite::Connection;
@@ -165,11 +165,11 @@ pub fn transport() -> TransportProfile {
 /// SEC's transport, its contact under SEC's credential name, and SEC's per-IP pace file: the
 /// roster and `edgar_press` are one conversation with one vendor (section 8 row R19).
 #[must_use]
-pub fn wire_for(ask: &Ask) -> Wire {
+pub fn wire_for(ask: &Ask, pace_root: &PaceRoot) -> Wire {
     Wire::new(
         transport(),
         Credentials::default().with(sec_edgar::CONTACT_CREDENTIAL, ask.contact.clone()),
-        &ask.store,
+        pace_root,
         &SourceId::new(sec_edgar::PER_IP_BUCKET),
     )
 }

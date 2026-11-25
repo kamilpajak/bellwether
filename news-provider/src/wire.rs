@@ -22,6 +22,7 @@ use crate::budget::{
 };
 use crate::clock::{Clock, Sleeper, ThreadSleeper};
 use crate::ledger::{AttemptId, SendPermit};
+use crate::pace_root::PaceRoot;
 use crate::request::{CredentialRef, HeaderValue, Request, SourceId};
 
 /// ureq 3.5.2's nine timeout budgets. No `Default`: a provider states every one, so none is
@@ -456,8 +457,8 @@ pub struct Wire {
     credentials: Credentials,
     /// `None` when the profile states no per-IP pace.
     pace: Option<Pace>,
-    /// Where a per-host pace file is opened, one per remote host a request names.
-    store: PathBuf,
+    /// Where `pace/` is: one per-host file per remote host a request names (section 12.2).
+    pace_root: PathBuf,
     source: SourceId,
     sleeper: Box<dyn Sleeper>,
     /// Held in memory: one `Wire` is one run, and a second process sees only the host slot granted.
@@ -486,10 +487,16 @@ impl Wire {
     pub fn new(
         profile: TransportProfile,
         credentials: Credentials,
-        store: &Path,
+        pace_root: &PaceRoot,
         source: &SourceId,
     ) -> Self {
-        Self::with_sleeper(profile, credentials, store, source, Box::new(ThreadSleeper))
+        Self::with_sleeper(
+            profile,
+            credentials,
+            pace_root.path(),
+            source,
+            Box::new(ThreadSleeper),
+        )
     }
 
     /// The seam the suite needs to observe a wait without spending one. Not public: outside this
@@ -498,12 +505,12 @@ impl Wire {
     pub(crate) fn with_sleeper(
         profile: TransportProfile,
         credentials: Credentials,
-        store: &Path,
+        pace_root: &Path,
         source: &SourceId,
         sleeper: Box<dyn Sleeper>,
     ) -> Self {
         let pace = profile.budget.min_interval.map(|interval| {
-            Pace::beside_the_store(store, &BudgetScope::PerIp(source.clone()), interval)
+            Pace::beside_the_store(pace_root, &BudgetScope::PerIp(source.clone()), interval)
         });
         let timeouts = profile.timeouts;
         let config = ureq::Agent::config_builder()
@@ -530,7 +537,7 @@ impl Wire {
             profile,
             credentials,
             pace,
-            store: store.to_path_buf(),
+            pace_root: pace_root.to_path_buf(),
             source: source.clone(),
             sleeper,
             backoff: RefCell::default(),
@@ -719,8 +726,8 @@ impl Wire {
         };
         let interval = self.host_interval(host, ordinary);
         let scope = BudgetScope::PerHost(host.clone());
-        let pace = Pace::beside_the_store(&self.store, &scope, interval);
-        let held = Hold::beside_the_store(&self.store, host).until()?;
+        let pace = Pace::beside_the_store(&self.pace_root, &scope, interval);
+        let held = Hold::beside_the_store(&self.pace_root, host).until()?;
         let now = clock.now();
         self.note_hold(host, held, now);
         match pace.reserve_within(now, held, deadline, ordinary)? {
@@ -755,11 +762,19 @@ impl Wire {
         if let (Some(host), Some(ordinary)) = (host, self.profile.budget.per_host) {
             let scope = BudgetScope::PerHost(host.clone());
             let interval = self.host_interval(host, ordinary);
-            gates.push(SendGate::beside_the_store(&self.store, &scope, interval)?);
+            gates.push(SendGate::beside_the_store(
+                &self.pace_root,
+                &scope,
+                interval,
+            )?);
         }
         if let Some(interval) = self.profile.budget.min_interval {
             let scope = BudgetScope::PerIp(self.source.clone());
-            gates.push(SendGate::beside_the_store(&self.store, &scope, interval)?);
+            gates.push(SendGate::beside_the_store(
+                &self.pace_root,
+                &scope,
+                interval,
+            )?);
         }
         if gates.is_empty() {
             return Ok(clock.now());
@@ -819,7 +834,7 @@ impl Wire {
             });
         }
         self.note_hold(host, Some(held_until), received);
-        Hold::beside_the_store(&self.store, host).raise(held_until)
+        Hold::beside_the_store(&self.pace_root, host).raise(held_until)
     }
 
     /// The socket, and the only call to the agent. Between the two clock reads in [`Wire::send`],
@@ -3084,6 +3099,8 @@ mod tests {
     const ROW_OPENED_IN: Duration = Duration::from_millis(1_070);
     /// The first send's delay between its reservation and its socket, under the 100 ms per-IP pace.
     const IP_ROW_OPENED_IN: Duration = Duration::from_millis(60);
+    /// A second caller's interval, five of `TEST_INTERVAL`.
+    const SLOWER_INTERVAL: Duration = Duration::from_millis(500);
 
     /// The instant `send` stamped as `requested_at`, which the ledger keeps per attempt.
     fn requested_at(
@@ -3171,6 +3188,52 @@ mod tests {
         )?;
         let second = reserved_then_sent(&later_run, &clock, SECOND_ATTEMPT, LOCALHOST, NO_WAIT)?;
         assert_eq!((second - first).to_std()?, FLOOR);
+        Ok(())
+    }
+
+    /// SEC's shape, one interval for both paces, at the interval a caller states.
+    fn caller(root: &Path, interval: Duration, clock: &WaitedClock) -> Wire {
+        let mut stated = profile();
+        stated.budget = RequestBudget {
+            min_interval: Some(interval),
+            per_host: Some(interval),
+        };
+        let source = SourceId::new(SOURCE);
+        Wire::with_sleeper(stated, held(), root, &source, Box::new(clock.clone()))
+    }
+
+    /// The gap between one request of each of two callers, each over its own pace root.
+    fn gap_between(
+        first: (&Path, Duration),
+        second: (&Path, Duration),
+    ) -> Result<Duration, Box<dyn std::error::Error>> {
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let earlier = caller(first.0, first.1, &clock);
+        let later = caller(second.0, second.1, &clock);
+        let sent = reserved_then_sent(&earlier, &clock, FIRST_ATTEMPT, LOCALHOST, NO_WAIT)?;
+        let next = reserved_then_sent(&later, &clock, SECOND_ATTEMPT, LOCALHOST, NO_WAIT)?;
+        Ok((next - sent).to_std()?)
+    }
+
+    /// Section 12.2: two callers of one vendor at two intervals, under one per-IP bucket name.
+    /// Over one pace root the second request leaves the longer interval after the first, in
+    /// either order; over two roots it leaves at once, which is row R19's hole 2.
+    #[test]
+    fn two_callers_at_two_intervals_share_one_pace_root_and_neither_shortens_the_other() -> Checked
+    {
+        let roots = [(); 4].map(|()| tempfile::tempdir());
+        let [Ok(one), Ok(other), Ok(first_store), Ok(second_store)] = &roots else {
+            return Err("no pace root".into());
+        };
+        let (brisk, slow) = (TEST_INTERVAL, SLOWER_INTERVAL);
+        assert_eq!(
+            (
+                gap_between((one.path(), brisk), (one.path(), slow))?,
+                gap_between((other.path(), slow), (other.path(), brisk))?,
+                gap_between((first_store.path(), slow), (second_store.path(), brisk))?,
+            ),
+            (slow, slow, NO_WAIT)
+        );
         Ok(())
     }
 

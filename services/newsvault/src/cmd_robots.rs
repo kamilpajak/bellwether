@@ -12,9 +12,9 @@ use chrono::{DateTime, Utc};
 use news_provider::robots::{Reading, Robots, RobotsError as ParseError};
 use news_provider::{
     AttemptId, AttemptSlot, Baseline, BudgetError, Clock, Counts, Credentials, Exchange, Exit,
-    LedgerError, Outcome, OutcomeKind, Payload, Provenance, Provider, RawResponse, Request,
-    RequestPhase, RunId, SendFailure, SourceId, Tally, TargetWindow, TransportError, TransportKind,
-    Verdict, Wire,
+    LedgerError, Outcome, OutcomeKind, PaceRoot, Payload, Provenance, Provider, RawResponse,
+    Request, RequestPhase, RunId, SendFailure, SourceId, Tally, TargetWindow, TransportError,
+    TransportKind, Verdict, Wire,
 };
 use open_web_feed::{HostPin, OpenWebFeed};
 use pit::ObservationTime;
@@ -197,11 +197,11 @@ pub fn open(ask: &Ask) -> Result<OpenWebFeed, RobotsError> {
 /// collector's open-web profile, credential and pace files, so a robots fetch waits for the same
 /// per-host slots a collect run does.
 #[must_use]
-pub fn wire_for(ask: &Ask, feed: &OpenWebFeed) -> Wire {
+pub fn wire_for(ask: &Ask, feed: &OpenWebFeed, pace_root: &PaceRoot) -> Wire {
     Wire::new(
         feed.transport(),
         Credentials::default().with(Registered::OpenWebWires.credential(), ask.contact.clone()),
-        &ask.store,
+        pace_root,
         &feed.source(),
     )
 }
