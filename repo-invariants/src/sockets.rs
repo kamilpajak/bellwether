@@ -1,6 +1,7 @@
 //! The no-socket scan: `docs/design/architecture.md` section 8 row FV1. The store core names the
-//! standard library's socket module nowhere. A text scan over CODE lines of `vault-core/src`,
-//! because the module is reached with no manifest line: rows FV1 and R4 read manifests only.
+//! standard library's socket module nowhere. A text scan over CODE lines of every `.rs` file below
+//! `vault-core`, its build script and `tests/` included, because the module is reached with no
+//! manifest line: rows FV1 and R4 read manifests only.
 
 use std::path::Path;
 
@@ -32,16 +33,17 @@ fn names_the_module(line: &str) -> bool {
         .any(|word| word == SOCKET_MODULE)
 }
 
-/// Every code line under the store core's `src` naming [`SOCKET_MODULE`], test modules included.
+/// Every code line below the store core's directory naming [`SOCKET_MODULE`], test modules
+/// included.
 /// `Err` when the core is no member or holds no Rust file: a scan that read nothing found nothing.
 pub fn sockets_named(root: &Path, members: &[crate::Member]) -> Result<Vec<SocketNamed>, String> {
     let core = members
         .iter()
         .find(|member| member.path == STORE_CORE)
         .ok_or_else(|| format!("no workspace member is at `{STORE_CORE}`"))?;
-    let files = rust_files(&root.join(&core.path).join("src"))?;
+    let files = rust_files(&root.join(&core.path))?;
     if files.is_empty() {
-        return Err(format!("`{STORE_CORE}/src` holds no Rust file"));
+        return Err(format!("`{STORE_CORE}` holds no Rust file"));
     }
     let mut found = Vec::new();
     for file in files {
@@ -115,8 +117,9 @@ mod tests {
     }
 
     /// §8 row FV1's socket clause over this workspace. Mutations 2026-11-25, each red here:
-    /// `use std::net::TcpStream;` in `vault-core/src/lib.rs`; `use std::{fs, net};` in
-    /// `vault-core/src/lease.rs`; `std::os::unix::net::UnixStream` in a function of `sqlite.rs`.
+    /// `use std::net::TcpStream;` in `vault-core/src/lib.rs`, in a new `vault-core/build.rs` and
+    /// in a new `vault-core/tests/wire.rs`; `use std::{fs, net};` in `vault-core/src/lease.rs`;
+    /// `std::os::unix::net::UnixStream` in a function of `sqlite.rs`.
     #[test]
     fn the_store_core_names_the_socket_module_on_no_code_line() {
         let failure = socket_failure(&root_manifest()).unwrap_or_default();
@@ -128,11 +131,15 @@ mod tests {
         let tree = core_and_seam();
         tree.write("vault-core/src/wire.rs", FIVE_LINES);
         tree.write("news-provider/src/wire.rs", FIVE_LINES);
+        tree.write("vault-core/build.rs", FIVE_LINES);
+        tree.write("vault-core/tests/wire.rs", FIVE_LINES);
         let failure = socket_failure(&tree.root_manifest()).expect("expected a failure");
         let named = [1, 2, 3, 4, 5].map(|line| failure.contains(&format!("src/wire.rs:{line}")));
+        let outside_src = ["vault-core/build.rs:1", "vault-core/tests/wire.rs:1"]
+            .map(|place| failure.contains(place));
         assert_eq!(
-            (named, failure.contains("news-provider/src")),
-            ([true, true, true, false, false], false),
+            (named, outside_src, failure.contains("news-provider/src")),
+            ([true, true, true, false, false], [true, true], false),
             "{failure}"
         );
     }
