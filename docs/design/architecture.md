@@ -5580,6 +5580,18 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
   | 100 ms × 30 beside 500 ms × 30, no delay | 98.5 ms |
   | two 100 ms senders, 60 ms delay | 74.6 ms |
   | two 100 ms senders, no delay | 21.9 ms |
+- The acceptance rule for the send gate's fix, written 2026-11-26 before the fixed gate ran. `k` processes share one bucket; `d` is a sender's own interval for it.
+  - The instrument: `news-provider/tests/shared_bucket.rs`, its `measure` test, release build, development Mac; one OS process per sender through `Wire::new`, `Wire::reserve` and `Wire::send`, a per-IP and a per-host pace at the sender's interval, one fresh pace root, a loopback listener whose accepting thread polls `accept` without sleeping and stamps when it returns.
+  - The runs, each as `interval × sends, delay between reservation and send`: 100 ms × 300 alone; two of 100 ms × 300, delay 0 and 60 ms; 100 ms × 80 beside 500 ms × 30, delay 0 and 60 ms; three of 100 ms × 200, delay 0; two of 100 ms × 300 beside 500 ms × 60, delay 60 ms; two of 100 ms × 200 beside 500 ms × 20 whose delay is 650 ms, hosts only.
+
+  | rule | accepted when |
+  |---|---|
+  | A1, no refusal | 0 sends refused `NeverCleared` in every run. The one condition left for it: the clock read does not pass the wait the gate took, `GATE_TRIES` times in a row, which no other sender can cause |
+  | A2, the wait at the gate, from entering `Wire::send` to the stamp | at most the sum of the `k` senders' intervals plus 20 ms per sender (the others ahead, each holding the gate for at most its own interval, then the sender's own) when the kernel grants the lock in arrival order. `flock` does not promise that order, so: no send above twice that bound, and the count above it is published |
+  | A3, stamps | every two consecutive `requested_at` through the bucket are at least the later sender's `d` apart, to the microsecond, in every run |
+  | A4, arrivals | every two consecutive `accept` stamps are at least the later sender's `d` less 14.8 ms apart. 14.8 ms is the largest spread (max less min, within one run) of accept-stamp less `requested_at` on the gate BEFORE the fix: 0.244 ms to 15.056 ms in the first of two runs of one sender alone, over 9 runs and 3,625 sends |
+  | A5, a sender killed with `-9` | holding the gate's lock in its wait: the next sender is granted the lock by the kernel at the death and stamps after at most its own `d`; asserted as an ordering, the survivor's first stamp after the kill and all its sends made. Holding a reserved pace slot: unchanged, the others queue behind that slot, one interval of the dead sender |
+  | A6, one process | the `.sent` and pace files hold the same bytes, and a send takes the same clock reads and waits: every test of `wire.rs` and `budget.rs` green with no assertion changed |
 
 | not in this step | state |
 |---|---|
