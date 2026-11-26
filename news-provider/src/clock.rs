@@ -1,6 +1,9 @@
-//! The one clock this seam reads, injected, and the one wait it takes. `Utc::now` is called here
-//! and nowhere else in the crate: `Wire::send` is handed a `&dyn Clock` and no other method takes
-//! one, so a provider cannot read an instant even by accident.
+//! The one clock this seam reads, injected, and the wait a pace or a stamp owes (`Sleeper`).
+//! `Utc::now` is called here and nowhere else in the crate: `Wire::send` is handed a `&dyn Clock`
+//! and no other method takes one, so a provider cannot read an instant even by accident.
+//!
+//! Through neither: the bounded wait for a send gate's lock, `recv_timeout` in
+//! `budget::lock_within`, a timed wait inside std (architecture.md section 8, rows R4 and R19).
 
 use std::time::Duration;
 
