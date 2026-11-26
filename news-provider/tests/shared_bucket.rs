@@ -11,7 +11,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -228,6 +228,7 @@ fn start(sender: Sender, port: u16, root: &Path) -> Checked<Running> {
     let child = Command::new(std::env::current_exe()?)
         .args(["--exact", SENDER_TEST, "--nocapture"])
         .env(SENDER, spec)
+        .stdout(Stdio::null())
         .spawn()?;
     Ok(Running(child))
 }
