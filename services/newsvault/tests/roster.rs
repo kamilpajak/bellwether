@@ -565,17 +565,17 @@ fn the_schema_lists_gate_refused_with_the_exit_and_retryable_a_refused_run_repor
         .args(["schema", "--format", "json"])
         .output()?;
     let schema: Value = serde_json::from_slice(&printed.stdout)?;
-    let refusal = RobotsError::GateRefused {
+    let refusal = RosterError::Robots(RobotsError::GateRefused {
         attempt_id: "an attempt".to_owned(),
         why: BudgetError::NeverCleared {
             tries: 8,
             owed: SEC_INTERVAL,
         },
-    };
-    let object = refusal.gate_refusal(Vec::new()).unwrap_or_default();
+    });
+    let (object, exit) = refusal.ended_at_the_gate(Vec::new()).unwrap_or_default();
     let listed = json!({
         "code": object["code"],
-        "exit": RosterError::Robots(refusal).exit(),
+        "exit": exit,
         "retryable": object["retryable"],
     });
     let named_at_seven = |command: &[&str]| {
@@ -634,11 +634,11 @@ fn a_roster_fetch_whose_send_the_gate_refuses_ends_retryable_with_its_attempt_cl
     drop(held);
     let seen = server.seen()?;
     server.finish()?;
-    let object = match &refused {
-        Some(RosterError::Robots(refusal)) => refusal.gate_refusal(vec!["again".to_owned()]),
-        _ => None,
-    }
-    .unwrap_or_default();
+    let (object, exit) = refused
+        .as_ref()
+        .and_then(|refusal| refusal.ended_at_the_gate(vec!["again".to_owned()]))
+        .unwrap_or_default();
+    let human = newsvault::cmd_robots::human_error(&object);
     let db = read_only(root.path())?;
     let attempts: Vec<ClosedAttempt> = db
         .prepare(
@@ -668,7 +668,9 @@ fn a_roster_fetch_whose_send_the_gate_refuses_ends_retryable_with_its_attempt_cl
     )?)?;
     assert_eq!(
         (
-            refused.as_ref().map(RosterError::exit),
+            exit,
+            human.starts_with("error: gate_refused (retryable true): the send gate refused")
+                && human.contains(&gate.display().to_string()),
             (
                 object["code"].clone(),
                 object["retryable"].clone(),
@@ -685,7 +687,8 @@ fn a_roster_fetch_whose_send_the_gate_refuses_ends_retryable_with_its_attempt_cl
             run_file["refused"].clone(),
         ),
         (
-            Some(7),
+            7,
+            true,
             (json!("gate_refused"), json!(true), json!([["again"]]), true),
             Vec::new(),
             2,

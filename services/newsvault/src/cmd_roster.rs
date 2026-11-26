@@ -120,8 +120,19 @@ pub enum RosterError {
 }
 
 impl RosterError {
-    /// The section 5.1 exit: `input_absent` 4, `lease_held` and `gate_refused` 7; `credential_contact_missing`,
-    /// `input_unparseable`, `input_schema_mismatch` and `io_failed` 2.
+    /// How a run the send gate ended is reported, `None` for any other error: the object of
+    /// [`RobotsError::ended_at_the_gate`], and this error's own exit.
+    #[must_use]
+    pub fn ended_at_the_gate(&self, argv: Vec<String>) -> Option<(Value, u8)> {
+        let Self::Robots(refused) = self else {
+            return None;
+        };
+        let (object, _) = refused.ended_at_the_gate(argv)?;
+        Some((object, self.exit()))
+    }
+
+    /// The section 5.1 exit: `input_absent` 4, `lease_held` and `gate_refused` 7;
+    /// `credential_contact_missing`, `input_unparseable`, `input_schema_mismatch` and `io_failed` 2.
     #[must_use]
     pub const fn exit(&self) -> u8 {
         match self {
@@ -264,19 +275,22 @@ pub fn run(ask: &Ask, exchange: &dyn Exchange, clock: &dyn Clock) -> Result<Answ
     };
     let fetched = fetch_each(&mut store, exchange, clock, &run, &hosts);
     // Finished and marked, as a run the lease kept out is: the first refusal ends the run, since
-    // every later request would wait at the same per-IP gate.
+    // every later request would wait at the same per-IP gate. Any other error leaves the run
+    // file unfinished, as `cmd_robots::run` does.
     let refused = matches!(
         fetched,
         Err(RosterError::Robots(RobotsError::GateRefused { .. }))
     );
-    write_envelope(
-        &ask.store,
-        &Envelope {
-            finished_at: Some(clock.now()),
-            refused: refused.then(|| cmd_robots::GATE_REFUSED.to_owned()),
-            ..envelope
-        },
-    )?;
+    if fetched.is_ok() || refused {
+        write_envelope(
+            &ask.store,
+            &Envelope {
+                finished_at: Some(clock.now()),
+                refused: refused.then(|| cmd_robots::GATE_REFUSED.to_owned()),
+                ..envelope
+            },
+        )?;
+    }
     let (robots, files) = fetched?;
     Ok(answer_of(ask, &run_id, started, &robots, &files))
 }

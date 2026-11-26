@@ -710,7 +710,12 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
             let wire = cmd_robots::wire_for(&ask, &feed, &pace_root);
             let answer = match cmd_robots::run(&ask, &feed, &wire, &SystemClock) {
                 Ok(answer) => answer,
-                Err(refused) => return gate_refused(refused, format),
+                Err(failed) => {
+                    return match failed.ended_at_the_gate(std::env::args().collect()) {
+                        Some(ended) => gate_refused(&ended, format),
+                        None => Err(failed.into()),
+                    }
+                }
             };
             match answer.emitted(std::env::args().collect()) {
                 cmd_robots::Emitted::Stdout(report) => emit_robots(&report, format)?,
@@ -868,8 +873,12 @@ fn run_roster(action: RosterAction) -> anyhow::Result<Verdict> {
             let wire = cmd_roster::wire_for(&ask, &pace_root);
             let answer = match cmd_roster::run(&ask, &wire, &SystemClock) {
                 Ok(answer) => answer,
-                Err(RosterError::Robots(refused)) => return gate_refused(refused, format),
-                Err(other) => return Err(other.into()),
+                Err(failed) => {
+                    return match failed.ended_at_the_gate(std::env::args().collect()) {
+                        Some(ended) => gate_refused(&ended, format),
+                        None => Err(failed.into()),
+                    }
+                }
             };
             match answer.error_object(std::env::args().collect()) {
                 None => emit_value(&answer.report, format, cmd_roster::render_human)?,
@@ -1080,16 +1089,13 @@ fn emit_robots(report: &serde_json::Value, format: Format) -> anyhow::Result<()>
     Ok(())
 }
 
-/// A run the send gate ended: section 5.1's `gate_refused` on stderr, stdout empty, exit 7. Any
-/// other error of the command goes on to `main` as it did.
-fn gate_refused(refused: RobotsError, format: Format) -> anyhow::Result<Verdict> {
-    match refused.gate_refusal(std::env::args().collect()) {
-        Some(object) => {
-            emit_robots_error(&object, format)?;
-            Ok(Verdict::No(cmd_robots::GATE_REFUSED_EXIT))
-        }
-        None => Err(refused.into()),
-    }
+/// A run the send gate ended: the command's own object on stderr, stdout empty, and its exit.
+fn gate_refused(
+    (object, exit): &(serde_json::Value, u8),
+    format: Format,
+) -> anyhow::Result<Verdict> {
+    emit_robots_error(object, format)?;
+    Ok(Verdict::No(*exit))
 }
 
 /// Exit 7, every row failed transiently: the report rides the error object, never stdout.
@@ -1098,12 +1104,7 @@ fn emit_robots_error(object: &serde_json::Value, format: Format) -> anyhow::Resu
     let mut err = err.lock();
     match format {
         Format::Json => writeln!(err, "{object}")?,
-        Format::Human => writeln!(
-            err,
-            "error: {} (retryable {})",
-            object["code"].as_str().unwrap_or_default(),
-            object["retryable"]
-        )?,
+        Format::Human => writeln!(err, "{}", cmd_robots::human_error(object))?,
     }
     Ok(())
 }
@@ -1698,9 +1699,12 @@ fn print_schema(format: Format) {
                              dry_run, after the clock's now (else invalid_argument); a request whose pace slot opens later is not \
                              asked and is a deferred row (run_deadline, or host_held when a \
                              server's hold or slow-down moved it), with the rest of its host's \
-                             queue; a send the send gate refuses, which waits for no lock past \
-                             this instant, is an attempt closed not_sent and a deferred row \
-                             (gate_refused), with the rest of its host's queue; absent, open_web_wires takes min(slot start + period / 2, \
+                             queue; a send the send gate refuses is an attempt closed not_sent \
+                             and a deferred row, with the rest of its host's queue: gate_refused \
+                             when another sender kept the gate, whose lock is waited for at most \
+                             half of what is left before this instant, and run_deadline when this \
+                             instant alone refused it, since no request is stamped after it; \
+                             absent, open_web_wires takes min(slot start + period / 2, \
                              next slot) - 30 s of the schedule slot the clock's now is in, one \
                              already passed included, a dry run's too whatever its at, and \
                              edgar_press takes none"},

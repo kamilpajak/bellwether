@@ -482,9 +482,9 @@ fn a_refresh_whose_send_the_gate_refuses_ends_retryable_with_its_attempt_closed_
     drop(held);
     let (sent, seen) = (exchange.sent(), server.seen()?);
     server.finish()?;
-    let object = refused
+    let (object, exit) = refused
         .as_ref()
-        .and_then(|refusal| refusal.gate_refusal(vec!["again".to_owned()]))
+        .and_then(|refusal| refusal.ended_at_the_gate(vec!["again".to_owned()]))
         .unwrap_or_default();
     let recorded: Vec<(String, Option<String>, Option<i64>, bool)> = read_only(root.path())?
         .prepare("SELECT outcome, requested_at, slots, closed_at IS NOT NULL FROM attempts")?
@@ -502,7 +502,7 @@ fn a_refresh_whose_send_the_gate_refuses_ends_retryable_with_its_attempt_closed_
                 object["retryable"].clone(),
                 object["details"]["attempt_id"].is_string(),
             ),
-            cmd_robots::GATE_REFUSED_EXIT,
+            exit,
             sent,
             seen,
             recorded,

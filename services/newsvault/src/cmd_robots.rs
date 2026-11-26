@@ -98,20 +98,22 @@ pub const GATE_REFUSED_EXIT: u8 = 7;
 pub const GATE_REFUSED_RETRYABLE: bool = true;
 
 impl RobotsError {
-    /// The `newsvault.error/1` object of a run the send gate ended; `argv` is the rerun.
+    /// How a run the send gate ended is reported, `None` for any other error: the
+    /// `newsvault.error/1` object `main` writes to stderr, and the exit; `argv` is the rerun.
     #[must_use]
-    pub fn gate_refusal(&self, argv: Vec<String>) -> Option<Value> {
+    pub fn ended_at_the_gate(&self, argv: Vec<String>) -> Option<(Value, u8)> {
         let Self::GateRefused { attempt_id, why } = self else {
             return None;
         };
-        Some(json!({
+        let object = json!({
             "schema": "newsvault.error/1",
             "code": GATE_REFUSED,
             "message": self.to_string(),
             "retryable": GATE_REFUSED_RETRYABLE,
             "details": {"attempt_id": attempt_id, "refusal": why.to_string()},
             "suggestions": [argv],
-        }))
+        });
+        Some((object, GATE_REFUSED_EXIT))
     }
 
     /// `invalid_argument` (section 5.1), which `main` writes as `usage error:`.
@@ -325,6 +327,17 @@ pub fn run(
         Some(refused) => Err(refused),
         None => Ok(answer_of(ask, feed, &run_id, started, &rows, &fetched)),
     }
+}
+
+/// The one human line of an error object: its code, its `retryable` and its message.
+#[must_use]
+pub fn human_error(object: &Value) -> String {
+    format!(
+        "error: {} (retryable {}): {}",
+        object["code"].as_str().unwrap_or_default(),
+        object["retryable"],
+        object["message"].as_str().unwrap_or_default()
+    )
 }
 
 /// A robots fetch of `host`; `hosts_version` is `None` for a caller that reads no hosts file.
