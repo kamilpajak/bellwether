@@ -56,11 +56,10 @@ const FORBIDDEN: u16 = 403;
 /// this tree has timed an EDGAR response, so there is no quantile to quote. `transport()` below is
 /// the one place to change it.
 const VENDOR_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
-/// 1 s / 10 requests. SEC's fair-access ceiling is 10 requests a second per IP as the
-/// predecessor's vendor-quota table states it (read 2026-11-13 from
-/// `apps/alphalens-pipeline/CLAUDE.md`); nothing here has measured it, and this paces TO the
-/// ceiling with no margin under it, which row R19 names as the open question it is.
-const SEC_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+/// 110 ms, owner decision 2026-11-26: 10 intervals of it less a 100 ms stamp-to-arrival spread
+/// still span SEC's 1 s for 10 requests per IP (predecessor table, read 2026-11-13). The spread
+/// and what no margin covers: architecture.md section 12.6, the row on SEC's interval.
+const SEC_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(110);
 
 /// Who asks `www.sec.gov`. SEC counts every caller against one address, so how the ceiling is
 /// split between them is one table, [`Caller::interval`].
