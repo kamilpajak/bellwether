@@ -5864,6 +5864,32 @@ mod tests {
         Ok(())
     }
 
+    /// §8 row M1, the per-version shape check at user_version 17.
+    #[test]
+    fn a_v17_store_whose_columns_differ_is_refused_and_left_at_user_version_seventeen() -> TestResult
+    {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_seventeen(&temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch("ALTER TABLE dictionaries DROP COLUMN trained_at;")?;
+        drop(db);
+        let read_only = match super::refuse_an_unreadable_version(temp.path()) {
+            Err(StoreError::ShapeDiffers { found: 17, columns }) => columns,
+            other => vec![format!("{other:?}")],
+        };
+        let refused = match open(&temp) {
+            Err(StoreError::ShapeDiffers { found: 17, columns }) => columns,
+            other => vec![format!("{other:?}")],
+        };
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let expected = vec!["dictionaries.trained_at".to_owned()];
+        assert_eq!(
+            (refused, read_only, user_version(&db)?),
+            (expected.clone(), expected, 17)
+        );
+        Ok(())
+    }
+
     /// The rollback in §3.1 keeps every row, a `gate_refused` one included, leaves a store the
     /// v17 shape check accepts, and the next upgrade migrates it to 18 again with that row kept.
     #[test]
