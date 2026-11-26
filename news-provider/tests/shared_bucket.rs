@@ -256,15 +256,20 @@ fn start(sender: Sender, port: u16, root: &Path) -> Checked<Running> {
     Ok(Running(child))
 }
 
-/// Waits for `child` and reads what it wrote; an error past `PATIENCE`.
-fn finished(mut child: Running, sender: Sender, root: &Path) -> Checked<Vec<Sent>> {
+/// Waits for `child` and reads what it wrote; an error past `patience`.
+fn finished(
+    mut child: Running,
+    sender: Sender,
+    root: &Path,
+    patience: Duration,
+) -> Checked<Vec<Sent>> {
     let mut waited = Duration::ZERO;
     let status = loop {
         if let Some(status) = child.0.try_wait()? {
             break status;
         }
-        if waited > PATIENCE {
-            return Err(format!("{} was still sending after {PATIENCE:?}", sender.id).into());
+        if waited > patience {
+            return Err(format!("{} was still sending after {patience:?}", sender.id).into());
         }
         thread::sleep(POLL);
         waited += POLL;
@@ -292,7 +297,11 @@ fn finished(mut child: Running, sender: Sender, root: &Path) -> Checked<Vec<Sent
 
 /// Every send of `senders` started together on one fresh pace root, and every arrival at a
 /// sender's own path: another local program may connect to the port.
-fn run(senders: &[Sender], spinning: bool) -> Checked<(Vec<Sent>, Vec<Arrival>)> {
+fn run(
+    senders: &[Sender],
+    spinning: bool,
+    patience: Duration,
+) -> Checked<(Vec<Sent>, Vec<Arrival>)> {
     let root = tempfile::tempdir()?;
     let (port, arrivals) = listen(spinning)?;
     let mut children = Vec::new();
@@ -301,7 +310,7 @@ fn run(senders: &[Sender], spinning: bool) -> Checked<(Vec<Sent>, Vec<Arrival>)>
     }
     let mut sent = Vec::new();
     for (child, sender) in children {
-        sent.extend(finished(child, sender, root.path())?);
+        sent.extend(finished(child, sender, root.path(), patience)?);
     }
     let mut arrivals = arrivals.lock().map_err(|why| why.to_string())?.clone();
     arrivals.retain(|arrival| {
@@ -382,7 +391,7 @@ const ALL_OF_THEM: usize = 93;
 /// 8 tries, because a fast one had stamped inside its last 250 ms, and was refused.
 #[test]
 fn a_slow_sender_late_behind_two_fast_ones_is_cleared_and_every_gap_holds() -> Checked {
-    let (sent, arrivals) = run(&SENDERS, false)?;
+    let (sent, arrivals) = run(&SENDERS, false, PATIENCE)?;
     let refused: Vec<&Sent> = sent
         .iter()
         .filter(|send| send.requested.is_none())
@@ -481,7 +490,7 @@ fn a_sender_killed_while_it_waits_at_the_gate_does_not_block_the_next() -> Check
     thread::sleep(POLL * HELD_FOR);
     let killed_at = Utc::now().timestamp_micros();
     drop(holder);
-    let sent = finished(survivor, SURVIVOR, root.path())?;
+    let sent = finished(survivor, SURVIVOR, root.path(), PATIENCE)?;
     let stamps: Vec<i64> = sent.iter().filter_map(|send| send.requested).collect();
     let first = stamps.first().copied().unwrap_or_default();
     assert_eq!(
@@ -538,14 +547,22 @@ fn measure() -> Checked {
             host: String::from(*host).leak(),
         });
     }
-    let (sent, arrivals) = run(&senders, true)?;
+    let (sent, arrivals) = run(&senders, true, PATIENCE * 10)?;
     for sender in &senders {
         let own = sent.iter().filter(|send| send.id == sender.id);
         let mut refused = BTreeMap::new();
         for send in own.clone().filter(|send| send.requested.is_none()) {
             *refused.entry(send.outcome.as_str()).or_insert(0) += 1;
         }
-        println!("{} sent {} refused {refused:?}", sender.id, own.count());
+        let longest = own
+            .clone()
+            .filter_map(|send| Some(send.requested? - send.entered));
+        println!(
+            "{} sent {} refused {refused:?} longest gate wait us {:?}",
+            sender.id,
+            own.clone().count(),
+            longest.max()
+        );
     }
     // How long a refused send was inside `Wire::send` before its named outcome.
     let mut refusals: Vec<i64> = sent
