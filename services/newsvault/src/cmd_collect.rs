@@ -20,8 +20,8 @@ use news_provider::robots::{Robots, RobotsError};
 use news_provider::{
     stamp_of, Archive, ArchiveError, AttemptReceipt, AttemptRow, Clock, Closing, CollectError,
     Collected, CollectedItem, Committed, Credentials, DeferReason, Deferred, Exchange, Exit,
-    Headers, OpenDeferred, Payload, Provider, ReleasedCut, Relisted, Run, RunId, SourceId,
-    TargetWindow, Wire,
+    Headers, OpenDeferred, PaceRoot, Payload, Provider, ReleasedCut, Relisted, Run, RunId,
+    SourceId, TargetWindow, Wire,
 };
 use open_web_feed::{
     Basis, Continuity, CrossChecker, DirectAnswer, Generation, HostRobots, OpenWebFeed, Paging,
@@ -533,13 +533,13 @@ fn required<'a>(
 
 /// The one place a collect builds its `Wire`, for `main.rs` and the loopback tests alike: the
 /// provider's profile unchanged, the contact under the provider's credential name, the pace files
-/// beside the run's own store.
+/// under the deployable's pace root (section 12.2).
 #[must_use]
-pub fn wire_for(ask: &Ask, opened: &Opened) -> Wire {
+pub fn wire_for(ask: &Ask, opened: &Opened, pace_root: &PaceRoot) -> Wire {
     Wire::new(
         opened.provider.transport(),
         Credentials::default().with(opened.registered.credential(), ask.contact.clone()),
-        &ask.store,
+        pace_root,
         &opened.provider.source(),
     )
 }

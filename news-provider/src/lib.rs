@@ -44,6 +44,7 @@ pub mod conformance;
 pub mod contact;
 pub mod lag_policy;
 pub mod ledger;
+pub mod pace_root;
 pub mod provider;
 pub mod request;
 pub mod robots;
@@ -62,6 +63,7 @@ pub use ledger::{
     abandon, AttemptEvent, AttemptId, AttemptReceipt, AttemptSlot, Baseline, Cost, Counts,
     LedgerError, Outcome, OutcomeKind, SendPermit, Sink, Verdict,
 };
+pub use pace_root::{PaceRoot, PaceRootError};
 pub use provider::{
     listed_sessions, precision_of, probed_lag, stamp_of, BodyState, Cadence, Calendar,
     CalendarError, CollectedItem, DecidedBy, Extracted, ExtractedBody, Listing, NotPlanned, Plan,

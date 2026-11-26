@@ -448,7 +448,7 @@ type Refreshed = (
 );
 
 fn refreshed_through_a_redirect(body_over_the_limit: bool) -> Result<Refreshed, Box<dyn Error>> {
-    let root = TempDir::new()?;
+    let (root, shared) = (TempDir::new()?, TempDir::new()?);
     let ask = ask(root.path(), gnw_hosts());
     let feed = cmd_robots::open(&ask)?;
     let server = if body_over_the_limit {
@@ -460,13 +460,21 @@ fn refreshed_through_a_redirect(body_over_the_limit: bool) -> Result<Refreshed, 
     let unanswered = Robots::of(&[]);
     let exchange = loopback::Relay {
         stub: &unanswered,
-        wire: cmd_robots::wire_for(&ask, &feed),
+        wire: cmd_robots::wire_for(
+            &ask,
+            &feed,
+            &news_provider::PaceRoot::resolve(Some(shared.path()), &ask.store)?,
+        ),
         relayed: BTreeMap::from([(GNW_ROBOTS.to_owned(), server.url(ROBOTS_PATH))]),
         asked: RefCell::default(),
     };
     let answer = cmd_robots::run(&ask, &feed, &exchange, &Fixed)?;
     let (sent, hops) = (exchange.sent(), server.seen()?);
     server.finish()?;
+    // Section 12.2: the pace files are under the root named and none is in the store.
+    if root.path().join("pace").exists() || !shared.path().join("pace").exists() {
+        return Err("the refresh kept its pace files outside the pace root named".into());
+    }
     let recorded: Vec<(String, Option<i64>, Option<String>)> = read_only(root.path())?
         .prepare("SELECT outcome, transport_status, verdict FROM attempts")?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
@@ -595,7 +603,11 @@ fn a_robots_refresh_and_a_collect_on_one_store_reserve_one_pace_file_per_host() 
     let unanswered = Robots::of(&[]);
     let by_robots = loopback::Relay {
         stub: &unanswered,
-        wire: cmd_robots::wire_for(&ask, &feed),
+        wire: cmd_robots::wire_for(
+            &ask,
+            &feed,
+            &news_provider::PaceRoot::resolve(None, &ask.store)?,
+        ),
         relayed: relayed.clone(),
         asked: RefCell::default(),
     };
@@ -621,7 +633,11 @@ fn a_robots_refresh_and_a_collect_on_one_store_reserve_one_pace_file_per_host() 
     let opened = newsvault::cmd_collect::open_provider(&collect_ask)?;
     let by_collect = loopback::Relay {
         stub: &unanswered,
-        wire: newsvault::cmd_collect::wire_for(&collect_ask, &opened),
+        wire: newsvault::cmd_collect::wire_for(
+            &collect_ask,
+            &opened,
+            &news_provider::PaceRoot::resolve(None, &collect_ask.store)?,
+        ),
         relayed,
         asked: RefCell::default(),
     };
