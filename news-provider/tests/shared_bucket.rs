@@ -523,7 +523,8 @@ fn smallest_gap(mut instants: Vec<i64>) -> Option<(i64, i64)> {
 
 /// The instrument behind section 12.6's tables. Run again when the gate, the pace or SEC's margin
 /// changes: `SHARED_BUCKET_MEASURE=a:100:300:0:true:127.0.0.1,b:100:300:0:true:127.0.0.1 cargo test
-/// --release -p news-provider --test shared_bucket -- --ignored --nocapture measure`.
+/// --release -p news-provider --test shared_bucket -- --ignored --nocapture measure`. A run of
+/// eight senders at 100 ms and 1,400 sends each takes 1,120 s, so each sender is given 1,800 s.
 #[test]
 #[ignore = "a measurement: it prints numbers and asserts nothing"]
 fn measure() -> Checked {
@@ -548,7 +549,7 @@ fn measure() -> Checked {
             host: String::from(*host).leak(),
         });
     }
-    let (sent, arrivals) = run(&senders, true, PATIENCE * 10)?;
+    let (sent, arrivals) = run(&senders, true, PATIENCE * 15)?;
     for sender in &senders {
         let own = sent.iter().filter(|send| send.id == sender.id);
         let mut refused = BTreeMap::new();
@@ -591,15 +592,40 @@ fn measure() -> Checked {
         above(bound),
         above(bound * 2)
     );
-    let places = sent.iter().filter_map(|send| {
-        let own = send.requested?;
-        Some(
-            stamps
-                .iter()
-                .filter(|other| (send.entered..own).contains(*other))
-                .count(),
-        )
-    });
+    let places: Vec<usize> = sent
+        .iter()
+        .filter_map(|send| {
+            let own = send.requested?;
+            Some(
+                stamps
+                    .iter()
+                    .filter(|other| (send.entered..own).contains(*other))
+                    .count(),
+            )
+        })
+        .collect();
+    // Rule L5: whether the run reached a line at the gate, and where. The waits in the order
+    // the sends entered, cut in ten, each tenth's median; and the waits another process stamped
+    // inside, which is a sender waiting behind another.
+    let mut entered: Vec<(i64, i64)> = sent
+        .iter()
+        .filter_map(|send| Some((send.entered, send.requested? - send.entered)))
+        .collect();
+    entered.sort_unstable();
+    let tenths: Vec<i64> = entered
+        .chunks(entered.len().div_ceil(10).max(1))
+        .map(|tenth| {
+            let mut waits: Vec<i64> = tenth.iter().map(|(_, wait)| *wait).collect();
+            waits.sort_unstable();
+            waits.get(waits.len() / 2).copied().unwrap_or_default()
+        })
+        .collect();
+    println!(
+        "gate wait us, median of each tenth in entry order {tenths:?}\n\
+         waits another process stamped inside: {} of {}",
+        places.iter().filter(|others| **others > 0).count(),
+        places.len()
+    );
     // Per send, accept minus stamp, with the accepting thread's stall: the spread is how far an
     // arrival gap can fall below a stamp gap. Paths are `/<id>/<seq>`, a sender's lines in order.
     let mut delays = Vec::new();
@@ -629,7 +655,7 @@ fn measure() -> Checked {
         smallest_gap(arrivals.iter().map(|arrival| arrival.read).collect()),
         waits.get(waits.len() / 2).map(|(wait, _)| wait),
         waits.last(),
-        places.max(),
+        places.iter().max(),
         refusals.first(),
         refusals.last(),
         delays.first().map(|(delay, _)| delay),
