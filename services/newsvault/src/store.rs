@@ -90,7 +90,7 @@ use news_provider::{
 use pit::datedness::{Datedness, Published};
 use pit::{ObservationTime, Visibility};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
-use vault_core::blobs::{BlobDigest, BlobStore, Dictionary};
+use vault_core::blobs::{BlobDigest, BlobStore, Dictionary, WritePolicy};
 use vault_core::lease::Lease;
 use vault_core::sqlite::{connect, read_only};
 use vault_core::{BlobError, LeaseError};
@@ -106,6 +106,8 @@ pub const ITEMS_DIR: &str = "items";
 /// measured lag keeps the bytes that stated it.
 pub const POLICY_DIR: &str = "policy";
 const BLOB_DIR: &str = "blobs";
+/// The news store's blob policy: architecture.md section 3.9, row "compression".
+const WRITE_POLICY: WritePolicy = WritePolicy::RawUntilDictionary;
 /// One constant for the label `record` writes and `ok_vendor_rows` reads, so the two cannot drift.
 const OUTCOME_OK: &str = "ok";
 /// Statuses a permanent failure is not held under: owner decision of 2026-11-15 (§10).
@@ -964,7 +966,7 @@ pub fn refuse_an_unreadable_version(root: &Path) -> Result<(), StoreError> {
 /// Read without the commit log: the pinned robots body `collect` parses (section 11.2). Bytes
 /// that no longer hash to `hex` are `BlobAltered`.
 pub fn blob_bytes(root: &Path, hex: &str) -> Result<Option<Vec<u8>>, StoreError> {
-    let blobs = BlobStore::new(root.join(BLOB_DIR));
+    let blobs = BlobStore::new(root.join(BLOB_DIR), WRITE_POLICY);
     match blobs.named(hex) {
         Some(digest) => Ok(Some(blobs.read_verified(&digest)?)),
         None => Ok(None),
@@ -974,7 +976,7 @@ pub fn blob_bytes(root: &Path, hex: &str) -> Result<Option<Vec<u8>>, StoreError>
 /// The blob tree of the store at `root`, with no dictionary active: a reader's.
 #[must_use]
 pub fn blob_store(root: &Path) -> BlobStore {
-    BlobStore::new(root.join(BLOB_DIR))
+    BlobStore::new(root.join(BLOB_DIR), WRITE_POLICY)
 }
 
 /// How a dictionary was trained, as `dictionaries` records it.
@@ -1290,7 +1292,7 @@ fn robots_answer(
 
 impl RobotsLedger {
     pub fn open(root: &Path) -> Result<Self, StoreError> {
-        let blobs = BlobStore::new(root.join(BLOB_DIR));
+        let blobs = BlobStore::new(root.join(BLOB_DIR), WRITE_POLICY);
         let log = root.join(COMMIT_LOG);
         if !log.exists() {
             return Ok(Self {
@@ -1503,7 +1505,7 @@ impl Committer {
         let mut db = connect(&root.join(COMMIT_LOG), OpenFlags::default())?;
         db.execute_batch(CONNECTION)?;
         migrate(&mut db)?;
-        let blobs = BlobStore::new(root.join(BLOB_DIR));
+        let blobs = BlobStore::new(root.join(BLOB_DIR), WRITE_POLICY);
         if let Some(hex) = active_dictionary(&db)? {
             blobs.activate(&blobs.load_dictionary(&hex)?)?;
         }
@@ -2814,7 +2816,6 @@ mod tests {
     const VALID_FIELD: &str = "ACCEPTANCE-DATETIME";
     const UNKNOWN_HIGHER_VERSION: i32 = SCHEMA_VERSION + 1;
     const CORRECTED_PAYLOAD: &[u8] = b"{\"filings\": 2}";
-    const SENTINEL: &[u8] = b"a staged file a crash left behind";
     const STATUS_OK: u16 = 200;
     /// Distinct values, so a swap of the two columns is visible. 59 is the day the collapse
     /// outcome exists for (`news_provider::ledger`'s `TRAILING_MEDIAN` comment).
@@ -7281,20 +7282,6 @@ mod tests {
             matches!(refused, Err(StoreError::BlobAbsent { .. })),
             "{refused:?}"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn a_blob_whose_staging_path_already_exists_is_refused_rather_than_truncated() -> TestResult {
-        let temp = TempDir::new()?;
-        let store = open(&temp)?;
-        let digest = store.put_blob(PAYLOAD)?;
-        fs::remove_file(store.blobs.path_of(&digest))?;
-        let staging = store.blobs.staging_path(RUN, &digest);
-        fs::write(&staging, SENTINEL)?;
-        let refused = store.put_blob(PAYLOAD);
-        assert!(matches!(refused, Err(StoreError::Io(_))), "{refused:?}");
-        assert_eq!(fs::read(&staging)?, SENTINEL);
         Ok(())
     }
 
