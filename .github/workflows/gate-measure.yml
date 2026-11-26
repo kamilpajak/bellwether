@@ -7,6 +7,10 @@ name: gate-measure
 
 on:
   workflow_dispatch:
+  # TEMPORARY, removed before this pull request is ready: GitHub starts a workflow by hand only
+  # once its file is on the default branch, so the first Linux run is started by a push here.
+  push:
+    branches: [fix/gate-refusal-contract]
 
 permissions:
   contents: read
