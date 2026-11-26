@@ -1,7 +1,8 @@
 //! How fast a vendor may be called, and the cross-process file that holds it to that. One locked
-//! file per bucket carries one wall instant (`BudgetScope::held` says which); the lock is held
-//! for the read-reserve-write and never across the wait, so callers stack reservations instead
-//! of serialising on each other's wait.
+//! file per bucket carries one wall instant (`BudgetScope::held` says which); a pace file's lock is
+//! held for the read-reserve-write and never across the wait, so callers stack reservations
+//! instead of serialising on each other's wait. A `.sent` file's lock is held across the gate's
+//! wait ([`SendGate::lock`]).
 //!
 //! The shape is the predecessor's `sec_rate_coordinator.py`, written after the failure it
 //! prevents: three processes on one residential IP, each with its own in-process throttle, whose
@@ -397,45 +398,39 @@ impl SendGate {
         Ok(Self { path, interval })
     }
 
-    /// Locks every gate in the order given, then writes `now`, cut to the file's microseconds,
-    /// to all of them, or to none when any one's last call is less than its interval ago.
-    pub fn stamp(gates: &[Self], now: DateTime<Utc>) -> Result<Stamped, BudgetError> {
-        let now = now.trunc_subsecs(STAMP_DIGITS);
+    /// Locks every gate in the order given. The caller keeps the locks through the wait a stamp
+    /// answers `Owed` with: released for it, the opening went to whichever process read its clock
+    /// first, and a sender lost 8 times running was refused (13 of 600 sends, two processes at
+    /// 100 ms, 2026-11-26; architecture.md section 12.6).
+    pub fn lock(gates: &[Self]) -> Result<Locked<'_>, BudgetError> {
         let mut locked = Vec::with_capacity(gates.len());
-        let mut stamped = Ok(Stamped::Sent(now));
         for gate in gates {
-            let file = match open_for_update(&gate.path) {
-                Ok(file) => file,
-                Err(why) => {
-                    stamped = Err(why);
-                    break;
-                }
-            };
-            if let Err(why) = file.lock() {
-                stamped = Err(unusable(&gate.path, "locked", &why));
-                break;
-            }
+            let file = open_for_update(&gate.path)?;
+            file.lock()
+                .map_err(|why| unusable(&gate.path, "locked", &why))?;
             locked.push((gate, file));
         }
-        if stamped.is_ok() {
-            stamped = Self::stamp_locked(&locked, now);
-        }
-        for (gate, file) in &locked {
-            let unlocked = file
-                .unlock()
-                .map_err(|why| unusable(&gate.path, "unlocked", &why));
-            if stamped.is_ok() {
-                unlocked?;
-            }
-        }
-        stamped
+        Ok(Locked(locked))
     }
+}
 
-    fn stamp_locked(locked: &[(&Self, File)], now: DateTime<Utc>) -> Result<Stamped, BudgetError> {
+/// Every gate of one call, locked until dropped: closing a file releases its lock, as the kernel
+/// does for a process that died holding it.
+#[derive(Debug)]
+pub struct Locked<'gates>(Vec<(&'gates SendGate, File)>);
+
+impl Locked<'_> {
+    /// Writes `now`, cut to the file's microseconds, to every gate, or to none when any one's
+    /// last call is less than its interval ago.
+    pub fn stamp(&self, now: DateTime<Utc>) -> Result<Stamped, BudgetError> {
+        let now = now.trunc_subsecs(STAMP_DIGITS);
         let mut owed = TimeDelta::zero();
-        for (gate, file) in locked {
+        for (gate, file) in &self.0 {
             let mut file: &File = file;
             let mut held = String::new();
+            // A second try reads the same open file, which the first left at its end.
+            file.seek(SeekFrom::Start(0))
+                .map_err(|why| unusable(&gate.path, "rewound", &why))?;
             file.read_to_string(&mut held)
                 .map_err(|why| unusable(&gate.path, "read", &why))?;
             if let Some(last) = read_stamp(&gate.path, &held)? {
@@ -452,7 +447,7 @@ impl SendGate {
         if owed > TimeDelta::zero() {
             return Ok(Stamped::Owed(owed.to_std().unwrap_or(Duration::ZERO)));
         }
-        for (gate, file) in locked {
+        for (gate, file) in &self.0 {
             let mut file: &File = file;
             file.set_len(0)
                 .map_err(|why| unusable(&gate.path, "truncated", &why))?;
@@ -585,6 +580,11 @@ mod tests {
         Ok(())
     }
 
+    /// One try at the gate, its locks released after it.
+    fn stamp_once(gates: &[SendGate], now: DateTime<Utc>) -> Result<Stamped, BudgetError> {
+        SendGate::lock(gates)?.stamp(now)
+    }
+
     /// Two clock reads a nanosecond-precise clock gives, a hair over one interval apart.
     const FIRST_SEND: &str = "2026-11-10T13:00:00.000000500Z";
     const A_HAIR_PAST_ONE_INTERVAL: &str = "2026-11-10T13:00:01.000000200Z";
@@ -605,7 +605,7 @@ mod tests {
             let now = read
                 .parse::<DateTime<Utc>>()
                 .map_err(|why| why.to_string())?;
-            match SendGate::stamp(&gates, now).map_err(|why| why.to_string())? {
+            match stamp_once(&gates, now).map_err(|why| why.to_string())? {
                 Stamped::Sent(at) => sent.push(at),
                 Stamped::Owed(wait) => return Err(format!("owed {wait:?} at {read}")),
             }
@@ -639,9 +639,9 @@ mod tests {
                 .map_err(|why| why.to_string())?,
             ];
         let at = |read: &str| read.parse::<DateTime<Utc>>().map_err(|why| why.to_string());
-        SendGate::stamp(&gates, at(LAST_SEND)?).map_err(|why| why.to_string())?;
-        let short = SendGate::stamp(&gates, at(ONE_MICROSECOND_SHORT)?);
-        let on_it = SendGate::stamp(&gates, at(ONE_INTERVAL_ON)?);
+        stamp_once(&gates, at(LAST_SEND)?).map_err(|why| why.to_string())?;
+        let short = stamp_once(&gates, at(ONE_MICROSECOND_SHORT)?);
+        let on_it = stamp_once(&gates, at(ONE_INTERVAL_ON)?);
         assert_eq!(
             (short, on_it),
             (
@@ -670,7 +670,7 @@ mod tests {
                 .map_err(|why| why.to_string())?,
             ];
         let at = |read: &str| read.parse::<DateTime<Utc>>().map_err(|why| why.to_string());
-        let stamped = SendGate::stamp(&gates, at(A_READ_WITH_NANOSECONDS)?);
+        let stamped = stamp_once(&gates, at(A_READ_WITH_NANOSECONDS)?);
         assert_eq!(stamped, Ok(Stamped::Sent(at(THAT_READ_IN_MICROSECONDS)?)));
         Ok(())
     }

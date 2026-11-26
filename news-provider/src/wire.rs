@@ -472,8 +472,9 @@ pub struct Wire {
 }
 
 const USER_AGENT: &str = "User-Agent";
-/// Each try past the first follows a wait the clock did not see pass, or another caller's send
-/// on the bucket during it; a bound so a clock that never advances refuses instead of spinning.
+/// Each try past the first follows a wait the clock did not see pass: the gate's locks are held
+/// through it, so no other caller sends on the bucket meanwhile. A bound so a clock that never
+/// advances refuses instead of spinning.
 const GATE_TRIES: u32 = 8;
 
 impl Wire {
@@ -751,8 +752,9 @@ impl Wire {
     }
 
     /// The `requested_at` of a call, read once the last call through its host's bucket and its
-    /// per-IP bucket is a full interval ago, and written to both under their locks. Without a
-    /// gate (a url no host keys, under a hosts-only profile) it is one clock read.
+    /// per-IP bucket is a full interval ago, and written to both under their locks, which are
+    /// held through the wait for that. Without a gate (a url no host keys, under a hosts-only
+    /// profile) it is one clock read.
     fn clear_to_send(
         &self,
         host: Option<&HostKey>,
@@ -779,9 +781,10 @@ impl Wire {
         if gates.is_empty() {
             return Ok(clock.now());
         }
+        let locked = SendGate::lock(&gates)?;
         let mut owed = Duration::ZERO;
         for _ in 0..GATE_TRIES {
-            match SendGate::stamp(&gates, clock.now())? {
+            match locked.stamp(clock.now())? {
                 Stamped::Sent(at) => return Ok(at),
                 Stamped::Owed(wait) => {
                     owed = wait;
