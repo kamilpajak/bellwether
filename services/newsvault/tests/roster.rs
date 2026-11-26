@@ -33,7 +33,7 @@ const ROBOTS_URL: &str = "https://www.sec.gov/robots.txt";
 const FILE_URL: &str = "https://www.sec.gov/files/company_tickers_exchange.json";
 const FILE_KEY: &str = "sec_company_tickers_exchange";
 const SEC_HOST: &str = "www.sec.gov";
-const SEC_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const SEC_INTERVAL: std::time::Duration = std::time::Duration::from_millis(110);
 const ROSTER_BODY_LIMIT: u64 = 8 * 1_024 * 1_024;
 /// SEC's robots.txt shape on 2026-11-23: `*` disallows paths, none under `/files/`.
 const ROBOTS_BODY: &[u8] = b"User-agent: *\nDisallow: /cgi-bin\nDisallow: /Archives/bin\n";
@@ -305,7 +305,7 @@ fn a_roster_fetch_keeps_the_file_as_received_under_one_attempt_after_its_robots(
 }
 
 /// robots.txt is honoured before the file: a rule over its path, a Crawl-delay slower than SEC's
-/// 100 ms pace or a body that is no robots.txt asks nothing and opens no roster attempt, and exits
+/// 110 ms pace or a body that is no robots.txt asks nothing and opens no roster attempt, and exits
 /// 8. Mutations 2026-11-23, each red: `allows` not consulted; the Crawl-delay check dropped; a
 /// body `Robots::parse` refuses read as no rules.
 #[test]
@@ -608,7 +608,7 @@ fn the_schema_lists_gate_refused_with_the_exit_and_retryable_a_refused_run_repor
 type ClosedAttempt = (String, String, Option<String>, Option<i64>, bool);
 
 /// SEC's per-IP gate file kept locked by a second open file, as another sending process keeps
-/// it: the file's send waits its 32 intervals (3.2 s) and is refused. The run ends there with
+/// it: the file's send waits its 32 intervals (3.52 s) and is refused. The run ends there with
 /// `gate_refused`, exit 7, retryable; the attempt is closed `not_sent` with nothing requested,
 /// no payload and no slot spent, none is left open for a sweep, and the server saw no request.
 #[test]
