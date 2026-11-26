@@ -122,11 +122,11 @@ PRAGMA synchronous = FULL;
 const IN_MEMORY: &str = ":memory:";
 
 /// The `PRAGMA user_version` this build writes, and the only one a read-only reader accepts.
-pub const SCHEMA_VERSION: i32 = 17;
+pub const SCHEMA_VERSION: i32 = 18;
 
 /// Version `i + 1` is reached from version `i` by `MIGRATIONS[i]`, run by [`migrate`] with
 /// foreign keys off, as SQLite's twelve-step table rebuild (lang_altertable.html) requires.
-const MIGRATIONS: [&str; 17] = [
+const MIGRATIONS: [&str; 18] = [
     "
 -- The hosts file a run was admitted under: architecture.md section 2's `hosts_version` row. NULL
 -- for a provider that reads no hosts file.
@@ -429,6 +429,34 @@ WHEN NEW.provenance IS NOT OLD.provenance
 BEGIN
     SELECT RAISE(ABORT, 'attempts.provenance is set once');
 END;
+",
+    "
+-- Section 12.8 step 9b: `reason` admits `gate_refused` (section 3.2). A CHECK cannot be altered
+-- in place, so `deferred` is rebuilt, every column and row carried and each `deferred_id` kept,
+-- which `deferred_closed` names.
+CREATE TABLE deferred_v18 (
+    deferred_id   INTEGER PRIMARY KEY,
+    run_id        TEXT NOT NULL,
+    source        TEXT NOT NULL,
+    target_window TEXT NOT NULL,
+    host          TEXT,
+    url           TEXT NOT NULL,
+    phase         TEXT NOT NULL CHECK (phase IN ('index', 'document')),
+    story_id      TEXT,
+    listed_date   TEXT,
+    reason        TEXT NOT NULL
+        CHECK (reason IN ('run_deadline', 'host_held', 'follow_up_cap', 'gate_refused')),
+    deferred_at   TEXT NOT NULL,
+    listed_by     TEXT REFERENCES attempts (attempt_id)
+);
+INSERT INTO deferred_v18
+    (deferred_id, run_id, source, target_window, host, url, phase, story_id, listed_date, reason,
+     deferred_at, listed_by)
+SELECT deferred_id, run_id, source, target_window, host, url, phase, story_id, listed_date, reason,
+       deferred_at, listed_by
+FROM deferred;
+DROP TABLE deferred;
+ALTER TABLE deferred_v18 RENAME TO deferred;
 ",
 ];
 
@@ -2698,6 +2726,7 @@ fn outcome_name(kind: OutcomeKind) -> &'static str {
         OutcomeKind::Empty => "empty",
         OutcomeKind::Failed => "failed",
         OutcomeKind::Interrupted => "interrupted",
+        OutcomeKind::NotSent => "not_sent",
     }
 }
 
@@ -5693,6 +5722,177 @@ mod tests {
                 upgraded.map_err(|failure| failure.to_string()),
             ),
             (Ok(()), (16, before), Ok(SCHEMA_VERSION))
+        );
+        Ok(())
+    }
+
+    /// A v17 store: the v16 fixture, `MIGRATIONS[16]`, one open `deferred` row per v17 reason and
+    /// a `deferred_closed` row naming the last of them.
+    fn a_store_at_user_version_seventeen(temp: &TempDir) -> TestResult {
+        a_store_at_user_version_sixteen(temp)?;
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch(MIGRATIONS[16])?;
+        db.pragma_update(None, "user_version", 17)?;
+        for reason in V17_REASONS {
+            db.execute(
+                "INSERT INTO deferred
+                     (run_id, source, target_window, host, url, phase, story_id, listed_date,
+                      reason, deferred_at, listed_by)
+                 VALUES ('a v17 run', 'open_web_wires', '2026-11-20', 'example.test',
+                         'https://example.test/' || ?1, 'document', 's', NULL, ?1, 't',
+                         'a v16 edgar attempt')",
+                [reason],
+            )?;
+        }
+        db.execute_batch(
+            "INSERT INTO deferred_closed (deferred_id, run_id, closed_as, attempt_id, closed_at)
+             SELECT MAX(deferred_id), 'a v17 run', 'held', NULL, 't' FROM deferred;",
+        )?;
+        Ok(())
+    }
+
+    const V17_REASONS: [&str; 3] = ["run_deadline", "host_held", "follow_up_cap"];
+    const V17_TABLES: [&str; 12] = V16_TABLES;
+    /// The v13 fixture's two `deferred` rows, this fixture's three, and the one a test adds.
+    const V17_ROWS_AND_ONE: usize = 6;
+    /// The v14 fixture's closing row and this fixture's, and no dangling reference.
+    const V17_CLOSINGS: (i64, i64) = (2, 0);
+    /// The down-migration §3.1 names for a v18 store: the wider `CHECK` stays, which a v17
+    /// writer never meets, and its `gate_refused` rows stay open rows a v17 carry asks.
+    const ROLLBACK_TO_SEVENTEEN: &str = "PRAGMA user_version = 17;";
+
+    fn gate_refused_row() -> news_provider::Deferred {
+        news_provider::Deferred {
+            source: "open_web_wires".to_owned(),
+            target_window: "2026-11-26".to_owned(),
+            host: Some("example.test".to_owned()),
+            url: "https://example.test/refused".to_owned(),
+            phase: RequestPhase::Document,
+            story_id: None,
+            listed_date: None,
+            reason: news_provider::DeferReason::GateRefused,
+            at: at(1),
+            listed_by: None,
+            go_at: None,
+        }
+    }
+
+    /// `(closing rows that name a deferred row, rows the foreign-key check finds dangling)`.
+    fn closings(db: &Connection) -> Result<(i64, i64), StoreError> {
+        let named = db.query_row(
+            "SELECT COUNT(*) FROM deferred_closed c JOIN deferred d USING (deferred_id)",
+            [],
+            |row| row.get(0),
+        )?;
+        let dangling =
+            db.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        Ok((named, dangling))
+    }
+
+    /// §8 row M1 from 17 (section 12.8 step 9b): the rebuilt `deferred` takes a `gate_refused`
+    /// row through `record_deferred`, still refuses a reason no variant names, and is the table
+    /// `deferred_closed` names: every closing row still joins its row, and one naming no row is
+    /// refused.
+    #[test]
+    fn a_store_at_user_version_seventeen_migrates_to_eighteen_and_takes_a_gate_refused_row(
+    ) -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_seventeen(&temp)?;
+        let v17 = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let before = closings(&v17)?;
+        drop(v17);
+        let mut store = open(&temp)?;
+        let taken = store.record_deferred(&gate_refused_row()).is_ok();
+        let reasons: Vec<String> = store
+            .db
+            .prepare("SELECT reason FROM deferred ORDER BY deferred_id")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        let unnamed = store.db.execute(
+            "INSERT INTO deferred (run_id, source, target_window, url, phase, reason, deferred_at)
+             VALUES ('r', 's', 'w', 'u', 'document', 'gate_held', 't')",
+            [],
+        );
+        let orphan = store.db.execute(
+            "INSERT INTO deferred_closed (deferred_id, run_id, closed_as, closed_at)
+             VALUES (9999, 'r', 'held', 't')",
+            [],
+        );
+        assert_eq!(
+            (
+                user_version(&store.db)?,
+                taken,
+                reasons.last().map(String::as_str),
+                reasons.len(),
+                unnamed.is_err(),
+                orphan.is_err(),
+                closings(&store.db)?,
+                before,
+            ),
+            (
+                SCHEMA_VERSION,
+                true,
+                Some("gate_refused"),
+                V17_ROWS_AND_ONE,
+                true,
+                true,
+                before,
+                V17_CLOSINGS,
+            )
+        );
+        Ok(())
+    }
+
+    /// §8 row M1, the carried half from user_version 17: every column of every row of every v17
+    /// table, compared by `quote()`, each `deferred_id` included.
+    #[test]
+    fn a_v17_store_keeps_every_v17_column_of_every_row() -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_seventeen(&temp)?;
+        let v17 = Connection::open(temp.path().join(COMMIT_LOG))?;
+        let before = quoted_rows(&v17, 17, &V17_TABLES)?;
+        drop(v17);
+        let store = open(&temp)?;
+        let after = quoted_rows(&store.db, 17, &V17_TABLES)?;
+        let deferred_rows = before
+            .iter()
+            .filter(|row| row.starts_with("deferred|"))
+            .count();
+        assert_eq!((after, deferred_rows >= V17_REASONS.len()), (before, true));
+        Ok(())
+    }
+
+    /// The rollback in §3.1 keeps every row, a `gate_refused` one included, leaves a store the
+    /// v17 shape check accepts, and the next upgrade migrates it to 18 again with that row kept.
+    #[test]
+    fn the_rollback_to_seventeen_keeps_a_gate_refused_row_and_the_store_upgrades_again(
+    ) -> TestResult {
+        let temp = TempDir::new()?;
+        a_store_at_user_version_seventeen(&temp)?;
+        let mut store = open(&temp)?;
+        store.record_deferred(&gate_refused_row())?;
+        let before = quoted_rows(&store.db, 18, &V17_TABLES)?;
+        drop(store);
+        let db = Connection::open(temp.path().join(COMMIT_LOG))?;
+        db.execute_batch(ROLLBACK_TO_SEVENTEEN)?;
+        let shape = super::refuse_another_shape(&db, 17);
+        let rolled_back = (user_version(&db)?, quoted_rows(&db, 17, &V17_TABLES)?);
+        drop(db);
+        let upgraded = open(&temp)?;
+        let again = (
+            user_version(&upgraded.db)?,
+            quoted_rows(&upgraded.db, 18, &V17_TABLES)?,
+        );
+        assert_eq!(
+            (
+                shape.map_err(|failure| failure.to_string()),
+                rolled_back,
+                again,
+                before.iter().any(|row| row.contains("'gate_refused'")),
+            ),
+            (Ok(()), (17, before.clone()), (SCHEMA_VERSION, before), true)
         );
         Ok(())
     }

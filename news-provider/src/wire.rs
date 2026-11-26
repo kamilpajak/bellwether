@@ -463,8 +463,8 @@ pub struct Wire {
     /// Held in memory: one `Wire` is one run, and a second process sees only the host slot granted.
     backoff: RefCell<BTreeMap<HostKey, Backoff>>,
     /// The url [`Wire::reserve`] last answered `Go` for, which the next `send` of it does not
-    /// pace again.
-    reserved: RefCell<Option<String>>,
+    /// pace again, and the deadline it was reserved under, which that send's gate honours.
+    reserved: RefCell<Option<(String, Option<DateTime<Utc>>)>>,
     capped: RefCell<Vec<CappedHold>>,
     /// Per host, the latest hold seen ahead of the clock in this run, for [`Wire::slowed`].
     holds: RefCell<BTreeMap<HostKey, DateTime<Utc>>>,
@@ -475,6 +475,10 @@ const USER_AGENT: &str = "User-Agent";
 /// that bucket meanwhile: one such wait for the host, one for the per-IP bucket, and any further
 /// one the clock did not see pass. A bound so a clock that never advances refuses, not spins.
 const GATE_TRIES: u32 = 8;
+/// The doublings a gate counts: it holds its lock through at most 16 of the host's own interval,
+/// under the 32 another sender waits for it (`GATE_TURNS`). The pace still waits out every
+/// doubling, before the gate and under no lock (architecture.md section 12.6, rule C4).
+const GATE_DOUBLINGS: u32 = 4;
 
 impl Wire {
     /// One `Wire` is one vendor's conversation, so the pace file is named by `source` and the
@@ -582,7 +586,7 @@ impl Wire {
         self.headers_for(request)?;
         let reserved = self.pace(request, clock, deadline)?;
         if reserved == Reservation::Go {
-            *self.reserved.borrow_mut() = Some(request.url.clone());
+            *self.reserved.borrow_mut() = Some((request.url.clone(), deadline));
         }
         Ok(reserved)
     }
@@ -631,14 +635,19 @@ impl Wire {
         let attempt_id = permit.into_attempt_id();
         let headers = self.headers_for(request)?;
         let reserved = self.reserved.borrow_mut().take();
-        if reserved.as_deref() != Some(request.url.as_str()) {
-            // With no deadline every slot is granted, so `PastDeadline` cannot come back.
-            match self.pace(request, clock, None)? {
-                Reservation::Go | Reservation::PastDeadline { .. } => {}
+        let deadline = match reserved {
+            Some((url, deadline)) if url == request.url => deadline,
+            _ => {
+                // With no deadline every slot is granted, so `PastDeadline` cannot come back.
+                match self.pace(request, clock, None)? {
+                    Reservation::Go | Reservation::PastDeadline { .. } => {}
+                }
+                None
             }
-        }
+        };
         let host = self.paced_host(&request.url)?;
-        let requested_at = ObservationTime::new(self.clear_to_send(host.as_ref(), clock)?);
+        let cleared = self.clear_to_send(host.as_ref(), clock, deadline)?;
+        let requested_at = ObservationTime::new(cleared);
         let answered = self.exchange(&request.url, &headers);
         let received_at = ObservationTime::new(clock.now());
         if let Some(host) = host {
@@ -753,27 +762,33 @@ impl Wire {
     /// The `requested_at` of a call, read once the last call through its host's bucket and its
     /// per-IP bucket is a full interval ago, and written to both under their locks. The host's
     /// is held through the wait for that, the per-IP one unless the host owes more. Without a
-    /// gate (a url no host keys, under a hosts-only profile) it is one clock read.
+    /// gate (a url no host keys, under a hosts-only profile) it is one clock read. No wait here
+    /// passes `deadline`: a lock is waited for, and an owed wait slept, only within what is left.
     fn clear_to_send(
         &self,
         host: Option<&HostKey>,
         clock: &dyn Clock,
+        deadline: Option<DateTime<Utc>>,
     ) -> Result<DateTime<Utc>, BudgetError> {
         let host = host
             .zip(self.profile.budget.per_host)
-            .map(|(host, ordinary)| (host, self.host_interval(host, ordinary)));
+            .map(|(host, ordinary)| (host, self.gate_interval(host, ordinary)));
         let per_ip = self.profile.budget.min_interval;
         let per_ip = per_ip.map(|interval| (&self.source, interval));
         let gates = Gates::of_a_call(&self.pace_root, host, per_ip)?;
         if gates.is_empty() {
             return Ok(clock.now());
         }
-        let mut locked = gates.lock()?;
+        let left = || deadline.map(|by| (by - clock.now()).to_std().unwrap_or(Duration::ZERO));
+        let mut locked = gates.lock(&*self.sleeper, &left)?;
         let mut owed = Duration::ZERO;
-        for _ in 0..GATE_TRIES {
+        for tries in 1..=GATE_TRIES {
             match locked.stamp(&|| clock.now())? {
                 Stamped::Sent(at) => return Ok(at),
                 Stamped::Owed(wait) => {
+                    if left().is_some_and(|left| wait > left) {
+                        return Err(BudgetError::NeverCleared { tries, owed: wait });
+                    }
                     owed = wait;
                     self.sleeper.sleep(wait);
                 }
@@ -783,6 +798,13 @@ impl Wire {
             tries: GATE_TRIES,
             owed,
         })
+    }
+
+    /// The interval a host's gate compares with: [`Wire::host_interval`] up to
+    /// [`GATE_DOUBLINGS`] doublings.
+    fn gate_interval(&self, host: &HostKey, ordinary: Duration) -> Duration {
+        let backoff = self.backoff.borrow().get(host).copied().unwrap_or_default();
+        ordinary.saturating_mul(2_u32.saturating_pow(backoff.doublings.min(GATE_DOUBLINGS)))
     }
 
     /// The url's host when the profile paces hosts. ureq 3.5.2 parses a url with this same
@@ -962,11 +984,11 @@ struct Failed {
 #[cfg(test)]
 mod tests {
     use super::{
-        retry_after, CappedHold, Credentials, DateTime, Headers, RawResponse, Reservation,
+        retry_after, Backoff, CappedHold, Credentials, DateTime, Headers, RawResponse, Reservation,
         SendFailure, Slowed, Timeouts, TransportError, TransportKind, TransportProfile, Unreserved,
         Utc, Wire, GATE_TRIES, USER_AGENT,
     };
-    use crate::budget::{BudgetError, RequestBudget};
+    use crate::budget::{BudgetError, HostKey, RequestBudget};
     use crate::clock::testing::{StepClock, WaitRecorder, WaitedClock};
     use crate::clock::Clock;
     use crate::collect::{Exchange, HostQueue, Payload, Popped, Queued};
@@ -3307,6 +3329,178 @@ mod tests {
                 0,
                 Vec::new(),
                 true
+            )
+        );
+        Ok(())
+    }
+
+    /// A second open file of this test holds `gate`'s lock until the returned sender is dropped
+    /// or told; the thread ends on either.
+    fn held_by_another(
+        gate: &Path,
+    ) -> Result<std::sync::mpsc::Sender<()>, Box<dyn std::error::Error>> {
+        if let Some(dir) = gate.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let held_open = std::fs::File::create(gate)?;
+        held_open.lock()?;
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        thread::spawn(move || {
+            let told = released.recv_timeout(HUNG).is_ok();
+            drop(held_open);
+            told
+        });
+        Ok(release)
+    }
+
+    const THREE_S_LATER: &str = "2026-11-10T13:00:03Z";
+    const WHAT_THE_RUN_HAS_LEFT: Duration = Duration::from_secs(3);
+
+    /// The run's deadline bounds the wait for a gate's lock: 3 s are left, so the lock is waited
+    /// for 3 s and not the 320 s that are 32 of this host's 10 s (`GATE_TURNS`). The wait is the
+    /// one handed to the seam, on a clock that wait advances.
+    #[test]
+    fn a_gate_lock_is_waited_for_no_longer_than_the_run_has_left() -> Checked {
+        let store = tempfile::tempdir()?;
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let wire = Wire::with_sleeper(
+            hosts_only_profile(),
+            held(),
+            store.path(),
+            &SourceId::new(SOURCE),
+            Box::new(clock.clone()),
+        );
+        let gate = store.path().join(PACE_DIR).join(HOST_SENT_FILE);
+        let release = held_by_another(&gate)?;
+        let asked = Request {
+            url: LOCALHOST.to_owned(),
+            ..request()
+        };
+        let reservation = wire.reserve(&asked, &clock, Some(THREE_S_LATER.parse()?))?;
+        let mut sink = Recorder::default();
+        let Some(permit) = permit(&mut sink, FIRST_ATTEMPT) else {
+            return Err("no permit".into());
+        };
+        let refused = wire.send(permit, &asked, &clock).err();
+        drop(release);
+        assert_eq!(
+            (reservation, refused, clock.waits()),
+            (
+                Reservation::Go,
+                Some(SendFailure::Budget(BudgetError::GateHeld {
+                    path: gate,
+                    waited: WHAT_THE_RUN_HAS_LEFT
+                })),
+                vec![NO_WAIT, WHAT_THE_RUN_HAS_LEFT]
+            )
+        );
+        Ok(())
+    }
+
+    /// `RESERVED_AT` plus `FLOOR` plus `ROW_OPENED_IN`: where the gate opens for the second send.
+    const THE_GATE_OPENS_AT: &str = "2026-11-10T13:00:11.07Z";
+    const ONE_MICROSECOND_BEFORE_IT: &str = "2026-11-10T13:00:11.069999Z";
+    const FLOOR_LESS_THE_LATENESS: Duration = Duration::from_millis(8_930);
+
+    /// The first send left its slot 1.07 s late, so the gate owes the second 1.07 s. A deadline
+    /// one microsecond before the gate opens refuses it with that wait named and not slept; a
+    /// deadline at the opening sends it there.
+    #[test]
+    fn an_owed_wait_the_deadline_leaves_no_time_for_is_refused_and_not_slept() -> Checked {
+        let mut seen = Vec::new();
+        for deadline in [ONE_MICROSECOND_BEFORE_IT, THE_GATE_OPENS_AT] {
+            let store = tempfile::tempdir()?;
+            let clock = WaitedClock::at(RESERVED_AT)?;
+            let wire = Wire::with_sleeper(
+                hosts_only_profile(),
+                held(),
+                store.path(),
+                &SourceId::new(SOURCE),
+                Box::new(clock.clone()),
+            );
+            reserved_then_sent(&wire, &clock, FIRST_ATTEMPT, LOCALHOST, ROW_OPENED_IN)?;
+            let asked = Request {
+                url: LOCALHOST.to_owned(),
+                ..request()
+            };
+            let reservation = wire.reserve(&asked, &clock, Some(deadline.parse()?))?;
+            let mut sink = Recorder::default();
+            let Some(permit) = permit(&mut sink, SECOND_ATTEMPT) else {
+                return Err("no permit".into());
+            };
+            let sent = match wire.send(permit, &asked, &clock) {
+                Err(SendFailure::Budget(refused)) => Err(refused),
+                Err(SendFailure::Transport(failed)) => Ok(failed.requested_at().inner()),
+                other => return Err(format!("{other:?}").into()),
+            };
+            seen.push((reservation, sent, clock.waits()));
+        }
+        let opens: DateTime<Utc> = THE_GATE_OPENS_AT.parse()?;
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    Reservation::Go,
+                    Err(BudgetError::NeverCleared {
+                        tries: 1,
+                        owed: ROW_OPENED_IN
+                    }),
+                    vec![NO_WAIT, FLOOR_LESS_THE_LATENESS]
+                ),
+                (
+                    Reservation::Go,
+                    Ok(opens),
+                    vec![NO_WAIT, FLOOR_LESS_THE_LATENESS, ROW_OPENED_IN]
+                )
+            ]
+        );
+        Ok(())
+    }
+
+    const SIX_DOUBLINGS: u32 = 6;
+    /// `FLOOR` doubled 6 times, which the pace waits out, and 4 times, which is all a gate counts.
+    const SIXTY_FOUR_FLOORS: Duration = Duration::from_secs(640);
+    const SIXTEEN_FLOORS: Duration = Duration::from_secs(160);
+
+    /// A host answered this sender 6 bare slow-downs. Its pace waits 64 intervals under no lock;
+    /// another sender then stamps, and at the gate this one waits 16 intervals from that stamp
+    /// holding the lock, not 64: under the 32 the other waits for the lock (`GATE_TURNS`).
+    #[test]
+    fn a_host_doubled_six_times_keeps_its_gate_sixteen_intervals_and_its_pace_sixty_four() -> Checked
+    {
+        let store = tempfile::tempdir()?;
+        let clock = WaitedClock::at(RESERVED_AT)?;
+        let on_the_store = || {
+            Wire::with_sleeper(
+                hosts_only_profile(),
+                held(),
+                store.path(),
+                &SourceId::new(SOURCE),
+                Box::new(clock.clone()),
+            )
+        };
+        let (slowed, other) = (on_the_store(), on_the_store());
+        send_to(&slowed, &clock, FIRST_ATTEMPT, LOCALHOST)?;
+        let host = HostKey::new("localhost")?;
+        slowed.backoff.borrow_mut().insert(
+            host,
+            Backoff {
+                doublings: SIX_DOUBLINGS,
+            },
+        );
+        let asked = Request {
+            url: LOCALHOST.to_owned(),
+            ..request()
+        };
+        let reservation = slowed.reserve(&asked, &clock, None)?;
+        let theirs = requested_at(&other, &clock, SECOND_ATTEMPT, LOCALHOST)?;
+        let ours = requested_at(&slowed, &clock, SECOND_ATTEMPT + 1, LOCALHOST)?;
+        assert_eq!(
+            (reservation, (ours - theirs).to_std()?, clock.waits()),
+            (
+                Reservation::Go,
+                SIXTEEN_FLOORS,
+                vec![NO_WAIT, SIXTY_FOUR_FLOORS, FLOOR, SIXTEEN_FLOORS]
             )
         );
         Ok(())

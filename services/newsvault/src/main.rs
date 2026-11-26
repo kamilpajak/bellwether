@@ -708,7 +708,10 @@ fn run(cli: Cli) -> anyhow::Result<Verdict> {
             let pace_root = pace.resolve(&ask.store, format);
             let feed = cmd_robots::open(&ask)?;
             let wire = cmd_robots::wire_for(&ask, &feed, &pace_root);
-            let answer = cmd_robots::run(&ask, &feed, &wire, &SystemClock)?;
+            let answer = match cmd_robots::run(&ask, &feed, &wire, &SystemClock) {
+                Ok(answer) => answer,
+                Err(refused) => return gate_refused(refused, format),
+            };
             match answer.emitted(std::env::args().collect()) {
                 cmd_robots::Emitted::Stdout(report) => emit_robots(&report, format)?,
                 cmd_robots::Emitted::Stderr(error) => emit_robots_error(&error, format)?,
@@ -863,7 +866,11 @@ fn run_roster(action: RosterAction) -> anyhow::Result<Verdict> {
             };
             let pace_root = pace.resolve(&ask.store, format);
             let wire = cmd_roster::wire_for(&ask, &pace_root);
-            let answer = cmd_roster::run(&ask, &wire, &SystemClock)?;
+            let answer = match cmd_roster::run(&ask, &wire, &SystemClock) {
+                Ok(answer) => answer,
+                Err(RosterError::Robots(refused)) => return gate_refused(refused, format),
+                Err(other) => return Err(other.into()),
+            };
             match answer.error_object(std::env::args().collect()) {
                 None => emit_value(&answer.report, format, cmd_roster::render_human)?,
                 Some(error) => emit_robots_error(&error, format)?,
@@ -1071,6 +1078,18 @@ fn emit_robots(report: &serde_json::Value, format: Format) -> anyhow::Result<()>
         Format::Human => cmd_robots::render_human(report, &mut out)?,
     }
     Ok(())
+}
+
+/// A run the send gate ended: section 5.1's `gate_refused` on stderr, stdout empty, exit 7. Any
+/// other error of the command goes on to `main` as it did.
+fn gate_refused(refused: RobotsError, format: Format) -> anyhow::Result<Verdict> {
+    match refused.gate_refusal(std::env::args().collect()) {
+        Some(object) => {
+            emit_robots_error(&object, format)?;
+            Ok(Verdict::No(cmd_robots::GATE_REFUSED_EXIT))
+        }
+        None => Err(refused.into()),
+    }
 }
 
 /// Exit 7, every row failed transiently: the report rides the error object, never stdout.
@@ -1679,7 +1698,9 @@ fn print_schema(format: Format) {
                              dry_run, after the clock's now (else invalid_argument); a request whose pace slot opens later is not \
                              asked and is a deferred row (run_deadline, or host_held when a \
                              server's hold or slow-down moved it), with the rest of its host's \
-                             queue; absent, open_web_wires takes min(slot start + period / 2, \
+                             queue; a send the send gate refuses, which waits for no lock past \
+                             this instant, is an attempt closed not_sent and a deferred row \
+                             (gate_refused), with the rest of its host's queue; absent, open_web_wires takes min(slot start + period / 2, \
                              next slot) - 30 s of the schedule slot the clock's now is in, one \
                              already passed included, a dry run's too whatever its at, and \
                              edgar_press takes none"},
@@ -1772,8 +1793,9 @@ fn print_schema(format: Format) {
                           shape, io",
                     "4": "an absent hosts or rules file or pace root (input_absent), or a hosts \
                           file admitting no host",
-                    "7": "every row failed transiently (vendor_unreachable), or another run holds \
-                          the lease (lease_held)",
+                    "7": "every row failed transiently (vendor_unreachable), another run holds \
+                          the lease (lease_held), or the send gate refused a send, which ends \
+                          the run with that attempt closed not_sent (gate_refused)",
                     "8": "a row failed"
                 },
                 "mutates": true
@@ -1807,7 +1829,7 @@ fn print_schema(format: Format) {
                     "0": "every file answered usable",
                     "2": "credential_contact_missing, a store of another version, io, a pace root that is relative, no directory or itself named pace (invalid_argument), pace_root_split",
                     "4": "input_absent: the pace root named does not exist",
-                    "7": "every fetch failed transiently (vendor_unreachable), or another run holds the lease (lease_held)",
+                    "7": "every fetch failed transiently (vendor_unreachable), another run holds the lease (lease_held), or the send gate refused a send, which ends the run with that attempt closed not_sent (gate_refused)",
                     "8": "a file failed, was empty, was another shape, or was not asked"
                 },
                 "mutates": true
@@ -1994,7 +2016,7 @@ fn print_schema(format: Format) {
             "1": "the answer is no",
             "2": "usage, unparseable input, schema mismatch, io",
             "4": "not found",
-            "7": "another run holds the lease (retryable)",
+            "7": "another run holds the lease, or another sender the send gate (retryable)",
             "8": "the report is incomplete"
         },
         "error_codes": [
@@ -2016,7 +2038,9 @@ fn print_schema(format: Format) {
             {"code": "provenance_unrecorded", "exit": 4, "retryable": false},
             {"code": "nothing_visible", "exit": 4, "retryable": false},
             {"code": "staging_left", "exit": 2, "retryable": false},
-            {"code": "pace_root_split", "exit": 2, "retryable": false}
+            {"code": "pace_root_split", "exit": 2, "retryable": false},
+            {"code": cmd_robots::GATE_REFUSED, "exit": cmd_robots::GATE_REFUSED_EXIT,
+             "retryable": cmd_robots::GATE_REFUSED_RETRYABLE}
         ],
         // Decision D1's companion rule, which `news_provider::Exit` holds as one function.
         "stdout_carries_the_result_for_exits": [0, 1, 8]

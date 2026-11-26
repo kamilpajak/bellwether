@@ -83,9 +83,37 @@ pub enum RobotsError {
     Credential(String),
     #[error(transparent)]
     Budget(#[from] BudgetError),
+    /// Section 5.1's `gate_refused`: the attempt is closed `not_sent` and the run ends here.
+    #[error("the send gate refused attempt {attempt_id} before the socket: {why}")]
+    GateRefused {
+        attempt_id: String,
+        why: BudgetError,
+    },
 }
 
+/// Section 5.1's `gate_refused`, which `robots refresh` and `roster fetch` end a run with: the
+/// code, its exit and its `retryable`, read by the error object and by `newsvault schema`.
+pub const GATE_REFUSED: &str = "gate_refused";
+pub const GATE_REFUSED_EXIT: u8 = 7;
+pub const GATE_REFUSED_RETRYABLE: bool = true;
+
 impl RobotsError {
+    /// The `newsvault.error/1` object of a run the send gate ended; `argv` is the rerun.
+    #[must_use]
+    pub fn gate_refusal(&self, argv: Vec<String>) -> Option<Value> {
+        let Self::GateRefused { attempt_id, why } = self else {
+            return None;
+        };
+        Some(json!({
+            "schema": "newsvault.error/1",
+            "code": GATE_REFUSED,
+            "message": self.to_string(),
+            "retryable": GATE_REFUSED_RETRYABLE,
+            "details": {"attempt_id": attempt_id, "refusal": why.to_string()},
+            "suggestions": [argv],
+        }))
+    }
+
     /// `invalid_argument` (section 5.1), which `main` writes as `usage error:`.
     #[must_use]
     pub const fn is_usage(&self) -> bool {
@@ -96,7 +124,8 @@ impl RobotsError {
             | Self::Store(_)
             | Self::Ledger(_)
             | Self::Credential(_)
-            | Self::Budget(_) => false,
+            | Self::Budget(_)
+            | Self::GateRefused { .. } => false,
         }
     }
 }
@@ -265,6 +294,7 @@ pub fn run(
     let mut store = Committer::open(&ask.store, &run)?;
     let mut fetched = Vec::with_capacity(rows.len());
     let interval = feed.transport().budget.per_host;
+    let mut refused = None;
     for (ordinal, row) in (0_u32..).zip(&rows) {
         let request = request_for(&row.host, Some(feed.hosts_version()));
         let asked = Asked {
@@ -274,16 +304,27 @@ pub fn run(
             request: &request,
             interval,
         };
-        fetched.push(fetch(&mut store, exchange, clock, &asked)?);
+        match fetch(&mut store, exchange, clock, &asked) {
+            Ok(one) => fetched.push(one),
+            Err(RobotsError::GateRefused { attempt_id, why }) => {
+                refused = Some(RobotsError::GateRefused { attempt_id, why });
+                break;
+            }
+            Err(other) => return Err(other),
+        }
     }
     write_envelope(
         &ask.store,
         &Envelope {
             finished_at: Some(clock.now()),
+            refused: refused.as_ref().map(|_| GATE_REFUSED.to_owned()),
             ..envelope
         },
     )?;
-    Ok(answer_of(ask, feed, &run_id, started, &rows, &fetched))
+    match refused {
+        Some(refused) => Err(refused),
+        None => Ok(answer_of(ask, feed, &run_id, started, &rows, &fetched)),
+    }
 }
 
 /// A robots fetch of `host`; `hosts_version` is `None` for a caller that reads no hosts file.
@@ -324,6 +365,26 @@ pub(crate) fn sent(
         Err(SendFailure::Transport(failed)) => Ok(Err(failed)),
         Err(SendFailure::CredentialMissing(name)) => Err(RobotsError::Credential(name)),
         Err(SendFailure::Budget(why)) => Err(RobotsError::Budget(why)),
+    }
+}
+
+/// A send the gate refused: its attempt is closed `not_sent`, never left to a sweep, and the
+/// refusal is the error the run ends with (section 5.1, `gate_refused`).
+pub(crate) fn unsent(
+    slot: AttemptSlot,
+    store: &mut Committer,
+    clock: &dyn Clock,
+    why: BudgetError,
+) -> RobotsError {
+    let at = ObservationTime::new(clock.now());
+    let attempt_id = slot.attempt_id().hex().to_owned();
+    let closed = match slot.close_unsent(store, at) {
+        Ok(closed) => closed,
+        Err(refused) => return refused.into(),
+    };
+    match store.record(closed, None, &[], at) {
+        Ok(_) => RobotsError::GateRefused { attempt_id, why },
+        Err(refused) => refused.into(),
     }
 }
 
@@ -388,11 +449,12 @@ pub(crate) fn fetch(
         clock,
     };
     let permit = or_abandon::<_, _, RobotsError>(slot.take_permit(), store, &opened)?;
-    let answer = or_abandon::<_, _, RobotsError>(
-        sent(exchange.send(permit, request, clock)),
-        store,
-        &opened,
-    )?;
+    let answer = match exchange.send(permit, request, clock) {
+        Err(SendFailure::Budget(why)) if why.is_a_gate_refusal() => {
+            return Err(unsent(slot, store, clock, why));
+        }
+        answered => or_abandon::<_, _, RobotsError>(sent(answered), store, &opened)?,
+    };
     let verdict = verdict_of(&answer);
     // Every body is stored and linked, a 403 page and a cut body included (P10, section 3.9).
     let payload = Payload::stored(request, &answer, |body| {

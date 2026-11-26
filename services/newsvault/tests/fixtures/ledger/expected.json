@@ -29,6 +29,7 @@
           "empty": 0,
           "failed": 0,
           "interrupted": 0,
+          "not_sent": 0,
           "in_flight": 2,
           "opened_without_answered": [
             "a-0701-edgar-2"
@@ -70,7 +71,8 @@
           "deferred": {
             "run_deadline": 0,
             "host_held": 0,
-            "follow_up_cap": 0
+            "follow_up_cap": 0,
+            "gate_refused": 0
           },
           "carried": {
             "answered": 0,
@@ -87,6 +89,7 @@
           "empty": 0,
           "failed": 0,
           "interrupted": 0,
+          "not_sent": 0,
           "in_flight": 0,
           "opened_without_answered": [],
           "answered_without_finalised": [],
@@ -124,7 +127,8 @@
           "deferred": {
             "run_deadline": 0,
             "host_held": 0,
-            "follow_up_cap": 0
+            "follow_up_cap": 0,
+            "gate_refused": 0
           },
           "carried": {
             "answered": 0,
@@ -157,6 +161,7 @@
           "empty": 1,
           "failed": 0,
           "interrupted": 0,
+          "not_sent": 0,
           "in_flight": 0,
           "opened_without_answered": [],
           "answered_without_finalised": [],
@@ -194,7 +199,8 @@
           "deferred": {
             "run_deadline": 0,
             "host_held": 0,
-            "follow_up_cap": 0
+            "follow_up_cap": 0,
+            "gate_refused": 0
           },
           "carried": {
             "answered": 0,
@@ -211,6 +217,7 @@
           "empty": 1,
           "failed": 0,
           "interrupted": 0,
+          "not_sent": 0,
           "in_flight": 0,
           "opened_without_answered": [],
           "answered_without_finalised": [],
@@ -248,7 +255,8 @@
           "deferred": {
             "run_deadline": 0,
             "host_held": 0,
-            "follow_up_cap": 0
+            "follow_up_cap": 0,
+            "gate_refused": 0
           },
           "carried": {
             "answered": 0,
@@ -281,6 +289,7 @@
           "empty": 0,
           "failed": 1,
           "interrupted": 1,
+          "not_sent": 0,
           "in_flight": 0,
           "opened_without_answered": [],
           "answered_without_finalised": [],
@@ -318,7 +327,8 @@
           "deferred": {
             "run_deadline": 0,
             "host_held": 0,
-            "follow_up_cap": 0
+            "follow_up_cap": 0,
+            "gate_refused": 0
           },
           "carried": {
             "answered": 0,
@@ -335,6 +345,7 @@
           "empty": 0,
           "failed": 1,
           "interrupted": 0,
+          "not_sent": 0,
           "in_flight": 0,
           "opened_without_answered": [],
           "answered_without_finalised": [],
@@ -372,7 +383,8 @@
           "deferred": {
             "run_deadline": 0,
             "host_held": 0,
-            "follow_up_cap": 0
+            "follow_up_cap": 0,
+            "gate_refused": 0
           },
           "carried": {
             "answered": 0,
@@ -405,6 +417,7 @@
           "empty": 0,
           "failed": 0,
           "interrupted": 0,
+          "not_sent": 0,
           "in_flight": 0,
           "opened_without_answered": [],
           "answered_without_finalised": [],
@@ -442,7 +455,8 @@
           "deferred": {
             "run_deadline": 0,
             "host_held": 0,
-            "follow_up_cap": 0
+            "follow_up_cap": 0,
+            "gate_refused": 0
           },
           "carried": {
             "answered": 0,
@@ -475,6 +489,7 @@
           "empty": 0,
           "failed": 0,
           "interrupted": 0,
+          "not_sent": 0,
           "in_flight": 0,
           "opened_without_answered": [],
           "answered_without_finalised": [],
@@ -512,7 +527,8 @@
           "deferred": {
             "run_deadline": 0,
             "host_held": 0,
-            "follow_up_cap": 0
+            "follow_up_cap": 0,
+            "gate_refused": 0
           },
           "carried": {
             "answered": 0,

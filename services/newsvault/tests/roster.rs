@@ -556,6 +556,106 @@ fn a_roster_fetch_through_the_wire_pays_into_edgar_press_s_per_ip_pace() -> Test
     Ok(())
 }
 
+/// `(source, outcome, requested_at, slots, closed)` of one stored attempt.
+type ClosedAttempt = (String, String, Option<String>, Option<i64>, bool);
+
+/// SEC's per-IP gate file kept locked by a second open file, as another sending process keeps
+/// it: the file's send waits its 32 intervals (3.2 s) and is refused. The run ends there with
+/// `gate_refused`, exit 7, retryable; the attempt is closed `not_sent` with nothing requested,
+/// no payload and no slot spent, none is left open for a sweep, and the server saw no request.
+#[test]
+fn a_roster_fetch_whose_send_the_gate_refuses_ends_retryable_with_its_attempt_closed_not_sent(
+) -> TestResult {
+    let (root, shared) = (TempDir::new()?, TempDir::new()?);
+    let server = loopback::Loopback::redirecting("/never", ROSTER_BODY.to_vec())?;
+    let stub = Stub::sec(ROBOTS_BODY, b"");
+    let ask = ask(root.path());
+    let pace_root = PaceRoot::resolve(Some(shared.path()), root.path())?;
+    let pace = shared.path().join("pace");
+    std::fs::create_dir_all(&pace)?;
+    let gate = pace.join(format!("{}.per-ip.sent", edgar_press::SOURCE));
+    let held = std::fs::File::create(&gate)?;
+    held.lock()?;
+    let exchange = loopback::Relay {
+        stub: &stub,
+        wire: cmd_roster::wire_for(&ask, &pace_root),
+        relayed: BTreeMap::from([(FILE_URL.to_owned(), server.url("/files/roster.json"))]),
+        asked: RefCell::new(Vec::new()),
+    };
+    let refused = cmd_roster::run(&ask, &exchange, &Set::at(FIRST_RUN)?).err();
+    drop(held);
+    let seen = server.seen()?;
+    server.finish()?;
+    let object = match &refused {
+        Some(RosterError::Robots(refusal)) => refusal.gate_refusal(vec!["again".to_owned()]),
+        _ => None,
+    }
+    .unwrap_or_default();
+    let db = read_only(root.path())?;
+    let attempts: Vec<ClosedAttempt> = db
+        .prepare(
+            "SELECT source, outcome, requested_at, slots, closed_at IS NOT NULL
+               FROM attempts ORDER BY rowid",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    let payloads: i64 = db.query_row(
+        "SELECT COUNT(*) FROM payloads p JOIN attempts a ON a.attempt_id = p.attempt_id
+          WHERE a.source = ?1",
+        [ROSTER_SOURCE],
+        |row| row.get(0),
+    )?;
+    let run_file: Value = serde_json::from_slice(&std::fs::read(
+        root.path()
+            .join(RUNS_DIR)
+            .join("roster-20261123T012000Z.json"),
+    )?)?;
+    assert_eq!(
+        (
+            refused.as_ref().map(RosterError::exit),
+            (
+                object["code"].clone(),
+                object["retryable"].clone(),
+                object["suggestions"].clone(),
+                object["details"]["refusal"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(&gate.display().to_string())),
+            ),
+            seen,
+            attempts.len(),
+            attempts.last().cloned(),
+            payloads,
+            run_file["finished_at"].is_string(),
+            run_file["refused"].clone(),
+        ),
+        (
+            Some(7),
+            (json!("gate_refused"), json!(true), json!([["again"]]), true),
+            Vec::new(),
+            2,
+            Some((
+                ROSTER_SOURCE.to_owned(),
+                "not_sent".to_owned(),
+                None,
+                Some(0),
+                true
+            )),
+            0,
+            true,
+            json!("gate_refused"),
+        )
+    );
+    Ok(())
+}
+
 /// The roster's row of SEC's interval table and the roster's own body limit (section 8 row R19).
 /// Before this test the row at 200 ms was 0 red of 1,307 (2026-11-25).
 #[test]

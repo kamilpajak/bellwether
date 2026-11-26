@@ -151,6 +151,8 @@ pub enum OutcomeKind {
     Empty,
     Failed,
     Interrupted,
+    /// Opened and never sent: the send gate refused before the socket (section 3.2).
+    NotSent,
 }
 
 impl OutcomeKind {
@@ -163,6 +165,7 @@ impl OutcomeKind {
             Self::Empty => "empty",
             Self::Failed => "failed",
             Self::Interrupted => "interrupted",
+            Self::NotSent => "not_sent",
         }
     }
 }
@@ -262,6 +265,18 @@ impl Outcome {
     pub fn abandoned() -> Self {
         Self {
             kind: OutcomeKind::Interrupted,
+            verdict: None,
+            counts: None,
+            baseline: None,
+        }
+    }
+
+    /// The only producer of [`OutcomeKind::NotSent`], reached through
+    /// [`AttemptSlot::close_unsent`]: no answer, so no verdict, no counts and no baseline.
+    #[must_use]
+    pub const fn not_sent() -> Self {
+        Self {
+            kind: OutcomeKind::NotSent,
             verdict: None,
             counts: None,
             baseline: None,
@@ -457,6 +472,29 @@ impl AttemptSlot {
             attempt_id: self.attempt_id.clone(),
             outcome: outcome.clone(),
             cost: Some(cost),
+            closed_at: at,
+        })?;
+        Ok(AttemptReceipt {
+            attempt_id: self.attempt_id,
+            outcome,
+            closed_at: at,
+        })
+    }
+}
+
+impl AttemptSlot {
+    /// Closes an attempt whose send the gate refused: `Finalised` alone, with no `Answered`
+    /// row, since nothing was requested, and no slot spent, since no call left.
+    pub fn close_unsent(
+        self,
+        sink: &mut dyn Sink,
+        at: ObservationTime,
+    ) -> Result<AttemptReceipt, LedgerError> {
+        let outcome = Outcome::not_sent();
+        sink.write(&AttemptEvent::Finalised {
+            attempt_id: self.attempt_id.clone(),
+            outcome: outcome.clone(),
+            cost: Some(Cost::Slots(0)),
             closed_at: at,
         })?;
         Ok(AttemptReceipt {
@@ -762,6 +800,32 @@ pub(crate) mod tests {
         assert_eq!(
             (taken.cost(), untaken.cost()),
             (Some(Cost::Slots(1)), Some(Cost::Slots(0)))
+        );
+    }
+
+    /// A send the gate refused: the permit was taken and no call left, so the row closes with
+    /// no `Answered` event, by its own name and with no slot spent.
+    #[test]
+    fn an_attempt_the_gate_refused_is_closed_not_sent_with_no_answered_row_and_no_slot_spent() {
+        let mut sink = Recorder::default();
+        let Ok(mut opened) = slot(&mut sink, FIRST_ATTEMPT) else {
+            assert_eq!(sink.names(), vec!["an opened slot"]);
+            return;
+        };
+        let taken = opened.take_permit().is_ok();
+        let closed = opened.close_unsent(&mut sink, at(CLOSED_AT));
+        let outcome = closed.as_ref().map(|receipt| {
+            let outcome = receipt.outcome();
+            (outcome.kind().name(), outcome.verdict(), outcome.counts())
+        });
+        assert_eq!(
+            (taken, outcome, sink.names(), sink.cost()),
+            (
+                true,
+                Ok(("not_sent", None, None)),
+                vec!["opened", "finalised"],
+                Some(Cost::Slots(0))
+            )
         );
     }
 
