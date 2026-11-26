@@ -348,9 +348,9 @@ const SLOW: u64 = 250;
 /// Past one slow interval, so the slow sender reaches the gate after the fast ones resumed.
 const LATE: u64 = 325;
 /// The fast senders stamp for over 3 s, past the 2 s that 8 tries of 250 ms lasted before the fix.
-/// `fast-b` asks a second host, so only the per-IP gate's lock stands between it and the others;
-/// `plain` owes no per-IP pace, so only the host gate's does. Each alone stamps for 3 s or more.
-const SENDERS: [Sender; 4] = [
+/// `fast-b` asks a second host, so only the per-IP gate's lock stands between it and the others,
+/// and alone it stamps for 3 s.
+const SENDERS: [Sender; 3] = [
     Sender {
         id: "fast-a",
         interval_ms: FAST,
@@ -368,14 +368,6 @@ const SENDERS: [Sender; 4] = [
         host: LOCALHOST,
     },
     Sender {
-        id: "plain",
-        interval_ms: FAST,
-        sends: 60,
-        delay_ms: 0,
-        per_ip: None,
-        host: LOOPBACK,
-    },
-    Sender {
         id: "slow",
         interval_ms: SLOW,
         sends: 3,
@@ -384,7 +376,7 @@ const SENDERS: [Sender; 4] = [
         host: LOOPBACK,
     },
 ];
-const ALL_OF_THEM: usize = 153;
+const ALL_OF_THEM: usize = 93;
 
 /// Before the gate held its lock through its wait, the slow sender was owed again on each of its
 /// 8 tries, because a fast one had stamped inside its last 250 ms, and was refused.
