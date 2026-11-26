@@ -16,7 +16,7 @@ use news_provider::{
 };
 use newsvault::cmd_collect::Registered;
 use newsvault::cmd_ledger;
-use newsvault::cmd_robots::ROBOTS_SOURCE;
+use newsvault::cmd_robots::{RobotsError, ROBOTS_SOURCE};
 use newsvault::cmd_roster::{self, Ask, RosterError, FILES, ROSTER_SOURCE};
 use newsvault::store::{Committer, COMMIT_LOG, RUNS_DIR};
 use rusqlite::{Connection, OpenFlags};
@@ -551,6 +551,54 @@ fn a_roster_fetch_through_the_wire_pays_into_edgar_press_s_per_ip_pace() -> Test
             true,
             false,
             false
+        )
+    );
+    Ok(())
+}
+
+/// One metadata for the code (section 5.1): the entry `newsvault schema` lists is the code and
+/// the `retryable` of the object a refused run writes and the exit it takes, and both commands'
+/// exit tables name it at 7.
+#[test]
+fn the_schema_lists_gate_refused_with_the_exit_and_retryable_a_refused_run_reports() -> TestResult {
+    let printed = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .args(["schema", "--format", "json"])
+        .output()?;
+    let schema: Value = serde_json::from_slice(&printed.stdout)?;
+    let refusal = RobotsError::GateRefused {
+        attempt_id: "an attempt".to_owned(),
+        why: BudgetError::NeverCleared {
+            tries: 8,
+            owed: SEC_INTERVAL,
+        },
+    };
+    let object = refusal.gate_refusal(Vec::new()).unwrap_or_default();
+    let listed = json!({
+        "code": object["code"],
+        "exit": RosterError::Robots(refusal).exit(),
+        "retryable": object["retryable"],
+    });
+    let named_at_seven = |command: &[&str]| {
+        schema["commands"]
+            .as_array()
+            .and_then(|all| all.iter().find(|entry| entry["path"] == json!(command)))
+            .and_then(|entry| entry["exits"]["7"].as_str())
+            .is_some_and(|text| text.contains("gate_refused"))
+    };
+    assert_eq!(
+        (
+            schema["error_codes"]
+                .as_array()
+                .is_some_and(|codes| codes.contains(&listed)),
+            listed,
+            named_at_seven(&["roster", "fetch"]),
+            named_at_seven(&["robots", "refresh"]),
+        ),
+        (
+            true,
+            json!({"code": "gate_refused", "exit": 7, "retryable": true}),
+            true,
+            true
         )
     );
     Ok(())
