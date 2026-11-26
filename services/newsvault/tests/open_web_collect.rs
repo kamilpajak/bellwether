@@ -6305,6 +6305,7 @@ fn a_host_whose_gate_another_sender_keeps_is_deferred_and_carried_while_the_othe
         .and_then(|row| row["not_sent"].as_str())
         .is_some_and(|text| text.contains(&gate));
     let deferred: Vec<(String, String, String, Value)> = deferred_of(&first.envelope);
+    let fed_lane = busy_of(&first.envelope, FED_HOST);
     let mut human = Vec::new();
     cmd_collect::render_human(&first.envelope, &mut human)?;
     let human = String::from_utf8(human)?;
@@ -6319,6 +6320,7 @@ fn a_host_whose_gate_another_sender_keeps_is_deferred_and_carried_while_the_othe
                 .collect::<Vec<_>>(),
             named,
             deferred,
+            (fed_lane["stopped"].clone(), fed_lane["not_looked"].clone()),
             human.lines().find(|line| line.starts_with("deferred")),
             seen_while_held,
             attempts_not_ok(root.path())?,
@@ -6338,6 +6340,7 @@ fn a_host_whose_gate_another_sender_keeps_is_deferred_and_carried_while_the_othe
                     Value::Null
                 ))
                 .collect::<Vec<_>>(),
+            (Value::from(true), Value::from(3)),
             Some("deferred         3 run_deadline 0 host_held 0 follow_up_cap 0 gate_refused 3"),
             Vec::new(),
             vec![(NOT_SENT.to_owned(), None, Some(0), true)],
@@ -6411,6 +6414,15 @@ fn a_host_whose_gate_another_sender_keeps_is_deferred_and_carried_while_the_othe
         )
     );
     Ok(())
+}
+
+/// `host`'s row of the envelope's `busy.hosts`.
+fn busy_of(envelope: &Value, host: &str) -> Value {
+    envelope["busy"]["hosts"]
+        .as_array()
+        .and_then(|lanes| lanes.iter().find(|lane| lane["host"] == host))
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// The committed hosts on Monday with no deadline, on a fresh store.
@@ -6487,9 +6499,10 @@ fn a_send_the_gate_never_clears_is_closed_not_sent_and_deferred_with_its_lane() 
 const A_SHORT_DEADLINE: &str = "2026-11-16T09:30:30.300Z";
 
 /// The same held gate at the open-web profile's own 7 s, under a deadline 300 ms away: the lock
-/// is waited for those 300 ms, as the refusal says, and not the 224 s that are 32 intervals.
+/// is waited for half of those 300 ms, as the refusal says, and not the 224 s that are 32
+/// intervals. Another sender is the cause, so the rows are `gate_refused`.
 #[test]
-fn a_gate_held_past_the_run_s_deadline_ends_the_wait_at_the_deadline() -> TestResult {
+fn a_gate_held_near_the_run_s_deadline_is_waited_for_half_of_what_is_left() -> TestResult {
     let root = TempDir::new()?;
     seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
     let server = loopback::Loopback::redirecting("/never", Vec::new())?;
@@ -6524,12 +6537,126 @@ fn a_gate_held_past_the_run_s_deadline_ends_the_wait_at_the_deadline() -> TestRe
             refusals.len(),
             refusals
                 .first()
-                .is_some_and(|text| text.ends_with("after 300ms")),
+                .is_some_and(|text| text.ends_with("after 150ms")),
             reasons,
             answer.exit.code(),
             seen,
         ),
         (1, true, vec![GATE_REFUSED.to_owned(); 3], 8, Vec::new())
+    );
+    Ok(())
+}
+
+/// A clock that stays where it is until it is moved.
+struct Moved(Cell<DateTime<Utc>>);
+
+impl Clock for Moved {
+    fn now(&self) -> DateTime<Utc> {
+        self.0.get()
+    }
+}
+
+/// `Reserving`, with `late` passing on `clock` before each relayed send: an attempt row that
+/// took that long to write between the reservation and the gate.
+struct RowWrittenLate<'run> {
+    reserving: Reserving<'run>,
+    clock: &'run Moved,
+    late: TimeDelta,
+}
+
+impl Exchange for RowWrittenLate<'_> {
+    fn reserve(
+        &self,
+        request: &Request,
+        clock: &dyn Clock,
+        deadline: Option<DateTime<Utc>>,
+    ) -> Result<news_provider::Reservation, news_provider::Unreserved> {
+        self.reserving.reserve(request, clock, deadline)
+    }
+
+    fn send(
+        &self,
+        permit: SendPermit,
+        request: &Request,
+        clock: &dyn Clock,
+    ) -> Result<RawResponse, SendFailure> {
+        if self.reserving.0.relayed.contains_key(&request.url) {
+            self.clock.0.set(self.clock.0.get() + self.late);
+        }
+        self.reserving.send(permit, request, clock)
+    }
+}
+
+/// 2 ms after `MONDAY_AT`, and the 3 ms the first release's attempt row takes to write.
+const A_DEADLINE_INSIDE_THE_ROW_WRITE: &str = "2026-11-16T09:30:30.002Z";
+const THE_ROW_WRITE: TimeDelta = TimeDelta::milliseconds(3);
+const WHERE_THE_ROW_WRITE_ENDS: &str = "2026-11-16T09:30:30.003000Z";
+const RUN_DEADLINE: &str = "run_deadline";
+
+/// One sending process and no gate held: the first release is reserved before the deadline and
+/// its attempt row is written past it. The gate is free and stamps nothing after the deadline,
+/// so the attempt is closed `not_sent` by the deadline's name and the lane is `run_deadline`
+/// with the first row's `go_at`, never `gate_refused`; the lane's wait counts the row write.
+#[test]
+fn a_send_the_deadline_passes_before_its_gate_is_not_sent_and_its_lane_is_run_deadline(
+) -> TestResult {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    let server = loopback::Loopback::redirecting("/never", Vec::new())?;
+    let ask = Ask {
+        hosts: Some(seed::committed_hosts()),
+        at: instant(MONDAY_AT),
+        deadline: Some(instant(A_DEADLINE_INSIDE_THE_ROW_WRITE)),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let stub = Gnw::five_hosts()?;
+    let clock = Moved(Cell::new(instant(MONDAY_AT)));
+    let exchange = RowWrittenLate {
+        reserving: fed_through_the_wire(&ask, &stub, &server, None)?,
+        clock: &clock,
+        late: THE_ROW_WRITE,
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, &exchange, &clock)?;
+    let seen = server.seen()?;
+    server.finish()?;
+    let refusals: Vec<&str> =
+        answer.envelope["attempts"]
+            .as_array()
+            .map_or_else(Vec::new, |rows| {
+                rows.iter()
+                    .filter_map(|row| row["not_sent"].as_str())
+                    .collect()
+            });
+    let deferred: Vec<(String, Value)> = deferred_of(&answer.envelope)
+        .into_iter()
+        .map(|row| (row.2, row.3))
+        .collect();
+    let fed_lane = busy_of(&answer.envelope, FED_HOST);
+    assert_eq!(
+        (
+            seen,
+            refusals,
+            deferred,
+            (fed_lane["stopped"].clone(), fed_lane["waited_s"].clone()),
+            attempts_not_ok(root.path())?,
+            answer.exit.code(),
+        ),
+        (
+            Vec::new(),
+            vec!["the send gate owed 0ns and the run had 0ns left before its deadline"],
+            vec![
+                (
+                    RUN_DEADLINE.to_owned(),
+                    Value::from(WHERE_THE_ROW_WRITE_ENDS)
+                ),
+                (RUN_DEADLINE.to_owned(), Value::Null),
+                (RUN_DEADLINE.to_owned(), Value::Null),
+            ],
+            (Value::from(true), Value::from(0.003)),
+            vec![(NOT_SENT.to_owned(), None, Some(0), true)],
+            8,
+        )
     );
     Ok(())
 }

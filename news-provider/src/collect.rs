@@ -7,6 +7,7 @@
 //! [`Wire`], and [`Archive`] is the store door.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use pit::datedness::Published;
@@ -88,9 +89,9 @@ impl Exchange for Wire {
     }
 }
 
-/// One host's share of a run (S7-D11). `waited` is the clock inside [`Exchange::reserve`],
-/// `requesting` each answer's own `received_at - requested_at`; the host is `None` for a url
-/// `host_of` cannot key.
+/// One host's share of a run (S7-D11). `waited` is the clock inside [`Exchange::reserve`] and,
+/// for a send the gate refused, from there to the refusal; `requesting` each answer's own
+/// `received_at - requested_at`; the host is `None` for a url `host_of` cannot key.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostBusy {
     pub host: Option<String>,
@@ -127,8 +128,9 @@ pub enum DeferReason {
     /// Its slot opens after the deadline only because a server held or slowed its host.
     HostHeld,
     FollowUpCap,
-    /// The send gate refused its send, or the send of a request ahead of it in its host's lane
-    /// (`BudgetError::is_a_gate_refusal`): a local condition, never a vendor's answer.
+    /// Another sender kept the send gate from its send, or from the send of a request ahead of
+    /// it in its host's lane: a local condition, never a vendor's answer. A send the gate
+    /// refused for the run's deadline alone is `RunDeadline`.
     GateRefused,
 }
 
@@ -762,7 +764,8 @@ pub fn collect<A: Archive>(
         let asked_at = clock.now();
         // Before the attempt row: a request past the deadline gets none (condition A).
         let reserved = exchange.reserve(&queued.request, clock, run.deadline);
-        busy.entry(host.clone()).or_default().waited += elapsed(asked_at, clock.now());
+        let reserved_at = clock.now();
+        busy.entry(host.clone()).or_default().waited += elapsed(asked_at, reserved_at);
         let (go_at, by_server) = match reserved {
             Ok(Reservation::Go) => (None, false),
             Ok(Reservation::PastDeadline { go_at, by_server }) => (Some(go_at), by_server),
@@ -798,16 +801,28 @@ pub fn collect<A: Archive>(
         ordinal += 1;
         let mut attempted = match sent {
             Sent::Attempted(attempted) => *attempted,
-            // The gate is the host's or our address's, so the rest of the lane would wait at it
-            // too: the lane is deferred whole, as at the deadline, and the other hosts go on.
-            Sent::Refused(row) => {
-                let at = ObservationTime::new(clock.now());
-                busy.entry(host).or_default().stopped = true;
+            // The lane is deferred whole, as at the deadline, and the other hosts go on.
+            Sent::Refused { row, owed } => {
+                let now = clock.now();
+                let at = ObservationTime::new(now);
+                let share = busy.entry(host).or_default();
+                share.stopped = true;
+                share.waited += elapsed(reserved_at, now);
                 collected.attempts.push(*row);
+                let reason = match owed {
+                    Some(_) => DeferReason::RunDeadline,
+                    None => DeferReason::GateRefused,
+                };
                 let lane = queue.stop(&queued);
-                for rest in std::iter::once(queued).chain(lane) {
-                    let deferred = Deferred::of(provider, rest, DeferReason::GateRefused, at);
-                    collected.defer(archive, deferred)?;
+                let mut first = Deferred::of(provider, queued, reason, at);
+                first.go_at = owed.and_then(|owed| {
+                    TimeDelta::from_std(owed)
+                        .ok()
+                        .and_then(|owed| now.checked_add_signed(owed))
+                });
+                collected.defer(archive, first)?;
+                for rest in lane {
+                    collected.defer(archive, Deferred::of(provider, rest, reason, at))?;
                 }
                 continue;
             }
@@ -1324,8 +1339,12 @@ struct Driving<'a> {
 /// What [`attempt_once`] made of one request.
 enum Sent {
     Attempted(Box<Attempted>),
-    /// The send gate refused it: its attempt is closed `not_sent` and this is its envelope row.
-    Refused(Box<AttemptRow>),
+    /// The send gate refused it: its attempt is closed `not_sent` and `row` is its envelope row.
+    /// `owed` is the gate's wait when the run's deadline, and no other sender, was the cause.
+    Refused {
+        row: Box<AttemptRow>,
+        owed: Option<Duration>,
+    },
 }
 
 /// One attempt, from its `Opened` row to its committed rows.
@@ -1410,7 +1429,7 @@ fn attempt_once<A: Archive>(
             let at = ObservationTime::new(clock.now());
             let closed = slot.close_unsent(archive, at)?;
             archive.commit(closed, &[], None, at)?;
-            return Ok(Sent::Refused(Box::new(AttemptRow {
+            let row = Box::new(AttemptRow {
                 attempt_id,
                 source: request.source.as_str().to_owned(),
                 target_window: request.target_window.as_str().to_owned(),
@@ -1426,7 +1445,11 @@ fn attempt_once<A: Archive>(
                 items_committed: 0,
                 commit_refused: None,
                 not_sent: Some(why.to_string()),
-            })));
+            });
+            return Ok(Sent::Refused {
+                row,
+                owed: why.owed_past_the_deadline(),
+            });
         }
         Err(SendFailure::Budget(why)) => return Err(CollectError::Budget(why)),
     };
