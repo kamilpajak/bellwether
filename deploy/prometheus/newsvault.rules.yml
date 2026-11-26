@@ -47,6 +47,14 @@ groups:
         annotations:
           summary: "{{ $labels.source }}: {{ $value }} request(s) deferred host_held, run date {{ $labels.run_date }}."
 
+      # Section 12.8 step 9b: another sender kept the send gate from a request of a run.
+      - alert: NewsvaultGateRefused
+        expr: max without(days_ago) (newsvault_deferred_gate_refused) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.source }}: {{ $value }} request(s) deferred gate_refused, run date {{ $labels.run_date }}."
+
       # S7-D8: a deferred document closed after 24 h, never asked.
       - alert: NewsvaultDeferredExpired
         expr: max without(days_ago) (newsvault_carried_expired) > 0

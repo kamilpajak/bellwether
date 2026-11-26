@@ -83,6 +83,8 @@ tests:
         values: '1 0'
       - series: 'newsvault_deferred_host_held{source="open_web_wires",run_date="2026-11-18",days_ago="0"}'
         values: '0 2'
+      - series: 'newsvault_deferred_gate_refused{source="open_web_wires",run_date="2026-11-18",days_ago="0"}'
+        values: '0 4'
       - series: 'newsvault_carried_expired{source="open_web_wires",run_date="2026-11-17",days_ago="1"}'
         values: '0 3'
       - series: 'newsvault_walk_range_unread_polls{source="open_web_wires",run_date="2026-11-18",days_ago="0"}'
@@ -112,6 +114,18 @@ tests:
               run_date: "2026-11-18"
             exp_annotations:
               summary: "open_web_wires: 2 request(s) deferred host_held, run date 2026-11-18."
+      - eval_time: 0m
+        alertname: NewsvaultGateRefused
+        exp_alerts: []
+      - eval_time: 1h
+        alertname: NewsvaultGateRefused
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              source: open_web_wires
+              run_date: "2026-11-18"
+            exp_annotations:
+              summary: "open_web_wires: 4 request(s) deferred gate_refused, run date 2026-11-18."
       - eval_time: 0m
         alertname: NewsvaultDeferredExpired
         exp_alerts: []

@@ -1559,11 +1559,12 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
 pub const PROMETHEUS_SCHEMA: &str = "newsvault.prom/1";
 /// Every family [`render_prometheus`] writes, in its order: the list a deploy test holds the alert
 /// rules to, so a family with no rule reading it, or a rule reading none, is red.
-pub const PROMETHEUS_FAMILIES: [&str; 8] = [
+pub const PROMETHEUS_FAMILIES: [&str; 9] = [
     "newsvault_ledger_at_timestamp_seconds",
     "newsvault_ledger_complete",
     "newsvault_collect_last_asked_age_seconds",
     "newsvault_deferred_host_held",
+    "newsvault_deferred_gate_refused",
     "newsvault_carried_expired",
     "newsvault_walk_range_unread_polls",
     "newsvault_holds_capped",
@@ -1669,6 +1670,12 @@ pub fn render_prometheus(
     )?;
     family(
         out,
+        "newsvault_deferred_gate_refused",
+        "Requests another sender kept out of a run at the send gate (section 3.2 gate_refused).",
+        &per_source(&|row| row.deferred.gate_refused),
+    )?;
+    family(
+        out,
         "newsvault_carried_expired",
         "Deferred rows the carry closed expired after 24 h, never asked (S7-D5).",
         &per_source(&|row| row.carried.expired),
@@ -1745,7 +1752,7 @@ mod tests {
             run_deadline: 101,
             host_held,
             follow_up_cap: 103,
-            gate_refused: 0,
+            gate_refused: host_held + 100,
         };
         row.carried = CarriedCounts {
             answered: 104,
@@ -1857,6 +1864,8 @@ mod tests {
                 "newsvault_collect_last_asked_age_seconds 23".to_owned(),
                 format!("newsvault_deferred_host_held{{{}}} 3", day(1)),
                 format!("newsvault_deferred_host_held{{{}}} 13", day(0)),
+                format!("newsvault_deferred_gate_refused{{{}}} 103", day(1)),
+                format!("newsvault_deferred_gate_refused{{{}}} 113", day(0)),
                 format!("newsvault_carried_expired{{{}}} 5", day(1)),
                 format!("newsvault_carried_expired{{{}}} 17", day(0)),
                 format!("newsvault_walk_range_unread_polls{{{}}} 7", day(1)),
