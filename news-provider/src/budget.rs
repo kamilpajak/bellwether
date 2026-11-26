@@ -420,13 +420,45 @@ impl SendGate {
     /// answers `Owed` with: released for it, the opening went to whichever process read its clock
     /// first, and a sender lost 8 times running was refused (13 of 600 sends, two processes at
     /// 100 ms, 2026-11-26; architecture.md section 12.6).
-    pub(crate) fn lock(gates: &[Self]) -> Result<Locked<'_>, BudgetError> {
+    fn lock(gates: &[Self]) -> Result<Locked<'_>, BudgetError> {
         let mut locked = Locked {
             gates,
             held: Vec::with_capacity(gates.len()),
         };
         locked.lock_the_rest()?;
         Ok(locked)
+    }
+}
+
+/// The gates of one call in the order their locks are taken: the host's, then our address's.
+/// Per-IP first, its lock was kept through a host's wait (`gates.reverse()` in `Wire` passed
+/// every test, review 2026-11-26), so the order is stated here alone and the field is private.
+#[derive(Debug)]
+pub(crate) struct Gates(Vec<SendGate>);
+
+impl Gates {
+    pub(crate) fn of_a_call(
+        store: &Path,
+        host: Option<(&HostKey, Duration)>,
+        per_ip: Option<(&SourceId, Duration)>,
+    ) -> Result<Self, BudgetError> {
+        let host = host.map(|(host, interval)| (BudgetScope::PerHost(host.clone()), interval));
+        let per_ip =
+            per_ip.map(|(source, interval)| (BudgetScope::PerIp(source.clone()), interval));
+        [host, per_ip]
+            .into_iter()
+            .flatten()
+            .map(|(scope, interval)| SendGate::beside_the_store(store, &scope, interval))
+            .collect::<Result<_, _>>()
+            .map(Self)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn lock(&self) -> Result<Locked<'_>, BudgetError> {
+        SendGate::lock(&self.0)
     }
 }
 
@@ -570,6 +602,7 @@ fn stamp(at: DateTime<Utc>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::TryLockError;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -577,7 +610,7 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     use super::{
-        open_for_update, BudgetError, BudgetScope, Hold, HostKey, Pace, SendGate, Stamped,
+        open_for_update, BudgetError, BudgetScope, Gates, Hold, HostKey, Pace, SendGate, Stamped,
     };
     use crate::request::SourceId;
 
@@ -763,21 +796,25 @@ mod tests {
     const ANOTHER_HOST_S_SEND: &str = "2026-11-10T13:00:00.95Z";
     const LEFT_OF_THE_PER_IP_INTERVAL: Duration = Duration::from_millis(50);
     const PAST_BOTH: &str = "2026-11-10T13:00:01.05Z";
+    const BOTH_SENT: &str = "2026-11-10T13:00:02Z";
+    const BOTH_OWED_ALIKE: &str = "2026-11-10T13:00:02.05Z";
 
     /// A host owed more than the per-IP bucket is waited out without the per-IP lock, so another
     /// host's call is stamped meanwhile, and the next stamp takes that lock and reads that bucket
-    /// again. Kept, the lock refuses the other call `GateHeld` after 3.2 s.
+    /// again. Kept, the lock refuses the other call `GateHeld` after 3.2 s. A host owed exactly
+    /// what the per-IP bucket is (SEC's shape, one interval for both) keeps the per-IP lock.
     #[test]
     fn a_call_another_host_made_during_a_host_s_wait_is_still_owed_the_per_ip_interval(
     ) -> Result<(), String> {
         let store = tempfile::tempdir().map_err(|why| why.to_string())?;
+        let source = SourceId::new("edgar_press");
         let gates = |host: &str, interval| {
             let host = HostKey::new(host)?;
-            let per_ip = BudgetScope::PerIp(SourceId::new("edgar_press"));
-            Ok::<_, BudgetError>([
-                SendGate::beside_the_store(store.path(), &BudgetScope::PerHost(host), interval)?,
-                SendGate::beside_the_store(store.path(), &per_ip, PER_IP)?,
-            ])
+            Gates::of_a_call(
+                store.path(),
+                Some((&host, interval)),
+                Some((&source, PER_IP)),
+            )
         };
         let ours = gates(SEC, GATE_INTERVAL).map_err(|why| why.to_string())?;
         let theirs = gates("data.sec.gov", PER_IP).map_err(|why| why.to_string())?;
@@ -787,22 +824,38 @@ mod tests {
             at(ONE_INTERVAL_ON)?,
             at(PAST_BOTH)?,
         );
-        stamp_once(&ours, at(LAST_SEND)?).map_err(|why| why.to_string())?;
-        let mut locked = SendGate::lock(&ours).map_err(|why| why.to_string())?;
+        let (both_sent, alike) = (at(BOTH_SENT)?, at(BOTH_OWED_ALIKE)?);
+        stamp_once(&ours.0, at(LAST_SEND)?).map_err(|why| why.to_string())?;
+        let mut locked = ours.lock().map_err(|why| why.to_string())?;
         let stamps = [
             locked.stamp(&|| half_on),
-            stamp_once(&theirs, at(ANOTHER_HOST_S_SEND)?),
+            stamp_once(&theirs.0, at(ANOTHER_HOST_S_SEND)?),
             locked.stamp(&|| one_on),
             locked.stamp(&|| past_both),
         ];
+        drop(locked);
+        let mut tied = theirs.lock().map_err(|why| why.to_string())?;
+        let alike = [tied.stamp(&|| both_sent), tied.stamp(&|| alike)];
+        let [_, SendGate { path, .. }] = theirs.0.as_slice() else {
+            return Err("no per-IP gate".to_owned());
+        };
+        let per_ip = open_for_update(path).map_err(|why| why.to_string())?;
+        let per_ip_kept = matches!(per_ip.try_lock(), Err(TryLockError::WouldBlock));
         assert_eq!(
-            stamps,
-            [
-                Ok(Stamped::Owed(HALF_A_HOST_INTERVAL)),
-                Ok(Stamped::Sent(at(ANOTHER_HOST_S_SEND)?)),
-                Ok(Stamped::Owed(LEFT_OF_THE_PER_IP_INTERVAL)),
-                Ok(Stamped::Sent(past_both))
-            ]
+            (stamps, alike, per_ip_kept),
+            (
+                [
+                    Ok(Stamped::Owed(HALF_A_HOST_INTERVAL)),
+                    Ok(Stamped::Sent(at(ANOTHER_HOST_S_SEND)?)),
+                    Ok(Stamped::Owed(LEFT_OF_THE_PER_IP_INTERVAL)),
+                    Ok(Stamped::Sent(past_both))
+                ],
+                [
+                    Ok(Stamped::Sent(both_sent)),
+                    Ok(Stamped::Owed(LEFT_OF_THE_PER_IP_INTERVAL))
+                ],
+                true
+            )
         );
         Ok(())
     }
