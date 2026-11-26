@@ -572,7 +572,7 @@ fn stamp(at: DateTime<Utc>) -> String {
 mod tests {
     use std::sync::mpsc;
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use chrono::{DateTime, Utc};
 
@@ -657,7 +657,8 @@ mod tests {
     const HUNG: Duration = Duration::from_secs(120);
 
     /// The holder is this test: a second open file of one process is another `flock` owner. It
-    /// keeps the lock until the refused caller is back, which no clock decides.
+    /// keeps the lock until the refused caller is back, which no clock decides. The wait itself
+    /// is not timed here: this crate reads no clock outside `wire` and `clock` (row R4).
     #[test]
     fn a_gate_lock_another_sender_keeps_is_refused_by_name_after_its_turns() -> Result<(), String> {
         let store = tempfile::tempdir().map_err(|why| why.to_string())?;
@@ -675,9 +676,7 @@ mod tests {
             drop(held);
             told
         });
-        let began = Instant::now();
         let refused = SendGate::lock(&gate).err();
-        let waited = began.elapsed();
         release.send(()).map_err(|why| why.to_string())?;
         let told = holder.join().map_err(|_| "the holder panicked")?;
         let refused_by_name = Some(BudgetError::GateHeld {
@@ -685,13 +684,8 @@ mod tests {
             waited: ITS_TURNS,
         });
         assert_eq!(
-            (
-                refused,
-                told,
-                waited >= ITS_TURNS,
-                SendGate::lock(&gate).is_ok()
-            ),
-            (refused_by_name, true, true, true)
+            (refused, told, SendGate::lock(&gate).is_ok()),
+            (refused_by_name, true, true)
         );
         Ok(())
     }
