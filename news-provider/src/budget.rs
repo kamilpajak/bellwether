@@ -2,7 +2,7 @@
 //! file per bucket carries one wall instant (`BudgetScope::held` says which); a pace file's lock is
 //! held for the read-reserve-write and never across the wait, so callers stack reservations
 //! instead of serialising on each other's wait. A `.sent` file's lock is held across the gate's
-//! wait ([`SendGate::lock`]).
+//! wait (`SendGate::lock`) and waited for within a limit (`GATE_TURNS`).
 //!
 //! The shape is the predecessor's `sec_rate_coordinator.py`, written after the failure it
 //! prevents: three processes on one residential IP, each with its own in-process throttle, whose
@@ -11,9 +11,11 @@
 //!
 //! What it does and does not close: `docs/design/architecture.md` section 8 row R19.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, SubsecRound, TimeDelta, Utc};
@@ -140,7 +142,16 @@ pub enum BudgetError {
     /// The send gate still owed a wait after this many tries (`SendGate`, row R19).
     #[error("the send gate still owed {owed:?} after {tries} tries")]
     NeverCleared { tries: u32, owed: Duration },
+    /// Another sender kept a gate's lock past `GATE_TURNS` of the caller's interval: stopped and
+    /// not dead, or waiting out an interval that many times the caller's (row R19, hole 4).
+    #[error("the send gate at {path} was still locked by another sender after {waited:?}")]
+    GateHeld { path: PathBuf, waited: Duration },
 }
+
+/// How many of its own interval a caller waits for one gate's lock. Not fitted: a live line of
+/// `k` senders at one interval is `k` intervals long, so 32 leaves room for 31 ahead, or for one
+/// holder doubled 4 times (architecture.md section 12.6, rule B1, written before any run).
+const GATE_TURNS: u32 = 32;
 
 /// The directory the pace files sit in, under the pace root the `Wire` is given.
 pub(crate) const PACE_DIR: &str = "pace";
@@ -373,9 +384,11 @@ impl Hold {
 pub struct SendGate {
     path: PathBuf,
     interval: TimeDelta,
+    /// How long this gate's lock is waited for: `GATE_TURNS` of the interval.
+    patience: Duration,
 }
 
-/// What [`SendGate::stamp`] answered.
+/// What a stamp at the gate answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stamped {
     /// Written to every gate: the call's `requested_at`.
@@ -393,39 +406,82 @@ impl SendGate {
         let path = store
             .join(PACE_DIR)
             .join(format!("{}.sent", scope.file_name()));
+        let patience = interval.saturating_mul(GATE_TURNS);
         let interval = TimeDelta::from_std(interval)
             .map_err(|why| unusable(&path, "read as an interval", &why))?;
-        Ok(Self { path, interval })
+        Ok(Self {
+            path,
+            interval,
+            patience,
+        })
     }
 
     /// Locks every gate in the order given. The caller keeps the locks through the wait a stamp
     /// answers `Owed` with: released for it, the opening went to whichever process read its clock
     /// first, and a sender lost 8 times running was refused (13 of 600 sends, two processes at
     /// 100 ms, 2026-11-26; architecture.md section 12.6).
-    pub fn lock(gates: &[Self]) -> Result<Locked<'_>, BudgetError> {
-        let mut locked = Vec::with_capacity(gates.len());
-        for gate in gates {
-            let file = open_for_update(&gate.path)?;
-            file.lock()
-                .map_err(|why| unusable(&gate.path, "locked", &why))?;
-            locked.push((gate, file));
-        }
-        Ok(Locked(locked))
+    pub(crate) fn lock(gates: &[Self]) -> Result<Locked<'_>, BudgetError> {
+        let mut locked = Locked {
+            gates,
+            held: Vec::with_capacity(gates.len()),
+        };
+        locked.lock_the_rest()?;
+        Ok(locked)
     }
 }
 
-/// Every gate of one call, locked until dropped: closing a file releases its lock, as the kernel
-/// does for a process that died holding it.
+/// `file` locked, waited for in the kernel's queue for at most `patience`. A thread waits there
+/// in the caller's place, since `flock` takes no limit and polling `try_lock` keeps no place in
+/// the queue; granted the lock after the caller left, the thread drops the file and so the lock.
+fn lock_within(path: &Path, file: File, patience: Duration) -> Result<File, BudgetError> {
+    match file.try_lock() {
+        Ok(()) => return Ok(file),
+        Err(TryLockError::WouldBlock) => {}
+        Err(TryLockError::Error(why)) => return Err(unusable(path, "locked", &why)),
+    }
+    let (granted, waiting) = mpsc::channel();
+    thread::Builder::new()
+        .spawn(move || drop(granted.send(file.lock().map(|()| file))))
+        .map_err(|why| unusable(path, "waited for on a thread", &why))?;
+    match waiting.recv_timeout(patience) {
+        Ok(Ok(file)) => Ok(file),
+        Ok(Err(why)) => Err(unusable(path, "locked", &why)),
+        Err(_) => Err(BudgetError::GateHeld {
+            path: path.to_path_buf(),
+            waited: patience,
+        }),
+    }
+}
+
+/// The gates of one call and the locks held on the first of them, until dropped: closing a file
+/// releases its lock, as the kernel does for a process that died holding it.
 #[derive(Debug)]
-pub struct Locked<'gates>(Vec<(&'gates SendGate, File)>);
+pub(crate) struct Locked<'gates> {
+    gates: &'gates [SendGate],
+    held: Vec<File>,
+}
 
 impl Locked<'_> {
-    /// Writes `now`, cut to the file's microseconds, to every gate, or to none when any one's
-    /// last call is less than its interval ago.
-    pub fn stamp(&self, now: DateTime<Utc>) -> Result<Stamped, BudgetError> {
-        let now = now.trunc_subsecs(STAMP_DIGITS);
-        let mut owed = TimeDelta::zero();
-        for (gate, file) in &self.0 {
+    fn lock_the_rest(&mut self) -> Result<(), BudgetError> {
+        for gate in self.gates.iter().skip(self.held.len()) {
+            let file = open_for_update(&gate.path)?;
+            self.held
+                .push(lock_within(&gate.path, file, gate.patience)?);
+        }
+        Ok(())
+    }
+
+    /// Under every gate's lock, reads `clock` and writes that instant, cut to the file's
+    /// microseconds, to every gate, or to none when any one's last call is less than its interval
+    /// ago. `Owed` keeps the locks up to the gate owed the most and releases the later ones.
+    pub(crate) fn stamp(
+        &mut self,
+        clock: &dyn Fn() -> DateTime<Utc>,
+    ) -> Result<Stamped, BudgetError> {
+        self.lock_the_rest()?;
+        let now = clock().trunc_subsecs(STAMP_DIGITS);
+        let (mut owed, mut kept) = (TimeDelta::zero(), 0);
+        for (at, (gate, file)) in self.gates.iter().zip(&self.held).enumerate() {
             let mut file: &File = file;
             let mut held = String::new();
             // A second try reads the same open file, which the first left at its end.
@@ -441,13 +497,18 @@ impl Locked<'_> {
                         &"past the last representable instant",
                     )
                 })?;
-                owed = owed.max(opens - now);
+                if opens > now && opens - now >= owed {
+                    (owed, kept) = (opens - now, at + 1);
+                }
             }
         }
         if owed > TimeDelta::zero() {
+            // A per-IP lock held through a host's wait stalled another host's sender 1,807.7 ms at
+            // a 100 ms per-IP pace (review 2026-11-26, architecture.md section 12.6, rule B3).
+            self.held.truncate(kept);
             return Ok(Stamped::Owed(owed.to_std().unwrap_or(Duration::ZERO)));
         }
-        for (gate, file) in &self.0 {
+        for (gate, file) in self.gates.iter().zip(&self.held) {
             let mut file: &File = file;
             file.set_len(0)
                 .map_err(|why| unusable(&gate.path, "truncated", &why))?;
@@ -509,11 +570,15 @@ fn stamp(at: DateTime<Utc>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use chrono::{DateTime, Utc};
 
-    use super::{BudgetError, BudgetScope, Hold, HostKey, Pace, SendGate, Stamped};
+    use super::{
+        open_for_update, BudgetError, BudgetScope, Hold, HostKey, Pace, SendGate, Stamped,
+    };
     use crate::request::SourceId;
 
     const SHOUTED: &str = "WWW.SEC.GOV";
@@ -582,7 +647,53 @@ mod tests {
 
     /// One try at the gate, its locks released after it.
     fn stamp_once(gates: &[SendGate], now: DateTime<Utc>) -> Result<Stamped, BudgetError> {
-        SendGate::lock(gates)?.stamp(now)
+        SendGate::lock(gates)?.stamp(&|| now)
+    }
+
+    const A_TURN: Duration = Duration::from_millis(2);
+    /// 32 of `A_TURN`, written out so that another `GATE_TURNS` is red.
+    const ITS_TURNS: Duration = Duration::from_millis(64);
+    /// Ends only a caller that never gives up, so that it is red and not hung.
+    const HUNG: Duration = Duration::from_secs(120);
+
+    /// The holder is this test: a second open file of one process is another `flock` owner. It
+    /// keeps the lock until the refused caller is back, which no clock decides.
+    #[test]
+    fn a_gate_lock_another_sender_keeps_is_refused_by_name_after_its_turns() -> Result<(), String> {
+        let store = tempfile::tempdir().map_err(|why| why.to_string())?;
+        let host = HostKey::new(SEC).map_err(|why| why.to_string())?;
+        let gate = [
+            SendGate::beside_the_store(store.path(), &BudgetScope::PerHost(host), A_TURN)
+                .map_err(|why| why.to_string())?,
+        ];
+        let [SendGate { path, .. }] = &gate;
+        let held = open_for_update(path).map_err(|why| why.to_string())?;
+        held.lock().map_err(|why| why.to_string())?;
+        let (release, released) = mpsc::channel::<()>();
+        let holder = thread::spawn(move || {
+            let told = released.recv_timeout(HUNG).is_ok();
+            drop(held);
+            told
+        });
+        let began = Instant::now();
+        let refused = SendGate::lock(&gate).err();
+        let waited = began.elapsed();
+        release.send(()).map_err(|why| why.to_string())?;
+        let told = holder.join().map_err(|_| "the holder panicked")?;
+        let refused_by_name = Some(BudgetError::GateHeld {
+            path: path.clone(),
+            waited: ITS_TURNS,
+        });
+        assert_eq!(
+            (
+                refused,
+                told,
+                waited >= ITS_TURNS,
+                SendGate::lock(&gate).is_ok()
+            ),
+            (refused_by_name, true, true, true)
+        );
+        Ok(())
     }
 
     /// Two clock reads a nanosecond-precise clock gives, a hair over one interval apart.
