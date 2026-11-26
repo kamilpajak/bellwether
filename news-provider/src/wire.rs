@@ -17,8 +17,7 @@ use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
 use pit::ObservationTime;
 
 use crate::budget::{
-    host_of, BudgetError, BudgetScope, Hold, HostKey, Pace, RequestBudget, Reserved, SendGate,
-    Stamped,
+    host_of, BudgetError, BudgetScope, Gates, Hold, HostKey, Pace, RequestBudget, Reserved, Stamped,
 };
 use crate::clock::{Clock, Sleeper, ThreadSleeper};
 use crate::ledger::{AttemptId, SendPermit};
@@ -472,8 +471,9 @@ pub struct Wire {
 }
 
 const USER_AGENT: &str = "User-Agent";
-/// Each try past the first follows a wait the clock did not see pass, or another caller's send
-/// on the bucket during it; a bound so a clock that never advances refuses instead of spinning.
+/// A try past the first follows the wait of a lock the gate kept, so no other caller sent on
+/// that bucket meanwhile: one such wait for the host, one for the per-IP bucket, and any further
+/// one the clock did not see pass. A bound so a clock that never advances refuses, not spins.
 const GATE_TRIES: u32 = 8;
 
 impl Wire {
@@ -751,37 +751,27 @@ impl Wire {
     }
 
     /// The `requested_at` of a call, read once the last call through its host's bucket and its
-    /// per-IP bucket is a full interval ago, and written to both under their locks. Without a
+    /// per-IP bucket is a full interval ago, and written to both under their locks. The host's
+    /// is held through the wait for that, the per-IP one unless the host owes more. Without a
     /// gate (a url no host keys, under a hosts-only profile) it is one clock read.
     fn clear_to_send(
         &self,
         host: Option<&HostKey>,
         clock: &dyn Clock,
     ) -> Result<DateTime<Utc>, BudgetError> {
-        let mut gates = Vec::new();
-        if let (Some(host), Some(ordinary)) = (host, self.profile.budget.per_host) {
-            let scope = BudgetScope::PerHost(host.clone());
-            let interval = self.host_interval(host, ordinary);
-            gates.push(SendGate::beside_the_store(
-                &self.pace_root,
-                &scope,
-                interval,
-            )?);
-        }
-        if let Some(interval) = self.profile.budget.min_interval {
-            let scope = BudgetScope::PerIp(self.source.clone());
-            gates.push(SendGate::beside_the_store(
-                &self.pace_root,
-                &scope,
-                interval,
-            )?);
-        }
+        let host = host
+            .zip(self.profile.budget.per_host)
+            .map(|(host, ordinary)| (host, self.host_interval(host, ordinary)));
+        let per_ip = self.profile.budget.min_interval;
+        let per_ip = per_ip.map(|interval| (&self.source, interval));
+        let gates = Gates::of_a_call(&self.pace_root, host, per_ip)?;
         if gates.is_empty() {
             return Ok(clock.now());
         }
+        let mut locked = gates.lock()?;
         let mut owed = Duration::ZERO;
         for _ in 0..GATE_TRIES {
-            match SendGate::stamp(&gates, clock.now())? {
+            match locked.stamp(&|| clock.now())? {
                 Stamped::Sent(at) => return Ok(at),
                 Stamped::Owed(wait) => {
                     owed = wait;
@@ -3263,6 +3253,61 @@ mod tests {
                 tries
             ),
             (true, GATE_TRIES)
+        );
+        Ok(())
+    }
+
+    const A_TURN: Duration = Duration::from_millis(2);
+    /// 32 of `A_TURN` (`GATE_TURNS`).
+    const ITS_TURNS: Duration = Duration::from_millis(64);
+    /// Ends only a send that never gives up, so that it is red and not hung.
+    const HUNG: Duration = Duration::from_secs(120);
+
+    /// The holder is a second open file of this test, as in `budget`'s test of the refusal. A
+    /// refused send that went on to the socket passed every test before this one (2026-11-26).
+    #[test]
+    fn a_send_refused_at_a_held_gate_reaches_no_socket_and_stamps_nothing() -> Checked {
+        let store = tempfile::tempdir()?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let asked = Request {
+            url: format!("http://{}/page", listener.local_addr()?),
+            ..request()
+        };
+        let mut stated = profile();
+        stated.budget.min_interval = Some(A_TURN);
+        let source = SourceId::new(SOURCE);
+        let waits = WaitRecorder::default();
+        let wire = Wire::with_sleeper(stated, held(), store.path(), &source, Box::new(waits));
+        let gate = store.path().join(PACE_DIR).join(SOURCE_SENT_FILE);
+        std::fs::create_dir_all(store.path().join(PACE_DIR))?;
+        let held_open = std::fs::File::create(&gate)?;
+        held_open.lock()?;
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = thread::spawn(move || {
+            let told = released.recv_timeout(HUNG).is_ok();
+            drop(held_open);
+            told
+        });
+        let mut sink = Recorder::default();
+        let Some(permit) = permit(&mut sink, FIRST_ATTEMPT) else {
+            return Err("no permit".into());
+        };
+        let refused = wire.send(permit, &asked, &clock_over(&[RESERVED_AT])).err();
+        release.send(())?;
+        let told = holder.join().map_err(|_| "the holder panicked")?;
+        let connections = usize::from(listener.accept().is_ok());
+        assert_eq!(
+            (refused, connections, std::fs::read(&gate)?, told),
+            (
+                Some(SendFailure::Budget(BudgetError::GateHeld {
+                    path: gate,
+                    waited: ITS_TURNS
+                })),
+                0,
+                Vec::new(),
+                true
+            )
         );
         Ok(())
     }
