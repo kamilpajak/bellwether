@@ -30,10 +30,13 @@ type Checked<T = ()> = Result<T, Box<dyn std::error::Error>>;
 /// Set in a sender process only: its `Sender` fields, the listener, the pace root and its output
 /// file, one per line.
 const SENDER: &str = "SHARED_BUCKET_SENDER";
-/// `id:interval_ms:sends:delay_ms:per_ip` per sender, comma-separated, for `measure`.
+/// `id:interval_ms:sends:delay_ms:per_ip:host` per sender, comma-separated, for `measure`.
 const MEASURE: &str = "SHARED_BUCKET_MEASURE";
 const SENDER_TEST: &str = "sender";
 const BUCKET: &str = "shared_bucket";
+const LOOPBACK: &str = "127.0.0.1";
+/// A second host on the one listener: its own per-host bucket, and the per-IP one shared.
+const LOCALHOST: &str = "localhost";
 const HOST_GATE: &str = "pace/127.0.0.1.per-host.sent";
 const REFUSED: &str = "never_cleared";
 /// Far past any exchange on a loaded runner: no test here is about a timeout.
@@ -51,6 +54,7 @@ struct Sender {
     sends: u32,
     delay_ms: u64,
     per_ip: bool,
+    host: &'static str,
 }
 
 /// One send as its process saw it: `requested` is `None` when the gate refused it.
@@ -157,10 +161,10 @@ fn sender() -> Checked {
 /// one slow read cannot delay the next stamp. The threads end with the test process.
 /// `spinning` polls `accept` without sleeping: a thread blocked in `accept` was woken up to 9.6 ms
 /// late on the development Mac, a spinning one within 1.5 ms (300 sends each, 2026-11-26).
-fn listen(spinning: bool) -> Checked<(String, Arc<Mutex<Vec<Arrival>>>)> {
+fn listen(spinning: bool) -> Checked<(u16, Arc<Mutex<Vec<Arrival>>>)> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(spinning)?;
-    let url = format!("http://{}", listener.local_addr()?);
+    let port = listener.local_addr()?.port();
     let arrivals = Arc::new(Mutex::new(Vec::new()));
     let kept = Arc::clone(&arrivals);
     thread::spawn(move || loop {
@@ -174,7 +178,7 @@ fn listen(spinning: bool) -> Checked<(String, Arc<Mutex<Vec<Arrival>>>)> {
             thread::spawn(move || answer(stream, accepted, &kept));
         }
     });
-    Ok((url, arrivals))
+    Ok((port, arrivals))
 }
 
 fn answer(mut stream: TcpStream, accepted: i64, kept: &Mutex<Vec<Arrival>>) {
@@ -208,15 +212,16 @@ impl Drop for Running {
     }
 }
 
-fn start(sender: Sender, url: &str, root: &Path) -> Checked<Running> {
+fn start(sender: Sender, port: u16, root: &Path) -> Checked<Running> {
     let out = root.join(sender.id);
     let spec = format!(
-        "{}\n{}\n{}\n{}\n{}\n{url}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\nhttp://{}:{port}\n{}\n{}",
         sender.id,
         sender.interval_ms,
         sender.sends,
         sender.delay_ms,
         sender.per_ip,
+        sender.host,
         root.display(),
         out.display()
     );
@@ -262,10 +267,10 @@ fn finished(mut child: Running, sender: Sender, root: &Path) -> Checked<Vec<Sent
 /// Every send of `senders` started together on one fresh pace root, and every arrival.
 fn run(senders: &[Sender], spinning: bool) -> Checked<(Vec<Sent>, Vec<Arrival>)> {
     let root = tempfile::tempdir()?;
-    let (url, arrivals) = listen(spinning)?;
+    let (port, arrivals) = listen(spinning)?;
     let mut children = Vec::new();
     for sender in senders {
-        children.push((start(*sender, &url, root.path())?, *sender));
+        children.push((start(*sender, port, root.path())?, *sender));
     }
     let mut sent = Vec::new();
     for (child, sender) in children {
@@ -306,7 +311,9 @@ const FAST: u64 = 50;
 const SLOW: u64 = 250;
 /// Past one slow interval, so the slow sender reaches the gate after the fast ones resumed.
 const LATE: u64 = 325;
-/// Two fast senders stamp for 3 s, past the 2 s that 8 tries of 250 ms lasted before the fix.
+/// The fast senders stamp for over 3 s, past the 2 s that 8 tries of 250 ms lasted before the fix.
+/// `fast-b` asks a second host, so only the per-IP gate's lock stands between it and the others,
+/// and alone it stamps for 3 s.
 const SENDERS: [Sender; 3] = [
     Sender {
         id: "fast-a",
@@ -314,13 +321,15 @@ const SENDERS: [Sender; 3] = [
         sends: 30,
         delay_ms: 0,
         per_ip: true,
+        host: LOOPBACK,
     },
     Sender {
         id: "fast-b",
         interval_ms: FAST,
-        sends: 30,
+        sends: 60,
         delay_ms: 0,
         per_ip: true,
+        host: LOCALHOST,
     },
     Sender {
         id: "slow",
@@ -328,9 +337,10 @@ const SENDERS: [Sender; 3] = [
         sends: 3,
         delay_ms: LATE,
         per_ip: true,
+        host: LOOPBACK,
     },
 ];
-const ALL_OF_THEM: usize = 63;
+const ALL_OF_THEM: usize = 93;
 
 /// Before the gate held its lock through its wait, the slow sender was owed again on each of its
 /// 8 tries, because a fast one had stamped inside its last 250 ms, and was refused.
@@ -361,6 +371,7 @@ const HOLDER: Sender = Sender {
     sends: 1,
     delay_ms: 0,
     per_ip: false,
+    host: LOOPBACK,
 };
 const SURVIVOR: Sender = Sender {
     id: "survivor",
@@ -368,6 +379,7 @@ const SURVIVOR: Sender = Sender {
     sends: 3,
     delay_ms: 0,
     per_ip: false,
+    host: LOOPBACK,
 };
 /// A stamp takes the lock for microseconds; 20 refusals 10 ms apart are one holder waiting in it.
 const HELD_FOR: u32 = 20;
@@ -391,12 +403,12 @@ fn locked(gate: &Path) -> Checked<bool> {
 #[test]
 fn a_sender_killed_while_it_waits_at_the_gate_does_not_block_the_next() -> Checked {
     let root = tempfile::tempdir()?;
-    let (url, _arrivals) = listen(false)?;
+    let (port, _arrivals) = listen(false)?;
     fs::create_dir(root.path().join("pace"))?;
     let just_now = Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
     let gate = root.path().join(HOST_GATE);
     fs::write(&gate, just_now)?;
-    let holder = start(HOLDER, &url, root.path())?;
+    let holder = start(HOLDER, port, root.path())?;
     let (mut held, mut waited) = (0, Duration::ZERO);
     while held < HELD_FOR {
         held = if locked(&gate)? { held + 1 } else { 0 };
@@ -406,7 +418,7 @@ fn a_sender_killed_while_it_waits_at_the_gate_does_not_block_the_next() -> Check
             return Err("the holder never waited holding the gate's lock".into());
         }
     }
-    let survivor = start(SURVIVOR, &url, root.path())?;
+    let survivor = start(SURVIVOR, port, root.path())?;
     // Time for a survivor nothing blocks to stamp before the kill, so that it is red.
     thread::sleep(POLL * HELD_FOR);
     let killed_at = Utc::now().timestamp_micros();
@@ -439,7 +451,7 @@ fn smallest_gap(mut instants: Vec<i64>) -> Option<(i64, i64)> {
 }
 
 /// The instrument behind section 12.6's tables. Run again when the gate, the pace or SEC's margin
-/// changes: `SHARED_BUCKET_MEASURE=a:100:300:0:true,b:100:300:0:true cargo test --release -p news-provider
+/// changes: `SHARED_BUCKET_MEASURE=a:100:300:0:true:127.0.0.1,b:100:300:0:true:127.0.0.1 cargo test --release -p news-provider
 /// --test shared_bucket -- --ignored --nocapture measure`.
 #[test]
 #[ignore = "a measurement: it prints numbers and asserts nothing"]
@@ -448,7 +460,7 @@ fn measure() -> Checked {
     let mut senders = Vec::new();
     for sender in spec.split(',') {
         let fields: Vec<&str> = sender.split(':').collect();
-        let [id, interval, sends, delay, per_ip] = fields.as_slice() else {
+        let [id, interval, sends, delay, per_ip, host] = fields.as_slice() else {
             return Err(format!("not a sender: {sender}").into());
         };
         senders.push(Sender {
@@ -457,6 +469,7 @@ fn measure() -> Checked {
             sends: sends.parse()?,
             delay_ms: delay.parse()?,
             per_ip: per_ip.parse()?,
+            host: String::from(*host).leak(),
         });
     }
     let (sent, arrivals) = run(&senders, true)?;
