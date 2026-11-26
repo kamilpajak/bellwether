@@ -506,6 +506,7 @@ fn at(micros: i64) -> String {
 }
 
 const LATE_US: i64 = 3_000;
+const A2_MARGIN_US: i64 = 20_000;
 const STALL_US: i64 = 1_000;
 
 /// The smallest gap between consecutive values, with the later one.
@@ -579,6 +580,17 @@ fn measure() -> Checked {
         .filter_map(|send| Some((send.requested? - send.entered, send.id.as_str())))
         .collect();
     waits.sort_unstable();
+    // Rule A2's bound when every sender shares one bucket: their intervals summed, plus 20 ms each.
+    let bound: i64 = senders
+        .iter()
+        .map(|sender| i64::try_from(sender.interval_ms * 1_000).unwrap_or(i64::MAX) + A2_MARGIN_US)
+        .sum();
+    let above = |limit: i64| waits.iter().filter(|(wait, _)| *wait > limit).count();
+    println!(
+        "bound A2 us {bound}: waits above it {}, above twice it {}",
+        above(bound),
+        above(bound * 2)
+    );
     let places = sent.iter().filter_map(|send| {
         let own = send.requested?;
         Some(
