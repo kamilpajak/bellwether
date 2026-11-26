@@ -523,8 +523,8 @@ fn smallest_gap(mut instants: Vec<i64>) -> Option<(i64, i64)> {
 
 /// The instrument behind section 12.6's tables. Run again when the gate, the pace or SEC's margin
 /// changes: `SHARED_BUCKET_MEASURE=a:100:300:0:true:127.0.0.1,b:100:300:0:true:127.0.0.1 cargo test
-/// --release -p news-provider --test shared_bucket -- --ignored --nocapture measure`. A run of
-/// eight senders at 100 ms and 1,400 sends each takes 1,120 s, so each sender is given 1,800 s.
+/// --release -p news-provider --test shared_bucket -- --ignored --nocapture measure`. Rule L5's
+/// longest shape takes 1,350 s, so each sender is given 1,800 s.
 #[test]
 #[ignore = "a measurement: it prints numbers and asserts nothing"]
 fn measure() -> Checked {
