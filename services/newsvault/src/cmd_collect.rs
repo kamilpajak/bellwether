@@ -1817,6 +1817,7 @@ fn envelope_of(
             "unusable_rows": row.unusable_rows,
             "items_committed": row.items_committed,
             "commit_refused": row.commit_refused,
+            "not_sent": row.not_sent,
         })).collect::<Vec<Value>>(),
         "per_source": per_source_json(collected),
         "provenance_counts": provenance_counts(collected),

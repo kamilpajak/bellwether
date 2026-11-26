@@ -16,7 +16,7 @@ use news_provider::{
 };
 use newsvault::cmd_collect::Registered;
 use newsvault::cmd_ledger;
-use newsvault::cmd_robots::ROBOTS_SOURCE;
+use newsvault::cmd_robots::{RobotsError, ROBOTS_SOURCE};
 use newsvault::cmd_roster::{self, Ask, RosterError, FILES, ROSTER_SOURCE};
 use newsvault::store::{Committer, COMMIT_LOG, RUNS_DIR};
 use rusqlite::{Connection, OpenFlags};
@@ -551,6 +551,157 @@ fn a_roster_fetch_through_the_wire_pays_into_edgar_press_s_per_ip_pace() -> Test
             true,
             false,
             false
+        )
+    );
+    Ok(())
+}
+
+/// One metadata for the code (section 5.1): the entry `newsvault schema` lists is the code and
+/// the `retryable` of the object a refused run writes and the exit it takes, and both commands'
+/// exit tables name it at 7.
+#[test]
+fn the_schema_lists_gate_refused_with_the_exit_and_retryable_a_refused_run_reports() -> TestResult {
+    let printed = Command::new(env!("CARGO_BIN_EXE_newsvault"))
+        .args(["schema", "--format", "json"])
+        .output()?;
+    let schema: Value = serde_json::from_slice(&printed.stdout)?;
+    let refusal = RosterError::Robots(RobotsError::GateRefused {
+        attempt_id: "an attempt".to_owned(),
+        why: BudgetError::NeverCleared {
+            tries: 8,
+            owed: SEC_INTERVAL,
+        },
+    });
+    let (object, exit) = refusal.ended_at_the_gate(Vec::new()).unwrap_or_default();
+    let listed = json!({
+        "code": object["code"],
+        "exit": exit,
+        "retryable": object["retryable"],
+    });
+    let named_at_seven = |command: &[&str]| {
+        schema["commands"]
+            .as_array()
+            .and_then(|all| all.iter().find(|entry| entry["path"] == json!(command)))
+            .and_then(|entry| entry["exits"]["7"].as_str())
+            .is_some_and(|text| text.contains("gate_refused"))
+    };
+    assert_eq!(
+        (
+            schema["error_codes"]
+                .as_array()
+                .is_some_and(|codes| codes.contains(&listed)),
+            listed,
+            named_at_seven(&["roster", "fetch"]),
+            named_at_seven(&["robots", "refresh"]),
+        ),
+        (
+            true,
+            json!({"code": "gate_refused", "exit": 7, "retryable": true}),
+            true,
+            true
+        )
+    );
+    Ok(())
+}
+
+/// `(source, outcome, requested_at, slots, closed)` of one stored attempt.
+type ClosedAttempt = (String, String, Option<String>, Option<i64>, bool);
+
+/// SEC's per-IP gate file kept locked by a second open file, as another sending process keeps
+/// it: the file's send waits its 32 intervals (3.2 s) and is refused. The run ends there with
+/// `gate_refused`, exit 7, retryable; the attempt is closed `not_sent` with nothing requested,
+/// no payload and no slot spent, none is left open for a sweep, and the server saw no request.
+#[test]
+fn a_roster_fetch_whose_send_the_gate_refuses_ends_retryable_with_its_attempt_closed_not_sent(
+) -> TestResult {
+    let (root, shared) = (TempDir::new()?, TempDir::new()?);
+    let server = loopback::Loopback::redirecting("/never", ROSTER_BODY.to_vec())?;
+    let stub = Stub::sec(ROBOTS_BODY, b"");
+    let ask = ask(root.path());
+    let pace_root = PaceRoot::resolve(Some(shared.path()), root.path())?;
+    let pace = shared.path().join("pace");
+    std::fs::create_dir_all(&pace)?;
+    let gate = pace.join(format!("{}.per-ip.sent", edgar_press::SOURCE));
+    let held = std::fs::File::create(&gate)?;
+    held.lock()?;
+    let exchange = loopback::Relay {
+        stub: &stub,
+        wire: cmd_roster::wire_for(&ask, &pace_root),
+        relayed: BTreeMap::from([(FILE_URL.to_owned(), server.url("/files/roster.json"))]),
+        asked: RefCell::new(Vec::new()),
+    };
+    let refused = cmd_roster::run(&ask, &exchange, &Set::at(FIRST_RUN)?).err();
+    drop(held);
+    let seen = server.seen()?;
+    server.finish()?;
+    let (object, exit) = refused
+        .as_ref()
+        .and_then(|refusal| refusal.ended_at_the_gate(vec!["again".to_owned()]))
+        .unwrap_or_default();
+    let human = newsvault::cmd_robots::human_error(&object);
+    let db = read_only(root.path())?;
+    let attempts: Vec<ClosedAttempt> = db
+        .prepare(
+            "SELECT source, outcome, requested_at, slots, closed_at IS NOT NULL
+               FROM attempts ORDER BY rowid",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    let payloads: i64 = db.query_row(
+        "SELECT COUNT(*) FROM payloads p JOIN attempts a ON a.attempt_id = p.attempt_id
+          WHERE a.source = ?1",
+        [ROSTER_SOURCE],
+        |row| row.get(0),
+    )?;
+    let run_file: Value = serde_json::from_slice(&std::fs::read(
+        root.path()
+            .join(RUNS_DIR)
+            .join("roster-20261123T012000Z.json"),
+    )?)?;
+    assert_eq!(
+        (
+            exit,
+            human.starts_with("error: gate_refused (retryable true): the send gate refused")
+                && human.contains(&gate.display().to_string()),
+            (
+                object["code"].clone(),
+                object["retryable"].clone(),
+                object["suggestions"].clone(),
+                object["details"]["refusal"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(&gate.display().to_string())),
+            ),
+            seen,
+            attempts.len(),
+            attempts.last().cloned(),
+            payloads,
+            run_file["finished_at"].is_string(),
+            run_file["refused"].clone(),
+        ),
+        (
+            7,
+            true,
+            (json!("gate_refused"), json!(true), json!([["again"]]), true),
+            Vec::new(),
+            2,
+            Some((
+                ROSTER_SOURCE.to_owned(),
+                "not_sent".to_owned(),
+                None,
+                Some(0),
+                true
+            )),
+            0,
+            true,
+            json!("gate_refused"),
         )
     );
     Ok(())

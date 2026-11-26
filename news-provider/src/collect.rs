@@ -7,6 +7,7 @@
 //! [`Wire`], and [`Archive`] is the store door.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use pit::datedness::Published;
@@ -88,16 +89,16 @@ impl Exchange for Wire {
     }
 }
 
-/// One host's share of a run (S7-D11). `waited` is the clock inside [`Exchange::reserve`],
-/// `requesting` each answer's own `received_at - requested_at`; the host is `None` for a url
-/// `host_of` cannot key.
+/// One host's share of a run (S7-D11). `waited` is the clock inside [`Exchange::reserve`] and,
+/// for a send the gate refused, from there to the refusal; `requesting` each answer's own
+/// `received_at - requested_at`; the host is `None` for a url `host_of` cannot key.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostBusy {
     pub host: Option<String>,
     pub waited: TimeDelta,
     pub requesting: TimeDelta,
     pub requests: u32,
-    /// The deadline stopped its lane.
+    /// The deadline or a refusal at the send gate stopped its lane.
     pub stopped: bool,
     /// Its `deferred` rows, every reason.
     pub not_looked: u32,
@@ -127,11 +128,20 @@ pub enum DeferReason {
     /// Its slot opens after the deadline only because a server held or slowed its host.
     HostHeld,
     FollowUpCap,
+    /// Another sender kept the send gate from its send, or from the send of a request ahead of
+    /// it in its host's lane: a local condition, never a vendor's answer. A send the gate
+    /// refused for the run's deadline alone is `RunDeadline`.
+    GateRefused,
 }
 
 impl DeferReason {
     /// Every arm, in the order the envelope's and the ledger's human lines print them.
-    pub const ALL: [Self; 3] = [Self::RunDeadline, Self::HostHeld, Self::FollowUpCap];
+    pub const ALL: [Self; 4] = [
+        Self::RunDeadline,
+        Self::HostHeld,
+        Self::FollowUpCap,
+        Self::GateRefused,
+    ];
 
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -139,12 +149,14 @@ impl DeferReason {
             Self::RunDeadline => "run_deadline",
             Self::HostHeld => "host_held",
             Self::FollowUpCap => "follow_up_cap",
+            Self::GateRefused => "gate_refused",
         }
     }
 }
 
 /// One request this run did not ask, and why. It has no attempt row, because no call was made
-/// (section 8 row R16); `story_id` by the rule `attempt_once` opens a `Document` attempt under.
+/// (section 8 row R16), but for the one request a gate refused, whose row was open by then and
+/// is closed `not_sent`; `story_id` by the rule `attempt_once` opens a `Document` attempt under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Deferred {
     pub source: String,
@@ -582,6 +594,9 @@ pub struct AttemptRow {
     /// Present when the store refused this attempt's rows, so exit 8 names the attempt rather
     /// than reporting a bare status.
     pub commit_refused: Option<String>,
+    /// Present on a `not_sent` attempt: the gate's refusal as it read, which names the gate
+    /// file and the wait.
+    pub not_sent: Option<String>,
 }
 
 /// One planned source's own counts, written whatever they are: a source asked and answered empty
@@ -749,7 +764,8 @@ pub fn collect<A: Archive>(
         let asked_at = clock.now();
         // Before the attempt row: a request past the deadline gets none (condition A).
         let reserved = exchange.reserve(&queued.request, clock, run.deadline);
-        busy.entry(host.clone()).or_default().waited += elapsed(asked_at, clock.now());
+        let reserved_at = clock.now();
+        busy.entry(host.clone()).or_default().waited += elapsed(asked_at, reserved_at);
         let (go_at, by_server) = match reserved {
             Ok(Reservation::Go) => (None, false),
             Ok(Reservation::PastDeadline { go_at, by_server }) => (Some(go_at), by_server),
@@ -773,6 +789,44 @@ pub fn collect<A: Archive>(
             }
             continue;
         }
+        let listing = queued.listed_by.as_deref();
+        let sent = attempt_once(
+            &driving,
+            archive,
+            &queued.request,
+            ordinal,
+            listing,
+            &mut issued,
+        )?;
+        ordinal += 1;
+        let mut attempted = match sent {
+            Sent::Attempted(attempted) => *attempted,
+            // The lane is deferred whole, as at the deadline, and the other hosts go on.
+            Sent::Refused { row, owed } => {
+                let now = clock.now();
+                let at = ObservationTime::new(now);
+                let share = busy.entry(host).or_default();
+                share.stopped = true;
+                share.waited += elapsed(reserved_at, now);
+                collected.attempts.push(*row);
+                let reason = match owed {
+                    Some(_) => DeferReason::RunDeadline,
+                    None => DeferReason::GateRefused,
+                };
+                let lane = queue.stop(&queued);
+                let mut first = Deferred::of(provider, queued, reason, at);
+                first.go_at = owed.and_then(|owed| {
+                    TimeDelta::from_std(owed)
+                        .ok()
+                        .and_then(|owed| now.checked_add_signed(owed))
+                });
+                collected.defer(archive, first)?;
+                for rest in lane {
+                    collected.defer(archive, Deferred::of(provider, rest, reason, at))?;
+                }
+                continue;
+            }
+        };
         let Queued {
             request,
             retries,
@@ -780,10 +834,6 @@ pub fn collect<A: Archive>(
             listed_by,
             ..
         } = queued;
-        let listing = listed_by.as_deref();
-        let mut attempted =
-            attempt_once(&driving, archive, &request, ordinal, listing, &mut issued)?;
-        ordinal += 1;
         asked.extend(attempted.story.clone());
         for key in attempted.story.iter().chain([&request.url]) {
             asked_by
@@ -1286,6 +1336,17 @@ struct Driving<'a> {
     baseline: &'a Baseline,
 }
 
+/// What [`attempt_once`] made of one request.
+enum Sent {
+    Attempted(Box<Attempted>),
+    /// The send gate refused it: its attempt is closed `not_sent` and `row` is its envelope row.
+    /// `owed` is the gate's wait when the run's deadline, and no other sender, was the cause.
+    Refused {
+        row: Box<AttemptRow>,
+        owed: Option<Duration>,
+    },
+}
+
 /// One attempt, from its `Opened` row to its committed rows.
 struct Attempted {
     row: AttemptRow,
@@ -1337,7 +1398,7 @@ fn attempt_once<A: Archive>(
     ordinal: u32,
     listed_by: Option<&str>,
     issued: &mut BTreeSet<String>,
-) -> Result<Attempted, CollectError> {
+) -> Result<Sent, CollectError> {
     let Driving {
         provider,
         exchange,
@@ -1364,6 +1425,32 @@ fn attempt_once<A: Archive>(
         Ok(response) => Ok(response),
         Err(SendFailure::Transport(failed)) => Err(failed),
         Err(SendFailure::CredentialMissing(name)) => return Err(CollectError::Credential(name)),
+        Err(SendFailure::Budget(why)) if why.is_a_gate_refusal() => {
+            let at = ObservationTime::new(clock.now());
+            let closed = slot.close_unsent(archive, at)?;
+            archive.commit(closed, &[], None, at)?;
+            let row = Box::new(AttemptRow {
+                attempt_id,
+                source: request.source.as_str().to_owned(),
+                target_window: request.target_window.as_str().to_owned(),
+                phase: request.phase.name(),
+                provenance: request.provenance.name(),
+                url: request.url.clone(),
+                transport_status: None,
+                outcome: OutcomeKind::NotSent.name(),
+                vendor_rows: 0,
+                filtered_out: 0,
+                robots_disallowed: 0,
+                unusable_rows: 0,
+                items_committed: 0,
+                commit_refused: None,
+                not_sent: Some(why.to_string()),
+            });
+            return Ok(Sent::Refused {
+                row,
+                owed: why.owed_past_the_deadline(),
+            });
+        }
         Err(SendFailure::Budget(why)) => return Err(CollectError::Budget(why)),
     };
     let verdict = provider.classify(request, &answer);
@@ -1479,7 +1566,7 @@ fn attempt_once<A: Archive>(
         }
         _ => (Vec::new(), Vec::new()),
     };
-    Ok(Attempted {
+    Ok(Sent::Attempted(Box::new(Attempted {
         row: AttemptRow {
             attempt_id,
             source: request.source.as_str().to_owned(),
@@ -1495,6 +1582,7 @@ fn attempt_once<A: Archive>(
             unusable_rows,
             items_committed: committed.items_committed,
             commit_refused: refusal,
+            not_sent: None,
         },
         follow_ups,
         walked,
@@ -1515,7 +1603,7 @@ fn attempt_once<A: Archive>(
         story: story.map(|story| story.hex().to_owned()),
         held,
         promoted,
-    })
+    })))
 }
 
 /// The follow-ups `listed` holds and `issued` does not, each with its story and listed value.
@@ -1611,8 +1699,9 @@ impl Collected {
                 OutcomeKind::Empty => self.tally.empty += 1,
                 OutcomeKind::Failed if attempted.permanent => self.tally.permanent += 1,
                 OutcomeKind::Failed => self.tally.transient += 1,
-                // The sweep's attempts are counted where they are closed, not here.
-                OutcomeKind::Interrupted => {}
+                // The sweep's attempts are counted where they are closed, and a refused send
+                // where its `deferred` row is written, not here.
+                OutcomeKind::Interrupted | OutcomeKind::NotSent => {}
             }
         }
         self.tally.committed += attempted.committed.items_committed;

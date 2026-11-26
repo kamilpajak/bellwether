@@ -5879,7 +5879,7 @@ fn the_301st_follow_up_is_deferred_recorded_and_never_sent_and_the_run_exits_8()
     assert_eq!(
         (line.as_deref(), ledgered),
         (
-            Some("deferred         1 run_deadline 0 host_held 0 follow_up_cap 1"),
+            Some("deferred         1 run_deadline 0 host_held 0 follow_up_cap 1 gate_refused 0"),
             vec![1]
         )
     );
@@ -6123,6 +6123,544 @@ fn a_held_host_past_the_deadline_is_stopped_with_its_lane_while_the_other_hosts_
     Ok(())
 }
 
+/// A `Relay` whose `reserve` reaches its `Wire` for a relayed url, as `collect` hands `Wire` the
+/// run's deadline; every other url is the stub's, which paces nothing.
+struct Reserving<'stub>(loopback::Relay<'stub>);
+
+impl Exchange for Reserving<'_> {
+    fn reserve(
+        &self,
+        request: &Request,
+        clock: &dyn Clock,
+        deadline: Option<DateTime<Utc>>,
+    ) -> Result<news_provider::Reservation, news_provider::Unreserved> {
+        match self.0.relayed.get(&request.url) {
+            Some(to) => {
+                let relayed = Request {
+                    url: to.clone(),
+                    ..request.clone()
+                };
+                self.0.wire.reserve(&relayed, clock, deadline)
+            }
+            None => Ok(news_provider::Reservation::Go),
+        }
+    }
+
+    fn send(
+        &self,
+        permit: SendPermit,
+        request: &Request,
+        clock: &dyn Clock,
+    ) -> Result<RawResponse, SendFailure> {
+        self.0.send(permit, request, clock)
+    }
+}
+
+/// A clock 10 ms later at each read, so a gate's 5 ms wait is seen to pass.
+struct Passing(Cell<DateTime<Utc>>);
+
+impl Clock for Passing {
+    fn now(&self) -> DateTime<Utc> {
+        let now = self.0.get();
+        self.0.set(now + TimeDelta::milliseconds(10));
+        now
+    }
+}
+
+const FED_HOST: &str = "www.federalreserve.gov";
+/// The loopback's host: the gate every relayed Federal Reserve release passes.
+const LOOPBACK_GATE: &str = "pace/127.0.0.1.per-host.sent";
+/// 32 of it are 160 ms, where the open-web profile's 7 s are 224 s.
+const A_SHORT_INTERVAL: Duration = Duration::from_millis(5);
+const A_LATER_POLL: &str = "2026-11-16T10:00:30Z";
+const NOT_SENT: &str = "not_sent";
+const GATE_REFUSED: &str = "gate_refused";
+
+fn fed_release_urls() -> Vec<String> {
+    FED_RELEASES
+        .iter()
+        .map(|(key, _)| format!("https://{key}"))
+        .collect()
+}
+
+/// `stub` with the three Federal Reserve releases sent through a real `Wire` to `server`, at
+/// `per_host` when given and at the open-web profile's own pace when not.
+fn fed_through_the_wire<'stub>(
+    ask: &Ask,
+    stub: &'stub Gnw,
+    server: &loopback::Loopback,
+    per_host: Option<Duration>,
+) -> Result<Reserving<'stub>, Box<dyn Error>> {
+    let opened = cmd_collect::open_provider(ask)?;
+    let pace_root = news_provider::PaceRoot::resolve(None, &ask.store)?;
+    let wire = match per_host {
+        None => cmd_collect::wire_for(ask, &opened, &pace_root),
+        Some(interval) => {
+            let mut brisk = opened.provider.transport();
+            brisk.budget.per_host = Some(interval);
+            let credentials = news_provider::Credentials::default()
+                .with(opened.registered.credential(), ask.contact.clone());
+            news_provider::Wire::new(brisk, credentials, &pace_root, &opened.provider.source())
+        }
+    };
+    let relayed = fed_release_urls()
+        .into_iter()
+        .enumerate()
+        .map(|(at, url)| (url, server.url(&format!("/fed/{at}"))))
+        .collect();
+    Ok(Reserving(loopback::Relay {
+        stub,
+        wire,
+        relayed,
+        asked: RefCell::default(),
+    }))
+}
+
+/// A second open file keeping the loopback host's gate locked, as another sending process does.
+fn gate_held(store: &Path) -> Result<std::fs::File, Box<dyn Error>> {
+    let gate = store.join(LOOPBACK_GATE);
+    std::fs::create_dir_all(gate.parent().ok_or("no pace directory")?)?;
+    let held = std::fs::File::create(gate)?;
+    held.lock()?;
+    Ok(held)
+}
+
+/// `(url, outcome, items_committed)` of each envelope attempt off the Federal Reserve's releases.
+fn attempts_off_the_fed_releases(envelope: &Value) -> Vec<(String, String, Option<u64>)> {
+    let releases = fed_release_urls();
+    envelope["attempts"]
+        .as_array()
+        .map_or_else(Vec::new, |rows| {
+            rows.iter()
+                .map(|row| {
+                    let field = |name: &str| row[name].as_str().unwrap_or_default().to_owned();
+                    (
+                        field("url"),
+                        field("outcome"),
+                        row["items_committed"].as_u64(),
+                    )
+                })
+                .filter(|row| !releases.contains(&row.0))
+                .collect()
+        })
+}
+
+type StoredAttempt = (String, Option<String>, Option<i64>, bool);
+
+/// `(outcome, requested_at, slots, closed)` of every stored attempt of the source whose outcome
+/// is not `ok`.
+fn attempts_not_ok(store: &Path) -> Result<Vec<StoredAttempt>, Box<dyn Error>> {
+    let db = Connection::open_with_flags(store.join(COMMIT_LOG), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let rows = db
+        .prepare(
+            "SELECT COALESCE(outcome, 'open'), requested_at, slots, closed_at IS NOT NULL
+               FROM attempts WHERE source = ?1 AND outcome IS NOT 'ok' ORDER BY rowid",
+        )?
+        .query_map([SOURCE], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<Result<Vec<StoredAttempt>, _>>()?;
+    Ok(rows)
+}
+
+/// Section 12.8 step 9b. The Federal Reserve's releases pass a gate another process keeps
+/// locked; the other four hosts' gates are free. The run finishes: every other request is asked
+/// and stored as in a run with no gate held, the refused release's attempt is closed `not_sent`
+/// with nothing requested, its lane is three `deferred` rows `gate_refused`, the exit is 8, and
+/// `ledger --check` counts both and finds no failure. The next run sweeps nothing and asks the
+/// three carried releases once the gate is free.
+#[test]
+fn a_host_whose_gate_another_sender_keeps_is_deferred_and_carried_while_the_other_hosts_are_asked(
+) -> TestResult {
+    let (control_root, control) = deadline_free_run(&Gnw::five_hosts()?)?;
+    drop(control_root);
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    let page =
+        std::fs::read(provider_dir().join("tests/fixtures/fed/article_bcreg20261113a.html"))?;
+    let server = loopback::Loopback::redirecting("/never", page)?;
+    let ask = Ask {
+        hosts: Some(seed::committed_hosts()),
+        at: instant(MONDAY_AT),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let stub = Gnw::five_hosts()?;
+    let exchange = fed_through_the_wire(&ask, &stub, &server, Some(A_SHORT_INTERVAL))?;
+    let held = gate_held(root.path())?;
+    let opened = cmd_collect::open_provider(&ask)?;
+    let first = cmd_collect::run(&ask, &opened, &exchange, &Monday)?;
+    drop(held);
+    let seen_while_held = server.seen()?;
+    let refused: Vec<&Value> =
+        first.envelope["attempts"]
+            .as_array()
+            .map_or_else(Vec::new, |rows| {
+                rows.iter()
+                    .filter(|row| row["outcome"] == NOT_SENT)
+                    .collect()
+            });
+    let gate = root.path().join(LOOPBACK_GATE).display().to_string();
+    let named = refused
+        .first()
+        .and_then(|row| row["not_sent"].as_str())
+        .is_some_and(|text| text.contains(&gate));
+    let deferred: Vec<(String, String, String, Value)> = deferred_of(&first.envelope);
+    let fed_lane = busy_of(&first.envelope, FED_HOST);
+    let mut human = Vec::new();
+    cmd_collect::render_human(&first.envelope, &mut human)?;
+    let human = String::from_utf8(human)?;
+    assert_eq!(
+        (
+            first.exit.code(),
+            first.exit.error_code(),
+            attempts_off_the_fed_releases(&first.envelope),
+            refused
+                .iter()
+                .map(|row| row["url"].clone())
+                .collect::<Vec<_>>(),
+            named,
+            deferred,
+            (fed_lane["stopped"].clone(), fed_lane["not_looked"].clone()),
+            human.lines().find(|line| line.starts_with("deferred")),
+            seen_while_held,
+            attempts_not_ok(root.path())?,
+        ),
+        (
+            8,
+            Some("partial_collect"),
+            attempts_off_the_fed_releases(&control.envelope),
+            vec![Value::from(fed_release_urls()[0].clone())],
+            true,
+            fed_release_urls()
+                .into_iter()
+                .map(|url| (
+                    FED_HOST.to_owned(),
+                    url,
+                    GATE_REFUSED.to_owned(),
+                    Value::Null
+                ))
+                .collect::<Vec<_>>(),
+            (Value::from(true), Value::from(3)),
+            Some("deferred         3 run_deadline 0 host_held 0 follow_up_cap 0 gate_refused 3"),
+            Vec::new(),
+            vec![(NOT_SENT.to_owned(), None, Some(0), true)],
+        )
+    );
+    let report = newsvault::cmd_ledger::read(
+        root.path(),
+        &newsvault::cmd_ledger::Ask {
+            at: instant("2026-11-17T00:00:00Z"),
+            from: "2026-11-16".parse()?,
+            to: "2026-11-16".parse()?,
+            source: Some(SOURCE.to_owned()),
+            expected_runs: None,
+            limit: None,
+            check: true,
+        },
+    )?;
+    let counted: Vec<(u32, i64, u32, u32, u32)> = report
+        .days
+        .iter()
+        .flat_map(|day| &day.per_source)
+        .map(|row| {
+            (
+                row.not_sent,
+                row.deferred.gate_refused,
+                row.failed,
+                row.interrupted,
+                row.in_flight,
+            )
+        })
+        .collect();
+    let findings: Vec<&str> = report
+        .check
+        .findings
+        .iter()
+        .map(|finding| finding.code)
+        .collect();
+    assert_eq!(
+        (counted, findings),
+        (vec![(1, 3, 0, 0, 0)], Vec::<&str>::new())
+    );
+    let later = Ask {
+        at: instant(A_LATER_POLL),
+        schedule: Some("a later poll".to_owned()),
+        ..ask.clone()
+    };
+    let passing = Passing(Cell::new(instant(A_LATER_POLL)));
+    let second = cmd_collect::run(&later, &opened, &exchange, &passing)?;
+    let asked_once_free = server.seen()?;
+    server.finish()?;
+    let carried: Vec<(String, bool, Value, usize)> = carried_of(&second.envelope);
+    assert_eq!(
+        (
+            second.envelope["swept"].clone(),
+            asked_once_free,
+            carried,
+            deferred_of(&second.envelope).len(),
+        ),
+        (
+            serde_json::json!([]),
+            vec![
+                "/fed/0".to_owned(),
+                "/fed/1".to_owned(),
+                "/fed/2".to_owned()
+            ],
+            fed_release_urls()
+                .into_iter()
+                .map(|url| (url, true, Value::from("answered"), 1))
+                .collect::<Vec<_>>(),
+            0,
+        )
+    );
+    Ok(())
+}
+
+/// `host`'s row of the envelope's `busy.hosts`.
+fn busy_of(envelope: &Value, host: &str) -> Value {
+    envelope["busy"]["hosts"]
+        .as_array()
+        .and_then(|lanes| lanes.iter().find(|lane| lane["host"] == host))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The committed hosts on Monday with no deadline, on a fresh store.
+fn deadline_free_run(
+    exchange: &dyn Exchange,
+) -> Result<(TempDir, cmd_collect::Answer), Box<dyn Error>> {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    let ask = Ask {
+        hosts: Some(seed::committed_hosts()),
+        at: instant(MONDAY_AT),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, exchange, &Monday)?;
+    Ok((root, answer))
+}
+
+/// The gate's other refusal, with no gate held: on a clock that never moves the second release
+/// is owed its interval at every try and is refused `NeverCleared`. It is closed `not_sent` and
+/// deferred with the release behind it, like a send a held gate refused; the first was sent.
+#[test]
+fn a_send_the_gate_never_clears_is_closed_not_sent_and_deferred_with_its_lane() -> TestResult {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    let server = loopback::Loopback::redirecting("/never", Vec::new())?;
+    let ask = Ask {
+        hosts: Some(seed::committed_hosts()),
+        at: instant(MONDAY_AT),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let stub = Gnw::five_hosts()?;
+    let exchange = fed_through_the_wire(&ask, &stub, &server, Some(A_SHORT_INTERVAL))?;
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, &exchange, &Monday)?;
+    let seen = server.seen()?;
+    server.finish()?;
+    let refusals: Vec<&str> =
+        answer.envelope["attempts"]
+            .as_array()
+            .map_or_else(Vec::new, |rows| {
+                rows.iter()
+                    .filter_map(|row| row["not_sent"].as_str())
+                    .collect()
+            });
+    let deferred: Vec<(String, String)> = deferred_of(&answer.envelope)
+        .into_iter()
+        .map(|row| (row.1, row.2))
+        .collect();
+    assert_eq!(
+        (
+            seen,
+            refusals,
+            deferred,
+            attempts_not_ok(root.path())?,
+            answer.exit.code(),
+        ),
+        (
+            vec!["/fed/0".to_owned()],
+            vec!["the send gate still owed 5ms after 8 tries"],
+            fed_release_urls()
+                .into_iter()
+                .skip(1)
+                .map(|url| (url, GATE_REFUSED.to_owned()))
+                .collect::<Vec<_>>(),
+            vec![(NOT_SENT.to_owned(), None, Some(0), true)],
+            8,
+        )
+    );
+    Ok(())
+}
+
+/// 300 ms after `MONDAY_AT`, which the run's clock never leaves.
+const A_SHORT_DEADLINE: &str = "2026-11-16T09:30:30.300Z";
+
+/// The same held gate at the open-web profile's own 7 s, under a deadline 300 ms away: the lock
+/// is waited for half of those 300 ms, as the refusal says, and not the 224 s that are 32
+/// intervals. Another sender is the cause, so the rows are `gate_refused`.
+#[test]
+fn a_gate_held_near_the_run_s_deadline_is_waited_for_half_of_what_is_left() -> TestResult {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    let server = loopback::Loopback::redirecting("/never", Vec::new())?;
+    let ask = Ask {
+        hosts: Some(seed::committed_hosts()),
+        at: instant(MONDAY_AT),
+        deadline: Some(instant(A_SHORT_DEADLINE)),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let stub = Gnw::five_hosts()?;
+    let exchange = fed_through_the_wire(&ask, &stub, &server, None)?;
+    let held = gate_held(root.path())?;
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, &exchange, &Monday)?;
+    drop(held);
+    let seen = server.seen()?;
+    server.finish()?;
+    let refusals: Vec<&str> =
+        answer.envelope["attempts"]
+            .as_array()
+            .map_or_else(Vec::new, |rows| {
+                rows.iter()
+                    .filter_map(|row| row["not_sent"].as_str())
+                    .collect()
+            });
+    let reasons: Vec<String> = deferred_of(&answer.envelope)
+        .into_iter()
+        .map(|row| row.2)
+        .collect();
+    assert_eq!(
+        (
+            refusals.len(),
+            refusals
+                .first()
+                .is_some_and(|text| text.ends_with("after 150ms")),
+            reasons,
+            answer.exit.code(),
+            seen,
+        ),
+        (1, true, vec![GATE_REFUSED.to_owned(); 3], 8, Vec::new())
+    );
+    Ok(())
+}
+
+/// A clock that stays where it is until it is moved.
+struct Moved(Cell<DateTime<Utc>>);
+
+impl Clock for Moved {
+    fn now(&self) -> DateTime<Utc> {
+        self.0.get()
+    }
+}
+
+/// `Reserving`, with `late` passing on `clock` before each relayed send: an attempt row that
+/// took that long to write between the reservation and the gate.
+struct RowWrittenLate<'run> {
+    reserving: Reserving<'run>,
+    clock: &'run Moved,
+    late: TimeDelta,
+}
+
+impl Exchange for RowWrittenLate<'_> {
+    fn reserve(
+        &self,
+        request: &Request,
+        clock: &dyn Clock,
+        deadline: Option<DateTime<Utc>>,
+    ) -> Result<news_provider::Reservation, news_provider::Unreserved> {
+        self.reserving.reserve(request, clock, deadline)
+    }
+
+    fn send(
+        &self,
+        permit: SendPermit,
+        request: &Request,
+        clock: &dyn Clock,
+    ) -> Result<RawResponse, SendFailure> {
+        if self.reserving.0.relayed.contains_key(&request.url) {
+            self.clock.0.set(self.clock.0.get() + self.late);
+        }
+        self.reserving.send(permit, request, clock)
+    }
+}
+
+/// 2 ms after `MONDAY_AT`, and the 3 ms the first release's attempt row takes to write.
+const A_DEADLINE_INSIDE_THE_ROW_WRITE: &str = "2026-11-16T09:30:30.002Z";
+const THE_ROW_WRITE: TimeDelta = TimeDelta::milliseconds(3);
+const WHERE_THE_ROW_WRITE_ENDS: &str = "2026-11-16T09:30:30.003000Z";
+const RUN_DEADLINE: &str = "run_deadline";
+
+/// One sending process and no gate held: the first release is reserved before the deadline and
+/// its attempt row is written past it. The gate is free and stamps nothing after the deadline,
+/// so the attempt is closed `not_sent` by the deadline's name and the lane is `run_deadline`
+/// with the first row's `go_at`, never `gate_refused`; the lane's wait counts the row write.
+#[test]
+fn a_send_the_deadline_passes_before_its_gate_is_not_sent_and_its_lane_is_run_deadline(
+) -> TestResult {
+    let root = TempDir::new()?;
+    seed::refresh_committed(root.path(), ROBOTS_EARLIER)?;
+    let server = loopback::Loopback::redirecting("/never", Vec::new())?;
+    let ask = Ask {
+        hosts: Some(seed::committed_hosts()),
+        at: instant(MONDAY_AT),
+        deadline: Some(instant(A_DEADLINE_INSIDE_THE_ROW_WRITE)),
+        ..ask(root.path(), cmd_collect::TODAY)
+    };
+    let stub = Gnw::five_hosts()?;
+    let clock = Moved(Cell::new(instant(MONDAY_AT)));
+    let exchange = RowWrittenLate {
+        reserving: fed_through_the_wire(&ask, &stub, &server, None)?,
+        clock: &clock,
+        late: THE_ROW_WRITE,
+    };
+    let opened = cmd_collect::open_provider(&ask)?;
+    let answer = cmd_collect::run(&ask, &opened, &exchange, &clock)?;
+    let seen = server.seen()?;
+    server.finish()?;
+    let refusals: Vec<&str> =
+        answer.envelope["attempts"]
+            .as_array()
+            .map_or_else(Vec::new, |rows| {
+                rows.iter()
+                    .filter_map(|row| row["not_sent"].as_str())
+                    .collect()
+            });
+    let deferred: Vec<(String, Value)> = deferred_of(&answer.envelope)
+        .into_iter()
+        .map(|row| (row.2, row.3))
+        .collect();
+    let fed_lane = busy_of(&answer.envelope, FED_HOST);
+    assert_eq!(
+        (
+            seen,
+            refusals,
+            deferred,
+            (fed_lane["stopped"].clone(), fed_lane["waited_s"].clone()),
+            attempts_not_ok(root.path())?,
+            answer.exit.code(),
+        ),
+        (
+            Vec::new(),
+            vec!["the send gate owed 0ns and the run had 0ns left before its deadline"],
+            vec![
+                (
+                    RUN_DEADLINE.to_owned(),
+                    Value::from(WHERE_THE_ROW_WRITE_ENDS)
+                ),
+                (RUN_DEADLINE.to_owned(), Value::Null),
+                (RUN_DEADLINE.to_owned(), Value::Null),
+            ],
+            (Value::from(true), Value::from(0.003)),
+            vec![(NOT_SENT.to_owned(), None, Some(0), true)],
+            8,
+        )
+    );
+    Ok(())
+}
+
 /// The envelope's attempt urls, once the store's attempt rows are counted equal to them.
 fn attempted_urls(store: &Path, envelope: &Value) -> Result<BTreeSet<String>, Box<dyn Error>> {
     let db = Connection::open_with_flags(store.join(COMMIT_LOG), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -6213,11 +6751,14 @@ fn deferred_requests_open_no_attempt_and_every_reader_counts_each_reason_apart()
         ),
         (
             vec![
-                "deferred         6 run_deadline 2 host_held 4 follow_up_cap 0",
+                "deferred         6 run_deadline 2 host_held 4 follow_up_cap 0 gate_refused 0",
                 "holds capped     1"
             ],
             vec![(2, 4, 0)],
-            Some(" 2 deferred_host_held 4 deferred_follow_up_cap 0".to_owned()),
+            Some(
+                " 2 deferred_host_held 4 deferred_follow_up_cap 0 deferred_gate_refused 0"
+                    .to_owned()
+            ),
             serde_json::json!([{
                 "host": PRN_HOST,
                 "retry_after": "315360000",

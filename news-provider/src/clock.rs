@@ -1,10 +1,10 @@
-//! The one clock this seam reads, injected, and the wait a pace or a stamp owes (`Sleeper`).
+//! The one clock this seam reads, injected, and every wait it takes (`Sleeper`): the wait a pace
+//! or a stamp owes, and the bounded wait for a send gate's lock.
 //! `Utc::now` is called here and nowhere else in the crate: `Wire::send` is handed a `&dyn Clock`
 //! and no other method takes one, so a provider cannot read an instant even by accident.
-//!
-//! Through neither: the bounded wait for a send gate's lock, `recv_timeout` in
-//! `budget::lock_within`, a timed wait inside std (architecture.md section 8, rows R4 and R19).
 
+use std::fs::File;
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -27,7 +27,14 @@ impl Clock for SystemClock {
 /// would spend `Pace`'s interval on every send. `Wire::send` is the only caller.
 pub trait Sleeper: std::fmt::Debug {
     fn sleep(&self, how_long: Duration);
+
+    /// The lock a thread is queued for in `queued`, waited for at most `limit`; `None` when it
+    /// was not granted by then. A timed wait inside std, which reads std's monotonic clock.
+    fn granted(&self, queued: &Receiver<LockAnswer>, limit: Duration) -> Option<LockAnswer>;
 }
+
+/// What a thread queued for a gate file's lock sends back: the file, locked.
+pub type LockAnswer = std::io::Result<File>;
 
 /// The process sleeper.
 #[derive(Debug, Clone, Copy, Default)]
@@ -37,6 +44,10 @@ impl Sleeper for ThreadSleeper {
     fn sleep(&self, how_long: Duration) {
         std::thread::sleep(how_long);
     }
+
+    fn granted(&self, queued: &Receiver<LockAnswer>, limit: Duration) -> Option<LockAnswer> {
+        queued.recv_timeout(limit).ok()
+    }
 }
 
 /// The test clock and this module's own test, in ONE `#[cfg(test)]` item: the CI size step counts
@@ -44,8 +55,9 @@ impl Sleeper for ThreadSleeper {
 /// holding several markers measures wrong. The guard is the size step's own.
 #[cfg(test)]
 pub(crate) mod testing {
-    use super::{Clock, Sleeper, SystemClock, ThreadSleeper};
+    use super::{Clock, LockAnswer, Sleeper, SystemClock, ThreadSleeper};
     use chrono::{DateTime, TimeDelta, Utc};
+    use std::sync::mpsc::Receiver;
     use std::time::Duration;
 
     /// A clock handing out a stated sequence, so a test can say which read got which instant.
@@ -100,6 +112,12 @@ pub(crate) mod testing {
         fn sleep(&self, how_long: Duration) {
             self.0.borrow_mut().push(how_long);
         }
+
+        /// Recorded as a wait and not taken: a lock not granted yet is not granted.
+        fn granted(&self, queued: &Receiver<LockAnswer>, limit: Duration) -> Option<LockAnswer> {
+            self.sleep(limit);
+            queued.try_recv().ok()
+        }
     }
 
     /// A clock its own waits advance, so each read sees the instant the waits before it left.
@@ -141,6 +159,11 @@ pub(crate) mod testing {
         fn sleep(&self, how_long: Duration) {
             self.waits.sleep(how_long);
             self.elapse(how_long);
+        }
+
+        fn granted(&self, queued: &Receiver<LockAnswer>, limit: Duration) -> Option<LockAnswer> {
+            self.sleep(limit);
+            queued.try_recv().ok()
         }
     }
 

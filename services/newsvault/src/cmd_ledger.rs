@@ -37,6 +37,7 @@ const OUTCOME_OK: &str = "ok";
 const OUTCOME_EMPTY: &str = "empty";
 const OUTCOME_FAILED: &str = "failed";
 const OUTCOME_INTERRUPTED: &str = "interrupted";
+const OUTCOME_NOT_SENT: &str = "not_sent";
 
 /// The `--check` answers, each the code of a finding: `coverage_incomplete` since 2026-11-13
 /// (§8 row R20), the two busy bounds since 2026-11-18 (S7-D11). No asking-clock age: it needs a
@@ -192,6 +193,9 @@ pub struct SourceRow {
     pub empty: u32,
     pub failed: u32,
     pub interrupted: u32,
+    /// Attempts the send gate refused before the socket (section 3.2): opened, never sent, and
+    /// no failure of the vendor's, so `--check` does not count them.
+    pub not_sent: u32,
     pub in_flight: u32,
     pub opened_without_answered: Vec<String>,
     /// The ENOSPC and kill-mid-commit state: an attempt with an `Answered` row and no
@@ -316,6 +320,7 @@ pub struct DeferredCounts {
     pub run_deadline: i64,
     pub host_held: i64,
     pub follow_up_cap: i64,
+    pub gate_refused: i64,
 }
 
 impl DeferredCounts {
@@ -324,6 +329,7 @@ impl DeferredCounts {
             run_deadline: self.run_deadline + other.run_deadline,
             host_held: self.host_held + other.host_held,
             follow_up_cap: self.follow_up_cap + other.follow_up_cap,
+            gate_refused: self.gate_refused + other.gate_refused,
         }
     }
 }
@@ -815,7 +821,8 @@ struct DeferredGroup {
 
 fn deferred_per_run(db: &Connection, at: &str) -> Result<Vec<DeferredGroup>, LedgerReadError> {
     let mut statement = db.prepare(
-        "SELECT run_id, source, SUM(reason = ?2), SUM(reason = ?3), SUM(reason = ?4)
+        "SELECT run_id, source, SUM(reason = ?2), SUM(reason = ?3), SUM(reason = ?4),
+                SUM(reason = ?5)
            FROM deferred WHERE deferred_at <= ?1
           GROUP BY run_id, source ORDER BY run_id, source",
     )?;
@@ -823,7 +830,8 @@ fn deferred_per_run(db: &Connection, at: &str) -> Result<Vec<DeferredGroup>, Led
         at,
         DeferReason::RunDeadline.name(),
         DeferReason::HostHeld.name(),
-        DeferReason::FollowUpCap.name()
+        DeferReason::FollowUpCap.name(),
+        DeferReason::GateRefused.name()
     ];
     let rows = statement
         .query_map(reasons, |row| {
@@ -834,6 +842,7 @@ fn deferred_per_run(db: &Connection, at: &str) -> Result<Vec<DeferredGroup>, Led
                     run_deadline: row.get(2)?,
                     host_held: row.get(3)?,
                     follow_up_cap: row.get(4)?,
+                    gate_refused: row.get(5)?,
                 },
             })
         })?
@@ -1132,6 +1141,7 @@ fn day_row(date: NaiveDate, envelopes: &[Envelope], read: &Read, ask: &Ask) -> D
             OUTCOME_EMPTY => row.empty += entry.attempts,
             OUTCOME_FAILED => row.failed += entry.attempts,
             OUTCOME_INTERRUPTED => row.interrupted += entry.attempts,
+            OUTCOME_NOT_SENT => row.not_sent += entry.attempts,
             _ => row.in_flight += entry.attempts,
         }
     }
@@ -1222,6 +1232,7 @@ impl SourceRow {
             empty: 0,
             failed: 0,
             interrupted: 0,
+            not_sent: 0,
             in_flight: 0,
             opened_without_answered: Vec::new(),
             answered_without_finalised: Vec::new(),
@@ -1384,7 +1395,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
         for row in &day.per_source {
             writeln!(
                 out,
-                "  {:<14} ok {} empty {} failed {} interrupted {} in-flight {} \
+                "  {:<14} ok {} empty {} failed {} interrupted {} not_sent {} in-flight {} \
                  vendor_rows {} held {} listing_unusable {} bodies_truncated {} \
                  cuts_held_at_limit {} cuts_released_unreachable {} \
                  relisted_disputed {} relisted_compared {} robots_disallowed {} \
@@ -1395,6 +1406,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                  boundary_generation_unknown {} walk_complete {} walk_first_poll {} \
                  walk_id_unread {} walk_range_unread {} walk_gone {} walk_other_language {} walk_unread {} \
                  deferred_run_deadline {} deferred_host_held {} deferred_follow_up_cap {} \
+                 deferred_gate_refused {} \
                  carried_answered {} carried_held {} carried_expired {} \
                  items_new {} rows {}",
                 row.source,
@@ -1402,6 +1414,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 row.empty,
                 row.failed,
                 row.interrupted,
+                row.not_sent,
                 row.in_flight,
                 row.vendor_rows,
                 row.held,
@@ -1431,6 +1444,7 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
                 row.deferred.run_deadline,
                 row.deferred.host_held,
                 row.deferred.follow_up_cap,
+                row.deferred.gate_refused,
                 row.carried.answered,
                 row.carried.held,
                 row.carried.expired,
@@ -1545,11 +1559,12 @@ pub fn render_human(report: &Report, out: &mut impl std::io::Write) -> std::io::
 pub const PROMETHEUS_SCHEMA: &str = "newsvault.prom/1";
 /// Every family [`render_prometheus`] writes, in its order: the list a deploy test holds the alert
 /// rules to, so a family with no rule reading it, or a rule reading none, is red.
-pub const PROMETHEUS_FAMILIES: [&str; 8] = [
+pub const PROMETHEUS_FAMILIES: [&str; 9] = [
     "newsvault_ledger_at_timestamp_seconds",
     "newsvault_ledger_complete",
     "newsvault_collect_last_asked_age_seconds",
     "newsvault_deferred_host_held",
+    "newsvault_deferred_gate_refused",
     "newsvault_carried_expired",
     "newsvault_walk_range_unread_polls",
     "newsvault_holds_capped",
@@ -1655,6 +1670,12 @@ pub fn render_prometheus(
     )?;
     family(
         out,
+        "newsvault_deferred_gate_refused",
+        "Requests another sender kept out of a run at the send gate (section 3.2 gate_refused).",
+        &per_source(&|row| row.deferred.gate_refused),
+    )?;
+    family(
+        out,
         "newsvault_carried_expired",
         "Deferred rows the carry closed expired after 24 h, never asked (S7-D5).",
         &per_source(&|row| row.carried.expired),
@@ -1731,6 +1752,7 @@ mod tests {
             run_deadline: 101,
             host_held,
             follow_up_cap: 103,
+            gate_refused: host_held + 100,
         };
         row.carried = CarriedCounts {
             answered: 104,
@@ -1842,6 +1864,8 @@ mod tests {
                 "newsvault_collect_last_asked_age_seconds 23".to_owned(),
                 format!("newsvault_deferred_host_held{{{}}} 3", day(1)),
                 format!("newsvault_deferred_host_held{{{}}} 13", day(0)),
+                format!("newsvault_deferred_gate_refused{{{}}} 103", day(1)),
+                format!("newsvault_deferred_gate_refused{{{}}} 113", day(0)),
                 format!("newsvault_carried_expired{{{}}} 5", day(1)),
                 format!("newsvault_carried_expired{{{}}} 17", day(0)),
                 format!("newsvault_walk_range_unread_polls{{{}}} 7", day(1)),

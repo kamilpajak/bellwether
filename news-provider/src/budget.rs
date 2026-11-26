@@ -11,6 +11,7 @@
 //!
 //! What it does and does not close: `docs/design/architecture.md` section 8 row R19.
 
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -20,6 +21,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, SubsecRound, TimeDelta, Utc};
 
+use crate::clock::Sleeper;
 use crate::request::SourceId;
 
 /// Which bucket one pace file counts, and so which callers share it. A third arm, per-CREDENTIAL,
@@ -142,16 +144,47 @@ pub enum BudgetError {
     /// The send gate still owed a wait after this many tries (`SendGate`, row R19).
     #[error("the send gate still owed {owed:?} after {tries} tries")]
     NeverCleared { tries: u32, owed: Duration },
-    /// Another sender kept a gate's lock past `GATE_TURNS` of the caller's interval: stopped and
-    /// not dead, or waiting out an interval that many times the caller's (row R19, hole 4).
+    /// Another sender kept a gate's lock past `GATE_TURNS` of the caller's interval, or past
+    /// what was left of the caller's run: stopped and not dead, or waiting out a longer interval
+    /// (row R19, hole 4).
     #[error("the send gate at {path} was still locked by another sender after {waited:?}")]
     GateHeld { path: PathBuf, waited: Duration },
+    /// The run's deadline, and no other sender: the gate owed a wait longer than the run had
+    /// left, or its lock was free and the deadline had passed before the stamp.
+    #[error("the send gate owed {owed:?} and the run had {left:?} left before its deadline")]
+    PastDeadline { owed: Duration, left: Duration },
+}
+
+impl BudgetError {
+    /// The gate refused the send and no file is at fault: nothing was stamped and no socket was
+    /// opened, so the caller records the request as not asked and may ask it again.
+    #[must_use]
+    pub const fn is_a_gate_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::NeverCleared { .. } | Self::GateHeld { .. } | Self::PastDeadline { .. }
+        )
+    }
+
+    /// The wait the gate owed when the run's deadline, and no other sender, refused the send.
+    #[must_use]
+    pub const fn owed_past_the_deadline(&self) -> Option<Duration> {
+        match self {
+            Self::PastDeadline { owed, .. } => Some(*owed),
+            _ => None,
+        }
+    }
 }
 
 /// How many of its own interval a caller waits for one gate's lock. Not fitted: a live line of
 /// `k` senders at one interval is `k` intervals long, so 32 leaves room for 31 ahead, or for one
 /// holder doubled 4 times (architecture.md section 12.6, rule B1, written before any run).
 const GATE_TURNS: u32 = 32;
+
+/// The share of what is left of a run that one wait for a gate's lock may take: half, so a gate
+/// another sender keeps leaves the hosts whose gates are free the other half. Not fitted
+/// (architecture.md section 12.8, step 9b, decision D5, written before any run).
+const LOCK_SHARE: u32 = 2;
 
 /// The directory the pace files sit in, under the pace root the `Wire` is given.
 pub(crate) const PACE_DIR: &str = "pace";
@@ -419,11 +452,19 @@ impl SendGate {
     /// Locks every gate in the order given. The caller keeps the locks through the wait a stamp
     /// answers `Owed` with: released for it, the opening went to whichever process read its clock
     /// first, and a sender lost 8 times running was refused (13 of 600 sends, two processes at
-    /// 100 ms, 2026-11-26; architecture.md section 12.6).
-    fn lock(gates: &[Self]) -> Result<Locked<'_>, BudgetError> {
+    /// 100 ms, 2026-11-26; architecture.md section 12.6). `left` is what is left of the caller's
+    /// run, read before each wait for a lock and never for a lock that is free.
+    fn lock<'gates>(
+        gates: &'gates [Self],
+        wait: &'gates dyn Sleeper,
+        left: &'gates dyn Fn() -> Option<Duration>,
+    ) -> Result<Locked<'gates>, BudgetError> {
         let mut locked = Locked {
             gates,
             held: Vec::with_capacity(gates.len()),
+            wait,
+            left,
+            not_after: None,
         };
         locked.lock_the_rest()?;
         Ok(locked)
@@ -457,48 +498,90 @@ impl Gates {
         self.0.is_empty()
     }
 
-    pub(crate) fn lock(&self) -> Result<Locked<'_>, BudgetError> {
-        SendGate::lock(&self.0)
+    /// The gates among `refused` are not waited for: each kept its lock through a whole wait of
+    /// this run already, so a second wait would spend the run on the same holder.
+    #[must_use]
+    pub(crate) fn impatient_at(mut self, refused: &BTreeSet<PathBuf>) -> Self {
+        for gate in &mut self.0 {
+            if refused.contains(&gate.path) {
+                gate.patience = Duration::ZERO;
+            }
+        }
+        self
+    }
+
+    pub(crate) fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.0.iter().map(|gate| gate.path.as_path())
+    }
+
+    pub(crate) fn lock<'gates>(
+        &'gates self,
+        wait: &'gates dyn Sleeper,
+        left: &'gates dyn Fn() -> Option<Duration>,
+    ) -> Result<Locked<'gates>, BudgetError> {
+        SendGate::lock(&self.0, wait, left)
     }
 }
 
-/// `file` locked, waited for in the kernel's queue for at most `patience`. A thread waits there
-/// in the caller's place, since `flock` takes no limit and polling `try_lock` keeps no place in
-/// the queue; granted the lock after the caller left, the thread drops the file and so the lock.
-fn lock_within(path: &Path, file: File, patience: Duration) -> Result<File, BudgetError> {
+/// `file` locked, waited for in the kernel's queue for at most `patience` or `LOCK_SHARE` of what
+/// `left` says is left of the run, whichever is less; not at all when that is nothing. A thread
+/// waits there in the caller's place, since `flock` takes no limit and polling `try_lock` keeps no
+/// place in the queue; granted the lock after the caller left, the thread drops the file and so
+/// the lock.
+fn lock_within(
+    path: &Path,
+    file: File,
+    patience: Duration,
+    wait: &dyn Sleeper,
+    left: &dyn Fn() -> Option<Duration>,
+) -> Result<File, BudgetError> {
     match file.try_lock() {
         Ok(()) => return Ok(file),
         Err(TryLockError::WouldBlock) => {}
         Err(TryLockError::Error(why)) => return Err(unusable(path, "locked", &why)),
     }
+    let patience = left().map_or(patience, |left| (left / LOCK_SHARE).min(patience));
+    let held = || BudgetError::GateHeld {
+        path: path.to_path_buf(),
+        waited: patience,
+    };
+    if patience.is_zero() {
+        return Err(held());
+    }
     let (granted, waiting) = mpsc::channel();
     thread::Builder::new()
         .spawn(move || drop(granted.send(file.lock().map(|()| file))))
         .map_err(|why| unusable(path, "waited for on a thread", &why))?;
-    match waiting.recv_timeout(patience) {
-        Ok(Ok(file)) => Ok(file),
-        Ok(Err(why)) => Err(unusable(path, "locked", &why)),
-        Err(_) => Err(BudgetError::GateHeld {
-            path: path.to_path_buf(),
-            waited: patience,
-        }),
+    match wait.granted(&waiting, patience) {
+        Some(Ok(file)) => Ok(file),
+        Some(Err(why)) => Err(unusable(path, "locked", &why)),
+        None => Err(held()),
     }
 }
 
 /// The gates of one call and the locks held on the first of them, until dropped: closing a file
 /// releases its lock, as the kernel does for a process that died holding it.
-#[derive(Debug)]
 pub(crate) struct Locked<'gates> {
     gates: &'gates [SendGate],
     held: Vec<File>,
+    wait: &'gates dyn Sleeper,
+    left: &'gates dyn Fn() -> Option<Duration>,
+    /// The run's deadline: no stamp is written for a clock read after it.
+    not_after: Option<DateTime<Utc>>,
 }
 
 impl Locked<'_> {
+    #[must_use]
+    pub(crate) const fn not_after(mut self, deadline: Option<DateTime<Utc>>) -> Self {
+        self.not_after = deadline;
+        self
+    }
+
     fn lock_the_rest(&mut self) -> Result<(), BudgetError> {
         for gate in self.gates.iter().skip(self.held.len()) {
             let file = open_for_update(&gate.path)?;
-            self.held
-                .push(lock_within(&gate.path, file, gate.patience)?);
+            let locked = lock_within(&gate.path, file, gate.patience, self.wait, self.left)?;
+            self.held.push(locked);
         }
         Ok(())
     }
@@ -539,6 +622,12 @@ impl Locked<'_> {
             // a 100 ms per-IP pace (review 2026-11-26, architecture.md section 12.6, rule B3).
             self.held.truncate(kept);
             return Ok(Stamped::Owed(owed.to_std().unwrap_or(Duration::ZERO)));
+        }
+        if self.not_after.is_some_and(|deadline| now > deadline) {
+            return Err(BudgetError::PastDeadline {
+                owed: Duration::ZERO,
+                left: Duration::ZERO,
+            });
         }
         for (gate, file) in self.gates.iter().zip(&self.held) {
             let mut file: &File = file;
@@ -612,6 +701,7 @@ mod tests {
     use super::{
         open_for_update, BudgetError, BudgetScope, Gates, Hold, HostKey, Pace, SendGate, Stamped,
     };
+    use crate::clock::ThreadSleeper;
     use crate::request::SourceId;
 
     const SHOUTED: &str = "WWW.SEC.GOV";
@@ -678,9 +768,12 @@ mod tests {
         Ok(())
     }
 
+    /// A run with no deadline.
+    const NO_DEADLINE: fn() -> Option<Duration> = || None;
+
     /// One try at the gate, its locks released after it.
     fn stamp_once(gates: &[SendGate], now: DateTime<Utc>) -> Result<Stamped, BudgetError> {
-        SendGate::lock(gates)?.stamp(&|| now)
+        SendGate::lock(gates, &ThreadSleeper, &NO_DEADLINE)?.stamp(&|| now)
     }
 
     const A_TURN: Duration = Duration::from_millis(2);
@@ -709,7 +802,7 @@ mod tests {
             drop(held);
             told
         });
-        let refused = SendGate::lock(&gate).err();
+        let refused = SendGate::lock(&gate, &ThreadSleeper, &NO_DEADLINE).err();
         release.send(()).map_err(|why| why.to_string())?;
         let told = holder.join().map_err(|_| "the holder panicked")?;
         let refused_by_name = Some(BudgetError::GateHeld {
@@ -717,7 +810,11 @@ mod tests {
             waited: ITS_TURNS,
         });
         assert_eq!(
-            (refused, told, SendGate::lock(&gate).is_ok()),
+            (
+                refused,
+                told,
+                SendGate::lock(&gate, &ThreadSleeper, &NO_DEADLINE).is_ok()
+            ),
             (refused_by_name, true, true)
         );
         Ok(())
@@ -826,7 +923,9 @@ mod tests {
         );
         let (both_sent, alike) = (at(BOTH_SENT)?, at(BOTH_OWED_ALIKE)?);
         stamp_once(&ours.0, at(LAST_SEND)?).map_err(|why| why.to_string())?;
-        let mut locked = ours.lock().map_err(|why| why.to_string())?;
+        let mut locked = ours
+            .lock(&ThreadSleeper, &NO_DEADLINE)
+            .map_err(|why| why.to_string())?;
         let stamps = [
             locked.stamp(&|| half_on),
             stamp_once(&theirs.0, at(ANOTHER_HOST_S_SEND)?),
@@ -834,7 +933,9 @@ mod tests {
             locked.stamp(&|| past_both),
         ];
         drop(locked);
-        let mut tied = theirs.lock().map_err(|why| why.to_string())?;
+        let mut tied = theirs
+            .lock(&ThreadSleeper, &NO_DEADLINE)
+            .map_err(|why| why.to_string())?;
         let alike = [tied.stamp(&|| both_sent), tied.stamp(&|| alike)];
         let [_, SendGate { path, .. }] = theirs.0.as_slice() else {
             return Err("no per-IP gate".to_owned());

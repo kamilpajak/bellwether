@@ -120,14 +120,26 @@ pub enum RosterError {
 }
 
 impl RosterError {
-    /// The section 5.1 exit: `input_absent` 4, `lease_held` 7; `credential_contact_missing`,
-    /// `input_unparseable`, `input_schema_mismatch` and `io_failed` 2.
+    /// How a run the send gate ended is reported, `None` for any other error: the object of
+    /// [`RobotsError::ended_at_the_gate`], and this error's own exit.
+    #[must_use]
+    pub fn ended_at_the_gate(&self, argv: Vec<String>) -> Option<(Value, u8)> {
+        let Self::Robots(refused) = self else {
+            return None;
+        };
+        let (object, _) = refused.ended_at_the_gate(argv)?;
+        Some((object, self.exit()))
+    }
+
+    /// The section 5.1 exit: `input_absent` 4, `lease_held` and `gate_refused` 7;
+    /// `credential_contact_missing`, `input_unparseable`, `input_schema_mismatch` and `io_failed` 2.
     #[must_use]
     pub const fn exit(&self) -> u8 {
         match self {
             Self::StoreAbsent(_) => 4,
             Self::Store(StoreError::LeaseHeld(_))
             | Self::Robots(RobotsError::Store(StoreError::LeaseHeld(_))) => 7,
+            Self::Robots(RobotsError::GateRefused { .. }) => cmd_robots::GATE_REFUSED_EXIT,
             _ => 2,
         }
     }
@@ -261,21 +273,51 @@ pub fn run(ask: &Ask, exchange: &dyn Exchange, clock: &dyn Clock) -> Result<Answ
         }
         Err(other) => return Err(other.into()),
     };
+    let fetched = fetch_each(&mut store, exchange, clock, &run, &hosts);
+    // Finished and marked, as a run the lease kept out is: the first refusal ends the run, since
+    // every later request would wait at the same per-IP gate. Any other error leaves the run
+    // file unfinished, as `cmd_robots::run` does.
+    let refused = matches!(
+        fetched,
+        Err(RosterError::Robots(RobotsError::GateRefused { .. }))
+    );
+    if fetched.is_ok() || refused {
+        write_envelope(
+            &ask.store,
+            &Envelope {
+                finished_at: Some(clock.now()),
+                refused: refused.then(|| cmd_robots::GATE_REFUSED.to_owned()),
+                ..envelope
+            },
+        )?;
+    }
+    let (robots, files) = fetched?;
+    Ok(answer_of(ask, &run_id, started, &robots, &files))
+}
+
+/// Each host's robots.txt, then each of its files the answer allows.
+fn fetch_each(
+    store: &mut Committer,
+    exchange: &dyn Exchange,
+    clock: &dyn Clock,
+    run: &RunId,
+    hosts: &[&'static str],
+) -> Result<(Vec<RobotsRow>, Vec<FileRow>), RosterError> {
     let interval = transport().budget.per_host;
     let mut ordinal: u32 = 0;
     let mut robots = Vec::with_capacity(hosts.len());
     let mut files = Vec::with_capacity(FILES.len());
-    for host in hosts {
+    for &host in hosts {
         let request = cmd_robots::request_for(host, None);
         let asked = Asked {
-            run: &run,
+            run,
             ordinal,
             host,
             request: &request,
             interval,
         };
         ordinal += 1;
-        let fetched = cmd_robots::fetch(&mut store, exchange, clock, &asked)?;
+        let fetched = cmd_robots::fetch(store, exchange, clock, &asked)?;
         for file in FILES.iter().filter(|file| file.host == host) {
             match gate(&fetched, file.path, interval) {
                 Some(reason) => files.push(FileRow {
@@ -283,9 +325,7 @@ pub fn run(ask: &Ask, exchange: &dyn Exchange, clock: &dyn Clock) -> Result<Answ
                     ..FileRow::planned(*file)
                 }),
                 None => {
-                    files.push(fetch_file(
-                        &mut store, exchange, clock, &run, ordinal, *file,
-                    )?);
+                    files.push(fetch_file(store, exchange, clock, run, ordinal, *file)?);
                     ordinal += 1;
                 }
             }
@@ -295,14 +335,7 @@ pub fn run(ask: &Ask, exchange: &dyn Exchange, clock: &dyn Clock) -> Result<Answ
             fetched: Some(fetched),
         });
     }
-    write_envelope(
-        &ask.store,
-        &Envelope {
-            finished_at: Some(clock.now()),
-            ..envelope
-        },
-    )?;
-    Ok(answer_of(ask, &run_id, started, &robots, &files))
+    Ok((robots, files))
 }
 
 /// Each host once, in the order [`FILES`] first names it.
@@ -380,11 +413,12 @@ fn fetch_file(
         clock,
     };
     let permit = or_abandon::<_, _, RosterError>(slot.take_permit(), store, &opened)?;
-    let answer = or_abandon::<_, _, RosterError>(
-        sent(exchange.send(permit, &request, clock)),
-        store,
-        &opened,
-    )?;
+    let answer = match exchange.send(permit, &request, clock) {
+        Err(news_provider::SendFailure::Budget(why)) if why.is_a_gate_refusal() => {
+            return Err(cmd_robots::unsent(slot, store, clock, why).into());
+        }
+        answered => or_abandon::<_, _, RosterError>(sent(answered), store, &opened)?,
+    };
     let rows = match &answer {
         Ok(response) if response.status() == OK => (file.rows)(response.body()),
         _ => None,

@@ -447,6 +447,87 @@ type Refreshed = (
     Vec<(bool, i64, String)>,
 );
 
+/// The pace of the refresh below: 32 of it are 160 ms, where the open-web profile's 7 s are 224 s.
+const A_SHORT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// The first row's host gate kept locked by a second open file, through a real `Wire` at a
+/// short per-host pace. The refresh ends at that send with `gate_refused`, exit 7, retryable:
+/// the attempt is closed `not_sent`, the second row is not asked, the run file is finished and
+/// marked, and no robots row is filed.
+#[test]
+fn a_refresh_whose_send_the_gate_refuses_ends_retryable_with_its_attempt_closed_not_sent(
+) -> TestResult {
+    let (root, shared) = (TempDir::new()?, TempDir::new()?);
+    let ask = ask(root.path(), two_row_hosts());
+    let feed = cmd_robots::open(&ask)?;
+    let server = loopback::Loopback::redirecting("/never", gnw_body()?)?;
+    let pace_root = news_provider::PaceRoot::resolve(Some(shared.path()), &ask.store)?;
+    let mut brisk = feed.transport();
+    brisk.budget.per_host = Some(A_SHORT_INTERVAL);
+    let credentials = news_provider::Credentials::default()
+        .with(Registered::OpenWebWires.credential(), CONTACT.to_owned());
+    let pace = shared.path().join("pace");
+    std::fs::create_dir_all(&pace)?;
+    let gate = pace.join("127.0.0.1.per-host.sent");
+    let held = std::fs::File::create(&gate)?;
+    held.lock()?;
+    let never_asked = Robots::of(&[(PRN_ROBOTS, OK, PRN_BODY)]);
+    let exchange = loopback::Relay {
+        stub: &never_asked,
+        wire: news_provider::Wire::new(brisk, credentials, &pace_root, &feed.source()),
+        relayed: BTreeMap::from([(GNW_ROBOTS.to_owned(), server.url(ROBOTS_PATH))]),
+        asked: RefCell::default(),
+    };
+    let refused = cmd_robots::run(&ask, &feed, &exchange, &Fixed).err();
+    drop(held);
+    let (sent, seen) = (exchange.sent(), server.seen()?);
+    server.finish()?;
+    let (object, exit) = refused
+        .as_ref()
+        .and_then(|refusal| refusal.ended_at_the_gate(vec!["again".to_owned()]))
+        .unwrap_or_default();
+    let recorded: Vec<(String, Option<String>, Option<i64>, bool)> = read_only(root.path())?
+        .prepare("SELECT outcome, requested_at, slots, closed_at IS NOT NULL FROM attempts")?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    let run_file: Value = serde_json::from_slice(&std::fs::read(
+        root.path().join(RUNS_DIR).join(format!("{RUN_ID}.json")),
+    )?)?;
+    assert_eq!(
+        (
+            (
+                object["code"].clone(),
+                object["retryable"].clone(),
+                object["details"]["attempt_id"].is_string(),
+            ),
+            exit,
+            sent,
+            seen,
+            recorded,
+            robots_rows(root.path())?.len(),
+            run_file["finished_at"].is_string(),
+            run_file["refused"].clone(),
+        ),
+        (
+            (
+                serde_json::json!("gate_refused"),
+                serde_json::json!(true),
+                true
+            ),
+            7,
+            vec![GNW_ROBOTS.to_owned()],
+            Vec::new(),
+            vec![("not_sent".to_owned(), None, Some(0), true)],
+            0,
+            true,
+            serde_json::json!("gate_refused"),
+        )
+    );
+    Ok(())
+}
+
 fn refreshed_through_a_redirect(body_over_the_limit: bool) -> Result<Refreshed, Box<dyn Error>> {
     let (root, shared) = (TempDir::new()?, TempDir::new()?);
     let ask = ask(root.path(), gnw_hosts());
