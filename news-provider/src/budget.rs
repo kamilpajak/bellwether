@@ -763,6 +763,56 @@ mod tests {
         Ok(())
     }
 
+    const PER_IP: Duration = Duration::from_millis(100);
+    const HALF_A_HOST_INTERVAL_ON: &str = "2026-11-10T13:00:00.5Z";
+    const HALF_A_HOST_INTERVAL: Duration = Duration::from_millis(500);
+    const ANOTHER_HOST_S_SEND: &str = "2026-11-10T13:00:00.95Z";
+    const LEFT_OF_THE_PER_IP_INTERVAL: Duration = Duration::from_millis(50);
+    const PAST_BOTH: &str = "2026-11-10T13:00:01.05Z";
+
+    /// A host owed more than the per-IP bucket is waited out without the per-IP lock, so another
+    /// host's call is stamped meanwhile, and the next stamp takes that lock and reads that bucket
+    /// again. Kept, the lock refuses the other call `GateHeld` after 3.2 s.
+    #[test]
+    fn a_call_another_host_made_during_a_host_s_wait_is_still_owed_the_per_ip_interval(
+    ) -> Result<(), String> {
+        let store = tempfile::tempdir().map_err(|why| why.to_string())?;
+        let gates = |host: &str, interval| {
+            let host = HostKey::new(host)?;
+            let per_ip = BudgetScope::PerIp(SourceId::new("edgar_press"));
+            Ok::<_, BudgetError>([
+                SendGate::beside_the_store(store.path(), &BudgetScope::PerHost(host), interval)?,
+                SendGate::beside_the_store(store.path(), &per_ip, PER_IP)?,
+            ])
+        };
+        let ours = gates(SEC, GATE_INTERVAL).map_err(|why| why.to_string())?;
+        let theirs = gates("data.sec.gov", PER_IP).map_err(|why| why.to_string())?;
+        let at = |read: &str| read.parse::<DateTime<Utc>>().map_err(|why| why.to_string());
+        let (half_on, one_on, past_both) = (
+            at(HALF_A_HOST_INTERVAL_ON)?,
+            at(ONE_INTERVAL_ON)?,
+            at(PAST_BOTH)?,
+        );
+        stamp_once(&ours, at(LAST_SEND)?).map_err(|why| why.to_string())?;
+        let mut locked = SendGate::lock(&ours).map_err(|why| why.to_string())?;
+        let stamps = [
+            locked.stamp(&|| half_on),
+            stamp_once(&theirs, at(ANOTHER_HOST_S_SEND)?),
+            locked.stamp(&|| one_on),
+            locked.stamp(&|| past_both),
+        ];
+        assert_eq!(
+            stamps,
+            [
+                Ok(Stamped::Owed(HALF_A_HOST_INTERVAL)),
+                Ok(Stamped::Sent(at(ANOTHER_HOST_S_SEND)?)),
+                Ok(Stamped::Owed(LEFT_OF_THE_PER_IP_INTERVAL)),
+                Ok(Stamped::Sent(past_both))
+            ]
+        );
+        Ok(())
+    }
+
     const A_READ_WITH_NANOSECONDS: &str = "2026-11-10T13:00:00.123456789Z";
     const THAT_READ_IN_MICROSECONDS: &str = "2026-11-10T13:00:00.123456Z";
 

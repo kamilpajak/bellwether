@@ -418,14 +418,6 @@ const SURVIVOR: Sender = Sender {
     per_ip: None,
     host: LOOPBACK,
 };
-const OTHER_HOST: Sender = Sender {
-    id: "other-host",
-    interval_ms: FAST,
-    sends: 3,
-    delay_ms: 0,
-    per_ip: Some(FAST),
-    host: LOCALHOST,
-};
 /// A stamp takes the lock for microseconds; 20 refusals 10 ms apart are one holder waiting in it.
 const HELD_FOR: u32 = 20;
 
@@ -496,25 +488,6 @@ fn a_sender_killed_while_it_waits_at_the_gate_does_not_block_the_next() -> Check
         (stamps.len(), first >= killed_at),
         (3, true),
         "{sent:?} killed at {killed_at}"
-    );
-    Ok(())
-}
-
-/// The holder waits out its host holding that host's lock and not the per-IP gate's, so a sender
-/// of the same per-IP bucket asking another host is stamped while the holder still waits. With
-/// both locks held it is refused `GateHeld` after 32 of its 50 ms.
-#[test]
-fn a_sender_waiting_out_its_host_holds_no_lock_another_host_waits_for() -> Checked {
-    let root = tempfile::tempdir()?;
-    let (port, _arrivals) = listen(false)?;
-    let _holder = holder_waiting(port, root.path())?;
-    let other = start(OTHER_HOST, port, root.path())?;
-    let sent = finished(other, OTHER_HOST, root.path())?;
-    let stamped = sent.iter().filter(|send| send.requested.is_some()).count();
-    assert_eq!(
-        (stamped, locked(&root.path().join(HOST_GATE))?),
-        (3, true),
-        "{sent:?}"
     );
     Ok(())
 }
