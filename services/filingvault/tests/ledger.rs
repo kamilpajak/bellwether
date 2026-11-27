@@ -154,6 +154,22 @@ fn a_store_with_no_collect_run_by_at_has_no_forward_window_and_answers_no() -> T
     Ok(())
 }
 
+/// A store whose only run received no listing answers no, even before a forward day is owed
+/// (review LBD-6): robots.txt answered 503. Mutation 2026-11-27, `usable_listings` left out of
+/// the exit: red here.
+#[test]
+fn a_store_holding_no_usable_listing_answers_no() -> TestResult {
+    let temp = TempDir::new()?;
+    let refused = Stub::default().answering(ROBOTS_URL, Reply::Status(503, Vec::new()));
+    drop(run(temp.path(), &refused, RUN)?);
+    let read = checked(temp.path(), "2026-11-15T12:00:00Z")?;
+    assert_eq!(
+        (read.exit, read.report["usable_listings"].clone()),
+        (1, serde_json::json!(0))
+    );
+    Ok(())
+}
+
 /// Mutation 2026-11-27, the read-only open replaced by the writer's create: red.
 #[test]
 fn ledger_check_without_a_store_exits_4_and_creates_nothing() -> TestResult {

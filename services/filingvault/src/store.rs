@@ -469,7 +469,7 @@ const INDEX_ATTEMPTS: &str =
   FROM attempts
  WHERE kind = 'index' AND closed_at IS NOT NULL AND (?1 IS NULL OR closed_at <= ?1)
  ORDER BY target, seq";
-const HELD_LISTINGS: &str = "SELECT target, raw_blob, max(received_at)
+const HELD_LISTINGS: &str = "SELECT target, raw_blob, max(received_at), max(verdict = 'usable')
   FROM attempts
  WHERE kind = 'listing' AND verdict IN ('usable', 'empty') AND closed_at IS NOT NULL
    AND (?1 IS NULL OR closed_at <= ?1) AND raw_blob IS NOT NULL
@@ -543,6 +543,8 @@ pub struct HeldListing {
     pub blob: String,
     /// The newest `received_at` of the attempts that answered this body.
     pub received: String,
+    /// Read `usable`, naming at least one day; else `empty`. One body is one verdict.
+    pub usable: bool,
 }
 
 /// Every distinct usable or empty listing body of each quarter closed by `until`, oldest first:
@@ -558,6 +560,7 @@ pub fn held_listings(
                 quarter: row.get(0)?,
                 blob: row.get(1)?,
                 received: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                usable: row.get(3)?,
             })
         })?
         .collect::<Result<Vec<HeldListing>, _>>()?;

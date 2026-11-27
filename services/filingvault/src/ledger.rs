@@ -1,6 +1,7 @@
 //! `filingvault ledger check --at`: which index days were asked, as of an instant (architecture.md
 //! section 12.2, "What complete means"). Read-only and lease-free. Exit 1 is "the answer is no":
-//! a forward day is not asked or not yet listed, or no collect run had started by `--at`.
+//! a forward day is not asked or not yet listed, no collect run had started by `--at`, or no
+//! usable listing was held by it.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -65,7 +66,9 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
     };
     let mut listed: BTreeMap<NaiveDate, String> = BTreeMap::new();
     let mut newest_named: BTreeMap<String, NaiveDate> = BTreeMap::new();
+    let mut usable_listings = 0_u32;
     for held in store::held_listings(&db, Some(&until))? {
+        usable_listings += u32::from(held.usable);
         let days = listed_days(&store::read_blob(&blobs, &held.blob)?).map_err(|why| {
             FilingsError::Unparseable {
                 what: format!("the stored listing of {}", held.quarter),
@@ -151,7 +154,11 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let last_run = store::last_run(&db, &until)?;
-    let exit = if forward_from.is_none() || forward_unasked > 0 || forward_unlisted > 0 {
+    let exit = if forward_from.is_none()
+        || usable_listings == 0
+        || forward_unasked > 0
+        || forward_unlisted > 0
+    {
         ANSWER_IS_NO
     } else {
         0
@@ -164,6 +171,7 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
         "days": by_state,
         "forward_unasked": forward_unasked,
         "forward_unlisted": forward_unlisted,
+        "usable_listings": usable_listings,
         "listed_rows": rows.values().map(|held| held.listed).sum::<u32>(),
         "per_day": day_rows,
         "blob_raw_bytes": raw.unwrap_or(0),

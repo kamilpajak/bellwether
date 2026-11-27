@@ -5163,6 +5163,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 
   - Cross-check, offline, 2026-11-27: the listings of 2024 Q4 to 2026 Q3 (the QS-3 run's bodies, below) and 2026 Q4 to 11-12 (`probes/observation_lag/quarter_index.2026Q4.json`), the same rule run for 2024 to 2028. 28 weekdays carry no `form.*.idx`; 24 of them are rule holidays, and 24 of 24 rule holidays in those days carry none (2026-10-12 and 2026-11-11 among them). The other 4 are closures by executive order: 2024-12-24, 2025-01-09, 2025-12-24, 2025-12-26. Such a day at a quarter's end reads `unlisted`, and the list cannot hold it while the test rebuilds it from the statute (§12.6).
 - Reader: `filingvault ledger check --at <instant>`: the three day counts, the open filings by age, `complete_from`, the last run. Exit 0 nothing open in the forward window; 1 the answer is no; 4 no store; 2 usage.
+- Exit 1 also while `--at` holds no `usable` listing, counted as distinct bodies in `usable_listings` (owner decision 2026-11-27, review LBD-6: a store whose only run received nothing answered 0 for its first 3 days). An `empty` listing does not count: it is the ambiguous case of EF1.
 - It grows with its tables: after step 10 it prints asked and unasked days and the listed rows, and exits 1 while a forward day is unasked or unlisted; open filings arrive with step 11; `complete` and `complete_from` arrive with step 12, the first step that can close a filing.
 
 **Schedule and run accounting.**
