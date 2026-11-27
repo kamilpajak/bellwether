@@ -168,8 +168,9 @@ fn an_error_writes_one_object_to_stderr_and_nothing_to_stdout() -> TestResult {
     Ok(())
 }
 
-/// Everything but the mutation: the plan comes back, and no store, lease or log is made.
-/// Mutation 2026-11-27, the dry run opening the writer: red.
+/// Everything but the mutation: the plan comes back, says the store is absent, and no store,
+/// lease or log is made. Mutations 2026-11-27, each red here: the dry run opening the writer;
+/// `store` left out of the report (review EF4).
 #[test]
 fn a_dry_run_plans_from_the_store_and_creates_nothing() -> TestResult {
     let temp = TempDir::new()?;
@@ -193,6 +194,7 @@ fn a_dry_run_plans_from_the_store_and_creates_nothing() -> TestResult {
         (
             out.status.code(),
             report["dry_run"].clone(),
+            report["store"].clone(),
             report["planned"]["listings"]
                 .as_array()
                 .map(Vec::len)
@@ -201,7 +203,14 @@ fn a_dry_run_plans_from_the_store_and_creates_nothing() -> TestResult {
             store.exists(),
             std::fs::read_dir(root.path())?.count(),
         ),
-        (Some(0), serde_json::json!(true), true, false, 0)
+        (
+            Some(0),
+            serde_json::json!(true),
+            serde_json::json!("absent"),
+            true,
+            false,
+            0
+        )
     );
     Ok(())
 }

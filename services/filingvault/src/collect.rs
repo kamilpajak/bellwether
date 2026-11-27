@@ -28,6 +28,9 @@ use crate::store::{self, Ask as Described, Body, Commit, Writer};
 pub const COLLECT_SCHEMA: &str = "filingvault.collect/1";
 const RUN_PREFIX: &str = "filings";
 const RUN_ID_FORMAT: &str = "%Y%m%dT%H%M%S%.6fZ";
+/// A dry run's `store`: a mistyped `--store` plans as an empty store would (review EF4).
+const STORE_ABSENT: &str = "absent";
+const STORE_HELD: &str = "held";
 /// `runs.stopped_by` of a run an error ended: its `exit` is the error code's.
 const STOPPED_BY_ERROR: &str = "error";
 
@@ -461,14 +464,15 @@ pub fn run(ask: &Ask, exchange: &dyn Exchange, clock: &dyn Clock) -> Result<Repo
 }
 
 /// `--dry-run`: the quarters and the days a run would ask from what the store holds, read only;
-/// no store is created, no lease taken and nothing sent.
+/// no store is created, no lease taken and nothing sent. `store` says whether `--store` held one.
 fn planned(ask: &Ask, run_id: &str, started: DateTime<Utc>) -> Result<Report, FilingsError> {
     let run_date = started.date_naive();
     let current = Quarter::of(run_date.pred_opt().unwrap_or(run_date));
-    let (quarters, days) = match store::open_read(&ask.store) {
+    let (store, quarters, days) = match store::open_read(&ask.store) {
         Err(FilingsError::Absent(_)) => {
             let fill_start = fill_start(run_date, ask.rules.fill_days)?;
             (
+                STORE_ABSENT,
                 quarters_to_ask(fill_start, current, &BTreeSet::new())?,
                 Vec::new(),
             )
@@ -488,6 +492,7 @@ fn planned(ask: &Ask, run_id: &str, started: DateTime<Utc>) -> Result<Report, Fi
                 BODY_LIMIT,
             );
             (
+                STORE_HELD,
                 quarters_to_ask(window.fill_start, window.current, &window.complete)?,
                 days_to_ask(&listed, &states, window.fill_start, run_date),
             )
@@ -498,6 +503,7 @@ fn planned(ask: &Ask, run_id: &str, started: DateTime<Utc>) -> Result<Report, Fi
         "run_id": run_id,
         "at": store::stamp(started),
         "dry_run": true,
+        "store": store,
         "planned": {
             "listings": quarters.iter().map(|quarter| quarter.label()).collect::<Vec<String>>(),
             "days": days.into_iter().map(store::day_text).collect::<Vec<String>>(),

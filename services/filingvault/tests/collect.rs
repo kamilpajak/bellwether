@@ -875,10 +875,15 @@ fn a_dry_run_over_a_store_plans_the_trailing_three_days() -> TestResult {
     let mut dry = support::ask(temp.path());
     dry.dry_run = true;
     let stub = Stub::sec();
-    let planned = run_ask(&dry, &stub, NEXT_RUN)??.value["planned"].clone();
+    let report = run_ask(&dry, &stub, NEXT_RUN)??.value;
     assert_eq!(
-        (planned, stub.asked().len()),
         (
+            report["store"].clone(),
+            report["planned"].clone(),
+            stub.asked().len()
+        ),
+        (
+            serde_json::json!("held"),
             serde_json::json!({
                 "listings": ["2026/QTR4"],
                 "days": ["2026-11-11", "2026-11-10", "2026-11-09"],
