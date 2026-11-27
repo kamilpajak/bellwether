@@ -118,6 +118,9 @@ pub enum Reply {
     /// A body over the limit, cut at it.
     OverLimit(Vec<u8>),
     GateHeld,
+    /// A pace file the gate cannot read: a budget error that is no gate refusal.
+    Budget,
+    NoCredential,
 }
 
 /// Each url answered as set, the last reply repeating; a url it does not hold fails in transport.
@@ -227,6 +230,10 @@ impl Exchange for Stub {
                 path: "pace/www.sec.gov.per-host.sent".into(),
                 waited: std::time::Duration::from_secs(16),
             })),
+            Some(Reply::Budget) => Err(SendFailure::Budget(BudgetError::NoPace)),
+            Some(Reply::NoCredential) => {
+                Err(SendFailure::CredentialMissing("sec_contact".to_owned()))
+            }
             Some(Reply::Transport) | None => Err(SendFailure::Transport(failed())),
         }
     }

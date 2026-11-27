@@ -646,3 +646,49 @@ fn a_blob_row_records_the_size_the_write_left() -> TestResult {
     assert!(checked >= 3);
     Ok(())
 }
+
+/// An error mid-run leaves no attempt and no run open, and an answer whose blob write failed keeps
+/// its status (review of 2026-11-27, PIT-4 and PIT-5). Mutations 2026-11-27, each red here: the
+/// attempt not abandoned after a budget error, a missing credential or a failed blob write.
+#[test]
+fn an_error_mid_run_closes_its_attempt_and_its_run() -> TestResult {
+    let mut seen = Vec::new();
+    for case in ["budget", "credential", "blob"] {
+        let temp = TempDir::new()?;
+        let stub = match case {
+            "budget" => Stub::sec().replacing(ROBOTS_URL, Reply::Budget),
+            "credential" => Stub::sec().replacing(ROBOTS_URL, Reply::NoCredential),
+            _ => {
+                std::fs::write(temp.path().join("blobs"), b"")?;
+                Stub::sec()
+            }
+        };
+        let code = run(temp.path(), &stub, RUN)?
+            .err()
+            .map(|why| why.code().name());
+        seen.push((
+            code,
+            rows(temp.path(), "SELECT kind, outcome, status FROM attempts")?,
+            rows(
+                temp.path(),
+                "SELECT exit, stopped_by, finished_at IS NOT NULL FROM runs",
+            )?,
+        ));
+    }
+    let closed = |code: &'static str, attempt: &str| {
+        (
+            Some(code),
+            vec![attempt.to_owned()],
+            vec!["2|error|1".to_owned()],
+        )
+    };
+    assert_eq!(
+        seen,
+        vec![
+            closed("io_failed", "robots|interrupted|null"),
+            closed("credential_contact_missing", "robots|interrupted|null"),
+            closed("io_failed", "robots|failed|200"),
+        ]
+    );
+    Ok(())
+}

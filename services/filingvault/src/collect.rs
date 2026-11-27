@@ -27,6 +27,8 @@ use crate::store::{self, Ask as Described, Body, Commit, Writer};
 pub const COLLECT_SCHEMA: &str = "filingvault.collect/1";
 const RUN_PREFIX: &str = "filings";
 const RUN_ID_FORMAT: &str = "%Y%m%dT%H%M%S%.6fZ";
+/// `runs.stopped_by` of a run an error ended: its `exit` is the error code's.
+const STOPPED_BY_ERROR: &str = "error";
 
 #[derive(Debug, Clone)]
 pub struct Ask {
@@ -177,7 +179,17 @@ impl Driver<'_> {
                     headers: got.headers.to_json(),
                 }),
                 Err(why) => {
-                    self.abandon(&attempt_id)?;
+                    let kept_nothing = Outcome::decide(
+                        &Verdict::TransientFailure,
+                        Counts {
+                            vendor_rows: 0,
+                            listing_unusable: 0,
+                            robots_disallowed: 0,
+                        },
+                        &Baseline::from_trailing_ok(&[]),
+                    );
+                    let at = self.now();
+                    drop(slot.close(&mut self.writer, kept_nothing, &answer, at)?);
                     return Err(why);
                 }
             },
@@ -394,7 +406,16 @@ pub fn run(ask: &Ask, exchange: &dyn Exchange, clock: &dyn Clock) -> Result<Repo
         listings: Vec::new(),
         days: Vec::new(),
     };
-    let stop = driver.collect(&ask.rules, started.date_naive())?;
+    let stop = match driver.collect(&ask.rules, started.date_naive()) {
+        Ok(stop) => stop,
+        Err(why) => {
+            let exit = why.code().exit();
+            return driver
+                .writer
+                .finish_run(clock.now(), exit, Some(STOPPED_BY_ERROR))
+                .and(Err(why));
+        }
+    };
     let code = match (&stop, driver.failed) {
         (Some(Stop::Robots(_)), _) => Some(ErrorCode::RobotsStopped),
         (Some(Stop::Gate { .. }), _) => Some(ErrorCode::GateRefused),
