@@ -952,6 +952,29 @@ fn a_rewrite_after_a_failed_reask_is_asked() -> TestResult {
     Ok(())
 }
 
+/// A listing naming a `form.*.idx` of a day outside its own quarter is refused, not read
+/// (review 2026-11-27, N2: `form.20271231.idx` in 2026 Q4's listing hid its two missing last
+/// days, exit 0). Mutation 2026-11-27, the quarter check dropped: red here.
+#[test]
+fn a_listing_naming_a_day_of_another_quarter_is_a_permanent_failure() -> TestResult {
+    let temp = TempDir::new()?;
+    let stray = [&LISTED[..], &["2027-12-31"]].concat();
+    let stub =
+        listing_of(&LISTED).replacing(&listing_url(LISTED[0]), Reply::Status(OK, listing(&stray)));
+    drop(run(temp.path(), &stub, RUN)?);
+    assert_eq!(
+        (
+            rows(
+                temp.path(),
+                "SELECT verdict FROM attempts WHERE kind = 'listing'"
+            )?,
+            asked_days(&stub),
+        ),
+        (vec!["permanent_failure".to_owned()], Vec::<String>::new())
+    );
+    Ok(())
+}
+
 /// One failed request is enough for exit 8. Mutation 2026-11-27, exit 8 from two failures: red.
 #[test]
 fn one_failed_request_makes_the_run_partial() -> TestResult {

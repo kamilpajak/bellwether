@@ -265,7 +265,7 @@ impl Driver<'_> {
                 return Ok(Some(Stop::Robots(RobotsStop::Disallowed)));
             }
             let turn = match self.turn(described, Provenance::LiveIngest, |answer| {
-                let (verdict, days) = listing_read(answer);
+                let (verdict, days) = listing_read(answer, quarter);
                 (verdict, Commit::default(), days)
             })? {
                 Ok(turn) => turn,

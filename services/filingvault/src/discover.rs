@@ -147,13 +147,19 @@ pub fn allowed(rules: Option<&Robots>, url: &str) -> bool {
 /// A listed day and the instant the listing says its index was last written.
 pub type Written = (NaiveDate, DateTime<Utc>);
 
-/// A listing's verdict and the days it names: a listing naming no day is `empty`, one that is no
-/// directory listing a permanent failure with its body kept.
+/// A listing's verdict and the days it names: a listing naming no day is `empty`; one that is no
+/// directory listing, or names a day outside `quarter`, a permanent failure with its body kept.
 #[must_use]
-pub fn listing_read(answer: &Result<RawResponse, TransportError>) -> (Verdict, Vec<Written>) {
+pub fn listing_read(
+    answer: &Result<RawResponse, TransportError>,
+    quarter: Quarter,
+) -> (Verdict, Vec<Written>) {
     match body_of_200(answer) {
         Err(verdict) => (verdict, Vec::new()),
         Ok(body) => match listed_writes(body.as_bytes()) {
+            Ok(days) if days.iter().any(|(day, _)| Quarter::of(*day) != quarter) => {
+                (Verdict::PermanentFailure, Vec::new())
+            }
             Ok(days) if days.is_empty() => (Verdict::Empty, days),
             Ok(days) => (Verdict::Usable, days),
             Err(_) => (Verdict::PermanentFailure, Vec::new()),
@@ -503,9 +509,9 @@ mod tests {
     }
 
     /// A listing is a `directory.item` array; one naming no day is `empty`; one naming no real day,
-    /// or a day with no `last-modified`, a failure. Mutations 2026-11-27, each red here: a body
-    /// that does not parse read `empty`; an empty listing read `usable`; `form.2026111.idx` read as
-    /// 2026-11-01; a missing `last-modified` read as a default instant.
+    /// or a day with no `last-modified` or of another quarter, a failure. Mutations 2026-11-27, each
+    /// red here: a body that does not parse read `empty`; an empty listing read `usable`;
+    /// `form.2026111.idx` read as 2026-11-01; a missing `last-modified` read as a default instant.
     #[test]
     fn a_listing_that_is_no_listing_fails_and_one_naming_no_day_is_empty() {
         let read = [
@@ -515,9 +521,10 @@ mod tests {
             r#"{"directory": {"item": [{"name": "form.20261110.idx", "last-modified": "11/10/2026 10:01:42 PM"}]}}"#,
             r#"{"directory": {"item": [{"name": "form.2026111.idx", "last-modified": "11/01/2026 10:01:42 PM"}]}}"#,
             r#"{"directory": {"item": [{"name": "form.20261110.idx"}]}}"#,
+            r#"{"directory": {"item": [{"name": "form.20270102.idx", "last-modified": "01/02/2027 10:01:42 PM"}]}}"#,
         ]
         .map(|body| {
-            let (verdict, days) = listing_read(&answered(body));
+            let (verdict, days) = listing_read(&answered(body), Quarter::of(day("2026-11-10")));
             (verdict.name(), days.len())
         });
         assert_eq!(
@@ -527,6 +534,7 @@ mod tests {
                 ("permanent_failure", 0),
                 ("empty", 0),
                 ("usable", 1),
+                ("permanent_failure", 0),
                 ("permanent_failure", 0),
                 ("permanent_failure", 0)
             ]
