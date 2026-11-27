@@ -448,6 +448,33 @@ impl TransportError {
     }
 }
 
+/// The body an answer carried, as received, with the headers kept beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Received<'a> {
+    pub body: &'a [u8],
+    pub headers: &'a Headers,
+    /// True when the body was over `body_limit` and `body` holds its first `body_limit` bytes.
+    pub truncated: bool,
+}
+
+/// What a caller stores of an answer, whole or cut at the limit; `None` when it carried no body.
+/// The one rule for every caller that keeps answers (P10, architecture.md section 3.9).
+#[must_use]
+pub fn received(answer: &Result<RawResponse, TransportError>) -> Option<Received<'_>> {
+    match answer {
+        Ok(response) => Some(Received {
+            body: response.body(),
+            headers: response.headers(),
+            truncated: false,
+        }),
+        Err(failed) => failed.cut_body().map(|cut| Received {
+            body: cut,
+            headers: failed.headers(),
+            truncated: true,
+        }),
+    }
+}
+
 /// The one HTTP client.
 #[derive(Debug)]
 pub struct Wire {
@@ -1009,9 +1036,9 @@ struct Failed {
 #[cfg(test)]
 mod tests {
     use super::{
-        retry_after, Backoff, CappedHold, Credentials, DateTime, Headers, RawResponse, Reservation,
-        SendFailure, Slowed, Timeouts, TransportError, TransportKind, TransportProfile, Unreserved,
-        Utc, Wire, GATE_TRIES, USER_AGENT,
+        received, retry_after, Backoff, CappedHold, Credentials, DateTime, Headers, RawResponse,
+        Reservation, SendFailure, Slowed, Timeouts, TransportError, TransportKind,
+        TransportProfile, Unreserved, Utc, Wire, GATE_TRIES, USER_AGENT,
     };
     use crate::budget::{BudgetError, HostKey, RequestBudget};
     use crate::clock::testing::{StepClock, WaitRecorder, WaitedClock};
@@ -3844,6 +3871,33 @@ mod tests {
         assert_eq!(
             (past_it, at_it),
             (past(RESERVED_AT, false)?, Reservation::Go)
+        );
+        Ok(())
+    }
+
+    /// Mutation 2026-11-27, `truncated` false on the cut arm: red here.
+    #[test]
+    fn a_cut_body_is_received_truncated_and_a_failure_without_one_is_none() -> Checked {
+        let attempt = crate::ledger::AttemptId::recorded("a");
+        let at = at(RESERVED_AT);
+        let failed = || TransportError::new(attempt.clone(), at, at, "cut".to_owned());
+        let whole: Result<RawResponse, TransportError> = Ok(RawResponse::new(
+            attempt.clone(),
+            200,
+            b"whole".to_vec(),
+            at,
+            at,
+        ));
+        let cut = Err(failed().with_cut_body(b"cu".to_vec()));
+        let none = Err(failed());
+        let read = |answer| received(answer).map(|got| (got.body.to_vec(), got.truncated));
+        assert_eq!(
+            (read(&whole), read(&cut), read(&none)),
+            (
+                Some((b"whole".to_vec(), false)),
+                Some((b"cu".to_vec(), true)),
+                None
+            )
         );
         Ok(())
     }
