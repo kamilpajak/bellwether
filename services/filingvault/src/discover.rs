@@ -157,9 +157,9 @@ pub fn listing_read(answer: &Result<RawResponse, TransportError>) -> (Verdict, V
     }
 }
 
-/// An index's verdict and its rows of a listed form. A body that is no index, and a line of a
-/// listed form that is no whole filing (`sec_edgar::filing_of`), are permanent failures, never a
-/// quiet day or a dropped row.
+/// An index's verdict and its rows of a listed form. A body that is no index or holds no line,
+/// and a line of a listed form that is no whole filing (`sec_edgar::filing_of`), are permanent
+/// failures, never a quiet day or a dropped row.
 #[must_use]
 pub fn index_read(
     answer: &Result<RawResponse, TransportError>,
@@ -169,7 +169,7 @@ pub fn index_read(
         Ok(body) => body,
         Err(verdict) => return (verdict, Vec::new()),
     };
-    let Some(lines) = index_lines(&body) else {
+    let Some(lines) = index_lines(&body).filter(|lines| !lines.is_empty()) else {
         return (Verdict::PermanentFailure, Vec::new());
     };
     let mut listed = Vec::new();
@@ -396,12 +396,15 @@ mod tests {
         "10-K  ACME CORP  320193  20261110  edgar/data/320193/0000320193-26-000071.txt";
 
     /// Each listed row is a filing with every field read, or the day fails: never a made-up CIK,
-    /// a dropped row or a quiet day (review of 2026-11-27, finding F2). Mutation 2026-11-27, a
-    /// row whose path names no accession dropped: red.
+    /// a dropped row or a quiet day (review of 2026-11-27, findings F2 and EF3). Mutations
+    /// 2026-11-27, each red here: a row whose path names no accession dropped; an index of no line
+    /// after its separator read `empty`.
     #[test]
     fn a_listed_index_row_is_read_whole_or_the_day_fails() {
         let forms = ["10-K".to_owned(), "10-K/A".to_owned()];
         let cases = [
+            (HEAD.to_owned(), "permanent_failure", vec![]),
+            (format!("{HEAD}\n  \n"), "permanent_failure", vec![]),
             (
                 format!("{HEAD}{GOOD}\n8-K  X\n"),
                 "usable",

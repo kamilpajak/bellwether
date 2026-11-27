@@ -5490,6 +5490,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
   | situation | verdict | the register reads |
   |---|---|---|
   | the index lists no row of a listed form | `empty` | a day we asked and found nothing |
+  | the index holds no line at all after its separator | `permanent_failure`, the body kept; the day `failed` and asked again (review 2026-11-27, EF3: read `empty` before, the day `asked` and never asked again) | not inside `complete_from` |
   | the manifest answers 404, names another accession, or names no primary document | `permanent_failure` | `listed_not_held` |
   | a selected file answers 404 | `permanent_failure` | `listed_not_held` when it is the primary document |
   | 403 with `AccessDenied` | `permanent_failure` | the same |
