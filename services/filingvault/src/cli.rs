@@ -289,6 +289,37 @@ pub fn run(cli: Cli, argv: &[String], out: &mut dyn Write, err: &mut dyn Write) 
     exit
 }
 
+/// A refusal of the parser: help and the version are results on stdout, exit 0; anything else
+/// is `invalid_argument`, an object on stderr when argv asks for `--format json`, else clap's text.
+pub fn refused(why: &clap::Error, argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    use clap::error::ErrorKind;
+    let json = argv
+        .windows(2)
+        .any(|pair| pair[0] == "--format" && pair[1] == "json")
+        || argv.iter().any(|arg| arg == "--format=json");
+    let written = match why.kind() {
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+            return match write!(out, "{}", why.render()) {
+                Ok(()) => 0,
+                Err(_) => ErrorCode::IoFailed.exit(),
+            };
+        }
+        _ if json => writeln!(err, "{}", FilingsError::Usage(first_line(why)).object(argv)),
+        _ => write!(err, "{}", why.render()),
+    };
+    match written {
+        Ok(()) => ErrorCode::InvalidArgument.exit(),
+        Err(_) => ErrorCode::IoFailed.exit(),
+    }
+}
+
+/// clap's message without its `error: ` prefix and the usage lines after it.
+fn first_line(why: &clap::Error) -> String {
+    let text = why.to_string();
+    let line = text.lines().next().unwrap_or_default();
+    line.strip_prefix("error: ").unwrap_or(line).to_owned()
+}
+
 /// The human rendering of a result: its scalar fields one per line, then each list's length.
 fn render_human(value: &Value, out: &mut dyn Write) -> std::io::Result<()> {
     let Some(fields) = value.as_object() else {

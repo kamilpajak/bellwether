@@ -241,3 +241,33 @@ fn a_dry_run_refuses_a_spaced_form_and_a_fill_window_past_the_calendar() -> Test
     assert_eq!(refused, vec![expected.clone(), expected]);
     Ok(())
 }
+
+/// A refusal of the parser is the same object as any other under `--format json`, and help is
+/// still a result (review of 2026-11-27, F6). Before then clap wrote its own text, no `code`.
+#[test]
+fn a_parser_refusal_is_an_invalid_argument_object_and_help_is_a_result() -> TestResult {
+    let refused = filingvault(&[
+        "ledger", "check", "--at", "notadate", "--store", "s", "--rules", "r", "--format", "json",
+    ])?;
+    let help = filingvault(&["ledger", "check", "--help"])?;
+    let object: Value = serde_json::from_slice(&refused.stderr)?;
+    assert_eq!(
+        (
+            refused.status.code(),
+            refused.stdout.len(),
+            object["code"].clone(),
+            object["retryable"].clone(),
+            help.status.code(),
+            help.stdout.is_empty(),
+        ),
+        (
+            Some(2),
+            0,
+            serde_json::json!("invalid_argument"),
+            serde_json::json!(false),
+            Some(0),
+            false
+        )
+    );
+    Ok(())
+}
