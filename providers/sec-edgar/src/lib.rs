@@ -254,28 +254,85 @@ pub struct IndexRow {
 /// file in production for months by splitting from both ends, which also survives a width change.
 #[must_use]
 pub fn index_rows(payload: &str) -> Option<Vec<IndexRow>> {
+    Some(
+        index_lines(payload)?
+            .into_iter()
+            .filter_map(index_row)
+            .collect(),
+    )
+}
+
+/// The non-blank lines after a daily index's dashed separator, or `None` when there is none.
+#[must_use]
+pub fn index_lines(payload: &str) -> Option<Vec<&str>> {
     let separator_at = payload
         .lines()
         .position(|line| !line.trim().is_empty() && line.trim().chars().all(|c| c == DASH))?;
-    let rows = payload
-        .lines()
-        .skip(separator_at + 1)
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            // Form type, then a company name of unknown word count, then CIK, date and path.
-            let [form, .., cik, date, path] = fields.as_slice() else {
-                return None;
-            };
-            Some(IndexRow {
-                form: (*form).to_owned(),
-                cik: (*cik).to_owned(),
-                filed: (*date).to_owned(),
-                path: (*path).to_owned(),
-            })
-        })
-        .collect();
-    Some(rows)
+    Some(
+        payload
+            .lines()
+            .skip(separator_at + 1)
+            .filter(|line| !line.trim().is_empty())
+            .collect(),
+    )
+}
+
+/// One index line read from both ends: form type, then a company name of unknown word count,
+/// then CIK, date and path. `None` for a line of fewer than four fields.
+#[must_use]
+pub fn index_row(line: &str) -> Option<IndexRow> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let [form, .., cik, date, path] = fields.as_slice() else {
+        return None;
+    };
+    Some(IndexRow {
+        form: (*form).to_owned(),
+        cik: (*cik).to_owned(),
+        filed: (*date).to_owned(),
+        path: (*path).to_owned(),
+    })
+}
+
+/// A filing as an index row names it, every field checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Filing {
+    /// Decimal digits with no leading zero, so `0000320193` and `320193` are one filer.
+    pub cik: String,
+    pub accession: String,
+    pub filed: NaiveDate,
+}
+
+/// `##########-##-######`, the accession's digit groups.
+const ACCESSION_GROUPS: [usize; 3] = [10, 2, 6];
+/// `YYYYMMDD`: chrono's `%m` and `%d` also take one digit, so `2026111` parses as 2026-11-01.
+const INDEX_DATE_WIDTH: usize = 8;
+
+/// The filing a row names, or `None` unless the CIK is digits, the date is `YYYYMMDD` and the
+/// path is `edgar/data/<the same CIK>/<accession>.txt`: a cut or damaged line is never a filing.
+#[must_use]
+pub fn filing_of(row: &IndexRow) -> Option<Filing> {
+    let number = |text: &str| {
+        (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| text.parse::<u64>().ok())
+            .flatten()
+    };
+    let cik = number(&row.cik)?;
+    let ["edgar", "data", directory, file] = row.path.split('/').collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    let accession = file.strip_suffix(".txt")?;
+    let groups: Vec<&str> = accession.split('-').collect();
+    let shaped = groups.len() == ACCESSION_GROUPS.len()
+        && groups.iter().zip(ACCESSION_GROUPS).all(|(group, width)| {
+            group.len() == width && group.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    let dated = row.filed.len() == INDEX_DATE_WIDTH;
+    (shaped && dated && number(directory)? == cik).then_some(())?;
+    Some(Filing {
+        cik: cik.to_string(),
+        accession: accession.to_owned(),
+        filed: NaiveDate::parse_from_str(&row.filed, INDEX_DATE).ok()?,
+    })
 }
 
 /// A line of the form `<TAG>value`, which is how the filing header carries its acceptance instant.

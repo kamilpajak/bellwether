@@ -67,7 +67,7 @@ CREATE TABLE listings (
     cik       TEXT NOT NULL,
     accession TEXT NOT NULL,
     form      TEXT NOT NULL,
-    filed_day TEXT CHECK (filed_day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+    filed_day TEXT NOT NULL CHECK (filed_day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
     first_seq INTEGER NOT NULL REFERENCES attempts (seq),
     PRIMARY KEY (index_day, cik, accession)
 );
@@ -146,8 +146,8 @@ pub struct Listed {
     pub cik: String,
     pub accession: String,
     pub form: String,
-    /// `None` when the row's `Date Filed` is not a date.
-    pub filed_day: Option<NaiveDate>,
+    /// The row's own `Date Filed`.
+    pub filed_day: NaiveDate,
 }
 
 /// What the closing `Finalised` commits beside the attempt's outcome.
@@ -377,7 +377,7 @@ impl Writer {
                         row.cik,
                         row.accession,
                         row.form,
-                        row.filed_day.map(day_text),
+                        day_text(row.filed_day),
                     ],
                 )?;
             }

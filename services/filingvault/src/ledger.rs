@@ -41,7 +41,6 @@ struct Rows {
     listed: u32,
     by_form: BTreeMap<String, u32>,
     late: u32,
-    filed_unreadable: u32,
     listed_later: u32,
 }
 
@@ -115,7 +114,6 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
             "listed_rows": held.listed,
             "by_form": held.by_form,
             "late": held.late,
-            "filed_unreadable": held.filed_unreadable,
             "listed_later": held.listed_later,
         }));
     }
@@ -176,7 +174,7 @@ fn rows_by_day(
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
             ))
         })?
@@ -187,10 +185,8 @@ fn rows_by_day(
         let held = by_day.entry(day).or_default();
         held.listed += 1;
         *held.by_form.entry(form).or_default() += 1;
-        match filed.as_deref().map(store::day_of).transpose()? {
-            None => held.filed_unreadable += 1,
-            Some(filed) if filed != day => held.late += 1,
-            Some(_) => {}
+        if store::day_of(&filed)? != day {
+            held.late += 1;
         }
         if first_usable
             .get(&day)

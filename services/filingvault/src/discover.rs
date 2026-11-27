@@ -10,7 +10,7 @@ use news_provider::robots::Robots;
 use news_provider::{
     Provenance, RawResponse, Request, RequestPhase, SourceId, TargetWindow, TransportError, Verdict,
 };
-use sec_edgar::{accession_of, body_of_200, index_rows, listed_days, Quarter, HOST, INDEX_DATE};
+use sec_edgar::{body_of_200, filing_of, index_lines, index_row, listed_days, Quarter, HOST};
 
 use crate::error::FilingsError;
 use crate::store::{Ask, IndexAttempt, Kind, Listed};
@@ -154,8 +154,9 @@ pub fn listing_read(answer: &Result<RawResponse, TransportError>) -> (Verdict, V
     }
 }
 
-/// An index's verdict and its rows of a listed form. A body that is no index, and a listed row
-/// whose path names no accession, are permanent failures, never a quiet day or a dropped row.
+/// An index's verdict and its rows of a listed form. A body that is no index, and a line of a
+/// listed form that is no whole filing (`sec_edgar::filing_of`), are permanent failures, never a
+/// quiet day or a dropped row.
 #[must_use]
 pub fn index_read(
     answer: &Result<RawResponse, TransportError>,
@@ -165,19 +166,23 @@ pub fn index_read(
         Ok(body) => body,
         Err(verdict) => return (verdict, Vec::new()),
     };
-    let Some(rows) = index_rows(&body) else {
+    let Some(lines) = index_lines(&body) else {
         return (Verdict::PermanentFailure, Vec::new());
     };
     let mut listed = Vec::new();
-    for row in rows.into_iter().filter(|row| forms.contains(&row.form)) {
-        let Some(accession) = accession_of(&row.path) else {
+    for line in lines {
+        let form = line.split_whitespace().next().unwrap_or_default();
+        if !forms.iter().any(|listed_form| listed_form == form) {
+            continue;
+        }
+        let Some(filing) = index_row(line).as_ref().and_then(filing_of) else {
             return (Verdict::PermanentFailure, Vec::new());
         };
         listed.push(Listed {
-            filed_day: NaiveDate::parse_from_str(&row.filed, INDEX_DATE).ok(),
-            cik: row.cik,
-            accession,
-            form: row.form,
+            cik: filing.cik,
+            accession: filing.accession,
+            form: form.to_owned(),
+            filed_day: filing.filed,
         });
     }
     if listed.is_empty() {
@@ -366,6 +371,110 @@ mod tests {
                 ),
                 Err(crate::error::ErrorCode::InputUnparseable)
             )
+        );
+    }
+
+    fn answered(body: &str) -> Result<RawResponse, TransportError> {
+        let at = pit::ObservationTime::new(chrono::DateTime::UNIX_EPOCH);
+        let attempt = news_provider::AttemptId::recorded("a");
+        Ok(RawResponse::new(
+            attempt,
+            OK,
+            body.as_bytes().to_vec(),
+            at,
+            at,
+        ))
+    }
+
+    const HEAD: &str = "Form Type   Company Name   CIK   Date Filed  File Name\n-----------\n";
+    const GOOD: &str =
+        "10-K  ACME CORP  320193  20261110  edgar/data/320193/0000320193-26-000071.txt";
+
+    /// Each listed row is a filing with every field read, or the day fails: never a made-up CIK,
+    /// a dropped row or a quiet day (review of 2026-11-27, finding F2). Mutation 2026-11-27, a
+    /// row whose path names no accession dropped: red.
+    #[test]
+    fn a_listed_index_row_is_read_whole_or_the_day_fails() {
+        let forms = ["10-K".to_owned(), "10-K/A".to_owned()];
+        let cases = [
+            (
+                format!("{HEAD}{GOOD}\n8-K  X\n"),
+                "usable",
+                vec!["320193|0000320193-26-000071"],
+            ),
+            (
+                format!("{HEAD}{}", GOOD.replace("320193  ", "0000320193  ")),
+                "usable",
+                vec!["320193|0000320193-26-000071"],
+            ),
+            (
+                format!("{HEAD}8-K  ACME  1  20261110  edgar/data/1/0000000001-26-000001.txt\n"),
+                "empty",
+                vec![],
+            ),
+            (
+                format!("{HEAD}{GOOD}\n10-K BETA INC 1234\n"),
+                "permanent_failure",
+                vec![],
+            ),
+            (format!("{HEAD}10-K x y\n"), "permanent_failure", vec![]),
+            (
+                format!("{HEAD}{}", GOOD.replace("20261110", "2026111")),
+                "permanent_failure",
+                vec![],
+            ),
+            (
+                format!("{HEAD}{}", GOOD.replace("data/320193/", "data/320194/")),
+                "permanent_failure",
+                vec![],
+            ),
+            (
+                format!("{HEAD}{}", GOOD.replace("-26-000071.txt", "-26-71.txt")),
+                "permanent_failure",
+                vec![],
+            ),
+            (
+                format!("{HEAD}{}", GOOD.replace("0000320193-26-000071.txt", "")),
+                "permanent_failure",
+                vec![],
+            ),
+        ];
+        for (body, verdict, rows) in cases {
+            let (read, listed) = index_read(&answered(&body), &forms);
+            let listed: Vec<String> = listed
+                .iter()
+                .map(|row| format!("{}|{}", row.cik, row.accession))
+                .collect();
+            assert_eq!(
+                (read.name(), listed),
+                (verdict, rows.into_iter().map(str::to_owned).collect()),
+                "{body}"
+            );
+        }
+    }
+
+    /// A listing is a `directory.item` array; one naming no day is `empty`. Mutations 2026-11-27,
+    /// each red here: a body that does not parse read `empty`; an empty listing read `usable`.
+    #[test]
+    fn a_listing_that_is_no_listing_fails_and_one_naming_no_day_is_empty() {
+        let read = [
+            "{}",
+            "<html>",
+            r#"{"directory": {"item": []}}"#,
+            r#"{"directory": {"item": [{"name": "form.20261110.idx"}]}}"#,
+        ]
+        .map(|body| {
+            let (verdict, days) = listing_read(&answered(body));
+            (verdict.name(), days.len())
+        });
+        assert_eq!(
+            read,
+            [
+                ("permanent_failure", 0),
+                ("permanent_failure", 0),
+                ("empty", 0),
+                ("usable", 1)
+            ]
         );
     }
 }
