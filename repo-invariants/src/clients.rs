@@ -58,6 +58,14 @@ const ROW_FV1: &str = "docs/design/architecture.md section 8 row FV1";
 /// The members section 12.1 says hold no store, and the two crates a store is reached through.
 pub const STORE_FREE: [&str; 2] = ["news-provider", "sec-edgar"];
 const STORE_CRATES: [&str; 2] = ["rusqlite", STORE_CORE];
+/// Each context, and what it may not reach (architecture.md section 12.1, "Dependency rules").
+pub const CONTEXTS: [(&str, &[&str]); 2] = [
+    (
+        "filingvault",
+        &["newsvault", "edgar-press", "open-web-feed"],
+    ),
+    ("newsvault", &["filingvault", "filing-contract"]),
+];
 
 /// One declared edge from a workspace member to a client crate.
 #[derive(Debug, PartialEq, Eq)]
@@ -140,51 +148,74 @@ pub fn http_client_allowlist_failure(root_manifest: &Path) -> Option<String> {
     ))
 }
 
+/// Member name to the (name, is under `providers/`) of each dependency it declares, of any kind.
+type Edges = BTreeMap<String, Vec<(String, bool)>>;
+
+/// Every member's declared edges, read from `cargo metadata`.
+fn member_edges(root_manifest: &Path) -> Result<Edges, String> {
+    let json = cargo_metadata(root_manifest)?;
+    let meta: serde_json::Value = serde_json::from_slice(&json)
+        .map_err(|why| format!("`cargo metadata` printed something that is not JSON: {why}"))?;
+    let mut edges = Edges::new();
+    for package in array_at(&meta, "packages")? {
+        let member = string_at(package, "name")?;
+        let declared = edges.entry(member).or_default();
+        for dependency in array_at(package, "dependencies")? {
+            let from_providers = dependency
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|path| path.replace('\\', "/").contains(PROVIDER_DIR));
+            declared.push((string_at(dependency, "name")?, from_providers));
+        }
+    }
+    Ok(edges)
+}
+
+/// Breadth first from `start` over declared edges: each crate reached once, as (name, is under
+/// `providers/`, the member that declares the edge). Rows MG10 and FV1 walk the graph through it.
+fn reached_from(edges: &Edges, start: &str) -> Vec<(String, bool, String)> {
+    let mut seen = BTreeSet::from([start.to_owned()]);
+    let mut pending = VecDeque::from([start.to_owned()]);
+    let mut reached = Vec::new();
+    while let Some(via) = pending.pop_front() {
+        for (name, from_providers) in edges.get(&via).into_iter().flatten() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            reached.push((name.clone(), *from_providers, via.clone()));
+            pending.push_back(name.clone());
+        }
+    }
+    reached
+}
+
+/// How a reached crate is named: directly, or through the member that declares the edge.
+fn reach(subject: &str, name: &str, via: &str) -> String {
+    if via == subject {
+        format!("    * {subject} depends on `{name}`")
+    } else {
+        format!("    * {subject} reaches `{name}` through `{via}`")
+    }
+}
+
 /// Row MG10: `None` when the model's owner reaches no crate of the news side, directly or through
 /// another member, and no member declares a dependency on it. A manifest question, so a file read
 /// through `std::fs` passes it.
 pub fn model_owner_isolation_failure(root_manifest: &Path) -> Option<String> {
     let read = || -> Result<Vec<String>, String> {
-        let json = cargo_metadata(root_manifest)?;
-        let meta: serde_json::Value = serde_json::from_slice(&json)
-            .map_err(|why| format!("`cargo metadata` printed something that is not JSON: {why}"))?;
-        let mut problems = Vec::new();
-        // Member name to the (name, is under providers/) of each dependency it declares.
-        let mut declared: BTreeMap<String, Vec<(String, bool)>> = BTreeMap::new();
-        for package in array_at(&meta, "packages")? {
-            let member = string_at(package, "name")?;
-            for dependency in array_at(package, "dependencies")? {
-                let name = string_at(dependency, "name")?;
-                let from_providers = dependency
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|path| path.replace('\\', "/").contains(PROVIDER_DIR));
-                if name == MODEL_OWNER {
-                    problems.push(format!("    * {member} depends on `{MODEL_OWNER}`"));
-                }
+        let edges = member_edges(root_manifest)?;
+        let mut problems: Vec<String> = edges
+            .iter()
+            .flat_map(|(member, declared)| {
                 declared
-                    .entry(member.clone())
-                    .or_default()
-                    .push((name, from_providers));
-            }
-        }
-        // Breadth first from the owner over member-to-member edges; `via` is the member that
-        // declares the edge.
-        let mut seen = BTreeSet::from([MODEL_OWNER.to_owned()]);
-        let mut pending = VecDeque::from([MODEL_OWNER.to_owned()]);
-        while let Some(via) = pending.pop_front() {
-            for (name, from_providers) in declared.get(&via).into_iter().flatten() {
-                if !seen.insert(name.clone()) {
-                    continue;
-                }
-                if NEWS_SIDE.contains(&name.as_str()) || *from_providers {
-                    problems.push(if via == MODEL_OWNER {
-                        format!("    * {MODEL_OWNER} depends on `{name}`")
-                    } else {
-                        format!("    * {MODEL_OWNER} reaches `{name}` through `{via}`")
-                    });
-                }
-                pending.push_back(name.clone());
+                    .iter()
+                    .filter(|(name, _)| name == MODEL_OWNER)
+                    .map(move |_| format!("    * {member} depends on `{MODEL_OWNER}`"))
+            })
+            .collect();
+        for (name, from_providers, via) in reached_from(&edges, MODEL_OWNER) {
+            if NEWS_SIDE.contains(&name.as_str()) || from_providers {
+                problems.push(reach(MODEL_OWNER, &name, &via));
             }
         }
         problems.sort();
@@ -196,6 +227,38 @@ pub fn model_owner_isolation_failure(root_manifest: &Path) -> Option<String> {
         Ok(problems) => Some(format!(
             "The model's owner is not isolated ({ROW_MG10}):\n\n{}\n\n`{MODEL_OWNER}` reads news \
              only as a snapshot file, and nothing links the crate that spends money.\n",
+            problems.join("\n")
+        )),
+    }
+}
+
+/// Row FV1's context clause: `None` when each context is a member and reaches none of the
+/// crates it may not, directly or through another member, by an edge of any kind. A context that
+/// is no member is a failure, never a pass.
+pub fn context_isolation_failure(root_manifest: &Path) -> Option<String> {
+    let read = || -> Result<Vec<String>, String> {
+        let edges = member_edges(root_manifest)?;
+        let mut problems = Vec::new();
+        for (subject, forbidden) in CONTEXTS {
+            if !edges.contains_key(subject) {
+                return Err(format!("no workspace member is named `{subject}`"));
+            }
+            for (name, _, via) in reached_from(&edges, subject) {
+                if forbidden.contains(&name.as_str()) {
+                    problems.push(reach(subject, &name, &via));
+                }
+            }
+        }
+        problems.sort();
+        Ok(problems)
+    };
+    match read() {
+        Err(why) => Some(format!("{why}\n\nThe invariant is {ROW_FV1}.\n")),
+        Ok(problems) if problems.is_empty() => None,
+        Ok(problems) => Some(format!(
+            "A context reaches a sibling ({ROW_FV1}):\n\n{}\n\nThe shared mechanics are \
+             `vault-core`, `news-provider` and `sec-edgar`; a context links neither the other \
+             context nor its adapters.\n",
             problems.join("\n")
         )),
     }
@@ -311,7 +374,8 @@ mod tests {
         assert_eq!(CLIENT_ALLOWLIST, [MODEL_OWNER, SEAM]);
     }
 
-    /// Row MG10 over this workspace.
+    /// Row MG10 over this workspace. Re-run 2026-11-27 after the walk became [`reached_from`]:
+    /// the three manifest mutations of the test below, each red here.
     #[test]
     fn the_model_owner_depends_on_nothing_of_the_news_side_and_nothing_depends_on_it() {
         assert_eq!(model_owner_isolation_failure(&root_manifest()), None);
@@ -389,6 +453,58 @@ mod tests {
         let failure = model_owner_isolation_failure(&through.root_manifest()).unwrap_or_default();
         assert!(
             failure.contains("modelgate reaches `newsvault` through `between`"),
+            "{failure}"
+        );
+    }
+
+    /// Row FV1's context clause over this workspace. Mutations 2026-11-27, each red here:
+    /// `newsvault`, then `edgar-press`, added to `services/filingvault/Cargo.toml`;
+    /// `open-web-feed` added to its `[dev-dependencies]`; `filingvault` added to
+    /// `services/newsvault/Cargo.toml`; the first context named `filingvaults`.
+    #[test]
+    fn the_filings_context_and_the_news_context_reach_each_other_through_no_member() {
+        assert_eq!(context_isolation_failure(&root_manifest()), None);
+    }
+
+    /// The walk's control, on a tree of its own: a sibling reached through a third member is
+    /// named from either side. Mutation 2026-11-27, the walk reading direct edges only: red.
+    #[test]
+    fn a_sibling_reached_through_another_member_is_named_from_either_side() {
+        const THREE: &str = "[workspace]\nmembers = [\"services/filingvault\", \"services/newsvault\", \"between\"]\nresolver = \"2\"\n";
+        let tree = Tree::new(THREE)
+            .crate_at(
+                "services/filingvault",
+                &manifest(
+                    "filingvault",
+                    "\n[dependencies]\nbetween = { path = \"../../between\" }\n\n[lints]\nworkspace = true\n",
+                ),
+            )
+            .crate_at(
+                "between",
+                &manifest(
+                    "between",
+                    "\n[dependencies]\nnewsvault = { path = \"../services/newsvault\" }\n\n[lints]\nworkspace = true\n",
+                ),
+            )
+            .crate_at("services/newsvault", &manifest("newsvault", INHERITS));
+        let failure = context_isolation_failure(&tree.root_manifest()).unwrap_or_default();
+        assert!(
+            failure.contains("filingvault reaches `newsvault` through `between`"),
+            "{failure}"
+        );
+        let back = Tree::new(THREE)
+            .crate_at("services/filingvault", &manifest("filingvault", INHERITS))
+            .crate_at("between", &manifest("between", INHERITS))
+            .crate_at(
+                "services/newsvault",
+                &manifest(
+                    "newsvault",
+                    "\n[dev-dependencies]\nfilingvault = { path = \"../filingvault\" }\n\n[lints]\nworkspace = true\n",
+                ),
+            );
+        let failure = context_isolation_failure(&back.root_manifest()).unwrap_or_default();
+        assert!(
+            failure.contains("newsvault depends on `filingvault`"),
             "{failure}"
         );
     }
