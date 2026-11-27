@@ -5162,6 +5162,20 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
   - Rejected: oldest first. After one night the register would answer for mid-2025 and not for the most recent weeks.
   - Which quarter listings (built 2026-11-27): the current quarter, of the run's UTC date less one day, always; any other quarter of the fill window while the store holds no usable listing of it received more than 3 days after its last day (`QUARTER_SETTLE_DAYS`, not fitted).
     - Rejected: complete on a listing received the day after the last day, as built first. Symptom: an index SEC writes after the 06:10 UTC run on the next quarter's first day is never listed, asked or counted (review 2026-11-27, PIT-3, a stub run). The days a run plans come from this run's listings and, for a quarter not asked, from its newest stored one.
+    - How late after a quarter's end SEC still writes or rewrites that quarter's daily form indexes (review QS-3; live requests approved by the owner 2026-11-27). Registered 2026-11-27, before any request:
+
+      | registered 2026-11-27, before the run | value |
+      |---|---|
+      | quarters | the 8 most recent complete quarters before 2026 Q4: 2024 Q4, 2025 Q1, Q2, Q3, Q4, 2026 Q1, Q2, Q3 |
+      | requests | robots.txt of `www.sec.gov` once, then one GET of each quarter's `Archives/edgar/daily-index/<year>/QTR<n>/index.json`, oldest quarter first; strictly one at a time, at least 1 s apart; at most 10 in all |
+      | User-Agent | the contact, as `collect::wire_for` sends it under `sec_edgar::CONTACT_CREDENTIAL`; refused before any request unless `sec_edgar::contact_is_addressed` holds |
+      | stop | robots.txt answering other than 200, or disallowing `/Archives/edgar/daily-index/` to `*`; the first listing answering other than 200 after one retry 10 s later. Nothing is fetched after a stop, and the stop is the result |
+      | items read | every `directory.item` whose `name` is `form.<YYYYMMDD>.idx`; its `last-modified` read in `America/New_York` (the zone the 2026-11-13 run tested: listing and `Last-Modified` header 0 s apart on 2 files, `probes/observation_lag/PREREGISTRATION.md`). Items of another name are not read; a `form` item dated outside its quarter is counted and reported |
+      | per quarter, L_q | the latest `last-modified` among its `form.*.idx` items, less the end of the quarter's last calendar day in New York (00:00 of the next quarter's first day) |
+      | per file | its `last-modified` less the end of its own New York day; counted: files with a value above 0, and the largest value |
+      | decision rule | re-ask point = ceil(max over the 8 quarters of L_q, in days) + 1, with the value as it comes out; it is the construction `QUARTER_SETTLE_DAYS` lacks (QS-4) and the point of the one re-ask per past quarter (QS-1) |
+      | what it bounds | `last-modified` is the newest write, so L_q is an upper bound on the first write of the quarter's latest file; the rule errs toward asking later |
+      | not measured by it | a write after the run; a quarter before 2024 Q4; a row added to a file whose `last-modified` did not move |
   - The fill window until the budget exists (step 11): the rules file's `fill_days`, 456 (§12.9's 15 months), before the UTC date of the store's first collect run. Every listed day of it that is not `asked` or `truncated` is asked, newest first, until the deadline. Construction: about 314 index days and 6 listings once (§12.9), about 3 minutes at 500 ms.
   - A forward day: a listed day on or after the UTC date of the first collect run started by `--at`, whose date plus 3 days is before `--at`'s UTC date. No collect run by `--at`: no forward window, and `ledger check` exits 1.
     - Every calendar day of that window is also checked against the listings: one that is `unlisted` (the table above) counts in `forward_unlisted`, and `ledger check` exits 1 while there is one.
