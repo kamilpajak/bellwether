@@ -226,6 +226,16 @@ pub fn listed_days(bytes: &[u8]) -> Result<Vec<NaiveDate>, ListingUnparseable> {
         .collect())
 }
 
+/// [`listed_days`] with the empty fallback `edgar-press` reads a listing by: JSON with no
+/// `directory.item` array lists no day. Changing it changes an `edgar-press` verdict, which is the
+/// owner's decision (architecture.md section 12.6).
+pub fn listed_days_or_none(bytes: &[u8]) -> Result<Vec<NaiveDate>, ListingUnparseable> {
+    match listed_days(bytes) {
+        Err(_) if serde_json::from_slice::<serde_json::Value>(bytes).is_ok() => Ok(Vec::new()),
+        read => read,
+    }
+}
+
 fn day_of_index_name(name: &str) -> Option<NaiveDate> {
     let digits = name.strip_prefix("form.")?.strip_suffix(".idx")?;
     NaiveDate::parse_from_str(digits, INDEX_DATE).ok()
@@ -486,7 +496,8 @@ mod tests {
     }
 
     /// A body with no `directory.item` array is no listing; an empty array is a listing of no
-    /// day. Before 2026-11-27 `{}` read as no day, and filingvault held it as a complete quarter.
+    /// day. Before 2026-11-27 `{}` read as no day, and filingvault held it as a complete quarter;
+    /// `edgar-press`'s reading keeps that until the owner decides.
     #[test]
     fn a_body_with_no_item_array_is_unparseable_and_an_empty_one_lists_no_day() {
         let read = [
@@ -496,8 +507,16 @@ mod tests {
         ]
         .map(|body| listed_days(body).map_err(|_| "unparseable"));
         assert_eq!(
-            read,
-            [Err("unparseable"), Err("unparseable"), Ok(Vec::new())]
+            (
+                read,
+                listed_days_or_none(b"{}"),
+                listed_days_or_none(b"<html>").is_err()
+            ),
+            (
+                [Err("unparseable"), Err("unparseable"), Ok(Vec::new())],
+                Ok(Vec::new()),
+                true
+            )
         );
     }
 }

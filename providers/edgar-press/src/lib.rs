@@ -25,7 +25,7 @@ use pit::datedness::{archive_observation, Published};
 use pit::{MeasuredLag, ObservationTime, PitError, ValidTime};
 use sec_edgar::{
     acceptance_instant, accession_of, archive_url, body_of_200, contact_is_addressed, index_rows,
-    index_url, labelled, listed_days, tagged, Caller, IndexRow, ListingUnparseable,
+    index_url, labelled, listed_days_or_none, tagged, Caller, IndexRow, ListingUnparseable,
     CONTACT_CREDENTIAL, DATE_FILED, HEADER_END, INDEX_DATE,
 };
 
@@ -527,7 +527,7 @@ impl Provider for EdgarPress {
 
 /// The quarter's listing, read into the seam's [`Listing`].
 pub fn read_listing(bytes: &[u8]) -> Result<Listing, Refusal> {
-    Ok(Listing::of_days(&listed_days(bytes)?))
+    Ok(Listing::of_days(&listed_days_or_none(bytes)?))
 }
 
 impl From<ListingUnparseable> for Refusal {
