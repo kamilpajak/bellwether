@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Months, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use news_provider::request::HeaderValue;
 use news_provider::wire::{RawResponse, Timeouts, TransportError, TransportKind, TransportProfile};
@@ -45,6 +45,14 @@ const DASH: char = '-';
 pub const DATE_FILED: &str = COLUMNS[3];
 /// `Date Filed` and the index file name both read `YYYYMMDD`, measured on the real file 2026-11-13.
 pub const INDEX_DATE: &str = "%Y%m%d";
+/// The index header naming the day the index holds; the real file spells `Nov 10, 2026`, the
+/// `edgar-press` fixture `November 10, 2026`.
+const LAST_DATA_RECEIVED: &str = "Last Data Received";
+/// chrono 0.4 parses `Nov` and `November` both under `%B` (review SE8b, 2026-11-27).
+const MONTH_DAY: &str = "%B %d, %Y";
+/// A listing item's `last-modified`: `11/10/2026 10:01:42 PM`, in [`LISTING_ZONE`].
+const LISTING_WRITTEN: &str = "%m/%d/%Y %I:%M:%S %p";
+const LISTING_ZONE: &str = "America/New_York";
 const ACCESS_DENIED: &str = "<Code>AccessDenied</Code>";
 const REQUEST_TIMEOUT: u16 = 408;
 const TOO_MANY_REQUESTS: u16 = 429;
@@ -60,6 +68,9 @@ const VENDOR_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 /// still span SEC's 1 s for 10 requests per IP (predecessor table, read 2026-11-13). The spread
 /// and what no margin covers: architecture.md section 12.6, the row on SEC's interval.
 const SEC_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(110);
+/// 500 ms, owner decision 2026-11-24: 2 requests a second, 20% of SEC's stated 10, for the one
+/// caller whose nightly run asks thousands (architecture.md section 12.2).
+const FILINGS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Who asks `www.sec.gov`. SEC counts every caller against one address, so how the ceiling is
 /// split between them is one table, [`Caller::interval`].
@@ -69,6 +80,8 @@ pub enum Caller {
     EdgarPress,
     /// `newsvault roster fetch` (architecture.md section 10, the roster).
     Roster,
+    /// `filingvault filings collect` (architecture.md section 12.2).
+    Filings,
 }
 
 impl Caller {
@@ -78,6 +91,7 @@ impl Caller {
         match self {
             Self::EdgarPress => SEC_MIN_INTERVAL,
             Self::Roster => SEC_MIN_INTERVAL,
+            Self::Filings => FILINGS_INTERVAL,
         }
     }
 }
@@ -120,13 +134,56 @@ pub fn contact_is_addressed(contact: &str) -> bool {
     })
 }
 
+/// A calendar quarter, which is how SEC files its daily indexes: one directory each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Quarter {
+    year: i32,
+    number: u32,
+}
+
+const MONTHS_A_QUARTER: u32 = 3;
+
+impl Quarter {
+    #[must_use]
+    pub fn of(day: NaiveDate) -> Self {
+        Self {
+            year: day.year(),
+            number: (day.month() - 1) / MONTHS_A_QUARTER + 1,
+        }
+    }
+
+    #[must_use]
+    pub fn first_day(self) -> NaiveDate {
+        NaiveDate::from_ymd_opt(self.year, (self.number - 1) * MONTHS_A_QUARTER + 1, 1)
+            .unwrap_or(NaiveDate::MIN)
+    }
+
+    #[must_use]
+    pub fn last_day(self) -> NaiveDate {
+        self.first_day()
+            .checked_add_months(Months::new(MONTHS_A_QUARTER))
+            .and_then(|next| next.pred_opt())
+            .unwrap_or(NaiveDate::MAX)
+    }
+
+    #[must_use]
+    pub fn previous(self) -> Self {
+        Self::of(self.first_day().pred_opt().unwrap_or(NaiveDate::MIN))
+    }
+
+    /// The directory's own name below `daily-index/`: `2026/QTR4`.
+    #[must_use]
+    pub fn label(self) -> String {
+        format!("{}/QTR{}", self.year, self.number)
+    }
+}
+
 /// The quarter listing's url for a day: the directory that names each daily index it holds.
 #[must_use]
 pub fn listing_url(day: NaiveDate) -> String {
     format!(
-        "https://{HOST}{ARCHIVES}{DAILY_INDEX}/{}/QTR{}/index.json",
-        day.format("%Y"),
-        quarter(day)
+        "https://{HOST}{ARCHIVES}{DAILY_INDEX}/{}/index.json",
+        Quarter::of(day).label()
     )
 }
 
@@ -134,9 +191,8 @@ pub fn listing_url(day: NaiveDate) -> String {
 #[must_use]
 pub fn index_url(day: NaiveDate) -> String {
     format!(
-        "https://{HOST}{ARCHIVES}{DAILY_INDEX}/{}/QTR{}/form.{}.idx",
-        day.format("%Y"),
-        quarter(day),
+        "https://{HOST}{ARCHIVES}{DAILY_INDEX}/{}/form.{}.idx",
+        Quarter::of(day).label(),
         day.format(INDEX_DATE)
     )
 }
@@ -145,10 +201,6 @@ pub fn index_url(day: NaiveDate) -> String {
 #[must_use]
 pub fn archive_url(path: &str) -> String {
     format!("https://{HOST}{ARCHIVES}{path}")
-}
-
-fn quarter(day: NaiveDate) -> u32 {
-    (chrono::Datelike::month(&day) - 1) / 3 + 1
 }
 
 /// The accession an EDGAR document url ends in:
@@ -168,25 +220,84 @@ pub fn accession_of(url: &str) -> Option<String> {
 pub struct ListingUnparseable(pub String);
 
 /// The days a quarter's listing holds a form index for. Only `form.<date>.idx` names count: a
-/// quarter directory also holds `company.`, `master.` and `index.json` itself.
+/// quarter directory also holds `company.`, `master.` and `index.json` itself. A body with no
+/// `directory.item` array, or a `form.*.idx` name that is no `YYYYMMDD` day, is refused, never
+/// read as a listing of no day or of another day.
 pub fn listed_days(bytes: &[u8]) -> Result<Vec<NaiveDate>, ListingUnparseable> {
+    Ok(listed_items(bytes)?
+        .into_iter()
+        .map(|(day, _)| day)
+        .collect())
+}
+
+/// [`listed_days`], each day with the instant its index was last written: the item's
+/// `last-modified`, New York local time, 0 s from the file's own `Last-Modified` on the 2 days
+/// read (`probes/observation_lag/PREREGISTRATION.md`, 2026-11-13). An item of a day with no such
+/// value refuses the listing: 29 of 29 of 2026 Q4 and 496 of 496 of 2024 Q4 to 2026 Q3 carry one.
+pub fn listed_writes(bytes: &[u8]) -> Result<Vec<(NaiveDate, DateTime<Utc>)>, ListingUnparseable> {
+    listed_items(bytes)?
+        .into_iter()
+        .map(|(day, item)| {
+            item["last-modified"]
+                .as_str()
+                .and_then(|raw| acceptance_instant(raw, LISTING_WRITTEN, LISTING_ZONE))
+                .map(|written| (day, written))
+                .ok_or_else(|| {
+                    ListingUnparseable(format!("the item of {day} has no last-modified"))
+                })
+        })
+        .collect()
+}
+
+/// The `form.*.idx` items of a listing with their days.
+fn listed_items(bytes: &[u8]) -> Result<Vec<(NaiveDate, serde_json::Value)>, ListingUnparseable> {
     let read: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|why| ListingUnparseable(why.to_string()))?;
-    let days: Vec<NaiveDate> = read["directory"]["item"]
+    let items = read["directory"]["item"]
         .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| day_of_index_name(item["name"].as_str()?))
-                .collect()
-        })
-        .unwrap_or_default();
+        .ok_or_else(|| ListingUnparseable("no `directory.item` array".to_owned()))?;
+    let mut days = Vec::new();
+    for item in items {
+        let Some(name) = item["name"].as_str() else {
+            continue;
+        };
+        if let Some(day) = day_of_index_name(name)? {
+            days.push((day, item.clone()));
+        }
+    }
     Ok(days)
 }
 
-fn day_of_index_name(name: &str) -> Option<NaiveDate> {
-    let digits = name.strip_prefix("form.")?.strip_suffix(".idx")?;
-    NaiveDate::parse_from_str(digits, INDEX_DATE).ok()
+/// An HTTP date, as SEC's `Last-Modified` header carries one: `Wed, 11 Nov 2026 03:01:42 GMT`.
+#[must_use]
+pub fn http_date(text: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc2822(text.trim())
+        .ok()
+        .map(|at| at.with_timezone(&Utc))
+}
+
+/// `None` for a name of another file; a `form.*.idx` name must hold [`INDEX_DATE_WIDTH`] digits.
+fn day_of_index_name(name: &str) -> Result<Option<NaiveDate>, ListingUnparseable> {
+    let Some(digits) = name
+        .strip_prefix("form.")
+        .and_then(|rest| rest.strip_suffix(".idx"))
+    else {
+        return Ok(None);
+    };
+    let shaped = digits.len() == INDEX_DATE_WIDTH && digits.bytes().all(|b| b.is_ascii_digit());
+    shaped
+        .then(|| NaiveDate::parse_from_str(digits, INDEX_DATE).ok())
+        .flatten()
+        .map(Some)
+        .ok_or_else(|| ListingUnparseable(format!("{name:?} names no YYYYMMDD day")))
+}
+
+/// The day a daily index's `Last Data Received:` header names, `Nov 10, 2026` or
+/// `November 10, 2026`; `None` when the payload carries no such line or another shape.
+#[must_use]
+pub fn last_data_received(payload: &str) -> Option<NaiveDate> {
+    let value = labelled(payload, LAST_DATA_RECEIVED)?;
+    NaiveDate::parse_from_str(&value, MONTH_DAY).ok()
 }
 
 /// One row of a daily index.
@@ -212,28 +323,85 @@ pub struct IndexRow {
 /// file in production for months by splitting from both ends, which also survives a width change.
 #[must_use]
 pub fn index_rows(payload: &str) -> Option<Vec<IndexRow>> {
+    Some(
+        index_lines(payload)?
+            .into_iter()
+            .filter_map(index_row)
+            .collect(),
+    )
+}
+
+/// The non-blank lines after a daily index's dashed separator, or `None` when there is none.
+#[must_use]
+pub fn index_lines(payload: &str) -> Option<Vec<&str>> {
     let separator_at = payload
         .lines()
         .position(|line| !line.trim().is_empty() && line.trim().chars().all(|c| c == DASH))?;
-    let rows = payload
-        .lines()
-        .skip(separator_at + 1)
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            // Form type, then a company name of unknown word count, then CIK, date and path.
-            let [form, .., cik, date, path] = fields.as_slice() else {
-                return None;
-            };
-            Some(IndexRow {
-                form: (*form).to_owned(),
-                cik: (*cik).to_owned(),
-                filed: (*date).to_owned(),
-                path: (*path).to_owned(),
-            })
-        })
-        .collect();
-    Some(rows)
+    Some(
+        payload
+            .lines()
+            .skip(separator_at + 1)
+            .filter(|line| !line.trim().is_empty())
+            .collect(),
+    )
+}
+
+/// One index line read from both ends: form type, then a company name of unknown word count,
+/// then CIK, date and path. `None` for a line of fewer than four fields.
+#[must_use]
+pub fn index_row(line: &str) -> Option<IndexRow> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let [form, .., cik, date, path] = fields.as_slice() else {
+        return None;
+    };
+    Some(IndexRow {
+        form: (*form).to_owned(),
+        cik: (*cik).to_owned(),
+        filed: (*date).to_owned(),
+        path: (*path).to_owned(),
+    })
+}
+
+/// A filing as an index row names it, every field checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Filing {
+    /// Decimal digits with no leading zero, so `0000320193` and `320193` are one filer.
+    pub cik: String,
+    pub accession: String,
+    pub filed: NaiveDate,
+}
+
+/// `##########-##-######`, the accession's digit groups.
+const ACCESSION_GROUPS: [usize; 3] = [10, 2, 6];
+/// `YYYYMMDD`: chrono's `%m` and `%d` also take one digit, so `2026111` parses as 2026-11-01.
+const INDEX_DATE_WIDTH: usize = 8;
+
+/// The filing a row names, or `None` unless the CIK is digits, the date is `YYYYMMDD` and the
+/// path is `edgar/data/<the same CIK>/<accession>.txt`: a cut or damaged line is never a filing.
+#[must_use]
+pub fn filing_of(row: &IndexRow) -> Option<Filing> {
+    let number = |text: &str| {
+        (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| text.parse::<u64>().ok())
+            .flatten()
+    };
+    let cik = number(&row.cik)?;
+    let ["edgar", "data", directory, file] = row.path.split('/').collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    let accession = file.strip_suffix(".txt")?;
+    let groups: Vec<&str> = accession.split('-').collect();
+    let shaped = groups.len() == ACCESSION_GROUPS.len()
+        && groups.iter().zip(ACCESSION_GROUPS).all(|(group, width)| {
+            group.len() == width && group.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    let dated = row.filed.len() == INDEX_DATE_WIDTH;
+    (shaped && dated && number(directory)? == cik).then_some(())?;
+    Some(Filing {
+        cik: cik.to_string(),
+        accession: accession.to_owned(),
+        filed: NaiveDate::parse_from_str(&row.filed, INDEX_DATE).ok()?,
+    })
 }
 
 /// A line of the form `<TAG>value`, which is how the filing header carries its acceptance instant.
@@ -318,6 +486,45 @@ mod tests {
         }
     }
 
+    /// Mutations 2026-11-27, each red here: `last_day` one day short; `previous` returning the
+    /// quarter itself.
+    #[test]
+    fn a_quarter_spans_its_three_months_and_the_previous_one_crosses_a_year() {
+        let first = Quarter::of(day("2026-01-15").unwrap_or_default());
+        assert_eq!(
+            (
+                first.label(),
+                Some(first.first_day()),
+                Some(first.last_day()),
+                first.previous().label(),
+                Some(first.previous().last_day()),
+            ),
+            (
+                "2026/QTR1".to_owned(),
+                day("2026-01-01"),
+                day("2026-03-31"),
+                "2025/QTR4".to_owned(),
+                day("2025-12-31"),
+            )
+        );
+    }
+
+    /// Section 12.2's split of SEC's ceiling: the filings row is 500 ms per IP and per host, the
+    /// other two 110 ms. Mutation 2026-11-27, `Caller::Filings` at `SEC_MIN_INTERVAL`: red here.
+    #[test]
+    fn the_filings_caller_paces_our_address_and_the_host_at_500_ms() {
+        let paced = |caller| {
+            let budget = transport(caller, 1).budget;
+            (budget.min_interval, budget.per_host)
+        };
+        let filings = Some(std::time::Duration::from_millis(500));
+        let others = Some(std::time::Duration::from_millis(110));
+        assert_eq!(
+            [Caller::Filings, Caller::Roster, Caller::EdgarPress].map(paced),
+            [(filings, filings), (others, others), (others, others)]
+        );
+    }
+
     /// Mutation 2026-11-25, an address needing a local part OR a dotted domain: red here, and
     /// 0 red of 637 before this test.
     #[test]
@@ -344,6 +551,78 @@ mod tests {
         assert_eq!(
             listed_days(listing),
             Ok(vec![day("2026-11-12")].into_iter().flatten().collect())
+        );
+    }
+
+    /// A `form.*.idx` name whose date is not eight digits of a real day refuses the listing:
+    /// chrono reads `2026111` as 2026-11-01 (review of 2026-11-27). Mutations 2026-11-27, the
+    /// width check dropped; the digit check dropped (`2026 111` read as a day): red here.
+    #[test]
+    fn a_form_index_name_that_is_no_yyyymmdd_day_refuses_the_listing() {
+        let named = |name: &str| {
+            let body = format!(r#"{{"directory": {{"item": [{{"name": "{name}"}}]}}}}"#);
+            listed_days(body.as_bytes()).map_err(|_| "unparseable")
+        };
+        assert_eq!(
+            [
+                "form.2026111.idx",
+                "form.2026XX12.idx",
+                "form.2026 111.idx",
+                "form.20261131.idx",
+                "form.20261112.idx"
+            ]
+            .map(named),
+            [
+                Err("unparseable"),
+                Err("unparseable"),
+                Err("unparseable"),
+                Err("unparseable"),
+                Ok(vec![day("2026-11-12")].into_iter().flatten().collect())
+            ]
+        );
+    }
+
+    /// Both spellings of `Last Data Received`; no header is `None`. Mutation 2026-11-27, `%b` for
+    /// `%B`: red here.
+    #[test]
+    fn last_data_received_reads_both_spellings_of_the_month() {
+        let read = [
+            "Description: x\nLast Data Received:    Nov 10, 2026\n",
+            "Last Data Received:    November 10, 2026\n",
+            "Description: x\n",
+            "Last Data Received:    10 Nov 2026\n",
+        ]
+        .map(last_data_received);
+        assert_eq!(read, [day("2026-11-10"), day("2026-11-10"), None, None]);
+    }
+
+    /// A listing item's `last-modified` is New York time: `form.20261110.idx`'s reads the instant
+    /// its `Last-Modified` header carried, 0 s apart, as measured 2026-11-13
+    /// (`probes/observation_lag/PREREGISTRATION.md`). Mutation 2026-11-27, the zone UTC: red here.
+    #[test]
+    fn a_listed_write_is_new_york_time_and_equals_the_files_last_modified() {
+        let listing = br#"{"directory": {"item": [
+            {"name": "form.20261110.idx", "last-modified": "11/10/2026 10:01:42 PM"}]}}"#;
+        let header = http_date("Wed, 11 Nov 2026 03:01:42 GMT");
+        assert_eq!(
+            listed_writes(listing).map(|writes| writes.first().map(|(_, at)| *at)),
+            Ok(header)
+        );
+    }
+
+    /// A body with no `directory.item` array is no listing; an empty array is a listing of no
+    /// day. Before 2026-11-27 `{}` read as no day, and filingvault held it as a complete quarter.
+    #[test]
+    fn a_body_with_no_item_array_is_unparseable_and_an_empty_one_lists_no_day() {
+        let read = [
+            &b"{}"[..],
+            br#"{"directory": {"item": {}}}"#,
+            br#"{"directory": {"item": []}}"#,
+        ]
+        .map(|body| listed_days(body).map_err(|_| "unparseable"));
+        assert_eq!(
+            read,
+            [Err("unparseable"), Err("unparseable"), Ok(Vec::new())]
         );
     }
 }

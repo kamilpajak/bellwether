@@ -1630,20 +1630,16 @@ impl Payload {
         answer: &Result<RawResponse, TransportError>,
         put: impl FnOnce(&[u8]) -> Result<String, E>,
     ) -> Result<Option<Self>, E> {
-        let (body, headers, truncated) = match answer {
-            Ok(response) => (response.body(), response.headers(), false),
-            Err(failed) => match failed.cut_body() {
-                Some(cut) => (cut, failed.headers(), true),
-                None => return Ok(None),
-            },
+        let Some(got) = crate::wire::received(answer) else {
+            return Ok(None);
         };
         Ok(Some(Self {
-            raw_blob: put(body)?,
+            raw_blob: put(got.body)?,
             url: request.url.clone(),
             phase: request.phase,
             listed_date: request.listed_date.clone(),
-            headers: headers.clone(),
-            truncated,
+            headers: got.headers.clone(),
+            truncated: got.truncated,
         }))
     }
 }

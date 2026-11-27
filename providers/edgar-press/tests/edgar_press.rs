@@ -1227,14 +1227,17 @@ fn the_quarter_listing_names_only_the_days_its_form_index_files_name() -> Outcom
 
 /// The seam of section 12.8 step 6: `sec_edgar::ListingUnparseable` reaches a run as this
 /// adapter's refusal, its reason kept. Before this test the listing read as empty and the reason
-/// dropped were each 0 red of 1,307 (2026-11-25).
+/// dropped were each 0 red of 1,307 (2026-11-25). JSON with no `directory.item` array is refused
+/// too (owner decision 2026-11-27): the empty fallback restored, red here.
 #[test]
 fn a_quarter_listing_that_is_no_directory_listing_is_refused_with_its_reason() {
-    let refused = read_listing(NOT_A_LISTING).err();
-    assert!(
-        matches!(&refused, Some(Refusal::ListingUnparseable(why)) if !why.is_empty()),
-        "{refused:?}"
-    );
+    for body in [NOT_A_LISTING, b"{}"] {
+        let refused = read_listing(body).err();
+        assert!(
+            matches!(&refused, Some(Refusal::ListingUnparseable(why)) if !why.is_empty()),
+            "{refused:?}"
+        );
+    }
     let shared = sec_edgar::ListingUnparseable("why".to_owned());
     assert_eq!(shared.to_string(), Refusal::from(shared).to_string());
 }

@@ -75,8 +75,9 @@ pub use request::{
     TargetWindow,
 };
 pub use wire::{
-    CappedHold, Credentials, Headers, RawResponse, Reservation, SendFailure, Slowed, Timeouts,
-    TransportError, TransportKind, TransportProfile, Unreserved, Wire, HOLD_CEILING,
+    received, CappedHold, Credentials, Headers, RawResponse, Received, Reservation, SendFailure,
+    Slowed, Timeouts, TransportError, TransportKind, TransportProfile, Unreserved, Wire,
+    HOLD_CEILING, LOOPBACK_ONLY_REFUSAL,
 };
 
 #[cfg(test)]

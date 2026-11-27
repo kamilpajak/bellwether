@@ -196,8 +196,11 @@ mod tests {
     use crate::tests::{manifest, root_manifest, Tree, INHERITS};
 
     const MAIN: &str = "services/newsvault/src/main.rs";
-    /// The module whose private field only `clap` fills.
-    const OPTION_MODULE: &str = "services/newsvault/src/pace_option.rs";
+    /// The modules whose private field only `clap` fills, one per context.
+    const OPTION_MODULES: [&str; 2] = [
+        "services/filingvault/src/pace_option.rs",
+        "services/newsvault/src/pace_option.rs",
+    ];
     const ONE_SERVICE: &str = "[workspace]\nmembers = [\"services/newsvault\"]\nresolver = \"2\"\n";
 
     fn here() -> (std::path::PathBuf, Vec<Member>) {
@@ -220,14 +223,16 @@ mod tests {
         )
     }
 
-    /// One file per entry of `SENDING_COMMANDS`: a `Wire` built anywhere else is red here until
-    /// its command is named and its unit mounts the pace root.
+    /// One file per sending command: the three of `SENDING_COMMANDS` and `filings collect`,
+    /// whose unit arrives in step 17 (architecture.md section 12.8). A `Wire` built anywhere
+    /// else is red here. Mutation 2026-11-27, a second `Wire::new(` in `filingvault`: red.
     #[test]
-    fn a_service_builds_a_wire_in_exactly_the_three_sending_commands() {
+    fn a_service_builds_a_wire_in_exactly_the_sending_commands_of_both_contexts() {
         let (root, members) = here();
         assert_eq!(
             wire_sites(&root, &members).unwrap(),
             vec![
+                "services/filingvault/src/collect.rs",
                 "services/newsvault/src/cmd_collect.rs",
                 "services/newsvault/src/cmd_robots.rs",
                 "services/newsvault/src/cmd_roster.rs"
@@ -236,13 +241,17 @@ mod tests {
     }
 
     /// `Wire::new` takes a `PaceRoot` and `PaceRoot::resolve` is its only constructor, so this
-    /// is every pace root a service can hand a `Wire`.
+    /// is every pace root a service can hand a `Wire`. Mutation 2026-11-27,
+    /// `PaceRoot::resolve(None, store)` in `filingvault`'s option module: red.
     #[test]
     fn every_pace_root_a_service_resolves_comes_from_the_option() {
         let (root, members) = here();
         assert_eq!(
             resolved_roots(&root, &members).unwrap(),
-            (vec![OPTION_MODULE.to_owned()], Vec::<String>::new())
+            (
+                OPTION_MODULES.map(str::to_owned).to_vec(),
+                Vec::<String>::new()
+            )
         );
     }
 

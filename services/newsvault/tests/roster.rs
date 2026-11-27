@@ -28,6 +28,16 @@ mod loopback;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+/// Row N1: the binary every test spawns refuses any host but the loopback, SEC's included. Only
+/// the guard holds the text.
+#[test]
+fn the_binary_the_tests_spawn_sends_to_loopback_only() -> TestResult {
+    let binary = std::fs::read(env!("CARGO_BIN_EXE_newsvault"))?;
+    let guard = news_provider::LOOPBACK_ONLY_REFUSAL.as_bytes();
+    assert!(binary.windows(guard.len()).any(|bytes| bytes == guard));
+    Ok(())
+}
+
 const CONTACT: &str = "bellwether collector contact@example.test";
 const ROBOTS_URL: &str = "https://www.sec.gov/robots.txt";
 const FILE_URL: &str = "https://www.sec.gov/files/company_tickers_exchange.json";

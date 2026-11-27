@@ -1,0 +1,28 @@
+[package]
+name = "filingvault"
+version = "0.1.0"
+edition = "2021"
+description = "The filings context: which annual reports SEC lists per index day, with a ledger row for every call."
+publish = false
+
+# No HTTP client (architecture.md section 8 row R4) and no sibling context: section 8 row FV1.
+[dependencies]
+canon = { path = "../../canon" }
+chrono = "0.4.45"
+clap = { version = "4.6.7", features = ["derive"] }
+news-provider = { path = "../../news-provider" }
+pit = { path = "../../pit" }
+# As `newsvault` declares it: the system library, opened only through `vault-core` (row T1).
+rusqlite = { version = "0.42.0", features = ["backup"] }
+sec-edgar = { path = "../../providers/sec-edgar" }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+vault-core = { path = "../../vault-core" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+# Every test, and the binary the tests spawn, sends to loopback only: section 8 row N1.
+news-provider = { path = "../../news-provider", features = ["loopback-only"] }

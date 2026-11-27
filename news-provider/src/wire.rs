@@ -188,6 +188,15 @@ const GZIP: &str = "gzip";
 /// `TooManyRedirects` only above 0 (`config.rs`); its default, 10, sends each hop unpaced and
 /// unledgered (architecture.md section 8 row R19).
 const MAX_REDIRECTS: u32 = 0;
+/// The `detail` of a send a test build refused before the socket, because its url names a host
+/// that is not the loopback (architecture.md section 8 row N1). Only a test build holds the text.
+pub const LOOPBACK_ONLY_REFUSAL: &str =
+    "refused before the socket: a test build sends to loopback only";
+#[cfg(any(test, feature = "loopback-only"))]
+const LOCALHOST_NAME: &str = "localhost";
+/// The first part of a dotted IPv4 host in `127.0.0.0/8`, written in decimal.
+#[cfg(any(test, feature = "loopback-only"))]
+const LOOPBACK_FIRST_PART: &str = "127";
 
 /// The [`KEPT_HEADERS`] of one answer, as `(name, value)` pairs in the order `http` 1.x's
 /// `HeaderMap` yields them: names by first appearance, each name's values in the order received.
@@ -445,6 +454,33 @@ impl TransportError {
     #[must_use]
     pub const fn clock_nonmonotonic(&self) -> bool {
         self.clock_nonmonotonic
+    }
+}
+
+/// The body an answer carried, as received, with the headers kept beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Received<'a> {
+    pub body: &'a [u8],
+    pub headers: &'a Headers,
+    /// True when the body was over `body_limit` and `body` holds its first `body_limit` bytes.
+    pub truncated: bool,
+}
+
+/// What a caller stores of an answer, whole or cut at the limit; `None` when it carried no body.
+/// The one rule for every caller that keeps answers (P10, architecture.md section 3.9).
+#[must_use]
+pub fn received(answer: &Result<RawResponse, TransportError>) -> Option<Received<'_>> {
+    match answer {
+        Ok(response) => Some(Received {
+            body: response.body(),
+            headers: response.headers(),
+            truncated: false,
+        }),
+        Err(failed) => failed.cut_body().map(|cut| Received {
+            body: cut,
+            headers: failed.headers(),
+            truncated: true,
+        }),
     }
 }
 
@@ -881,6 +917,16 @@ impl Wire {
         url: &str,
         headers: &[(String, String)],
     ) -> Result<(u16, Headers, Vec<u8>), Failed> {
+        #[cfg(any(test, feature = "loopback-only"))]
+        if let Some(host) = beyond_loopback(url) {
+            return Err(Failed {
+                kind: TransportKind::Conversation,
+                status: None,
+                headers: Headers::default(),
+                cut: None,
+                detail: format!("{LOOPBACK_ONLY_REFUSAL}: {host}"),
+            });
+        }
         let mut call = self.agent.get(url);
         for (name, value) in headers {
             call = call.header(name, value);
@@ -927,6 +973,39 @@ impl Wire {
             }),
         }
     }
+}
+
+/// The host of `url` unless it is a loopback one. A url `http::Uri` cannot parse, or one with no
+/// host, passes: ureq 3.5.2 parses with that same type and refuses either before any socket.
+#[cfg(any(test, feature = "loopback-only"))]
+fn beyond_loopback(url: &str) -> Option<String> {
+    let uri = url.parse::<ureq::http::Uri>().ok()?;
+    let host = uri.host()?;
+    (!is_loopback(host)).then(|| host.to_owned())
+}
+
+/// `localhost`, a bracketed IPv6 loopback (`http::Uri` keeps the brackets), or a dotted decimal
+/// IPv4 of 2 to 4 parts whose first is 127: `inet_aton` reads `127.1` as `127.0.0.1`. Any other
+/// spelling of a loopback (hex, octal, one part) is refused, which only costs a test its send.
+#[cfg(any(test, feature = "loopback-only"))]
+fn is_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case(LOCALHOST_NAME) {
+        return true;
+    }
+    if let Some(v6) = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        return v6
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    }
+    let parts: Vec<&str> = host.split('.').collect();
+    (2..=4).contains(&parts.len())
+        && parts.first() == Some(&LOOPBACK_FIRST_PART)
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// Why a body read stopped before its end.
@@ -1009,9 +1088,10 @@ struct Failed {
 #[cfg(test)]
 mod tests {
     use super::{
-        retry_after, Backoff, CappedHold, Credentials, DateTime, Headers, RawResponse, Reservation,
-        SendFailure, Slowed, Timeouts, TransportError, TransportKind, TransportProfile, Unreserved,
-        Utc, Wire, GATE_TRIES, USER_AGENT,
+        beyond_loopback, received, retry_after, Backoff, CappedHold, Credentials, DateTime,
+        Headers, RawResponse, Reservation, SendFailure, Slowed, Timeouts, TransportError,
+        TransportKind, TransportProfile, Unreserved, Utc, Wire, GATE_TRIES, LOOPBACK_ONLY_REFUSAL,
+        USER_AGENT,
     };
     use crate::budget::{BudgetError, HostKey, RequestBudget};
     use crate::clock::testing::{StepClock, WaitRecorder, WaitedClock};
@@ -1088,6 +1168,17 @@ mod tests {
     const IPV6_HOST: &str = "[::1]";
     /// A space is no url `http::Uri` parses, so ureq refuses it as a transport error.
     const UNPARSEABLE: &str = "http://local host:1/never";
+    /// Not a loopback spelling, yet "this host" to the kernel: without the guard it is refused on
+    /// this machine and no packet leaves it.
+    const BEYOND_LOOPBACK: &str = "http://0.0.0.0:1/never";
+    /// Named, never sent: a test that sends to SEC's host sends to SEC once the guard is gone.
+    const SEC_INDEX: &str = "https://www.sec.gov/Archives/edgar/daily-index/";
+    const SEC_HOST: &str = "www.sec.gov";
+    /// `inet_aton`'s short form, which the round-robin test sends to.
+    const LOOPBACK_SHORT_URL: &str = "http://127.1:1/never";
+    /// A loopback all the same, in a spelling the guard does not read: refused.
+    const LOOPBACK_HEX_HOST: &str = "0x7f.1";
+    const LOOPBACK_HEX_URL: &str = "http://0x7f.1:1/never";
     const PACE_DIR: &str = "pace";
     const SOURCE_PACE_FILE: &str = "edgar_press.per-ip";
     const HOST_PACE_FILE: &str = "localhost.per-host";
@@ -1284,6 +1375,63 @@ mod tests {
 
     fn permit(sink: &mut Recorder, ordinal: u32) -> Option<SendPermit> {
         slot_at(sink, ordinal)?.take_permit().ok()
+    }
+
+    /// Row N1. Mutation 2026-11-27, the guard's `if` in `exchange` deleted: red, ureq's own
+    /// "Connection refused" in place of the refusal.
+    #[test]
+    fn a_test_build_refuses_a_host_beyond_loopback_before_the_socket() -> Checked {
+        let store = tempfile::tempdir()?;
+        let clock = clock_over(&[RESERVED_AT]);
+        let mut sink = Recorder::default();
+        let Some(permit) = permit(&mut sink, FIRST_ATTEMPT) else {
+            return Err("no permit".into());
+        };
+        let asked = Request {
+            url: BEYOND_LOOPBACK.to_owned(),
+            ..request()
+        };
+        let sent =
+            wire(held(), store.path(), &WaitRecorder::default()).send(permit, &asked, &clock);
+        let detail = match &sent {
+            Err(SendFailure::Transport(failed)) => failed.to_string(),
+            other => format!("{other:?}"),
+        };
+        assert!(detail.starts_with(LOOPBACK_ONLY_REFUSAL), "{detail}");
+        Ok(())
+    }
+
+    /// Row N1: SEC's host is refused, and every loopback spelling the suite sends to passes.
+    #[test]
+    fn sec_s_host_is_beyond_loopback_and_every_loopback_spelling_is_not() {
+        let refused: Vec<Option<String>> = [
+            SEC_INDEX,
+            REFUSED,
+            LOCALHOST,
+            LOCALHOST_SHOUTED,
+            IPV6_LOOPBACK,
+            UNPARSEABLE,
+            NO_HOST,
+            LOOPBACK_SHORT_URL,
+            LOOPBACK_HEX_URL,
+        ]
+        .into_iter()
+        .map(beyond_loopback)
+        .collect();
+        assert_eq!(
+            refused,
+            [
+                Some(SEC_HOST.to_owned()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(LOOPBACK_HEX_HOST.to_owned()),
+            ]
+        );
     }
 
     #[test]
@@ -3844,6 +3992,33 @@ mod tests {
         assert_eq!(
             (past_it, at_it),
             (past(RESERVED_AT, false)?, Reservation::Go)
+        );
+        Ok(())
+    }
+
+    /// Mutation 2026-11-27, `truncated` false on the cut arm: red here.
+    #[test]
+    fn a_cut_body_is_received_truncated_and_a_failure_without_one_is_none() -> Checked {
+        let attempt = crate::ledger::AttemptId::recorded("a");
+        let at = at(RESERVED_AT);
+        let failed = || TransportError::new(attempt.clone(), at, at, "cut".to_owned());
+        let whole: Result<RawResponse, TransportError> = Ok(RawResponse::new(
+            attempt.clone(),
+            200,
+            b"whole".to_vec(),
+            at,
+            at,
+        ));
+        let cut = Err(failed().with_cut_body(b"cu".to_vec()));
+        let none = Err(failed());
+        let read = |answer| received(answer).map(|got| (got.body.to_vec(), got.truncated));
+        assert_eq!(
+            (read(&whole), read(&cut), read(&none)),
+            (
+                Some((b"whole".to_vec(), false)),
+                Some((b"cu".to_vec(), true)),
+                None
+            )
         );
         Ok(())
     }
