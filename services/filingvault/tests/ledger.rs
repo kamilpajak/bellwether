@@ -222,11 +222,9 @@ fn a_row_listed_by_a_later_attempt_is_counted_listed_later() -> TestResult {
     Ok(())
 }
 
-/// A forward day no held listing could have named yet is owed as well: a listing that fails night
-/// after night leaves the newest days unlisted, never "nothing owed", and the held days are still
-/// asked (review of 2026-11-27, PIT-1). Mutations 2026-11-27, each red here: a failed listing
-/// erasing the days the store holds; `forward_unlisted` left out of the exit; a listing received
-/// on a day read as naming it.
+/// Section 12.2's unlisted forward days, while the held days are still asked. Mutations
+/// 2026-11-27, each red here: a failed listing erasing the held days; `forward_unlisted` left out
+/// of the exit; a listing received on a day read as naming it.
 #[test]
 fn forward_days_after_the_newest_listing_are_unlisted_and_answer_no() -> TestResult {
     let temp = TempDir::new()?;
@@ -307,9 +305,8 @@ fn a_held_listing_whose_blob_is_gone_is_an_error() -> TestResult {
     Ok(())
 }
 
-/// Each listings row lives under the index day that listed it and keeps its own filed day, a
-/// row filed earlier counts `late`, and the index's `Last-Modified` reaches the ledger.
-/// Mutations 2026-11-27, each red here: rows filed under their filed day; `filed_day` dropped;
+/// A row lives under its index day with its own filed day, and `late` and `Last-Modified` reach
+/// the ledger. Mutations 2026-11-27, each red here: index and filed day swapped or made one;
 /// `late` never counted; the headers not stored; `last_modified` not read.
 #[test]
 fn an_index_days_rows_keep_their_filed_day_and_its_last_modified() -> TestResult {

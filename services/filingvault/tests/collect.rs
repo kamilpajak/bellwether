@@ -449,10 +449,9 @@ fn robots_that_disallow_the_archive_ask_nothing_else_and_exit_7() -> TestResult 
     Ok(())
 }
 
-/// A Crawl-delay at most our 500 ms is honoured by pace; above it, a body that does not parse,
-/// and an answer neither 200 nor 404, the run asks nothing more. Mutations 2026-11-27, each red
-/// here: the Crawl-delay compared with 110 ms, or by `>=`; a body that does not parse read as
-/// allowing every path; a 500 read as no rules.
+/// A Crawl-delay at most 500 ms is paced; over it, an unparseable body or a 500 asks nothing more.
+/// Mutations 2026-11-27, each red here: the Crawl-delay compared with 110 ms, or by `>=`; an
+/// unparseable body read as allowing every path; a 500 read as no rules.
 #[test]
 fn a_robots_crawl_delay_over_500_ms_or_a_body_that_does_not_parse_asks_nothing() -> TestResult {
     let mut reasons = Vec::new();
@@ -704,11 +703,9 @@ fn an_error_mid_run_closes_its_attempt_and_its_run() -> TestResult {
     Ok(())
 }
 
-/// A past quarter's listing is asked again until one is received more than three days after the
-/// quarter's last day, so an index SEC writes late on that day is still listed; the current
-/// quarter is that of the day before the run (review of 2026-11-27, PIT-3). Mutations 2026-11-27,
-/// each red here: completeness read from the run's date; `>` made `>=`; the current quarter taken
-/// from the run's own date.
+/// Section 12.2's settled quarter, and the current one as of the day before the run. Mutations
+/// 2026-11-27, each red here: completeness from the run's date; `>=`; `QUARTER_SETTLE_DAYS` 0 or
+/// 4; the current quarter from the run's own date.
 #[test]
 fn a_past_quarter_is_listed_again_until_a_listing_comes_three_days_after_its_end() -> TestResult {
     let temp = TempDir::new()?;
