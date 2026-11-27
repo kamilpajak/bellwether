@@ -203,3 +203,41 @@ fn a_dry_run_plans_from_the_store_and_creates_nothing() -> TestResult {
     );
     Ok(())
 }
+
+/// A rules file the plan cannot use is refused before any store or request: a form holding a
+/// space (the index's form is its first word, so it never matches) and a `fill_days` past the
+/// calendar's start. Before 2026-11-27 the first planned no row and the second panicked, exit 101.
+#[test]
+fn a_dry_run_refuses_a_spaced_form_and_a_fill_window_past_the_calendar() -> TestResult {
+    let temp = TempDir::new()?;
+    let root = TempDir::new()?;
+    let mut refused = Vec::new();
+    for (forms, fill_days) in [(r#"["DEF 14A"]"#, "456"), (r#"["10-K"]"#, "4294967295")] {
+        let rules = temp.path().join("rules.json");
+        std::fs::write(
+            &rules,
+            format!(
+                r#"{{"schema": "filingvault.rules/1", "forms": {forms}, "fill_days": {fill_days}}}"#
+            ),
+        )?;
+        let out = filingvault(&[
+            "filings",
+            "collect",
+            "--store",
+            text(&temp.path().join("store")),
+            "--pace-root",
+            text(root.path()),
+            "--rules",
+            text(&rules),
+            "--dry-run",
+            "--format",
+            "json",
+        ])?;
+        let code =
+            serde_json::from_slice::<Value>(&out.stderr).map(|object| object["code"].clone());
+        refused.push((out.status.code(), out.stdout.len(), code.ok()));
+    }
+    let expected = (Some(2), 0, Some(serde_json::json!("input_unparseable")));
+    assert_eq!(refused, vec![expected.clone(), expected]);
+    Ok(())
+}

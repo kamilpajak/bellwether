@@ -321,7 +321,7 @@ impl Window {
             Some(started) => instant(started)?.date_naive(),
             None => run_date,
         };
-        let fill_start = first - Days::new(u64::from(rules.fill_days));
+        let fill_start = fill_start(first, rules.fill_days)?;
         let current = Quarter::of(run_date.pred_opt().unwrap_or(run_date));
         let mut held_days = BTreeMap::new();
         let mut complete = BTreeSet::new();
@@ -351,6 +351,13 @@ impl Window {
             complete,
         })
     }
+}
+
+/// `fill_days` before `first`, or the error naming a window the calendar does not hold.
+fn fill_start(first: NaiveDate, fill_days: u32) -> Result<NaiveDate, FilingsError> {
+    first
+        .checked_sub_days(Days::new(u64::from(fill_days)))
+        .ok_or_else(|| FilingsError::FillWindow(format!("{fill_days} days before {first}")))
 }
 
 /// A stored instant, or `input_unparseable` naming it.
@@ -436,7 +443,7 @@ fn planned(ask: &Ask, run_id: &str, started: DateTime<Utc>) -> Result<Report, Fi
     let current = Quarter::of(run_date.pred_opt().unwrap_or(run_date));
     let (quarters, days) = match store::open_read(&ask.store) {
         Err(FilingsError::Absent(_)) => {
-            let fill_start = run_date - Days::new(u64::from(ask.rules.fill_days));
+            let fill_start = fill_start(run_date, ask.rules.fill_days)?;
             (
                 quarters_to_ask(fill_start, current, &BTreeSet::new())?,
                 Vec::new(),

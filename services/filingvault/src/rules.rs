@@ -53,6 +53,13 @@ pub fn read(path: &Path) -> Result<Rules, FilingsError> {
         })
         .filter(|forms| !forms.is_empty())
         .ok_or_else(|| refused("forms is not a list of form names".to_owned()))?;
+    // `sec_edgar::index_row` reads a row's form as its first word, so `DEF 14A` never matches.
+    if let Some(spaced) = forms
+        .iter()
+        .find(|form| form.is_empty() || form.contains(char::is_whitespace))
+    {
+        return Err(refused(format!("the form {spaced:?} is not one word")));
+    }
     let fill_days = read["fill_days"]
         .as_u64()
         .and_then(|days| u32::try_from(days).ok())
