@@ -17,9 +17,9 @@ use sec_edgar::{listed_writes, Caller, Quarter};
 use serde_json::{json, Value};
 
 use crate::discover::{
-    allowed, day_states, days_to_ask, index_ask, index_read, listing_ask, listing_read,
-    quarters_to_ask, request, rewritten_days, robots_ask, robots_rules, robots_verdict, RobotsStop,
-    Written, BODY_LIMIT, QUARTER_SETTLE_DAYS,
+    allowed, day_states, days_to_ask, index_ask, index_data_day, index_read, listing_ask,
+    listing_read, quarters_to_ask, request, rewritten_days, robots_ask, robots_rules,
+    robots_verdict, RobotsStop, Written, BODY_LIMIT, QUARTER_SETTLE_DAYS,
 };
 use crate::error::{ErrorCode, FilingsError};
 use crate::rules::Rules;
@@ -292,6 +292,7 @@ impl Driver<'_> {
                     body: None,
                     index_day: Some(day),
                     listed,
+                    data_day: index_data_day(answer),
                 };
                 (verdict, commit, ())
             })? {

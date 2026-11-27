@@ -45,6 +45,11 @@ const DASH: char = '-';
 pub const DATE_FILED: &str = COLUMNS[3];
 /// `Date Filed` and the index file name both read `YYYYMMDD`, measured on the real file 2026-11-13.
 pub const INDEX_DATE: &str = "%Y%m%d";
+/// The index header naming the day the index holds; the real file spells `Nov 10, 2026`, the
+/// `edgar-press` fixture `November 10, 2026`.
+const LAST_DATA_RECEIVED: &str = "Last Data Received";
+const SHORT_MONTH_DAY: &str = "%b %d, %Y";
+const LONG_MONTH_DAY: &str = "%B %d, %Y";
 /// A listing item's `last-modified`: `11/10/2026 10:01:42 PM`, in [`LISTING_ZONE`].
 const LISTING_WRITTEN: &str = "%m/%d/%Y %I:%M:%S %p";
 const LISTING_ZONE: &str = "America/New_York";
@@ -285,6 +290,16 @@ fn day_of_index_name(name: &str) -> Result<Option<NaiveDate>, ListingUnparseable
         .flatten()
         .map(Some)
         .ok_or_else(|| ListingUnparseable(format!("{name:?} names no YYYYMMDD day")))
+}
+
+/// The day a daily index's `Last Data Received:` header names, `Nov 10, 2026` or
+/// `November 10, 2026`; `None` when the payload carries no such line or another shape.
+#[must_use]
+pub fn last_data_received(payload: &str) -> Option<NaiveDate> {
+    let value = labelled(payload, LAST_DATA_RECEIVED)?;
+    [SHORT_MONTH_DAY, LONG_MONTH_DAY]
+        .iter()
+        .find_map(|format| NaiveDate::parse_from_str(&value, format).ok())
 }
 
 /// One row of a daily index.
@@ -565,6 +580,20 @@ mod tests {
                 Ok(vec![day("2026-11-12")].into_iter().flatten().collect())
             ]
         );
+    }
+
+    /// Both spellings of `Last Data Received`; no header is `None`. Mutation 2026-11-27, the long
+    /// spelling not tried: red here.
+    #[test]
+    fn last_data_received_reads_both_spellings_of_the_month() {
+        let read = [
+            "Description: x\nLast Data Received:    Nov 10, 2026\n",
+            "Last Data Received:    November 10, 2026\n",
+            "Description: x\n",
+            "Last Data Received:    10 Nov 2026\n",
+        ]
+        .map(last_data_received);
+        assert_eq!(read, [day("2026-11-10"), day("2026-11-10"), None, None]);
     }
 
     /// A listing item's `last-modified` is New York time: `form.20261110.idx`'s reads the instant

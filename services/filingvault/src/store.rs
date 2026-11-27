@@ -59,7 +59,8 @@ CREATE TABLE attempts (
     closed_at        TEXT,
     truncated        INTEGER CHECK (truncated IN (0, 1)),
     raw_blob         TEXT REFERENCES blobs (digest),
-    response_headers TEXT
+    response_headers TEXT,
+    data_day         TEXT CHECK (data_day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]')
 );
 CREATE INDEX attempts_by_target ON attempts (kind, target, seq);
 CREATE INDEX attempts_open ON attempts (closed_at) WHERE closed_at IS NULL;
@@ -157,6 +158,8 @@ pub struct Commit {
     pub body: Option<Body>,
     pub index_day: Option<NaiveDate>,
     pub listed: Vec<Listed>,
+    /// The day an index body's `Last Data Received` names, `attempts.data_day`.
+    pub data_day: Option<NaiveDate>,
 }
 
 /// The one writer: the lease, the log and the blob tree.
@@ -354,7 +357,7 @@ impl Writer {
         };
         transaction.execute(
             "UPDATE attempts SET outcome = ?2, verdict = ?3, closed_at = ?4, raw_blob = ?5,
-                                 truncated = ?6, response_headers = ?7
+                                 truncated = ?6, response_headers = ?7, data_day = ?8
               WHERE attempt_id = ?1",
             params![
                 attempt_id.hex(),
@@ -364,6 +367,7 @@ impl Writer {
                 raw_blob,
                 truncated,
                 headers,
+                staged.data_day.map(day_text),
             ],
         )?;
         if let Some(day) = staged.index_day {
@@ -465,7 +469,7 @@ pub fn open_read(store: &Path) -> Result<Connection, FilingsError> {
 /// The two attempt reads of the planner and `ledger check`, each served by `attempts_by_target`.
 const INDEX_ATTEMPTS: &str =
     "SELECT seq, target, forms, body_limit, outcome, verdict, status, truncated,
-       response_headers
+       response_headers, data_day
   FROM attempts
  WHERE kind = 'index' AND closed_at IS NOT NULL AND (?1 IS NULL OR closed_at <= ?1)
  ORDER BY target, seq";
@@ -488,6 +492,7 @@ pub struct IndexAttempt {
     pub status: Option<i64>,
     pub truncated: bool,
     pub headers: Option<String>,
+    pub data_day: Option<NaiveDate>,
 }
 
 /// Every index attempt closed by `until`, or every closed one; ordered by day, then `seq`.
@@ -509,12 +514,15 @@ pub fn index_attempts(
                     row.get::<_, Option<i64>>(6)?,
                     row.get::<_, Option<bool>>(7)?,
                     row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ),
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let mut attempts = Vec::with_capacity(rows.len());
-    for (seq, target, forms, body_limit, outcome, (verdict, status, truncated, headers)) in rows {
+    for (seq, target, forms, body_limit, outcome, (verdict, status, truncated, headers, data)) in
+        rows
+    {
         let forms: Vec<String> = serde_json::from_str(forms.as_deref().unwrap_or_default())
             .map_err(|why| FilingsError::Unparseable {
                 what: format!("the forms of attempt {seq}"),
@@ -530,6 +538,7 @@ pub fn index_attempts(
             status,
             truncated: truncated.unwrap_or(false),
             headers,
+            data_day: data.as_deref().map(day_of).transpose()?,
         });
     }
     Ok(attempts)

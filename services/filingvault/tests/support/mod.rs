@@ -32,6 +32,8 @@ pub const ROBOTS: &[u8] = b"User-agent: *\nDisallow: /cgi-bin\nDisallow: /Archiv
 pub const INDEX: &str = include_str!("../fixtures/form.20261110.idx");
 /// The fixture's own day, as its rows' `Date Filed` spells it.
 const FIXTURE_DAY: &str = "20261110";
+/// The fixture's `Last Data Received`, as SEC spells it.
+const FIXTURE_RECEIVED: &str = "Nov 10, 2026";
 /// QTR4 2026 as the tests list it; the trailing three of a run on 2026-11-12 are the last three.
 pub const LISTED: [&str; 5] = [
     "2026-11-05",
@@ -83,10 +85,12 @@ pub fn listing_written<T: AsRef<str>>(days: &[(&str, T)]) -> Vec<u8> {
     format!(r#"{{"directory": {{"item": [{}]}}}}"#, items.join(", ")).into_bytes()
 }
 
-/// The real index's rows, filed on `text`'s day.
+/// The real index's rows, filed on `text`'s day, under a `Last Data Received` naming it.
 pub fn index_of(text: &str) -> Vec<u8> {
+    let received = day(text).format("%b %d, %Y").to_string();
     INDEX
         .replace(FIXTURE_DAY, &text.replace('-', ""))
+        .replace(FIXTURE_RECEIVED, &received)
         .into_bytes()
 }
 

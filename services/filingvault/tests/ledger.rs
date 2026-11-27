@@ -144,6 +144,36 @@ fn a_store_with_no_collect_run_by_at_has_no_forward_window_and_answers_no() -> T
     Ok(())
 }
 
+/// An index body whose `Last Data Received` is not its own day is counted, not failed: 11-16's
+/// url answering 11-13's body (review LBD-5; owner decision 5 of 2026-11-27, a count and not yet
+/// a gate). Mutations 2026-11-27, each red here: the header not stored; the count not compared.
+#[test]
+fn an_index_body_of_another_day_is_counted_by_its_last_data_received() -> TestResult {
+    let temp = TempDir::new()?;
+    run(temp.path(), &listing_of(&FIRST), RUN)??;
+    let stale = listing_of(&LATER).replacing(
+        &index_url("2026-11-16"),
+        Reply::Status(OK, index_of("2026-11-13")),
+    );
+    run(temp.path(), &stale, "2026-11-17T06:10:00Z")??;
+    let read = checked(temp.path(), "2026-11-17T12:00:00Z")?;
+    assert_eq!(
+        (
+            read.exit,
+            read.report["last_data_received_mismatch"].clone(),
+            per_day(&read, "2026-11-16")["last_data_received"].clone(),
+            per_day(&read, "2026-11-13")["last_data_received"].clone(),
+        ),
+        (
+            0,
+            serde_json::json!(1),
+            serde_json::json!("2026-11-13"),
+            serde_json::json!("2026-11-13"),
+        )
+    );
+    Ok(())
+}
+
 /// A store whose only run received no listing answers no, even before a forward day is owed
 /// (review LBD-6): robots.txt answered 503. Mutation 2026-11-27, `usable_listings` left out of
 /// the exit: red here.

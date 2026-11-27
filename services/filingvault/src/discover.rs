@@ -199,6 +199,15 @@ pub fn index_read(
     }
 }
 
+/// The day a 200's index body says it holds (`Last Data Received`); `None` for any other answer
+/// or a body without the header.
+#[must_use]
+pub fn index_data_day(answer: &Result<RawResponse, TransportError>) -> Option<NaiveDate> {
+    body_of_200(answer)
+        .ok()
+        .and_then(|body| sec_edgar::last_data_received(&body))
+}
+
 /// What the ledger knows of an index day (architecture.md section 12.2). Every state but `Asked`
 /// is "unasked" there; the split keeps "we looked and failed" apart from "we did not look".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -541,6 +550,7 @@ mod tests {
                 status,
                 truncated: false,
                 headers: None,
+                data_day: None,
             };
         let cut = |on: &str, limit: u64| IndexAttempt {
             truncated: true,

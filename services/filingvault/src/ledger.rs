@@ -107,6 +107,7 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
     }
     let mut counts: BTreeMap<&str, u32> = BTreeMap::new();
     let mut forward_unasked = 0_u32;
+    let mut data_day_mismatch = 0_u32;
     let mut day_rows = Vec::with_capacity(listed.len());
     for (day, quarter) in &listed {
         let state = states.get(day).copied().unwrap_or(DayState::Unasked);
@@ -120,6 +121,13 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
             .filter(|attempt| attempt.day == *day)
             .collect();
         let last = of_day.last();
+        let answered = of_day
+            .iter()
+            .rev()
+            .find(|attempt| matches!(attempt.verdict.as_deref(), Some("usable" | "empty")));
+        if answered.is_some_and(|attempt| attempt.data_day != Some(*day)) {
+            data_day_mismatch += 1;
+        }
         let none = Rows::default();
         let held = rows.get(day).unwrap_or(&none);
         day_rows.push(json!({
@@ -137,6 +145,7 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
                 Some(attempt) => store::stored_last_modified(attempt.headers.as_deref())?,
                 None => None,
             },
+            "last_data_received": answered.and_then(|attempt| attempt.data_day.map(store::day_text)),
             "listed_rows": held.listed,
             "by_form": held.by_form,
             "late": held.late,
@@ -172,6 +181,7 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
         "forward_unasked": forward_unasked,
         "forward_unlisted": forward_unlisted,
         "usable_listings": usable_listings,
+        "last_data_received_mismatch": data_day_mismatch,
         "listed_rows": rows.values().map(|held| held.listed).sum::<u32>(),
         "per_day": day_rows,
         "blob_raw_bytes": raw.unwrap_or(0),
