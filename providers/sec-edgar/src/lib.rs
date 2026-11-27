@@ -213,17 +213,21 @@ pub struct ListingUnparseable(pub String);
 
 /// The days a quarter's listing holds a form index for. Only `form.<date>.idx` names count: a
 /// quarter directory also holds `company.`, `master.` and `index.json` itself. A body with no
-/// `directory.item` array is refused, never read as a listing of no day.
+/// `directory.item` array, or a `form.*.idx` name that is no `YYYYMMDD` day, is refused, never
+/// read as a listing of no day or of another day.
 pub fn listed_days(bytes: &[u8]) -> Result<Vec<NaiveDate>, ListingUnparseable> {
     let read: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|why| ListingUnparseable(why.to_string()))?;
     let items = read["directory"]["item"]
         .as_array()
         .ok_or_else(|| ListingUnparseable("no `directory.item` array".to_owned()))?;
-    Ok(items
-        .iter()
-        .filter_map(|item| day_of_index_name(item["name"].as_str()?))
-        .collect())
+    let mut days = Vec::new();
+    for name in items.iter().filter_map(|item| item["name"].as_str()) {
+        if let Some(day) = day_of_index_name(name)? {
+            days.push(day);
+        }
+    }
+    Ok(days)
 }
 
 /// [`listed_days`] with the empty fallback `edgar-press` reads a listing by: JSON with no
@@ -236,9 +240,20 @@ pub fn listed_days_or_none(bytes: &[u8]) -> Result<Vec<NaiveDate>, ListingUnpars
     }
 }
 
-fn day_of_index_name(name: &str) -> Option<NaiveDate> {
-    let digits = name.strip_prefix("form.")?.strip_suffix(".idx")?;
-    NaiveDate::parse_from_str(digits, INDEX_DATE).ok()
+/// `None` for a name of another file; a `form.*.idx` name must hold [`INDEX_DATE_WIDTH`] digits.
+fn day_of_index_name(name: &str) -> Result<Option<NaiveDate>, ListingUnparseable> {
+    let Some(digits) = name
+        .strip_prefix("form.")
+        .and_then(|rest| rest.strip_suffix(".idx"))
+    else {
+        return Ok(None);
+    };
+    let shaped = digits.len() == INDEX_DATE_WIDTH && digits.bytes().all(|b| b.is_ascii_digit());
+    shaped
+        .then(|| NaiveDate::parse_from_str(digits, INDEX_DATE).ok())
+        .flatten()
+        .map(Some)
+        .ok_or_else(|| ListingUnparseable(format!("{name:?} names no YYYYMMDD day")))
 }
 
 /// One row of a daily index.
@@ -492,6 +507,32 @@ mod tests {
         assert_eq!(
             listed_days(listing),
             Ok(vec![day("2026-11-12")].into_iter().flatten().collect())
+        );
+    }
+
+    /// A `form.*.idx` name whose date is not eight digits of a real day refuses the listing:
+    /// chrono reads `2026111` as 2026-11-01 (review of 2026-11-27). Mutation 2026-11-27, the
+    /// width check dropped: red here.
+    #[test]
+    fn a_form_index_name_that_is_no_yyyymmdd_day_refuses_the_listing() {
+        let named = |name: &str| {
+            let body = format!(r#"{{"directory": {{"item": [{{"name": "{name}"}}]}}}}"#);
+            listed_days(body.as_bytes()).map_err(|_| "unparseable")
+        };
+        assert_eq!(
+            [
+                "form.2026111.idx",
+                "form.2026XX12.idx",
+                "form.20261131.idx",
+                "form.20261112.idx"
+            ]
+            .map(named),
+            [
+                Err("unparseable"),
+                Err("unparseable"),
+                Err("unparseable"),
+                Ok(vec![day("2026-11-12")].into_iter().flatten().collect())
+            ]
         );
     }
 

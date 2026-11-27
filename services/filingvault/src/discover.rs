@@ -458,8 +458,9 @@ mod tests {
         }
     }
 
-    /// A listing is a `directory.item` array; one naming no day is `empty`. Mutations 2026-11-27,
-    /// each red here: a body that does not parse read `empty`; an empty listing read `usable`.
+    /// A listing is a `directory.item` array; one naming no day is `empty`, one naming no real day
+    /// a failure. Mutations 2026-11-27, each red here: a body that does not parse read `empty`; an
+    /// empty listing read `usable`; `form.2026111.idx` read as 2026-11-01.
     #[test]
     fn a_listing_that_is_no_listing_fails_and_one_naming_no_day_is_empty() {
         let read = [
@@ -467,6 +468,7 @@ mod tests {
             "<html>",
             r#"{"directory": {"item": []}}"#,
             r#"{"directory": {"item": [{"name": "form.20261110.idx"}]}}"#,
+            r#"{"directory": {"item": [{"name": "form.2026111.idx"}]}}"#,
         ]
         .map(|body| {
             let (verdict, days) = listing_read(&answered(body));
@@ -478,7 +480,8 @@ mod tests {
                 ("permanent_failure", 0),
                 ("permanent_failure", 0),
                 ("empty", 0),
-                ("usable", 1)
+                ("usable", 1),
+                ("permanent_failure", 0)
             ]
         );
     }
