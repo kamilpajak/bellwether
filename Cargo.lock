@@ -766,6 +766,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "filingvault"
+version = "0.1.0"
+dependencies = [
+ "canon",
+ "chrono",
+ "clap",
+ "news-provider",
+ "pit",
+ "rusqlite",
+ "sec-edgar",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "vault-core",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
