@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Months, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use news_provider::request::HeaderValue;
 use news_provider::wire::{RawResponse, Timeouts, TransportError, TransportKind, TransportProfile};
@@ -60,6 +60,9 @@ const VENDOR_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 /// still span SEC's 1 s for 10 requests per IP (predecessor table, read 2026-11-13). The spread
 /// and what no margin covers: architecture.md section 12.6, the row on SEC's interval.
 const SEC_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(110);
+/// 500 ms, owner decision 2026-11-24: 2 requests a second, 20% of SEC's stated 10, for the one
+/// caller whose nightly run asks thousands (architecture.md section 12.2).
+const FILINGS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Who asks `www.sec.gov`. SEC counts every caller against one address, so how the ceiling is
 /// split between them is one table, [`Caller::interval`].
@@ -69,6 +72,8 @@ pub enum Caller {
     EdgarPress,
     /// `newsvault roster fetch` (architecture.md section 10, the roster).
     Roster,
+    /// `filingvault filings collect` (architecture.md section 12.2).
+    Filings,
 }
 
 impl Caller {
@@ -78,6 +83,7 @@ impl Caller {
         match self {
             Self::EdgarPress => SEC_MIN_INTERVAL,
             Self::Roster => SEC_MIN_INTERVAL,
+            Self::Filings => FILINGS_INTERVAL,
         }
     }
 }
@@ -120,13 +126,56 @@ pub fn contact_is_addressed(contact: &str) -> bool {
     })
 }
 
+/// A calendar quarter, which is how SEC files its daily indexes: one directory each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Quarter {
+    year: i32,
+    number: u32,
+}
+
+const MONTHS_A_QUARTER: u32 = 3;
+
+impl Quarter {
+    #[must_use]
+    pub fn of(day: NaiveDate) -> Self {
+        Self {
+            year: day.year(),
+            number: (day.month() - 1) / MONTHS_A_QUARTER + 1,
+        }
+    }
+
+    #[must_use]
+    pub fn first_day(self) -> NaiveDate {
+        NaiveDate::from_ymd_opt(self.year, (self.number - 1) * MONTHS_A_QUARTER + 1, 1)
+            .unwrap_or(NaiveDate::MIN)
+    }
+
+    #[must_use]
+    pub fn last_day(self) -> NaiveDate {
+        self.first_day()
+            .checked_add_months(Months::new(MONTHS_A_QUARTER))
+            .and_then(|next| next.pred_opt())
+            .unwrap_or(NaiveDate::MAX)
+    }
+
+    #[must_use]
+    pub fn previous(self) -> Self {
+        Self::of(self.first_day().pred_opt().unwrap_or(NaiveDate::MIN))
+    }
+
+    /// The directory's own name below `daily-index/`: `2026/QTR4`.
+    #[must_use]
+    pub fn label(self) -> String {
+        format!("{}/QTR{}", self.year, self.number)
+    }
+}
+
 /// The quarter listing's url for a day: the directory that names each daily index it holds.
 #[must_use]
 pub fn listing_url(day: NaiveDate) -> String {
     format!(
-        "https://{HOST}{ARCHIVES}{DAILY_INDEX}/{}/QTR{}/index.json",
-        day.format("%Y"),
-        quarter(day)
+        "https://{HOST}{ARCHIVES}{DAILY_INDEX}/{}/index.json",
+        Quarter::of(day).label()
     )
 }
 
@@ -134,9 +183,8 @@ pub fn listing_url(day: NaiveDate) -> String {
 #[must_use]
 pub fn index_url(day: NaiveDate) -> String {
     format!(
-        "https://{HOST}{ARCHIVES}{DAILY_INDEX}/{}/QTR{}/form.{}.idx",
-        day.format("%Y"),
-        quarter(day),
+        "https://{HOST}{ARCHIVES}{DAILY_INDEX}/{}/form.{}.idx",
+        Quarter::of(day).label(),
         day.format(INDEX_DATE)
     )
 }
@@ -145,10 +193,6 @@ pub fn index_url(day: NaiveDate) -> String {
 #[must_use]
 pub fn archive_url(path: &str) -> String {
     format!("https://{HOST}{ARCHIVES}{path}")
-}
-
-fn quarter(day: NaiveDate) -> u32 {
-    (chrono::Datelike::month(&day) - 1) / 3 + 1
 }
 
 /// The accession an EDGAR document url ends in:
@@ -316,6 +360,45 @@ mod tests {
                 format!("https://{HOST}/Archives/edgar/daily-index/2026/QTR{quarter}/index.json");
             assert_eq!(listing, Some(expected), "{text}");
         }
+    }
+
+    /// Mutations 2026-11-27, each red here: `last_day` one day short; `previous` returning the
+    /// quarter itself.
+    #[test]
+    fn a_quarter_spans_its_three_months_and_the_previous_one_crosses_a_year() {
+        let first = Quarter::of(day("2026-01-15").unwrap_or_default());
+        assert_eq!(
+            (
+                first.label(),
+                Some(first.first_day()),
+                Some(first.last_day()),
+                first.previous().label(),
+                Some(first.previous().last_day()),
+            ),
+            (
+                "2026/QTR1".to_owned(),
+                day("2026-01-01"),
+                day("2026-03-31"),
+                "2025/QTR4".to_owned(),
+                day("2025-12-31"),
+            )
+        );
+    }
+
+    /// Section 12.2's split of SEC's ceiling: the filings row is 500 ms per IP and per host, the
+    /// other two 110 ms. Mutation 2026-11-27, `Caller::Filings` at `SEC_MIN_INTERVAL`: red here.
+    #[test]
+    fn the_filings_caller_paces_our_address_and_the_host_at_500_ms() {
+        let paced = |caller| {
+            let budget = transport(caller, 1).budget;
+            (budget.min_interval, budget.per_host)
+        };
+        let filings = Some(std::time::Duration::from_millis(500));
+        let others = Some(std::time::Duration::from_millis(110));
+        assert_eq!(
+            [Caller::Filings, Caller::Roster, Caller::EdgarPress].map(paced),
+            [(filings, filings), (others, others), (others, others)]
+        );
     }
 
     /// Mutation 2026-11-25, an address needing a local part OR a dotted domain: red here, and
