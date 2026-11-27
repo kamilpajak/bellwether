@@ -567,6 +567,19 @@ pub fn held_listings(
     Ok(rows)
 }
 
+/// A stored answer's `Last-Modified`: the instant SEC wrote the index, section 12.3's floor.
+pub fn stored_last_modified(headers: Option<&str>) -> Result<Option<String>, FilingsError> {
+    let Some(headers) = headers else {
+        return Ok(None);
+    };
+    let headers =
+        news_provider::Headers::from_json(headers).map_err(|why| FilingsError::Unparseable {
+            what: "stored response headers".to_owned(),
+            why: why.to_string(),
+        })?;
+    Ok(headers.first("last-modified").map(str::to_owned))
+}
+
 /// The UTC dates of the collect runs started by `until`, oldest first.
 pub fn collect_starts(db: &Connection, until: Option<&str>) -> Result<Vec<String>, FilingsError> {
     let mut statement = db.prepare(

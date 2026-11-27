@@ -134,7 +134,7 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
                 "status": attempt.status,
             })),
             "last_modified": match last {
-                Some(attempt) => last_modified(attempt.headers.as_deref())?,
+                Some(attempt) => store::stored_last_modified(attempt.headers.as_deref())?,
                 None => None,
             },
             "listed_rows": held.listed,
@@ -228,17 +228,4 @@ fn rows_by_day(
         }
     }
     Ok(by_day)
-}
-
-/// The index's `Last-Modified`: the instant SEC wrote it, section 12.3's floor.
-fn last_modified(headers: Option<&str>) -> Result<Option<String>, FilingsError> {
-    let Some(headers) = headers else {
-        return Ok(None);
-    };
-    let headers =
-        news_provider::Headers::from_json(headers).map_err(|why| FilingsError::Unparseable {
-            what: "stored response headers".to_owned(),
-            why: why.to_string(),
-        })?;
-    Ok(headers.first("last-modified").map(str::to_owned))
 }

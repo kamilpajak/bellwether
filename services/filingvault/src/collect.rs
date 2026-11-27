@@ -13,13 +13,13 @@ use news_provider::{
     TransportError, TransportProfile, Unreserved, Verdict, Wire,
 };
 use pit::ObservationTime;
-use sec_edgar::{listed_days, Caller, Quarter};
+use sec_edgar::{listed_writes, Caller, Quarter};
 use serde_json::{json, Value};
 
 use crate::discover::{
     allowed, day_states, days_to_ask, index_ask, index_read, listing_ask, listing_read,
-    quarters_to_ask, request, robots_ask, robots_rules, robots_verdict, RobotsStop, BODY_LIMIT,
-    QUARTER_SETTLE_DAYS,
+    quarters_to_ask, request, rewritten_days, robots_ask, robots_rules, robots_verdict, RobotsStop,
+    Written, BODY_LIMIT, QUARTER_SETTLE_DAYS,
 };
 use crate::error::{ErrorCode, FilingsError};
 use crate::rules::Rules;
@@ -276,16 +276,11 @@ impl Driver<'_> {
             row["days"] = json!(turn.got.len());
             self.listings.push(row);
             if matches!(turn.verdict, Verdict::Usable | Verdict::Empty) {
-                days.entry(quarter).or_default().extend(turn.got);
+                merge(days.entry(quarter).or_default(), turn.got);
             }
         }
-        let listed: BTreeSet<NaiveDate> = days.into_values().flatten().collect();
-        let states = day_states(
-            &store::index_attempts(self.writer.db(), None)?,
-            &rules.forms,
-            BODY_LIMIT,
-        );
-        for day in days_to_ask(&listed, &states, window.fill_start, run_date) {
+        let planned = plan(self.writer.db(), &days, rules, window.fill_start, run_date)?;
+        for day in planned {
             let described = index_ask(day, &rules.forms);
             if !allowed(robots.as_ref(), &described.url) {
                 return Ok(Some(Stop::Robots(RobotsStop::Disallowed)));
@@ -315,8 +310,8 @@ impl Driver<'_> {
 struct Window {
     fill_start: NaiveDate,
     current: Quarter,
-    /// The days any held listing of each quarter names.
-    held_days: BTreeMap<Quarter, BTreeSet<NaiveDate>>,
+    /// The days any held listing of each quarter names, each with its newest listed write.
+    held_days: BTreeMap<Quarter, Writes>,
     /// Quarters with a usable listing received after their last day and
     /// [`QUARTER_SETTLE_DAYS`]: never asked again.
     complete: BTreeSet<Quarter>,
@@ -340,7 +335,7 @@ impl Window {
         };
         let fill_start = fill_start(first, rules.fill_days)?;
         let current = Quarter::of(run_date.pred_opt().unwrap_or(run_date));
-        let mut held_days: BTreeMap<Quarter, BTreeSet<NaiveDate>> = BTreeMap::new();
+        let mut held_days: BTreeMap<Quarter, Writes> = BTreeMap::new();
         let mut complete = BTreeSet::new();
         let labels: BTreeMap<String, Quarter> = quarters_to_ask(fill_start, current, &complete)?
             .into_iter()
@@ -350,7 +345,7 @@ impl Window {
             let Some(quarter) = labels.get(&held.quarter) else {
                 continue;
             };
-            let days = listed_days(&store::read_blob(blobs, &held.blob)?).map_err(|why| {
+            let days = listed_writes(&store::read_blob(blobs, &held.blob)?).map_err(|why| {
                 FilingsError::Unparseable {
                     what: format!("the stored listing of {}", held.quarter),
                     why: why.to_string(),
@@ -360,7 +355,7 @@ impl Window {
             if held.usable && instant(&held.received)?.date_naive() > settled {
                 complete.insert(*quarter);
             }
-            held_days.entry(*quarter).or_default().extend(days);
+            merge(held_days.entry(*quarter).or_default(), days);
         }
         Ok(Self {
             fill_start,
@@ -369,6 +364,34 @@ impl Window {
             complete,
         })
     }
+}
+
+/// Each listed day with the newest write any listing of it states.
+type Writes = BTreeMap<NaiveDate, DateTime<Utc>>;
+
+fn merge(held: &mut Writes, listed: Vec<Written>) {
+    for (day, written) in listed {
+        let newest = held.entry(day).or_insert(written);
+        *newest = (*newest).max(written);
+    }
+}
+
+/// The index days a run asks from the listed days of every quarter and the attempts held.
+fn plan(
+    db: &rusqlite::Connection,
+    listed: &BTreeMap<Quarter, Writes>,
+    rules: &Rules,
+    fill_start: NaiveDate,
+    run_date: NaiveDate,
+) -> Result<Vec<NaiveDate>, FilingsError> {
+    let writes: Writes = listed.values().flatten().map(|(d, w)| (*d, *w)).collect();
+    let days: BTreeSet<NaiveDate> = writes.keys().copied().collect();
+    let attempts = store::index_attempts(db, None)?;
+    let states = day_states(&attempts, &rules.forms, BODY_LIMIT);
+    let rewritten = rewritten_days(&writes, &attempts)?;
+    Ok(days_to_ask(
+        &days, &states, &rewritten, fill_start, run_date,
+    ))
 }
 
 /// `fill_days` before `first`, or the error naming a window the calendar does not hold.
@@ -484,17 +507,16 @@ fn planned(ask: &Ask, run_id: &str, started: DateTime<Utc>) -> Result<Report, Fi
                 store::WRITE_POLICY,
             );
             let window = Window::read(&db, &blobs, &ask.rules, run_date)?;
-            let listed: BTreeSet<NaiveDate> =
-                window.held_days.values().flatten().copied().collect();
-            let states = day_states(
-                &store::index_attempts(&db, None)?,
-                &ask.rules.forms,
-                BODY_LIMIT,
-            );
             (
                 STORE_HELD,
                 quarters_to_ask(window.fill_start, window.current, &window.complete)?,
-                days_to_ask(&listed, &states, window.fill_start, run_date),
+                plan(
+                    &db,
+                    &window.held_days,
+                    &ask.rules,
+                    window.fill_start,
+                    run_date,
+                )?,
             )
         }
     };

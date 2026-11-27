@@ -45,6 +45,9 @@ const DASH: char = '-';
 pub const DATE_FILED: &str = COLUMNS[3];
 /// `Date Filed` and the index file name both read `YYYYMMDD`, measured on the real file 2026-11-13.
 pub const INDEX_DATE: &str = "%Y%m%d";
+/// A listing item's `last-modified`: `11/10/2026 10:01:42 PM`, in [`LISTING_ZONE`].
+const LISTING_WRITTEN: &str = "%m/%d/%Y %I:%M:%S %p";
+const LISTING_ZONE: &str = "America/New_York";
 const ACCESS_DENIED: &str = "<Code>AccessDenied</Code>";
 const REQUEST_TIMEOUT: u16 = 408;
 const TOO_MANY_REQUESTS: u16 = 429;
@@ -216,18 +219,56 @@ pub struct ListingUnparseable(pub String);
 /// `directory.item` array, or a `form.*.idx` name that is no `YYYYMMDD` day, is refused, never
 /// read as a listing of no day or of another day.
 pub fn listed_days(bytes: &[u8]) -> Result<Vec<NaiveDate>, ListingUnparseable> {
+    Ok(listed_items(bytes)?
+        .into_iter()
+        .map(|(day, _)| day)
+        .collect())
+}
+
+/// [`listed_days`], each day with the instant its index was last written: the item's
+/// `last-modified`, New York local time, 0 s from the file's own `Last-Modified` on the 2 days
+/// read (`probes/observation_lag/PREREGISTRATION.md`, 2026-11-13). An item of a day with no such
+/// value refuses the listing: 29 of 29 of 2026 Q4 and 496 of 496 of 2024 Q4 to 2026 Q3 carry one.
+pub fn listed_writes(bytes: &[u8]) -> Result<Vec<(NaiveDate, DateTime<Utc>)>, ListingUnparseable> {
+    listed_items(bytes)?
+        .into_iter()
+        .map(|(day, item)| {
+            item["last-modified"]
+                .as_str()
+                .and_then(|raw| acceptance_instant(raw, LISTING_WRITTEN, LISTING_ZONE))
+                .map(|written| (day, written))
+                .ok_or_else(|| {
+                    ListingUnparseable(format!("the item of {day} has no last-modified"))
+                })
+        })
+        .collect()
+}
+
+/// The `form.*.idx` items of a listing with their days.
+fn listed_items(bytes: &[u8]) -> Result<Vec<(NaiveDate, serde_json::Value)>, ListingUnparseable> {
     let read: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|why| ListingUnparseable(why.to_string()))?;
     let items = read["directory"]["item"]
         .as_array()
         .ok_or_else(|| ListingUnparseable("no `directory.item` array".to_owned()))?;
     let mut days = Vec::new();
-    for name in items.iter().filter_map(|item| item["name"].as_str()) {
+    for item in items {
+        let Some(name) = item["name"].as_str() else {
+            continue;
+        };
         if let Some(day) = day_of_index_name(name)? {
-            days.push(day);
+            days.push((day, item.clone()));
         }
     }
     Ok(days)
+}
+
+/// An HTTP date, as SEC's `Last-Modified` header carries one: `Wed, 11 Nov 2026 03:01:42 GMT`.
+#[must_use]
+pub fn http_date(text: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc2822(text.trim())
+        .ok()
+        .map(|at| at.with_timezone(&Utc))
 }
 
 /// `None` for a name of another file; a `form.*.idx` name must hold [`INDEX_DATE_WIDTH`] digits.
@@ -523,6 +564,20 @@ mod tests {
                 Err("unparseable"),
                 Ok(vec![day("2026-11-12")].into_iter().flatten().collect())
             ]
+        );
+    }
+
+    /// A listing item's `last-modified` is New York time: `form.20261110.idx`'s reads the instant
+    /// its `Last-Modified` header carried, 0 s apart, as measured 2026-11-13
+    /// (`probes/observation_lag/PREREGISTRATION.md`). Mutation 2026-11-27, the zone UTC: red here.
+    #[test]
+    fn a_listed_write_is_new_york_time_and_equals_the_files_last_modified() {
+        let listing = br#"{"directory": {"item": [
+            {"name": "form.20261110.idx", "last-modified": "11/10/2026 10:01:42 PM"}]}}"#;
+        let header = http_date("Wed, 11 Nov 2026 03:01:42 GMT");
+        assert_eq!(
+            listed_writes(listing).map(|writes| writes.first().map(|(_, at)| *at)),
+            Ok(header)
         );
     }
 

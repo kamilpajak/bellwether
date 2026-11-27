@@ -12,16 +12,6 @@ use tempfile::TempDir;
 
 const NOW: &str = "2026-12-01T00:00:00Z";
 
-/// robots.txt, QTR4 listing `days`, and each day's index.
-fn listing_of(days: &[&str]) -> Stub {
-    let stub = Stub::default()
-        .answering(ROBOTS_URL, Reply::Status(OK, ROBOTS.to_vec()))
-        .answering(&listing_url(days[0]), Reply::Status(OK, listing(days)));
-    days.iter().fold(stub, |stub, text| {
-        stub.answering(&index_url(text), Reply::Status(OK, index_of(text)))
-    })
-}
-
 fn checked(store: &Path, at: &str) -> Result<Checked, Box<dyn std::error::Error>> {
     let asked = Asked {
         at: at.parse()?,

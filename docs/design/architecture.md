@@ -5475,6 +5475,9 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
   - A row added k days later would be stamped observable at about D + 26 h, a lookahead of up to k days.
   - Steady state asks each index day on at least 3 runs, and on 5 when a weekend follows it (a Friday is among the trailing 3 index days on the Saturday to Wednesday runs); equal bytes are one blob, and `listings.first_seq` names the attempt that first listed each row.
   - Rule, built only if such a row is found: it is dated as a late row from that attempt's `received_at`.
+  - Built 2026-11-27 (owner decision 7, review QS-2): a day whose listed `last-modified` (New York time, `sec_edgar::listed_writes`) is newer than the `Last-Modified` of its newest usable or `empty` answer is asked again by the next run, with no added request: the listings are asked anyway. `tests/collect.rs::a_day_rewritten_after_its_stored_answer_is_asked_again_once` (11-12 rewritten on 11-18: asked once, its added row held).
+    - An answer that kept no `Last-Modified` is not compared; `ledger check` shows its `last_modified` null.
+    - A `form.*.idx` item with no `last-modified` refuses its listing `permanent_failure`: 29 of 29 of 2026 Q4 and 496 of 496 of 2024 Q4 to 2026 Q3 carry one (the QS-3 run, §12.2).
 - A read made before the fill and one made after differ at the same instant; `--through-seq` makes a read reproducible (§12.5).
 
 **Discovery and the ledger.**

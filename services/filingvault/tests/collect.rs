@@ -774,6 +774,81 @@ fn a_past_quarter_is_listed_again_until_a_listing_comes_a_day_after_its_end() ->
     Ok(())
 }
 
+/// A day the listing shows written after the `Last-Modified` of its stored answer is asked
+/// again, once, and the row SEC added is held (review QS-2): 11-12 rewritten on 11-18, after it
+/// left the trailing three. Mutation 2026-11-27, the rewritten days not planned: red here.
+#[test]
+fn a_day_rewritten_after_its_stored_answer_is_asked_again_once() -> TestResult {
+    let temp = TempDir::new()?;
+    let first: Vec<&str> = LISTED.iter().copied().chain(["2026-11-12"]).collect();
+    let dated = |stub: Stub, body: Vec<u8>, header: &'static str| {
+        stub.replacing(&index_url("2026-11-12"), Reply::Dated(OK, body, header))
+    };
+    let one = dated(
+        listing_of(&first),
+        index_of("2026-11-12"),
+        "Fri, 13 Nov 2026 03:00:00 GMT",
+    );
+    run(temp.path(), &one, NEXT_RUN)??;
+    let later = [
+        &first[..],
+        &["2026-11-13", "2026-11-16", "2026-11-17", "2026-11-18"],
+    ]
+    .concat();
+    let mut written: Vec<(&str, String)> = later
+        .iter()
+        .map(|text| {
+            (
+                *text,
+                format!("{}/{}/2026 10:00:00 PM", &text[5..7], &text[8..]),
+            )
+        })
+        .collect();
+    written[5].1 = "11/18/2026 09:00:00 PM".to_owned();
+    let added = "10-K             LATE ADDED CORP                                               \
+                 1112223     20261112    edgar/data/1112223/0001112223-26-000001.txt\n";
+    let rewritten = [index_of("2026-11-12"), added.as_bytes().to_vec()].concat();
+    let stub = || {
+        dated(
+            listing_of(&later).replacing(
+                &listing_url(LISTED[0]),
+                Reply::Status(OK, listing_written(&written)),
+            ),
+            rewritten.clone(),
+            "Thu, 19 Nov 2026 02:00:00 GMT",
+        )
+    };
+    let (two, three) = (stub(), stub());
+    run(temp.path(), &two, "2026-11-19T06:10:00Z")??;
+    run(temp.path(), &three, "2026-11-20T06:10:00Z")??;
+    assert_eq!(
+        (
+            asked_days(&two),
+            asked_days(&three),
+            rows(
+                temp.path(),
+                "SELECT count(*) FROM listings WHERE accession = '0001112223-26-000001'"
+            )?,
+        ),
+        (
+            [
+                "2026-11-18",
+                "2026-11-17",
+                "2026-11-16",
+                "2026-11-13",
+                "2026-11-12"
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            ["2026-11-18", "2026-11-17", "2026-11-16"]
+                .map(str::to_owned)
+                .to_vec(),
+            vec!["1".to_owned()],
+        )
+    );
+    Ok(())
+}
+
 /// One failed request is enough for exit 8. Mutation 2026-11-27, exit 8 from two failures: red.
 #[test]
 fn one_failed_request_makes_the_run_partial() -> TestResult {

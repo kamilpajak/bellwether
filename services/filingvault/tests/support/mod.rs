@@ -55,13 +55,27 @@ pub fn listing_url(text: &str) -> String {
     sec_edgar::listing_url(day(text))
 }
 
-/// A quarter listing naming `days`, in the shape SEC's `index.json` has.
+/// A quarter listing naming `days`, in the shape SEC's `index.json` has: each index last
+/// written at 22:00 New York on its own day, as 29 of 29 of 2026 Q4 were (section 12.2).
 pub fn listing(days: &[&str]) -> Vec<u8> {
-    let items: Vec<String> = days
+    let written: Vec<(&str, String)> = days
         .iter()
         .map(|text| {
+            let [year, month, on] = [&text[..4], &text[5..7], &text[8..]];
+            (*text, format!("{month}/{on}/{year} 10:00:00 PM"))
+        })
+        .collect();
+    listing_written(&written)
+}
+
+/// A quarter listing naming each day with its `last-modified`, New York time as SEC writes it.
+pub fn listing_written<T: AsRef<str>>(days: &[(&str, T)]) -> Vec<u8> {
+    let items: Vec<String> = days
+        .iter()
+        .map(|(text, written)| {
             format!(
-                r#"{{"name": "form.{}.idx", "type": "file"}}"#,
+                r#"{{"last-modified": "{}", "name": "form.{}.idx", "type": "file"}}"#,
+                written.as_ref(),
                 text.replace('-', "")
             )
         })
@@ -74,6 +88,16 @@ pub fn index_of(text: &str) -> Vec<u8> {
     INDEX
         .replace(FIXTURE_DAY, &text.replace('-', ""))
         .into_bytes()
+}
+
+/// robots.txt, the listing of `days`'s quarter naming them, and each day's index.
+pub fn listing_of(days: &[&str]) -> Stub {
+    let stub = Stub::default()
+        .answering(ROBOTS_URL, Reply::Status(OK, ROBOTS.to_vec()))
+        .answering(&listing_url(days[0]), Reply::Status(OK, listing(days)));
+    days.iter().fold(stub, |stub, text| {
+        stub.answering(&index_url(text), Reply::Status(OK, index_of(text)))
+    })
 }
 
 pub fn rules(fill_days: u32) -> Rules {
