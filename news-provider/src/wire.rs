@@ -192,9 +192,11 @@ const MAX_REDIRECTS: u32 = 0;
 /// that is not the loopback (architecture.md section 8 row N1). Only a test build holds the text.
 pub const LOOPBACK_ONLY_REFUSAL: &str =
     "refused before the socket: a test build sends to loopback only";
-/// The hosts a test build sends to, compared without case: `http::Uri` keeps IPv6 brackets.
 #[cfg(any(test, feature = "loopback-only"))]
-const LOOPBACK_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "[::1]"];
+const LOCALHOST_NAME: &str = "localhost";
+/// The first part of a dotted IPv4 host in `127.0.0.0/8`, written in decimal.
+#[cfg(any(test, feature = "loopback-only"))]
+const LOOPBACK_FIRST_PART: &str = "127";
 
 /// The [`KEPT_HEADERS`] of one answer, as `(name, value)` pairs in the order `http` 1.x's
 /// `HeaderMap` yields them: names by first appearance, each name's values in the order received.
@@ -973,17 +975,37 @@ impl Wire {
     }
 }
 
-/// The host of `url` when it names one outside [`LOOPBACK_HOSTS`]. A url `http::Uri` cannot
-/// parse, or one with no host, passes: ureq 3.5.2 parses with that same type and refuses either
-/// before any socket.
+/// The host of `url` unless it is a loopback one. A url `http::Uri` cannot parse, or one with no
+/// host, passes: ureq 3.5.2 parses with that same type and refuses either before any socket.
 #[cfg(any(test, feature = "loopback-only"))]
 fn beyond_loopback(url: &str) -> Option<String> {
     let uri = url.parse::<ureq::http::Uri>().ok()?;
     let host = uri.host()?;
-    (!LOOPBACK_HOSTS
-        .iter()
-        .any(|loopback| host.eq_ignore_ascii_case(loopback)))
-    .then(|| host.to_owned())
+    (!is_loopback(host)).then(|| host.to_owned())
+}
+
+/// `localhost`, a bracketed IPv6 loopback (`http::Uri` keeps the brackets), or a dotted decimal
+/// IPv4 of 2 to 4 parts whose first is 127: `inet_aton` reads `127.1` as `127.0.0.1`. Any other
+/// spelling of a loopback (hex, octal, one part) is refused, which only costs a test its send.
+#[cfg(any(test, feature = "loopback-only"))]
+fn is_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case(LOCALHOST_NAME) {
+        return true;
+    }
+    if let Some(v6) = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        return v6
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    }
+    let parts: Vec<&str> = host.split('.').collect();
+    (2..=4).contains(&parts.len())
+        && parts.first() == Some(&LOOPBACK_FIRST_PART)
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// Why a body read stopped before its end.
@@ -1152,6 +1174,11 @@ mod tests {
     /// Named, never sent: a test that sends to SEC's host sends to SEC once the guard is gone.
     const SEC_INDEX: &str = "https://www.sec.gov/Archives/edgar/daily-index/";
     const SEC_HOST: &str = "www.sec.gov";
+    /// `inet_aton`'s short form, which the round-robin test sends to.
+    const LOOPBACK_SHORT_URL: &str = "http://127.1:1/never";
+    /// A loopback all the same, in a spelling the guard does not read: refused.
+    const LOOPBACK_HEX_HOST: &str = "0x7f.1";
+    const LOOPBACK_HEX_URL: &str = "http://0x7f.1:1/never";
     const PACE_DIR: &str = "pace";
     const SOURCE_PACE_FILE: &str = "edgar_press.per-ip";
     const HOST_PACE_FILE: &str = "localhost.per-host";
@@ -1385,6 +1412,8 @@ mod tests {
             IPV6_LOOPBACK,
             UNPARSEABLE,
             NO_HOST,
+            LOOPBACK_SHORT_URL,
+            LOOPBACK_HEX_URL,
         ]
         .into_iter()
         .map(beyond_loopback)
@@ -1398,7 +1427,9 @@ mod tests {
                 None,
                 None,
                 None,
-                None
+                None,
+                None,
+                Some(LOOPBACK_HEX_HOST.to_owned()),
             ]
         );
     }
