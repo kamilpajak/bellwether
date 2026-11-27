@@ -317,28 +317,38 @@ fn walk_back(
     }
 }
 
-/// Asked days whose listed write is newer than the `Last-Modified` of their newest usable or
-/// empty answer: SEC wrote the index again after we read it (review QS-2). An answer that kept
-/// no `Last-Modified` is not compared; `ledger check` shows its `last_modified` null.
+/// Asked days SEC wrote again after we read them (review QS-2): the listed write is after the
+/// newest usable or empty answer was received, and after its `Last-Modified` where one parses.
+/// One answer received after the write ends it, whatever its header says (review N4).
 pub fn rewritten_days(
     listed: &BTreeMap<NaiveDate, DateTime<Utc>>,
     attempts: &[IndexAttempt],
 ) -> Result<BTreeSet<NaiveDate>, FilingsError> {
-    let mut stored: BTreeMap<NaiveDate, Option<DateTime<Utc>>> = BTreeMap::new();
+    let mut read: BTreeMap<NaiveDate, (DateTime<Utc>, Option<DateTime<Utc>>)> = BTreeMap::new();
     for attempt in attempts
         .iter()
         .filter(|attempt| matches!(attempt.verdict.as_deref(), Some("usable" | "empty")))
     {
+        let received = attempt
+            .received
+            .as_deref()
+            .ok_or_else(|| FilingsError::Unparseable {
+                what: format!("the answer of attempt {}", attempt.seq),
+                why: "no received_at".to_owned(),
+            })
+            .and_then(crate::collect::instant)?;
         let header = crate::store::stored_last_modified(attempt.headers.as_deref())?;
-        stored.insert(
+        read.insert(
             attempt.day,
-            header.as_deref().and_then(sec_edgar::http_date),
+            (received, header.as_deref().and_then(sec_edgar::http_date)),
         );
     }
-    Ok(stored
+    Ok(read
         .into_iter()
-        .filter(|(day, stored)| {
-            stored.is_some_and(|stored| listed.get(day).is_some_and(|written| *written > stored))
+        .filter(|(day, (received, stored))| {
+            listed.get(day).is_some_and(|written| {
+                written > received && stored.is_none_or(|stored| *written > stored)
+            })
         })
         .map(|(day, _)| day)
         .collect())
@@ -559,6 +569,7 @@ mod tests {
                 truncated: false,
                 headers: None,
                 data_day: None,
+                received: None,
             };
         let cut = |on: &str, limit: u64| IndexAttempt {
             truncated: true,

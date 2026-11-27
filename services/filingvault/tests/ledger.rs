@@ -723,3 +723,52 @@ fn a_holiday_list_not_covering_a_forward_day_aborts_the_check() -> TestResult {
     assert_eq!(code, Some("holidays_uncovered"));
     Ok(())
 }
+
+/// A forward day SEC rewrote after we read it, whose re-ask fails, answers no (review
+/// 2026-11-27, N3: it read `asked`, exit 0). Mutation 2026-11-27, `forward_rewritten` left out
+/// of the exit: red here.
+#[test]
+fn a_forward_day_rewritten_and_not_read_again_answers_no() -> TestResult {
+    let temp = TempDir::new()?;
+    run(temp.path(), &listing_of(&FIRST), RUN)??;
+    let named: Vec<&str> = FIRST.iter().copied().chain(["2026-11-12"]).collect();
+    let dated = listing_of(&named).replacing(
+        &index_url("2026-11-12"),
+        Reply::Dated(OK, index_of("2026-11-12"), "Fri, 13 Nov 2026 03:00:00 GMT"),
+    );
+    run(temp.path(), &dated, NEXT_RUN)??;
+    let later = [&LATER[..], &["2026-11-17", "2026-11-18"]].concat();
+    let written: Vec<(&str, String)> = later
+        .iter()
+        .map(|text| match *text {
+            "2026-11-12" => (*text, "11/18/2026 09:00:00 PM".to_owned()),
+            _ => (
+                *text,
+                format!("{}/{}/2026 10:00:00 PM", &text[5..7], &text[8..]),
+            ),
+        })
+        .collect();
+    let failing = listing_of(&later)
+        .replacing(
+            &listing_url(LISTED[0]),
+            Reply::Status(OK, listing_written(&written)),
+        )
+        .replacing(&index_url("2026-11-12"), Reply::Transport);
+    drop(run(temp.path(), &failing, "2026-11-19T06:10:00Z")?);
+    let read = checked(temp.path(), "2026-11-19T12:00:00Z")?;
+    assert_eq!(
+        (
+            read.exit,
+            read.report["forward_rewritten"].clone(),
+            read.report["forward_unasked"].clone(),
+            per_day(&read, "2026-11-12")["rewritten"].clone(),
+        ),
+        (
+            1,
+            serde_json::json!(1),
+            serde_json::json!(0),
+            serde_json::json!(true)
+        )
+    );
+    Ok(())
+}

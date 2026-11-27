@@ -133,8 +133,8 @@ const EXITS: [(&str, &[(u8, &str)]); 3] = [
     (
         "ledger check",
         &[
-            (0, "no forward index day is unasked or unlisted"),
-            (1, "the answer is no: a forward day is unasked, or no listing held by --at could name it yet, or no collect run had started by --at, or --at holds no usable listing"),
+            (0, "no forward index day is unasked, unlisted or rewritten since it was read"),
+            (1, "the answer is no: a forward day is unasked, or rewritten since it was read and not read again, or no listing held by --at could name it yet, or no collect run had started by --at, or --at holds no usable listing"),
             (2, "invalid_argument, input_unparseable, input_schema_mismatch, holidays_uncovered, io_failed"),
             (4, "input_absent: no store, rules file or holiday list"),
         ],

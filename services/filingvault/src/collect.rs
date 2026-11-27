@@ -368,9 +368,9 @@ impl Window {
 }
 
 /// Each listed day with the newest write any listing of it states.
-type Writes = BTreeMap<NaiveDate, DateTime<Utc>>;
+pub(crate) type Writes = BTreeMap<NaiveDate, DateTime<Utc>>;
 
-fn merge(held: &mut Writes, listed: Vec<Written>) {
+pub(crate) fn merge(held: &mut Writes, listed: Vec<Written>) {
     for (day, written) in listed {
         let newest = held.entry(day).or_insert(written);
         *newest = (*newest).max(written);

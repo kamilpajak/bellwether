@@ -975,6 +975,90 @@ fn a_listing_naming_a_day_of_another_quarter_is_a_permanent_failure() -> TestRes
     Ok(())
 }
 
+/// The listings of `days` before each night's run, 11-12 listed written at `written_12`.
+fn nights_listing_12(night: &str, written_12: &str) -> Stub {
+    let days = [
+        "2026-11-05",
+        "2026-11-06",
+        "2026-11-09",
+        "2026-11-10",
+        "2026-11-12",
+        "2026-11-13",
+        "2026-11-16",
+        "2026-11-17",
+        "2026-11-18",
+        "2026-11-19",
+    ];
+    let named: Vec<(&str, String)> = days
+        .iter()
+        .filter(|text| **text < night)
+        .map(|text| match *text {
+            "2026-11-12" => (*text, written_12.to_owned()),
+            _ => (
+                *text,
+                format!("{}/{}/2026 10:00:00 PM", &text[5..7], &text[8..]),
+            ),
+        })
+        .collect();
+    let names: Vec<&str> = named.iter().map(|(text, _)| *text).collect();
+    listing_of(&names).replacing(
+        &listing_url(LISTED[0]),
+        Reply::Status(OK, listing_written(&named)),
+    )
+}
+
+/// A listed write that stays 1 s after the stored `Last-Modified` asks the day again only until
+/// an answer is received after the write (review 2026-11-27, N4: asked on all 13 nights).
+/// Mutation 2026-11-27, the receive instant not compared: red here.
+#[test]
+fn a_listed_write_never_matched_by_the_header_is_not_asked_every_night() -> TestResult {
+    let temp = TempDir::new()?;
+    let mut nights = Vec::new();
+    for night in day("2026-11-13")
+        .iter_days()
+        .take_while(|on| *on <= day("2026-11-20"))
+    {
+        let night = night.format("%Y-%m-%d").to_string();
+        let stub = nights_listing_12(&night, "11/12/2026 10:00:01 PM").replacing(
+            &index_url("2026-11-12"),
+            Reply::Dated(OK, index_of("2026-11-12"), "Fri, 13 Nov 2026 03:00:00 GMT"),
+        );
+        drop(run(temp.path(), &stub, &format!("{night}T06:10:00Z"))?);
+        if asked_days(&stub).contains(&"2026-11-12".to_owned()) {
+            nights.push(night);
+        }
+    }
+    assert_eq!(
+        nights,
+        [
+            "2026-11-13",
+            "2026-11-14",
+            "2026-11-15",
+            "2026-11-16",
+            "2026-11-17"
+        ]
+        .map(str::to_owned)
+    );
+    Ok(())
+}
+
+/// A stored `Last-Modified` that does not parse does not hide a rewrite: the receive instant is
+/// compared (review 2026-11-27, F2: never asked again). Mutation 2026-11-27, an unparseable
+/// header read as "not rewritten": red here.
+#[test]
+fn a_rewrite_after_an_answer_whose_last_modified_does_not_parse_is_asked() -> TestResult {
+    let temp = TempDir::new()?;
+    let first = nights_listing_12("2026-11-13", "11/12/2026 10:00:00 PM").replacing(
+        &index_url("2026-11-12"),
+        Reply::Dated(OK, index_of("2026-11-12"), "yesterday"),
+    );
+    run(temp.path(), &first, NEXT_RUN)??;
+    let rewritten = nights_listing_12("2026-11-20", "11/18/2026 09:00:00 PM");
+    run(temp.path(), &rewritten, "2026-11-20T06:10:00Z")??;
+    assert!(asked_days(&rewritten).contains(&"2026-11-12".to_owned()));
+    Ok(())
+}
+
 /// One failed request is enough for exit 8. Mutation 2026-11-27, exit 8 from two failures: red.
 #[test]
 fn one_failed_request_makes_the_run_partial() -> TestResult {

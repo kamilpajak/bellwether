@@ -469,7 +469,7 @@ pub fn open_read(store: &Path) -> Result<Connection, FilingsError> {
 /// The two attempt reads of the planner and `ledger check`, each served by `attempts_by_target`.
 const INDEX_ATTEMPTS: &str =
     "SELECT seq, target, forms, body_limit, outcome, verdict, status, truncated,
-       response_headers, data_day
+       response_headers, data_day, received_at
   FROM attempts
  WHERE kind = 'index' AND closed_at IS NOT NULL AND (?1 IS NULL OR closed_at <= ?1)
  ORDER BY target, seq";
@@ -493,6 +493,8 @@ pub struct IndexAttempt {
     pub truncated: bool,
     pub headers: Option<String>,
     pub data_day: Option<NaiveDate>,
+    /// `received_at`: a listed write after it is a rewrite we have not read (review N4).
+    pub received: Option<String>,
 }
 
 /// Every index attempt closed by `until`, or every closed one; ordered by day, then `seq`.
@@ -515,13 +517,20 @@ pub fn index_attempts(
                     row.get::<_, Option<bool>>(7)?,
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ),
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let mut attempts = Vec::with_capacity(rows.len());
-    for (seq, target, forms, body_limit, outcome, (verdict, status, truncated, headers, data)) in
-        rows
+    for (
+        seq,
+        target,
+        forms,
+        body_limit,
+        outcome,
+        (verdict, status, truncated, headers, data, received),
+    ) in rows
     {
         let forms: Vec<String> = serde_json::from_str(forms.as_deref().unwrap_or_default())
             .map_err(|why| FilingsError::Unparseable {
@@ -539,6 +548,7 @@ pub fn index_attempts(
             truncated: truncated.unwrap_or(false),
             headers,
             data_day: data.as_deref().map(day_of).transpose()?,
+            received,
         });
     }
     Ok(attempts)

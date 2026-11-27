@@ -1,19 +1,19 @@
 //! `filingvault ledger check --at`: which index days were asked, as of an instant (architecture.md
 //! section 12.2, "What complete means"). Read-only and lease-free. Exit 1 is "the answer is no":
-//! a forward day is not asked or not yet listed, no collect run had started by `--at`, or no
-//! usable listing was held by it.
+//! a forward day is not asked, not yet listed, or rewritten since it was read; no collect run had
+//! started by `--at`; or no usable listing was held by it.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Datelike, Days, NaiveDate, Utc, Weekday};
 use rusqlite::Connection;
-use sec_edgar::{listed_days, Quarter};
+use sec_edgar::{listed_writes, Quarter};
 use serde_json::{json, Value};
 use vault_core::blobs::BlobStore;
 
-use crate::collect::instant;
-use crate::discover::{day_states, DayState, BODY_LIMIT};
+use crate::collect::{instant, merge, Writes};
+use crate::discover::{day_states, rewritten_days, DayState, BODY_LIMIT};
 use crate::error::FilingsError;
 use crate::holidays::Holidays;
 use crate::rules::Rules;
@@ -67,24 +67,28 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
     let mut listed: BTreeMap<NaiveDate, String> = BTreeMap::new();
     let mut newest_named: BTreeMap<String, NaiveDate> = BTreeMap::new();
     let mut usable_listings = 0_u32;
+    let mut writes = Writes::new();
     for held in store::held_listings(&db, Some(&until))? {
         usable_listings += u32::from(held.usable);
-        let days = listed_days(&store::read_blob(&blobs, &held.blob)?).map_err(|why| {
+        let days = listed_writes(&store::read_blob(&blobs, &held.blob)?).map_err(|why| {
             FilingsError::Unparseable {
                 what: format!("the stored listing of {}", held.quarter),
                 why: why.to_string(),
             }
         })?;
-        for day in days {
+        for (day, _) in &days {
+            let day = *day;
             let newest = newest_named.entry(held.quarter.clone()).or_insert(day);
             *newest = (*newest).max(day);
             if day < at_date {
                 listed.insert(day, held.quarter.clone());
             }
         }
+        merge(&mut writes, days);
     }
     let attempts = store::index_attempts(&db, Some(&until))?;
     let states = day_states(&attempts, &asked.rules.forms, BODY_LIMIT);
+    let rewritten = rewritten_days(&writes, &attempts)?;
     let rows = rows_by_day(&db, &until, &attempts)?;
     let owed = |day: NaiveDate| {
         forward_from
@@ -108,6 +112,7 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
     }
     let mut counts: BTreeMap<&str, u32> = BTreeMap::new();
     let mut forward_unasked = 0_u32;
+    let mut forward_rewritten = 0_u32;
     let mut data_day_mismatch = 0_u32;
     let mut day_rows = Vec::with_capacity(listed.len());
     for (day, quarter) in &listed {
@@ -116,6 +121,9 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
         let forward = owed(*day);
         if forward && state != DayState::Asked {
             forward_unasked += 1;
+        }
+        if forward && state == DayState::Asked && rewritten.contains(day) {
+            forward_rewritten += 1;
         }
         let of_day: Vec<&store::IndexAttempt> = attempts
             .iter()
@@ -136,6 +144,7 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
             "quarter": quarter,
             "state": state.name(),
             "forward": forward,
+            "rewritten": rewritten.contains(day),
             "attempts": of_day.len(),
             "last_attempt": last.map(|attempt| json!({
                 "outcome": attempt.outcome,
@@ -167,6 +176,7 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
     let exit = if forward_from.is_none()
         || usable_listings == 0
         || forward_unasked > 0
+        || forward_rewritten > 0
         || forward_unlisted > 0
     {
         ANSWER_IS_NO
@@ -181,6 +191,7 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
         "days": by_state,
         "forward_unasked": forward_unasked,
         "forward_unlisted": forward_unlisted,
+        "forward_rewritten": forward_rewritten,
         "usable_listings": usable_listings,
         "last_data_received_mismatch": data_day_mismatch,
         "listed_rows": rows.values().map(|held| held.listed).sum::<u32>(),
