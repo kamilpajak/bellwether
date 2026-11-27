@@ -64,6 +64,7 @@ keep passing.
 | `providers/` | one crate per vendor adapter, and `sec-edgar`: what is true of SEC's host for every caller. Each declares no HTTP dependency at all |
 | `vault-core/` | store mechanics every archive needs, whatever it stores: the content-addressed blob store and its error type. It depends on no other crate of this repository |
 | `services/newsvault/` | the archive: the commit log, the coverage reader and the segment export, in Rust |
+| `services/filingvault/` | the filings context: which annual reports SEC lists per index day, with an attempt row for every call and `ledger check` over days. It has never sent a request to SEC |
 | `services/modelgate/` | the only exit to a language model: `decide` calls behind an attempt ledger, a cost cap and a pinned build, and the record-only `shadow run`. Nothing has been sent to a model |
 | `snapshot-contract/` | the Snapshot contract `vault` hands `derive`: the column list, the manifest, the visibility predicate every reader of stored times calls, the writer and the validator `newsvault cut` runs before it renames a cut into place |
 | `panel-contract/` | the panel manifest contract: the shape the statistics tier may read, and the validator that refuses a row count that is really a product |
