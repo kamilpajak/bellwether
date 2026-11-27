@@ -1628,7 +1628,7 @@ impl Committer {
 
     /// Stores a payload under its own digest, before any transaction opens.
     pub fn put_blob(&self, payload: &[u8]) -> Result<BlobDigest, StoreError> {
-        Ok(self.blobs.put(self.run.as_str(), payload)?)
+        Ok(self.blobs.put(self.run.as_str(), payload)?.digest)
     }
 
     /// The blob tree this writer puts into, under its lease.

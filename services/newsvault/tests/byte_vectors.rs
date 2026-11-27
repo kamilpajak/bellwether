@@ -54,7 +54,7 @@ fn put(case: &str) -> TestResult<(Value, Value, bool)> {
     if let Some(dictionary) = dictionary {
         writer.activate(&writer.store_dictionary(RUN, &dictionary)?)?;
     }
-    let digest = writer.put(RUN, payload)?;
+    let digest = writer.put(RUN, payload)?.digest;
     let mut found = BTreeMap::new();
     files(root.path(), root.path(), &mut found)?;
     let read = blob_store(root.path()).read_verified(&digest)?;

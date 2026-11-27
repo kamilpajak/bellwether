@@ -6,6 +6,7 @@
 //! layout, the level and how a dictionary is named: architecture.md section 3.9, row
 //! "compression".
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -29,6 +30,14 @@ impl BlobDigest {
     pub fn hex(&self) -> &str {
         &self.0
     }
+}
+
+/// What one write left: the digest, and the length of the file on disk that holds it, which a
+/// context's `blobs.stored_bytes` records (architecture.md section 12.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stored {
+    pub digest: BlobDigest,
+    pub stored_bytes: u64,
 }
 
 /// The zstd level every blob is written at, chosen by architecture.md section 3.9's level table.
@@ -261,24 +270,38 @@ impl BlobStore {
         }
     }
 
-    /// Stores a payload under its own digest and returns it. A digest already held in either
-    /// form is not written again. Under [`WritePolicy::RawUntilDictionary`], raw until a
+    /// Stores a payload under its own digest and returns it with the length of the file that
+    /// holds it. A digest already held in either form is not written again, and answers the
+    /// length of the copy a read takes. Under [`WritePolicy::RawUntilDictionary`], raw until a
     /// dictionary is active: `blobs compress` rewrites a raw file and never a `.zst` one, so a
     /// frame written without a dictionary would keep the weaker ratio for good (architecture.md
     /// section 3.9's level table, 2.99 against 7.49).
-    pub fn put(&self, run: &str, payload: &[u8]) -> Result<BlobDigest, BlobError> {
+    pub fn put(&self, run: &str, payload: &[u8]) -> Result<Stored, BlobError> {
         let digest = BlobDigest(const_hex::encode(Sha256::digest(payload)));
         let held = self.listed(&digest);
         if held.raw || held.zstd {
-            return Ok(digest);
+            let stored_bytes = fs::metadata(self.path_in(&digest, held.read_from()))?.len();
+            return Ok(Stored {
+                digest,
+                stored_bytes,
+            });
         }
         let staging = self.staging_path(run, &digest);
-        if self.policy == WritePolicy::RawUntilDictionary && self.active_dictionary().is_none() {
-            return write_durably(&staging, &self.path_of(&digest), payload).map(|()| digest);
-        }
-        let encoded = self.encode(payload)?;
-        write_durably(&staging, &self.compressed_path_of(&digest), &encoded)?;
-        Ok(digest)
+        let (target, bytes) = if self.policy == WritePolicy::RawUntilDictionary
+            && self.active_dictionary().is_none()
+        {
+            (self.path_of(&digest), Cow::Borrowed(payload))
+        } else {
+            (
+                self.compressed_path_of(&digest),
+                Cow::Owned(self.encode(payload)?),
+            )
+        };
+        write_durably(&staging, &target, &bytes)?;
+        Ok(Stored {
+            digest,
+            stored_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        })
     }
 
     /// A digest this store ALREADY holds, by its hex, in either form. The file has to be there,
@@ -970,7 +993,7 @@ mod tests {
     ) -> TestResult {
         let temp = TempDir::new()?;
         let store = compressing(&temp)?;
-        let digest = store.put(RUN, PAYLOAD)?;
+        let digest = store.put(RUN, PAYLOAD)?.digest;
         let file = fs::read(store.compressed_path_of(&digest))?;
         assert_eq!(
             (
@@ -996,7 +1019,7 @@ mod tests {
     fn before_a_dictionary_is_active_a_payload_is_stored_raw() -> TestResult {
         let temp = TempDir::new()?;
         let store = BlobStore::new(temp.path(), RAW_FIRST);
-        let digest = store.put(RUN, PAYLOAD)?;
+        let digest = store.put(RUN, PAYLOAD)?.digest;
         assert_eq!(
             (
                 fs::read(store.path_of(&digest))?,
@@ -1030,7 +1053,7 @@ mod tests {
     fn the_bulk_read_refuses_a_frame_that_decodes_to_other_bytes() -> TestResult {
         let temp = TempDir::new()?;
         let store = compressing(&temp)?;
-        let digest = store.put(RUN, PAYLOAD)?;
+        let digest = store.put(RUN, PAYLOAD)?.digest;
         overwrite_compressed(&store.compressed_path_of(&digest), b"other bytes")?;
         let read: Vec<_> = store
             .stream()
@@ -1060,7 +1083,7 @@ mod tests {
     fn a_compressed_file_decoding_to_other_bytes_is_altered() -> TestResult {
         let temp = TempDir::new()?;
         let store = compressing(&temp)?;
-        let digest = store.put(RUN, PAYLOAD)?;
+        let digest = store.put(RUN, PAYLOAD)?.digest;
         overwrite_compressed(&store.compressed_path_of(&digest), b"other bytes")?;
         let read = store.read_verified(&digest);
         assert!(
@@ -1079,7 +1102,7 @@ mod tests {
         let temp = TempDir::new()?;
         let store = compressing(&temp)?;
         let long = [b'a'; 10_000];
-        let compressed = store.put(RUN, &long)?;
+        let compressed = store.put(RUN, &long)?.digest;
         let raw = write_raw(&store, PAYLOAD)?;
         let stored = fs::metadata(store.compressed_path_of(&compressed))?.len();
         assert_eq!(
@@ -1102,8 +1125,8 @@ mod tests {
         let temp = TempDir::new()?;
         let store = compressing(&temp)?;
         let raw = write_raw(&store, PAYLOAD)?;
-        let put = store.put(RUN, PAYLOAD)?;
-        let compressed = store.put(RUN, b"a later payload")?;
+        let put = store.put(RUN, PAYLOAD)?.digest;
+        let compressed = store.put(RUN, b"a later payload")?.digest;
         assert_eq!(
             (
                 &put,
@@ -1135,7 +1158,7 @@ mod tests {
         let raw = write_raw(&store, &looks_compressed)?;
         let server_zstd = zstd::bulk::compress(PAYLOAD, 3)?;
         let raw_frame = write_raw(&store, &server_zstd)?;
-        let put = store.put(RUN, &[&ZSTD_MAGIC[..], PAYLOAD].concat())?;
+        let put = store.put(RUN, &[&ZSTD_MAGIC[..], PAYLOAD].concat())?.digest;
         assert_eq!(
             (
                 store.read_verified(&raw)?,
@@ -1162,7 +1185,7 @@ mod tests {
         let dictionary = writer.store_dictionary(RUN, &trained(&["prn", "gnw"])?)?;
         writer.activate(&dictionary)?;
         let page = fixtures("fed")?.concat();
-        let digest = writer.put(RUN, &page)?;
+        let digest = writer.put(RUN, &page)?.digest;
         let reader = BlobStore::new(temp.path(), RAW_FIRST);
         let back = reader.read_copy(&digest, Encoding::Zstd)?;
         assert_eq!(
@@ -1180,7 +1203,7 @@ mod tests {
         let writer = BlobStore::new(temp.path(), RAW_FIRST);
         let dictionary = writer.store_dictionary(RUN, &trained(&["prn", "gnw"])?)?;
         writer.activate(&dictionary)?;
-        let digest = writer.put(RUN, PAYLOAD)?;
+        let digest = writer.put(RUN, PAYLOAD)?.digest;
         fs::remove_file(writer.dictionary_path(dictionary.hex()))?;
         let read = BlobStore::new(temp.path(), RAW_FIRST).read_verified(&digest);
         assert!(
@@ -1217,10 +1240,10 @@ mod tests {
         let plain = write_plain_frame(&store, &pages[1])?;
         let first = store.store_dictionary(RUN, &trained(&["prn", "gnw"])?)?;
         store.activate(&first)?;
-        let under_first = store.put(RUN, &pages[2])?;
+        let under_first = store.put(RUN, &pages[2])?.digest;
         let second = store.store_dictionary(RUN, &trained(&["fed", "yahoo", "gnw"])?)?;
         store.activate(&second)?;
-        let under_second = store.put(RUN, &pages[3])?;
+        let under_second = store.put(RUN, &pages[3])?.digest;
         let mut expected = vec![
             (raw, Encoding::Raw, None, pages[0].clone()),
             (plain, Encoding::Zstd, None, pages[1].clone()),
@@ -1449,7 +1472,7 @@ mod tests {
             store.store_dictionary(RUN, b"a dictionary").map(|_| ()),
             store.activate(&dictionary),
         ];
-        let digest = store.put(RUN, PAYLOAD)?;
+        let digest = store.put(RUN, PAYLOAD)?.digest;
         let back = store.read_copy(&digest, Encoding::Zstd)?;
         for refused in &refused {
             assert!(
@@ -1476,12 +1499,44 @@ mod tests {
     fn a_payload_a_plain_store_holds_is_not_written_again() -> TestResult {
         let temp = TempDir::new()?;
         let store = BlobStore::new(temp.path(), WritePolicy::PlainZstd);
-        let digest = store.put(RUN, PAYLOAD)?;
+        let digest = store.put(RUN, PAYLOAD)?.digest;
         fs::write(store.compressed_path_of(&digest), SENTINEL)?;
-        let again = store.put(RUN, PAYLOAD)?;
+        let again = store.put(RUN, PAYLOAD)?.digest;
         assert_eq!(
             (again, fs::read(store.compressed_path_of(&digest))?),
             (digest, SENTINEL.to_vec())
+        );
+        Ok(())
+    }
+
+    /// The size a context's `blobs.stored_bytes` records (section 12.2): the file's length, for a
+    /// frame, a raw copy and a digest already held. Mutations 2026-11-27, each red here: the
+    /// payload's length returned; a held digest answering 0.
+    #[test]
+    fn a_write_returns_the_size_of_the_file_it_left_and_a_held_digest_the_size_already_there(
+    ) -> TestResult {
+        let plain_root = TempDir::new()?;
+        let raw_root = TempDir::new()?;
+        let plain = BlobStore::new(plain_root.path(), WritePolicy::PlainZstd);
+        let raw = BlobStore::new(raw_root.path(), RAW_FIRST);
+        let long = PAYLOAD.repeat(64);
+        let framed = plain.put(RUN, &long)?;
+        let again = plain.put(RUN, &long)?;
+        let kept = raw.put(RUN, PAYLOAD)?;
+        let on_disk = |path: PathBuf| fs::metadata(path).map(|file| file.len());
+        assert_eq!(
+            (
+                framed.stored_bytes,
+                again.stored_bytes,
+                kept.stored_bytes,
+                framed.stored_bytes < u64::try_from(long.len())?,
+            ),
+            (
+                on_disk(plain.compressed_path_of(&framed.digest))?,
+                framed.stored_bytes,
+                u64::try_from(PAYLOAD.len())?,
+                true,
+            )
         );
         Ok(())
     }
@@ -1511,7 +1566,7 @@ mod tests {
     fn a_file_that_names_no_digest_is_listed_as_a_stray_and_the_walk_goes_on() -> TestResult {
         let temp = TempDir::new()?;
         let store = BlobStore::new(temp.path(), RAW_FIRST);
-        let digest = store.put(RUN, PAYLOAD)?;
+        let digest = store.put(RUN, PAYLOAD)?.digest;
         let stray = store.space().join("00").join("00").join("notes.txt");
         if let Some(parent) = stray.parent() {
             fs::create_dir_all(parent)?;

@@ -422,7 +422,7 @@ fn zst_path(store: &Path, hex: &str) -> PathBuf {
 fn frame_of(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     let scratch = TempDir::new()?;
     let blobs = store::blob_store(scratch.path());
-    let digest = blobs.put("scratch", payload)?;
+    let digest = blobs.put("scratch", payload)?.digest;
     blobs.compress_raw("scratch", &digest)?;
     Ok(std::fs::read(blobs.compressed_path_of(&digest))?)
 }
