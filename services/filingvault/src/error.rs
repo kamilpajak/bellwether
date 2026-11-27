@@ -88,6 +88,9 @@ pub enum FilingsError {
     Absent(PathBuf),
     #[error("{what} could not be read: {why}")]
     Unparseable { what: String, why: String },
+    /// The fill window `fill_days` names cannot be walked back by quarter.
+    #[error("the fill window cannot be planned: {0}")]
+    FillWindow(String),
     #[error("{} is at user_version {found}; this build reads {expected}", .path.display())]
     SchemaMismatch {
         path: PathBuf,
@@ -132,7 +135,7 @@ impl FilingsError {
         match self {
             Self::Usage(_) => ErrorCode::InvalidArgument,
             Self::Absent(_) => ErrorCode::InputAbsent,
-            Self::Unparseable { .. } => ErrorCode::InputUnparseable,
+            Self::Unparseable { .. } | Self::FillWindow(_) => ErrorCode::InputUnparseable,
             Self::SchemaMismatch { .. } => ErrorCode::InputSchemaMismatch,
             Self::Contact(why) => ErrorCode::named(why.code()).unwrap_or(ErrorCode::IoFailed),
             Self::ContactUnaddressed | Self::Credential(_) => ErrorCode::CredentialContactMissing,

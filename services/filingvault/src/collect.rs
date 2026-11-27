@@ -243,7 +243,7 @@ impl Driver<'_> {
         };
         let window = Window::of(&self.writer, rules, run_date)?;
         let mut days = window.held_days.clone();
-        for quarter in quarters_to_ask(window.fill_start, window.current, &window.complete) {
+        for quarter in quarters_to_ask(window.fill_start, window.current, &window.complete)? {
             let described = listing_ask(quarter);
             if !allowed(robots.as_ref(), &described.url) {
                 return Ok(Some(Stop::Robots(RobotsStop::Disallowed)));
@@ -325,7 +325,7 @@ impl Window {
         let current = Quarter::of(run_date.pred_opt().unwrap_or(run_date));
         let mut held_days = BTreeMap::new();
         let mut complete = BTreeSet::new();
-        let labels: BTreeMap<String, Quarter> = quarters_to_ask(fill_start, current, &complete)
+        let labels: BTreeMap<String, Quarter> = quarters_to_ask(fill_start, current, &complete)?
             .into_iter()
             .map(|quarter| (quarter.label(), quarter))
             .collect();
@@ -438,7 +438,7 @@ fn planned(ask: &Ask, run_id: &str, started: DateTime<Utc>) -> Result<Report, Fi
         Err(FilingsError::Absent(_)) => {
             let fill_start = run_date - Days::new(u64::from(ask.rules.fill_days));
             (
-                quarters_to_ask(fill_start, current, &BTreeSet::new()),
+                quarters_to_ask(fill_start, current, &BTreeSet::new())?,
                 Vec::new(),
             )
         }
@@ -457,7 +457,7 @@ fn planned(ask: &Ask, run_id: &str, started: DateTime<Utc>) -> Result<Report, Fi
                 BODY_LIMIT,
             );
             (
-                quarters_to_ask(window.fill_start, window.current, &window.complete),
+                quarters_to_ask(window.fill_start, window.current, &window.complete)?,
                 days_to_ask(&listed, &states, window.fill_start, run_date),
             )
         }

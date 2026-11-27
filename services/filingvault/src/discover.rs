@@ -12,6 +12,7 @@ use news_provider::{
 };
 use sec_edgar::{accession_of, body_of_200, index_rows, listed_days, Quarter, HOST, INDEX_DATE};
 
+use crate::error::FilingsError;
 use crate::store::{Ask, IndexAttempt, Kind, Listed};
 
 /// The ledger's source of every filings request; the `Wire`'s per-IP bucket is SEC's shared one.
@@ -251,25 +252,50 @@ pub fn day_states(
 }
 
 /// The quarters a run asks for a listing, newest first: the current one always, and each other
-/// quarter of the fill window while no listing of it was received after its last day.
-#[must_use]
+/// quarter of the fill window while no listing of it was received after its last day. A step back
+/// that does not go back, or more quarters than the window holds, is an error and never a loop.
 pub fn quarters_to_ask(
     fill_start: NaiveDate,
     current: Quarter,
     received_after_end: &BTreeSet<Quarter>,
-) -> Vec<Quarter> {
-    let oldest = Quarter::of(fill_start);
-    let mut quarters = vec![current];
-    let mut quarter = current.previous();
-    while quarter >= oldest {
-        if !received_after_end.contains(&quarter) {
-            quarters.push(quarter);
-        }
-        quarter = quarter.previous();
-    }
-    quarters
+) -> Result<Vec<Quarter>, FilingsError> {
+    walk_back(fill_start, current, received_after_end, Quarter::previous)
 }
 
+/// The shortest quarter, a non-leap first one, in days.
+const SHORTEST_QUARTER_DAYS: i64 = 90;
+
+fn walk_back(
+    fill_start: NaiveDate,
+    current: Quarter,
+    received_after_end: &BTreeSet<Quarter>,
+    step: impl Fn(Quarter) -> Quarter,
+) -> Result<Vec<Quarter>, FilingsError> {
+    let oldest = Quarter::of(fill_start);
+    let most = (current.first_day() - fill_start).num_days().max(0) / SHORTEST_QUARTER_DAYS + 2;
+    let mut quarters = vec![current];
+    let mut quarter = current;
+    let mut steps = 0_i64;
+    loop {
+        let next = step(quarter);
+        steps += 1;
+        if next >= quarter || steps > most {
+            return Err(FilingsError::FillWindow(format!(
+                "the quarter before {} is {}, and the window from {fill_start} holds at most \
+                 {most}",
+                quarter.label(),
+                next.label()
+            )));
+        }
+        if next < oldest {
+            return Ok(quarters);
+        }
+        if !received_after_end.contains(&next) {
+            quarters.push(next);
+        }
+        quarter = next;
+    }
+}
 /// The index days a run asks, newest first: the trailing [`TRAILING_DAYS`] listed days before
 /// the run's date, then every other listed day of the fill window not asked or cut.
 #[must_use]
@@ -298,4 +324,48 @@ pub fn days_to_ask(
                 .filter(|day| !matches!(state(day), DayState::Asked | DayState::Truncated)),
         )
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn day(text: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap_or_default()
+    }
+
+    /// A step that does not go back ends the walk with an error. On 2026-11-27, `Quarter::of`
+    /// mutated to `month % 12` grew the walk to 87 GB resident and panicked the host kernel.
+    #[test]
+    fn a_quarter_step_that_does_not_go_back_is_an_error_and_never_a_loop() {
+        let current = Quarter::of(day("2026-11-12"));
+        let fill_start = day("2025-08-13");
+        let none = BTreeSet::new();
+        let labels = |walked: Result<Vec<Quarter>, FilingsError>| {
+            walked.map(|quarters| quarters.into_iter().map(Quarter::label).collect::<Vec<_>>())
+        };
+        let stuck =
+            walk_back(fill_start, current, &none, |quarter| quarter).map_err(|why| why.code());
+        assert_eq!(
+            (
+                labels(quarters_to_ask(fill_start, current, &none)).ok(),
+                stuck
+            ),
+            (
+                Some(
+                    [
+                        "2026/QTR4",
+                        "2026/QTR3",
+                        "2026/QTR2",
+                        "2026/QTR1",
+                        "2025/QTR4",
+                        "2025/QTR3"
+                    ]
+                    .map(str::to_owned)
+                    .to_vec()
+                ),
+                Err(crate::error::ErrorCode::InputUnparseable)
+            )
+        );
+    }
 }
