@@ -33,6 +33,13 @@ ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
 # `newsvault` already pull it; without `dev` the figure is 160 either way.
 [dev-dependencies]
 tempfile = "3.27.0"
+# The integration tests link this crate without `cfg(test)`; this turns the guard on for them.
+news-provider = { path = ".", features = ["loopback-only"] }
+
+# Sends to loopback only: architecture.md section 8 row N1. A dev-dependency's feature, never a
+# normal one's, so a release build never holds it.
+[features]
+loopback-only = []
 
 [lints]
 workspace = true

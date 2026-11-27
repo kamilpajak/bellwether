@@ -340,6 +340,88 @@ pub fn store_free_failure(root_manifest: &Path) -> Option<String> {
     }
 }
 
+/// The seam's feature that refuses every host but the loopback before the socket (row N1).
+pub const LOOPBACK_ONLY: &str = "loopback-only";
+const SEAM_CRATE: &str = "news-provider";
+const ROW_N1: &str = "docs/design/architecture.md section 8 row N1";
+
+/// Row N1: `None` when the seam states [`LOOPBACK_ONLY`] outside its defaults, every member that
+/// reaches the seam (the seam included) turns it on as a dev-dependency, and no normal or build
+/// edge does. A test build of any such member then holds the guard; a release build none.
+pub fn loopback_only_failure(root_manifest: &Path) -> Option<String> {
+    let read = || -> Result<Vec<String>, String> {
+        let json = cargo_metadata(root_manifest)?;
+        let meta: serde_json::Value = serde_json::from_slice(&json)
+            .map_err(|why| format!("`cargo metadata` printed something that is not JSON: {why}"))?;
+        let packages = array_at(&meta, "packages")?;
+        let seam = packages
+            .iter()
+            .find(|package| {
+                package.get("name").and_then(serde_json::Value::as_str) == Some(SEAM_CRATE)
+            })
+            .ok_or_else(|| format!("no workspace member is named `{SEAM_CRATE}`"))?;
+        let features = seam.get("features").cloned().unwrap_or_default();
+        let mut problems = Vec::new();
+        if features.get(LOOPBACK_ONLY).is_none() {
+            problems.push(format!(
+                "    * {SEAM_CRATE} states no `{LOOPBACK_ONLY}` feature"
+            ));
+        }
+        let defaults = features.get("default").cloned().unwrap_or_default();
+        if defaults
+            .as_array()
+            .is_some_and(|on| on.iter().any(|name| name == LOOPBACK_ONLY))
+        {
+            problems.push(format!(
+                "    * {SEAM_CRATE} turns `{LOOPBACK_ONLY}` on by default"
+            ));
+        }
+        let edges = member_edges(root_manifest)?;
+        for package in packages {
+            let member = string_at(package, "name")?;
+            let reaches = member == SEAM_CRATE
+                || reached_from(&edges, &member)
+                    .iter()
+                    .any(|(name, _, _)| name == SEAM_CRATE);
+            let mut guarded = false;
+            for dependency in array_at(package, "dependencies")? {
+                if string_at(dependency, "name")? != SEAM_CRATE {
+                    continue;
+                }
+                let on = dependency
+                    .get("features")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|on| on.iter().any(|name| name == LOOPBACK_ONLY));
+                let kind = dependency.get("kind").and_then(serde_json::Value::as_str);
+                match (kind, on) {
+                    (Some("dev"), true) => guarded = true,
+                    (_, true) => problems.push(format!(
+                        "    * {member} turns `{LOOPBACK_ONLY}` on outside its dev-dependencies"
+                    )),
+                    _ => {}
+                }
+            }
+            if reaches && !guarded {
+                problems.push(format!(
+                    "    * {member} reaches `{SEAM_CRATE}` and its tests do not turn on \
+                     `{LOOPBACK_ONLY}`"
+                ));
+            }
+        }
+        problems.sort();
+        Ok(problems)
+    };
+    match read() {
+        Err(why) => Some(format!("{why}\n\nThe invariant is {ROW_N1}.\n")),
+        Ok(problems) if problems.is_empty() => None,
+        Ok(problems) => Some(format!(
+            "A test build could send beyond the loopback ({ROW_N1}):\n\n{}\n\nA test whose lease, \
+             flag or gate is mutated away then sends to the vendor itself, SEC included.\n",
+            problems.join("\n")
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -379,6 +461,14 @@ mod tests {
     #[test]
     fn the_model_owner_depends_on_nothing_of_the_news_side_and_nothing_depends_on_it() {
         assert_eq!(model_owner_isolation_failure(&root_manifest()), None);
+    }
+
+    /// Row N1 over this workspace. Mutations 2026-11-27, each red here: `loopback-only` dropped
+    /// from `services/filingvault/Cargo.toml`'s dev-dependency; moved to its normal dependency.
+    #[test]
+    fn every_member_that_reaches_the_seam_tests_against_the_loopback_only() {
+        let failure = loopback_only_failure(&root_manifest()).unwrap_or_default();
+        assert!(failure.is_empty(), "\n\n{failure}\n");
     }
 
     /// Row FV1 over this workspace. Mutations 2026-11-25, each red here: `news-provider` added to

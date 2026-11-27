@@ -1178,6 +1178,7 @@ dependencies = [
  "canon",
  "chrono",
  "flate2",
+ "news-provider",
  "pit",
  "serde_json",
  "tempfile",

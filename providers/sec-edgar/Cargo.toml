@@ -17,3 +17,7 @@ thiserror = "2.0.21"
 
 [lints]
 workspace = true
+
+# Every test sends to loopback only: architecture.md section 8 row N1.
+[dev-dependencies]
+news-provider = { path = "../../news-provider", features = ["loopback-only"] }

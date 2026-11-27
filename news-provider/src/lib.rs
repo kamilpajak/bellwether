@@ -77,7 +77,7 @@ pub use request::{
 pub use wire::{
     received, CappedHold, Credentials, Headers, RawResponse, Received, Reservation, SendFailure,
     Slowed, Timeouts, TransportError, TransportKind, TransportProfile, Unreserved, Wire,
-    HOLD_CEILING,
+    HOLD_CEILING, LOOPBACK_ONLY_REFUSAL,
 };
 
 #[cfg(test)]

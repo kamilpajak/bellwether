@@ -188,6 +188,13 @@ const GZIP: &str = "gzip";
 /// `TooManyRedirects` only above 0 (`config.rs`); its default, 10, sends each hop unpaced and
 /// unledgered (architecture.md section 8 row R19).
 const MAX_REDIRECTS: u32 = 0;
+/// The `detail` of a send a test build refused before the socket, because its url names a host
+/// that is not the loopback (architecture.md section 8 row N1). Only a test build holds the text.
+pub const LOOPBACK_ONLY_REFUSAL: &str =
+    "refused before the socket: a test build sends to loopback only";
+/// The hosts a test build sends to, compared without case: `http::Uri` keeps IPv6 brackets.
+#[cfg(any(test, feature = "loopback-only"))]
+const LOOPBACK_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "[::1]"];
 
 /// The [`KEPT_HEADERS`] of one answer, as `(name, value)` pairs in the order `http` 1.x's
 /// `HeaderMap` yields them: names by first appearance, each name's values in the order received.
@@ -908,6 +915,16 @@ impl Wire {
         url: &str,
         headers: &[(String, String)],
     ) -> Result<(u16, Headers, Vec<u8>), Failed> {
+        #[cfg(any(test, feature = "loopback-only"))]
+        if let Some(host) = beyond_loopback(url) {
+            return Err(Failed {
+                kind: TransportKind::Conversation,
+                status: None,
+                headers: Headers::default(),
+                cut: None,
+                detail: format!("{LOOPBACK_ONLY_REFUSAL}: {host}"),
+            });
+        }
         let mut call = self.agent.get(url);
         for (name, value) in headers {
             call = call.header(name, value);
@@ -954,6 +971,19 @@ impl Wire {
             }),
         }
     }
+}
+
+/// The host of `url` when it names one outside [`LOOPBACK_HOSTS`]. A url `http::Uri` cannot
+/// parse, or one with no host, passes: ureq 3.5.2 parses with that same type and refuses either
+/// before any socket.
+#[cfg(any(test, feature = "loopback-only"))]
+fn beyond_loopback(url: &str) -> Option<String> {
+    let uri = url.parse::<ureq::http::Uri>().ok()?;
+    let host = uri.host()?;
+    (!LOOPBACK_HOSTS
+        .iter()
+        .any(|loopback| host.eq_ignore_ascii_case(loopback)))
+    .then(|| host.to_owned())
 }
 
 /// Why a body read stopped before its end.
@@ -1036,9 +1066,10 @@ struct Failed {
 #[cfg(test)]
 mod tests {
     use super::{
-        received, retry_after, Backoff, CappedHold, Credentials, DateTime, Headers, RawResponse,
-        Reservation, SendFailure, Slowed, Timeouts, TransportError, TransportKind,
-        TransportProfile, Unreserved, Utc, Wire, GATE_TRIES, USER_AGENT,
+        beyond_loopback, received, retry_after, Backoff, CappedHold, Credentials, DateTime,
+        Headers, RawResponse, Reservation, SendFailure, Slowed, Timeouts, TransportError,
+        TransportKind, TransportProfile, Unreserved, Utc, Wire, GATE_TRIES, LOOPBACK_ONLY_REFUSAL,
+        USER_AGENT,
     };
     use crate::budget::{BudgetError, HostKey, RequestBudget};
     use crate::clock::testing::{StepClock, WaitRecorder, WaitedClock};
@@ -1115,6 +1146,12 @@ mod tests {
     const IPV6_HOST: &str = "[::1]";
     /// A space is no url `http::Uri` parses, so ureq refuses it as a transport error.
     const UNPARSEABLE: &str = "http://local host:1/never";
+    /// Not a loopback spelling, yet "this host" to the kernel: without the guard it is refused on
+    /// this machine and no packet leaves it.
+    const BEYOND_LOOPBACK: &str = "http://0.0.0.0:1/never";
+    /// Named, never sent: a test that sends to SEC's host sends to SEC once the guard is gone.
+    const SEC_INDEX: &str = "https://www.sec.gov/Archives/edgar/daily-index/";
+    const SEC_HOST: &str = "www.sec.gov";
     const PACE_DIR: &str = "pace";
     const SOURCE_PACE_FILE: &str = "edgar_press.per-ip";
     const HOST_PACE_FILE: &str = "localhost.per-host";
@@ -1311,6 +1348,59 @@ mod tests {
 
     fn permit(sink: &mut Recorder, ordinal: u32) -> Option<SendPermit> {
         slot_at(sink, ordinal)?.take_permit().ok()
+    }
+
+    /// Row N1. Mutation 2026-11-27, the guard's `if` in `exchange` deleted: red, ureq's own
+    /// "Connection refused" in place of the refusal.
+    #[test]
+    fn a_test_build_refuses_a_host_beyond_loopback_before_the_socket() -> Checked {
+        let store = tempfile::tempdir()?;
+        let clock = clock_over(&[RESERVED_AT]);
+        let mut sink = Recorder::default();
+        let Some(permit) = permit(&mut sink, FIRST_ATTEMPT) else {
+            return Err("no permit".into());
+        };
+        let asked = Request {
+            url: BEYOND_LOOPBACK.to_owned(),
+            ..request()
+        };
+        let sent =
+            wire(held(), store.path(), &WaitRecorder::default()).send(permit, &asked, &clock);
+        let detail = match &sent {
+            Err(SendFailure::Transport(failed)) => failed.to_string(),
+            other => format!("{other:?}"),
+        };
+        assert!(detail.starts_with(LOOPBACK_ONLY_REFUSAL), "{detail}");
+        Ok(())
+    }
+
+    /// Row N1: SEC's host is refused, and every loopback spelling the suite sends to passes.
+    #[test]
+    fn sec_s_host_is_beyond_loopback_and_every_loopback_spelling_is_not() {
+        let refused: Vec<Option<String>> = [
+            SEC_INDEX,
+            REFUSED,
+            LOCALHOST,
+            LOCALHOST_SHOUTED,
+            IPV6_LOOPBACK,
+            UNPARSEABLE,
+            NO_HOST,
+        ]
+        .into_iter()
+        .map(beyond_loopback)
+        .collect();
+        assert_eq!(
+            refused,
+            [
+                Some(SEC_HOST.to_owned()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None
+            ]
+        );
     }
 
     #[test]

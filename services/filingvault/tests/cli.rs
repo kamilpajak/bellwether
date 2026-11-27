@@ -28,6 +28,17 @@ fn text(path: &Path) -> &str {
     path.to_str().unwrap_or_default()
 }
 
+/// Row N1: the binary every test here spawns refuses any host but the loopback, so a test whose
+/// lease, flag or gate is mutated away still sends nothing to SEC. Only the guard holds the text.
+/// Mutation 2026-11-27, `loopback-only` dropped from this crate's dev-dependency: red.
+#[test]
+fn the_binary_the_tests_spawn_sends_to_loopback_only() -> TestResult {
+    let binary = std::fs::read(env!("CARGO_BIN_EXE_filingvault"))?;
+    let guard = news_provider::LOOPBACK_ONLY_REFUSAL.as_bytes();
+    assert!(binary.windows(guard.len()).any(|bytes| bytes == guard));
+    Ok(())
+}
+
 /// Mutation 2026-11-27, `lease_held` left out of `ErrorCode::ALL`: red.
 #[test]
 fn the_schema_names_every_command_option_exit_and_error_code() -> TestResult {
