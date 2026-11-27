@@ -724,11 +724,12 @@ fn an_error_mid_run_closes_its_attempt_and_its_run() -> TestResult {
     Ok(())
 }
 
-/// Section 12.2's settled quarter, and the current one as of the day before the run. Mutations
-/// 2026-11-27, each red here: completeness from the run's date; `>=`; `QUARTER_SETTLE_DAYS` 0 or
-/// 4; the current quarter from the run's own date.
+/// Section 12.2's settled quarter, and the current one as of the day before the run: a past
+/// quarter's listing is asked once more, on the first run over the QS-3 re-ask point of 1 day
+/// (owner decision 4 of 2026-11-27). Mutations 2026-11-27, each red here: completeness from the
+/// run's date; `>=`; `QUARTER_SETTLE_DAYS` 0 or 3; the current quarter from the run's own date.
 #[test]
-fn a_past_quarter_is_listed_again_until_a_listing_comes_three_days_after_its_end() -> TestResult {
+fn a_past_quarter_is_listed_again_until_a_listing_comes_a_day_after_its_end() -> TestResult {
     let temp = TempDir::new()?;
     let q4 = ["2026-12-29", "2026-12-30", "2026-12-31"];
     let q1 = ["2027-01-02"];
@@ -765,8 +766,8 @@ fn a_past_quarter_is_listed_again_until_a_listing_comes_three_days_after_its_end
         vec![
             vec![q4.clone()],
             vec![q4.clone()],
-            vec![q1.clone(), q4.clone()],
             vec![q1.clone(), q4],
+            vec![q1.clone()],
             vec![q1],
         ]
     );

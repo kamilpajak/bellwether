@@ -21,9 +21,10 @@ pub const SOURCE: &str = "edgar_filings";
 pub const BODY_LIMIT: u64 = 64 * 1_024 * 1_024;
 /// The newest listed days every run asks again, so a day written late is read (section 12.2).
 pub const TRAILING_DAYS: usize = 3;
-/// A past quarter is complete once a listing of it is received more than this many days after
-/// its last day; until then a day SEC writes late is missing from it (section 12.2). Not fitted.
-pub const QUARTER_SETTLE_DAYS: u64 = 3;
+/// A past quarter is complete once a usable listing of it is received more than this many days
+/// after its last day. The QS-3 rule registered before its run, ceil(max L_q) + 1 over 2024 Q4 to
+/// 2026 Q3, measured 2026-11-27 (section 12.2, "Which quarter listings").
+pub const QUARTER_SETTLE_DAYS: u64 = 1;
 const ROBOTS_PATH: &str = "/robots.txt";
 const OK: u16 = 200;
 const NOT_FOUND: u16 = 404;
