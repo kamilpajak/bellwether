@@ -205,9 +205,9 @@ pub enum DayState {
     Narrower,
     /// Cut at a limit at least the one in force: asked again only under a higher one.
     Truncated,
-    /// Sent, and no answer above.
+    /// Sent, and no answer above: a failure, or a status we kept nothing of.
     Failed,
-    /// No attempt was sent.
+    /// No attempt was sent, or none came back before its run died.
     Unasked,
 }
 
@@ -248,7 +248,7 @@ pub fn day_states(
             DayState::Narrower
         } else if attempt.truncated && attempt.body_limit >= limit {
             DayState::Truncated
-        } else if attempt.outcome == "failed" {
+        } else if attempt.outcome == "failed" || attempt.status.is_some() {
             DayState::Failed
         } else {
             DayState::Unasked
@@ -477,6 +477,61 @@ mod tests {
                 ("permanent_failure", 0),
                 ("empty", 0),
                 ("usable", 1)
+            ]
+        );
+    }
+
+    /// The best attempt of a day sets its state, and only an answer we kept nothing of is
+    /// `failed` (review of 2026-11-27, PIT-6). Mutations 2026-11-27, each red here: the last
+    /// attempt wins; `not_sent` read failed; a swept attempt read failed; the limit not compared.
+    #[test]
+    fn a_days_state_is_its_best_attempt_and_a_swept_answer_is_failed() {
+        let full = ["10-K".to_owned(), "10-K/A".to_owned()];
+        let attempt =
+            |on: &str, outcome: &str, verdict: Option<&str>, status: Option<i64>| IndexAttempt {
+                seq: 0,
+                day: day(on),
+                forms: full.to_vec(),
+                body_limit: BODY_LIMIT,
+                outcome: outcome.to_owned(),
+                verdict: verdict.map(str::to_owned),
+                status,
+                truncated: false,
+                headers: None,
+            };
+        let cut = |on: &str, limit: u64| IndexAttempt {
+            truncated: true,
+            body_limit: limit,
+            ..attempt(on, "failed", Some("permanent_failure"), Some(200))
+        };
+        let narrow = IndexAttempt {
+            forms: vec!["10-K".to_owned()],
+            ..attempt("2026-11-07", "ok", Some("usable"), Some(200))
+        };
+        let attempts = [
+            attempt("2026-11-01", "ok", Some("usable"), Some(200)),
+            attempt("2026-11-01", "failed", Some("transient_failure"), None),
+            attempt("2026-11-02", "not_sent", None, None),
+            attempt("2026-11-03", "interrupted", None, None),
+            attempt("2026-11-04", "interrupted", None, Some(200)),
+            cut("2026-11-05", BODY_LIMIT - 1),
+            cut("2026-11-06", BODY_LIMIT),
+            narrow,
+        ];
+        let states: Vec<&str> = day_states(&attempts, &full, BODY_LIMIT)
+            .into_values()
+            .map(DayState::name)
+            .collect();
+        assert_eq!(
+            states,
+            [
+                "asked",
+                "unasked",
+                "unasked",
+                "failed",
+                "failed",
+                "truncated",
+                "narrower"
             ]
         );
     }
