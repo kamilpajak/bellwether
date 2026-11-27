@@ -77,6 +77,7 @@ fn the_schema_names_every_command_option_exit_and_error_code() -> TestResult {
         ("input_absent", 4, false),
         ("input_unparseable", 2, false),
         ("input_schema_mismatch", 2, false),
+        ("holidays_uncovered", 2, false),
         ("credential_contact_missing", 2, false),
         ("io_failed", 2, false),
         ("pace_root_split", 2, false),
@@ -279,6 +280,41 @@ fn a_parser_refusal_is_an_invalid_argument_object_and_help_is_a_result() -> Test
             Some(0),
             false
         )
+    );
+    Ok(())
+}
+
+/// `ledger check` reads its holiday list before the store: a missing list is `input_absent`
+/// naming the list, never a list of no holiday (owner decision 1 of 2026-11-27, R6). Mutation
+/// 2026-11-27, `--holidays` ignored and the committed list read: red here.
+#[test]
+fn ledger_check_refuses_a_missing_holiday_list_before_the_store() -> TestResult {
+    let temp = TempDir::new()?;
+    let absent = temp.path().join("no-holidays.json");
+    let out = filingvault(&[
+        "ledger",
+        "check",
+        "--at",
+        "2026-11-20T00:00:00Z",
+        "--store",
+        text(temp.path()),
+        "--rules",
+        RULES,
+        "--holidays",
+        text(&absent),
+        "--format",
+        "json",
+    ])?;
+    let object: Value = serde_json::from_slice(&out.stderr)?;
+    assert_eq!(
+        (
+            out.status.code(),
+            object["code"].clone(),
+            object["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("no-holidays.json")),
+        ),
+        (Some(4), serde_json::json!("input_absent"), true)
     );
     Ok(())
 }

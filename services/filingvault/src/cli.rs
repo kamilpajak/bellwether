@@ -14,7 +14,7 @@ use crate::collect::{self, COLLECT_SCHEMA};
 use crate::error::{ErrorCode, FilingsError};
 use crate::ledger::{self, LEDGER_SCHEMA};
 use crate::pace_option::Pace;
-use crate::rules;
+use crate::{holidays, rules};
 
 pub const SCHEMA_SCHEMA: &str = "filingvault.schema/1";
 /// The contact every SEC request carries: the feed's, which the roster reads too (section 12.2).
@@ -99,6 +99,9 @@ pub struct CheckArgs {
     /// The rules file whose form list "asked" is read under.
     #[arg(long)]
     pub rules: PathBuf,
+    /// The holiday list: weekdays SEC writes no index on, never counted unlisted.
+    #[arg(long)]
+    pub holidays: PathBuf,
     #[arg(long, value_enum, default_value_t = Format::Human)]
     pub format: Format,
 }
@@ -132,8 +135,8 @@ const EXITS: [(&str, &[(u8, &str)]); 3] = [
         &[
             (0, "no forward index day is unasked or unlisted"),
             (1, "the answer is no: a forward day is unasked, or no listing held by --at could name it yet, or no collect run had started by --at"),
-            (2, "invalid_argument, input_unparseable, input_schema_mismatch, io_failed"),
-            (4, "input_absent: no store"),
+            (2, "invalid_argument, input_unparseable, input_schema_mismatch, holidays_uncovered, io_failed"),
+            (4, "input_absent: no store, rules file or holiday list"),
         ],
     ),
     ("schema", &[(0, "the schema")]),
@@ -243,6 +246,7 @@ fn check(args: &CheckArgs) -> Result<(Value, u8), FilingsError> {
         at: args.at,
         store: args.store.clone(),
         rules: rules::read(&args.rules)?,
+        holidays: holidays::read(&args.holidays)?,
     };
     let checked = ledger::check(&asked, SystemClock.now())?;
     Ok((checked.report, checked.exit))

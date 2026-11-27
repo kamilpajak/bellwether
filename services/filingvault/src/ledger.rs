@@ -14,6 +14,7 @@ use vault_core::blobs::BlobStore;
 use crate::collect::instant;
 use crate::discover::{day_states, DayState, BODY_LIMIT};
 use crate::error::FilingsError;
+use crate::holidays::Holidays;
 use crate::rules::Rules;
 use crate::store;
 
@@ -27,6 +28,8 @@ pub struct Asked {
     pub at: DateTime<Utc>,
     pub store: PathBuf,
     pub rules: Rules,
+    /// The weekdays SEC writes no index on; a forward day outside its years is an error.
+    pub holidays: Holidays,
 }
 
 #[derive(Debug)]
@@ -84,19 +87,21 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
         forward_from
             .is_some_and(|from| day >= from && day + Days::new(FORWARD_GRACE_DAYS) < at_date)
     };
-    let unlisted = |day: &NaiveDate| {
-        !matches!(day.weekday(), Weekday::Sat | Weekday::Sun)
-            && !listed.contains_key(day)
+    let unlisted = |day: NaiveDate| -> Result<bool, FilingsError> {
+        Ok(!matches!(day.weekday(), Weekday::Sat | Weekday::Sun)
+            && !listed.contains_key(&day)
             && newest_named
-                .get(&Quarter::of(*day).label())
-                .is_none_or(|named| named < day)
+                .get(&Quarter::of(day).label())
+                .is_none_or(|named| *named < day)
+            && !asked.holidays.holds(day)?)
     };
-    let forward_unlisted = forward_from.map_or(0, |from| {
-        from.iter_days()
-            .take_while(|day| owed(*day))
-            .filter(unlisted)
-            .count()
-    });
+    let mut forward_unlisted = 0_u32;
+    for day in forward_from
+        .iter()
+        .flat_map(|from| from.iter_days().take_while(|day| owed(*day)))
+    {
+        forward_unlisted += u32::from(unlisted(day)?);
+    }
     let mut counts: BTreeMap<&str, u32> = BTreeMap::new();
     let mut forward_unasked = 0_u32;
     let mut day_rows = Vec::with_capacity(listed.len());

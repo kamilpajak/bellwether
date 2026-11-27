@@ -16,6 +16,7 @@ pub enum ErrorCode {
     InputAbsent,
     InputUnparseable,
     InputSchemaMismatch,
+    HolidaysUncovered,
     CredentialContactMissing,
     IoFailed,
     PaceRootSplit,
@@ -26,11 +27,12 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::InvalidArgument,
         Self::InputAbsent,
         Self::InputUnparseable,
         Self::InputSchemaMismatch,
+        Self::HolidaysUncovered,
         Self::CredentialContactMissing,
         Self::IoFailed,
         Self::PaceRootSplit,
@@ -47,6 +49,7 @@ impl ErrorCode {
             Self::InputAbsent => "input_absent",
             Self::InputUnparseable => "input_unparseable",
             Self::InputSchemaMismatch => "input_schema_mismatch",
+            Self::HolidaysUncovered => "holidays_uncovered",
             Self::CredentialContactMissing => "credential_contact_missing",
             Self::IoFailed => "io_failed",
             Self::PaceRootSplit => "pace_root_split",
@@ -88,6 +91,13 @@ pub enum FilingsError {
     Absent(PathBuf),
     #[error("{what} could not be read: {why}")]
     Unparseable { what: String, why: String },
+    /// `ledger check` asked about a day of a year the holiday list does not cover.
+    #[error("the holiday list covers {first_year} to {last_year} and not {day}: extend it")]
+    HolidaysUncovered {
+        day: chrono::NaiveDate,
+        first_year: i32,
+        last_year: i32,
+    },
     /// The fill window `fill_days` names cannot be walked back by quarter.
     #[error("the fill window cannot be planned: {0}")]
     FillWindow(String),
@@ -137,6 +147,7 @@ impl FilingsError {
             Self::Absent(_) => ErrorCode::InputAbsent,
             Self::Unparseable { .. } | Self::FillWindow(_) => ErrorCode::InputUnparseable,
             Self::SchemaMismatch { .. } => ErrorCode::InputSchemaMismatch,
+            Self::HolidaysUncovered { .. } => ErrorCode::HolidaysUncovered,
             Self::Contact(why) => ErrorCode::named(why.code()).unwrap_or(ErrorCode::IoFailed),
             Self::ContactUnaddressed | Self::Credential(_) => ErrorCode::CredentialContactMissing,
             Self::PaceRoot(why) => ErrorCode::named(why.code()).unwrap_or(ErrorCode::IoFailed),

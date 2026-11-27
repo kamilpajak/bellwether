@@ -83,6 +83,14 @@ pub fn rules(fill_days: u32) -> Rules {
     }
 }
 
+/// The committed holiday list, as `ledger check --holidays` reads it.
+pub fn holidays() -> Result<filingvault::holidays::Holidays, FilingsError> {
+    filingvault::holidays::read(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/rules/holidays.json"
+    )))
+}
+
 pub fn ask(store: &Path) -> Ask {
     Ask {
         store: store.to_path_buf(),

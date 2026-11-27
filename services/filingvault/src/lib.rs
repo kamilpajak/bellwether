@@ -7,6 +7,7 @@ pub mod cli;
 pub mod collect;
 pub mod discover;
 pub mod error;
+pub mod holidays;
 pub mod ledger;
 pub mod pace_option;
 pub mod rules;

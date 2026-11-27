@@ -27,6 +27,7 @@ fn checked(store: &Path, at: &str) -> Result<Checked, Box<dyn std::error::Error>
         at: at.parse()?,
         store: store.to_path_buf(),
         rules: rules(10),
+        holidays: holidays()?,
     };
     Ok(check(&asked, NOW.parse::<DateTime<Utc>>()?)?)
 }
@@ -168,6 +169,7 @@ fn ledger_check_without_a_store_exits_4_and_creates_nothing() -> TestResult {
         at: "2026-11-17T12:00:00Z".parse()?,
         store: temp.path().to_path_buf(),
         rules: rules(10),
+        holidays: holidays()?,
     };
     let code = check(&asked, NOW.parse()?).err().map(|why| why.code());
     assert_eq!(
@@ -371,6 +373,7 @@ fn ledger_check_refuses_an_at_after_now() -> TestResult {
         at: "2026-12-02T00:00:00Z".parse()?,
         store: temp.path().to_path_buf(),
         rules: rules(10),
+        holidays: holidays()?,
     };
     let code = check(&asked, NOW.parse()?)
         .err()
@@ -379,8 +382,9 @@ fn ledger_check_refuses_an_at_after_now() -> TestResult {
     Ok(())
 }
 
-/// A day of a quarter whose listing the store never held is unlisted too. Mutation 2026-11-27, a
-/// quarter with no held listing read as covering its days: red here.
+/// A weekday of a quarter whose listing the store never held is unlisted too, but not a listed
+/// holiday: 01-04 and 01-05, not 2027-01-01. Mutations 2026-11-27, each red here: a quarter with
+/// no held listing read as covering its days; the holiday list not read.
 #[test]
 fn the_days_of_a_quarter_never_listed_are_unlisted() -> TestResult {
     let temp = TempDir::new()?;
@@ -396,11 +400,12 @@ fn the_days_of_a_quarter_never_listed_are_unlisted() -> TestResult {
         at: "2027-01-09T12:00:00Z".parse()?,
         store: temp.path().to_path_buf(),
         rules: rules(10),
+        holidays: holidays()?,
     };
     let read = check(&asked, "2027-02-01T00:00:00Z".parse()?)?;
     assert_eq!(
         (read.exit, read.report["forward_unlisted"].clone()),
-        (1, serde_json::json!(3))
+        (1, serde_json::json!(2))
     );
     Ok(())
 }
@@ -515,6 +520,65 @@ fn a_listing_naming_no_form_index_covers_no_day() -> TestResult {
     assert_eq!(
         (read.exit, read.report["forward_unlisted"].clone()),
         (1, serde_json::json!(3))
+    );
+    Ok(())
+}
+
+/// SEC as it answers a run at `at`: each quarter's listing names every one of `days` before the
+/// run's date, and each day's index answers.
+fn sec_on(at: &str, days: &[String]) -> Stub {
+    let run_day = day(&at[..10]);
+    let mut by_quarter: std::collections::BTreeMap<String, Vec<&str>> = Default::default();
+    for text in days {
+        let named = by_quarter.entry(listing_url(text)).or_default();
+        if day(text) < run_day {
+            named.push(text);
+        }
+    }
+    let robots = Stub::default().answering(ROBOTS_URL, Reply::Status(OK, ROBOTS.to_vec()));
+    let stub = by_quarter.into_iter().fold(robots, |stub, (url, named)| {
+        stub.answering(&url, Reply::Status(OK, listing(&named)))
+    });
+    days.iter().fold(stub, |stub, text| {
+        stub.answering(&index_url(text), Reply::Status(OK, index_of(text)))
+    })
+}
+
+/// A quarter ending on a federal holiday observed on a Friday, 2027-12-31 for 2028-01-01, in a
+/// steady state where SEC writes every other weekday: nothing is unlisted (owner decision 1 of
+/// 2026-11-27). Mutation 2026-11-27, the holiday list not read: red here, exit 1.
+#[test]
+fn a_quarter_ending_on_an_observed_holiday_leaves_no_day_unlisted() -> TestResult {
+    let temp = TempDir::new()?;
+    let written: Vec<String> = day("2027-12-13")
+        .iter_days()
+        .take_while(|on| *on <= day("2028-01-14"))
+        .filter(|on| {
+            !matches!(
+                chrono::Datelike::weekday(on),
+                chrono::Weekday::Sat | chrono::Weekday::Sun
+            )
+        })
+        .map(|on| on.format("%Y-%m-%d").to_string())
+        .filter(|text| !["2027-12-24", "2027-12-31"].contains(&text.as_str()))
+        .collect();
+    for night in day("2027-12-27")
+        .iter_days()
+        .take_while(|on| *on <= day("2028-01-12"))
+    {
+        let at = format!("{}T06:10:00Z", night.format("%Y-%m-%d"));
+        run(temp.path(), &sec_on(&at, &written), &at)??;
+    }
+    let asked = Asked {
+        at: "2028-01-12T12:00:00Z".parse()?,
+        store: temp.path().to_path_buf(),
+        rules: rules(10),
+        holidays: holidays()?,
+    };
+    let read = check(&asked, "2029-01-01T00:00:00Z".parse()?)?;
+    assert_eq!(
+        (read.exit, read.report["forward_unlisted"].clone()),
+        (0, serde_json::json!(0))
     );
     Ok(())
 }
