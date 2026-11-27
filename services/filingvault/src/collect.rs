@@ -317,8 +317,8 @@ struct Window {
     current: Quarter,
     /// The days any held listing of each quarter names.
     held_days: BTreeMap<Quarter, BTreeSet<NaiveDate>>,
-    /// Quarters with a listing received after their last day and [`QUARTER_SETTLE_DAYS`]: never
-    /// asked again.
+    /// Quarters with a usable listing received after their last day and
+    /// [`QUARTER_SETTLE_DAYS`]: never asked again.
     complete: BTreeSet<Quarter>,
 }
 
@@ -357,7 +357,7 @@ impl Window {
                 }
             })?;
             let settled = quarter.last_day() + Days::new(QUARTER_SETTLE_DAYS);
-            if instant(&held.received)?.date_naive() > settled {
+            if held.usable && instant(&held.received)?.date_naive() > settled {
                 complete.insert(*quarter);
             }
             held_days.entry(*quarter).or_default().extend(days);

@@ -545,6 +545,27 @@ fn a_past_quarters_listing_received_after_its_end_is_not_asked_again() -> TestRe
     Ok(())
 }
 
+/// A past quarter is complete only on a `usable` listing: one naming no day is asked again
+/// (review EF2). Mutation 2026-11-27, an `empty` listing completing its quarter: red here.
+#[test]
+fn a_past_quarters_empty_listing_does_not_complete_it() -> TestResult {
+    let temp = TempDir::new()?;
+    let q3 = listing_url("2026-09-30");
+    let stub = || Stub::sec().answering(&q3, Reply::Status(OK, listing(&[])));
+    let mut first = support::ask(temp.path());
+    first.rules = rules(60);
+    run_ask(&first, &stub(), RUN)??;
+    let two = stub();
+    run_ask(&first, &two, NEXT_RUN)??;
+    let listings: Vec<String> = two
+        .asked()
+        .into_iter()
+        .filter(|url| url.ends_with("index.json"))
+        .collect();
+    assert_eq!(listings, vec![listing_url(LISTED[0]), q3]);
+    Ok(())
+}
+
 /// The first days of a quarter: its trailing three reach into the previous one through that
 /// quarter's listing. Mutation 2026-11-27, the previous quarter never asked: red.
 #[test]
