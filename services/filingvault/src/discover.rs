@@ -21,6 +21,9 @@ pub const SOURCE: &str = "edgar_filings";
 pub const BODY_LIMIT: u64 = 64 * 1_024 * 1_024;
 /// The newest listed days every run asks again, so a day written late is read (section 12.2).
 pub const TRAILING_DAYS: usize = 3;
+/// A past quarter is complete once a listing of it is received more than this many days after
+/// its last day; until then a day SEC writes late is missing from it (section 12.2). Not fitted.
+pub const QUARTER_SETTLE_DAYS: u64 = 3;
 const ROBOTS_PATH: &str = "/robots.txt";
 const OK: u16 = 200;
 const NOT_FOUND: u16 = 404;
@@ -257,7 +260,7 @@ pub fn day_states(
 }
 
 /// The quarters a run asks for a listing, newest first: the current one always, and each other
-/// quarter of the fill window while no listing of it was received after its last day. A step back
+/// quarter of the fill window while it is not complete ([`QUARTER_SETTLE_DAYS`]). A step back
 /// that does not go back, or more quarters than the window holds, is an error and never a loop.
 pub fn quarters_to_ask(
     fill_start: NaiveDate,

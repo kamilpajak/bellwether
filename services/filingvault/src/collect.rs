@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use crate::discover::{
     allowed, day_states, days_to_ask, index_ask, index_read, listing_ask, listing_read,
     quarters_to_ask, request, robots_ask, robots_rules, robots_verdict, RobotsStop, BODY_LIMIT,
+    QUARTER_SETTLE_DAYS,
 };
 use crate::error::{ErrorCode, FilingsError};
 use crate::rules::Rules;
@@ -313,7 +314,8 @@ struct Window {
     current: Quarter,
     /// The days of each quarter's newest held listing.
     held_days: BTreeMap<Quarter, Vec<NaiveDate>>,
-    /// Quarters with a listing received after their last day: never asked again.
+    /// Quarters with a listing received after their last day and [`QUARTER_SETTLE_DAYS`]: never
+    /// asked again.
     complete: BTreeSet<Quarter>,
 }
 
@@ -351,7 +353,8 @@ impl Window {
                     why: why.to_string(),
                 }
             })?;
-            if instant(&received_at)?.date_naive() > quarter.last_day() {
+            let settled = quarter.last_day() + Days::new(QUARTER_SETTLE_DAYS);
+            if instant(&received_at)?.date_naive() > settled {
                 complete.insert(*quarter);
             }
             held_days.insert(*quarter, days);

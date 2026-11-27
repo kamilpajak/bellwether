@@ -692,3 +692,54 @@ fn an_error_mid_run_closes_its_attempt_and_its_run() -> TestResult {
     );
     Ok(())
 }
+
+/// A past quarter's listing is asked again until one is received more than three days after the
+/// quarter's last day, so an index SEC writes late on that day is still listed; the current
+/// quarter is that of the day before the run (review of 2026-11-27, PIT-3). Mutations 2026-11-27,
+/// each red here: completeness read from the run's date; `>` made `>=`; the current quarter taken
+/// from the run's own date.
+#[test]
+fn a_past_quarter_is_listed_again_until_a_listing_comes_three_days_after_its_end() -> TestResult {
+    let temp = TempDir::new()?;
+    let q4 = ["2026-12-29", "2026-12-30", "2026-12-31"];
+    let q1 = ["2027-01-02"];
+    let stub = || {
+        let stub = Stub::default()
+            .answering(ROBOTS_URL, Reply::Status(OK, ROBOTS.to_vec()))
+            .answering(&listing_url(q4[0]), Reply::Status(OK, listing(&q4)))
+            .answering(&listing_url(q1[0]), Reply::Status(OK, listing(&q1)));
+        q4.iter().chain(&q1).fold(stub, |stub, text| {
+            stub.answering(&index_url(text), Reply::Status(OK, index_of(text)))
+        })
+    };
+    let mut listed = Vec::new();
+    for at in [
+        "2026-12-30",
+        "2027-01-01",
+        "2027-01-03",
+        "2027-01-04",
+        "2027-01-05",
+    ] {
+        let asked = stub();
+        run(temp.path(), &asked, &format!("{at}T06:10:00Z"))??;
+        listed.push(
+            asked
+                .asked()
+                .into_iter()
+                .filter(|url| url.ends_with("index.json"))
+                .collect::<Vec<String>>(),
+        );
+    }
+    let (q4, q1) = (listing_url(q4[0]), listing_url(q1[0]));
+    assert_eq!(
+        listed,
+        vec![
+            vec![q4.clone()],
+            vec![q4.clone()],
+            vec![q1.clone(), q4.clone()],
+            vec![q1.clone(), q4],
+            vec![q1],
+        ]
+    );
+    Ok(())
+}
