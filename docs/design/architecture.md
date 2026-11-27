@@ -5156,11 +5156,14 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 **Schedule and run accounting.**
 
 - One run a night: `filingvault-collect.timer` at 06:10 UTC, `TimeoutStartSec=7200`, `SuccessExitStatus=8`, no `Persistent=` (owner decision 2026-11-25, `FV-Q8`: the 2 h bound and the slot).
-  - 06:10 UTC is 01:10 or 02:10 in New York. Unverified: when SEC writes a day's index; the trailing three days cover a late one.
+  - 06:10 UTC is 01:10 or 02:10 in New York.
+  - When SEC writes a day's index, the construction of `TRAILING_DAYS` 3: 29 of 29 `form.*.idx` of 2026 Q4 (10-01 to 11-12) last written on their own New York day, 22:01:28 to 22:16:41 (`probes/observation_lag/quarter_index.2026Q4.json`, the listing received 2026-11-13).
+    - Over 2024 Q4 to 2026 Q3 (the QS-3 run below, 2026-11-27): 486 of 496 last written on their own day; 10 after it, the largest 509,943 s = 5.90 d (`form.20250102.idx`, written 2025-01-08 21:39 New York).
+    - 2 of those 10 (`form.20250102.idx`, `form.20250103.idx`) were written when 4 and 3 later index days were already listed by the write's New York date, so the trailing 3 of the next run do not hold them (review QS-2). Whether either was a first write or a rewrite is unknown: `last-modified` is the newest write.
   - It overlaps news collect slots and shares no lock, table or store with them.
 - One run, in order: robots.txt of `www.sec.gov` under a `robots` attempt; the quarter listing of each quarter holding an open or unasked day in the plan; the trailing 3 index days; unasked days from newest to oldest until the filing budget is reached; each open filing, manifest first, then its documents.
   - Rejected: oldest first. After one night the register would answer for mid-2025 and not for the most recent weeks.
-  - Which quarter listings (built 2026-11-27): the current quarter, of the run's UTC date less one day, always; any other quarter of the fill window while the store holds no usable listing of it received more than 3 days after its last day (`QUARTER_SETTLE_DAYS`, not fitted).
+  - Which quarter listings (built 2026-11-27): the current quarter, of the run's UTC date less one day, always; any other quarter of the fill window while the store holds no usable listing of it received more than 3 days after its last day (`QUARTER_SETTLE_DAYS`; the QS-3 rule below gives 1, measured 2026-11-27).
     - Rejected: complete on a listing received the day after the last day, as built first. Symptom: an index SEC writes after the 06:10 UTC run on the next quarter's first day is never listed, asked or counted (review 2026-11-27, PIT-3, a stub run). The days a run plans come from this run's listings and, for a quarter not asked, from its newest stored one.
     - How late after a quarter's end SEC still writes or rewrites that quarter's daily form indexes (review QS-3; live requests approved by the owner 2026-11-27). Registered 2026-11-27, before any request:
 
@@ -5176,6 +5179,25 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
       | decision rule | re-ask point = ceil(max over the 8 quarters of L_q, in days) + 1, with the value as it comes out; it is the construction `QUARTER_SETTLE_DAYS` lacks (QS-4) and the point of the one re-ask per past quarter (QS-1) |
       | what it bounds | `last-modified` is the newest write, so L_q is an upper bound on the first write of the quarter's latest file; the rule errs toward asking later |
       | not measured by it | a write after the run; a quarter before 2024 Q4; a row added to a file whose `last-modified` did not move |
+
+      - Run 2026-11-27, 18:33:47Z to 18:34:03Z: 9 requests, every one 200 (robots.txt 2,736 B; the 8 listings 40,151 B to 42,844 B). robots.txt has no rule matching `/Archives/edgar/daily-index/` for `*`. No retry and no other request. Bodies and headers are not in the tree.
+      - Result: max L_q = −5,914 s = −0.068 d (2025 Q1), so the **re-ask point is ceil(−0.068) + 1 = 1 day**. In all 8 quarters the latest `form.*.idx` is the last day's own file, written that evening 22:02 to 22:21 New York.
+
+        | quarter | last day | `form.*.idx` items | latest of them, written (New York) | L_q | files written after their own day | largest per-file value |
+        |---|---|---|---|---|---|---|
+        | 2024 Q4 | Tue 2024-12-31 | 61 | `form.20241231.idx`, 22:19:02 | −6,058 s | 0 | −5,707 s |
+        | 2025 Q1 | Mon 2025-03-31 | 60 | `form.20250331.idx`, 22:21:26 | −5,914 s | 6 | 509,943 s (`form.20250102.idx`) |
+        | 2025 Q2 | Mon 2025-06-30 | 63 | `form.20250630.idx`, 22:05:06 | −6,894 s | 1 | 6,903 s (`form.20250409.idx`) |
+        | 2025 Q3 | Tue 2025-09-30 | 64 | `form.20250930.idx`, 22:12:13 | −6,467 s | 0 | −4,584 s |
+        | 2025 Q4 | Wed 2025-12-31 | 60 | `form.20251231.idx`, 22:03:42 | −6,978 s | 0 | −5,897 s |
+        | 2026 Q1 | Tue 2026-03-31 | 61 | `form.20260331.idx`, 22:07:11 | −6,769 s | 0 | −5,338 s |
+        | 2026 Q2 | Tue 2026-06-30 | 63 | `form.20260630.idx`, 22:02:23 | −7,057 s | 2 | 57,344 s (`form.20260515.idx`) |
+        | 2026 Q3 | Wed 2026-09-30 | 64 | `form.20260930.idx`, 22:02:24 | −7,056 s | 1 | 126,670 s (`form.20260710.idx`) |
+
+      - 0 of 496 `form` items dated outside their quarter; 0 `last-modified` values fell in a repeated New York hour.
+      - Not covered by the 8: a quarter whose last day is a weekend or a holiday. Every one ended on a weekday SEC was open.
+      - The 10 late files, inside their quarters: 6 in 2025 Q1 (largest 5.90 d), 1 in 2025 Q2, 2 in 2026 Q2, 1 in 2026 Q3. The largest per-file value, 5.90 d, is above the re-ask point; it is a value inside a quarter and the registered rule does not read it.
+      - Decides nothing: each listing's own `Last-Modified` header is 23:45:09 to 23:45:16 New York on its quarter's last day.
   - The fill window until the budget exists (step 11): the rules file's `fill_days`, 456 (§12.9's 15 months), before the UTC date of the store's first collect run. Every listed day of it that is not `asked` or `truncated` is asked, newest first, until the deadline. Construction: about 314 index days and 6 listings once (§12.9), about 3 minutes at 500 ms.
   - A forward day: a listed day on or after the UTC date of the first collect run started by `--at`, whose date plus 3 days is before `--at`'s UTC date. No collect run by `--at`: no forward window, and `ledger check` exits 1.
     - Every calendar day of that window is also checked against the listings: one that is `unlisted` (the table above) counts in `forward_unlisted`, and `ledger check` exits 1 while there is one.
@@ -5434,7 +5456,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
   | rows | 5,429 | 7,805 |
   | 8-K rows; the 12 sampled accessions | 384; the same 12 | 549; the same 12 |
 
-  - Unmeasured: any other index day; any quarter but 2026 Q4; a row added later than 2026-11-25, 15 and 13 days after the days named; byte equality of the two reads, since neither body was kept.
+  - Unmeasured: any other index day; for quarters 2024 Q4 to 2026 Q3, only each file's newest write instant (the QS-3 run, §12.2: 10 of 496 after their own day); a row added later than 2026-11-25, 15 and 13 days after the days named; byte equality of the two reads, since neither body was kept.
   - A row added k days later would be stamped observable at about D + 26 h, a lookahead of up to k days.
   - Steady state asks each index day on at least 3 runs, and on 5 when a weekend follows it (a Friday is among the trailing 3 index days on the Saturday to Wednesday runs); equal bytes are one blob, and `listings.first_seq` names the attempt that first listed each row.
   - Rule, built only if such a row is found: it is dated as a late row from that attempt's `received_at`.
@@ -5569,7 +5591,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | a filing that exists and is not yet observable at T | absent at T by design |
 | the interval between acceptance and public availability | unmeasured; `valid_at` is a lower bound |
 | SEC changing or deleting a document after acceptance | not observed; `Last-Modified` is printed; 1 of 43 was modified 2.39 years after acceptance (§12.10) |
-| rows added to a daily index after its day | none in 12 days on the two index days read twice (2026-11-13, 2026-11-25); every other day and a later addition unmeasured (§12.3) |
+| rows added to a daily index after its day | none in 12 days on the two index days read twice (2026-11-13, 2026-11-25); 10 of 496 files of 2024 Q4 to 2026 Q3 last written after their own day, at most 5.90 d, rows unknown (2026-11-27, §12.2); a later addition unmeasured (§12.3) |
 | a description for a 40-F filer | stored; the cut refuses |
 | a description from an amendment | never, until an amendments stratum is measured |
 | the 2,233 annual filers with no listed security | stored and cut like any other; scored with no threshold |
