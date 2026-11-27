@@ -212,20 +212,18 @@ pub fn accession_of(url: &str) -> Option<String> {
 pub struct ListingUnparseable(pub String);
 
 /// The days a quarter's listing holds a form index for. Only `form.<date>.idx` names count: a
-/// quarter directory also holds `company.`, `master.` and `index.json` itself.
+/// quarter directory also holds `company.`, `master.` and `index.json` itself. A body with no
+/// `directory.item` array is refused, never read as a listing of no day.
 pub fn listed_days(bytes: &[u8]) -> Result<Vec<NaiveDate>, ListingUnparseable> {
     let read: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|why| ListingUnparseable(why.to_string()))?;
-    let days: Vec<NaiveDate> = read["directory"]["item"]
+    let items = read["directory"]["item"]
         .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| day_of_index_name(item["name"].as_str()?))
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(days)
+        .ok_or_else(|| ListingUnparseable("no `directory.item` array".to_owned()))?;
+    Ok(items
+        .iter()
+        .filter_map(|item| day_of_index_name(item["name"].as_str()?))
+        .collect())
 }
 
 fn day_of_index_name(name: &str) -> Option<NaiveDate> {
@@ -427,6 +425,22 @@ mod tests {
         assert_eq!(
             listed_days(listing),
             Ok(vec![day("2026-11-12")].into_iter().flatten().collect())
+        );
+    }
+
+    /// A body with no `directory.item` array is no listing; an empty array is a listing of no
+    /// day. Before 2026-11-27 `{}` read as no day, and filingvault held it as a complete quarter.
+    #[test]
+    fn a_body_with_no_item_array_is_unparseable_and_an_empty_one_lists_no_day() {
+        let read = [
+            &b"{}"[..],
+            br#"{"directory": {"item": {}}}"#,
+            br#"{"directory": {"item": []}}"#,
+        ]
+        .map(|body| listed_days(body).map_err(|_| "unparseable"));
+        assert_eq!(
+            read,
+            [Err("unparseable"), Err("unparseable"), Ok(Vec::new())]
         );
     }
 }
