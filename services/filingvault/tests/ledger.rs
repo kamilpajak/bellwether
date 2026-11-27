@@ -724,6 +724,38 @@ fn a_holiday_list_not_covering_a_forward_day_aborts_the_check() -> TestResult {
     Ok(())
 }
 
+/// The list is read for an owed weekend day too: at 2028-01-05 the only owed day of 2028 is
+/// Saturday 01-01, and a list ending in 2027 aborts. Mutation 2026-11-27, `holds` skipped on a
+/// weekend: green before this test (review M5), red here.
+#[test]
+fn a_holiday_list_not_covering_an_owed_weekend_day_aborts_the_check() -> TestResult {
+    let temp = TempDir::new()?;
+    let written: Vec<String> = ["2027-12-20", "2027-12-21", "2027-12-22", "2027-12-23"]
+        .map(str::to_owned)
+        .to_vec();
+    let at = "2027-12-28T06:10:00Z";
+    run(temp.path(), &sec_on(at, &written), at)??;
+    let path = temp.path().join("holidays-2027.json");
+    std::fs::write(
+        &path,
+        format!(
+            r#"{{"schema": "{}", "first_year": 2027, "last_year": 2027, "days": ["2027-12-24", "2027-12-31"]}}"#,
+            filingvault::holidays::HOLIDAYS_SCHEMA
+        ),
+    )?;
+    let asked = Asked {
+        at: "2028-01-05T12:00:00Z".parse()?,
+        store: temp.path().to_path_buf(),
+        rules: rules(10),
+        holidays: filingvault::holidays::read(&path)?,
+    };
+    let code = check(&asked, "2029-01-01T00:00:00Z".parse()?)
+        .err()
+        .map(|why| why.code().name());
+    assert_eq!(code, Some("holidays_uncovered"));
+    Ok(())
+}
+
 /// A forward day SEC rewrote after we read it, whose re-ask fails, answers no (review
 /// 2026-11-27, N3: it read `asked`, exit 0). Mutation 2026-11-27, `forward_rewritten` left out
 /// of the exit: red here.

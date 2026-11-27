@@ -23,7 +23,8 @@ pub const BODY_LIMIT: u64 = 64 * 1_024 * 1_024;
 pub const TRAILING_DAYS: usize = 3;
 /// A past quarter is complete once a usable listing of it is received more than this many days
 /// after its last day. The QS-3 rule registered before its run, ceil(max L_q) + 1 over 2024 Q4 to
-/// 2026 Q3, measured 2026-11-27 (section 12.2, "Which quarter listings").
+/// 2026 Q3, 2026-11-27: the ceiling of that run, since each listing was last written before its
+/// quarter ended (section 12.2, QS-3 "Caps the result").
 pub const QUARTER_SETTLE_DAYS: u64 = 1;
 const ROBOTS_PATH: &str = "/robots.txt";
 const OK: u16 = 200;

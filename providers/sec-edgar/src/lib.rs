@@ -6,7 +6,10 @@
 
 use std::borrow::Cow;
 
-use chrono::{DateTime, Datelike, Months, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{
+    DateTime, Datelike, LocalResult, Months, NaiveDate, NaiveDateTime, Offset, TimeDelta, TimeZone,
+    Utc,
+};
 use chrono_tz::Tz;
 use news_provider::request::HeaderValue;
 use news_provider::wire::{RawResponse, Timeouts, TransportError, TransportKind, TransportProfile};
@@ -240,13 +243,31 @@ pub fn listed_writes(bytes: &[u8]) -> Result<Vec<(NaiveDate, DateTime<Utc>)>, Li
         .map(|(day, item)| {
             item["last-modified"]
                 .as_str()
-                .and_then(|raw| acceptance_instant(raw, LISTING_WRITTEN, LISTING_ZONE))
+                .and_then(listing_written)
                 .map(|written| (day, written))
                 .ok_or_else(|| {
                     ListingUnparseable(format!("the item of {day} has no last-modified"))
                 })
         })
         .collect()
+}
+
+/// A listing item's `last-modified` as an instant: [`acceptance_instant`], except that a local
+/// time New York skips at the spring change reads at the offset in force before it. Refusing it
+/// refused the quarter's listing for good (review F-NEW-1, 2026-11-27).
+fn listing_written(raw: &str) -> Option<DateTime<Utc>> {
+    let local = NaiveDateTime::parse_from_str(raw.trim(), LISTING_WRITTEN).ok()?;
+    let zone: Tz = LISTING_ZONE.parse().ok()?;
+    match zone.from_local_datetime(&local) {
+        LocalResult::None => zone
+            .offset_from_local_datetime(&(local - TimeDelta::days(1)))
+            .single()?
+            .fix()
+            .from_local_datetime(&local)
+            .single()
+            .map(|at| at.with_timezone(&Utc)),
+        _ => acceptance_instant(raw, LISTING_WRITTEN, LISTING_ZONE),
+    }
 }
 
 /// The `form.*.idx` items of a listing with their days.
@@ -604,6 +625,20 @@ mod tests {
         let listing = br#"{"directory": {"item": [
             {"name": "form.20261110.idx", "last-modified": "11/10/2026 10:01:42 PM"}]}}"#;
         let header = http_date("Wed, 11 Nov 2026 03:01:42 GMT");
+        assert_eq!(
+            listed_writes(listing).map(|writes| writes.first().map(|(_, at)| *at)),
+            Ok(header)
+        );
+    }
+
+    /// A listed write in the spring-forward hour, which New York time skips, reads at the offset
+    /// in force before the change. Before 2026-11-27 it refused the listing as having no
+    /// `last-modified`, so no later listing of that quarter was ever usable (review F-NEW-1).
+    #[test]
+    fn a_listed_write_in_the_skipped_spring_hour_reads_at_the_offset_before_the_change() {
+        let listing = br#"{"directory": {"item": [
+            {"name": "form.20260306.idx", "last-modified": "03/08/2026 02:30:00 AM"}]}}"#;
+        let header = http_date("Sun, 08 Mar 2026 07:30:00 GMT");
         assert_eq!(
             listed_writes(listing).map(|writes| writes.first().map(|(_, at)| *at)),
             Ok(header)
