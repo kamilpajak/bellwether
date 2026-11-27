@@ -91,12 +91,13 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
             .is_some_and(|from| day >= from && day + Days::new(FORWARD_GRACE_DAYS) < at_date)
     };
     let unlisted = |day: NaiveDate| -> Result<bool, FilingsError> {
+        let holiday = asked.holidays.holds(day)?;
         Ok(!matches!(day.weekday(), Weekday::Sat | Weekday::Sun)
             && !listed.contains_key(&day)
             && newest_named
                 .get(&Quarter::of(day).label())
                 .is_none_or(|named| *named < day)
-            && !asked.holidays.holds(day)?)
+            && !holiday)
     };
     let mut forward_unlisted = 0_u32;
     for day in forward_from

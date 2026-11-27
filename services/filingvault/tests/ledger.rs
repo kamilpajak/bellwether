@@ -693,3 +693,31 @@ fn the_newest_usable_answer_names_the_days_last_data_received() -> TestResult {
     );
     Ok(())
 }
+
+/// A holiday list whose years end before a forward day aborts `holidays_uncovered` even when
+/// every forward weekday is listed (reviews 2026-11-27, F1 and N5: exit 0 before). Mutation
+/// 2026-11-27, `holds` read as "no holiday" on an uncovered year: red here.
+#[test]
+fn a_holiday_list_not_covering_a_forward_day_aborts_the_check() -> TestResult {
+    let temp = TempDir::new()?;
+    three_runs(temp.path())?;
+    let later = [&LATER[..], &["2026-11-17"]].concat();
+    run(temp.path(), &listing_of(&later), "2026-11-18T06:10:00Z")??;
+    let path = temp.path().join("holidays-2025.json");
+    std::fs::write(
+        &path,
+        format!(
+            r#"{{"schema": "{}", "first_year": 2025, "last_year": 2025, "days": []}}"#,
+            filingvault::holidays::HOLIDAYS_SCHEMA
+        ),
+    )?;
+    let asked = Asked {
+        at: "2026-11-18T12:00:00Z".parse()?,
+        store: temp.path().to_path_buf(),
+        rules: rules(10),
+        holidays: filingvault::holidays::read(&path)?,
+    };
+    let code = check(&asked, NOW.parse()?).err().map(|why| why.code().name());
+    assert_eq!(code, Some("holidays_uncovered"));
+    Ok(())
+}
