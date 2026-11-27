@@ -599,6 +599,39 @@ mod tests {
         );
     }
 
+    /// Each adapter section 12.1 keeps from `filingvault` is named when reached, and a context
+    /// missing from the members is a failure. Mutations 2026-11-27, each red here: `CONTEXTS`
+    /// without `open-web-feed`, or without `edgar-press`; a missing context skipped.
+    #[test]
+    fn each_news_adapter_reached_from_filingvault_is_named_and_a_missing_context_fails() {
+        const FOUR: &str = "[workspace]\nmembers = [\"services/filingvault\", \"services/newsvault\", \"edgar-press\", \"open-web-feed\"]\nresolver = \"2\"\n";
+        let reaching = Tree::new(FOUR)
+            .crate_at(
+                "services/filingvault",
+                &manifest(
+                    "filingvault",
+                    "\n[dependencies]\nedgar-press = { path = \"../../edgar-press\" }\n\n[dev-dependencies]\nopen-web-feed = { path = \"../../open-web-feed\" }\n\n[lints]\nworkspace = true\n",
+                ),
+            )
+            .crate_at("services/newsvault", &manifest("newsvault", INHERITS))
+            .crate_at("edgar-press", &manifest("edgar-press", INHERITS))
+            .crate_at("open-web-feed", &manifest("open-web-feed", INHERITS));
+        let failure = context_isolation_failure(&reaching.root_manifest()).unwrap_or_default();
+        let without = Tree::new(TWO_MEMBERS)
+            .crate_at("gate", &manifest("gate", INHERITS))
+            .crate_at("services/newsvault", &manifest("newsvault", INHERITS));
+        let missing = context_isolation_failure(&without.root_manifest()).unwrap_or_default();
+        assert_eq!(
+            (
+                failure.contains("filingvault depends on `edgar-press`"),
+                failure.contains("filingvault depends on `open-web-feed`"),
+                missing.contains("no workspace member is named `filingvault`"),
+            ),
+            (true, true, true),
+            "{failure}\n{missing}"
+        );
+    }
+
     #[test]
     fn adding_an_http_client_to_a_member_other_than_the_seam_crate_exits_one_hundred_and_one() {
         let tree = Tree::new(TWO_MEMBERS)

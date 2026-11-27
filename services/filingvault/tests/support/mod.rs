@@ -120,6 +120,8 @@ pub enum Reply {
     GateHeld,
     /// A pace file the gate cannot read: a budget error that is no gate refusal.
     Budget,
+    /// The gate owed a wait past the run's deadline.
+    GateOwed,
     NoCredential,
 }
 
@@ -198,7 +200,8 @@ impl Exchange for Stub {
             check(attempt.hex());
         }
         let at = ObservationTime::new(clock.now());
-        let failed = || TransportError::new(attempt.clone(), at, at, "stub".to_owned());
+        let back = ObservationTime::new(clock.now());
+        let failed = || TransportError::new(attempt.clone(), at, back, "stub".to_owned());
         let reply = {
             let mut replies = self.replies.borrow_mut();
             replies.get_mut(&request.url).and_then(|queue| {
@@ -211,11 +214,11 @@ impl Exchange for Stub {
         };
         match reply {
             Some(Reply::Status(status, body)) => {
-                Ok(RawResponse::new(attempt, status, body, at, at))
+                Ok(RawResponse::new(attempt, status, body, at, back))
             }
             Some(Reply::Dated(status, body, modified)) => {
                 Ok(
-                    RawResponse::new(attempt, status, body, at, at).with_headers(Headers::new(
+                    RawResponse::new(attempt, status, body, at, back).with_headers(Headers::new(
                         vec![("last-modified".to_owned(), modified.to_owned())],
                     )),
                 )
@@ -231,6 +234,10 @@ impl Exchange for Stub {
                 waited: std::time::Duration::from_secs(16),
             })),
             Some(Reply::Budget) => Err(SendFailure::Budget(BudgetError::NoPace)),
+            Some(Reply::GateOwed) => Err(SendFailure::Budget(BudgetError::PastDeadline {
+                owed: std::time::Duration::from_secs(1),
+                left: std::time::Duration::ZERO,
+            })),
             Some(Reply::NoCredential) => {
                 Err(SendFailure::CredentialMissing("sec_contact".to_owned()))
             }

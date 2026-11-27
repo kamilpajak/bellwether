@@ -535,4 +535,28 @@ mod tests {
             ]
         );
     }
+
+    /// The run's own date is never asked, and a day cut at the limit in force is not asked again
+    /// even among the trailing three. Mutations 2026-11-27, each red here: the run's date asked;
+    /// a cut trailing day asked again.
+    #[test]
+    fn the_runs_own_date_and_a_cut_trailing_day_are_not_asked() {
+        let listed: BTreeSet<NaiveDate> = [
+            "2026-11-05",
+            "2026-11-06",
+            "2026-11-09",
+            "2026-11-10",
+            "2026-11-11",
+            "2026-11-12",
+        ]
+        .map(day)
+        .into();
+        let states = BTreeMap::from([
+            (day("2026-11-11"), DayState::Truncated),
+            (day("2026-11-10"), DayState::Asked),
+            (day("2026-11-06"), DayState::Asked),
+        ]);
+        let asked = days_to_ask(&listed, &states, day("2026-11-01"), day("2026-11-12"));
+        assert_eq!(asked, ["2026-11-10", "2026-11-09", "2026-11-05"].map(day));
+    }
 }

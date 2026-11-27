@@ -311,7 +311,11 @@ fn a_traffic_403_is_transient_and_access_denied_permanent() -> TestResult {
 fn a_body_over_the_limit_is_stored_cut_and_not_asked_again_under_the_same_limit() -> TestResult {
     let temp = TempDir::new()?;
     let stub = Stub::sec().replacing(&index_url("2026-11-05"), Reply::OverLimit(b"cut".to_vec()));
-    run(temp.path(), &stub, RUN)??;
+    let report = run(temp.path(), &stub, RUN)??;
+    let reported = report.value["days"]
+        .as_array()
+        .and_then(|days| days.iter().find(|row| row["index_day"] == "2026-11-05"))
+        .map(|row| row["truncated"].clone());
     let next = Stub::sec();
     run(temp.path(), &next, "2026-11-16T06:10:00Z")??;
     assert_eq!(
@@ -323,10 +327,12 @@ fn a_body_over_the_limit_is_stored_cut_and_not_asked_again_under_the_same_limit(
                   WHERE a.kind = 'index' AND a.target = '2026-11-05'"
             )?,
             asked_days(&next).contains(&"2026-11-05".to_owned()),
+            reported,
         ),
         (
             vec![format!("permanent_failure|1|{}|3", 64 * 1_024 * 1_024)],
-            false
+            false,
+            Some(serde_json::json!(true)),
         )
     );
     Ok(())
@@ -443,19 +449,22 @@ fn robots_that_disallow_the_archive_ask_nothing_else_and_exit_7() -> TestResult 
     Ok(())
 }
 
-/// A Crawl-delay at most our 500 ms is honoured by pace; above it, and a body that does not
-/// parse, the run asks nothing more. Mutations 2026-11-27, each red here: the Crawl-delay
-/// compared with 110 ms; a body that does not parse read as allowing every path.
+/// A Crawl-delay at most our 500 ms is honoured by pace; above it, a body that does not parse,
+/// and an answer neither 200 nor 404, the run asks nothing more. Mutations 2026-11-27, each red
+/// here: the Crawl-delay compared with 110 ms, or by `>=`; a body that does not parse read as
+/// allowing every path; a 500 read as no rules.
 #[test]
 fn a_robots_crawl_delay_over_500_ms_or_a_body_that_does_not_parse_asks_nothing() -> TestResult {
     let mut reasons = Vec::new();
-    for body in [
-        &b"User-agent: *\nCrawl-delay: 0.3\n"[..],
-        &b"User-agent: *\nCrawl-delay: 0.6\n"[..],
-        &b"<html><body>robots</body></html>"[..],
+    for (status, body) in [
+        (OK, &b"User-agent: *\nCrawl-delay: 0.3\n"[..]),
+        (OK, &b"User-agent: *\nCrawl-delay: 0.5\n"[..]),
+        (OK, &b"User-agent: *\nCrawl-delay: 0.6\n"[..]),
+        (OK, &b"<html><body>robots</body></html>"[..]),
+        (500, &b""[..]),
     ] {
         let temp = TempDir::new()?;
-        let stub = Stub::sec().replacing(ROBOTS_URL, Reply::Status(OK, body.to_vec()));
+        let stub = Stub::sec().replacing(ROBOTS_URL, Reply::Status(status, body.to_vec()));
         let refused = run(temp.path(), &stub, RUN)?;
         reasons.push((
             refused
@@ -468,8 +477,10 @@ fn a_robots_crawl_delay_over_500_ms_or_a_body_that_does_not_parse_asks_nothing()
         reasons,
         vec![
             (None, 7),
+            (None, 7),
             (Some(serde_json::json!("crawl_delay_over_interval")), 1),
             (Some(serde_json::json!("unparseable")), 1),
+            (Some(serde_json::json!("not_answered")), 1),
         ]
     );
     Ok(())
@@ -740,6 +751,143 @@ fn a_past_quarter_is_listed_again_until_a_listing_comes_three_days_after_its_end
             vec![q1.clone(), q4],
             vec![q1],
         ]
+    );
+    Ok(())
+}
+
+/// One failed request is enough for exit 8. Mutation 2026-11-27, exit 8 from two failures: red.
+#[test]
+fn one_failed_request_makes_the_run_partial() -> TestResult {
+    let temp = TempDir::new()?;
+    let stub = Stub::sec().replacing(&index_url("2026-11-10"), Reply::Transport);
+    assert_eq!(run(temp.path(), &stub, RUN)??.exit, 8);
+    Ok(())
+}
+
+/// Robots is read for every path asked, the index files too. Mutation 2026-11-27, robots
+/// consulted for the listing only: red.
+#[test]
+fn robots_disallowing_only_the_index_files_asks_no_index() -> TestResult {
+    let temp = TempDir::new()?;
+    let stub = Stub::sec().replacing(
+        ROBOTS_URL,
+        Reply::Status(
+            OK,
+            b"User-agent: *\nDisallow: /Archives/edgar/daily-index/2026/QTR4/form.\n".to_vec(),
+        ),
+    );
+    let refused = run(temp.path(), &stub, RUN)?
+        .err()
+        .map(|why| why.code().name());
+    assert_eq!(
+        (refused, asked_days(&stub).len()),
+        (Some("robots_stopped"), 0)
+    );
+    Ok(())
+}
+
+/// A 200 listing that is no listing is a permanent failure and never held, so the next run
+/// plans as usual. Mutations 2026-11-27, each red here: it read `empty`; any verdict held.
+#[test]
+fn a_listing_that_does_not_parse_does_not_stop_the_next_run() -> TestResult {
+    let temp = TempDir::new()?;
+    let bad = Stub::sec().replacing(
+        &listing_url(LISTED[0]),
+        Reply::Status(OK, b"<html>".to_vec()),
+    );
+    drop(run(temp.path(), &bad, RUN)?);
+    let next = Stub::sec();
+    let report = run(temp.path(), &next, NEXT_RUN)??;
+    assert_eq!((report.exit, asked_days(&next).len()), (0, 5));
+    Ok(())
+}
+
+/// Each attempt's instants are in order, from the run's start: opened, requested, received,
+/// closed. Mutations 2026-11-27, each red here: closed at the open instant; `requested_at` and
+/// `received_at` swapped or made one; `opened_at` a day early.
+#[test]
+fn an_attempts_instants_follow_one_another_from_the_runs_start() -> TestResult {
+    let temp = TempDir::new()?;
+    run(temp.path(), &Stub::sec(), RUN)??;
+    let out_of_order = rows(
+        temp.path(),
+        "SELECT a.target FROM attempts a JOIN runs r ON r.run_id = a.run_id
+          WHERE NOT (r.started_at <= a.opened_at AND a.opened_at < a.requested_at
+            AND a.requested_at < a.received_at AND a.received_at < a.closed_at)",
+    )?;
+    let all = rows(temp.path(), "SELECT count(*) FROM attempts")?;
+    assert_eq!(
+        (out_of_order, all),
+        (Vec::<String>::new(), vec!["7".to_owned()])
+    );
+    Ok(())
+}
+
+/// First sighting wins: a row listed again with another form and filed day keeps the first.
+/// Mutation 2026-11-27, the conflict overwriting `form` and `filed_day`: red.
+#[test]
+fn a_row_listed_again_keeps_its_first_form_and_filed_day() -> TestResult {
+    let temp = TempDir::new()?;
+    let day = "SELECT cik, accession, form, filed_day, first_seq FROM listings
+                WHERE index_day = '2026-11-11' ORDER BY cik, accession";
+    run(temp.path(), &Stub::sec(), RUN)??;
+    let first = rows(temp.path(), day)?;
+    let changed = String::from_utf8(index_of("2026-11-11"))?
+        .replace("10-K/A ", "10-K   ")
+        .replace("20261111", "20261109");
+    let again = Stub::sec().replacing(
+        &index_url("2026-11-11"),
+        Reply::Status(OK, changed.into_bytes()),
+    );
+    run(temp.path(), &again, NEXT_RUN)??;
+    assert_eq!((rows(temp.path(), day)?, first.len()), (first, 10));
+    Ok(())
+}
+
+/// A gate refusal owed past the deadline ends the run `deadline`, exit 8, its attempt not sent.
+/// Mutation 2026-11-27, it read as `gate_refused`: red.
+#[test]
+fn a_gate_owing_past_the_deadline_stops_the_run_deadline() -> TestResult {
+    let temp = TempDir::new()?;
+    let stub = Stub::sec().replacing(&index_url("2026-11-10"), Reply::GateOwed);
+    let report = run(temp.path(), &stub, RUN)??;
+    assert_eq!(
+        (
+            report.exit,
+            report.value["stopped_by"].clone(),
+            rows(
+                temp.path(),
+                "SELECT outcome FROM attempts WHERE target = '2026-11-10'"
+            )?,
+        ),
+        (
+            8,
+            serde_json::json!("deadline"),
+            vec!["not_sent".to_owned()]
+        )
+    );
+    Ok(())
+}
+
+/// A dry run over a store plans the listings and the days a run would ask: the trailing three.
+/// Mutations 2026-11-27, each red here: the dry run planning no day; `TRAILING_DAYS` 2 or 4.
+#[test]
+fn a_dry_run_over_a_store_plans_the_trailing_three_days() -> TestResult {
+    let temp = TempDir::new()?;
+    run(temp.path(), &Stub::sec(), RUN)??;
+    let mut dry = support::ask(temp.path());
+    dry.dry_run = true;
+    let stub = Stub::sec();
+    let planned = run_ask(&dry, &stub, NEXT_RUN)??.value["planned"].clone();
+    assert_eq!(
+        (planned, stub.asked().len()),
+        (
+            serde_json::json!({
+                "listings": ["2026/QTR4"],
+                "days": ["2026-11-11", "2026-11-10", "2026-11-09"],
+            }),
+            0
+        )
     );
     Ok(())
 }

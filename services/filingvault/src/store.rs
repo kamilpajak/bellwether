@@ -678,4 +678,32 @@ mod tests {
         }
         Ok(())
     }
+
+    /// The store refuses a row its keys or CHECKs exclude, and a slot whose described request is
+    /// not the one sent. Mutations 2026-11-27, each red here: both pragmas dropped (foreign keys
+    /// off); the `forms` CHECK dropped; the slot's window check dropped.
+    #[test]
+    fn the_store_refuses_a_row_its_schema_or_its_slot_does_not_describe() -> TestResult {
+        let temp = TempDir::new()?;
+        let mut writer = Writer::open(temp.path(), &run())?;
+        writer.start_run(DateTime::UNIX_EPOCH)?;
+        let refused = |sql: &str| writer.db().execute(sql, []).is_err();
+        let orphan = refused(
+            "INSERT INTO listings (index_day, cik, accession, form, filed_day, first_seq)
+             VALUES ('2026-11-10', '1', '0000000001-26-000001', '10-K', '2026-11-10', 99)",
+        );
+        let robots_with_forms = refused(
+            "INSERT INTO attempts (attempt_id, run_id, kind, target, url, forms, body_limit,
+                                   opened_at)
+             VALUES ('a', 'filings-test', 'robots', 'h', 'u', '[]', 1, 't')",
+        );
+        let listing = crate::discover::listing_ask(sec_edgar::Quarter::of(NaiveDate::MIN));
+        let sent = crate::discover::request(&listing, news_provider::Provenance::LiveIngest);
+        let at = ObservationTime::new(DateTime::UNIX_EPOCH);
+        let other = writer
+            .open_slot(crate::discover::robots_ask(), &sent, 0, at)
+            .is_err();
+        assert_eq!((orphan, robots_with_forms, other), (true, true, true));
+        Ok(())
+    }
 }

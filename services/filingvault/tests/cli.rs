@@ -39,7 +39,8 @@ fn the_binary_the_tests_spawn_sends_to_loopback_only() -> TestResult {
     Ok(())
 }
 
-/// Mutation 2026-11-27, `lease_held` left out of `ErrorCode::ALL`: red.
+/// Mutations 2026-11-27, each red here: `lease_held` left out of `ErrorCode::ALL`; no code
+/// retryable.
 #[test]
 fn the_schema_names_every_command_option_exit_and_error_code() -> TestResult {
     let out = filingvault(&["schema"])?;
@@ -58,7 +59,7 @@ fn the_schema_names_every_command_option_exit_and_error_code() -> TestResult {
         .as_array()
         .and_then(|options| options.iter().find(|option| option["name"] == "pace-root"))
         .map(|option| option["required"].clone());
-    let codes: Vec<(String, u64)> = schema["error_codes"]
+    let codes: Vec<(String, u64, bool)> = schema["error_codes"]
         .as_array()
         .cloned()
         .unwrap_or_default()
@@ -67,23 +68,24 @@ fn the_schema_names_every_command_option_exit_and_error_code() -> TestResult {
             (
                 code["code"].as_str().unwrap_or_default().to_owned(),
                 code["exit"].as_u64().unwrap_or_default(),
+                code["retryable"].as_bool().unwrap_or_default(),
             )
         })
         .collect();
-    let expected: Vec<(String, u64)> = [
-        ("invalid_argument", 2),
-        ("input_absent", 4),
-        ("input_unparseable", 2),
-        ("input_schema_mismatch", 2),
-        ("credential_contact_missing", 2),
-        ("io_failed", 2),
-        ("pace_root_split", 2),
-        ("lease_held", 7),
-        ("robots_stopped", 7),
-        ("gate_refused", 7),
-        ("partial_collect", 8),
+    let expected: Vec<(String, u64, bool)> = [
+        ("invalid_argument", 2, false),
+        ("input_absent", 4, false),
+        ("input_unparseable", 2, false),
+        ("input_schema_mismatch", 2, false),
+        ("credential_contact_missing", 2, false),
+        ("io_failed", 2, false),
+        ("pace_root_split", 2, false),
+        ("lease_held", 7, true),
+        ("robots_stopped", 7, true),
+        ("gate_refused", 7, true),
+        ("partial_collect", 8, false),
     ]
-    .map(|(code, exit)| (code.to_owned(), exit))
+    .map(|(code, exit, retryable)| (code.to_owned(), exit, retryable))
     .to_vec();
     assert_eq!(
         (
