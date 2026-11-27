@@ -184,7 +184,10 @@ fn an_index_day_lists_one_row_per_listed_form_row_and_keeps_the_first_attempt_th
         (
             vec!["11|10".to_owned()],
             vec!["10-K".to_owned(), "10-K/A".to_owned()],
-            vec![format!("1|{0}|{0}", first.value["run_id"].as_str().unwrap_or_default())],
+            vec![format!(
+                "1|{0}|{0}",
+                first.value["run_id"].as_str().unwrap_or_default()
+            )],
             vec!["1889106".to_owned(), "7654321".to_owned()],
         )
     );
