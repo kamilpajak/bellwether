@@ -5144,7 +5144,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 | an index day | complete | a quarter listing names the day, the day has a usable or `empty` index attempt whose `forms` holds every form of the current list, and every filing its `listings` rows name is closed |
 | an index day | open | it has such an index attempt and at least one open filing |
 | an index day | unasked | a listing names it and it has no such index attempt, or only attempts under a narrower form list |
-| a calendar day of the forward window | unlisted | the newest listing of its quarter held by `--at` was received on or before it, so no held listing could name it yet (built 2026-11-27, review PIT-1) |
+| a weekday of the forward window | unlisted | no listing of its quarter held by `--at` names it, and it comes after the newest day any held listing of that quarter names; every weekday of a quarter with no held listing. "Held listings" are every distinct usable or `empty` listing body closed by `--at`, read once per body (owner decision 2026-11-27, reviews EF1, LBD-1 to LBD-3). Rejected: the newest listing alone, received on or before the day (PIT-1, as built first). Symptoms, each a stub run: a later `empty` listing erased every day of its quarter; a day written after the listing was read was neither listed nor unlisted; both answered 0 |
 | the window | `complete_from` | the first day of the unbroken run of complete index days ending at the newest index day observable at the instant asked; null when that newest day is not complete |
 
 - "Complete" means "nothing left to ask", not "everything held": a filing closed by a permanent failure completes its day and reads `listed_not_held` (§12.5).
@@ -5164,7 +5164,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
 - One run, in order: robots.txt of `www.sec.gov` under a `robots` attempt; the quarter listing of each quarter holding an open or unasked day in the plan; the trailing 3 index days; unasked days from newest to oldest until the filing budget is reached; each open filing, manifest first, then its documents.
   - Rejected: oldest first. After one night the register would answer for mid-2025 and not for the most recent weeks.
   - Which quarter listings (built 2026-11-27): the current quarter, of the run's UTC date less one day, always; any other quarter of the fill window while the store holds no usable listing of it received more than 3 days after its last day (`QUARTER_SETTLE_DAYS`; the QS-3 rule below gives 1, measured 2026-11-27).
-    - Rejected: complete on a listing received the day after the last day, as built first. Symptom: an index SEC writes after the 06:10 UTC run on the next quarter's first day is never listed, asked or counted (review 2026-11-27, PIT-3, a stub run). The days a run plans come from this run's listings and, for a quarter not asked, from its newest stored one.
+    - Rejected: complete on a listing received the day after the last day, as built first. Symptom: an index SEC writes after the 06:10 UTC run on the next quarter's first day is never listed, asked or counted (review 2026-11-27, PIT-3, a stub run). The days a run plans are the union of every held listing of each quarter and this run's (owner decision 2026-11-27, LBD-1).
     - How late after a quarter's end SEC still writes or rewrites that quarter's daily form indexes (review QS-3; live requests approved by the owner 2026-11-27). Registered 2026-11-27, before any request:
 
       | registered 2026-11-27, before the run | value |
@@ -5200,7 +5200,7 @@ Transport, decided by the owner 2026-11-14 (no code yet; §11.5 step 8):
       - Decides nothing: each listing's own `Last-Modified` header is 23:45:09 to 23:45:16 New York on its quarter's last day.
   - The fill window until the budget exists (step 11): the rules file's `fill_days`, 456 (§12.9's 15 months), before the UTC date of the store's first collect run. Every listed day of it that is not `asked` or `truncated` is asked, newest first, until the deadline. Construction: about 314 index days and 6 listings once (§12.9), about 3 minutes at 500 ms.
   - A forward day: a listed day on or after the UTC date of the first collect run started by `--at`, whose date plus 3 days is before `--at`'s UTC date. No collect run by `--at`: no forward window, and `ledger check` exits 1.
-    - Every calendar day of that window is also checked against the listings: one that is `unlisted` (the table above) counts in `forward_unlisted`, and `ledger check` exits 1 while there is one.
+    - Every weekday of that window is also checked against the listings: one that is `unlisted` (the table above) counts in `forward_unlisted`, and `ledger check` exits 1 while there is one.
     - Rejected: counting only the days a held listing names, as built first. Symptom: a listing failing night after night left the newest days invisible, and `ledger check` exited 0 with `forward_unasked` 0 (review 2026-11-27, PIT-1, a stub run).
   - Not built before step 11: a stop after 3 traffic 403 answers. A step-10 run under traffic 403 asks every planned day; no binary runs outside a test before step 17 (§12.1, "Binary and image").
 - The initial 15-month fill is the same unit over about 6 nights (§12.9). It does not start before the backup change of branch `fix/backup-blob-packs` is deployed (§12.9, disk).

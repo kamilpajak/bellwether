@@ -469,11 +469,12 @@ const INDEX_ATTEMPTS: &str =
   FROM attempts
  WHERE kind = 'index' AND closed_at IS NOT NULL AND (?1 IS NULL OR closed_at <= ?1)
  ORDER BY target, seq";
-const HELD_LISTINGS: &str = "SELECT target, raw_blob, received_at
+const HELD_LISTINGS: &str = "SELECT target, raw_blob, max(received_at)
   FROM attempts
  WHERE kind = 'listing' AND verdict IN ('usable', 'empty') AND closed_at IS NOT NULL
    AND (?1 IS NULL OR closed_at <= ?1) AND raw_blob IS NOT NULL
- ORDER BY target, seq";
+ GROUP BY target, raw_blob
+ ORDER BY target, min(seq)";
 
 /// A closed index attempt as the planner and `ledger check` read it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -534,25 +535,33 @@ pub fn index_attempts(
     Ok(attempts)
 }
 
-/// The newest usable or empty listing of each quarter closed by `until`: (quarter label, blob,
-/// `received_at`).
+/// One distinct body among the usable or empty listings of a quarter closed by `until`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldListing {
+    /// The quarter's label, `attempts.target`.
+    pub quarter: String,
+    pub blob: String,
+    /// The newest `received_at` of the attempts that answered this body.
+    pub received: String,
+}
+
+/// Every distinct usable or empty listing body of each quarter closed by `until`, oldest first:
+/// the ledger and the planner take the union of the days they name (review LBD-1, LBD-2).
 pub fn held_listings(
     db: &Connection,
     until: Option<&str>,
-) -> Result<Vec<(String, String, String)>, FilingsError> {
+) -> Result<Vec<HeldListing>, FilingsError> {
     let mut statement = db.prepare(HELD_LISTINGS)?;
     let rows = statement
-        .query_map([until], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-        .collect::<Result<Vec<(String, String, Option<String>)>, _>>()?;
-    let mut newest: Vec<(String, String, String)> = Vec::new();
-    for (quarter, blob, received) in rows {
-        let received = received.unwrap_or_default();
-        match newest.last_mut() {
-            Some(last) if last.0 == quarter => *last = (quarter, blob, received),
-            _ => newest.push((quarter, blob, received)),
-        }
-    }
-    Ok(newest)
+        .query_map([until], |row| {
+            Ok(HeldListing {
+                quarter: row.get(0)?,
+                blob: row.get(1)?,
+                received: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            })
+        })?
+        .collect::<Result<Vec<HeldListing>, _>>()?;
+    Ok(rows)
 }
 
 /// The UTC dates of the collect runs started by `until`, oldest first.

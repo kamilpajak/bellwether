@@ -276,7 +276,7 @@ impl Driver<'_> {
             row["days"] = json!(turn.got.len());
             self.listings.push(row);
             if matches!(turn.verdict, Verdict::Usable | Verdict::Empty) {
-                days.insert(quarter, turn.got);
+                days.entry(quarter).or_default().extend(turn.got);
             }
         }
         let listed: BTreeSet<NaiveDate> = days.into_values().flatten().collect();
@@ -315,8 +315,8 @@ impl Driver<'_> {
 struct Window {
     fill_start: NaiveDate,
     current: Quarter,
-    /// The days of each quarter's newest held listing.
-    held_days: BTreeMap<Quarter, Vec<NaiveDate>>,
+    /// The days any held listing of each quarter names.
+    held_days: BTreeMap<Quarter, BTreeSet<NaiveDate>>,
     /// Quarters with a listing received after their last day and [`QUARTER_SETTLE_DAYS`]: never
     /// asked again.
     complete: BTreeSet<Quarter>,
@@ -340,27 +340,27 @@ impl Window {
         };
         let fill_start = fill_start(first, rules.fill_days)?;
         let current = Quarter::of(run_date.pred_opt().unwrap_or(run_date));
-        let mut held_days = BTreeMap::new();
+        let mut held_days: BTreeMap<Quarter, BTreeSet<NaiveDate>> = BTreeMap::new();
         let mut complete = BTreeSet::new();
         let labels: BTreeMap<String, Quarter> = quarters_to_ask(fill_start, current, &complete)?
             .into_iter()
             .map(|quarter| (quarter.label(), quarter))
             .collect();
-        for (label, blob, received_at) in store::held_listings(db, None)? {
-            let Some(quarter) = labels.get(&label) else {
+        for held in store::held_listings(db, None)? {
+            let Some(quarter) = labels.get(&held.quarter) else {
                 continue;
             };
-            let days = listed_days(&store::read_blob(blobs, &blob)?).map_err(|why| {
+            let days = listed_days(&store::read_blob(blobs, &held.blob)?).map_err(|why| {
                 FilingsError::Unparseable {
-                    what: format!("the stored listing of {label}"),
+                    what: format!("the stored listing of {}", held.quarter),
                     why: why.to_string(),
                 }
             })?;
             let settled = quarter.last_day() + Days::new(QUARTER_SETTLE_DAYS);
-            if instant(&received_at)?.date_naive() > settled {
+            if instant(&held.received)?.date_naive() > settled {
                 complete.insert(*quarter);
             }
-            held_days.insert(*quarter, days);
+            held_days.entry(*quarter).or_default().extend(days);
         }
         Ok(Self {
             fill_start,

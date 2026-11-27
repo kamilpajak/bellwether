@@ -222,9 +222,9 @@ fn a_row_listed_by_a_later_attempt_is_counted_listed_later() -> TestResult {
     Ok(())
 }
 
-/// Section 12.2's unlisted forward days, while the held days are still asked. Mutations
-/// 2026-11-27, each red here: a failed listing erasing the held days; `forward_unlisted` left out
-/// of the exit; a listing received on a day read as naming it.
+/// Section 12.2's unlisted forward days, weekdays only, while the held days are still asked.
+/// Mutations 2026-11-27, each red here: a failed listing erasing the held days;
+/// `forward_unlisted` left out of the exit; a Saturday or a Sunday counted.
 #[test]
 fn forward_days_after_the_newest_listing_are_unlisted_and_answer_no() -> TestResult {
     let temp = TempDir::new()?;
@@ -247,7 +247,7 @@ fn forward_days_after_the_newest_listing_are_unlisted_and_answer_no() -> TestRes
             ],
             1,
             serde_json::json!(0),
-            serde_json::json!(6),
+            serde_json::json!(4),
         )
     );
     Ok(())
@@ -400,7 +400,121 @@ fn the_days_of_a_quarter_never_listed_are_unlisted() -> TestResult {
     let read = check(&asked, "2027-02-01T00:00:00Z".parse()?)?;
     assert_eq!(
         (read.exit, read.report["forward_unlisted"].clone()),
-        (1, serde_json::json!(5))
+        (1, serde_json::json!(3))
+    );
+    Ok(())
+}
+
+/// robots.txt, one listing body for the quarter of `quarter_day`, and each of `days` answered.
+fn stub_with(quarter_day: &str, body: Vec<u8>, days: &[&str]) -> Stub {
+    let stub = Stub::default()
+        .answering(ROBOTS_URL, Reply::Status(OK, ROBOTS.to_vec()))
+        .answering(&listing_url(quarter_day), Reply::Status(OK, body));
+    days.iter().fold(stub, |stub, text| {
+        stub.answering(&index_url(text), Reply::Status(OK, index_of(text)))
+    })
+}
+
+/// The store of [`three_runs`] up to 11-17: 11-13 failed and 11-16 listed by the 11-17 run.
+fn failed_13(store: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    run(store, &listing_of(&FIRST), RUN)??;
+    let failing = listing_of(&LATER).replacing(&index_url("2026-11-13"), Reply::Transport);
+    drop(run(store, &failing, "2026-11-17T06:10:00Z")?);
+    Ok(())
+}
+
+/// A later listing naming no day keeps every day an earlier one named: the ledger still counts
+/// 11-13 failed and the planner asks it again (review LBD-1). Mutations 2026-11-27, each red
+/// here: the ledger reading the newest listing only; the planner replacing the held days.
+#[test]
+fn an_empty_listing_keeps_the_days_an_earlier_listing_named() -> TestResult {
+    let temp = TempDir::new()?;
+    failed_13(temp.path())?;
+    let empty = stub_with(FIRST[0], listing(&[]), &[]);
+    drop(run(temp.path(), &empty, "2026-11-18T06:10:00Z")?);
+    let read = checked(temp.path(), "2026-11-18T12:00:00Z")?;
+    assert_eq!(
+        (
+            asked_days(&empty),
+            read.exit,
+            per_day(&read, "2026-11-13")["state"].clone()
+        ),
+        (
+            vec![
+                "2026-11-16".to_owned(),
+                "2026-11-13".to_owned(),
+                "2026-11-12".to_owned()
+            ],
+            1,
+            serde_json::json!("failed")
+        )
+    );
+    Ok(())
+}
+
+/// A newer listing that omits a day an older one named keeps that day (review LBD-2). Mutation
+/// 2026-11-27, the ledger reading the newest listing only: red here.
+#[test]
+fn a_newer_listing_that_omits_a_day_keeps_it() -> TestResult {
+    let temp = TempDir::new()?;
+    failed_13(temp.path())?;
+    let without = ["2026-11-12", "2026-11-16", "2026-11-17"];
+    drop(run(
+        temp.path(),
+        &stub_with(FIRST[0], listing(&without), &without),
+        "2026-11-18T06:10:00Z",
+    )?);
+    let read = checked(temp.path(), "2026-11-19T12:00:00Z")?;
+    assert_eq!(
+        (read.exit, read.report["forward_unasked"].clone()),
+        (1, serde_json::json!(1))
+    );
+    Ok(())
+}
+
+/// A weekday after the newest day any held listing of its quarter names is unlisted, whenever
+/// the listing came: 11-16 written after the 11-17T01:00Z run's listing, and the next listing
+/// failing (review LBD-3). Mutation 2026-11-27, a listing received on day R read as naming every
+/// day before R: red here.
+#[test]
+fn a_day_written_after_the_listing_was_read_is_unlisted() -> TestResult {
+    let temp = TempDir::new()?;
+    run(temp.path(), &listing_of(&FIRST), RUN)??;
+    let early = &LATER[..7];
+    drop(run(
+        temp.path(),
+        &stub_with(FIRST[0], listing(early), early),
+        "2026-11-17T01:00:00Z",
+    )?);
+    let failing = listing_of(&LATER).replacing(&listing_url(FIRST[0]), Reply::Transport);
+    drop(run(temp.path(), &failing, "2026-11-18T06:10:00Z")?);
+    let read = checked(temp.path(), "2026-11-20T12:00:00Z")?;
+    assert_eq!(
+        (read.exit, read.report["forward_unlisted"].clone()),
+        (1, serde_json::json!(1))
+    );
+    Ok(())
+}
+
+/// A listing whose items name no form index, held night after night, never covers a weekday
+/// (review EF1). Mutation 2026-11-27, a quarter with an `empty` listing read as covering every
+/// day before its receipt: red here.
+#[test]
+fn a_listing_naming_no_form_index_covers_no_day() -> TestResult {
+    let temp = TempDir::new()?;
+    let named = br#"{"directory": {"item": [{"name": "company.20261112.idx"}]}}"#;
+    for at in [
+        RUN,
+        NEXT_RUN,
+        "2026-11-16T06:10:00Z",
+        "2026-11-19T06:10:00Z",
+    ] {
+        run(temp.path(), &stub_with(FIRST[0], named.to_vec(), &[]), at)??;
+    }
+    let read = checked(temp.path(), "2026-11-20T12:00:00Z")?;
+    assert_eq!(
+        (read.exit, read.report["forward_unlisted"].clone()),
+        (1, serde_json::json!(3))
     );
     Ok(())
 }

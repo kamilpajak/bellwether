@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use chrono::{DateTime, Days, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Days, NaiveDate, Utc, Weekday};
 use rusqlite::Connection;
 use sec_edgar::{listed_days, Quarter};
 use serde_json::{json, Value};
@@ -61,17 +61,20 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
         None => None,
     };
     let mut listed: BTreeMap<NaiveDate, String> = BTreeMap::new();
-    let mut received: BTreeMap<String, NaiveDate> = BTreeMap::new();
-    for (label, blob, received_at) in store::held_listings(&db, Some(&until))? {
-        received.insert(label.clone(), instant(&received_at)?.date_naive());
-        let days = listed_days(&store::read_blob(&blobs, &blob)?).map_err(|why| {
+    let mut newest_named: BTreeMap<String, NaiveDate> = BTreeMap::new();
+    for held in store::held_listings(&db, Some(&until))? {
+        let days = listed_days(&store::read_blob(&blobs, &held.blob)?).map_err(|why| {
             FilingsError::Unparseable {
-                what: format!("the stored listing of {label}"),
+                what: format!("the stored listing of {}", held.quarter),
                 why: why.to_string(),
             }
         })?;
-        for day in days.into_iter().filter(|day| *day < at_date) {
-            listed.insert(day, label.clone());
+        for day in days {
+            let newest = newest_named.entry(held.quarter.clone()).or_insert(day);
+            *newest = (*newest).max(day);
+            if day < at_date {
+                listed.insert(day, held.quarter.clone());
+            }
         }
     }
     let attempts = store::index_attempts(&db, Some(&until))?;
@@ -81,11 +84,12 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
         forward_from
             .is_some_and(|from| day >= from && day + Days::new(FORWARD_GRACE_DAYS) < at_date)
     };
-    // A listing received on day R can name only days before R.
     let unlisted = |day: &NaiveDate| {
-        received
-            .get(&Quarter::of(*day).label())
-            .is_none_or(|got| got <= day)
+        !matches!(day.weekday(), Weekday::Sat | Weekday::Sun)
+            && !listed.contains_key(day)
+            && newest_named
+                .get(&Quarter::of(*day).label())
+                .is_none_or(|named| named < day)
     };
     let forward_unlisted = forward_from.map_or(0, |from| {
         from.iter_days()
