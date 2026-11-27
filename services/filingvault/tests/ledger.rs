@@ -717,7 +717,9 @@ fn a_holiday_list_not_covering_a_forward_day_aborts_the_check() -> TestResult {
         rules: rules(10),
         holidays: filingvault::holidays::read(&path)?,
     };
-    let code = check(&asked, NOW.parse()?).err().map(|why| why.code().name());
+    let code = check(&asked, NOW.parse()?)
+        .err()
+        .map(|why| why.code().name());
     assert_eq!(code, Some("holidays_uncovered"));
     Ok(())
 }
