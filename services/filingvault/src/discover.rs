@@ -261,7 +261,7 @@ pub fn day_states(
 
 /// The quarters a run asks for a listing, newest first: the current one always, and each other
 /// quarter of the fill window while it is not complete ([`QUARTER_SETTLE_DAYS`]). A step back
-/// that does not go back, or more quarters than the window holds, is an error and never a loop.
+/// that does not go back is an error and never a loop.
 pub fn quarters_to_ask(
     fill_start: NaiveDate,
     current: Quarter,
@@ -270,9 +270,6 @@ pub fn quarters_to_ask(
     walk_back(fill_start, current, received_after_end, Quarter::previous)
 }
 
-/// The shortest quarter, a non-leap first one, in days.
-const SHORTEST_QUARTER_DAYS: i64 = 90;
-
 fn walk_back(
     fill_start: NaiveDate,
     current: Quarter,
@@ -280,17 +277,13 @@ fn walk_back(
     step: impl Fn(Quarter) -> Quarter,
 ) -> Result<Vec<Quarter>, FilingsError> {
     let oldest = Quarter::of(fill_start);
-    let most = (current.first_day() - fill_start).num_days().max(0) / SHORTEST_QUARTER_DAYS + 2;
     let mut quarters = vec![current];
     let mut quarter = current;
-    let mut steps = 0_i64;
     loop {
         let next = step(quarter);
-        steps += 1;
-        if next >= quarter || steps > most {
+        if next >= quarter {
             return Err(FilingsError::FillWindow(format!(
-                "the quarter before {} is {}, and the window from {fill_start} holds at most \
-                 {most}",
+                "the quarter before {} is {}",
                 quarter.label(),
                 next.label()
             )));
@@ -304,6 +297,7 @@ fn walk_back(
         quarter = next;
     }
 }
+
 /// The index days a run asks, newest first: the trailing [`TRAILING_DAYS`] listed days before
 /// the run's date, then every other listed day of the fill window not asked or cut.
 #[must_use]
@@ -342,8 +336,9 @@ mod tests {
         NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap_or_default()
     }
 
-    /// A step that does not go back ends the walk with an error. On 2026-11-27, `Quarter::of`
-    /// mutated to `month % 12` grew the walk to 87 GB resident and panicked the host kernel.
+    /// A step that does not go back ends the walk at once with an error. On 2026-11-27,
+    /// `Quarter::of` mutated to `month % 12` grew the walk to 87 GB resident and panicked the host
+    /// kernel; here the step itself panics after 10 calls. Mutation 2026-11-27, the check dropped.
     #[test]
     fn a_quarter_step_that_does_not_go_back_is_an_error_and_never_a_loop() {
         let current = Quarter::of(day("2026-11-12"));
@@ -352,12 +347,18 @@ mod tests {
         let labels = |walked: Result<Vec<Quarter>, FilingsError>| {
             walked.map(|quarters| quarters.into_iter().map(Quarter::label).collect::<Vec<_>>())
         };
-        let stuck =
-            walk_back(fill_start, current, &none, |quarter| quarter).map_err(|why| why.code());
+        let calls = std::cell::Cell::new(0);
+        let stuck = walk_back(fill_start, current, &none, |quarter| {
+            calls.set(calls.get() + 1);
+            assert!(calls.get() <= 10, "the walk did not stop");
+            quarter
+        })
+        .map_err(|why| why.code());
         assert_eq!(
             (
                 labels(quarters_to_ask(fill_start, current, &none)).ok(),
-                stuck
+                stuck,
+                calls.get(),
             ),
             (
                 Some(
@@ -372,7 +373,8 @@ mod tests {
                     .map(str::to_owned)
                     .to_vec()
                 ),
-                Err(crate::error::ErrorCode::InputUnparseable)
+                Err(crate::error::ErrorCode::InputUnparseable),
+                1,
             )
         );
     }
