@@ -201,3 +201,35 @@ fn a_row_listed_by_a_later_attempt_is_counted_listed_later() -> TestResult {
     );
     Ok(())
 }
+
+/// A forward day no held listing could have named yet is owed as well: a listing that fails night
+/// after night leaves the newest days unlisted, never "nothing owed", and the held days are still
+/// asked (review of 2026-11-27, PIT-1). Mutation 2026-11-27, a failed listing erasing the days the
+/// store holds: red here.
+#[test]
+fn forward_days_after_the_newest_listing_are_unlisted_and_answer_no() -> TestResult {
+    let temp = TempDir::new()?;
+    run(temp.path(), &listing_of(&FIRST), RUN)??;
+    let failing = listing_of(&FIRST).replacing(&listing_url(FIRST[0]), Reply::Transport);
+    drop(run(temp.path(), &failing, "2026-11-17T06:10:00Z")?);
+    let read = checked(temp.path(), "2026-11-21T12:00:00Z")?;
+    assert_eq!(
+        (
+            asked_days(&failing),
+            read.exit,
+            read.report["forward_unasked"].clone(),
+            read.report["forward_unlisted"].clone(),
+        ),
+        (
+            vec![
+                "2026-11-11".to_owned(),
+                "2026-11-10".to_owned(),
+                "2026-11-09".to_owned()
+            ],
+            1,
+            serde_json::json!(0),
+            serde_json::json!(6),
+        )
+    );
+    Ok(())
+}

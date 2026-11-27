@@ -130,8 +130,8 @@ const EXITS: [(&str, &[(u8, &str)]); 3] = [
     (
         "ledger check",
         &[
-            (0, "no forward index day is unasked"),
-            (1, "the answer is no: a forward day is unasked, or no collect run had started by --at"),
+            (0, "no forward index day is unasked or unlisted"),
+            (1, "the answer is no: a forward day is unasked, or no listing held by --at could name it yet, or no collect run had started by --at"),
             (2, "invalid_argument, input_unparseable, input_schema_mismatch, io_failed"),
             (4, "input_absent: no store"),
         ],

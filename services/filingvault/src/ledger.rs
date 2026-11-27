@@ -1,13 +1,13 @@
 //! `filingvault ledger check --at`: which index days were asked, as of an instant (architecture.md
 //! section 12.2, "What complete means"). Read-only and lease-free. Exit 1 is "the answer is no":
-//! a forward day is not asked, or no collect run had started by `--at`.
+//! a forward day is not asked or not yet listed, or no collect run had started by `--at`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Days, NaiveDate, Utc};
 use rusqlite::Connection;
-use sec_edgar::listed_days;
+use sec_edgar::{listed_days, Quarter};
 use serde_json::{json, Value};
 use vault_core::blobs::BlobStore;
 
@@ -61,7 +61,9 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
         None => None,
     };
     let mut listed: BTreeMap<NaiveDate, String> = BTreeMap::new();
-    for (label, blob, _) in store::held_listings(&db, Some(&until))? {
+    let mut received: BTreeMap<String, NaiveDate> = BTreeMap::new();
+    for (label, blob, received_at) in store::held_listings(&db, Some(&until))? {
+        received.insert(label.clone(), instant(&received_at)?.date_naive());
         let days = listed_days(&store::read_blob(&blobs, &blob)?).map_err(|why| {
             FilingsError::Unparseable {
                 what: format!("the stored listing of {label}"),
@@ -79,6 +81,18 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
         forward_from
             .is_some_and(|from| day >= from && day + Days::new(FORWARD_GRACE_DAYS) < at_date)
     };
+    // A listing received on day R can name only days before R.
+    let unlisted = |day: &NaiveDate| {
+        received
+            .get(&Quarter::of(*day).label())
+            .is_none_or(|got| got <= day)
+    };
+    let forward_unlisted = forward_from.map_or(0, |from| {
+        from.iter_days()
+            .take_while(|day| owed(*day))
+            .filter(unlisted)
+            .count()
+    });
     let mut counts: BTreeMap<&str, u32> = BTreeMap::new();
     let mut forward_unasked = 0_u32;
     let mut day_rows = Vec::with_capacity(listed.len());
@@ -128,7 +142,7 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let last_run = store::last_run(&db, &until)?;
-    let exit = if forward_from.is_none() || forward_unasked > 0 {
+    let exit = if forward_from.is_none() || forward_unasked > 0 || forward_unlisted > 0 {
         ANSWER_IS_NO
     } else {
         0
@@ -140,6 +154,7 @@ pub fn check(asked: &Asked, now: DateTime<Utc>) -> Result<Checked, FilingsError>
         "forward_from": forward_from.map(store::day_text),
         "days": by_state,
         "forward_unasked": forward_unasked,
+        "forward_unlisted": forward_unlisted,
         "listed_rows": rows.values().map(|held| held.listed).sum::<u32>(),
         "per_day": day_rows,
         "blob_raw_bytes": raw.unwrap_or(0),
