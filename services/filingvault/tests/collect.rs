@@ -153,7 +153,7 @@ fn an_index_day_lists_one_row_per_listed_form_row_and_keeps_the_first_attempt_th
                     7654321     20261111    edgar/data/7654321/0001493152-26-050839.txt\n";
     let combined = [index_of("2026-11-11"), co_filer.as_bytes().to_vec()].concat();
     let stub = Stub::sec().replacing(&index_url("2026-11-11"), Reply::Status(OK, combined));
-    run(temp.path(), &stub, RUN)??;
+    let first = run(temp.path(), &stub, RUN)??;
     run(temp.path(), &stub, NEXT_RUN)??;
     let day = "index_day = '2026-11-11'";
     assert_eq!(
@@ -169,7 +169,7 @@ fn an_index_day_lists_one_row_per_listed_form_row_and_keeps_the_first_attempt_th
             rows(
                 temp.path(),
                 &format!(
-                    "SELECT count(DISTINCT l.first_seq), min(a.run_id) = max(a.run_id)
+                    "SELECT count(DISTINCT l.first_seq), min(a.run_id), max(a.run_id)
                        FROM listings l JOIN attempts a ON a.seq = l.first_seq WHERE {day}"
                 )
             )?,
@@ -184,7 +184,7 @@ fn an_index_day_lists_one_row_per_listed_form_row_and_keeps_the_first_attempt_th
         (
             vec!["11|10".to_owned()],
             vec!["10-K".to_owned(), "10-K/A".to_owned()],
-            vec!["1|1".to_owned()],
+            vec![format!("1|{0}|{0}", first.value["run_id"].as_str().unwrap_or_default())],
             vec!["1889106".to_owned(), "7654321".to_owned()],
         )
     );
