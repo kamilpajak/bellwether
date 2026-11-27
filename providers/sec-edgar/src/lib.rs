@@ -48,8 +48,8 @@ pub const INDEX_DATE: &str = "%Y%m%d";
 /// The index header naming the day the index holds; the real file spells `Nov 10, 2026`, the
 /// `edgar-press` fixture `November 10, 2026`.
 const LAST_DATA_RECEIVED: &str = "Last Data Received";
-const SHORT_MONTH_DAY: &str = "%b %d, %Y";
-const LONG_MONTH_DAY: &str = "%B %d, %Y";
+/// chrono 0.4 parses `Nov` and `November` both under `%B` (review SE8b, 2026-11-27).
+const MONTH_DAY: &str = "%B %d, %Y";
 /// A listing item's `last-modified`: `11/10/2026 10:01:42 PM`, in [`LISTING_ZONE`].
 const LISTING_WRITTEN: &str = "%m/%d/%Y %I:%M:%S %p";
 const LISTING_ZONE: &str = "America/New_York";
@@ -297,9 +297,7 @@ fn day_of_index_name(name: &str) -> Result<Option<NaiveDate>, ListingUnparseable
 #[must_use]
 pub fn last_data_received(payload: &str) -> Option<NaiveDate> {
     let value = labelled(payload, LAST_DATA_RECEIVED)?;
-    [SHORT_MONTH_DAY, LONG_MONTH_DAY]
-        .iter()
-        .find_map(|format| NaiveDate::parse_from_str(&value, format).ok())
+    NaiveDate::parse_from_str(&value, MONTH_DAY).ok()
 }
 
 /// One row of a daily index.
@@ -584,8 +582,8 @@ mod tests {
         );
     }
 
-    /// Both spellings of `Last Data Received`; no header is `None`. Mutation 2026-11-27, the long
-    /// spelling not tried: red here.
+    /// Both spellings of `Last Data Received`; no header is `None`. Mutation 2026-11-27, `%b` for
+    /// `%B`: red here.
     #[test]
     fn last_data_received_reads_both_spellings_of_the_month() {
         let read = [
