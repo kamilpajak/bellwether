@@ -212,4 +212,27 @@ mod tests {
         );
         Ok(())
     }
+
+    /// An unknown key, another schema, years out of order and a missing year each refuse the
+    /// list. Mutations 2026-11-27, each check dropped alone, and the missing year read as 2026:
+    /// red here.
+    #[test]
+    fn a_list_of_another_shape_is_unparseable() -> Result<(), std::io::Error> {
+        let temp = tempfile::TempDir::new()?;
+        let head = format!(r#""schema": "{HOLIDAYS_SCHEMA}""#);
+        let bodies = [
+            format!(r#"{{{head}, "first_year": 2026, "last_year": 2026, "days": [], "extra": 1}}"#),
+            r#"{"schema": "filingvault.holidays/9", "first_year": 2026, "last_year": 2026, "days": []}"#.to_owned(),
+            format!(r#"{{{head}, "first_year": 2027, "last_year": 2026, "days": []}}"#),
+            format!(r#"{{{head}, "last_year": 2026, "days": []}}"#),
+        ];
+        let mut codes = Vec::new();
+        for (n, body) in bodies.iter().enumerate() {
+            let path = temp.path().join(format!("{n}.json"));
+            std::fs::write(&path, body)?;
+            codes.push(read(&path).err().map(|why| why.code().name()));
+        }
+        assert_eq!(codes, vec![Some("input_unparseable"); 4]);
+        Ok(())
+    }
 }

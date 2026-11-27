@@ -618,3 +618,78 @@ fn a_quarter_ending_on_an_observed_holiday_leaves_no_day_unlisted() -> TestResul
     );
     Ok(())
 }
+
+/// A weekday no listing names, before the newest day a held listing named, is not unlisted, and
+/// a newer listing omitting that newest day does not move the bound back. Mutations 2026-11-27,
+/// each red here: the bound dropped; the newest named day taken from the last body read.
+#[test]
+fn a_gap_before_the_newest_named_day_is_not_unlisted() -> TestResult {
+    let temp = TempDir::new()?;
+    let gapped = [
+        "2026-11-05",
+        "2026-11-06",
+        "2026-11-09",
+        "2026-11-10",
+        "2026-11-11",
+        "2026-11-12",
+        "2026-11-16",
+    ];
+    run(temp.path(), &listing_of(&FIRST), RUN)??;
+    drop(run(
+        temp.path(),
+        &listing_of(&gapped),
+        "2026-11-17T06:10:00Z",
+    )?);
+    drop(run(
+        temp.path(),
+        &listing_of(&gapped[..6]),
+        "2026-11-18T06:10:00Z",
+    )?);
+    let read = checked(temp.path(), "2026-11-20T12:00:00Z")?;
+    assert_eq!(read.report["forward_unlisted"], serde_json::json!(0));
+    Ok(())
+}
+
+/// A store whose only listing is `empty` holds no usable listing and answers no. Mutation
+/// 2026-11-27, every held listing counted usable: red here.
+#[test]
+fn a_store_holding_only_an_empty_listing_answers_no() -> TestResult {
+    let temp = TempDir::new()?;
+    let stub = Stub::default()
+        .answering(ROBOTS_URL, Reply::Status(OK, ROBOTS.to_vec()))
+        .answering(&listing_url(LISTED[0]), Reply::Status(OK, listing(&[])));
+    drop(run(temp.path(), &stub, RUN)?);
+    let read = checked(temp.path(), "2026-11-12T12:00:00Z")?;
+    assert_eq!(
+        (read.exit, read.report["usable_listings"].clone()),
+        (1, serde_json::json!(0))
+    );
+    Ok(())
+}
+
+/// `Last Data Received` is read from the day's newest usable answer: 11-12 answered stale, then
+/// right, then failed. Mutations 2026-11-27, each red here: the oldest answer read; a failed
+/// answer read; the last attempt shown.
+#[test]
+fn the_newest_usable_answer_names_the_days_last_data_received() -> TestResult {
+    let temp = TempDir::new()?;
+    let named: Vec<&str> = LISTED.iter().copied().chain(["2026-11-12"]).collect();
+    run(temp.path(), &listing_of(&LISTED), RUN)??;
+    let stale = listing_of(&named).replacing(
+        &index_url("2026-11-12"),
+        Reply::Status(OK, index_of("2026-11-11")),
+    );
+    run(temp.path(), &stale, NEXT_RUN)??;
+    run(temp.path(), &listing_of(&named), "2026-11-14T06:10:00Z")??;
+    let failing = listing_of(&named).replacing(&index_url("2026-11-12"), Reply::Transport);
+    drop(run(temp.path(), &failing, "2026-11-16T06:10:00Z")?);
+    let read = checked(temp.path(), "2026-11-16T12:00:00Z")?;
+    assert_eq!(
+        (
+            read.report["last_data_received_mismatch"].clone(),
+            per_day(&read, "2026-11-12")["last_data_received"].clone()
+        ),
+        (serde_json::json!(0), serde_json::json!("2026-11-12"))
+    );
+    Ok(())
+}

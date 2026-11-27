@@ -557,8 +557,8 @@ mod tests {
     }
 
     /// A `form.*.idx` name whose date is not eight digits of a real day refuses the listing:
-    /// chrono reads `2026111` as 2026-11-01 (review of 2026-11-27). Mutation 2026-11-27, the
-    /// width check dropped: red here.
+    /// chrono reads `2026111` as 2026-11-01 (review of 2026-11-27). Mutations 2026-11-27, the
+    /// width check dropped; the digit check dropped (`2026 111` read as a day): red here.
     #[test]
     fn a_form_index_name_that_is_no_yyyymmdd_day_refuses_the_listing() {
         let named = |name: &str| {
@@ -569,11 +569,13 @@ mod tests {
             [
                 "form.2026111.idx",
                 "form.2026XX12.idx",
+                "form.2026 111.idx",
                 "form.20261131.idx",
                 "form.20261112.idx"
             ]
             .map(named),
             [
+                Err("unparseable"),
                 Err("unparseable"),
                 Err("unparseable"),
                 Err("unparseable"),

@@ -849,6 +849,109 @@ fn a_day_rewritten_after_its_stored_answer_is_asked_again_once() -> TestResult {
     Ok(())
 }
 
+/// The planner keeps a day an older stored listing named when a newer stored one omits it and
+/// this run's listing fails. Mutation 2026-11-27, `Window::read` replacing the held days: red.
+#[test]
+fn the_planner_keeps_a_day_only_an_older_stored_listing_names() -> TestResult {
+    let temp = TempDir::new()?;
+    run(temp.path(), &listing_of(&LISTED), RUN)??;
+    let later = [
+        "2026-11-05",
+        "2026-11-06",
+        "2026-11-09",
+        "2026-11-10",
+        "2026-11-11",
+        "2026-11-12",
+        "2026-11-13",
+        "2026-11-16",
+    ];
+    let failing = listing_of(&later).replacing(&index_url("2026-11-13"), Reply::Transport);
+    drop(run(temp.path(), &failing, "2026-11-17T06:10:00Z")?);
+    let omits = Stub::default()
+        .answering(ROBOTS_URL, Reply::Status(OK, ROBOTS.to_vec()))
+        .answering(
+            &listing_url(LISTED[0]),
+            Reply::Status(OK, listing(&["2026-11-12", "2026-11-16", "2026-11-17"])),
+        );
+    drop(run(temp.path(), &omits, "2026-11-18T06:10:00Z")?);
+    let blind = listing_of(&later).replacing(&listing_url(LISTED[0]), Reply::Transport);
+    drop(run(temp.path(), &blind, "2026-11-19T06:10:00Z")?);
+    assert!(asked_days(&blind).contains(&"2026-11-13".to_owned()));
+    Ok(())
+}
+
+/// A past quarter's listing received the day after its end does not complete it, and the next
+/// day's does: the QS-3 value 1. Mutation 2026-11-27, `QUARTER_SETTLE_DAYS` 2: red here.
+#[test]
+fn a_past_quarter_completes_on_a_listing_received_two_days_after_its_end() -> TestResult {
+    let temp = TempDir::new()?;
+    let q4 = ["2026-12-29", "2026-12-30", "2026-12-31"];
+    let q1 = ["2027-01-02"];
+    let stub = || {
+        let stub = Stub::default()
+            .answering(ROBOTS_URL, Reply::Status(OK, ROBOTS.to_vec()))
+            .answering(&listing_url(q4[0]), Reply::Status(OK, listing(&q4)))
+            .answering(&listing_url(q1[0]), Reply::Status(OK, listing(&q1)));
+        q4.iter().chain(&q1).fold(stub, |stub, text| {
+            stub.answering(&index_url(text), Reply::Status(OK, index_of(text)))
+        })
+    };
+    let mut last = Vec::new();
+    for at in ["2026-12-30", "2027-01-02", "2027-01-03"] {
+        let asked = stub();
+        run(temp.path(), &asked, &format!("{at}T06:10:00Z"))??;
+        last = asked
+            .asked()
+            .into_iter()
+            .filter(|url| url.ends_with("index.json"))
+            .collect::<Vec<String>>();
+    }
+    assert_eq!(last, vec![listing_url(q1[0])]);
+    Ok(())
+}
+
+/// A rewrite is found from the day's newest usable answer when a later re-ask of it failed.
+/// Mutation 2026-11-27, the failed attempt's headers compared: red here.
+#[test]
+fn a_rewrite_after_a_failed_reask_is_asked() -> TestResult {
+    let temp = TempDir::new()?;
+    let dated = listing_of(&LISTED).replacing(
+        &index_url("2026-11-10"),
+        Reply::Dated(OK, index_of("2026-11-10"), "Wed, 11 Nov 2026 03:00:00 GMT"),
+    );
+    run(temp.path(), &dated, RUN)??;
+    let named: Vec<&str> = LISTED.iter().copied().chain(["2026-11-12"]).collect();
+    let failing = listing_of(&named).replacing(&index_url("2026-11-10"), Reply::Transport);
+    drop(run(temp.path(), &failing, NEXT_RUN)?);
+    let later = [
+        "2026-11-05",
+        "2026-11-06",
+        "2026-11-09",
+        "2026-11-10",
+        "2026-11-11",
+        "2026-11-12",
+        "2026-11-13",
+        "2026-11-16",
+    ];
+    let written: Vec<(&str, String)> = later
+        .iter()
+        .map(|text| match *text {
+            "2026-11-10" => (*text, "11/16/2026 10:00:00 PM".to_owned()),
+            _ => (
+                *text,
+                format!("{}/{}/2026 10:00:00 PM", &text[5..7], &text[8..]),
+            ),
+        })
+        .collect();
+    let rewritten = listing_of(&later).replacing(
+        &listing_url(LISTED[0]),
+        Reply::Status(OK, listing_written(&written)),
+    );
+    drop(run(temp.path(), &rewritten, "2026-11-17T06:10:00Z")?);
+    assert!(asked_days(&rewritten).contains(&"2026-11-10".to_owned()));
+    Ok(())
+}
+
 /// One failed request is enough for exit 8. Mutation 2026-11-27, exit 8 from two failures: red.
 #[test]
 fn one_failed_request_makes_the_run_partial() -> TestResult {
