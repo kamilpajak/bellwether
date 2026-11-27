@@ -224,8 +224,9 @@ fn a_row_listed_by_a_later_attempt_is_counted_listed_later() -> TestResult {
 
 /// A forward day no held listing could have named yet is owed as well: a listing that fails night
 /// after night leaves the newest days unlisted, never "nothing owed", and the held days are still
-/// asked (review of 2026-11-27, PIT-1). Mutation 2026-11-27, a failed listing erasing the days the
-/// store holds: red here.
+/// asked (review of 2026-11-27, PIT-1). Mutations 2026-11-27, each red here: a failed listing
+/// erasing the days the store holds; `forward_unlisted` left out of the exit; a listing received
+/// on a day read as naming it.
 #[test]
 fn forward_days_after_the_newest_listing_are_unlisted_and_answer_no() -> TestResult {
     let temp = TempDir::new()?;
@@ -378,5 +379,31 @@ fn ledger_check_refuses_an_at_after_now() -> TestResult {
         .err()
         .map(|why| why.code().name());
     assert_eq!(code, Some("invalid_argument"));
+    Ok(())
+}
+
+/// A day of a quarter whose listing the store never held is unlisted too. Mutation 2026-11-27, a
+/// quarter with no held listing read as covering its days: red here.
+#[test]
+fn the_days_of_a_quarter_never_listed_are_unlisted() -> TestResult {
+    let temp = TempDir::new()?;
+    run(
+        temp.path(),
+        &listing_of(&["2026-12-29"]),
+        "2026-12-30T06:10:00Z",
+    )??;
+    let q1_failing = listing_of(&["2026-12-29", "2026-12-30", "2026-12-31"])
+        .answering(&listing_url("2027-01-04"), Reply::Transport);
+    drop(run(temp.path(), &q1_failing, "2027-01-05T06:10:00Z")?);
+    let asked = Asked {
+        at: "2027-01-09T12:00:00Z".parse()?,
+        store: temp.path().to_path_buf(),
+        rules: rules(10),
+    };
+    let read = check(&asked, "2027-02-01T00:00:00Z".parse()?)?;
+    assert_eq!(
+        (read.exit, read.report["forward_unlisted"].clone()),
+        (1, serde_json::json!(5))
+    );
     Ok(())
 }
