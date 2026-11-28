@@ -1209,7 +1209,8 @@ fn traffic_on(stub: Stub, days: &[&str]) -> Stub {
 }
 
 /// Section 12.2: three consecutive traffic 403 answers stop the run before a fourth attempt is
-/// opened, `stopped_by` `traffic_403`, exit 7, retryable. Mutation 2026-11-28, the stop at 4: red.
+/// opened, `stopped_by` `traffic_403`, exit 7, retryable. Mutations 2026-11-28, each red here:
+/// the stop at 4; the report's `error_code` `robots_stopped` under a traffic stop.
 #[test]
 fn three_consecutive_traffic_403s_open_no_fourth_attempt_and_exit_7() -> TestResult {
     let temp = TempDir::new()?;
@@ -1224,6 +1225,7 @@ fn three_consecutive_traffic_403s_open_no_fourth_attempt_and_exit_7() -> TestRes
             (object["code"].clone(), object["retryable"].clone()),
             object["details"]["count"].clone(),
             object["details"]["report"]["stopped_by"].clone(),
+            object["details"]["report"]["exit"]["error_code"].clone(),
             asked_days(&stub),
             rows(
                 temp.path(),
@@ -1238,6 +1240,7 @@ fn three_consecutive_traffic_403s_open_no_fourth_attempt_and_exit_7() -> TestRes
             ),
             serde_json::json!(3),
             serde_json::json!("traffic_403"),
+            serde_json::json!("traffic_stopped"),
             ["2026-11-11", "2026-11-10", "2026-11-09"]
                 .map(str::to_owned)
                 .to_vec(),

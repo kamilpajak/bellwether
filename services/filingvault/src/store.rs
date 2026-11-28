@@ -751,7 +751,8 @@ mod tests {
 
     /// The store refuses a row its keys or CHECKs exclude, and a slot whose described request is
     /// not the one sent. Mutations 2026-11-27, each red here: both pragmas dropped (foreign keys
-    /// off); the `forms` CHECK dropped; the slot's window check dropped.
+    /// off); the `forms` CHECK dropped; the slot's window check dropped. Mutations 2026-11-28, each
+    /// red here: the `runs.stopped_by`, `runs.budget` and `runs.planned` CHECKs dropped.
     #[test]
     fn the_store_refuses_a_row_its_schema_or_its_slot_does_not_describe() -> TestResult {
         let temp = TempDir::new()?;
@@ -767,13 +768,22 @@ mod tests {
                                    opened_at)
              VALUES ('a', 'filings-test', 'robots', 'h', 'u', '[]', 1, 't')",
         );
+        let runs = [
+            "UPDATE runs SET stopped_by = 'bogus'",
+            "UPDATE runs SET budget = -1",
+            "UPDATE runs SET planned = -1",
+        ]
+        .map(refused);
         let listing = crate::discover::listing_ask(sec_edgar::Quarter::of(NaiveDate::MIN));
         let sent = crate::discover::request(&listing, news_provider::Provenance::LiveIngest);
         let at = ObservationTime::new(DateTime::UNIX_EPOCH);
         let other = writer
             .open_slot(crate::discover::robots_ask(), &sent, 0, at)
             .is_err();
-        assert_eq!((orphan, robots_with_forms, other), (true, true, true));
+        assert_eq!(
+            (orphan, robots_with_forms, runs, other),
+            (true, true, [true; 3], true)
+        );
         Ok(())
     }
 }
