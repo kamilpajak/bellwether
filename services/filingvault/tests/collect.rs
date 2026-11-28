@@ -1331,6 +1331,33 @@ fn a_failure_after_a_head_resets_the_count_unless_the_head_was_a_403() -> TestRe
     Ok(())
 }
 
+/// A budget or robots stop met after the third traffic 403 ends the run `traffic_403`, exit 7,
+/// retryable (review 2026-11-28, boundaries F1). Mutation 2026-11-28, the end-of-run check read
+/// only when no other stop came: red.
+#[test]
+fn a_budget_or_robots_stop_after_three_traffic_403s_ends_traffic_403() -> TestResult {
+    let mut found = Vec::new();
+    for (budget, robots) in [
+        (0, ROBOTS.to_vec()),
+        (
+            1_800,
+            b"User-agent: *\nDisallow: /Archives/edgar/daily-index/2026/QTR4/form.20261106.idx\n"
+                .to_vec(),
+        ),
+    ] {
+        let temp = TempDir::new()?;
+        let stub = traffic_on(Stub::sec(), &["2026-11-11", "2026-11-10", "2026-11-09"])
+            .replacing(ROBOTS_URL, Reply::Status(OK, robots));
+        let got = run_ask(&budgeted(temp.path(), budget), &stub, RUN)?
+            .map(|report| report.exit)
+            .map_err(|why| why.code().name());
+        found.push((got, rows(temp.path(), "SELECT exit, stopped_by FROM runs")?));
+    }
+    let stopped = (Err("traffic_stopped"), vec!["7|traffic_403".to_owned()]);
+    assert_eq!(found, vec![stopped.clone(), stopped]);
+    Ok(())
+}
+
 /// [`Stub::sec`] with each listed day's index naming 10 filings no other day names: the
 /// accessions' year digits replaced by the day of the month.
 fn distinct_filings() -> Stub {

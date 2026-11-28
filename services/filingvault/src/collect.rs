@@ -483,7 +483,7 @@ pub fn run(ask: &Ask, exchange: &dyn Exchange, clock: &dyn Clock) -> Result<Repo
         days: Vec::new(),
     };
     let stop = match driver.collect(&ask.rules, started.date_naive()) {
-        Ok(None) if driver.traffic_403s >= TRAFFIC_403_STOP => Some(Stop::Traffic403),
+        Ok(_) if driver.traffic_403s >= TRAFFIC_403_STOP => Some(Stop::Traffic403),
         Ok(stop) => stop,
         Err(why) => {
             let exit = why.code().exit();
