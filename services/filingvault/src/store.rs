@@ -33,8 +33,10 @@ CREATE TABLE runs (
     started_at  TEXT NOT NULL,
     finished_at TEXT,
     exit        INTEGER,
-    stopped_by  TEXT CHECK (stopped_by IN ('deadline', 'robots', 'gate_refused', 'error',
-                                           'interrupted'))
+    stopped_by  TEXT CHECK (stopped_by IN ('deadline', 'budget', 'robots', 'traffic_403',
+                                           'gate_refused', 'error', 'interrupted')),
+    budget      INTEGER CHECK (budget >= 0),
+    planned     INTEGER CHECK (planned >= 0)
 );
 CREATE TABLE blobs (
     digest       TEXT PRIMARY KEY,
@@ -237,23 +239,34 @@ impl Writer {
         self.staged = Some(commit);
     }
 
-    pub fn start_run(&self, started: DateTime<Utc>) -> Result<(), FilingsError> {
+    /// `budget` is the rules file's `filing_budget` the run plans under.
+    pub fn start_run(&self, started: DateTime<Utc>, budget: u32) -> Result<(), FilingsError> {
         self.db.execute(
-            "INSERT INTO runs (run_id, kind, started_at) VALUES (?1, 'collect', ?2)",
-            params![self.run.as_str(), stamp(started)],
+            "INSERT INTO runs (run_id, kind, started_at, budget) VALUES (?1, 'collect', ?2, ?3)",
+            params![self.run.as_str(), stamp(started), budget],
         )?;
         Ok(())
     }
 
+    /// `planned` is [`open_filings`] at the close; `None` for a run an error ended, which left
+    /// the count unread.
     pub fn finish_run(
         &self,
         at: DateTime<Utc>,
         exit: u8,
         stopped_by: Option<&str>,
+        planned: Option<u64>,
     ) -> Result<(), FilingsError> {
         self.db.execute(
-            "UPDATE runs SET finished_at = ?2, exit = ?3, stopped_by = ?4 WHERE run_id = ?1",
-            params![self.run.as_str(), stamp(at), exit, stopped_by],
+            "UPDATE runs SET finished_at = ?2, exit = ?3, stopped_by = ?4, planned = ?5
+              WHERE run_id = ?1",
+            params![
+                self.run.as_str(),
+                stamp(at),
+                exit,
+                stopped_by,
+                planned.map(|count| i64::try_from(count).unwrap_or(i64::MAX)),
+            ],
         )?;
         Ok(())
     }
@@ -612,6 +625,20 @@ pub fn collect_starts(db: &Connection, until: Option<&str>) -> Result<Vec<String
     Ok(starts)
 }
 
+/// The filings the budget counts: every accession a `listings` row names. Each is open until the
+/// manifest level closes it (section 12.8, step 11b), so before it every listed filing is open.
+pub fn open_filings(db: &Connection) -> Result<u64, FilingsError> {
+    let count: i64 = db.query_row(
+        "SELECT count(DISTINCT accession) FROM listings",
+        [],
+        |row| row.get(0),
+    )?;
+    u64::try_from(count).map_err(|why| FilingsError::Unparseable {
+        what: format!("the open filings count {count}"),
+        why: why.to_string(),
+    })
+}
+
 /// The payload a stored listing names, re-hashed on the way out.
 pub fn read_blob(blobs: &BlobStore, hex: &str) -> Result<Vec<u8>, FilingsError> {
     let digest = blobs
@@ -624,7 +651,7 @@ pub fn read_blob(blobs: &BlobStore, hex: &str) -> Result<Vec<u8>, FilingsError> 
 pub fn last_run(db: &Connection, until: &str) -> Result<Option<serde_json::Value>, FilingsError> {
     Ok(db
         .query_row(
-            "SELECT run_id, started_at, finished_at, exit, stopped_by FROM runs
+            "SELECT run_id, started_at, finished_at, exit, stopped_by, budget, planned FROM runs
               WHERE started_at <= ?1 ORDER BY started_at DESC LIMIT 1",
             [until],
             |row| {
@@ -638,6 +665,8 @@ pub fn last_run(db: &Connection, until: &str) -> Result<Option<serde_json::Value
                     "finished_at": finished.filter(|_| closed),
                     "exit": row.get::<_, Option<i64>>(3)?.filter(|_| closed),
                     "stopped_by": row.get::<_, Option<String>>(4)?.filter(|_| closed),
+                    "budget": row.get::<_, Option<i64>>(5)?,
+                    "planned": row.get::<_, Option<i64>>(6)?.filter(|_| closed),
                 }))
             },
         )
@@ -725,12 +754,13 @@ mod tests {
 
     /// The store refuses a row its keys or CHECKs exclude, and a slot whose described request is
     /// not the one sent. Mutations 2026-11-27, each red here: both pragmas dropped (foreign keys
-    /// off); the `forms` CHECK dropped; the slot's window check dropped.
+    /// off); the `forms` CHECK dropped; the slot's window check dropped. Mutations 2026-11-28, each
+    /// red here: the `runs.stopped_by`, `runs.budget` and `runs.planned` CHECKs dropped.
     #[test]
     fn the_store_refuses_a_row_its_schema_or_its_slot_does_not_describe() -> TestResult {
         let temp = TempDir::new()?;
         let mut writer = Writer::open(temp.path(), &run())?;
-        writer.start_run(DateTime::UNIX_EPOCH)?;
+        writer.start_run(DateTime::UNIX_EPOCH, 0)?;
         let refused = |sql: &str| writer.db().execute(sql, []).is_err();
         let orphan = refused(
             "INSERT INTO listings (index_day, cik, accession, form, filed_day, first_seq)
@@ -741,13 +771,22 @@ mod tests {
                                    opened_at)
              VALUES ('a', 'filings-test', 'robots', 'h', 'u', '[]', 1, 't')",
         );
+        let runs = [
+            "UPDATE runs SET stopped_by = 'bogus'",
+            "UPDATE runs SET budget = -1",
+            "UPDATE runs SET planned = -1",
+        ]
+        .map(refused);
         let listing = crate::discover::listing_ask(sec_edgar::Quarter::of(NaiveDate::MIN));
         let sent = crate::discover::request(&listing, news_provider::Provenance::LiveIngest);
         let at = ObservationTime::new(DateTime::UNIX_EPOCH);
         let other = writer
             .open_slot(crate::discover::robots_ask(), &sent, 0, at)
             .is_err();
-        assert_eq!((orphan, robots_with_forms, other), (true, true, true));
+        assert_eq!(
+            (orphan, robots_with_forms, runs, other),
+            (true, true, [true; 3], true)
+        );
         Ok(())
     }
 }

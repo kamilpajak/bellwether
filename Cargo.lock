@@ -1714,6 +1714,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "news-provider",
+ "pit",
  "serde_json",
  "thiserror",
 ]

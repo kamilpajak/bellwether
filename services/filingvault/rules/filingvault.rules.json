@@ -1,5 +1,6 @@
 {
-  "schema": "filingvault.rules/1",
+  "schema": "filingvault.rules/2",
   "forms": ["10-K", "10-K/A", "10-KT", "10-KT/A", "20-F", "20-F/A", "40-F", "40-F/A"],
-  "fill_days": 456
+  "fill_days": 456,
+  "filing_budget": 1800
 }

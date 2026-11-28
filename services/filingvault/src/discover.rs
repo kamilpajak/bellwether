@@ -355,9 +355,17 @@ pub fn rewritten_days(
         .collect())
 }
 
-/// The index days a run asks, newest first: the trailing [`TRAILING_DAYS`] listed days before
-/// the run's date, then every other listed day of the fill window not asked or cut, or asked and
-/// `rewritten` since.
+/// The index days a run asks, each list newest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaysToAsk {
+    /// The trailing [`TRAILING_DAYS`] listed days before the run's date, not cut: asked whatever
+    /// the filing budget says.
+    pub trailing: Vec<NaiveDate>,
+    /// Every other listed day of the fill window not asked or cut, or asked and `rewritten`
+    /// since: asked while the open filings are under the budget (section 12.2).
+    pub older: Vec<NaiveDate>,
+}
+
 #[must_use]
 pub fn days_to_ask(
     listed: &BTreeSet<NaiveDate>,
@@ -365,7 +373,7 @@ pub fn days_to_ask(
     rewritten: &BTreeSet<NaiveDate>,
     fill_start: NaiveDate,
     run_date: NaiveDate,
-) -> Vec<NaiveDate> {
+) -> DaysToAsk {
     let window: Vec<NaiveDate> = listed
         .iter()
         .rev()
@@ -374,16 +382,22 @@ pub fn days_to_ask(
         .collect();
     let (trailing, older) = window.split_at(window.len().min(TRAILING_DAYS));
     let state = |day: &NaiveDate| states.get(day).copied().unwrap_or(DayState::Unasked);
-    trailing
-        .iter()
-        .copied()
-        .filter(|day| state(day) != DayState::Truncated)
-        .chain(older.iter().copied().filter(|day| match state(day) {
-            DayState::Asked => rewritten.contains(day),
-            DayState::Truncated => false,
-            _ => true,
-        }))
-        .collect()
+    DaysToAsk {
+        trailing: trailing
+            .iter()
+            .copied()
+            .filter(|day| state(day) != DayState::Truncated)
+            .collect(),
+        older: older
+            .iter()
+            .copied()
+            .filter(|day| match state(day) {
+                DayState::Asked => rewritten.contains(day),
+                DayState::Truncated => false,
+                _ => true,
+            })
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -636,6 +650,12 @@ mod tests {
             day("2026-11-01"),
             day("2026-11-12"),
         );
-        assert_eq!(asked, ["2026-11-10", "2026-11-09", "2026-11-05"].map(day));
+        assert_eq!(
+            (asked.trailing, asked.older),
+            (
+                ["2026-11-10", "2026-11-09"].map(day).to_vec(),
+                vec![day("2026-11-05")]
+            )
+        );
     }
 }

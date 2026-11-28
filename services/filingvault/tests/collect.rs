@@ -85,7 +85,7 @@ fn a_dead_runs_open_attempt_and_run_are_closed_interrupted_by_the_next_writer() 
     let temp = TempDir::new()?;
     {
         let writer = Writer::open(temp.path(), &RunId::new("filings-dead"))?;
-        writer.start_run("2026-11-11T06:10:00Z".parse()?)?;
+        writer.start_run("2026-11-11T06:10:00Z".parse()?, FILING_BUDGET)?;
         writer.db().execute(
             "INSERT INTO attempts (attempt_id, run_id, kind, target, url, body_limit, opened_at)
              VALUES ('dead', 'filings-dead', 'robots', 'www.sec.gov', 'u', 1,
@@ -1197,6 +1197,272 @@ fn a_dry_run_over_a_store_plans_the_trailing_three_days() -> TestResult {
             }),
             0
         )
+    );
+    Ok(())
+}
+
+/// `stub` with each of `days` answering SEC's traffic 403.
+fn traffic_on(stub: Stub, days: &[&str]) -> Stub {
+    days.iter().fold(stub, |stub, text| {
+        stub.replacing(&index_url(text), Reply::Status(403, TRAFFIC_403.to_vec()))
+    })
+}
+
+/// Section 12.2: three consecutive traffic 403 answers stop the run before a fourth attempt is
+/// opened, `stopped_by` `traffic_403`, exit 7, retryable. Mutations 2026-11-28, each red here:
+/// the stop at 4; the report's `error_code` `robots_stopped` under a traffic stop.
+#[test]
+fn three_consecutive_traffic_403s_open_no_fourth_attempt_and_exit_7() -> TestResult {
+    let temp = TempDir::new()?;
+    let stub = traffic_on(Stub::sec(), &["2026-11-11", "2026-11-10", "2026-11-09"]);
+    let stopped = run(temp.path(), &stub, RUN)?;
+    let Err(why @ FilingsError::TrafficStopped { .. }) = stopped else {
+        return Err(format!("not stopped by traffic: {stopped:?}").into());
+    };
+    let object = why.object(&[]);
+    assert_eq!(
+        (
+            (object["code"].clone(), object["retryable"].clone()),
+            object["details"]["count"].clone(),
+            object["details"]["report"]["stopped_by"].clone(),
+            object["details"]["report"]["exit"]["error_code"].clone(),
+            asked_days(&stub),
+            rows(
+                temp.path(),
+                "SELECT count(*) FROM attempts WHERE kind = 'index'"
+            )?,
+            rows(temp.path(), "SELECT exit, stopped_by FROM runs")?,
+        ),
+        (
+            (
+                serde_json::json!("traffic_stopped"),
+                serde_json::json!(true)
+            ),
+            serde_json::json!(3),
+            serde_json::json!("traffic_403"),
+            serde_json::json!("traffic_stopped"),
+            ["2026-11-11", "2026-11-10", "2026-11-09"]
+                .map(str::to_owned)
+                .to_vec(),
+            vec!["3".to_owned()],
+            vec!["7|traffic_403".to_owned()],
+        )
+    );
+    Ok(())
+}
+
+/// Any other answer between them, an `AccessDenied` 403 included, starts the count again; a
+/// transport error with no status is no answer and leaves it (section 12.8, step 11 as built).
+/// Mutations 2026-11-28, each red here: the count not reset by another answer; reset by a
+/// transport error; `AccessDenied` counted as traffic in `sec_edgar::is_traffic_403`.
+#[test]
+fn an_answer_between_traffic_403s_resets_the_count_and_a_transport_error_does_not() -> TestResult {
+    let broken = TempDir::new()?;
+    let answered = traffic_on(
+        Stub::sec(),
+        &["2026-11-11", "2026-11-10", "2026-11-06", "2026-11-05"],
+    )
+    .replacing(
+        &index_url("2026-11-09"),
+        Reply::Status(403, ACCESS_DENIED.to_vec()),
+    );
+    let went_on = run(broken.path(), &answered, RUN)?.map(|report| report.exit);
+    let lost = TempDir::new()?;
+    let unanswered = traffic_on(Stub::sec(), &["2026-11-11", "2026-11-09", "2026-11-06"])
+        .replacing(&index_url("2026-11-10"), Reply::Transport);
+    let stopped = run(lost.path(), &unanswered, RUN)?.map_err(|why| why.code().name());
+    assert_eq!(
+        (
+            went_on.ok(),
+            asked_days(&answered).len(),
+            stopped.err(),
+            asked_days(&unanswered),
+        ),
+        (
+            Some(8),
+            5,
+            Some("traffic_stopped"),
+            ["2026-11-11", "2026-11-10", "2026-11-09", "2026-11-06"]
+                .map(str::to_owned)
+                .to_vec(),
+        )
+    );
+    Ok(())
+}
+
+/// The stop is read at the run's end too, when the third traffic 403 was the plan's last
+/// request. Mutation 2026-11-28, the end-of-run check dropped: red (exit 8, `stopped_by` null).
+#[test]
+fn a_plan_ending_on_its_third_traffic_403_ends_traffic_403() -> TestResult {
+    let temp = TempDir::new()?;
+    let stub = traffic_on(Stub::sec(), &["2026-11-11", "2026-11-10", "2026-11-09"]);
+    let mut asked = support::ask(temp.path());
+    asked.rules = rules(5);
+    let stopped = run_ask(&asked, &stub, RUN)?.map_err(|why| why.code().name());
+    assert_eq!(
+        (
+            stopped.err(),
+            rows(temp.path(), "SELECT exit, stopped_by FROM runs")?
+        ),
+        (Some("traffic_stopped"), vec!["7|traffic_403".to_owned()])
+    );
+    Ok(())
+}
+
+/// A failure whose head was read resets the count, but a 403 head whose body was lost neither
+/// counts nor resets: its body cannot be told from `AccessDenied` (review 2026-11-28, F1 and C4).
+/// Mutations 2026-11-28, each red here: a 403 head with a lost body resetting; no head resetting.
+#[test]
+fn a_failure_after_a_head_resets_the_count_unless_the_head_was_a_403() -> TestResult {
+    let mut found = Vec::new();
+    for between in [
+        Reply::OverLimit(b"x".to_vec()),
+        Reply::HeadThenLost(403, TRAFFIC_403[..10].to_vec()),
+    ] {
+        let temp = TempDir::new()?;
+        let stub = traffic_on(
+            Stub::sec(),
+            &["2026-11-11", "2026-11-10", "2026-11-06", "2026-11-05"],
+        )
+        .replacing(&index_url("2026-11-09"), between);
+        let got = run(temp.path(), &stub, RUN)?
+            .map(|report| report.exit)
+            .map_err(|why| why.code().name());
+        found.push((got, asked_days(&stub).len()));
+    }
+    assert_eq!(found, vec![(Ok(8), 5), (Err("traffic_stopped"), 4)]);
+    Ok(())
+}
+
+/// A budget or robots stop met after the third traffic 403 ends the run `traffic_403`, exit 7,
+/// retryable (review 2026-11-28, boundaries F1). Mutation 2026-11-28, the end-of-run check read
+/// only when no other stop came: red.
+#[test]
+fn a_budget_or_robots_stop_after_three_traffic_403s_ends_traffic_403() -> TestResult {
+    let mut found = Vec::new();
+    for (budget, robots) in [
+        (0, ROBOTS.to_vec()),
+        (
+            1_800,
+            b"User-agent: *\nDisallow: /Archives/edgar/daily-index/2026/QTR4/form.20261106.idx\n"
+                .to_vec(),
+        ),
+    ] {
+        let temp = TempDir::new()?;
+        let stub = traffic_on(Stub::sec(), &["2026-11-11", "2026-11-10", "2026-11-09"])
+            .replacing(ROBOTS_URL, Reply::Status(OK, robots));
+        let got = run_ask(&budgeted(temp.path(), budget), &stub, RUN)?
+            .map(|report| report.exit)
+            .map_err(|why| why.code().name());
+        found.push((got, rows(temp.path(), "SELECT exit, stopped_by FROM runs")?));
+    }
+    let stopped = (Err("traffic_stopped"), vec!["7|traffic_403".to_owned()]);
+    assert_eq!(found, vec![stopped.clone(), stopped]);
+    Ok(())
+}
+
+/// [`Stub::sec`] with each listed day's index naming 10 filings no other day names: the
+/// accessions' year digits replaced by the day of the month.
+fn distinct_filings() -> Stub {
+    LISTED.iter().fold(Stub::sec(), |stub, text| {
+        let body =
+            String::from_utf8_lossy(&index_of(text)).replace("-26-", &format!("-{}-", &text[8..]));
+        stub.replacing(&index_url(text), Reply::Status(OK, body.into_bytes()))
+    })
+}
+
+fn budgeted(store: &std::path::Path, budget: u32) -> filingvault::collect::Ask {
+    let mut asked = support::ask(store);
+    asked.rules.filing_budget = budget;
+    asked
+}
+
+/// Section 12.2: unasked days are asked newest first until the open filings reach the budget;
+/// the run ends `budget`, exit 8, and records the budget and the count. Mutations 2026-11-28,
+/// each red here: the budget not compared; `>` for `>=`; `stopped_by` left null.
+#[test]
+fn unasked_days_stop_at_the_filing_budget() -> TestResult {
+    let mut found = Vec::new();
+    for budget in [30, 31] {
+        let temp = TempDir::new()?;
+        let stub = distinct_filings();
+        let report = run_ask(&budgeted(temp.path(), budget), &stub, RUN)??;
+        found.push((
+            report.exit,
+            asked_days(&stub),
+            rows(
+                temp.path(),
+                "SELECT budget, planned, stopped_by, exit FROM runs",
+            )?,
+            report.value["budget"].clone(),
+        ));
+    }
+    let days = |asked: &[&str]| asked.iter().copied().map(str::to_owned).collect::<Vec<_>>();
+    assert_eq!(
+        found,
+        vec![
+            (
+                8,
+                days(&["2026-11-11", "2026-11-10", "2026-11-09"]),
+                vec!["30|30|budget|8".to_owned()],
+                serde_json::json!({"budget": 30, "planned": 30}),
+            ),
+            (
+                8,
+                days(&["2026-11-11", "2026-11-10", "2026-11-09", "2026-11-06"]),
+                vec!["31|40|budget|8".to_owned()],
+                serde_json::json!({"budget": 31, "planned": 40}),
+            ),
+        ]
+    );
+    Ok(())
+}
+
+/// The trailing three days are asked whatever the budget, so a day SEC writes late is read
+/// (section 12.2's run order). Mutation 2026-11-28, the budget compared before a trailing day: red.
+#[test]
+fn the_trailing_three_days_are_asked_past_the_filing_budget() -> TestResult {
+    let temp = TempDir::new()?;
+    let stub = distinct_filings();
+    let report = run_ask(&budgeted(temp.path(), 0), &stub, RUN)??;
+    assert_eq!(
+        (report.exit, asked_days(&stub)),
+        (
+            8,
+            ["2026-11-11", "2026-11-10", "2026-11-09"]
+                .map(str::to_owned)
+                .to_vec()
+        )
+    );
+    Ok(())
+}
+
+/// A dry run plans older days only while the store's open filings are under the budget, and
+/// says both numbers. Mutation 2026-11-28, the budget not applied in the dry run: red.
+#[test]
+fn a_dry_run_plans_no_older_day_once_the_open_filings_reach_the_budget() -> TestResult {
+    let temp = TempDir::new()?;
+    let first = Stub::sec().replacing(&index_url("2026-11-06"), Reply::Transport);
+    run(temp.path(), &first, RUN)??;
+    let mut planned = Vec::new();
+    for budget in [10, 11] {
+        let mut dry = budgeted(temp.path(), budget);
+        dry.dry_run = true;
+        let report = run_ask(&dry, &Stub::sec(), NEXT_RUN)??.value;
+        planned.push((report["planned"]["days"].clone(), report["budget"].clone()));
+    }
+    assert_eq!(
+        planned,
+        vec![
+            (
+                serde_json::json!(["2026-11-11", "2026-11-10", "2026-11-09"]),
+                serde_json::json!({"budget": 10, "planned": 10}),
+            ),
+            (
+                serde_json::json!(["2026-11-11", "2026-11-10", "2026-11-09", "2026-11-06"]),
+                serde_json::json!({"budget": 11, "planned": 10}),
+            ),
+        ]
     );
     Ok(())
 }
