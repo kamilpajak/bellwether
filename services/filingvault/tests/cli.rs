@@ -83,6 +83,7 @@ fn the_schema_names_every_command_option_exit_and_error_code() -> TestResult {
         ("pace_root_split", 2, false),
         ("lease_held", 7, true),
         ("robots_stopped", 7, true),
+        ("traffic_stopped", 7, true),
         ("gate_refused", 7, true),
         ("partial_collect", 8, false),
     ]

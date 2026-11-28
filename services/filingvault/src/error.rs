@@ -22,12 +22,13 @@ pub enum ErrorCode {
     PaceRootSplit,
     LeaseHeld,
     RobotsStopped,
+    TrafficStopped,
     GateRefused,
     PartialCollect,
 }
 
 impl ErrorCode {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::InvalidArgument,
         Self::InputAbsent,
         Self::InputUnparseable,
@@ -38,6 +39,7 @@ impl ErrorCode {
         Self::PaceRootSplit,
         Self::LeaseHeld,
         Self::RobotsStopped,
+        Self::TrafficStopped,
         Self::GateRefused,
         Self::PartialCollect,
     ];
@@ -55,6 +57,7 @@ impl ErrorCode {
             Self::PaceRootSplit => "pace_root_split",
             Self::LeaseHeld => "lease_held",
             Self::RobotsStopped => "robots_stopped",
+            Self::TrafficStopped => "traffic_stopped",
             Self::GateRefused => "gate_refused",
             Self::PartialCollect => "partial_collect",
         }
@@ -64,7 +67,7 @@ impl ErrorCode {
     pub const fn exit(self) -> u8 {
         match self {
             Self::InputAbsent => 4,
-            Self::LeaseHeld | Self::RobotsStopped | Self::GateRefused => 7,
+            Self::LeaseHeld | Self::RobotsStopped | Self::TrafficStopped | Self::GateRefused => 7,
             Self::PartialCollect => 8,
             _ => 2,
         }
@@ -121,6 +124,9 @@ pub enum FilingsError {
     /// The report of the run so far rides in `details`.
     #[error("robots.txt of www.sec.gov stops the run: {reason}")]
     RobotsStopped { reason: &'static str, report: Value },
+    /// Consecutive traffic 403 answers (`sec_edgar::is_traffic_403`) stop the run.
+    #[error("{count} consecutive traffic 403 answers of www.sec.gov stop the run")]
+    TrafficStopped { count: u32, report: Value },
     #[error("the send gate refused attempt {attempt_id} before the socket: {why}")]
     GateRefused {
         attempt_id: String,
@@ -153,6 +159,7 @@ impl FilingsError {
             Self::PaceRoot(why) => ErrorCode::named(why.code()).unwrap_or(ErrorCode::IoFailed),
             Self::LeaseHeld(_) => ErrorCode::LeaseHeld,
             Self::RobotsStopped { .. } => ErrorCode::RobotsStopped,
+            Self::TrafficStopped { .. } => ErrorCode::TrafficStopped,
             Self::GateRefused { .. } => ErrorCode::GateRefused,
             Self::Budget(_) | Self::Sqlite(_) | Self::Blob(_) | Self::Ledger(_) | Self::Io(_) => {
                 ErrorCode::IoFailed
@@ -166,6 +173,7 @@ impl FilingsError {
         let code = self.code();
         let details = match self {
             Self::RobotsStopped { reason, report } => json!({"reason": reason, "report": report}),
+            Self::TrafficStopped { count, report } => json!({"count": count, "report": report}),
             Self::GateRefused {
                 attempt_id,
                 why,

@@ -33,8 +33,8 @@ CREATE TABLE runs (
     started_at  TEXT NOT NULL,
     finished_at TEXT,
     exit        INTEGER,
-    stopped_by  TEXT CHECK (stopped_by IN ('deadline', 'robots', 'gate_refused', 'error',
-                                           'interrupted'))
+    stopped_by  TEXT CHECK (stopped_by IN ('deadline', 'robots', 'traffic_403', 'gate_refused',
+                                           'error', 'interrupted'))
 );
 CREATE TABLE blobs (
     digest       TEXT PRIMARY KEY,

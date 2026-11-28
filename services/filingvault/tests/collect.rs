@@ -1200,3 +1200,108 @@ fn a_dry_run_over_a_store_plans_the_trailing_three_days() -> TestResult {
     );
     Ok(())
 }
+
+/// `stub` with each of `days` answering SEC's traffic 403.
+fn traffic_on(stub: Stub, days: &[&str]) -> Stub {
+    days.iter().fold(stub, |stub, text| {
+        stub.replacing(&index_url(text), Reply::Status(403, TRAFFIC_403.to_vec()))
+    })
+}
+
+/// Section 12.2: three consecutive traffic 403 answers stop the run before a fourth attempt is
+/// opened, `stopped_by` `traffic_403`, exit 7, retryable. Mutation 2026-11-28, the stop at 4: red.
+#[test]
+fn three_consecutive_traffic_403s_open_no_fourth_attempt_and_exit_7() -> TestResult {
+    let temp = TempDir::new()?;
+    let stub = traffic_on(Stub::sec(), &["2026-11-11", "2026-11-10", "2026-11-09"]);
+    let stopped = run(temp.path(), &stub, RUN)?;
+    let Err(why @ FilingsError::TrafficStopped { .. }) = stopped else {
+        return Err(format!("not stopped by traffic: {stopped:?}").into());
+    };
+    let object = why.object(&[]);
+    assert_eq!(
+        (
+            (object["code"].clone(), object["retryable"].clone()),
+            object["details"]["count"].clone(),
+            object["details"]["report"]["stopped_by"].clone(),
+            asked_days(&stub),
+            rows(
+                temp.path(),
+                "SELECT count(*) FROM attempts WHERE kind = 'index'"
+            )?,
+            rows(temp.path(), "SELECT exit, stopped_by FROM runs")?,
+        ),
+        (
+            (
+                serde_json::json!("traffic_stopped"),
+                serde_json::json!(true)
+            ),
+            serde_json::json!(3),
+            serde_json::json!("traffic_403"),
+            ["2026-11-11", "2026-11-10", "2026-11-09"]
+                .map(str::to_owned)
+                .to_vec(),
+            vec!["3".to_owned()],
+            vec!["7|traffic_403".to_owned()],
+        )
+    );
+    Ok(())
+}
+
+/// Any other answer between them, an `AccessDenied` 403 included, starts the count again; a
+/// transport error with no status is no answer and leaves it (section 12.8, step 11 as built).
+/// Mutations 2026-11-28, each red here: the count not reset by another answer; reset by a
+/// transport error; `AccessDenied` counted as traffic in `sec_edgar::is_traffic_403`.
+#[test]
+fn an_answer_between_traffic_403s_resets_the_count_and_a_transport_error_does_not() -> TestResult {
+    let broken = TempDir::new()?;
+    let answered = traffic_on(
+        Stub::sec(),
+        &["2026-11-11", "2026-11-10", "2026-11-06", "2026-11-05"],
+    )
+    .replacing(
+        &index_url("2026-11-09"),
+        Reply::Status(403, ACCESS_DENIED.to_vec()),
+    );
+    let went_on = run(broken.path(), &answered, RUN)?.map(|report| report.exit);
+    let lost = TempDir::new()?;
+    let unanswered = traffic_on(Stub::sec(), &["2026-11-11", "2026-11-09", "2026-11-06"])
+        .replacing(&index_url("2026-11-10"), Reply::Transport);
+    let stopped = run(lost.path(), &unanswered, RUN)?.map_err(|why| why.code().name());
+    assert_eq!(
+        (
+            went_on.ok(),
+            asked_days(&answered).len(),
+            stopped.err(),
+            asked_days(&unanswered),
+        ),
+        (
+            Some(8),
+            5,
+            Some("traffic_stopped"),
+            ["2026-11-11", "2026-11-10", "2026-11-09", "2026-11-06"]
+                .map(str::to_owned)
+                .to_vec(),
+        )
+    );
+    Ok(())
+}
+
+/// The stop is read at the run's end too, when the third traffic 403 was the plan's last
+/// request. Mutation 2026-11-28, the end-of-run check dropped: red (exit 8, `stopped_by` null).
+#[test]
+fn a_plan_ending_on_its_third_traffic_403_ends_traffic_403() -> TestResult {
+    let temp = TempDir::new()?;
+    let stub = traffic_on(Stub::sec(), &["2026-11-11", "2026-11-10", "2026-11-09"]);
+    let mut asked = support::ask(temp.path());
+    asked.rules = rules(5);
+    let stopped = run_ask(&asked, &stub, RUN)?.map_err(|why| why.code().name());
+    assert_eq!(
+        (
+            stopped.err(),
+            rows(temp.path(), "SELECT exit, stopped_by FROM runs")?
+        ),
+        (Some("traffic_stopped"), vec!["7|traffic_403".to_owned()])
+    );
+    Ok(())
+}

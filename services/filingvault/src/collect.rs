@@ -33,6 +33,9 @@ const STORE_ABSENT: &str = "absent";
 const STORE_HELD: &str = "held";
 /// `runs.stopped_by` of a run an error ended: its `exit` is the error code's.
 const STOPPED_BY_ERROR: &str = "error";
+/// Consecutive traffic 403 answers that stop a run: no further attempt is opened (owner decision
+/// 2026-11-24, section 12.2).
+pub const TRAFFIC_403_STOP: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct Ask {
@@ -73,6 +76,7 @@ pub struct Report {
 enum Stop {
     Deadline,
     Robots(RobotsStop),
+    Traffic403,
     Gate {
         attempt_id: String,
         why: BudgetError,
@@ -84,6 +88,7 @@ impl Stop {
         match self {
             Self::Deadline => "deadline",
             Self::Robots(_) => "robots",
+            Self::Traffic403 => "traffic_403",
             Self::Gate { .. } => "gate_refused",
         }
     }
@@ -106,6 +111,9 @@ struct Driver<'a> {
     run: RunId,
     ordinal: u32,
     failed: u32,
+    /// Traffic 403 answers since the last other answer; a transport error with no status is
+    /// no answer and leaves it as it is.
+    traffic_403s: u32,
     robots: Value,
     listings: Vec<Value>,
     days: Vec<Value>,
@@ -136,6 +144,9 @@ impl Driver<'_> {
         provenance: Provenance,
         read: impl FnOnce(&Answer) -> (Verdict, Commit, T),
     ) -> Result<Result<Turn<T>, Stop>, FilingsError> {
+        if self.traffic_403s >= TRAFFIC_403_STOP {
+            return Ok(Err(Stop::Traffic403));
+        }
         let request = request(&described, provenance);
         match self.exchange.reserve(&request, self.clock, self.deadline) {
             Ok(Reservation::Go) => {}
@@ -173,6 +184,12 @@ impl Driver<'_> {
                 return Err(FilingsError::Credential(name));
             }
         };
+        match &answer {
+            Ok(_) if sec_edgar::is_traffic_403(&answer) => self.traffic_403s += 1,
+            Ok(_) => self.traffic_403s = 0,
+            Err(failed) if failed.status().is_some() => self.traffic_403s = 0,
+            Err(_) => {}
+        }
         let body = match received(&answer) {
             None => None,
             Some(got) => match self.writer.put(got.body) {
@@ -412,8 +429,9 @@ pub fn instant(text: &str) -> Result<DateTime<Utc>, FilingsError> {
         })
 }
 
-/// One run. A robots stop and a gate refusal are errors carrying the report; every other run
-/// answers its report with exit 0, or 8 for a failed request or the deadline.
+/// One run. A robots stop, the traffic 403 stop and a gate refusal are errors carrying the
+/// report; every other run answers its report with exit 0, or 8 for a failed request or the
+/// deadline.
 pub fn run(ask: &Ask, exchange: &dyn Exchange, clock: &dyn Clock) -> Result<Report, FilingsError> {
     let started = clock.now();
     let run_id = format!("{RUN_PREFIX}-{}", started.format(RUN_ID_FORMAT));
@@ -432,11 +450,13 @@ pub fn run(ask: &Ask, exchange: &dyn Exchange, clock: &dyn Clock) -> Result<Repo
         run,
         ordinal: 0,
         failed: 0,
+        traffic_403s: 0,
         robots: Value::Null,
         listings: Vec::new(),
         days: Vec::new(),
     };
     let stop = match driver.collect(&ask.rules, started.date_naive()) {
+        Ok(None) if driver.traffic_403s >= TRAFFIC_403_STOP => Some(Stop::Traffic403),
         Ok(stop) => stop,
         Err(why) => {
             let exit = why.code().exit();
@@ -448,6 +468,7 @@ pub fn run(ask: &Ask, exchange: &dyn Exchange, clock: &dyn Clock) -> Result<Repo
     };
     let code = match (&stop, driver.failed) {
         (Some(Stop::Robots(_)), _) => Some(ErrorCode::RobotsStopped),
+        (Some(Stop::Traffic403), _) => Some(ErrorCode::TrafficStopped),
         (Some(Stop::Gate { .. }), _) => Some(ErrorCode::GateRefused),
         (Some(Stop::Deadline), _) | (None, 1..) => Some(ErrorCode::PartialCollect),
         (None, 0) => None,
@@ -476,6 +497,10 @@ pub fn run(ask: &Ask, exchange: &dyn Exchange, clock: &dyn Clock) -> Result<Repo
     match stop {
         Some(Stop::Robots(reason)) => Err(FilingsError::RobotsStopped {
             reason: reason.reason(),
+            report: value,
+        }),
+        Some(Stop::Traffic403) => Err(FilingsError::TrafficStopped {
+            count: driver.traffic_403s,
             report: value,
         }),
         Some(Stop::Gate { attempt_id, why }) => Err(FilingsError::GateRefused {
