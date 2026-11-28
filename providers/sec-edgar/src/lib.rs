@@ -456,6 +456,16 @@ pub fn acceptance_instant(raw: &str, format: &str, zone: &str) -> Option<DateTim
     )
 }
 
+/// SEC's shared-IP traffic 403: a 403 whose body is not S3's `AccessDenied`. A transport error
+/// is no answer, so it is never one.
+#[must_use]
+pub fn is_traffic_403(answer: &Result<RawResponse, TransportError>) -> bool {
+    answer.as_ref().is_ok_and(|response| {
+        response.status() == FORBIDDEN
+            && !String::from_utf8_lossy(response.body()).contains(ACCESS_DENIED)
+    })
+}
+
 /// The body of SEC's 200, for the caller to read, or the verdict every other answer closes with.
 /// The shared-IP traffic 403 is TRANSIENT: it cleared by waiting (predecessor issues #379, #382,
 /// #383). Permanent: the S3 403 `AccessDenied`, and a body over the limit whatever its status.
@@ -470,7 +480,7 @@ pub fn body_of_200(answer: &Result<RawResponse, TransportError>) -> Result<Cow<'
     let body = String::from_utf8_lossy(response.body());
     match response.status() {
         OK => Ok(body),
-        FORBIDDEN if body.contains(ACCESS_DENIED) => Err(Verdict::PermanentFailure),
+        FORBIDDEN if !is_traffic_403(answer) => Err(Verdict::PermanentFailure),
         FORBIDDEN | TOO_MANY_REQUESTS | REQUEST_TIMEOUT => Err(Verdict::TransientFailure),
         status if SERVER_ERRORS.contains(&status) => Err(Verdict::TransientFailure),
         _ => Err(Verdict::PermanentFailure),
@@ -528,6 +538,28 @@ mod tests {
                 day("2025-12-31"),
             )
         );
+    }
+
+    /// Section 12.2's 403 stop counts this reading. Mutations 2026-11-28, each red here:
+    /// `AccessDenied` counted as traffic; a 429 counted; a transport error counted.
+    #[test]
+    fn a_traffic_403_is_told_from_access_denied() {
+        let at = pit::ObservationTime::new(DateTime::UNIX_EPOCH);
+        let attempt = || news_provider::AttemptId::recorded("a");
+        let answer = |status: u16, body: &[u8]| -> Result<RawResponse, TransportError> {
+            Ok(RawResponse::new(attempt(), status, body.to_vec(), at, at))
+        };
+        let denied = b"<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>";
+        let lost = Err(TransportError::new(attempt(), at, at, "lost".to_owned()));
+        let read = [
+            answer(FORBIDDEN, b"<html>Request Rate Threshold Exceeded</html>"),
+            answer(FORBIDDEN, denied),
+            answer(TOO_MANY_REQUESTS, b""),
+            answer(OK, b""),
+            lost,
+        ]
+        .map(|answer| is_traffic_403(&answer));
+        assert_eq!(read, [true, false, false, false, false]);
     }
 
     /// Section 12.2's split of SEC's ceiling: the filings row is 500 ms per IP and per host, the
