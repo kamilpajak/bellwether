@@ -156,6 +156,8 @@ pub enum Reply {
     Transport,
     /// A body over the limit, cut at it.
     OverLimit(Vec<u8>),
+    /// A head of this status, then the connection lost with these bytes of the body read.
+    HeadThenLost(u16, Vec<u8>),
     GateHeld,
     /// A pace file the gate cannot read: a budget error that is no gate refusal.
     Budget,
@@ -267,6 +269,9 @@ impl Exchange for Stub {
                     .with_status(OK)
                     .with_cut_body(cut)
                     .of_kind(TransportKind::BodyOverLimit),
+            )),
+            Some(Reply::HeadThenLost(status, cut)) => Err(SendFailure::Transport(
+                failed().with_status(status).with_cut_body(cut),
             )),
             Some(Reply::GateHeld) => Err(SendFailure::Budget(BudgetError::GateHeld {
                 path: "pace/www.sec.gov.per-host.sent".into(),

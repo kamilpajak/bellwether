@@ -61,7 +61,8 @@ const REQUEST_TIMEOUT: u16 = 408;
 const TOO_MANY_REQUESTS: u16 = 429;
 const SERVER_ERRORS: std::ops::RangeInclusive<u16> = 500..=599;
 const OK: u16 = 200;
-const FORBIDDEN: u16 = 403;
+/// The status of both SEC 403s, the traffic 403 and S3's `AccessDenied`.
+pub const FORBIDDEN: u16 = 403;
 
 /// Every timeout, as one value. An ASSUMPTION taken by default and not a measurement: nothing in
 /// this tree has timed an EDGAR response, so there is no quantile to quote. `transport()` below is

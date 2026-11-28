@@ -191,6 +191,8 @@ impl Driver<'_> {
         match &answer {
             Ok(_) if sec_edgar::is_traffic_403(&answer) => self.traffic_403s += 1,
             Ok(_) => self.traffic_403s = 0,
+            // A 403 head whose body was lost: `AccessDenied` cannot be read from it (§12.2).
+            Err(failed) if failed.status() == Some(sec_edgar::FORBIDDEN) => {}
             Err(failed) if failed.status().is_some() => self.traffic_403s = 0,
             Err(_) => {}
         }

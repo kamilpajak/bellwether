@@ -1306,6 +1306,31 @@ fn a_plan_ending_on_its_third_traffic_403_ends_traffic_403() -> TestResult {
     Ok(())
 }
 
+/// A failure whose head was read resets the count, but a 403 head whose body was lost neither
+/// counts nor resets: its body cannot be told from `AccessDenied` (review 2026-11-28, F1 and C4).
+/// Mutations 2026-11-28, each red here: a 403 head with a lost body resetting; no head resetting.
+#[test]
+fn a_failure_after_a_head_resets_the_count_unless_the_head_was_a_403() -> TestResult {
+    let mut found = Vec::new();
+    for between in [
+        Reply::OverLimit(b"x".to_vec()),
+        Reply::HeadThenLost(403, TRAFFIC_403[..10].to_vec()),
+    ] {
+        let temp = TempDir::new()?;
+        let stub = traffic_on(
+            Stub::sec(),
+            &["2026-11-11", "2026-11-10", "2026-11-06", "2026-11-05"],
+        )
+        .replacing(&index_url("2026-11-09"), between);
+        let got = run(temp.path(), &stub, RUN)?
+            .map(|report| report.exit)
+            .map_err(|why| why.code().name());
+        found.push((got, asked_days(&stub).len()));
+    }
+    assert_eq!(found, vec![(Ok(8), 5), (Err("traffic_stopped"), 4)]);
+    Ok(())
+}
+
 /// [`Stub::sec`] with each listed day's index naming 10 filings no other day names: the
 /// accessions' year digits replaced by the day of the month.
 fn distinct_filings() -> Stub {
