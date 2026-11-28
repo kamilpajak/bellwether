@@ -1,6 +1,7 @@
 //! `filingvault filings collect`: one ledgered conversation with SEC (architecture.md section
 //! 12.2). Order: the sweep, robots.txt, the quarter listings, the trailing index days, then every
-//! other listed day of the fill window newest first. No in-run retry.
+//! other listed day of the fill window newest first while the open filings are under the
+//! budget. No in-run retry; three consecutive traffic 403 answers stop it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -19,7 +20,7 @@ use serde_json::{json, Value};
 use crate::discover::{
     allowed, day_states, days_to_ask, index_ask, index_data_day, index_read, listing_ask,
     listing_read, quarters_to_ask, request, rewritten_days, robots_ask, robots_rules,
-    robots_verdict, RobotsStop, Written, BODY_LIMIT, QUARTER_SETTLE_DAYS,
+    robots_verdict, DaysToAsk, RobotsStop, Written, BODY_LIMIT, QUARTER_SETTLE_DAYS,
 };
 use crate::error::{ErrorCode, FilingsError};
 use crate::rules::Rules;
@@ -75,6 +76,8 @@ pub struct Report {
 #[derive(Debug)]
 enum Stop {
     Deadline,
+    /// An older day was left unasked: the open filings had reached the rules' `filing_budget`.
+    Budget,
     Robots(RobotsStop),
     Traffic403,
     Gate {
@@ -87,6 +90,7 @@ impl Stop {
     const fn name(&self) -> &'static str {
         match self {
             Self::Deadline => "deadline",
+            Self::Budget => "budget",
             Self::Robots(_) => "robots",
             Self::Traffic403 => "traffic_403",
             Self::Gate { .. } => "gate_refused",
@@ -297,30 +301,51 @@ impl Driver<'_> {
             }
         }
         let planned = plan(self.writer.db(), &days, rules, window.fill_start, run_date)?;
-        for day in planned {
-            let described = index_ask(day, &rules.forms);
-            if !allowed(robots.as_ref(), &described.url) {
-                return Ok(Some(Stop::Robots(RobotsStop::Disallowed)));
+        for day in planned.trailing {
+            if let Err(stop) = self.ask_day(day, rules, robots.as_ref())? {
+                return Ok(Some(stop));
             }
-            let forms = rules.forms.clone();
-            let turn = match self.turn(described, Provenance::VendorArchive, move |answer| {
-                let (verdict, listed) = index_read(answer, &forms);
-                let commit = Commit {
-                    body: None,
-                    index_day: Some(day),
-                    listed,
-                    data_day: index_data_day(answer),
-                };
-                (verdict, commit, ())
-            })? {
-                Ok(turn) => turn,
-                Err(stop) => return Ok(Some(stop)),
-            };
-            let mut row = turn.row;
-            row["index_day"] = json!(store::day_text(day));
-            self.days.push(row);
+        }
+        for day in planned.older {
+            if store::open_filings(self.writer.db())? >= u64::from(rules.filing_budget) {
+                return Ok(Some(Stop::Budget));
+            }
+            if let Err(stop) = self.ask_day(day, rules, robots.as_ref())? {
+                return Ok(Some(stop));
+            }
         }
         Ok(None)
+    }
+
+    /// One index day: its path checked against robots.txt, then its turn.
+    fn ask_day(
+        &mut self,
+        day: NaiveDate,
+        rules: &Rules,
+        robots: Option<&Robots>,
+    ) -> Result<Result<(), Stop>, FilingsError> {
+        let described = index_ask(day, &rules.forms);
+        if !allowed(robots, &described.url) {
+            return Ok(Err(Stop::Robots(RobotsStop::Disallowed)));
+        }
+        let forms = rules.forms.clone();
+        let turn = match self.turn(described, Provenance::VendorArchive, move |answer| {
+            let (verdict, listed) = index_read(answer, &forms);
+            let commit = Commit {
+                body: None,
+                index_day: Some(day),
+                listed,
+                data_day: index_data_day(answer),
+            };
+            (verdict, commit, ())
+        })? {
+            Ok(turn) => turn,
+            Err(stop) => return Ok(Err(stop)),
+        };
+        let mut row = turn.row;
+        row["index_day"] = json!(store::day_text(day));
+        self.days.push(row);
+        Ok(Ok(()))
     }
 }
 
@@ -401,7 +426,7 @@ fn plan(
     rules: &Rules,
     fill_start: NaiveDate,
     run_date: NaiveDate,
-) -> Result<Vec<NaiveDate>, FilingsError> {
+) -> Result<DaysToAsk, FilingsError> {
     let writes: Writes = listed.values().flatten().map(|(d, w)| (*d, *w)).collect();
     let days: BTreeSet<NaiveDate> = writes.keys().copied().collect();
     let attempts = store::index_attempts(db, None)?;
@@ -441,7 +466,7 @@ pub fn run(ask: &Ask, exchange: &dyn Exchange, clock: &dyn Clock) -> Result<Repo
     let run = RunId::new(run_id.clone());
     let mut writer = Writer::open(&ask.store, &run)?;
     let (swept_attempts, swept_runs) = writer.sweep(started)?;
-    writer.start_run(started)?;
+    writer.start_run(started, ask.rules.filing_budget)?;
     let mut driver = Driver {
         writer,
         exchange,
@@ -462,7 +487,7 @@ pub fn run(ask: &Ask, exchange: &dyn Exchange, clock: &dyn Clock) -> Result<Repo
             let exit = why.code().exit();
             return driver
                 .writer
-                .finish_run(clock.now(), exit, Some(STOPPED_BY_ERROR))
+                .finish_run(clock.now(), exit, Some(STOPPED_BY_ERROR), None)
                 .and(Err(why));
         }
     };
@@ -470,13 +495,17 @@ pub fn run(ask: &Ask, exchange: &dyn Exchange, clock: &dyn Clock) -> Result<Repo
         (Some(Stop::Robots(_)), _) => Some(ErrorCode::RobotsStopped),
         (Some(Stop::Traffic403), _) => Some(ErrorCode::TrafficStopped),
         (Some(Stop::Gate { .. }), _) => Some(ErrorCode::GateRefused),
-        (Some(Stop::Deadline), _) | (None, 1..) => Some(ErrorCode::PartialCollect),
+        (Some(Stop::Deadline | Stop::Budget), _) | (None, 1..) => Some(ErrorCode::PartialCollect),
         (None, 0) => None,
     };
     let exit = code.map_or(0, ErrorCode::exit);
-    driver
-        .writer
-        .finish_run(clock.now(), exit, stop.as_ref().map(Stop::name))?;
+    let planned = store::open_filings(driver.writer.db())?;
+    driver.writer.finish_run(
+        clock.now(),
+        exit,
+        stop.as_ref().map(Stop::name),
+        Some(planned),
+    )?;
     let value = json!({
         "schema": COLLECT_SCHEMA,
         "run_id": run_id,
@@ -486,6 +515,7 @@ pub fn run(ask: &Ask, exchange: &dyn Exchange, clock: &dyn Clock) -> Result<Repo
         "robots": driver.robots,
         "listings": driver.listings,
         "days": driver.days,
+        "budget": {"budget": ask.rules.filing_budget, "planned": planned},
         "stopped_by": stop.as_ref().map(Stop::name),
         "changed": true,
         "exit": {
@@ -508,22 +538,25 @@ pub fn run(ask: &Ask, exchange: &dyn Exchange, clock: &dyn Clock) -> Result<Repo
             why,
             report: value,
         }),
-        Some(Stop::Deadline) | None => Ok(Report { value, exit }),
+        Some(Stop::Deadline | Stop::Budget) | None => Ok(Report { value, exit }),
     }
 }
 
 /// `--dry-run`: the quarters and the days a run would ask from what the store holds, read only;
 /// no store is created, no lease taken and nothing sent. `store` says whether `--store` held one.
+/// Older days are planned only while the open filings are under the budget; how many a run then
+/// asks before it reaches the budget is known only from the days' answers.
 fn planned(ask: &Ask, run_id: &str, started: DateTime<Utc>) -> Result<Report, FilingsError> {
     let run_date = started.date_naive();
     let current = Quarter::of(run_date.pred_opt().unwrap_or(run_date));
-    let (store, quarters, days) = match store::open_read(&ask.store) {
+    let (store, quarters, days, open) = match store::open_read(&ask.store) {
         Err(FilingsError::Absent(_)) => {
             let fill_start = fill_start(run_date, ask.rules.fill_days)?;
             (
                 STORE_ABSENT,
                 quarters_to_ask(fill_start, current, &BTreeSet::new())?,
                 Vec::new(),
+                0,
             )
         }
         Err(other) => return Err(other),
@@ -533,16 +566,24 @@ fn planned(ask: &Ask, run_id: &str, started: DateTime<Utc>) -> Result<Report, Fi
                 store::WRITE_POLICY,
             );
             let window = Window::read(&db, &blobs, &ask.rules, run_date)?;
+            let planned = plan(
+                &db,
+                &window.held_days,
+                &ask.rules,
+                window.fill_start,
+                run_date,
+            )?;
+            let open = store::open_filings(&db)?;
+            let older = if open < u64::from(ask.rules.filing_budget) {
+                planned.older
+            } else {
+                Vec::new()
+            };
             (
                 STORE_HELD,
                 quarters_to_ask(window.fill_start, window.current, &window.complete)?,
-                plan(
-                    &db,
-                    &window.held_days,
-                    &ask.rules,
-                    window.fill_start,
-                    run_date,
-                )?,
+                [planned.trailing, older].concat(),
+                open,
             )
         }
     };
@@ -556,6 +597,7 @@ fn planned(ask: &Ask, run_id: &str, started: DateTime<Utc>) -> Result<Report, Fi
             "listings": quarters.iter().map(|quarter| quarter.label()).collect::<Vec<String>>(),
             "days": days.into_iter().map(store::day_text).collect::<Vec<String>>(),
         },
+        "budget": {"budget": ask.rules.filing_budget, "planned": open},
         "changed": false,
         "exit": {"code": 0, "error_code": null, "retryable": false},
     });

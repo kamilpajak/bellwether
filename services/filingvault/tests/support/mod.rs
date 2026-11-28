@@ -43,6 +43,8 @@ pub const LISTED: [&str; 5] = [
     "2026-11-11",
 ];
 pub const ANNUAL: [&str; 2] = ["10-K", "10-K/A"];
+/// The committed rules file's budget: no stub run lists as many filings.
+pub const FILING_BUDGET: u32 = 1_800;
 pub const OK: u16 = 200;
 
 pub fn day(text: &str) -> NaiveDate {
@@ -108,6 +110,7 @@ pub fn rules(fill_days: u32) -> Rules {
     Rules {
         forms: ANNUAL.map(str::to_owned).to_vec(),
         fill_days,
+        filing_budget: FILING_BUDGET,
     }
 }
 

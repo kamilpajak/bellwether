@@ -804,3 +804,24 @@ fn a_forward_day_rewritten_and_not_read_again_answers_no() -> TestResult {
     );
     Ok(())
 }
+
+/// `ledger check` reads the last run's budget and the open filings it closed with, the count
+/// only once the run closed by `--at`. Mutations 2026-11-28, each red here: `planned` not
+/// written by `finish_run`; the count shown before the close.
+#[test]
+fn the_last_run_reports_its_budget_and_the_filings_it_left_planned() -> TestResult {
+    let temp = TempDir::new()?;
+    run(temp.path(), &listing_of(&FIRST), RUN)??;
+    let read = |at: &str| -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let last = checked(temp.path(), at)?.report["last_run"].clone();
+        Ok(serde_json::json!([last["budget"], last["planned"]]))
+    };
+    assert_eq!(
+        (read("2026-11-12T06:10:01Z")?, read("2026-11-16T12:00:00Z")?),
+        (
+            serde_json::json!([FILING_BUDGET, null]),
+            serde_json::json!([FILING_BUDGET, 10])
+        )
+    );
+    Ok(())
+}

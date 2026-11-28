@@ -1,6 +1,6 @@
-//! The context's rules file: the forms an index day is read for (architecture.md section 12.3)
-//! and how far back the first runs fill (section 12.2). Not hashed before step 11, whose
-//! `rules_version` is its first reader.
+//! The context's rules file: the forms an index day is read for (architecture.md section 12.3),
+//! how far back the first runs fill and how many filings a run plans (section 12.2). Not hashed:
+//! `rules_version` arrives with its first reader, the manifest level (section 12.8, step 11b).
 
 use std::path::Path;
 
@@ -8,8 +8,8 @@ use serde_json::Value;
 
 use crate::error::FilingsError;
 
-pub const RULES_SCHEMA: &str = "filingvault.rules/1";
-const KEYS: [&str; 3] = ["schema", "forms", "fill_days"];
+pub const RULES_SCHEMA: &str = "filingvault.rules/2";
+const KEYS: [&str; 4] = ["schema", "forms", "fill_days", "filing_budget"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rules {
@@ -17,6 +17,8 @@ pub struct Rules {
     pub forms: Vec<String>,
     /// Days before the first collect run's UTC date the fill reaches back to.
     pub fill_days: u32,
+    /// No unasked day past the trailing ones is asked once this many filings are open.
+    pub filing_budget: u32,
 }
 
 /// An absent file is `input_absent`; anything this reader cannot take whole is
@@ -64,5 +66,13 @@ pub fn read(path: &Path) -> Result<Rules, FilingsError> {
         .as_u64()
         .and_then(|days| u32::try_from(days).ok())
         .ok_or_else(|| refused("fill_days is not a count of days".to_owned()))?;
-    Ok(Rules { forms, fill_days })
+    let filing_budget = read["filing_budget"]
+        .as_u64()
+        .and_then(|count| u32::try_from(count).ok())
+        .ok_or_else(|| refused("filing_budget is not a count of filings".to_owned()))?;
+    Ok(Rules {
+        forms,
+        fill_days,
+        filing_budget,
+    })
 }

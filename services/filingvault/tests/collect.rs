@@ -85,7 +85,7 @@ fn a_dead_runs_open_attempt_and_run_are_closed_interrupted_by_the_next_writer() 
     let temp = TempDir::new()?;
     {
         let writer = Writer::open(temp.path(), &RunId::new("filings-dead"))?;
-        writer.start_run("2026-11-11T06:10:00Z".parse()?)?;
+        writer.start_run("2026-11-11T06:10:00Z".parse()?, FILING_BUDGET)?;
         writer.db().execute(
             "INSERT INTO attempts (attempt_id, run_id, kind, target, url, body_limit, opened_at)
              VALUES ('dead', 'filings-dead', 'robots', 'www.sec.gov', 'u', 1,
@@ -1302,6 +1302,112 @@ fn a_plan_ending_on_its_third_traffic_403_ends_traffic_403() -> TestResult {
             rows(temp.path(), "SELECT exit, stopped_by FROM runs")?
         ),
         (Some("traffic_stopped"), vec!["7|traffic_403".to_owned()])
+    );
+    Ok(())
+}
+
+/// [`Stub::sec`] with each listed day's index naming 10 filings no other day names: the
+/// accessions' year digits replaced by the day of the month.
+fn distinct_filings() -> Stub {
+    LISTED.iter().fold(Stub::sec(), |stub, text| {
+        let body =
+            String::from_utf8_lossy(&index_of(text)).replace("-26-", &format!("-{}-", &text[8..]));
+        stub.replacing(&index_url(text), Reply::Status(OK, body.into_bytes()))
+    })
+}
+
+fn budgeted(store: &std::path::Path, budget: u32) -> filingvault::collect::Ask {
+    let mut asked = support::ask(store);
+    asked.rules.filing_budget = budget;
+    asked
+}
+
+/// Section 12.2: unasked days are asked newest first until the open filings reach the budget;
+/// the run ends `budget`, exit 8, and records the budget and the count. Mutations 2026-11-28,
+/// each red here: the budget not compared; `>` for `>=`; `stopped_by` left null.
+#[test]
+fn unasked_days_stop_at_the_filing_budget() -> TestResult {
+    let mut found = Vec::new();
+    for budget in [30, 31] {
+        let temp = TempDir::new()?;
+        let stub = distinct_filings();
+        let report = run_ask(&budgeted(temp.path(), budget), &stub, RUN)??;
+        found.push((
+            report.exit,
+            asked_days(&stub),
+            rows(
+                temp.path(),
+                "SELECT budget, planned, stopped_by, exit FROM runs",
+            )?,
+            report.value["budget"].clone(),
+        ));
+    }
+    let days = |asked: &[&str]| asked.iter().copied().map(str::to_owned).collect::<Vec<_>>();
+    assert_eq!(
+        found,
+        vec![
+            (
+                8,
+                days(&["2026-11-11", "2026-11-10", "2026-11-09"]),
+                vec!["30|30|budget|8".to_owned()],
+                serde_json::json!({"budget": 30, "planned": 30}),
+            ),
+            (
+                8,
+                days(&["2026-11-11", "2026-11-10", "2026-11-09", "2026-11-06"]),
+                vec!["31|40|budget|8".to_owned()],
+                serde_json::json!({"budget": 31, "planned": 40}),
+            ),
+        ]
+    );
+    Ok(())
+}
+
+/// The trailing three days are asked whatever the budget, so a day SEC writes late is read
+/// (section 12.2's run order). Mutation 2026-11-28, the budget compared before a trailing day: red.
+#[test]
+fn the_trailing_three_days_are_asked_past_the_filing_budget() -> TestResult {
+    let temp = TempDir::new()?;
+    let stub = distinct_filings();
+    let report = run_ask(&budgeted(temp.path(), 0), &stub, RUN)??;
+    assert_eq!(
+        (report.exit, asked_days(&stub)),
+        (
+            8,
+            ["2026-11-11", "2026-11-10", "2026-11-09"]
+                .map(str::to_owned)
+                .to_vec()
+        )
+    );
+    Ok(())
+}
+
+/// A dry run plans older days only while the store's open filings are under the budget, and
+/// says both numbers. Mutation 2026-11-28, the budget not applied in the dry run: red.
+#[test]
+fn a_dry_run_plans_no_older_day_once_the_open_filings_reach_the_budget() -> TestResult {
+    let temp = TempDir::new()?;
+    let first = Stub::sec().replacing(&index_url("2026-11-06"), Reply::Transport);
+    run(temp.path(), &first, RUN)??;
+    let mut planned = Vec::new();
+    for budget in [10, 11] {
+        let mut dry = budgeted(temp.path(), budget);
+        dry.dry_run = true;
+        let report = run_ask(&dry, &Stub::sec(), NEXT_RUN)??.value;
+        planned.push((report["planned"]["days"].clone(), report["budget"].clone()));
+    }
+    assert_eq!(
+        planned,
+        vec![
+            (
+                serde_json::json!(["2026-11-11", "2026-11-10", "2026-11-09"]),
+                serde_json::json!({"budget": 10, "planned": 10}),
+            ),
+            (
+                serde_json::json!(["2026-11-11", "2026-11-10", "2026-11-09", "2026-11-06"]),
+                serde_json::json!({"budget": 11, "planned": 10}),
+            ),
+        ]
     );
     Ok(())
 }

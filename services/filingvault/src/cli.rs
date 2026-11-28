@@ -127,7 +127,7 @@ const EXITS: [(&str, &[(u8, &str)]); 3] = [
             (2, "invalid_argument, input_unparseable, input_schema_mismatch, credential_contact_missing, pace_root_split, io_failed; before any request"),
             (4, "input_absent: the rules file, the pace root or the contact file"),
             (7, "lease_held, robots_stopped, traffic_stopped, gate_refused: retryable, stdout empty, the run's report in details"),
-            (8, "partial_collect: a request failed, or the deadline stopped the run"),
+            (8, "partial_collect: a request failed, the deadline stopped the run, or the filing budget left a day unasked"),
         ],
     ),
     (

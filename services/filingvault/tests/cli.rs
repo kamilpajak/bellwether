@@ -230,7 +230,7 @@ fn a_dry_run_refuses_a_spaced_form_and_a_fill_window_past_the_calendar() -> Test
         std::fs::write(
             &rules,
             format!(
-                r#"{{"schema": "filingvault.rules/1", "forms": {forms}, "fill_days": {fill_days}}}"#
+                r#"{{"schema": "filingvault.rules/2", "forms": {forms}, "fill_days": {fill_days}, "filing_budget": 1800}}"#
             ),
         )?;
         let out = filingvault(&[
@@ -252,6 +252,32 @@ fn a_dry_run_refuses_a_spaced_form_and_a_fill_window_past_the_calendar() -> Test
     }
     let expected = (Some(2), 0, Some(serde_json::json!("input_unparseable")));
     assert_eq!(refused, vec![expected.clone(), expected]);
+    Ok(())
+}
+
+/// The committed rules file carries the budget of section 12.2, 1,800; a file of schema 1, or
+/// one whose `filing_budget` is absent or no count, is refused and never read as a default.
+/// Mutations 2026-11-28, each red here: the schema check dropped; an absent budget read as 0.
+#[test]
+fn a_rules_file_without_a_filing_budget_or_of_schema_1_is_refused() -> TestResult {
+    let temp = TempDir::new()?;
+    let committed = filingvault::rules::read(Path::new(RULES))?.filing_budget;
+    let head = r#""forms": ["10-K"], "fill_days": 456"#;
+    let mut refused = Vec::new();
+    for body in [
+        format!(r#"{{"schema": "filingvault.rules/1", {head}, "filing_budget": 1800}}"#),
+        format!(r#"{{"schema": "filingvault.rules/2", {head}}}"#),
+        format!(r#"{{"schema": "filingvault.rules/2", {head}, "filing_budget": -1}}"#),
+        format!(r#"{{"schema": "filingvault.rules/2", {head}, "filing_budget": "1800"}}"#),
+    ] {
+        let rules = temp.path().join("rules.json");
+        std::fs::write(&rules, body)?;
+        refused.push(filingvault::rules::read(&rules).map_err(|why| why.code().name()));
+    }
+    assert_eq!(
+        (committed, refused),
+        (1_800, vec![Err("input_unparseable"); 4])
+    );
     Ok(())
 }
 
