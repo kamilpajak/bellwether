@@ -633,7 +633,10 @@ pub fn open_filings(db: &Connection) -> Result<u64, FilingsError> {
         [],
         |row| row.get(0),
     )?;
-    Ok(u64::try_from(count).unwrap_or(0))
+    u64::try_from(count).map_err(|why| FilingsError::Unparseable {
+        what: format!("the open filings count {count}"),
+        why: why.to_string(),
+    })
 }
 
 /// The payload a stored listing names, re-hashed on the way out.
